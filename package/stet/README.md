@@ -1,4 +1,24 @@
-# stet
+<div align="center">
+
+<img src="https://getstet.github.io/brand/cover.png" alt="stet — one copy layer for all your sites and apps" width="820">
+
+<p>
+  <a href="https://www.npmjs.com/package/@getstet/stet"><img alt="npm" src="https://img.shields.io/npm/v/@getstet/stet?color=0e6b74&label=npm"></a>
+  <a href="https://www.apache.org/licenses/LICENSE-2.0"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-0e6b74"></a>
+  <img alt="Node" src="https://img.shields.io/badge/node-%E2%89%A522-0e6b74">
+  <img alt="Types" src="https://img.shields.io/badge/types-included-0e6b74">
+</p>
+
+<p>
+  <a href="https://getstet.github.io/docs">Documentation</a> ·
+  <a href="https://getstet.github.io/docs/quickstart">Quickstart</a> ·
+  <a href="https://getstet.github.io/docs/how-stet-works">How stet works</a> ·
+  <a href="https://getstet.github.io/changelog">Changelog</a>
+</p>
+
+</div>
+
+---
 
 stet is a copy layer for your codebase. Every user-facing sentence becomes a
 typed key with a committed fallback value; the CLI checks, versions and
@@ -22,9 +42,9 @@ committed snapshot and the typed read path, and shows you its one edit to
 existing code before applying it. Then:
 
 ```sh
-npx stet scan                    # find the copy already in your components
-npx stet register --from scan    # adopt a string as a key, byte-identical
-npx stet check                   # descriptor, snapshot and types — offline
+npx stet scan                            # find the copy already in your components
+npx stet register --from scan --write    # adopt those strings as keys, byte-identical
+npx stet check                           # descriptor, snapshot and types — offline
 ```
 
 ## What you get
@@ -51,19 +71,27 @@ npx stet check                   # descriptor, snapshot and types — offline
 ## The store, when you want one
 
 Publishing without deploys is the optional half: Postgres adapters, draft and
-publish with one-click revert, grouped changesets, per-environment connections.
-A project starts snapshot-only and adds a store later with `stet upgrade`.
+publish with revert, grouped changesets that publish and revert as one unit,
+and per-environment connections. A project starts snapshot-only and adds a
+store later with `stet upgrade`.
 
 ## Frameworks
 
 Next.js (both routers), React and Astro are first-class for scanning and
-adoption. Any JavaScript host reads through `@getstet/stet/core`. Non-JS services read
-the committed bundle directly — a stdlib-only Python helper ships in the
-package.
+adoption. Any JavaScript host reads through `@getstet/stet/core`. Non-JS
+services read the committed bundle directly — a stdlib-only Python helper
+ships in the package.
 
 ## Requirements
 
-Node.js 22 or later.
+Node.js 22 or later. Scanning and adoption use the TypeScript compiler API, so
+projects using those commands need `typescript` 5 or 6 as a dev dependency.
+
+## Documentation
+
+The [user guide](https://getstet.github.io/docs) covers installing, adopting
+the copy already in your components, the everyday draft-and-publish rhythm,
+email templates, the checks, and leaving cleanly.
 
 ## License
 
