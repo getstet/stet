@@ -1,0 +1,217 @@
+{
+  "version": 1,
+  "keys": {
+    "hero_headline": {
+      "shape": "text",
+      "target": "web",
+      "limits": { "max": 60, "severity": "advisory" },
+      "budget": { "desktop": 2, "mobile": 3 },
+      "pages": ["home"],
+      "label": "Headline",
+      "help": "The first line a visitor reads. Say what the product does.",
+      "previewUrl": "/",
+      "section": "Hero",
+      "pack": "core"
+    },
+    "hero_body": {
+      "shape": "text",
+      "target": "web",
+      "vars": ["handle"],
+      "pages": ["home"],
+      "section": "Hero",
+      "pack": "core"
+    },
+    "footer_links": {
+      "shape": "list",
+      "target": "web",
+      "pages": ["home", "pricing"],
+      "section": "Footer",
+      "pack": "core"
+    },
+    "contact_form_labels": {
+      "shape": "record",
+      "target": "web",
+      "pages": ["home"],
+      "section": "Contact",
+      "pack": "core"
+    },
+    "theme_mode": {
+      "shape": "enum",
+      "target": "web",
+      "values": ["light", "dark", "system"],
+      "pack": "core"
+    },
+    "brand__name": {
+      "shape": "text",
+      "target": "web",
+      "pages": ["home", "pricing"],
+      "label": "Brand name",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "brand__primary": {
+      "shape": "color",
+      "target": "web",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "brand__radius": {
+      "shape": "number",
+      "target": "web",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "brand__logo": {
+      "shape": "media",
+      "target": "web",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "brand__footer_address": {
+      "shape": "text",
+      "target": "html-email",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "blog_intro": {
+      "shape": "richtext",
+      "target": "web",
+      "pack": "content"
+    },
+    "pricing_tier_name": {
+      "shape": "text",
+      "target": "web",
+      "pages": ["pricing"],
+      "pack": "saas"
+    },
+    "pricing_price": {
+      "shape": "text",
+      "target": "web",
+      "pages": ["pricing"],
+      "pack": "saas"
+    },
+    "seo_home_title": {
+      "shape": "text",
+      "target": "web",
+      "limits": { "max": 60, "severity": "advisory" },
+      "derivesFrom": "hero_headline",
+      "tmpl": "{v} — Mirra",
+      "pages": ["home"],
+      "pack": "core"
+    },
+    "seo_home_desc": {
+      "shape": "text",
+      "target": "web",
+      "pages": ["home"],
+      "pack": "core"
+    },
+    "seo_pricing_title": {
+      "shape": "text",
+      "target": "web",
+      "derivesFrom": "pricing_tier_name",
+      "tmpl": "{v} pricing — Mirra",
+      "pages": ["pricing"],
+      "pack": "core"
+    },
+    "seo_pricing_desc": {
+      "shape": "text",
+      "target": "web",
+      "pages": ["pricing"],
+      "pack": "core"
+    },
+    "farewell_notice": {
+      "shape": "text",
+      "target": "telegram-md2",
+      "limits": { "max": 4096, "severity": "hard" },
+      "pack": "core"
+    },
+    "welcome__subject": {
+      "shape": "text",
+      "target": "html-email",
+      "limits": { "max": 60, "severity": "hard" },
+      "vars": ["handle"],
+      "label": "Subject",
+      "pack": "core"
+    },
+    "welcome__preheader": {
+      "shape": "text",
+      "target": "html-email",
+      "limits": { "max": 90, "severity": "advisory" },
+      "pack": "core"
+    },
+    "welcome__body": {
+      "shape": "text",
+      "target": "html-email",
+      "limits": { "max": 400, "severity": "advisory" },
+      "vars": ["handle"],
+      "pack": "core"
+    },
+    "newsletter__subject": {
+      "shape": "text",
+      "target": "html-email",
+      "limits": { "max": 60, "severity": "advisory" },
+      "pack": "core"
+    },
+    "newsletter__body": {
+      "shape": "text",
+      "target": "html-email",
+      "limits": { "max": 2000, "severity": "advisory" },
+      "vars": ["unsubscribe_url"],
+      "pack": "core"
+    },
+    "receipt__subject": {
+      "shape": "text",
+      "target": "html-email",
+      "limits": { "max": 60, "severity": "advisory" },
+      "pack": "saas"
+    },
+    "receipt__body": {
+      "shape": "text",
+      "target": "html-email",
+      "vars": ["amount"],
+      "pack": "saas"
+    }
+  },
+  "pages": {
+    "home": {
+      "route": "/",
+      "locales": ["default"],
+      "seo": { "title": "seo_home_title", "description": "seo_home_desc" },
+      "jsonLd": {
+        "type": "WebSite",
+        "bindings": { "name": "brand__name", "description": "hero_body" }
+      }
+    },
+    "pricing": {
+      "route": "/pricing",
+      "parent": "home",
+      "seo": { "title": "seo_pricing_title", "description": "seo_pricing_desc" },
+      "jsonLd": {
+        "type": "Offer",
+        "bindings": { "name": "pricing_tier_name", "price": "pricing_price" }
+      }
+    }
+  },
+  "templates": {
+    "welcome": {
+      "class": "marketing",
+      "trigger": "form",
+      "clock": "on join",
+      "sender": "news",
+      "slots": ["subject", "preheader", "body"],
+      "wrapperProvides": ["unsubscribe_url"]
+    },
+    "newsletter": {
+      "class": "marketing",
+      "trigger": "manual",
+      "sender": "news",
+      "slots": ["subject", "body"]
+    },
+    "receipt": {
+      "class": "transactional",
+      "trigger": "app-event",
+      "sender": "support",
+      "slots": ["subject", "body"]
+    }
+  }
+}

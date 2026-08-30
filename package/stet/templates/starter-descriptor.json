@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "keys": {
+    "brand__name": {
+      "shape": "text",
+      "target": "web",
+      "label": "Brand name",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "brand__primary": {
+      "shape": "color",
+      "target": "web",
+      "label": "Primary color",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "brand__ink": {
+      "shape": "color",
+      "target": "web",
+      "label": "Ink color",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "brand__radius": {
+      "shape": "number",
+      "target": "web",
+      "label": "Corner radius",
+      "agentPublish": false,
+      "pack": "core"
+    },
+    "hero_headline": {
+      "shape": "text",
+      "target": "web",
+      "limits": { "max": 60, "severity": "advisory" },
+      "label": "Headline",
+      "help": "The first line a visitor reads. Say what the product does.",
+      "pack": "core"
+    }
+  }
+}

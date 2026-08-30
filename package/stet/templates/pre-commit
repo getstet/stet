@@ -1,0 +1,8 @@
+#!/bin/sh
+# stet pre-commit gate — installed by `stet hook install`, removed by `stet eject`.
+# `check` blocks a commit on a broken descriptor/snapshot. `scan` warns about
+# unkeyed copy without blocking by default; with scan.severity: "fail" in
+# stet.config.json it exits non-zero and blocks the commit too — the opted-in
+# strict gate, which is correct when a project has chosen it.
+npx stet check || exit 1
+npx stet scan

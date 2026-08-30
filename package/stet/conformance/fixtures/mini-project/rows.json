@@ -1,0 +1,33 @@
+[
+  {
+    "key": "hero_headline",
+    "locale": "default",
+    "status": "published",
+    "is_active": false,
+    "value": "An older headline, superseded.",
+    "version": 1
+  },
+  {
+    "key": "hero_headline",
+    "locale": "default",
+    "status": "published",
+    "is_active": true,
+    "value": "Mirror your X posts to Telegram.",
+    "version": 3
+  },
+  {
+    "key": "hero_headline",
+    "locale": "default",
+    "status": "draft",
+    "value": "A headline still in progress.",
+    "version": 4
+  },
+  {
+    "key": "brand__primary",
+    "locale": "default",
+    "status": "published",
+    "is_active": true,
+    "value": "rebeccapurple",
+    "version": 2
+  }
+]

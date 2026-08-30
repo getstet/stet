@@ -1,0 +1,16 @@
+{
+  "values": {
+    "de": {
+      "hero_headline": "Verpasse nie wieder einen Post."
+    },
+    "default": {
+      "hero_body": "Follow {{handle}} without leaving Telegram.",
+      "hero_headline": "Never miss a post again."
+    }
+  },
+  "meta": {
+    "default": {
+      "hero_headline": { "version": 3 }
+    }
+  }
+}

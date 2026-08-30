@@ -1,0 +1,33 @@
+{
+  "de": {
+    "hero_headline": "Verpasse nie wieder einen Post."
+  },
+  "default": {
+    "blog_intro": "Notes from the build, in the open.",
+    "brand__footer_address": "Mirra Ltd, 12 Sandwith Street, Dublin 2, D02 XY45, Ireland",
+    "brand__logo": "/brand/logo.svg",
+    "brand__name": "Mirra",
+    "brand__primary": "#1d4ed8",
+    "brand__radius": 8,
+    "contact_form_labels": {
+      "heading": "Get in touch",
+      "submit": "Send it"
+    },
+    "farewell_notice": "This channel is closing. Thanks for reading.",
+    "footer_links": ["Privacy", "Terms", "Status"],
+    "hero_body": "Follow {{handle}} without leaving Telegram.",
+    "hero_headline": "Never miss a post again.",
+    "newsletter__body": "Here is what shipped this month. Unsubscribe any time: {{unsubscribe_url}}",
+    "newsletter__subject": "What shipped in August",
+    "pricing_price": "$16",
+    "pricing_tier_name": "Premium",
+    "receipt__body": "You paid {{amount}}. Nothing else is due today.",
+    "receipt__subject": "Your receipt",
+    "seo_home_desc": "Mirror an X account into a Telegram channel — every post, in order, minutes after it goes live.",
+    "seo_pricing_desc": "Two plans, one job: keep a Telegram channel in step with the accounts you follow. Change tier or cancel whenever you like.",
+    "theme_mode": "light",
+    "welcome__body": "Thanks for joining, {{handle}}. Your channel is on the way.",
+    "welcome__preheader": "Your channel is being created.",
+    "welcome__subject": "Welcome, {{handle}}"
+  }
+}

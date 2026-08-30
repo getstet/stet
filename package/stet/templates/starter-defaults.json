@@ -1,0 +1,9 @@
+{
+  "default": {
+    "brand__ink": "#111827",
+    "brand__name": "Your Brand",
+    "brand__primary": "#3B82F6",
+    "brand__radius": 8,
+    "hero_headline": "Your headline goes here"
+  }
+}
