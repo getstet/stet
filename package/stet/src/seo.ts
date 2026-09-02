@@ -1,5 +1,5 @@
 /**
- * The phase-1 SEO rules: eight checks over the descriptor and the committed
+ * The phase-1 SEO rules: nine checks over the descriptor and the committed
  * snapshot, one severity table, zero I/O. Every value the rules read is
  * resolved through the package's one resolution path with no store rows, so the
  * check sees the same text production serves — and so it runs on a fork PR with
@@ -18,6 +18,7 @@ import { webTarget } from './targets/web.js';
 import type { Descriptor, PageDef } from './types.js';
 
 export type SeoRule =
+  | 'missing-title'
   | 'missing-description'
   | 'duplicate-title'
   | 'over-length'
@@ -39,13 +40,14 @@ export interface SeoFinding {
 }
 
 /**
- * The one severity table (§13.1c): six errors, two warns. A project may flip a
+ * The one severity table (§13.1c): seven errors, two warns. A project may flip a
  * rule either way through `stet.config.json`'s `seoCheck` block; there is no
  * third state, because a warn already never gates and an `off` would only add
  * surface. It doubles as the runtime rule list — `id in SEO_SEVERITY` is what
  * the config validator tests membership with, a type having no `.includes`.
  */
 export const SEO_SEVERITY: Record<SeoRule, 'error' | 'warning'> = {
+  'missing-title': 'error',
   'missing-description': 'error',
   'duplicate-title': 'error',
   'over-length': 'error',
@@ -107,11 +109,11 @@ const MACHINE_IMPERATIVES: readonly string[] = [
 const NOINDEX = /\bnoindex\b/i;
 
 /**
- * No regex-escape helper exists anywhere in the package, so this is a local
- * one. Purely defensive against today's list — no pinned phrase carries a regex
- * special — and load-bearing the moment pack-configurable lists arrive.
+ * A literal as a regex-safe pattern. Purely defensive against today's word
+ * lists — no pinned phrase carries a regex special — and load-bearing wherever
+ * a HOST-chosen name becomes a pattern, which is what its two CLI consumers do.
  */
-function escapeRegExp(literal: string): string {
+export function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
@@ -215,8 +217,8 @@ interface TitleMember {
 
 /**
  * The page-scoped rules, in one walk over pages × their declared locales:
- * missing-description, over-length, missing-alt and canonical-noindex, plus the
- * title collection duplicate-title groups from. `visible-content` rides the
+ * missing-title, missing-description, over-length, missing-alt and
+ * canonical-noindex, plus the title collection duplicate-title groups from. `visible-content` rides the
  * same walk but sits outside the locale loop — a JSON-LD binding is a
  * descriptor fact, and reporting it once per locale would multiply one bug.
  */
@@ -227,21 +229,22 @@ function pageRules(d: Descriptor, s: Snapshot, emit: Emit): void {
     for (const locale of def.locales ?? ['default']) {
       const titleKey = def.seo?.title;
       const title = titleKey === undefined ? undefined : resolvedString(d, s, titleKey, locale);
+      missingField(emit, 'missing-title', 'title', page, locale, titleKey, title);
       const descriptionKey = def.seo?.description;
       const description =
         descriptionKey === undefined ? undefined : resolvedString(d, s, descriptionKey, locale);
 
       if (titleKey !== undefined && title !== undefined) {
-        // A page with no resolvable title joins no group: a missing title is
-        // not a row of the severity table, and grouping the absences together
-        // would invent one.
+        // A page with no resolvable title joins no group: the missing-title
+        // rule reports the absence, and grouping absences together would
+        // report it twice.
         const id = JSON.stringify([locale, title]);
         const group = titles.get(id) ?? { locale, title, members: [] };
         group.members.push({ page, key: titleKey });
         titles.set(id, group);
       }
 
-      missingDescription(emit, page, locale, descriptionKey, description);
+      missingField(emit, 'missing-description', 'description', page, locale, descriptionKey, description);
       overLength(emit, page, locale, titleKey, title, 'title', TITLE_MAX_CHARS);
       overLength(emit, page, locale, descriptionKey, description, 'description', DESCRIPTION_MAX_CHARS);
       missingAlt(d, s, emit, page, def, locale);
@@ -255,29 +258,32 @@ function pageRules(d: Descriptor, s: Snapshot, emit: Emit): void {
 }
 
 /**
- * Every declared page needs a description, and it must resolve to something.
- * Two causes, two messages: an unreferenced field is a descriptor edit, an
- * unresolvable reference is a publish.
+ * Every declared page needs a title and a description, and each must resolve to
+ * something. Two causes, two messages: an unreferenced field is a descriptor
+ * edit, an unresolvable reference is a publish. One emitter, the field word the
+ * only difference between the twin rules.
  */
-function missingDescription(
+function missingField(
   emit: Emit,
+  rule: 'missing-title' | 'missing-description',
+  field: 'title' | 'description',
   page: string,
   locale: string,
   key: string | undefined,
-  description: string | undefined,
+  value: string | undefined,
 ): void {
   if (key === undefined) {
     emit(
-      'missing-description',
-      `page "${page}" declares no SEO description — name the content key that carries it in the page's seo record`,
+      rule,
+      `page "${page}" declares no SEO ${field} — name the content key that carries it in the page's seo record`,
       { page, locale },
     );
     return;
   }
-  if (description === undefined) {
+  if (value === undefined) {
     emit(
-      'missing-description',
-      `page "${page}"${at(locale)}: its description key "${key}" resolves to nothing — publish a value or point the reference elsewhere`,
+      rule,
+      `page "${page}"${at(locale)}: its ${field} key "${key}" resolves to nothing — publish a value or point the reference elsewhere`,
       { page, key, locale },
     );
   }

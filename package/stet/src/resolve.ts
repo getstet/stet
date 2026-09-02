@@ -113,7 +113,11 @@ function resolveWith(
   }
 
   for (const loc of chain) {
-    const value = s[loc]?.[q.key];
+    // An OWN-property read. A bare index answers `constructor` from
+    // `Object.prototype` on a key that has no row at all, and `remove`'s bake
+    // takes this resolution as its write oracle.
+    const block = s[loc];
+    const value = block !== undefined && Object.hasOwn(block, q.key) ? block[q.key] : undefined;
     if (value !== undefined) return { value, source: 'snapshot' };
   }
 

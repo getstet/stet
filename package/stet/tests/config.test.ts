@@ -92,13 +92,30 @@ describe('stet.config.json', () => {
     expect(config.mountRoute).toBeUndefined();
   });
 
-  it('constrains router to the two values and scan.severity to warn|fail', () => {
+  it('constrains router to the three values and scan.severity to warn|fail', () => {
     const badRouter = tempDir();
     writeFileSync(join(badRouter, CONFIG_FILE), JSON.stringify({ router: 'nuxt' }));
-    expect(() => loadConfig(badRouter)).toThrow(/router must be "app" or "pages"/);
+    expect(() => loadConfig(badRouter)).toThrow(/router must be "app", "pages" or "astro"/);
 
     const badScan = tempDir();
     writeFileSync(join(badScan, CONFIG_FILE), JSON.stringify({ scan: { severity: 'boom' } }));
     expect(() => loadConfig(badScan)).toThrow(/scan\.severity must be/);
+  });
+
+  it('fills the root-layout default on a Next host and leaves it absent on an Astro one', () => {
+    // `undefined` is the Astro truth: there is no root React layout, and
+    // `app/layout.tsx` would name a file that is not there.
+    const astro = tempDir();
+    writeFileSync(join(astro, CONFIG_FILE), JSON.stringify({ router: 'astro' }));
+    expect(loadConfig(astro).rootLayout).toBeUndefined();
+
+    // A declared value on an Astro host is still the host's word.
+    const declared = tempDir();
+    writeFileSync(join(declared, CONFIG_FILE), JSON.stringify({ router: 'astro', rootLayout: 'x.astro' }));
+    expect(loadConfig(declared).rootLayout).toBe('x.astro');
+
+    const next = tempDir();
+    writeFileSync(join(next, CONFIG_FILE), JSON.stringify({ router: 'app' }));
+    expect(loadConfig(next).rootLayout).toBe('app/layout.tsx');
   });
 });

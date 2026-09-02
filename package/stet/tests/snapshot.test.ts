@@ -9,7 +9,7 @@ import {
   generatedBody,
 } from '../src/codegen.js';
 import { checkCurrency, loadSnapshot, snapshotSmells } from '../src/index.js';
-import type { Snapshot } from '../src/index.js';
+import type { Descriptor, Snapshot } from '../src/index.js';
 
 const descriptor = miniDescriptor();
 const snapshot = miniSnapshot();
@@ -90,6 +90,21 @@ describe('checkCurrency', () => {
     const report = checkCurrency(shrunk, snapshot);
     expect(report.orphans).toEqual(['blog_intro']);
     expect(JSON.stringify(snapshot)).toBe(before);
+  });
+
+  it('reads both maps as OWN properties, so a prototype name is checked like any other', () => {
+    // Assigned rather than written into the literal: `constructor` in an object
+    // literal takes `Object.prototype`'s type, not the index signature's.
+    const keys: Descriptor['keys'] = {};
+    keys['constructor'] = { shape: 'text', target: 'web' };
+    // Declared with no row: a bare `in` answers from the prototype and calls it
+    // present, so the missing value never surfaces.
+    expect(checkCurrency({ version: 1, keys }, { default: {} }).missing).toEqual(['constructor']);
+
+    // And the orphan side is the same test in the other direction.
+    const orphaned: Snapshot = { default: {} };
+    orphaned['default']!['constructor'] = 'x';
+    expect(checkCurrency({ version: 1, keys: {} }, orphaned).orphans).toEqual(['constructor']);
   });
 });
 

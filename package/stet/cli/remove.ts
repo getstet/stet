@@ -7,6 +7,12 @@
  * audit survive as exactly what `audit` already names — an orphan, reported
  * never deleted.
  *
+ * What the command owns: `keys`, the derivation declarations pointing at them
+ * (baked into plain values before the pointer goes) and the page references to
+ * them (dropped, an emptied `seo` record or `jsonLd` block with them). No other
+ * section is edited, and the validator's structural refusal remains the gate
+ * for any reference class a later schema adds.
+ *
  * Offline by contract: the loading path is `check`'s own, never `loadProject`,
  * which constructs an adapter. There is no store to select and no store to
  * damage, which is what makes a removal safe to run on a branch.
@@ -15,16 +21,16 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import {
   checkDescriptorStructure,
   DescriptorError,
   type DescriptorWarning,
 } from '../src/descriptor.js';
-import type { Snapshot } from '../src/snapshot.js';
+import { resolve } from '../src/resolve.js';
+import { checkCurrency, type Snapshot } from '../src/snapshot.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
 import { flag, parse, refuseEnv } from './args.js';
-import { asUpdate, planJson, planWrite, writePlanned, type WritePlan } from './artifacts.js';
+import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { checkValues, descriptorOf, snapshotOf } from './check.js';
 import { loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
@@ -69,7 +75,13 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
   const cleaned = structuredClone(descriptor);
   for (const key of keys) delete cleaned.keys[key];
   const cleanedSnapshot = withoutKeys(snapshot, keys);
-  const warnings = refuseDanglingReferences(cleaned, keys);
+  // The POST-REMOVAL forms, computed before anything prints as removable and
+  // before the gate reads them: the gate's job is the reference classes bake
+  // and drop do not cover, so it must see what they left.
+  const removed = new Set(keys);
+  const bakes = bakeDerivations(descriptor, snapshot, cleaned, cleanedSnapshot, removed);
+  const drops = dropPageReferences(cleaned, removed);
+  const warnings = refuseDanglingReferences(cleaned);
 
   // The plan, on the LINE channel: a plan is scriptable output, not findings.
   const surfaces = surfaceSources(io.cwd, config);
@@ -90,6 +102,40 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
         `  ${locale}: ${clip(typeof value === 'string' ? value : JSON.stringify(value), REMOVE_EXCERPT)}`,
       );
     }
+    // Every bake this removal will perform, one line per dependent with the
+    // value each locale receives — shown before `--write`, because a baked
+    // value is copy the command is about to commit on the operator's behalf.
+    const baked = new Map<string, BakeNote[]>();
+    for (const note of bakes.filter((n) => n.source === key)) {
+      baked.set(note.dep, [...(baked.get(note.dep) ?? []), note]);
+    }
+    for (const [dep, notes] of baked) {
+      report.line(
+        `  ${dep} derives from it — baked: ` +
+          `${notes.map((n) => `${n.locale}: ${clip(n.value, REMOVE_EXCERPT)}`).join(', ')}; derivation dropped`,
+      );
+    }
+    for (const drop of drops.filter((d) => d.key === key)) {
+      if (drop.kind === 'seo') {
+        // A dropped title or description arms the rule that reports the page,
+        // which is the red this removal creates. An emptied record is named the
+        // same way an emptied JSON-LD block is: the drop took the whole record,
+        // and a plan that said only "reference dropped" would read as a
+        // field-level edit.
+        report.line(
+          `  pages/${drop.page}/seo/${drop.field} — reference dropped` +
+            (drop.field === 'title' || drop.field === 'description'
+              ? `; seo check will report missing-${drop.field}`
+              : '') +
+            (drop.emptied ? '; the emptied record removed' : ''),
+        );
+        continue;
+      }
+      report.line(
+        `  pages/${drop.page}/jsonLd/bindings/${drop.field} — binding dropped` +
+          (drop.emptied ? '; the emptied block removed' : ''),
+      );
+    }
     for (const { file, source } of surfaces) {
       if (!mentionsToken(source, key)) continue;
       report.line(
@@ -108,6 +154,15 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
   for (const message of findingsOver(cleaned, cleanedSnapshot)) {
     if (held.has(message)) continue;
     report.line(`  after this removal, stet check will report: ${message}`);
+  }
+  // The currency gap the value pass cannot see: `checkValues` iterates SNAPSHOT
+  // keys, so a dependent whose source resolved to nothing — baking no row —
+  // leaves a declared key with no value that only `checkCurrency` reports. The
+  // string is check.ts's own, so the caution never restates it.
+  const beforeMissing = new Set(checkCurrency(descriptor, snapshot).missing);
+  for (const key of checkCurrency(cleaned, cleanedSnapshot).missing) {
+    if (beforeMissing.has(key)) continue;
+    report.line(`  after this removal, stet check will report: ${key}: declared in the descriptor with no value in the snapshot`);
   }
 
   // A config-level test over the default block and every declared environment:
@@ -145,40 +200,126 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
  * every file the run had already written, so a removal either lands whole or
  * leaves the project exactly as it found it.
  *
- * Every plan is `asUpdate`: each file's new text was computed FROM its current
- * contents, so `differs` is the ordinary case here rather than a host edit, and
- * refusing it would refuse every removal. Each is labeled with the
- * REPO-RELATIVE path, because a refusal that names a temp directory teaches
- * nothing. The bundle is not among them: the next `pull` regenerates it from
- * the cleaned snapshot base, and every descriptor-driven read path is blind to
- * the stale entry meanwhile.
+ * The bundle is not among them: the next `pull` regenerates it from the cleaned
+ * snapshot base, and every descriptor-driven read path is blind to the stale
+ * entry meanwhile.
  */
 function apply(io: CliIo, config: StetConfig, cleaned: Descriptor, snapshot: Snapshot): void {
   try {
-    const at = (rel: string): string => join(io.cwd, rel);
-    const { keysTs, dts } = generateRegistry(cleaned);
-    const plans: WritePlan[] = [
-      asUpdate(planJson(at(config.descriptorPath), cleaned, config.descriptorPath)),
-      asUpdate(planJson(at(config.snapshotPath), snapshot, config.snapshotPath)),
-      asUpdate(planWrite(at(config.codegen.registry), keysTs, config.codegen.registry)),
-      // MANDATORY: a stale ambient union keeps `copy('removed_key')` compiling
-      // in the host, and it is the residue a removal that outran its codegen
-      // leaves behind.
-      asUpdate(planWrite(at(config.codegen.dts), dts, config.codegen.dts)),
-      asUpdate(planWrite(at(config.codegen.defaults), generateDefaultsModule(snapshot), config.codegen.defaults)),
-    ];
-    writePlanned(plans);
+    writePlanned(planRepoForms(io.cwd, config, cleaned, snapshot));
   } catch (error) {
-    // A refusal already says what it refused and that nothing was written; an
-    // I/O failure says neither, and the batch's whole promise is that a failure
-    // left nothing behind.
-    if (error instanceof CliError || error instanceof UsageError) throw error;
-    const path = (error as { path?: string }).path;
-    throw new CliError(
-      `stet remove --write: the write batch failed${path === undefined ? '' : ` at ${path}`} — ` +
-        `${(error as Error).message}. Every file this run had already written was put back.`,
-    );
+    rethrowBatchFailure('stet remove --write', error);
   }
+}
+
+/** One baked derivation: the source that left, the dependent that kept its value, and the value per locale. */
+interface BakeNote {
+  source: string;
+  dep: string;
+  locale: string;
+  value: string;
+}
+
+/** One dropped page reference: where it lived, and whether its containing block went with it. */
+interface DropNote {
+  key: string;
+  page: string;
+  field: string;
+  kind: 'seo' | 'jsonLd';
+  emptied: boolean;
+}
+
+/**
+ * A surviving key that derives from a removed one, BAKED: it keeps the value it
+ * resolved to and becomes a plain key.
+ *
+ * The oracle is the resolver itself, over the ORIGINAL forms — `resolve(d, s,
+ * null, { key: dep, locale })` returns the dependent's finished value with
+ * `source === 'derived'`, so a derived-of-derived source bakes fully resolved
+ * and no template is re-applied outside the one place that applies templates.
+ * Extracting a `deriveValue` helper would be a second derivation.
+ *
+ * Every locale where the SOURCE carries its own row, plus `default` always:
+ * that is the set the source could differ across, and derived keys carry no
+ * snapshot rows today, so the bake creates rows rather than overwriting any. A
+ * source that resolves to nothing bakes nothing — the resulting currency gap is
+ * `checkCurrency.missing`'s to report, and the caution prints it.
+ *
+ * `derivesFrom` and `tmpl` leave TOGETHER: the schema's `dependentRequired`
+ * makes them both-or-neither. Every other field — `limits`, `pages`, the label
+ * — stays, because the key is the same key.
+ */
+function bakeDerivations(
+  descriptor: Descriptor,
+  snapshot: Snapshot,
+  cleaned: Descriptor,
+  cleanedSnapshot: Snapshot,
+  removed: Set<string>,
+): BakeNote[] {
+  const notes: BakeNote[] = [];
+  for (const [dep, def] of Object.entries(cleaned.keys)) {
+    // The `tmpl` test is the type narrowing as much as the guard: `KeyDef.tmpl`
+    // is independently optional, so a `derivesFrom` without one is not a
+    // derivation this can bake.
+    if (def.derivesFrom === undefined || def.tmpl === undefined || !removed.has(def.derivesFrom)) continue;
+    for (const locale of Object.keys(snapshot).sort()) {
+      if (locale !== 'default' && !Object.hasOwn(snapshot[locale] ?? {}, def.derivesFrom)) continue;
+      const r = resolve(descriptor, snapshot, null, { key: dep, locale });
+      if (r.source !== 'derived') continue;
+      (cleanedSnapshot[locale] ??= {})[dep] = r.value;
+      notes.push({ source: def.derivesFrom, dep, locale, value: String(r.value) });
+    }
+    delete def.derivesFrom;
+    delete def.tmpl;
+  }
+  return notes;
+}
+
+/**
+ * A page `seo` field or JSON-LD binding naming a removed key, DROPPED — and an
+ * `seo` record or `jsonLd` block the drop empties removed with it.
+ *
+ * `bindings` has no `minProperties`, so an empty block would validate and emit
+ * nothing: a JSON-LD declaration that produces no JSON-LD is worse than none.
+ * A page `seo` record emptied the same way goes the same way.
+ *
+ * Keyed by string membership, like the bake — which is what makes a declared
+ * key named `constructor` handled by construction rather than by a backstop.
+ */
+function dropPageReferences(cleaned: Descriptor, removed: Set<string>): DropNote[] {
+  const notes: DropNote[] = [];
+  for (const [page, def] of Object.entries(cleaned.pages ?? {})) {
+    if (def.seo !== undefined) {
+      // `PageSeo` has no index signature, so the delete goes through a local
+      // indexable copy and the narrowed record is reassigned.
+      const seo: Record<string, string | undefined> = { ...def.seo };
+      let dropped = false;
+      for (const [field, key] of Object.entries(seo)) {
+        if (key === undefined || !removed.has(key)) continue;
+        delete seo[field];
+        dropped = true;
+        notes.push({ key, page, field, kind: 'seo', emptied: Object.keys(seo).length === 0 });
+      }
+      // Only where THIS run dropped something: a record the removal never
+      // touched stays exactly as the developer wrote it, empty or not.
+      if (dropped) {
+        def.seo = seo;
+        if (Object.keys(seo).length === 0) delete def.seo;
+      }
+    }
+    const bindings = def.jsonLd?.bindings;
+    if (bindings !== undefined) {
+      let dropped = false;
+      for (const [field, key] of Object.entries(bindings)) {
+        if (!removed.has(key)) continue;
+        delete bindings[field];
+        dropped = true;
+        notes.push({ key, page, field, kind: 'jsonLd', emptied: Object.keys(bindings).length === 0 });
+      }
+      if (dropped && Object.keys(bindings).length === 0) delete def.jsonLd;
+    }
+  }
+  return notes;
 }
 
 /** The snapshot with the named keys gone from EVERY locale block, enabled or not. */
@@ -252,18 +393,21 @@ function slotRemedy(cleaned: Descriptor, warning: DescriptorWarning): string {
  * The dangling-reference gate: the descriptor's own structural validation, run
  * over the post-removal copy.
  *
- * A thrown `DescriptorError` — another key's `derivesFrom`, a page's SEO field,
- * a JSON-LD binding — refuses, because the descriptor this removal would leave
- * behind does not load at all and nothing downstream runs on a rejected one.
- * The remedy is a hand edit of the referencing block: this command owns `keys`
- * and no other section. The reference judgment is the validator's whole,
- * never re-enumerated here — the refusal names the site IT named.
+ * A thrown `DescriptorError` refuses, because the descriptor this removal would
+ * leave behind does not load at all and nothing downstream runs on a rejected
+ * one. Bake and drop consume every reference class today's schema carries, so
+ * this is the gate for the classes a LATER schema adds: the reference judgment
+ * is the validator's whole, never re-enumerated here, and the refusal names the
+ * site IT named. The remedy is a hand edit of the referencing block.
+ *
+ * Exported for the gate test, which builds a cleaned descriptor carrying a
+ * reference bake and drop cannot reach and asserts the throw.
  *
  * Warnings are handed back rather than raised: a template slot losing its key
  * degrades that slot and does not break the project, which is the same
  * judgment `check` inherits.
  */
-function refuseDanglingReferences(cleaned: Descriptor, removed: string[]): DescriptorWarning[] {
+export function refuseDanglingReferences(cleaned: Descriptor): DescriptorWarning[] {
   let warnings: DescriptorWarning[];
   try {
     warnings = checkDescriptorStructure(cleaned);
@@ -274,50 +418,7 @@ function refuseDanglingReferences(cleaned: Descriptor, removed: string[]): Descr
     if (error instanceof DescriptorError) throw cannotRemove(error.path, error.message);
     throw error;
   }
-  refuseShadowedReferences(cleaned, removed);
   return warnings;
-}
-
-/**
- * The one reference class the validator structurally cannot judge.
- *
- * Its membership tests are `in`, and `'constructor' in copy.keys` is still true
- * after the own property is deleted — so a DECLARED key named `constructor`
- * would take its references down with it invisibly, and the broken descriptor
- * would even reload clean. For exactly the removed keys still visible through
- * the prototype, the surviving references are compared by string; every
- * ordinary name stays the validator's to judge.
- */
-function refuseShadowedReferences(cleaned: Descriptor, removed: string[]): void {
-  if (!removed.some((key) => key in cleaned.keys)) return;
-  const gone = new Set(removed);
-
-  for (const [key, def] of Object.entries(cleaned.keys)) {
-    if (def.derivesFrom !== undefined && gone.has(def.derivesFrom)) {
-      throw cannotRemove(
-        `keys/${key}/derivesFrom`,
-        `key "${key}" derives from "${def.derivesFrom}", which is not a key in this descriptor`,
-      );
-    }
-  }
-  for (const [page, def] of Object.entries(cleaned.pages ?? {})) {
-    for (const [field, key] of Object.entries(def.seo ?? {})) {
-      if (key !== undefined && gone.has(key)) {
-        throw cannotRemove(
-          `pages/${page}/seo/${field}`,
-          `page "${page}" references SEO field "${field}" through "${key}", which is not a key in this descriptor`,
-        );
-      }
-    }
-    for (const [field, key] of Object.entries(def.jsonLd?.bindings ?? {})) {
-      if (gone.has(key)) {
-        throw cannotRemove(
-          `pages/${page}/jsonLd/bindings/${field}`,
-          `page "${page}" binds JSON-LD field "${field}" to "${key}", which is not a key in this descriptor`,
-        );
-      }
-    }
-  }
 }
 
 function cannotRemove(path: string, message: string): CliError {

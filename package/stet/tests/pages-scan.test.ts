@@ -4,7 +4,8 @@
  * Every case drives `runCli`, so the two-token dispatch, the argument split and
  * the exit codes are part of what is proven. The hosts are temp directories
  * built file by file: the detector reads directory entries and file names, so a
- * fixture IS its file list, and the file bodies are never opened.
+ * fixture IS its file list, and bodies are read only for a markdown page's
+ * frontmatter under seeding.
  *
  * The site mirror is the load-bearing one — the 23-file shape of the real Astro
  * host, whose 19 proposals and 4 named skips are what "the taxonomy is
@@ -78,7 +79,7 @@ function project(
   };
 }
 
-/** The files a fixture IS. Bodies are never read, so one line of markup is a whole page. */
+/** The files a fixture IS. `tree()` writes one line of markup; bodies are read only for a markdown page's frontmatter under seeding. */
 function tree(host: Host, root: string, files: string[]): void {
   for (const file of files) host.put(`${root}/${file}`, '<h1>x</h1>\n');
 }
@@ -86,8 +87,21 @@ function tree(host: Host, root: string, files: string[]): void {
 const PAGE = 'export default function Page() { return null; }\n';
 
 interface Payload {
-  pages: Array<{ name: string; route: string; file: string; parent?: string }>;
+  pages: Array<{
+    name: string;
+    route: string;
+    file: string;
+    parent?: string;
+    seed?: { title?: string; description?: string };
+  }>;
   skips: Array<{ file: string; reason: string; detail: string; remedy: string; name?: string }>;
+}
+
+/** The descriptor's declared page records, as the apply left them. */
+function readPages(host: Host): Record<string, { route: string; parent?: string }> {
+  return (JSON.parse(host.file('content/descriptor.json')) as {
+    pages?: Record<string, { route: string; parent?: string }>;
+  }).pages ?? {};
 }
 
 /** The proposal set as the machine sees it — the payload `--json` carries. */
@@ -224,12 +238,13 @@ describe('pages scan — the route walk', () => {
     const host = project();
     tree(host, 'src/pages', ['legacy.html', 'notes.md', 'data.json', 'widget.tsx', 'café.astro']);
     const { pages, skips } = await proposed(host);
-    // `.html` is a real Astro page type.
-    expect(pages.map((p) => `${p.name} ${p.route}`)).toEqual(['legacy /legacy']);
+    // `.html` and `.md` are real Astro page types; a markdown page with no
+    // frontmatter block proposes with no seed, like any other route.
+    expect(pages.map((p) => `${p.name} ${p.route}`)).toEqual(['legacy /legacy', 'notes /notes']);
+    expect(pages.find((p) => p.name === 'notes')?.seed).toBeUndefined();
     expect(skips.map((s) => `${s.file} ${s.reason}`).sort()).toEqual([
       'src/pages/café.astro unnameable',
       'src/pages/data.json unsupported-page-type',
-      'src/pages/notes.md markdown-page',
       'src/pages/widget.tsx unsupported-page-type',
     ]);
     // Naming never happened, so the skip carries no name to select by — a
@@ -551,8 +566,8 @@ describe('pages scan --apply', () => {
 
     expect(await host.run('pages', 'scan', '--apply')).toBe(0);
     expect(host.stdout()).toContain(
-      'seo check will now report 19 more missing descriptions — the scaffolded values are empty; ' +
-        'write them and re-run stet seo check',
+      'seo check will now report 19 more missing titles and 19 more missing descriptions — ' +
+        'write the empty values and re-run stet seo check',
     );
 
     expect(await host.run('seo', 'check', '--json')).toBe(1);
@@ -560,7 +575,10 @@ describe('pages scan --apply', () => {
     // Counted through the rule ids: the human channel prints no rule id at all,
     // so a stderr grep for `missing-description` counts zero.
     expect(payload.seo.filter((f) => f.rule === 'missing-description')).toHaveLength(19);
-    expect(payload.seo.filter((f) => f.rule !== 'missing-description')).toEqual([]);
+    expect(payload.seo.filter((f) => f.rule === 'missing-title')).toHaveLength(19);
+    expect(
+      payload.seo.filter((f) => f.rule !== 'missing-description' && f.rule !== 'missing-title'),
+    ).toEqual([]);
 
     expect(await host.run('seo', 'check')).toBe(1);
     expect(host.stdout()).toContain('seo: 19 pages checked');
@@ -586,6 +604,70 @@ describe('pages scan --apply', () => {
     ]);
     expect(await host.run('pages', 'scan')).toBe(0);
     expect(host.stdout()).toContain('pages scan: nothing to propose');
+  });
+
+  it('backfills the parent of an already-declared page whose ancestor lands later', async () => {
+    const host = applyHost();
+    // The child first: its ancestor is not declared, so it records no parent.
+    expect(await host.run('pages', 'scan', '--apply', 'docs_adopt')).toBe(0);
+    expect(readPages(host)['docs_adopt']?.parent).toBeUndefined();
+
+    // The ancestor lands, and the fill happens in the same batch, on its own
+    // line — without it a page declared before its ancestor stays parentless
+    // forever.
+    const since = host.out.length;
+    expect(await host.run('pages', 'scan', '--apply', 'docs')).toBe(0);
+    expect(readPages(host)['docs_adopt']?.parent).toBe('docs');
+    expect(host.out.slice(since).join('\n')).toContain('backfilled parent on 1 page(s)');
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('never rewrites a parent that is already set', async () => {
+    const host = applyHost();
+    // `home` and the child together: the child's nearest DECLARED ancestor is
+    // `home`, so the backfill fills that.
+    expect(await host.run('pages', 'scan', '--apply', 'home', 'docs_adopt')).toBe(0);
+    expect(readPages(host)['docs_adopt']?.parent).toBe('home');
+
+    // `docs` is nearer, and the fill still leaves the recorded parent alone: a
+    // present `parent` is the developer's word.
+    expect(await host.run('pages', 'scan', '--apply', 'docs')).toBe(0);
+    expect(readPages(host)['docs_adopt']?.parent).toBe('home');
+  });
+
+  it('writes for a fillable parent alone, with nothing left to propose', async () => {
+    const host = applyHost();
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    // The parent taken back out by hand — the shape a host that declared its
+    // pages before this fill existed carries.
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as {
+      pages: Record<string, { parent?: string }>;
+    };
+    delete descriptor.pages['docs_adopt']!.parent;
+    host.put('content/descriptor.json', `${JSON.stringify(descriptor, null, 2)}\n`);
+
+    const since = host.out.length;
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    const printed = host.out.slice(since).join('\n');
+    expect(readPages(host)['docs_adopt']?.parent).toBe('docs');
+    expect(printed).toContain('wrote content/descriptor.json');
+    expect(printed).toContain('backfilled parent on 1 page(s)');
+    // Nothing was declared, so neither the count line nor the red the close
+    // line announces belongs to this run.
+    expect(printed).not.toContain('declared ');
+    expect(printed).not.toContain('seo check will');
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('prints both lines on a run that lands and fills', async () => {
+    const host = applyHost();
+    expect(await host.run('pages', 'scan', '--apply', 'docs_adopt')).toBe(0);
+    const since = host.out.length;
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    const printed = host.out.slice(since).join('\n');
+    expect(printed).toContain('declared 18 page(s), scaffolded 36 key(s); next: stet seo check');
+    expect(printed).toContain('backfilled parent on 1 page(s)');
+    expect(readPages(host)['docs_adopt']?.parent).toBe('docs');
   });
 
   it('declares one named page and leaves every other entry alone', async () => {
@@ -631,7 +713,7 @@ describe('pages scan --apply', () => {
 
     expect(await host.run('pages', 'scan', '--apply')).toBe(0);
     expect(host.stdout()).toContain('declared 1 page(s), scaffolded 2 key(s); next: stet seo check');
-    expect(host.stdout()).toContain('seo check will now report 1 more missing descriptions');
+    expect(host.stdout()).toContain('seo check will now report 1 more missing titles and 1 more missing descriptions');
 
     expect(await host.run('seo', 'check', '--json')).toBe(1);
     const payload = host.json<{ seo: Array<{ rule: string; page?: string }> }>();
@@ -652,5 +734,125 @@ describe('pages scan --apply', () => {
     expect(await host.run('pages', 'scan', '--apply')).toBe(0);
     expect(await host.run('pages', 'scan', '--apply', 'home')).toBe(2);
     expect(host.stderr()).toContain('was skipped (already-declared)');
+  });
+});
+
+/**
+ * The one content read this command makes. The Astro arm is confirmed by an
+ * `.astro` file (pages.ts's own decisive probe), so every markdown fixture here
+ * sits beside `src/pages/index.astro` — a markdown-only tree detects no
+ * convention at all, which is a fact about the detector rather than about
+ * seeding.
+ */
+describe('pages scan — a markdown page seeds from its frontmatter', () => {
+  const GUIDE = '---\ntitle: "The guide"\ndescription: Read this first\n---\n# Guide\n';
+
+  it('proposes the route, shows the seed in the plan, and writes it at --apply', async () => {
+    const host = project();
+    host.put('src/pages/index.astro', '<h1>x</h1>\n');
+    host.put('src/pages/guide.md', GUIDE);
+
+    const { pages } = await proposed(host);
+    // `--json` carries the seed as read, so a CI consumer sees the same two
+    // values the plan printed.
+    expect(pages.find((p) => p.name === 'guide')).toMatchObject({
+      name: 'guide',
+      route: '/guide',
+      file: 'src/pages/guide.md',
+      seed: { title: 'The guide', description: 'Read this first' },
+    });
+
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('  seo: seo_guide_title, seo_guide_desc — seeded from frontmatter');
+    expect(host.stdout()).toContain('  title: "The guide"');
+    expect(host.stdout()).toContain('  description: "Read this first"');
+
+    expect(await host.run('pages', 'scan', '--apply', 'guide')).toBe(0);
+    const snapshot = loadSnapshot(JSON.parse(host.file('content/defaults.json')));
+    expect(snapshot['default']?.['seo_guide_title']).toBe('The guide');
+    expect(snapshot['default']?.['seo_guide_desc']).toBe('Read this first');
+  });
+
+  it('proposes a markdown page with no frontmatter exactly as any other route', async () => {
+    const host = project();
+    host.put('src/pages/index.astro', '<h1>x</h1>\n');
+    host.put('src/pages/notes.mdx', '# Notes\n\nNo frontmatter here.\n');
+
+    const { pages } = await proposed(host);
+    expect(pages.find((p) => p.name === 'notes')?.seed).toBeUndefined();
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('  seo: seo_notes_title, seo_notes_desc — scaffolded empty');
+
+    expect(await host.run('pages', 'scan', '--apply', 'notes')).toBe(0);
+    const snapshot = loadSnapshot(JSON.parse(host.file('content/defaults.json')));
+    expect(snapshot['default']?.['seo_notes_title']).toBe('');
+    expect(snapshot['default']?.['seo_notes_desc']).toBe('');
+  });
+
+  it('skips a dynamic markdown route like any other route template', async () => {
+    const host = project();
+    host.put('src/pages/index.astro', '<h1>x</h1>\n');
+    host.put('src/pages/[slug].md', GUIDE);
+
+    const { pages, skips } = await proposed(host);
+    expect(pages.map((p) => p.name)).toEqual(['home']);
+    expect(skips.map((s) => `${s.file} ${s.reason}`)).toEqual(['src/pages/[slug].md dynamic-route']);
+  });
+
+  it('reads two one-line scalars and nothing else, a BOM before the block included', async () => {
+    const host = project();
+    host.put('src/pages/index.astro', '<h1>x</h1>\n');
+    // A folded scalar is not a one-line scalar, and a quoted value whose
+    // closing quote is not the last character carries a comment this reader
+    // will not parse — each yields no seed for its field while the block's
+    // other field still reads.
+    host.put('src/pages/folded.md', '---\ntitle: >\n  folded\ndescription: Plain\n---\n');
+    host.put('src/pages/commented.md', '---\ntitle: "X" # note\ndescription: Plain # trailing\n---\n');
+    host.put('src/pages/bom.md', '\ufeff---\ntitle: Byte order mark\n---\n');
+
+    const { pages } = await proposed(host);
+    const seedOf = (name: string) => pages.find((p) => p.name === name)?.seed;
+    expect(seedOf('folded')).toEqual({ description: 'Plain' });
+    // The unquoted value IS cut at its first ` #`, which is why the quoted one
+    // has to refuse rather than cut: the quote is the author saying where the
+    // value ends.
+    expect(seedOf('commented')).toEqual({ description: 'Plain' });
+    expect(seedOf('bom')).toEqual({ title: 'Byte order mark' });
+  });
+
+  it('names the difference when a declared page and its frontmatter have drifted', async () => {
+    const host = project(
+      { seo_guide_title: { shape: 'text', target: 'web' } },
+      { seo_guide_title: 'Old' },
+      { guide: { route: '/guide', seo: { title: 'seo_guide_title' } } },
+    );
+    host.put('src/pages/index.astro', '<h1>x</h1>\n');
+    host.put('src/pages/guide.md', '---\ntitle: New\n---\n');
+
+    const { skips } = await proposed(host);
+    const skip = skips.find((s) => s.file === 'src/pages/guide.md');
+    expect(skip?.reason).toBe('already-declared');
+    expect(skip?.detail).toContain("frontmatter title differs from seo_guide_title's default");
+    // Nothing is written: the divergence is named, never resolved.
+    expect(JSON.parse(host.file('content/defaults.json')).default.seo_guide_title).toBe('Old');
+  });
+
+  it('closes on what it actually wrote: nothing new where every value was seeded', async () => {
+    const host = project();
+    host.put('src/pages/index.astro', '<h1>x</h1>\n');
+    host.put('src/pages/guide.md', GUIDE);
+    host.put('src/pages/notes.mdx', '# Notes\n');
+
+    expect(await host.run('pages', 'scan', '--apply', 'guide')).toBe(0);
+    expect(host.stdout()).toContain(
+      'seo check will report nothing new — the scaffolded values were seeded from frontmatter',
+    );
+
+    const sinceGuide = host.out.length;
+    expect(await host.run('pages', 'scan', '--apply', 'notes')).toBe(0);
+    expect(host.out.slice(sinceGuide).join('\n')).toContain(
+      'seo check will now report 1 more missing titles and 1 more missing descriptions — ' +
+        'write the empty values and re-run stet seo check',
+    );
   });
 });

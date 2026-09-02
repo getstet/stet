@@ -22,7 +22,7 @@ function only(findings: SeoFinding[], rule: SeoRule): SeoFinding[] {
 }
 
 describe('the severity table', () => {
-  it('is six errors and two warns, and it is the runtime rule list', () => {
+  it('is seven errors and two warns, and it is the runtime rule list', () => {
     const errors = Object.keys(SEO_SEVERITY).filter((r) => SEO_SEVERITY[r as SeoRule] === 'error');
     const warns = Object.keys(SEO_SEVERITY).filter((r) => SEO_SEVERITY[r as SeoRule] === 'warning');
     expect(errors.sort()).toEqual([
@@ -30,6 +30,7 @@ describe('the severity table', () => {
       'duplicate-title',
       'missing-alt',
       'missing-description',
+      'missing-title',
       'over-length',
       'visible-content',
     ]);

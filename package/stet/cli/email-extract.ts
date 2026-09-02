@@ -30,13 +30,12 @@ import { basename, join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { opensMarkupTag } from '../src/targets/html-email.js';
 import { EMAIL_TARGET, type Descriptor, type KeyDef, type TemplateDef } from '../src/types.js';
 import { validateSave } from '../src/validate.js';
 import { flag, parse, positionalsAround, refuseEnv } from './args.js';
-import { asUpdate, planJson, planWrite, writePlanned, type WritePlan } from './artifacts.js';
+import { asUpdate, planJson, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { CONFIG_FILE, defaultConfig, loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
@@ -297,17 +296,10 @@ function applyProposals(
     const at = (rel: string): string => join(io.cwd, rel);
     const plans: WritePlan[] = [];
     if (landed.length > 0) {
-      // The codegen trio rides the key add, exactly as `register` regenerates
-      // it: the slot keys this run wrote must typecheck in the host's editor
-      // without an intervening `stet upgrade`.
-      const { keysTs, dts } = generateRegistry(descriptor);
-      plans.push(
-        asUpdate(planJson(at(config.descriptorPath), descriptor, config.descriptorPath)),
-        asUpdate(planJson(at(config.snapshotPath), snapshot, config.snapshotPath)),
-        asUpdate(planWrite(at(config.codegen.registry), keysTs, config.codegen.registry)),
-        asUpdate(planWrite(at(config.codegen.dts), dts, config.codegen.dts)),
-        asUpdate(planWrite(at(config.codegen.defaults), generateDefaultsModule(snapshot), config.codegen.defaults)),
-      );
+      // The five repo forms, and the codegen trio among them rides the key add
+      // exactly as `register` regenerates it: the slot keys this run wrote must
+      // typecheck in the host's editor without an intervening `stet upgrade`.
+      plans.push(...planRepoForms(io.cwd, config, descriptor, snapshot));
       for (const proposal of landed) {
         plans.push(asUpdate(planWrite(at(proposal.file), proposal.edited, proposal.file)));
       }
@@ -325,16 +317,7 @@ function applyProposals(
     }
     ({ written, unchanged } = writePlanned(plans));
   } catch (error) {
-    // A refusal already says what it refused and that nothing was written; an
-    // I/O failure says neither, and the batch's whole promise is that a failure
-    // left nothing behind. Raised as a CliError so it prints as one line and
-    // exits 1 rather than reaching the terminal as a stack.
-    if (error instanceof CliError || error instanceof UsageError) throw error;
-    const path = (error as { path?: string }).path;
-    throw new CliError(
-      `email extract --apply: the write batch failed${path === undefined ? '' : ` at ${path}`} — ` +
-        `${(error as Error).message}. Every file this run had already written was put back.`,
-    );
+    rethrowBatchFailure('email extract --apply', error);
   }
 
   for (const label of unchanged) report.line(`${label}: already current`);

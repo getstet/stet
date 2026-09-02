@@ -23,6 +23,7 @@
 import type * as TS from 'typescript';
 
 import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
+import { escapeRegExp } from '../src/seo.js';
 import { CliError } from './report.js';
 
 // `managedSurfaces` speaks a two-token glob — a single star for one path segment
@@ -1383,7 +1384,7 @@ function blankLineFrom(text: string, i: number): boolean {
  * over a typo in their descriptor.
  */
 export function mentionsToken(source: string, token: string): boolean {
-  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escaped = escapeRegExp(token);
   // `\b` asserts a boundary only beside a word character, so a token that
   // begins or ends with punctuation takes a bare match on that side rather
   // than one that can never hold.

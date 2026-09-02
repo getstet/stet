@@ -1,5 +1,5 @@
 /**
- * `stet seo check` — the eight SEO rules over the descriptor and the committed
+ * `stet seo check` — the nine SEO rules over the descriptor and the committed
  * snapshot.
  *
  * It builds no adapter, exactly as `check` does not: the loading path is

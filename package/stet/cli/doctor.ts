@@ -14,7 +14,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { dirname, join, relative, resolve as resolvePath, sep } from 'node:path';
+import { dirname, join, resolve as resolvePath, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
@@ -26,7 +26,7 @@ import { packageVersion } from './installed.js';
 import type { CliIo } from './main.js';
 import { readProjectMeta } from './meta.js';
 import { loadProject, type LoadedProject } from './project.js';
-import { Report, UsageError, formatFinding, shapeOf } from './report.js';
+import { Report, UsageError, formatFinding, posixRelative, shapeOf } from './report.js';
 import { TS7_REFUSAL, carriesToken, loadTypescript, mentionsToken, scriptKindFor } from './source-scan.js';
 import { isStoreBacked } from './store.js';
 
@@ -343,7 +343,7 @@ function resolveRelative(cwd: string, fromRel: string, spec: string): string | n
     // long way round (`../../node_modules/x`).
     if (candidate.split(sep).includes('node_modules')) continue;
     if (!existsSync(candidate) || !statSync(candidate).isFile()) continue;
-    return relative(cwd, candidate).split(sep).join('/');
+    return posixRelative(cwd, candidate);
   }
   return null;
 }

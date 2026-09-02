@@ -4,7 +4,7 @@
  * position-free baseline, the i18n skip, the never-open-outside-the-globs
  * guarantee (a `readFileSync` spy), and the severity gate.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -1569,5 +1569,25 @@ describe('runScan — a static route with no page record', () => {
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
     expect(cap.err.join('\n')).not.toContain('has no page record');
+  });
+
+  it('warns a markdown route without reading the file', async () => {
+    // `pages scan` seeds from a markdown page's frontmatter; scan calls the
+    // same detector with no seed option, so its warn is names only. The file is
+    // made UNREADABLE, which is the only way to prove a read did not happen:
+    // if scan opened it the run would throw rather than warn.
+    const dir = withPages(DECLARED_HOME, ['index.astro']);
+    const path = join(dir, 'src/pages/x.md');
+    write(dir, 'src/pages/x.md', '---\ntitle: Secret\n---\n');
+    // Windows has no mode bits to clear and root reads through them anyway.
+    const enforced = process.platform !== 'win32' && process.getuid?.() !== 0;
+    if (enforced) chmodSync(path, 0o000);
+    try {
+      const cap = io(dir);
+      expect(await runScan([], cap)).toBe(0);
+      expect(cap.err.join('\n')).toContain('route /x (src/pages/x.md) has no page record');
+    } finally {
+      if (enforced) chmodSync(path, 0o644);
+    }
   });
 });

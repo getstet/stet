@@ -12,7 +12,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { join } from 'node:path';
 
 import type * as TS from 'typescript';
 
@@ -21,7 +21,7 @@ import { writeJsonDeterministic } from './artifacts.js';
 import { loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
 import { detectPagesRoots, proposePages, walk } from './pages.js';
-import { CliError, clip, Report } from './report.js';
+import { CliError, clip, posixRelative, Report } from './report.js';
 import {
   dialectOf,
   isJsxFile,
@@ -460,9 +460,10 @@ async function unrenderedSlots(
  * `Object.keys`, and an entry whose `route` is a number would crash the trim
  * inside a command whose whole contract is never failing by default.
  *
- * A route the taxonomy owns — a dynamic segment, an endpoint, a markdown page
- * — never warns: those are the taxonomy's subjects rather than drift, and scan
- * does not re-report them.
+ * A route the taxonomy owns — a dynamic segment, an endpoint, an unsupported
+ * form or type — never warns: those are the taxonomy's subjects rather than
+ * drift, and scan does not re-report them. Scan calls the detector with no seed
+ * option, so it reads names only.
  */
 function uncoveredRoutes(cwd: string, report: Report, descriptor: RawDescriptor | null): void {
   if (descriptor === null) return;
@@ -538,7 +539,7 @@ export function filesForGlobs(cwd: string, globs: string[]): string[] {
   for (const glob of globs) {
     const root = staticPrefix(glob);
     walk(join(cwd, root), (abs) => {
-      const rel = relative(cwd, abs).split(sep).join('/');
+      const rel = posixRelative(cwd, abs);
       if (globs.some((g) => matchGlob(g, rel))) found.add(rel);
     });
   }

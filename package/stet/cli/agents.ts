@@ -19,13 +19,13 @@
 
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { join } from 'node:path';
 
 import { noPositionals, parse, refuseEnv } from './args.js';
 import { writeText } from './artifacts.js';
 import { CONFIG_FILE, loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
-import { CliError, Report } from './report.js';
+import { CliError, posixRelative, Report } from './report.js';
 import { dominantEol } from './rewrite.js';
 
 export const GUIDANCE_BEGIN = '<!-- stet:agent-guidance:begin -->';
@@ -393,7 +393,7 @@ export async function runAgentsInstall(args: string[], io: CliIo): Promise<numbe
   const block = buildGuidanceBlock(loadConfig(io.cwd));
   const planned = guidanceFiles(io.cwd).map((file) => ({
     file,
-    label: repoRelative(io.cwd, file.path),
+    label: posixRelative(io.cwd, file.path),
     plan: planGuidance(file.path, block),
   }));
 
@@ -443,7 +443,7 @@ export async function writeInitGuidance(args: {
   const block = buildGuidanceBlock(config);
   const planned = guidanceFiles(target).map((file) => ({
     file,
-    label: repoRelative(io.cwd, file.path),
+    label: posixRelative(io.cwd, file.path),
     plan: planGuidance(file.path, block),
   }));
 
@@ -676,6 +676,4 @@ function outcomeLine(label: string, status: GuidanceStatus): string {
   return `${label}: agent guidance already present, identical`;
 }
 
-function repoRelative(cwd: string, diskPath: string): string {
-  return relative(cwd, diskPath).split(sep).join('/');
-}
+

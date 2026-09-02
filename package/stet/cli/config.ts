@@ -78,11 +78,11 @@ export interface StetConfig {
    */
   scan: { severity: 'warn' | 'fail'; baseline: string };
   /**
-   * The detected router. `register` reads it to choose the accessor: a
-   * Pages-Router file is client-rendered and carries no `'use client'`
-   * directive to detect it by.
+   * The detected router. `register` reads it to choose the accessor: only
+   * `pages` forces the client form, a Pages-Router file being client-rendered
+   * with no `'use client'` directive to detect it by.
    */
-  router: 'app' | 'pages';
+  router: 'app' | 'pages' | 'astro';
   /**
    * The module `init` scaffolds the server accessor into. `file` is where it
    * was written; `import` is the specifier `register` inserts into a server
@@ -93,8 +93,12 @@ export interface StetConfig {
    * Where the `CopyProvider` mount lives — the one source of truth for it.
    * `init` writes it source-root-rebased with the extension it found, and
    * `register`'s provider check and `eject`'s unwrap both address that file.
+   *
+   * ABSENT on an `astro` host, which has no root React layout: both readers
+   * treat its absence as no layout, and the parse fills no default there — a
+   * placeholder path is the lie this optionality exists to stop.
    */
-  rootLayout: string;
+  rootLayout?: string;
   /**
    * The NAME of the environment variable holding the mount's Bearer token.
    * `init` scaffolds `createStetHandler({ auth: apiTokenEnv })` and the handler
@@ -195,6 +199,9 @@ export function selectStoreBlock(
   return { name: selection, block };
 }
 
+/** Where a Next host's `CopyProvider` mount lives, absent a host saying otherwise. */
+export const DEFAULT_ROOT_LAYOUT = 'app/layout.tsx';
+
 export function defaultConfig(): StetConfig {
   return {
     project: 'default',
@@ -204,7 +211,7 @@ export function defaultConfig(): StetConfig {
     scan: { severity: 'warn', baseline: '.stet/scan-baseline.json' },
     router: 'app',
     readPath: { file: 'lib/content.ts', import: '@/lib/content' },
-    rootLayout: 'app/layout.tsx',
+    rootLayout: DEFAULT_ROOT_LAYOUT,
     apiTokenEnv: 'STET_API_TOKEN',
     descriptorPath: 'content/descriptor.json',
     snapshotPath: 'content/defaults.json',
@@ -259,7 +266,12 @@ export function loadConfig(cwd: string): StetConfig {
   config.bundlePath = str(source, 'bundlePath', config.bundlePath);
 
   config.router = router(source);
-  config.rootLayout = str(source, 'rootLayout', config.rootLayout);
+  // The default is filled for a Next host only: on Astro `undefined` is the
+  // truth, and `app/layout.tsx` would name a file that is not there.
+  config.rootLayout =
+    config.router === 'astro'
+      ? optionalStr(source, 'rootLayout')
+      : str(source, 'rootLayout', DEFAULT_ROOT_LAYOUT);
   config.apiTokenEnv = str(source, 'apiTokenEnv', config.apiTokenEnv);
   const mountRoute = source['mountRoute'];
   // Optional with no default: absent MEANS no scaffolded route, so a filled-in
@@ -530,12 +542,12 @@ function readJsonc(path: string): unknown {
   }
 }
 
-/** The two routers, constrained at the parse so `register` never branches on a typo. */
-function router(source: Record<string, unknown>): 'app' | 'pages' {
+/** The three routers, constrained at the parse so `register` never branches on a typo. */
+function router(source: Record<string, unknown>): 'app' | 'pages' | 'astro' {
   const value = str(source, 'router', 'app');
-  if (value !== 'app' && value !== 'pages') {
+  if (value !== 'app' && value !== 'pages' && value !== 'astro') {
     throw new CliError(
-      `${CONFIG_FILE}: router must be "app" or "pages" — got ${JSON.stringify(source['router'] ?? null)}`,
+      `${CONFIG_FILE}: router must be "app", "pages" or "astro" — got ${JSON.stringify(source['router'] ?? null)}`,
     );
   }
   return value;
@@ -553,6 +565,11 @@ function str(
     throw new CliError(`${CONFIG_FILE}: ${prefix}${field} must be a string`);
   }
   return value;
+}
+
+/** A field with no default: absent MEANS absent, and a present one validates as `str` does. */
+function optionalStr(source: Record<string, unknown>, field: string): string | undefined {
+  return source[field] === undefined ? undefined : str(source, field, '');
 }
 
 function obj(source: Record<string, unknown>, field: string): Record<string, unknown> | null {

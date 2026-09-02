@@ -204,9 +204,7 @@ function values(descriptor: Descriptor, snapshot: Snapshot, report: Report): voi
  * answers a bare `in` from the prototype, and the value then reaches
  * `shapeSchema`, whose bare index returns `Object.prototype.constructor` — a
  * definition with no `shape`, which falls past every switch arm and hands the
- * caller `undefined` to parse against. The stale LIST still cannot see such an
- * orphan (`checkCurrency` has an `in` of its own); that is stated residue, not
- * this pass's to fix.
+ * caller `undefined` to parse against.
  */
 export function checkValues(descriptor: Descriptor, snapshot: Snapshot, report: Report): number {
   let checked = 0;

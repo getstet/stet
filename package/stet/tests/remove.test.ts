@@ -12,6 +12,8 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
+import { refuseDanglingReferences } from '../cli/remove.js';
+import { CliError } from '../cli/report.js';
 import {
   cleanupCliHosts,
   countingStore as counting,
@@ -124,49 +126,187 @@ describe('remove — membership and the reference gate', () => {
     expect(host.stderr()).toContain('"constructor" is not a key in content/descriptor.json');
   });
 
-  it('refuses a key another key derives from, naming the derivesFrom path', async () => {
-    const host = makeHost({ config: {} });
-    expect(await host.run('remove', 'hero_headline')).toBe(1);
-    expect(host.stderr()).toContain('cannot remove: keys/seo_home_title/derivesFrom');
-    expect(host.stderr()).toContain('edit the reference, then re-run');
-    expect(host.stdout()).toBe('');
-  });
+  it('is gated on the descriptor validator, called before the first plan line', async () => {
+    // Bake and drop consume every reference class today's schema carries, so
+    // the gate is exercised DIRECTLY: a cleaned descriptor carrying a dangling
+    // `derivesFrom` is the shape a later schema's unhandled class would leave.
+    const dangling: Descriptor = {
+      version: 1,
+      keys: { seo_home_title: { shape: 'text', target: 'web', derivesFrom: 'hero_headline', tmpl: '{v} — Mirra' } },
+    };
+    expect(() => refuseDanglingReferences(dangling)).toThrow(CliError);
+    expect(() => refuseDanglingReferences(dangling)).toThrow(/cannot remove: keys\/seo_home_title\/derivesFrom/);
+    expect(() => refuseDanglingReferences(dangling)).toThrow(/edit the reference, then re-run/);
 
-  it('refuses in --write mode too, leaving every repo form byte-unchanged', async () => {
-    const host = makeHost({ config: {} });
-    const forms = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts'];
-    const before = forms.map((rel) => bytes(host, rel));
-    expect(await host.run('remove', 'hero_headline', '--write')).toBe(1);
-    expect(host.stderr()).toContain('cannot remove: keys/seo_home_title/derivesFrom');
-    forms.forEach((rel, i) => expect(`${rel}: ${bytes(host, rel).equals(before[i]!)}`).toBe(`${rel}: true`));
-  });
-
-  it('refuses a key a page references through its SEO fields', async () => {
-    const host = makeHost({ config: {} });
-    expect(await host.run('remove', 'seo_home_title')).toBe(1);
-    expect(host.stderr()).toContain('cannot remove: pages/home/seo/title');
-  });
-
-  it('refuses a key a page binds into its JSON-LD', async () => {
-    const host = makeHost({ config: {} });
-    expect(await host.run('remove', 'hero_body')).toBe(1);
-    expect(host.stderr()).toContain('cannot remove: pages/home/jsonLd/bindings/description');
-  });
-
-  it('takes a derivation pair as ONE set: removed together, the pair validates clean', async () => {
-    const host = bespokeHost(PAIR, PAIR_VALUES);
-    // Alone, the source refuses on its deriver…
-    expect(await host.run('remove', 'hero_headline')).toBe(1);
-    expect(host.stderr()).toContain('cannot remove: keys/seo_home_title/derivesFrom');
-
-    // …and together they are one validation over the whole set.
-    const pair = bespokeHost(PAIR, PAIR_VALUES);
-    expect(await pair.run('remove', 'hero_headline', 'seo_home_title')).toBe(0);
-    expect(pair.stderr()).toBe('');
+    // And it is called BEFORE the plan prints, which is what makes a refused
+    // run print no plan at all in either mode.
+    const source = readFileSync(new URL('../cli/remove.ts', import.meta.url), 'utf8');
+    const gate = source.indexOf('refuseDanglingReferences(cleaned)');
+    const firstPlanLine = source.indexOf('report.line(`remove ${key}');
+    expect(gate).toBeGreaterThan(-1);
+    expect(firstPlanLine).toBeGreaterThan(-1);
+    expect(gate).toBeLessThan(firstPlanLine);
   });
 });
 
-describe('remove — the prototype backstop', () => {
+describe('remove — the bake and the drop', () => {
+  it('bakes a removed source into its dependent, in every locale the source valued', async () => {
+    const host = makeHost({ config: {} });
+    expect(await host.run('remove', 'hero_headline')).toBe(0);
+    expect(host.stdout()).toContain(
+      'seo_home_title derives from it — baked: de: Verpasse nie wieder einen Post. — Mirra, ' +
+        'default: Never miss a post again. — Mirra; derivation dropped',
+    );
+
+    const written = makeHost({ config: {} });
+    expect(await written.run('remove', 'hero_headline', '--write')).toBe(0);
+    const descriptor = loadDescriptor(JSON.parse(written.file('content/descriptor.json')));
+    const baked = descriptor.keys['seo_home_title'];
+    // The derivation pair leaves TOGETHER; every other field is the same key's.
+    expect(baked?.derivesFrom).toBeUndefined();
+    expect(baked?.tmpl).toBeUndefined();
+    expect(baked?.limits).toEqual({ max: 60, severity: 'advisory' });
+    expect(baked?.pages).toEqual(['home']);
+    const snapshot = loadSnapshot(JSON.parse(written.file('content/defaults.json')));
+    expect(snapshot['default']?.['seo_home_title']).toBe('Never miss a post again. — Mirra');
+    expect(snapshot['de']?.['seo_home_title']).toBe('Verpasse nie wieder einen Post. — Mirra');
+    expect(await written.run('check')).toBe(0);
+  });
+
+  it('bakes only the locales the source carried a row in', async () => {
+    const descriptor: Descriptor = {
+      version: 1,
+      keys: {
+        hero_headline: { shape: 'text', target: 'web' },
+        seo_home_title: { shape: 'text', target: 'web', derivesFrom: 'hero_headline', tmpl: '{v} — Mirra' },
+        blog_intro: { shape: 'text', target: 'web' },
+      },
+    };
+    // `es` translated the OTHER key and not the source: resolving the dependent
+    // there would fall back to the default value, and writing that as an `es`
+    // row would invent a translation.
+    const values: Snapshot = {
+      default: { hero_headline: 'Never miss a post.', blog_intro: 'Notes.' },
+      es: { blog_intro: 'Notas.' },
+    };
+    const host = bespokeHost(descriptor, values);
+    expect(await host.run('remove', 'hero_headline', '--write')).toBe(0);
+    const written = loadSnapshot(JSON.parse(host.file('content/defaults.json')));
+    expect(written['default']?.['seo_home_title']).toBe('Never miss a post. — Mirra');
+    expect(Object.hasOwn(written['es'] ?? {}, 'seo_home_title')).toBe(false);
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('drops a page SEO reference, naming the rule that will report the page', async () => {
+    const descriptor: Descriptor = {
+      version: 1,
+      keys: { seo_home_desc: { shape: 'text', target: 'web' }, blog_intro: { shape: 'text', target: 'web' } },
+      pages: { home: { route: '/', seo: { description: 'seo_home_desc' } } },
+    };
+    const values: Snapshot = { default: { seo_home_desc: 'A description.', blog_intro: 'Notes.' } };
+    const host = bespokeHost(descriptor, values);
+    expect(await host.run('remove', 'seo_home_desc', '--write')).toBe(0);
+    // The record held only that field, so the drop takes the whole record — and
+    // the plan says so, the way the JSON-LD block's does.
+    expect(host.stdout()).toContain(
+      'pages/home/seo/description — reference dropped; seo check will report missing-description; ' +
+        'the emptied record removed',
+    );
+    const written = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    // The descriptor still loads, which is the whole point of computing the
+    // forms first.
+    expect(written.pages?.['home']?.seo).toBeUndefined();
+    expect(written.pages?.['home']?.route).toBe('/');
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('says nothing about an emptied record where another SEO field survives', async () => {
+    // The same drop with a sibling left standing: the record stays, so the
+    // suffix must not print — it is what tells a field-level edit from a record
+    // deletion, and a suffix on both would tell neither.
+    const descriptor: Descriptor = {
+      version: 1,
+      keys: {
+        seo_home_title: { shape: 'text', target: 'web' },
+        seo_home_desc: { shape: 'text', target: 'web' },
+        blog_intro: { shape: 'text', target: 'web' },
+      },
+      pages: { home: { route: '/', seo: { title: 'seo_home_title', description: 'seo_home_desc' } } },
+    };
+    const values: Snapshot = {
+      default: { seo_home_title: 'Home', seo_home_desc: 'A description.', blog_intro: 'Notes.' },
+    };
+    const host = bespokeHost(descriptor, values);
+    expect(await host.run('remove', 'seo_home_desc', '--write')).toBe(0);
+    expect(host.stdout()).toContain(
+      'pages/home/seo/description — reference dropped; seo check will report missing-description',
+    );
+    expect(host.stdout()).not.toContain('the emptied record removed');
+    const written = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    expect(written.pages?.['home']?.seo).toEqual({ title: 'seo_home_title' });
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('drops a JSON-LD binding and the block the drop empties', async () => {
+    const descriptor: Descriptor = {
+      version: 1,
+      keys: { brand__name: { shape: 'text', target: 'web' }, blog_intro: { shape: 'text', target: 'web' } },
+      pages: { home: { route: '/', jsonLd: { type: 'WebSite', bindings: { name: 'brand__name' } } } },
+    };
+    const values: Snapshot = { default: { brand__name: 'Mirra', blog_intro: 'Notes.' } };
+    const host = bespokeHost(descriptor, values);
+    expect(await host.run('remove', 'brand__name', '--write')).toBe(0);
+    expect(host.stdout()).toContain(
+      'pages/home/jsonLd/bindings/name — binding dropped; the emptied block removed',
+    );
+    // An empty `bindings` would validate and emit nothing — a declaration that
+    // produces no JSON-LD is worse than none.
+    expect(loadDescriptor(JSON.parse(host.file('content/descriptor.json'))).pages?.['home']?.jsonLd).toBeUndefined();
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('takes a derivation pair as ONE set: nothing baked, both written away', async () => {
+    const host = bespokeHost(PAIR, PAIR_VALUES);
+    expect(await host.run('remove', 'hero_headline', 'seo_home_title', '--write')).toBe(0);
+    expect(host.stderr()).toBe('');
+    expect(host.stdout()).not.toContain('baked');
+    const written = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    expect(Object.keys(written.keys)).toEqual(['blog_intro']);
+    expect(Object.hasOwn(loadSnapshot(JSON.parse(host.file('content/defaults.json')))['default'] ?? {}, 'seo_home_title')).toBe(false);
+  });
+
+  it('is a plan, not an action: a bake plan writes nothing', async () => {
+    const host = makeHost({ config: {} });
+    const forms = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts'];
+    const before = forms.map((rel) => bytes(host, rel));
+    expect(await host.run('remove', 'hero_headline')).toBe(0);
+    expect(host.stdout()).toContain('derives from it — baked:');
+    expect(host.stdout()).toContain('plan only — run with --write to apply');
+    forms.forEach((rel, i) => expect(`${rel}: ${bytes(host, rel).equals(before[i]!)}`).toBe(`${rel}: true`));
+  });
+
+  it('names the currency finding where the source resolves to nothing', async () => {
+    // No value anywhere for the source, so the dependent bakes no row and
+    // becomes a declared key with none — a gap `checkValues` never sees,
+    // because it iterates the snapshot's keys.
+    const descriptor: Descriptor = {
+      version: 1,
+      keys: {
+        hero_headline: { shape: 'text', target: 'web' },
+        seo_home_title: { shape: 'text', target: 'web', derivesFrom: 'hero_headline', tmpl: '{v} — Mirra' },
+        blog_intro: { shape: 'text', target: 'web' },
+      },
+    };
+    const host = bespokeHost(descriptor, { default: { blog_intro: 'Notes.' } });
+    expect(await host.run('remove', 'hero_headline')).toBe(0);
+    expect(host.stdout()).toContain(
+      'after this removal, stet check will report: seo_home_title: declared in the descriptor with no value in the snapshot',
+    );
+    expect(host.stdout()).not.toContain('derives from it — baked:');
+  });
+});
+
+describe('remove — the prototype name', () => {
   /** A declared `constructor` — the one prototype name the key grammar admits — plus a reference to it. */
   function declaring(reference: (d: Descriptor) => void): Descriptor {
     // Assigned rather than written into the literal: `constructor` in an object
@@ -179,10 +319,11 @@ describe('remove — the prototype backstop', () => {
   }
   const VALUES: Snapshot = { default: { constructor: 'A declared value', blog_intro: 'Notes.' } };
 
-  it('refuses a declared `constructor` whose references the validator cannot see', async () => {
-    // All three classes at once: without the backstop the gate proceeds, the
-    // three references dangle, and the broken descriptor reloads clean —
-    // `'constructor' in keys` is still true after the own property is gone.
+  it('bakes and drops a declared `constructor` like any other name', async () => {
+    // All three reference classes at once. Bake and drop are keyed by string
+    // membership over a `Set`, so the prototype name is handled by
+    // construction — before any backstop could run, which is why there is no
+    // longer one to run. The validator's own `in` tests never see the removal.
     const host = bespokeHost(
       declaring((d) => {
         d.keys['derived_title'] = { shape: 'text', target: 'web', derivesFrom: 'constructor', tmpl: '{v} — Mirra' };
@@ -196,29 +337,18 @@ describe('remove — the prototype backstop', () => {
       }),
       VALUES,
     );
-    expect(await host.run('remove', 'constructor')).toBe(1);
-    expect(host.stderr()).toContain('cannot remove: keys/derived_title/derivesFrom');
-    expect(host.stdout()).toBe('');
-  });
+    expect(await host.run('remove', 'constructor', '--write')).toBe(0);
+    expect(host.stdout()).toContain('derived_title derives from it — baked: default: A declared value — Mirra; derivation dropped');
+    expect(host.stdout()).toContain('pages/home/seo/title — reference dropped; seo check will report missing-title');
+    expect(host.stdout()).toContain('pages/home/jsonLd/bindings/name — binding dropped; the emptied block removed');
 
-  it('reaches the page-SEO and JSON-LD reference classes on their own', async () => {
-    const seo = bespokeHost(
-      declaring((d) => {
-        d.pages = { home: { route: '/', seo: { title: 'constructor' } } };
-      }),
-      VALUES,
-    );
-    expect(await seo.run('remove', 'constructor')).toBe(1);
-    expect(seo.stderr()).toContain('cannot remove: pages/home/seo/title');
-
-    const bound = bespokeHost(
-      declaring((d) => {
-        d.pages = { home: { route: '/', jsonLd: { type: 'WebSite', bindings: { name: 'constructor' } } } };
-      }),
-      VALUES,
-    );
-    expect(await bound.run('remove', 'constructor')).toBe(1);
-    expect(bound.stderr()).toContain('cannot remove: pages/home/jsonLd/bindings/name');
+    const written = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    expect(written.keys['derived_title']?.derivesFrom).toBeUndefined();
+    expect(written.pages?.['home']).toEqual({ route: '/' });
+    const values = loadSnapshot(JSON.parse(host.file('content/defaults.json')));
+    expect(values['default']?.['derived_title']).toBe('A declared value — Mirra');
+    expect(Object.hasOwn(values['default'] ?? {}, 'constructor')).toBe(false);
+    expect(await host.run('check')).toBe(0);
   });
 
   it('removes a declared `constructor` that nothing references', async () => {

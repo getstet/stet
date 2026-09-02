@@ -20,12 +20,13 @@
  * backstop). Snapshot-only degrades to 1–3 + 5, no history.
  */
 
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
-import { dirname, join, relative, resolve as resolvePath, sep } from 'node:path';
+import { existsSync, lstatSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { basename, dirname, join, resolve as resolvePath, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
 import { generateDefaultsModule } from '../src/codegen.js';
+import { escapeRegExp } from '../src/seo.js';
 import { activeRow, resolve } from '../src/resolve.js';
 import type { StoreRow } from '../src/resolve.js';
 import type { Snapshot } from '../src/snapshot.js';
@@ -52,10 +53,11 @@ import { hooksDir } from './hook.js';
 import { packageRoot } from './installed.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence } from './project.js';
-import { CliError, Report, collapseLines } from './report.js';
+import { walk } from './pages.js';
+import { CliError, Report, collapseLines, posixRelative } from './report.js';
 import { applyFileEdits, formatDiff, unRewriteFile, type Edit } from './rewrite.js';
 import { filesForGlobs } from './scan.js';
-import { TS7_REFUSAL, isDialectFile, loadTypescript, matchGlob, scanSource } from './source-scan.js';
+import { TS7_REFUSAL, isDialectFile, loadTypescript, matchGlob, scanSource, scriptKindFor } from './source-scan.js';
 import { isStoreBacked } from './store.js';
 
 const HISTORY_FILE = 'stet-history.json';
@@ -76,8 +78,11 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
 
     // The root layout is ALWAYS in the set — a JS host's `app/layout.js` is not
     // in the tsx globs, and a mounted provider needs the compiler at zero
-    // accessor calls.
-    const fileSet = new Set<string>([...filesForGlobs(io.cwd, config.managedSurfaces), config.rootLayout]);
+    // accessor calls. An Astro host records none, and there is nothing to add.
+    const fileSet = new Set<string>([
+      ...filesForGlobs(io.cwd, config.managedSurfaces),
+      ...(config.rootLayout === undefined ? [] : [config.rootLayout]),
+    ]);
     const stetImports = stetImportRegex(config);
     // What eject writes or deletes itself, excluded everywhere a HOST file is
     // being counted: a host whose globs happen to cover the generated modules
@@ -161,6 +166,8 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       for (const [file, source] of surfaceText) {
         const abs = join(io.cwd, file);
         const result = await scanSource(file, source, { readPathImport: config.readPath.import });
+        // `undefined === file` is never true, so an Astro host's absent layout
+        // simply matches nothing and the unwrap path is unreachable.
         const isLayout = file === config.rootLayout;
         if (result.parseErrors) {
           refusals.push(`${file}: could not be parsed cleanly — not un-rewritten (the backstop refuses the dep drop if it still imports stet)`);
@@ -341,7 +348,7 @@ function buildSnapshot(descriptor: Descriptor, snapshot: Snapshot, rows: StoreRo
  * literal (`return {children}`), so it must be `<>{expr}</>`.
  */
 function copyProviderUnwrap(ts: typeof import('typescript'), source: string, file: string): Edit | null {
-  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKind(ts, file));
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
   let found: TS.JsxElement | null = null;
   const visit = (node: TS.Node): void => {
     if (
@@ -382,7 +389,7 @@ function layoutOrphanImports(
   cwd: string,
   config: { descriptorPath: string; codegen: { defaults: string } },
 ): { pos: number; end: number }[] {
-  const sf = ts.createSourceFile(absFile, source, ts.ScriptTarget.Latest, true, scriptKind(ts, absFile));
+  const sf = ts.createSourceFile(absFile, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, absFile));
   const targets = new Set([
     normalizeNoExt(join(cwd, config.descriptorPath)),
     normalizeNoExt(join(cwd, config.codegen.defaults)),
@@ -439,6 +446,13 @@ function isHistoryPage(value: unknown): value is { rows: VersionRow[]; nextBefor
  * `@getstet/stet`/`@getstet/stet/*` or read-path specifier once the un-rewrite
  * has run. `package.json` and JSON are excluded — the dep line is dropped
  * separately, and a `"@getstet/stet"` key there is not an import.
+ *
+ * The walk is `pages`' dirent walk, the one `filesForGlobs` already bounds
+ * scan, register and eject's own surface set with: symlinked host files are
+ * outside every walk stet makes, so a symlinked file, a symlinked directory and
+ * a dangling link are not visited here either — a dangling source link used to
+ * crash this sweep at its bare read — and a missing root yields nothing rather
+ * than throwing.
  */
 function backstop(
   cwd: string,
@@ -469,65 +483,57 @@ function backstop(
     const path = join(cwd, name);
     if (existsSync(path)) owned.add(fileIdentity(path));
   }
-  const walk = (dir: string): void => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'dist' || entry.name === '.next') continue;
-      const abs = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(abs);
-        continue;
+  walk(cwd, (abs) => {
+    const name = basename(abs);
+    const rel = posixRelative(cwd, abs);
+    // Markdown is not in the import sweep's extensions and never will be, but
+    // it is where a guidance block lives — so the walk that already visits
+    // every file probes it, rather than a second walk of the whole host. The
+    // two names at the eject root are the removal step's own.
+    if (/\.md$/i.test(name)) {
+      if (owned.has(fileIdentity(abs))) return;
+      // A doc that cannot be read — a permission, a race — is not a carrier,
+      // and it must not abort the run with a raw stack. The probe is a report
+      // channel; nothing downstream depends on having read it.
+      let text: string;
+      try {
+        text = readFileSync(abs, 'utf8');
+      } catch {
+        return;
       }
-      const rel = relative(cwd, abs).split(sep).join('/');
-      // Markdown is not in the import sweep's extensions and never will be, but
-      // it is where a guidance block lives — so the walk that already visits
-      // every file probes it, rather than a second walk of the whole host. The
-      // two names at the eject root are the removal step's own.
-      if (/\.md$/i.test(entry.name)) {
-        if (owned.has(fileIdentity(abs))) continue;
-        // A doc that cannot be read — a stale symlink, a permission — is not a
-        // carrier, and it must not abort the run with a raw stack. The probe is
-        // a report channel; nothing downstream depends on having read it.
-        let text: string;
-        try {
-          text = readFileSync(abs, 'utf8');
-        } catch {
-          continue;
-        }
-        if (hasGuidanceMarker(text)) markerCarriers.push(rel);
-        continue;
-      }
-      // Every extension node itself will load as a module: `.mts`/`.cts` are
-      // as much host source as `.mjs`/`.cjs`, and a file eject never opens is
-      // a file whose stet import it never sees.
-      const isSource = /\.(tsx?|jsx?|mjs|cjs|mts|cts)$/.test(entry.name);
-      // The dialects are read for the consumers channel only: the survivors
-      // sweep does not parse one, but any of them can import the read path.
-      const isDialect = isDialectFile(entry.name);
-      if (!isSource && !isDialect) continue;
-      // The walk's own post-edit text (:372's idiom), so an import the
-      // un-rewrite already removed never counts as a consumer.
-      const text = edited.get(rel) ?? readFileSync(abs, 'utf8');
-
-      // A consumer is any importer stet did not write itself — eject deletes or
-      // regenerates its own files, so those are never what keeps one alive.
-      if (!consumers.stetWritten.has(rel)) {
-        for (const spec of importSpecifiers(text)) {
-          for (const candidate of resolveSpecifier(spec, rel, cwd, aliases)) {
-            const deletion = byTarget.get(candidate);
-            if (deletion === undefined || deletion === rel) continue;
-            const found = deletionConsumers.get(deletion);
-            if (found === undefined) deletionConsumers.set(deletion, [rel]);
-            else if (!found.includes(rel)) found.push(rel);
-          }
-        }
-      }
-
-      if (!isSource) continue;
-      if (deleted.has(rel)) continue;
-      if (re.test(text)) survivors.push(rel);
+      if (hasGuidanceMarker(text)) markerCarriers.push(rel);
+      return;
     }
-  };
-  walk(cwd);
+    // Every extension node itself will load as a module: `.mts`/`.cts` are
+    // as much host source as `.mjs`/`.cjs`, and a file eject never opens is
+    // a file whose stet import it never sees.
+    const isSource = /\.(tsx?|jsx?|mjs|cjs|mts|cts)$/.test(name);
+    // The dialects are read for the consumers channel only: the survivors
+    // sweep does not parse one, but any of them can import the read path.
+    const isDialect = isDialectFile(name);
+    if (!isSource && !isDialect) return;
+    // The walk's own post-edit text (:372's idiom), so an import the
+    // un-rewrite already removed never counts as a consumer.
+    const text = edited.get(rel) ?? readFileSync(abs, 'utf8');
+
+    // A consumer is any importer stet did not write itself — eject deletes or
+    // regenerates its own files, so those are never what keeps one alive.
+    if (!consumers.stetWritten.has(rel)) {
+      for (const spec of importSpecifiers(text)) {
+        for (const candidate of resolveSpecifier(spec, rel, cwd, aliases)) {
+          const deletion = byTarget.get(candidate);
+          if (deletion === undefined || deletion === rel) continue;
+          const found = deletionConsumers.get(deletion);
+          if (found === undefined) deletionConsumers.set(deletion, [rel]);
+          else if (!found.includes(rel)) found.push(rel);
+        }
+      }
+    }
+
+    if (!isSource) return;
+    if (deleted.has(rel)) return;
+    if (re.test(text)) survivors.push(rel);
+  });
   return { survivors, markerCarriers, deletionConsumers };
 }
 
@@ -575,10 +581,6 @@ function staysList(
   const stays = candidates.filter((rel) => existsSync(join(cwd, rel)));
   if (existsSync(join(cwd, HOST_MIGRATIONS))) stays.push(`${HOST_MIGRATIONS.split(sep).join('/')}/`);
   return stays;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -673,7 +675,7 @@ function removeGuidanceBlocks(
     // CANONICAL cwd: `realpathSync` resolved it, and on a host whose root is
     // itself reached through a link (macOS `/var` → `/private/var`) a raw
     // `relative(cwd, …)` climbs out of the project and back down.
-    const shown = isLink && real !== null ? `${name} → ${relative(root, real).split(sep).join('/') || real}` : name;
+    const shown = isLink && real !== null ? `${name} → ${posixRelative(root, real) || real}` : name;
 
     const plan = planGuidanceRemoval(path, block);
     if (plan.status === 'absent') continue;
@@ -753,11 +755,4 @@ function removeHook(cwd: string, write: boolean, report: Report): void {
   } else {
     report.line(`${hook} differs from the shipped hook — remove its "npx stet check" and "npx stet scan" lines by hand`);
   }
-}
-
-function scriptKind(ts: typeof import('typescript'), path: string): TS.ScriptKind {
-  if (path.endsWith('.tsx')) return ts.ScriptKind.TSX;
-  if (path.endsWith('.jsx')) return ts.ScriptKind.JSX;
-  if (path.endsWith('.js')) return ts.ScriptKind.JS;
-  return ts.ScriptKind.TS;
 }

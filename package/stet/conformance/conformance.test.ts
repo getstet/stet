@@ -42,6 +42,7 @@ import { loadConfig } from '../cli/config.js';
 import { createStetHandler, type PublishEvent } from '../server/mount.js';
 import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
+import { refuseDanglingReferences } from '../cli/remove.js';
 import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
 import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
@@ -73,7 +74,7 @@ import {
   validateSave,
   webTarget,
 } from '../src/index.js';
-import type { Bundle, SeoFinding, SeoRule, StoreAdapter, StoreRow } from '../src/index.js';
+import type { Bundle, Descriptor, SeoFinding, SeoRule, Snapshot, StoreAdapter, StoreRow } from '../src/index.js';
 import {
   cleanupCliHosts,
   countingStore,
@@ -224,7 +225,7 @@ describe('descriptor', () => {
     expect(checkBudget(descriptor, 'hero_body', 'x'.repeat(5000))).toBeNull();
   });
 
-  it('Requirement: The pages section declares structure, not content', () => {
+  it('Requirement: The pages section declares structure, not content', async () => {
     expect(descriptor.pages?.['pricing']).toMatchObject({ route: '/pricing', parent: 'home' });
     expect(descriptor.pages?.['home']?.jsonLd).toEqual({
       type: 'WebSite',
@@ -267,6 +268,17 @@ describe('descriptor', () => {
     const structure = JSON.stringify(descriptor.pages);
     validateSave(descriptor, { key: 'seo_home_desc', value: 'A different description.' });
     expect(JSON.stringify(descriptor.pages)).toBe(structure);
+
+    // Two DEVELOPER commands edit page records on the developer's behalf, each
+    // shown in its plan before the write. `stet remove` drops the `seo` field
+    // that references a key it removes — the reference is structure, and a
+    // reference to a key that left would not load.
+    const host = makeCliHost({ config: {} });
+    expect(await host.run('remove', 'seo_home_desc', '--write')).toBe(0);
+    expect(host.stdout()).toContain('pages/home/seo/description — reference dropped');
+    const edited = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    expect(edited.pages?.['home']?.seo).toEqual({ title: 'seo_home_title' });
+    expect(edited.pages?.['home']?.route).toBe('/');
   });
 
   it('Requirement: Keys carry their editor- and agent-facing settings', () => {
@@ -296,7 +308,7 @@ describe('descriptor', () => {
     expect(checkVars(descriptor, 'welcome__body', 'Hi {{first_name}}').ok).toBe(false);
   });
 
-  it('Requirement: Derivation is declared, not computed ad hoc', () => {
+  it('Requirement: Derivation is declared, not computed ad hoc', async () => {
     expect(descriptor.keys['seo_home_title']).toMatchObject({
       derivesFrom: 'hero_headline',
       tmpl: '{v} — Mirra',
@@ -312,6 +324,21 @@ describe('descriptor', () => {
     }
     expect(error?.message).toContain('seo_home_title');
     expect(error?.message).toContain('hero_headlin');
+
+    // Removing the source through `stet remove` BAKES the derivation rather
+    // than dangling it: the dependent keeps the resolved value as its own and
+    // drops `derivesFrom` and `tmpl` together, so the descriptor validates with
+    // no derivation left pointing at the removed key.
+    const host = makeCliHost({ config: {} });
+    expect(await host.run('remove', 'hero_headline', '--write')).toBe(0);
+    const baked = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    expect(baked.keys['seo_home_title']).toMatchObject({ shape: 'text', target: 'web' });
+    expect(baked.keys['seo_home_title']?.derivesFrom).toBeUndefined();
+    expect(baked.keys['seo_home_title']?.tmpl).toBeUndefined();
+    expect(JSON.parse(host.file('content/defaults.json')).default.seo_home_title).toBe(
+      'Never miss a post again. — Mirra',
+    );
+    expect(await host.run('check')).toBe(0);
   });
 
   it('Requirement: Email templates are declared in the templates section', () => {
@@ -441,6 +468,15 @@ describe('snapshot', () => {
     const added = mutable(descriptor);
     added.keys['hero_kicker'] = { shape: 'text', target: 'web' };
     expect(checkCurrency(added, snapshot).missing).toEqual(['hero_kicker']);
+
+    // An OWN property of the default block: a key whose name is also a
+    // prototype member needs its own row like any other, and a bare `in` read
+    // it as already there.
+    const prototypeNamed: Descriptor['keys'] = {};
+    prototypeNamed['constructor'] = { shape: 'text', target: 'web' };
+    expect(checkCurrency({ version: 1, keys: prototypeNamed }, { default: {} }).missing).toEqual([
+      'constructor',
+    ]);
   });
 
   it('Requirement: Snapshot output is deterministic and diff-friendly', () => {
@@ -886,6 +922,19 @@ describe('validation', () => {
     expect(report.orphans).toEqual(['blog_intro']);
     expect(report.missing).toEqual([]);
     expect(JSON.stringify(snapshot)).toBe(before);
+
+    // Both maps are read as OWN properties, so a key named like a prototype
+    // member produces the same two findings any other name would. Assigned
+    // rather than written into the literal: `constructor` in an object literal
+    // takes `Object.prototype`'s type, not the index signature's.
+    const declared: Descriptor['keys'] = {};
+    declared['constructor'] = { shape: 'text', target: 'web' };
+    expect(checkCurrency({ version: 1, keys: declared }, { default: {} }).missing).toEqual([
+      'constructor',
+    ]);
+    const orphaned: Snapshot = { default: {} };
+    orphaned['default']!['constructor'] = 'x';
+    expect(checkCurrency({ version: 1, keys: {} }, orphaned).orphans).toEqual(['constructor']);
   });
 
   it('Requirement: Fit budgets check as advisories, never gates', () => {
@@ -1184,6 +1233,7 @@ describe('seo', () => {
 
   it('Requirement: One severity table governs the rules', async () => {
     expect(SEO_SEVERITY).toEqual({
+      'missing-title': 'error',
       'missing-description': 'error',
       'duplicate-title': 'error',
       'over-length': 'error',
@@ -1233,7 +1283,32 @@ describe('seo', () => {
     expect(third.stderr()).toContain('"error" or "warn"');
   });
 
-  it('Requirement: The completeness rules', () => {
+  it('Requirement: The completeness rules', async () => {
+    // The title rule is the description rule with the field word swapped, and
+    // it fails either way it can happen. An unreferenced field carries no key
+    // in its payload; the reference the operator must edit is the descriptor's.
+    const noTitle = broken();
+    delete noTitle.d.pages?.['pricing']?.seo?.title;
+    const unnamed = of(seoCheck(noTitle.d, noTitle.s), 'missing-title');
+    expect(unnamed).toMatchObject([{ severity: 'error', page: 'pricing', locale: 'default' }]);
+    expect(unnamed[0]?.key).toBeUndefined();
+
+    // The scaffolded empty title `pages scan --apply` announces is exactly this
+    // finding, and it names the key that resolves to nothing.
+    const blankTitle = broken();
+    delete blankTitle.d.keys['seo_pricing_title']!.derivesFrom;
+    delete blankTitle.d.keys['seo_pricing_title']!.tmpl;
+    blankTitle.s['default']!['seo_pricing_title'] = '';
+    expect(of(seoCheck(blankTitle.d, blankTitle.s), 'missing-title')).toMatchObject([
+      { severity: 'error', page: 'pricing', key: 'seo_pricing_title', locale: 'default' },
+    ]);
+
+    // And it gates: the same descriptor through the command exits 1.
+    const titleless = makeCliHost({ config: {} });
+    writeFileSync(join(titleless.cwd, 'content/descriptor.json'), JSON.stringify(noTitle.d, null, 2));
+    expect(await titleless.run('seo', 'check')).toBe(1);
+    expect(titleless.stderr()).toContain('page "pricing" declares no SEO title');
+
     // A page with no resolvable description fails, either way it can happen.
     const unreferenced = broken();
     delete unreferenced.d.pages?.['pricing']?.seo?.description;
@@ -1415,7 +1490,7 @@ describe('seo', () => {
     // the red it just created, as ADDITIONS.
     expect(await host.run('pages', 'scan', '--apply')).toBe(0);
     expect(host.stdout()).toContain('declared 2 page(s), scaffolded 4 key(s); next: stet seo check');
-    expect(host.stdout()).toContain('seo check will now report 2 more missing descriptions');
+    expect(host.stdout()).toContain('seo check will now report 2 more missing titles and 2 more missing descriptions');
 
     const declared = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
     expect(Object.keys(declared.pages ?? {}).sort()).toEqual(['home', 'team']);
@@ -1424,6 +1499,29 @@ describe('seo', () => {
       parent: 'home',
       seo: { title: 'seo_team_title', description: 'seo_team_desc' },
     });
+
+    // AN ANCESTOR LANDING LATER FILLS THE PARENT. The child is declared first,
+    // with no ancestor to point at; the run that declares the ancestor fills it
+    // in the same batch and reports the fill on its own line — and a `parent`
+    // set by hand is left exactly as written.
+    const late = makeAdoptionHost();
+    late.write('content/descriptor.json', JSON.stringify({ version: 1, keys: {} }, null, 2));
+    late.write('content/defaults.json', JSON.stringify({ default: {} }, null, 2));
+    late.write('app/docs/page.tsx', 'export default function Docs() { return null; }\n');
+    late.write('app/docs/adopt/page.tsx', 'export default function Adopt() { return null; }\n');
+    expect(await late.run('pages', 'scan', '--apply', 'docs_adopt')).toBe(0);
+    const child = () => (JSON.parse(late.file('content/descriptor.json')) as {
+      pages: Record<string, { parent?: string }>;
+    }).pages['docs_adopt'];
+    expect(child()?.parent).toBeUndefined();
+    const filled = late.out.length;
+    expect(await late.run('pages', 'scan', '--apply', 'docs')).toBe(0);
+    expect(child()?.parent).toBe('docs');
+    expect(late.out.slice(filled).join('\n')).toContain('backfilled parent on 1 page(s)');
+    // `home` is nearer to nothing here, and a later run leaves the recorded
+    // parent alone — the developer's word is never rewritten.
+    expect(await late.run('pages', 'scan', '--apply')).toBe(0);
+    expect(child()?.parent).toBe('docs');
     // The human's key is untouched, and the page it would have carried is not
     // declared: refusing to overwrite it is the whole point of the skip.
     expect(declared.keys['seo_docs_title']).toEqual({ shape: 'text', target: 'web', label: 'Docs title' });
@@ -1439,13 +1537,57 @@ describe('seo', () => {
       'home',
       'team',
     ]);
-    expect(findings.filter((f) => f.rule !== 'missing-description')).toEqual([]);
+    expect(findings.filter((f) => f.rule === 'missing-title').map((f) => f.page).sort()).toEqual([
+      'home',
+      'team',
+    ]);
+    expect(
+      findings.filter((f) => f.rule !== 'missing-description' && f.rule !== 'missing-title'),
+    ).toEqual([]);
     // Sliced from this run alone: the streams accumulate across the commands
     // above, where the vacuous-pass warn was correctly present.
     const said = host.err.length;
     expect(await host.run('seo', 'check')).toBe(1);
     expect(host.stdout()).toContain('seo: 2 pages checked');
     expect(host.err.slice(said).join('\n')).not.toContain('no pages declared');
+
+    // The ONE seeded exception. A markdown page under the Astro pages root is a
+    // static route like any other, and its proposal additionally reads the
+    // frontmatter block — two one-line scalars, quotes stripped — so the
+    // scaffolded values are the host's own copy rather than empty. The arm is
+    // confirmed by an `.astro` file, so the fixture carries one.
+    const md = makeAdoptionHost();
+    md.write(
+      'content/descriptor.json',
+      JSON.stringify(
+        {
+          version: 1,
+          keys: { seo_guide_title: { shape: 'text', target: 'web' } },
+          pages: { guide: { route: '/guide', seo: { title: 'seo_guide_title' } } },
+        },
+        null,
+        2,
+      ),
+    );
+    md.write('content/defaults.json', JSON.stringify({ default: { seo_guide_title: 'Old' } }, null, 2));
+    md.write('src/pages/handbook.astro', '<h1>Handbook</h1>\n');
+    md.write('src/pages/tour.md', '---\ntitle: "The tour"\ndescription: Read this first\n---\n# Tour\n');
+    md.write('src/pages/guide.md', '---\ntitle: New\n---\n# Guide\n');
+
+    expect(await md.run('pages', 'scan')).toBe(0);
+    expect(md.stdout()).toContain('  seo: seo_tour_title, seo_tour_desc — seeded from frontmatter');
+    expect(md.stdout()).toContain('  title: "The tour"');
+    expect(md.stdout()).toContain('  description: "Read this first"');
+    // An already-declared markdown page whose frontmatter has drifted from the
+    // key's default names the difference — the file and the key diverge
+    // visibly, never silently — and nothing is written for it.
+    expect(md.stderr()).toContain("frontmatter title differs from seo_guide_title's default");
+
+    expect(await md.run('pages', 'scan', '--apply', 'tour')).toBe(0);
+    const seeded = JSON.parse(md.file('content/defaults.json')).default;
+    expect(seeded.seo_tour_title).toBe('The tour');
+    expect(seeded.seo_tour_desc).toBe('Read this first');
+    expect(seeded.seo_guide_title).toBe('Old');
   });
 });
 
@@ -2817,6 +2959,14 @@ describe('cli', () => {
     expect(loaded.readPath).toEqual({ file: 'copy/content.ts', import: '@/copy/content' });
     expect(loaded.rootLayout).toBe('src/app/layout.tsx');
     expect(loaded.apiTokenEnv).toBe('DASH_API_TOKEN');
+    // The Astro shape: `router` takes a third value and `rootLayout` reads back
+    // ABSENT — no `app/layout.tsx` default is filled in for a host that has no
+    // root React layout — while a `router` outside the three names all three.
+    const astro = makeCliHost({ config: { router: 'astro' } });
+    expect(loadConfig(astro.cwd).router).toBe('astro');
+    expect(loadConfig(astro.cwd).rootLayout).toBeUndefined();
+    const nuxt = makeCliHost({ config: { router: 'nuxt' } });
+    expect(() => loadConfig(nuxt.cwd)).toThrow(/router must be "app", "pages" or "astro"/);
     expect(loaded.managedSurfaces).toEqual(['app/**/*.tsx', 'lib/email/**/*.ts']);
     expect(loaded.emailSurfaces).toEqual(['lib/email/**/*.ts']);
     // A declared copy-module list survives the round trip untouched…
@@ -3205,8 +3355,6 @@ describe('cli', () => {
     };
     expect(checked.snapshot.stale).toEqual([]);
 
-    // A REFERENCED KEY REFUSES, NOTHING WRITTEN — in both modes, and every one
-    // of the five repo forms is byte-unchanged.
     const forms = [
       'content/descriptor.json',
       'content/defaults.json',
@@ -3214,16 +3362,78 @@ describe('cli', () => {
       'content/stet-env.d.ts',
       'content/defaults.ts',
     ];
-    for (const mode of [[], ['--write']]) {
-      const referenced = makeCliHost({ config: {} });
-      const before = forms.map((rel) => readFileSync(join(referenced.cwd, rel)));
-      expect(await referenced.run('remove', 'hero_headline', ...mode)).toBe(1);
-      expect(referenced.stderr()).toContain('cannot remove: keys/seo_home_title/derivesFrom');
-      expect(referenced.stderr()).toContain('edit the reference, then re-run');
-      forms.forEach((rel, i) => {
-        expect(`${rel}: ${readFileSync(join(referenced.cwd, rel)).equals(before[i]!)}`).toBe(`${rel}: true`);
-      });
-    }
+
+    // A DERIVATION SOURCE BAKES ITS DEPENDENTS. `seo_home_title` derives from
+    // `hero_headline` through `{v} — Mirra`; the source leaves and the
+    // dependent keeps the value it resolved to, in the default locale and in
+    // every locale where the source had its own row.
+    const derived = makeCliHost({ config: {} });
+    const heldForms = forms.map((rel) => readFileSync(join(derived.cwd, rel)));
+    expect(await derived.run('remove', 'hero_headline')).toBe(0);
+    expect(derived.stdout()).toContain(
+      'seo_home_title derives from it — baked: de: Verpasse nie wieder einen Post. — Mirra, ' +
+        'default: Never miss a post again. — Mirra; derivation dropped',
+    );
+    // A plain run is still a plan: the bake prints and nothing is written.
+    forms.forEach((rel, i) => {
+      expect(`${rel}: ${readFileSync(join(derived.cwd, rel)).equals(heldForms[i]!)}`).toBe(`${rel}: true`);
+    });
+    expect(await derived.run('remove', 'hero_headline', '--write')).toBe(0);
+    const bakedDescriptor = loadDescriptor(JSON.parse(derived.file('content/descriptor.json')));
+    expect(bakedDescriptor.keys['seo_home_title']?.derivesFrom).toBeUndefined();
+    expect(bakedDescriptor.keys['seo_home_title']?.tmpl).toBeUndefined();
+    const bakedValues = JSON.parse(derived.file('content/defaults.json')) as Record<string, Record<string, unknown>>;
+    expect(bakedValues['default']!['seo_home_title']).toBe('Never miss a post again. — Mirra');
+    expect(bakedValues['de']!['seo_home_title']).toBe('Verpasse nie wieder einen Post. — Mirra');
+    expect(await derived.run('check')).toBe(0);
+
+    // …and naming source and dependent in ONE run bakes nothing and removes
+    // both: the named keys validate and write as one set.
+    const together = makeCliHost({ config: {} });
+    expect(await together.run('remove', 'hero_headline', 'seo_home_title', '--write')).toBe(0);
+    expect(together.stdout()).not.toContain('baked');
+    expect(Object.hasOwn(JSON.parse(together.file('content/descriptor.json')).keys, 'seo_home_title')).toBe(false);
+
+    // A PAGE REFERENCE DROPS WITH THE KEY, and a dropped title or description
+    // names the seo rule that will then report the page.
+    const referenced = makeCliHost({ config: {} });
+    expect(await referenced.run('remove', 'seo_home_desc', '--write')).toBe(0);
+    expect(referenced.stdout()).toContain(
+      'pages/home/seo/description — reference dropped; seo check will report missing-description',
+    );
+    const dropped = loadDescriptor(JSON.parse(referenced.file('content/descriptor.json')));
+    expect(dropped.pages?.['home']?.seo).toEqual({ title: 'seo_home_title' });
+    expect(await referenced.run('check')).toBe(0);
+    expect(await referenced.run('seo', 'check')).toBe(1);
+
+    // A JSON-LD binding drops the same way, and an emptied block goes with it —
+    // an empty `bindings` would validate and emit nothing.
+    const bound = makeCliHost({ config: {} });
+    expect(await bound.run('remove', 'pricing_tier_name', 'pricing_price', '--write')).toBe(0);
+    expect(bound.stdout()).toContain('pages/pricing/jsonLd/bindings/name — binding dropped');
+    expect(bound.stdout()).toContain('pages/pricing/jsonLd/bindings/price — binding dropped; the emptied block removed');
+    expect(loadDescriptor(JSON.parse(bound.file('content/descriptor.json'))).pages?.['pricing']?.jsonLd).toBeUndefined();
+    expect(await bound.run('check')).toBe(0);
+
+    // A REFERENCED KEY REFUSES, NOTHING WRITTEN. Bake and drop consume every
+    // reference class today's schema carries, so the gate is exercised
+    // DIRECTLY — a cleaned descriptor carrying a dangling `derivesFrom` is the
+    // shape a later schema's unhandled class would leave behind.
+    const dangling: Descriptor = {
+      version: 1,
+      keys: { seo_home_title: { shape: 'text', target: 'web', derivesFrom: 'hero_headline', tmpl: '{v} — Mirra' } },
+    };
+    expect(() => refuseDanglingReferences(dangling)).toThrow(
+      /cannot remove: keys\/seo_home_title\/derivesFrom.*edit the reference, then re-run/,
+    );
+    // And the command calls the gate BEFORE its first plan line, which is what
+    // makes a refused run print no plan and write nothing in either mode.
+    const removeSource = readFileSync(new URL('../cli/remove.ts', import.meta.url), 'utf8');
+    const gateAt = removeSource.indexOf('refuseDanglingReferences(cleaned)');
+    const planAt = removeSource.indexOf('report.line(`remove ${key}');
+    expect(gateAt).toBeGreaterThan(-1);
+    expect(planAt).toBeGreaterThan(-1);
+    expect(gateAt).toBeLessThan(planAt);
 
     // A PLAIN RUN IS A PLAN, NOT AN ACTION.
     const plan = makeCliHost({ config: {} });
@@ -3276,9 +3486,13 @@ describe('cli', () => {
 
     // An unknown key refuses the whole run before any plan prints.
     const unknown = makeCliHost({ config: {} });
-    expect(await unknown.run('remove', 'footer_links', 'no_such_key')).toBe(1);
+    const untouched = forms.map((rel) => readFileSync(join(unknown.cwd, rel)));
+    expect(await unknown.run('remove', 'footer_links', 'no_such_key', '--write')).toBe(1);
     expect(unknown.stderr()).toContain('"no_such_key" is not a key in content/descriptor.json');
     expect(unknown.stdout()).toBe('');
+    forms.forEach((rel, i) => {
+      expect(`${rel}: ${readFileSync(join(unknown.cwd, rel)).equals(untouched[i]!)}`).toBe(`${rel}: true`);
+    });
   });
 
   it('Requirement: publish is one path — click, agent and clock', async () => {
@@ -3309,8 +3523,8 @@ describe('cli', () => {
     // gated by the descriptor exactly as the interactive leg is. The state is
     // reached the way it really arises: `stet remove` takes the key out while a
     // due draft for it is still open. `footer_links` is the key that reproduces
-    // it — removing `hero_headline` would dangle its deriver and make the
-    // descriptor unloadable, masking the bypass behind a load failure.
+    // it — a key nothing derives from and no page references, so the removal is
+    // a plain delete and the bypass is not masked by a bake.
     const departed = createMemoryStore({ project: 'default' });
     const gated = makeCliHost({ store: departed });
     await gated.run('draft', 'footer_links', '--value=["Privacy"]', '--editor', 'neil', '--publish-at', '2020-01-01T00:00:00.000Z');
@@ -3959,6 +4173,45 @@ describe('adoption', () => {
     expect(unconfirmed.exists('AGENTS.md')).toBe(false);
     expect(unconfirmed.exists('CLAUDE.md')).toBe(false);
     expect(unconfirmed.stdout()).toContain('agent guidance not written — stet agents install writes it later');
+
+    // The router is detected by the route FILES the host carries, and an Astro
+    // host is recorded as one — react declared or not. The fixture declares
+    // react and carries `app/layout.tsx`, which is exactly what makes the
+    // absence of a mount an assertion rather than an accident.
+    const astro = makeAdoptionHost();
+    astro.write('src/pages/index.astro', '---\nconst t = "Home";\n---\n<h1>{t}</h1>\n');
+    const astroLayout = astro.file('app/layout.tsx');
+    expect(await astro.run('init', '--yes')).toBe(0);
+    const astroConfig = JSON.parse(astro.file('stet.config.json')) as Record<string, unknown>;
+    expect(astroConfig['router']).toBe('astro');
+    expect(Object.hasOwn(astroConfig, 'rootLayout')).toBe(false);
+    expect(astroConfig['managedSurfaces']).toEqual(['src/**/*.astro']);
+    expect(astro.file('src/lib/content.ts')).toContain('createAccessor');
+    expect(astro.file('src/lib/content.ts')).toContain('copyMap');
+    expect(astro.file('app/layout.tsx')).toBe(astroLayout);
+    expect(astro.stdout()).toContain('router: astro (src/pages carries .astro files)');
+    expect([astro.stdout(), astro.stderr()].join('\n')).not.toContain('stet/react');
+
+    // A root `astro.config.*` with no `.astro` page at all is the same arm, and
+    // a store-backed Astro run writes no Next-shaped mount route.
+    const collections = makeAdoptionHost({ env: { STET_DATABASE_URL: 'postgres://localhost/x' } });
+    collections.write('astro.config.mjs', 'export default {};\n');
+    expect(await collections.run('init', '--yes')).toBe(0);
+    const collectionsConfig = JSON.parse(collections.file('stet.config.json')) as Record<string, unknown>;
+    expect(collectionsConfig['router']).toBe('astro');
+    expect(collectionsConfig['mountRoute']).toBeUndefined();
+    expect(collections.exists('src/app/api/stet/[...stet]/route.ts')).toBe(false);
+    expect(collections.stdout()).toContain(
+      'mount route: not scaffolded on an Astro host — mount createStetHandler in an Astro endpoint by hand',
+    );
+
+    // …while a host carrying `app/page.tsx` is recorded `app` with its root
+    // layout exactly as before.
+    const next = makeAdoptionHost();
+    expect(await next.run('init', '--yes')).toBe(0);
+    const nextConfig = JSON.parse(next.file('stet.config.json')) as Record<string, unknown>;
+    expect(nextConfig['router']).toBe('app');
+    expect(nextConfig['rootLayout']).toBe('app/layout.tsx');
   });
 
   it('Requirement: agents install writes the routing guidance into an already-adopted host', async () => {
@@ -4308,8 +4561,14 @@ describe('adoption', () => {
     routed.write('src/pages/index.astro', '<h1>Home</h1>\n');
     routed.write('src/pages/team.astro', '<h1>Team</h1>\n');
     routed.write('src/pages/changelog/[slug].astro', '<h1>Entry</h1>\n');
+    // A markdown route is a static route like any other, and scan warns it the
+    // same way — through the detector called with no seed option, so the
+    // file's contents are never opened on scan's behalf.
+    routed.write('src/pages/handbook.md', '---\ntitle: The handbook\n---\n# Handbook\n');
     expect(await routed.run('scan')).toBe(0);
     expect(routed.stderr()).toContain('route /team (src/pages/team.astro) has no page record — run stet pages scan');
+    expect(routed.stderr()).toContain('route /handbook (src/pages/handbook.md) has no page record');
+    expect(routed.stderr()).not.toContain('The handbook');
     // A dynamic route is the skip taxonomy's subject, not drift: scan does not
     // re-report what `pages scan` already refuses to propose.
     expect(routed.stderr()).not.toContain('[slug]');

@@ -41,17 +41,23 @@ export interface CurrencyReport {
   warnings: Warning[];
 }
 
-/** Descriptor against snapshot, both directions. */
+/**
+ * Descriptor against snapshot, both directions, as OWN properties of each map.
+ *
+ * Both maps are JSON-parsed, so a bare `in` answers from the prototype: a
+ * descriptor key named `constructor` with no snapshot row read as present, and
+ * a snapshot `constructor` row with no descriptor entry read as declared.
+ */
 export function checkCurrency(d: Descriptor, s: Snapshot): CurrencyReport {
   const defaults = s['default'] ?? {};
   const missing = Object.keys(d.keys)
     .filter((key) => d.keys[key]?.derivesFrom === undefined)
-    .filter((key) => !(key in defaults))
+    .filter((key) => !Object.hasOwn(defaults, key))
     .sort();
 
   const seen = new Set<string>();
   for (const values of Object.values(s)) for (const key of Object.keys(values)) seen.add(key);
-  const orphans = [...seen].filter((key) => !(key in d.keys)).sort();
+  const orphans = [...seen].filter((key) => !Object.hasOwn(d.keys, key)).sort();
 
   return { missing, orphans, warnings: snapshotSmells(s) };
 }

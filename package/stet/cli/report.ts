@@ -10,6 +10,8 @@
  * a human reads.
  */
 
+import { relative, sep } from 'node:path';
+
 import type { SeoRule } from '../src/seo.js';
 import type { FindingRule } from '../src/validate.js';
 
@@ -113,6 +115,18 @@ function sanitizeLine(text: string): string {
  */
 export function formatFinding(finding: CliFinding): string {
   return `${finding.level}: ${sanitizeLine(finding.message)}`;
+}
+
+/**
+ * A path from one directory to another in the `/`-joined spelling every message
+ * uses, whatever separator the platform walks with.
+ *
+ * Named for what it DOES rather than for repo-relative, because three of its
+ * callers rebase on something else: a tsconfig alias root, a module's own
+ * directory, and a symlink's canonical root.
+ */
+export function posixRelative(from: string, abs: string): string {
+  return relative(from, abs).split(sep).join('/');
 }
 
 /**

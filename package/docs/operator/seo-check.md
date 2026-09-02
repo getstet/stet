@@ -1,6 +1,6 @@
 # `stet seo check`
 
-Eight SEO rules over your descriptor and your committed snapshot. It reads two
+Nine SEO rules over your descriptor and your committed snapshot. It reads two
 files and nothing else — no network, no database, no `--env` — so it runs on a
 fork pull request, with every secret unset and nothing deployed.
 
@@ -17,6 +17,7 @@ npx stet seo check --json     # the same findings, plus a structured block
 
 | Rule | Severity | What fails |
 |---|---|---|
+| `missing-title` | error | A declared page whose `seo` record names no title key, or whose title key resolves to nothing (an empty or whitespace-only value counts as nothing). |
 | `missing-description` | error | A declared page whose `seo` record names no description key, or whose description key resolves to nothing (an empty or whitespace-only value counts as nothing). |
 | `over-length` | error | A resolved title over 60 characters, or a resolved description over 160. |
 | `duplicate-title` | error | Two pages whose titles resolve to the same string in the same locale. |

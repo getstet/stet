@@ -163,11 +163,7 @@ describe('check', () => {
     // The defaults module is stale after the hand edit, so the run has a
     // finding — what matters is that it REPORTS rather than throws.
     expect(await host.run('check', '--json')).toBe(1);
-    // Residue, stated: the stale LIST still cannot see this orphan, because
-    // `checkCurrency` tests membership with an `in` of its own. Out of scope
-    // here — no command writes that state — and named so the gap reads as a
-    // boundary rather than an oversight.
-    expect(host.json<{ snapshot: { stale: string[] } }>().snapshot.stale).toEqual([]);
+    expect(host.json<{ snapshot: { stale: string[] } }>().snapshot.stale).toEqual(['constructor']);
   });
 
   it('fails on a stale generated file', async () => {
@@ -432,7 +428,7 @@ describe('seo check', () => {
 
   it('is not a rule: a seoCheck override naming it is still an unknown-rule error', async () => {
     // The warn sits outside the severity table — no rule id, no override, and it
-    // never moves the exit. The eight-rule contract is unchanged.
+    // never moves the exit. The nine-rule contract is unchanged.
     const host = makeHost({ config: { seoCheck: { 'no-pages': 'error' } } });
     expect(await host.run('seo', 'check')).toBe(1);
     expect(host.stderr()).toContain('seoCheck.no-pages');

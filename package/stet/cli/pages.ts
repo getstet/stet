@@ -8,10 +8,12 @@
  * route the reading cannot make deterministic, a dynamic segment above all,
  * lands in a named skip instead.
  *
- * The detector is filesystem probes over directory entries and file NAMES. No
- * file content is ever opened, so adoption's never-read boundary holds by
- * construction, and the tree walked is the framework's own rather than a glob's
- * — a glob gate would drop the very endpoints the taxonomy has to report.
+ * The detector reads directory entries and file names; under `pages scan`, a
+ * markdown page's frontmatter block is the one content read, and only when
+ * seeding is on. Adoption's never-read boundary holds where it is stated —
+ * `scan`'s drift warn calls the detector with no seed option — and the tree
+ * walked is the framework's own rather than a glob's: a glob gate would drop
+ * the very endpoints the taxonomy has to report.
  *
  * Two channels, the `email extract` discipline: a file the framework says is not
  * a page (a layout, a private folder, `_app`, `api/**`) is EXCLUDED silently,
@@ -36,18 +38,17 @@
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { join, sep } from 'node:path';
 
-import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { route as normalizeRoute } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, type Descriptor, type PageDef } from '../src/types.js';
 import { flag, parse, positionalsAround, refuseEnv } from './args.js';
-import { asUpdate, planJson, planWrite, writePlanned, type WritePlan } from './artifacts.js';
+import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
-import { CliError, Report, UsageError } from './report.js';
+import { clip, posixRelative, CliError, Report, UsageError } from './report.js';
 
 // --- The dirent walk --------------------------------------------------------
 
@@ -76,11 +77,6 @@ function safeReaddir(dir: string) {
   } catch {
     return null;
   }
-}
-
-/** A path below `from`, in the `/`-joined spelling every finding names. */
-function repoRelative(from: string, abs: string): string {
-  return relative(from, abs).split(sep).join('/');
 }
 
 // --- The name grammar -------------------------------------------------------
@@ -135,10 +131,10 @@ const NEXT_PAGES_RESERVED = new Set(['_app', '_document', '_error', '404', '500'
 /**
  * The routing roots this host actually has, CONFIRMED by their entries.
  *
- * A directory alone proves nothing — `init`'s directory-only probes are how the
- * one real Astro host came to record `router: "pages"` — so nothing here reads
- * `config.router` and every arm is confirmed by a file name below it. Arms may
- * coexist: Next serves `app/` and `pages/` concurrently, and both walk.
+ * A directory alone proves nothing — `init` detects the router through this
+ * same detector — so nothing here reads `config.router` and every arm is
+ * confirmed by a file name below it. Arms may coexist: Next serves `app/` and
+ * `pages/` concurrently, and both walk.
  *
  * Zero arms is not an error. The command says what it probed and exits 0; a
  * host whose Astro `srcDir` moves the tree lands here, which is the fail-safe
@@ -182,7 +178,6 @@ function containsFile(cwd: string, root: string, test: (name: string) => boolean
 export type PageSkipReason =
   | 'dynamic-route'
   | 'endpoint'
-  | 'markdown-page'
   | 'unsupported-route-form'
   | 'unsupported-page-type'
   | 'unnameable'
@@ -210,6 +205,8 @@ export interface PageProposal {
   route: string;
   file: string;
   parent?: string;
+  /** A markdown page's frontmatter title and description, where seeding is on and the block yields either. */
+  seed?: { title?: string; description?: string };
 }
 
 export interface PageProposalSet {
@@ -254,12 +251,14 @@ export interface DeclaredState {
 
 /**
  * The proposal set for a host's routing roots. Reads directory entries and file
- * names; writes nothing, opens nothing.
+ * names; under `pages scan`, a markdown page's frontmatter block is the one
+ * content read, and only when seeding is on.
  */
 export function proposePages(
   cwd: string,
   roots: PagesRoot[],
   declared: DeclaredState,
+  options: { seed?: boolean } = {},
 ): PageProposalSet {
   // Every arm's files in ONE path-sorted union. Walk order is what decides
   // which of two colliding routes is the LATER one, so it has to be
@@ -268,7 +267,7 @@ export function proposePages(
   for (const root of roots) {
     const base = join(cwd, root.root);
     walk(base, (abs) => {
-      files.push({ arm: root.arm, file: repoRelative(cwd, abs), rel: repoRelative(base, abs) });
+      files.push({ arm: root.arm, file: posixRelative(cwd, abs), rel: posixRelative(base, abs) });
     });
   }
   files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
@@ -322,12 +321,14 @@ export function proposePages(
     const trimmed = normalizeRoute(route);
     const declaredAt = declaredRoutes.get(trimmed);
     if (declaredAt !== undefined) {
-      skip(
-        'already-declared',
-        `page "${declaredAt}" already declares the route ${route}`,
-        'nothing to declare — the page record is already there',
-        name,
-      );
+      // The seed rides the same read on the page that OWNS this route: a file
+      // and the key it seeded diverging is the one thing a seed can hide, so
+      // the skip names the difference rather than passing over it.
+      let detail = `page "${declaredAt}" already declares the route ${route}`;
+      for (const [field, value] of driftedFields(cwd, file, declared, declaredAt, options)) {
+        detail += ` — frontmatter ${field} differs from ${value}'s default`;
+      }
+      skip('already-declared', detail, 'nothing to declare — the page record is already there', name);
       continue;
     }
     if (Object.hasOwn(declared.pages, name)) {
@@ -377,6 +378,10 @@ export function proposePages(
     }
 
     const proposal: PageProposal = { name, route, file };
+    if (options.seed === true && isMarkdown(proposal.file)) {
+      const seed = readFrontmatter(join(cwd, proposal.file));
+      if (seed) proposal.seed = seed;
+    }
     proposals.push(proposal);
     proposedByRoute.set(trimmed, proposal);
     proposedByName.set(name, proposal);
@@ -391,6 +396,99 @@ export function proposePages(
   }
 
   return { proposals, skips };
+}
+
+/** A markdown page — the one file type whose contents this command opens. */
+function isMarkdown(path: string): boolean {
+  const ext = extensionOf(path);
+  return ext === '.md' || ext === '.mdx';
+}
+
+/**
+ * A markdown page's frontmatter title and description, where the block yields
+ * either — the ONE content read this command makes, and only under seeding.
+ *
+ * No YAML: the block is line-oriented and two top-level one-line scalars are
+ * the whole grammar, so a folded or nested value simply yields no seed rather
+ * than a parse this package would have to carry a dependency for. Every shape
+ * outside the grammar fails toward no seed, which scaffolds empty — the
+ * behaviour a markdown page had before it seeded at all.
+ */
+function readFrontmatter(abs: string): { title?: string; description?: string } | undefined {
+  const lines = readFileSync(abs, 'utf8').replace(/^\ufeff/, '').split(/\r?\n/);
+  if (lines[0] !== '---') return undefined;
+  let end = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i] === '---') {
+      end = i;
+      break;
+    }
+  }
+  if (end === -1) return undefined; // an unterminated block is not a block
+
+  const seed: { title?: string; description?: string } = {};
+  const seen = new Set<string>();
+  for (let i = 1; i < end; i++) {
+    const match = FRONTMATTER_FIELD.exec(lines[i] ?? '');
+    if (match === null) continue;
+    const field = match[1] as 'title' | 'description';
+    if (seen.has(field)) continue; // the first occurrence per field wins
+    seen.add(field);
+    const value = scalarValue(match[2] ?? '');
+    if (value !== undefined) seed[field] = value;
+  }
+  return seed.title === undefined && seed.description === undefined ? undefined : seed;
+}
+
+/** A top-level one-line `title:` or `description:` in a frontmatter block. */
+const FRONTMATTER_FIELD = /^(title|description):[ \t]*(.*)$/;
+
+/**
+ * One frontmatter scalar, or `undefined` where the value is not one this reads.
+ *
+ * A quoted value seeds only when its closing quote is the LAST character: a
+ * trailing YAML comment after a quoted scalar would otherwise land inside the
+ * seed, and stripping it would be a parse. An unquoted value is cut at its
+ * first ` #`, which is YAML's own comment boundary for a plain scalar.
+ */
+function scalarValue(raw: string): string | undefined {
+  const value = raw.trim();
+  if (value === '' || value.startsWith('>') || value.startsWith('|')) return undefined;
+  const quote = value[0];
+  if (quote === '"' || quote === "'") {
+    return value.length >= 2 && value.endsWith(quote) ? value.slice(1, -1) : undefined;
+  }
+  const comment = value.indexOf(' #');
+  const cut = (comment === -1 ? value : value.slice(0, comment)).trim();
+  return cut === '' ? undefined : cut;
+}
+
+/**
+ * The seeded fields whose frontmatter value differs from the key's committed
+ * default, on the page that already declares this route — each yielded as its
+ * field name and the key whose default it disagrees with.
+ */
+function driftedFields(
+  cwd: string,
+  file: string,
+  declared: DeclaredState,
+  declaredAt: string,
+  options: { seed?: boolean },
+): Array<[string, string]> {
+  if (options.seed !== true || !isMarkdown(file)) return [];
+  const seed = readFrontmatter(join(cwd, file));
+  const seo = declared.pages[declaredAt]?.seo;
+  if (seed === undefined || typeof seo !== 'object' || seo === null) return [];
+  const record = seo as Record<string, unknown>;
+  const drifted: Array<[string, string]> = [];
+  for (const field of ['title', 'description'] as const) {
+    const value = seed[field];
+    const key = record[field];
+    if (value === undefined || typeof key !== 'string') continue;
+    const current = Object.hasOwn(declared.values, key) ? declared.values[key] : undefined;
+    if (typeof current === 'string' && current !== value) drifted.push([field, key]);
+  }
+  return drifted;
 }
 
 /**
@@ -436,21 +534,14 @@ function dynamicSkip(route: string): { skip: Omit<PageSkip, 'file'> } {
 /**
  * Astro's contract: every file below the root maps by its path minus the last
  * extension, an `index` file collapsing to its directory, and the EXTENSION
- * splits the classes. `.html` is a real Astro page type, and an endpoint keeps
- * every earlier dot — `features.md.ts` serves `/features.md`.
+ * splits the classes into three: `.astro`/`.html`/`.md`/`.mdx` are pages,
+ * `.ts`/`.js` are endpoints, and everything else is a type this walk maps to no
+ * route. An endpoint keeps every earlier dot — `features.md.ts` serves
+ * `/features.md`.
  */
 function readAstro(rel: string): RouteRead {
   const ext = extensionOf(rel);
   const route = fileRoute(rel);
-  if (ext === '.md' || ext === '.mdx') {
-    return {
-      skip: {
-        reason: 'markdown-page',
-        detail: `${route} is a markdown page, whose SEO fields live in its frontmatter`,
-        remedy: HAND_DECLARED,
-      },
-    };
-  }
   if (ext === '.ts' || ext === '.js') {
     return {
       skip: {
@@ -462,7 +553,7 @@ function readAstro(rel: string): RouteRead {
   }
   // The terminal default, and it is real: the site's own config manages
   // `src/pages/**/*.tsx` files that Astro serves no route for.
-  if (ext !== '.astro' && ext !== '.html') {
+  if (ext !== '.astro' && ext !== '.html' && ext !== '.md' && ext !== '.mdx') {
     return {
       skip: {
         reason: 'unsupported-page-type',
@@ -590,11 +681,16 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
     return report.emit(io, { json });
   }
 
-  const set = proposePages(io.cwd, roots, {
-    pages: descriptor.pages ?? {},
-    keys: descriptor.keys,
-    values: committedValues(io.cwd, config),
-  });
+  const set = proposePages(
+    io.cwd,
+    roots,
+    {
+      pages: descriptor.pages ?? {},
+      keys: descriptor.keys,
+      values: committedValues(io.cwd, config),
+    },
+    { seed: true },
+  );
   printPages(report, set);
 
   if (!apply) {
@@ -641,6 +737,9 @@ function committedValues(cwd: string, config: StetConfig): Record<string, unknow
     : {};
 }
 
+/** How much of a seeded value the plan shows before the apply writes it whole. */
+const SEED_EXCERPT = 80;
+
 /** The two SEO keys a page scaffolds, named once for the print and the write alike. */
 function seoKeys(name: string): { title: string; description: string } {
   return { title: `seo_${name}_title`, description: `seo_${name}_desc` };
@@ -651,7 +750,15 @@ function printPages(report: Report, set: PageProposalSet): void {
   for (const proposal of set.proposals) {
     const keys = seoKeys(proposal.name);
     report.line(`${proposal.name} (${proposal.route})`);
-    report.line(`  seo: ${keys.title}, ${keys.description} — scaffolded empty`);
+    const origin = proposal.seed === undefined ? 'scaffolded empty' : 'seeded from frontmatter';
+    report.line(`  seo: ${keys.title}, ${keys.description} — ${origin}`);
+    // The value the apply is about to write, shown before it lands: a seed is
+    // the host's own copy, and copy stet is about to commit is copy the
+    // operator gets to read first.
+    for (const field of ['title', 'description'] as const) {
+      const value = proposal.seed?.[field];
+      if (value !== undefined) report.line(`  ${field}: "${clip(value, SEED_EXCERPT)}"`);
+    }
   }
   for (const skip of set.skips) {
     report.warn('pages', `${skip.file}: skipped (${skip.reason}) — ${skip.detail}; ${skip.remedy}`);
@@ -736,10 +843,12 @@ function applyPages(
       // `pages: [name]` costs nothing and is not decorative: without it the
       // key's page span in the changeset preview is silently empty.
       descriptor.keys[key] = { shape: 'text', target: DEFAULT_TARGET, pages: [proposal.name] };
-      // Empty, never invented copy. Derivation would be the other honest
-      // answer, and it needs a `tmpl` — which is invented copy too.
-      values[key] = '';
     }
+    // Empty, never invented copy — a markdown page's frontmatter seed is the
+    // host's own copy rather than a guess. Derivation would be the other honest
+    // answer for the rest, and it needs a `tmpl` — which is invented copy too.
+    values[keys.title] = proposal.seed?.title ?? '';
+    values[keys.description] = proposal.seed?.description ?? '';
     landed.push(proposal);
   }
 
@@ -754,7 +863,26 @@ function applyPages(
     if (record !== undefined && parent !== undefined && Object.hasOwn(pages, parent)) record.parent = parent;
   }
 
-  if (landed.length === 0) {
+  // The BACKFILL, over the full declared set and before the empty-landing
+  // return: `parent` was computed over one run's proposal set, so a page whose
+  // ancestor was declared later kept none forever. A present `parent` is the
+  // developer's word and is never rewritten; a run that lands nothing but fills
+  // one still writes, which is why this sits above the return.
+  const declaredRoutes = new Map<string, string>();
+  for (const [name, record] of Object.entries(pages)) {
+    declaredRoutes.set(normalizeRoute(record.route), name);
+  }
+  let backfilled = 0;
+  for (const [name, record] of Object.entries(pages)) {
+    if (record.parent !== undefined) continue;
+    const parent = nearestParent(record.route, new Map(), declaredRoutes);
+    if (parent !== undefined && parent !== name) {
+      record.parent = parent;
+      backfilled += 1;
+    }
+  }
+
+  if (landed.length === 0 && backfilled === 0) {
     report.line('pages scan: nothing to propose');
     return;
   }
@@ -762,37 +890,30 @@ function applyPages(
   let written: string[] = [];
   let unchanged: string[] = [];
   try {
-    const at = (rel: string): string => join(io.cwd, rel);
-    const { keysTs, dts } = generateRegistry(descriptor);
-    const plans: WritePlan[] = [
-      asUpdate(planJson(at(config.descriptorPath), descriptor, config.descriptorPath)),
-      asUpdate(planJson(at(config.snapshotPath), snapshot, config.snapshotPath)),
-      asUpdate(planWrite(at(config.codegen.registry), keysTs, config.codegen.registry)),
-      asUpdate(planWrite(at(config.codegen.dts), dts, config.codegen.dts)),
-      asUpdate(planWrite(at(config.codegen.defaults), generateDefaultsModule(snapshot), config.codegen.defaults)),
-    ];
-    ({ written, unchanged } = writePlanned(plans));
+    ({ written, unchanged } = writePlanned(planRepoForms(io.cwd, config, descriptor, snapshot)));
   } catch (error) {
-    // A refusal already says what it refused and that nothing was written; an
-    // I/O failure says neither, and the batch's whole promise is that a failure
-    // left nothing behind.
-    if (error instanceof CliError || error instanceof UsageError) throw error;
-    const path = (error as { path?: string }).path;
-    throw new CliError(
-      `pages scan --apply: the write batch failed${path === undefined ? '' : ` at ${path}`} — ` +
-        `${(error as Error).message}. Every file this run had already written was put back.`,
-    );
+    rethrowBatchFailure('pages scan --apply', error);
   }
 
   for (const label of unchanged) report.line(`${label}: already current`);
   for (const label of written) report.line(`wrote ${label}`);
+  if (backfilled > 0) report.line(`backfilled parent on ${backfilled} page(s)`);
+  if (landed.length === 0) return;
   report.line(`declared ${landed.length} page(s), scaffolded ${landed.length * 2} key(s); next: stet seo check`);
   // The red this run just created, announced rather than met at the next
-  // command: every scaffolded description is empty, and an empty description is
-  // exactly what the `missing-description` rule reports at error severity. The
-  // count is ADDITIONS — a partially declared host already carries its own.
+  // command: a scaffolded value left empty is exactly what the `missing-title`
+  // and `missing-description` rules report at error severity. The counts are
+  // ADDITIONS — a partially declared host already carries its own — and they
+  // are counted per field off what was actually written, so a frontmatter seed
+  // that filled one field and not the other makes the two differ.
+  const empty = (field: 'title' | 'description'): number =>
+    landed.filter((proposal) => values[seoKeys(proposal.name)[field]] === '').length;
+  const titles = empty('title');
+  const descriptions = empty('description');
   report.line(
-    `seo check will now report ${landed.length} more missing descriptions — the scaffolded values are empty; ` +
-      'write them and re-run stet seo check',
+    titles === 0 && descriptions === 0
+      ? 'seo check will report nothing new — the scaffolded values were seeded from frontmatter'
+      : `seo check will now report ${titles} more missing titles and ${descriptions} more missing descriptions — ` +
+        'write the empty values and re-run stet seo check',
   );
 }

@@ -322,6 +322,105 @@ describe('runInit — layout probing and rebasing', () => {
   });
 });
 
+describe('runInit — the router is detected by route files', () => {
+  const ASTRO_PAGE = '---\nconst title = "Home";\n---\n<h1>{title}</h1>\n';
+
+  it('records an Astro host as astro, with no root layout and the astro surface', async () => {
+    const dir = project();
+    write(dir, 'src/pages/index.astro', ASTRO_PAGE);
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+
+    const config = readConfig(dir);
+    expect(config['router']).toBe('astro');
+    // ABSENT, not a placeholder path: an Astro host has no root React layout,
+    // and a path naming a file that is not there is the lie this fixes.
+    expect(Object.hasOwn(config, 'rootLayout')).toBe(false);
+    expect(config['managedSurfaces']).toEqual(['src/**/*.astro']);
+    expect(config['readPath']).toMatchObject({ file: 'src/lib/content.ts' });
+
+    // The react-free scaffold, whether or not react is declared: an island's
+    // React tree is not the site's layout.
+    const readPath = readFileSync(join(dir, 'src/lib/content.ts'), 'utf8');
+    expect(readPath).toContain("from '@getstet/stet'");
+    expect(readPath).toContain('createAccessor');
+    expect(readPath).toContain('export const copyMap');
+    expect(existsSync(join(dir, 'src/app'))).toBe(false);
+
+    const out = [...io.out, ...io.err].join('\n');
+    expect(out).toContain('router: astro (src/pages carries .astro files)');
+    expect(out).toContain(
+      "no CopyProvider mount: an Astro host has no root React layout — read copy from '@/lib/content', " +
+        "either copy('key') for text or copyMap.key by property",
+    );
+    expect(out).not.toContain('stet/react');
+  });
+
+  it('writes no Next-shaped mount route on a store-backed Astro host', async () => {
+    const dir = project();
+    write(dir, 'src/pages/index.astro', ASTRO_PAGE);
+    const io = makeIo(dir, { env: { STET_DATABASE_URL: 'postgres://localhost/x' } });
+    expect(await runInit(['--yes'], io)).toBe(0);
+
+    const config = readConfig(dir);
+    expect(config['store']).toBeDefined();
+    expect(config['mountRoute']).toBeUndefined();
+    expect(existsSync(join(dir, 'src/app/api/stet/[...stet]/route.ts'))).toBe(false);
+
+    const out = [...io.out, ...io.err].join('\n');
+    expect(out).toContain(
+      'mount route: not scaffolded on an Astro host — mount createStetHandler in an Astro endpoint by hand',
+    );
+    // The read path serves the bundle `pull` writes, store route or not — so
+    // the store host is still told to run it.
+    expect(out).toContain('next: stet pull');
+  });
+
+  it('records an Astro host with no .astro page through its root config file', async () => {
+    // A content-collections or Starlight site may carry no `.astro` file under
+    // `src/pages` at all. Without this arm it takes the directory fallback and
+    // records the very lie the file probe fixes.
+    const dir = project();
+    write(dir, 'astro.config.mjs', "export default {};\n");
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(readConfig(dir)['router']).toBe('astro');
+    expect([...io.out, ...io.err].join('\n')).toContain('router: astro (astro.config.mjs at the root)');
+  });
+
+  it('gives an Astro host the Astro reason even where it declares no react', async () => {
+    const dir = project({ react: false });
+    write(dir, 'src/pages/index.astro', ASTRO_PAGE);
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    const out = [...io.out, ...io.err].join('\n');
+    expect(out).toContain('no CopyProvider mount: an Astro host has no root React layout');
+    expect(out).not.toContain('this host declares no react');
+  });
+
+  it('still records a Next App host by its page file, root layout and all', async () => {
+    const dir = project();
+    write(dir, 'app/layout.tsx', APP_LAYOUT);
+    write(dir, 'app/page.tsx', 'export default function Page() { return null; }\n');
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    const config = readConfig(dir);
+    expect(config['router']).toBe('app');
+    expect(config['rootLayout']).toBe('app/layout.tsx');
+    expect([...io.out, ...io.err].join('\n')).toContain('router: app (app carries a page file)');
+  });
+
+  it('ejects an Astro host at exit 0 without touching a layout', async () => {
+    const dir = project();
+    write(dir, 'src/pages/index.astro', ASTRO_PAGE);
+    expect(await runInit(['--yes'], makeIo(dir))).toBe(0);
+    // The unwrap path is unreachable with no recorded layout, and the sweep
+    // still runs over the `.astro` surface.
+    const io = makeIo(dir);
+    expect(await runCli(['eject'], io)).toBe(0);
+  });
+});
+
 describe('runInit — the read path matches the host (F5)', () => {
   /** The workspace's installed packages: what makes `from '@getstet/stet'` resolve in a temp host. */
   const WORKSPACE_MODULES = join(packageRoot(), '..', 'node_modules');

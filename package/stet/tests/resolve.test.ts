@@ -186,3 +186,38 @@ describe('the three host modes', () => {
     }
   });
 });
+
+describe('the snapshot read is an own-property read', () => {
+  /** A descriptor declaring `constructor`, assigned so the index signature types it. */
+  function declaring(extra: Partial<Descriptor['keys'][string]> = {}): Descriptor {
+    const keys: Descriptor['keys'] = {};
+    keys['constructor'] = { shape: 'text', target: 'web', ...extra };
+    return { version: 1, keys };
+  }
+
+  it('resolves a row-less `constructor` to nothing, with the warning any other name gets', () => {
+    // A bare index answered this from `Object.prototype` — the function object
+    // itself, silently, and `remove`'s bake takes this resolution as its write
+    // oracle.
+    const r = resolve(declaring(), { default: {} }, null, { key: 'constructor' });
+    expect(r.value).toBeUndefined();
+    expect(r.source).toBe('snapshot');
+    expect(r.warnings).toMatchObject([{ code: 'no_value', key: 'constructor' }]);
+  });
+
+  it('still serves an OWN `constructor` row, and still derives from it', () => {
+    const values: Snapshot = { default: {} };
+    values['default']!['constructor'] = 'A declared value';
+    expect(resolve(declaring(), values, null, { key: 'constructor' })).toMatchObject({
+      value: 'A declared value',
+      source: 'snapshot',
+    });
+
+    const derived = declaring();
+    derived.keys['derived_title'] = { shape: 'text', target: 'web', derivesFrom: 'constructor', tmpl: '{v} — Mirra' };
+    expect(resolve(derived, values, null, { key: 'derived_title' })).toMatchObject({
+      value: 'A declared value — Mirra',
+      source: 'derived',
+    });
+  });
+});

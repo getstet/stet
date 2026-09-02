@@ -10,10 +10,13 @@
  */
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 
-import { canonicalize } from '../src/codegen.js';
-import { CliError } from './report.js';
+import { canonicalize, generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import type { Snapshot } from '../src/snapshot.js';
+import type { Descriptor } from '../src/types.js';
+import type { StetConfig } from './config.js';
+import { CliError, UsageError } from './report.js';
 
 /** JSON, keys sorted at every depth, two-space indent, one trailing newline. */
 export function writeJsonDeterministic(path: string, value: unknown): void {
@@ -146,4 +149,56 @@ export function writePlanned(
     throw error;
   }
   return { written, unchanged };
+}
+
+/**
+ * The five repo forms as one update batch — the descriptor, the snapshot and
+ * the regenerated codegen trio.
+ *
+ * The three commands that write keys write exactly these five, and a batch that
+ * missed one would leave a permanent finding: `generateRegistry` stamps the
+ * WHOLE descriptor's source hash, so a descriptor edit alone stales the
+ * currency gate. Every plan is `asUpdate` — each file's new text was computed
+ * FROM its current contents, so `differs` is the ordinary case here rather than
+ * a host edit — and each is labeled with the REPO-RELATIVE path, because a
+ * refusal that names a temp directory teaches nothing.
+ *
+ * MANDATORY among them: a stale ambient union keeps `copy('removed_key')`
+ * compiling in the host, and it is the residue a write that outran its codegen
+ * leaves behind.
+ *
+ * The `StetConfig` import is type-only and erased under `verbatimModuleSyntax`;
+ * config.ts's runtime import of this module is the only runtime edge between
+ * the two.
+ */
+export function planRepoForms(
+  cwd: string,
+  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen'>,
+  descriptor: Descriptor,
+  snapshot: Snapshot,
+): WritePlan[] {
+  const at = (rel: string): string => join(cwd, rel);
+  const { keysTs, dts } = generateRegistry(descriptor);
+  return [
+    asUpdate(planJson(at(config.descriptorPath), descriptor, config.descriptorPath)),
+    asUpdate(planJson(at(config.snapshotPath), snapshot, config.snapshotPath)),
+    asUpdate(planWrite(at(config.codegen.registry), keysTs, config.codegen.registry)),
+    asUpdate(planWrite(at(config.codegen.dts), dts, config.codegen.dts)),
+    asUpdate(planWrite(at(config.codegen.defaults), generateDefaultsModule(snapshot), config.codegen.defaults)),
+  ];
+}
+
+/**
+ * What a failed write batch says. A refusal already names what it refused and
+ * that nothing was written; an I/O failure names neither, and the batch's whole
+ * promise is that a failure left nothing behind. Raised as a `CliError` so it
+ * prints as one line and exits 1 rather than reaching the terminal as a stack.
+ */
+export function rethrowBatchFailure(command: string, error: unknown): never {
+  if (error instanceof CliError || error instanceof UsageError) throw error;
+  const path = (error as { path?: string }).path;
+  throw new CliError(
+    `${command}: the write batch failed${path === undefined ? '' : ` at ${path}`} — ` +
+      `${(error as Error).message}. Every file this run had already written was put back.`,
+  );
 }

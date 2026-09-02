@@ -292,6 +292,9 @@ function kindFor(
   // router — checked FIRST, so a Pages host's email mailer is still server (and
   // reaches EMAIL_TARGET), not client-skipped for want of a provider.
   if (!isJsxFile(file)) return 'server';
+  // Only `pages` forces the client form: a Pages-Router file is client-rendered
+  // with no directive to detect it by. `app` and `astro` both fall through to
+  // the directive and the route-file test.
   if (config.router === 'pages' || hasUseClient) return 'client';
   if (isRouteFile(file)) return 'server';
   if (forced === 'server' || forced === 'client') return forced;
@@ -326,6 +329,9 @@ function freeKey(descriptor: Descriptor, base: string): string {
 
 /** The live grep P1-H uses: a `CopyProvider` import from `@getstet/stet/react` in the root layout. */
 function providerMounted(cwd: string, config: StetConfig): boolean {
+  // No recorded root layout is no layout, and no layout is no provider — an
+  // Astro host, whose site layout is a `.astro` template.
+  if (config.rootLayout === undefined) return false;
   const path = join(cwd, config.rootLayout);
   if (!existsSync(path)) return false;
   const source = readFileSync(path, 'utf8');

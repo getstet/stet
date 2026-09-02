@@ -90,7 +90,7 @@ export type {
   Verdict,
 } from './validate.js';
 
-// The SEO check: eight rules over the descriptor and the committed snapshot.
+// The SEO check: nine rules over the descriptor and the committed snapshot.
 export { SEO_SEVERITY, seoCheck } from './seo.js';
 export type { SeoFinding, SeoRule } from './seo.js';
 

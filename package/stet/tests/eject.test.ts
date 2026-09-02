@@ -8,7 +8,7 @@
  * over it is clean (it still builds).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -995,5 +995,38 @@ describe('runEject — the parse-refusal wall', () => {
     expect(await runEject([], cap)).toBe(0);
     expect(cap.out.join('\n')).toContain('un-rewrite: nothing to reverse');
     expect(cap.out.join('\n')).not.toContain('could not be parsed cleanly');
+  });
+});
+
+/**
+ * The whole-host sweep walks through `pages`' dirent walk — the same bound
+ * `filesForGlobs` already puts on scan, register and eject's own surface set.
+ * Symlinked host files are outside every walk stet makes, and the sweep says so
+ * rather than being the one place that follows them.
+ */
+describe('runEject — the sweep walks what every other host walk walks', () => {
+  it('does not report a symlinked guidance carrier as a moved block', async () => {
+    const dir = host();
+    const block = '# Notes\n\n<!-- stet:agent-guidance:begin -->\nCopy is stet-managed.\n<!-- stet:agent-guidance:end -->\n';
+    write(dir, 'shared/agent-notes.md', block);
+    mkdirSync(join(dir, 'docs'), { recursive: true });
+    symlinkSync(join(dir, 'shared/agent-notes.md'), join(dir, 'docs/linked-notes.md'));
+
+    const cap = io(dir);
+    expect(await runEject([], cap)).toBe(0);
+    // The real file is reported; the link to it is not visited at all, so the
+    // same block is never named twice under two paths.
+    expect(cap.out.join('\n')).toContain('shared/agent-notes.md: carries the stet agent-guidance markers');
+    expect(cap.out.join('\n')).not.toContain('docs/linked-notes.md');
+  });
+
+  it('runs through a dangling symlink instead of crashing on it', async () => {
+    const dir = host();
+    // A source-shaped link with no target: the inline walker read it at the
+    // bare `readFileSync` and took the run down with an ENOENT.
+    symlinkSync(join(dir, 'lib/gone.ts'), join(dir, 'app/dangling.ts'));
+    const cap = io(dir);
+    expect(await runEject([], cap)).toBe(0);
+    expect(cap.out.join('\n')).not.toContain('dangling.ts');
   });
 });

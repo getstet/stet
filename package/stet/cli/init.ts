@@ -19,7 +19,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, relative, sep } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
@@ -39,10 +39,11 @@ import {
   type StetConfig,
 } from './config.js';
 import { packageRoot, migrations } from './installed.js';
+import { detectPagesRoots } from './pages.js';
 import type { CliIo } from './main.js';
-import { Report } from './report.js';
+import { posixRelative, Report } from './report.js';
 import { applyFileEdits, dominantEol, formatDiff, type Edit } from './rewrite.js';
-import { loadTypescript } from './source-scan.js';
+import { loadTypescript, scriptKindFor } from './source-scan.js';
 
 export async function runInit(args: string[], io: CliIo): Promise<number> {
   const { values, positionals } = parse(args, { app: 'string', yes: 'boolean' });
@@ -52,9 +53,11 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   const target = app === undefined ? io.cwd : join(io.cwd, app);
   const report = new Report();
 
-  const base = detectSourceBase(target);
-  const router = detectRouter(target, base);
-  const rootLayout = probeRootLayout(target, base, router);
+  const { base, router, evidence } = detectLayout(target);
+  report.line(`router: ${router} (${evidence})`);
+  // An Astro host has no root React layout, and a placeholder path is the lie
+  // this absence exists to stop.
+  const rootLayout = router === 'astro' ? undefined : probeRootLayout(target, base, router);
   const storeBacked = detectStore(target, io.env);
   // The sub-package OR the invocation root: a hoisted monorepo declares react
   // once at the top, and reading only the app would call it react-less while
@@ -78,7 +81,7 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   const snapshot = loadSnapshot(starterDefaults);
   const { keysTs, dts } = generateRegistry(descriptor);
 
-  const label = (diskPath: string): string => repoRelative(io.cwd, diskPath);
+  const label = (diskPath: string): string => posixRelative(io.cwd, diskPath);
   const plan = (relPath: string, text: string): WritePlan =>
     planWrite(join(target, relPath), text, label(join(target, relPath)));
   const planJsonAt = (relPath: string, value: unknown): WritePlan =>
@@ -92,7 +95,10 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
     plan(config.codegen.defaults, generateDefaultsModule(snapshot)),
     plan(
       config.readPath.file,
-      readPathModule(config, join(target, config.readPath.file), target, storeBacked, hasReact),
+      // An Astro host takes the react-free scaffold whether or not react is
+      // declared: an island's React tree is not the site's layout, and
+      // `stet/react`'s server accessor is a Next server-component tool.
+      readPathModule(config, join(target, config.readPath.file), target, storeBacked, hasReact && router !== 'astro'),
     ),
   ];
   for (const migration of migrations()) {
@@ -118,31 +124,45 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   for (const name of written) report.line(`wrote ${name}`);
 
   // The mount exists to give CLIENT components an accessor through React
-  // context. A host that declares no react has no provider to mount, so the
-  // step is skipped whole and the read route it does have is named instead.
-  // The gate sits at the CALL, which is what also silences every fallback
-  // inside: the wrap-point miss and the layout-not-found branch both print a
-  // snippet importing `@getstet/stet/react`, and on this host that import cannot load.
-  if (hasReact) {
-    await mountProvider({ io, target, config, router, yes, report, ts });
-  } else {
+  // context. Two hosts have no provider to mount: one that declares no react,
+  // and an Astro host, whose site layout is a `.astro` template rather than a
+  // React tree — an island's React subtree is not the site's layout, and the
+  // Astro reason wins whether or not react is declared. The step is skipped
+  // whole and the read route it does have is named instead. The gate sits at
+  // the CALL, which is what also silences every fallback inside: the wrap-point
+  // miss and the layout-not-found branch both print a snippet importing
+  // `@getstet/stet/react`, and on those hosts that import cannot load.
+  const skipMount = (reason: string): void => {
     report.line(
-      `no CopyProvider mount: this host declares no react — read copy from '${config.readPath.import}', ` +
+      `no CopyProvider mount: ${reason} — read copy from '${config.readPath.import}', ` +
         "either copy('key') for text or copyMap.key by property",
     );
-  }
+  };
+  if (rootLayout === undefined || router === 'astro') skipMount('an Astro host has no root React layout');
+  else if (!hasReact) skipMount('this host declares no react');
+  else await mountProvider({ io, target, config, rootLayout, router, yes, report, ts });
   // Outside the all-or-nothing batch above: that batch is over NEW files stet
   // owns, while the guidance append edits files it does not, under per-file
   // three-state semantics. Folding it in would let a host's edited CLAUDE.md
   // veto the descriptor write.
   await writeInitGuidance({ io, target, config, yes, report });
 
+  // Where the Next-shaped mount route was not written, the endpoint is a hand
+  // step and the report says so rather than leaving a store-backed host with
+  // no server surface named.
+  if (storeBacked && config.mountRoute === undefined) {
+    report.line('mount route: not scaffolded on an Astro host — mount createStetHandler in an Astro endpoint by hand');
+  }
+
   report.line('');
   check(config, target, report);
   report.line('');
   // A store-backed read path serves `config.bundlePath`, which `pull` writes and
-  // `init` does not — so a fresh store host must `pull` before that path resolves.
-  if (config.mountRoute !== undefined) {
+  // `init` does not — so a fresh store host must `pull` before that path
+  // resolves. Keyed on the STORE rather than on the mount route, which the read
+  // path already is: an Astro store host writes no route and still carries an
+  // accessor that throws until `pull` runs.
+  if (storeBacked) {
     report.line('next: stet pull (populate the store bundle the read path serves), then stet scan');
   } else {
     report.line('next: stet scan');
@@ -158,6 +178,55 @@ function detectSourceBase(target: string): '' | 'src/' {
     if (existsSync(join(target, 'src', router))) return 'src/';
   }
   return '';
+}
+
+/** The `astro.config.*` spellings Astro itself accepts, probed by name like every other arm. */
+const ASTRO_CONFIGS = ['astro.config.mjs', 'astro.config.ts', 'astro.config.js', 'astro.config.cjs', 'astro.config.mts'];
+
+/**
+ * The host's router, CONFIRMED by its route files — the same detector `stet
+ * pages scan` proposes from, which reads names below each candidate root and
+ * never `config.router`.
+ *
+ * A directory alone proves nothing: `src/pages` exists on every Astro site, and
+ * reading it as Next's Pages Router is how the one real Astro host came to
+ * carry `router: "pages"` with a `.tsx` glob matching nothing. The
+ * `astro.config.*` probe is the same posture one step out — a content-collections
+ * or Starlight site may carry no `.astro` file under `src/pages` at all, and
+ * without it that host would take the directory fallback and record the very
+ * lie this arm fixes.
+ *
+ * A host with no route file yet keeps the directory fallback, so a bare repo
+ * still scaffolds as `app`. The evidence rides back so the report can say what
+ * decided it.
+ */
+function detectLayout(target: string): { base: '' | 'src/'; router: 'app' | 'pages' | 'astro'; evidence: string } {
+  const roots = detectPagesRoots(target);
+  if (roots.some((root) => root.arm === 'astro')) {
+    return { base: 'src/', router: 'astro', evidence: 'src/pages carries .astro files' };
+  }
+  const astroConfig = ASTRO_CONFIGS.find((name) => existsSync(join(target, name)));
+  if (astroConfig !== undefined) {
+    return { base: 'src/', router: 'astro', evidence: `${astroConfig} at the root` };
+  }
+  const app = roots.find((root) => root.arm === 'next-app');
+  if (app !== undefined) {
+    return {
+      base: app.root.startsWith('src/') ? 'src/' : '',
+      router: 'app',
+      evidence: `${app.root} carries a page file`,
+    };
+  }
+  const pages = roots.find((root) => root.arm === 'next-pages');
+  if (pages !== undefined) {
+    return {
+      base: pages.root.startsWith('src/') ? 'src/' : '',
+      router: 'pages',
+      evidence: `${pages.root} carries a page file`,
+    };
+  }
+  const base = detectSourceBase(target);
+  return { base, router: detectRouter(target, base), evidence: 'default — no route files found' };
 }
 
 /** App Router unless only `pages/` exists. A bare repo defaults to app. */
@@ -246,8 +315,8 @@ async function askEmail(io: CliIo, target: string, base: '' | 'src/', report: Re
 
 function buildConfig(d: {
   base: '' | 'src/';
-  router: 'app' | 'pages';
-  rootLayout: string;
+  router: 'app' | 'pages' | 'astro';
+  rootLayout: string | undefined;
   storeBacked: boolean;
   sendsEmail: boolean;
   target: string;
@@ -261,12 +330,18 @@ function buildConfig(d: {
   // `app/page.js`, so a `.tsx`/`.jsx`-only glob makes scan/register a silent
   // no-op there (P2-11). stet's glob matcher has no brace expansion, so the
   // widening is separate array entries, not `{tsx,jsx,js}`.
-  const js = jsHost(d.rootLayout);
+  const js = jsHost(d.rootLayout ?? '');
   const readPathFile = `${d.base}lib/content.${js ? 'js' : 'ts'}`;
   config.readPath = { file: readPathFile, import: resolveReadPathImport(d.target, d.base, readPathFile, d.report) };
-  const surfaceGlobs = js
-    ? [`${d.base}${d.router}/**/*.tsx`, `${d.base}${d.router}/**/*.jsx`, `${d.base}${d.router}/**/*.js`]
-    : [`${d.base}${d.router}/**/*.tsx`];
+  // Astro templates live in `pages/`, `layouts/` and `components/` alike, so
+  // the surface is every `.astro` file below the source root. `**` and not a
+  // brace list: stet's glob matcher has no brace expansion.
+  const surfaceGlobs =
+    d.router === 'astro'
+      ? [`${d.base}**/*.astro`]
+      : js
+        ? [`${d.base}${d.router}/**/*.tsx`, `${d.base}${d.router}/**/*.jsx`, `${d.base}${d.router}/**/*.js`]
+        : [`${d.base}${d.router}/**/*.tsx`];
   // `.tsx` belongs in the TypeScript host's email list as much as `.ts`: a
   // react-email template IS a `.tsx` component, and it is the shape the whole
   // ecosystem ships. Leaving it out made `stet email extract` with no arguments
@@ -282,8 +357,10 @@ function buildConfig(d: {
   if (d.storeBacked) {
     config.store = defaultStoreBlock('pg');
     // The route handler is App-Router style (`{ GET, POST }`) and lives under
-    // `app/` even on a Pages host, which Next serves alongside `pages/`.
-    config.mountRoute = `${d.base}app/api/stet/[...stet]/route.ts`;
+    // `app/` even on a Pages host, which Next serves alongside `pages/`. An
+    // Astro host serves no such route: its endpoint is a hand step the report
+    // names, so no `mountRoute` is recorded and `eject` looks for no file.
+    if (d.router !== 'astro') config.mountRoute = `${d.base}app/api/stet/[...stet]/route.ts`;
   }
   return config;
 }
@@ -319,7 +396,7 @@ function probePathAlias(target: string, readPathFile: string): string | undefine
     for (const dest of dests) {
       if (typeof dest !== 'string' || !dest.endsWith('/*')) continue;
       const destDir = join(target, mappings.baseUrl, dest.slice(0, -2)); // drop the trailing '/*'
-      const rel = relative(destDir, abs).split(sep).join('/');
+      const rel = posixRelative(destDir, abs);
       if (rel.startsWith('..') || rel.startsWith('/')) continue; // the read path is not under this alias root
       return `${prefix}${rel.replace(/\.(tsx?|jsx?)$/, '')}`;
     }
@@ -331,7 +408,7 @@ function probePathAlias(target: string, readPathFile: string): string | undefine
 
 /** A `/`-normalized, `./`-prefixed specifier from one file to a target path. */
 function relImport(fromFile: string, toDiskPath: string, opts: { stripExt?: boolean } = {}): string {
-  let spec = relative(dirname(fromFile), toDiskPath).split(sep).join('/');
+  let spec = posixRelative(dirname(fromFile), toDiskPath);
   if (!spec.startsWith('.')) spec = `./${spec}`;
   if (opts.stripExt) spec = spec.replace(/\.(tsx?|jsx?|json)$/, '');
   return spec;
@@ -469,14 +546,16 @@ async function mountProvider(args: {
   io: CliIo;
   target: string;
   config: StetConfig;
+  /** `config.rootLayout`, narrowed by the caller: this step is not reached without one. */
+  rootLayout: string;
   router: 'app' | 'pages';
   yes: boolean;
   report: Report;
   ts: typeof import('typescript') | null;
 }): Promise<void> {
-  const { io, target, config, router, yes, report, ts } = args;
-  const layoutPath = join(target, config.rootLayout);
-  const shown = repoRelative(io.cwd, layoutPath);
+  const { io, target, config, rootLayout, router, yes, report, ts } = args;
+  const layoutPath = join(target, rootLayout);
+  const shown = posixRelative(io.cwd, layoutPath);
 
   if (!existsSync(layoutPath)) {
     report.line(`${shown}: not found — mount the CopyProvider by hand:`);
@@ -490,7 +569,7 @@ async function mountProvider(args: {
   }
 
   const source = readFileSync(layoutPath, 'utf8');
-  const sf = ts.createSourceFile(layoutPath, source, ts.ScriptTarget.Latest, true, scriptKind(ts, layoutPath));
+  const sf = ts.createSourceFile(layoutPath, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, layoutPath));
 
   if (importsCopyProvider(ts, sf)) {
     report.line(`${shown}: CopyProvider already mounted — no change`);
@@ -646,9 +725,7 @@ function printProviderSnippet(
 
 // --- small shared helpers --------------------------------------------------
 
-function repoRelative(cwd: string, diskPath: string): string {
-  return relative(cwd, diskPath).split(sep).join('/');
-}
+
 
 /** A `.js`/`.jsx` file — a JS host, so the scaffold must carry no TypeScript syntax (P1-3). */
 function jsHost(file: string): boolean {
@@ -666,11 +743,4 @@ async function loadTypescriptOrNull(): Promise<typeof import('typescript') | nul
 
 function readJson(path: string): unknown {
   return JSON.parse(readFileSync(path, 'utf8'));
-}
-
-function scriptKind(ts: typeof import('typescript'), path: string): TS.ScriptKind {
-  if (path.endsWith('.tsx')) return ts.ScriptKind.TSX;
-  if (path.endsWith('.jsx')) return ts.ScriptKind.JSX;
-  if (path.endsWith('.js')) return ts.ScriptKind.JS;
-  return ts.ScriptKind.TS;
 }
