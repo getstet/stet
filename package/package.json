@@ -1,0 +1,32 @@
+{
+  "name": "stet-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "stet"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run build && npm run typecheck:tests && vitest run && npm run test:python",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json && tsc --noEmit -p stet/react/tsconfig.test.json",
+    "test:js": "vitest run",
+    "test:live": "vitest run -c vitest.live.config.ts",
+    "test:python": "python3 -B stet/tests/python/check_snapshot.py",
+    "codegen:schema": "node stet/scripts/gen-schema.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "jsdom": "^26.1.0",
+    "pg": "^8.23.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

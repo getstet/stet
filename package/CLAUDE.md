@@ -3,7 +3,9 @@
 The npm package is `@getstet/stet`, and its bin is `stet` (one published
 package; `@getstet/stet/core`, `@getstet/stet/react` and `@getstet/stet/server`
 are subpath exports, never separate packages). This file is the conventions
-layer; the change files under `openspec/` are the specification.
+layer; the specification is the openspec change files in the planning repository
+(`nj-io/stet-planning`), where every change is authored before it is built here —
+a public commit names the change it implements.
 
 ## Naming
 
