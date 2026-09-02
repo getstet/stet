@@ -1,6 +1,15 @@
 import { createHash } from 'node:crypto';
 
+import type { Snapshot } from './snapshot.js';
 import type { Descriptor, Shape } from './types.js';
+
+/**
+ * Descriptor → generated artifacts — the registry, the ambient types and the
+ * defaults module — the source hash they carry, and the generated-file currency
+ * check over that hash. The CLI is the one generator and reaches this module by
+ * path; it sits outside the root entry's closure, which is what keeps the
+ * hash's crypto builtin out of a browser bundle.
+ */
 
 /**
  * The generated-file header. Every artifact states its own source, because the
@@ -121,4 +130,53 @@ export function generateRegistry(d: Descriptor): { keysTs: string; dts: string }
     '}\n';
 
   return { keysTs, dts };
+}
+
+/**
+ * `defaults.ts` from `defaults.json`. Locales and keys sort, so a one-value
+ * change is a one-line diff; regeneration from the same JSON is byte-identical.
+ */
+export function generateDefaultsModule(s: Snapshot): string {
+  const sorted: Snapshot = {};
+  for (const locale of Object.keys(s).sort()) {
+    const values = s[locale] ?? {};
+    const sortedValues: Record<string, unknown> = {};
+    for (const key of Object.keys(values).sort()) sortedValues[key] = values[key];
+    sorted[locale] = sortedValues;
+  }
+  return (
+    generatedHeader('defaults.json', sourceHash(s)) +
+    '\n' +
+    `export const DEFAULTS = ${JSON.stringify(sorted, null, 2)} as const;\n`
+  );
+}
+
+export type GeneratedState = 'current' | 'staleSource' | 'handEdited';
+
+export interface GeneratedCheck {
+  status: GeneratedState;
+  /** The hash the file carries, or null when it carries no stet header. */
+  embedded: string | null;
+  /** The hash the source produces now. */
+  fresh: string;
+}
+
+/**
+ * Two distinct states, because they need two distinct fixes. `staleSource`: the
+ * source moved and the file did not — regenerate. `handEdited`: the hashes
+ * agree and the body does not, which a hash alone cannot see — the mechanism is
+ * regenerate-and-byte-compare.
+ */
+export function checkGeneratedCurrent<T>(
+  fileText: string,
+  source: T,
+  generate: (source: T) => string,
+): GeneratedCheck {
+  const embedded = embeddedHash(fileText);
+  const fresh = sourceHash(source);
+  if (embedded !== fresh) return { status: 'staleSource', embedded, fresh };
+  if (generatedBody(fileText) !== generatedBody(generate(source))) {
+    return { status: 'handEdited', embedded, fresh };
+  }
+  return { status: 'current', embedded, fresh };
 }

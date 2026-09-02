@@ -19,13 +19,8 @@ import { dirname, join } from 'node:path';
 
 import type { MemoryStore } from '../adapters/store-memory.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import {
-  generateDefaultsModule,
-  generateRegistry,
-  loadDescriptor,
-  loadSnapshot,
-  type StoreAdapter,
-} from '../src/index.js';
+import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import { loadDescriptor, loadSnapshot, type StoreAdapter } from '../src/index.js';
 
 const FIXTURE = new URL('./fixtures/mini-project/', import.meta.url);
 const made: string[] = [];

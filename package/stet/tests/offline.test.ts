@@ -4,7 +4,13 @@ import https from 'node:https';
 
 import { describe, expect, it } from 'vitest';
 
-import { sourceFiles, stemOf } from './helpers/source-roster.js';
+import {
+  isNodeBuiltin,
+  runtimeImportClosure,
+  runtimeImports,
+  sourceFiles,
+  stemOf,
+} from './helpers/source-roster.js';
 
 const srcDir = new URL('../src/', import.meta.url);
 
@@ -49,6 +55,7 @@ describe('the core is pure by construction', () => {
       'descriptor-schema.generated.ts',
       'descriptor.ts',
       'index.ts',
+      'preview-token.ts',
       'preview.ts',
       'resolve.ts',
       'seo.ts',
@@ -63,7 +70,6 @@ describe('the core is pure by construction', () => {
   });
 
   it('opens nothing: no file system, no network, no environment', () => {
-    // node:crypto is the one permitted builtin — the source hash needs it.
     const forbidden = [
       'node:fs',
       'node:http',
@@ -89,6 +95,27 @@ describe('the core is pure by construction', () => {
       expect(`${name}: ${text.includes('Math.random')}`).toBe(`${name}: false`);
       expect(`${name}: ${text.includes('toLocale')}`).toBe(`${name}: false`);
     }
+  });
+
+  it('permits node builtins at exactly two sites, both node:crypto', () => {
+    // Every builtin any src/ file names for itself, read the way the closure
+    // walk reads an edge — so a `require('node:path')`, a dynamic import or an
+    // import-equals counts the same as an import statement, and the pair names
+    // the file that wrote it. Two modules are permitted the hash and the token
+    // signature; a sixth builtin anywhere in src/ is a new pair here.
+    const sites = sources.flatMap(({ name }) =>
+      runtimeImports(new URL(name, srcDir))
+        .filter(isNodeBuiltin)
+        .map((spec) => [name, spec]),
+    );
+    expect([...sites].sort()).toEqual([
+      ['codegen.ts', 'node:crypto'],
+      ['preview-token.ts', 'node:crypto'],
+    ]);
+  });
+
+  it('reaches no Node builtin from the root entry', () => {
+    expect(runtimeImportClosure(new URL('index.ts', srcDir)).bare.filter(isNodeBuiltin)).toEqual([]);
   });
 
   it('keeps no file named for its lack of a job', () => {

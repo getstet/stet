@@ -1,6 +1,6 @@
 {
   "name": "@getstet/stet",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
@@ -47,7 +47,7 @@
     "./schema": "./descriptor.schema.json"
   },
   "bin": {
-    "stet": "./dist/cli/main.js"
+    "stet": "dist/cli/main.js"
   },
   "publishConfig": {
     "access": "public"

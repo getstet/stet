@@ -16,9 +16,9 @@ import { dirname, join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { generateRegistry } from '../src/codegen.js';
+import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptor } from '../src/descriptor.js';
-import { generateDefaultsModule, loadSnapshot } from '../src/snapshot.js';
+import { loadSnapshot } from '../src/snapshot.js';
 import { runCli, type CliIo } from '../cli/main.js';
 
 interface Host extends CliIo {

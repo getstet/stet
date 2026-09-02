@@ -23,9 +23,9 @@ import { dirname, join, relative, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { generateRegistry } from '../src/codegen.js';
+import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptorWithWarnings } from '../src/descriptor.js';
-import { generateDefaultsModule, loadSnapshot } from '../src/snapshot.js';
+import { loadSnapshot } from '../src/snapshot.js';
 import { writeInitGuidance } from './agents.js';
 import { flag, noPositionals, parse, text } from './args.js';
 import { planJson, planWrite, writePlanned, writeText, type WritePlan } from './artifacts.js';

@@ -40,11 +40,14 @@ import {
 import { createSnapshotStore } from '../adapters/store-snapshot.js';
 import { loadConfig } from '../cli/config.js';
 import { createStetHandler, type PublishEvent } from '../server/mount.js';
+import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { sourceFiles } from '../tests/helpers/source-roster.js';
+import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
 import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { installRegistryDts, typecheckHost } from '../tests/helpers/ts-host.js';
+import { generateDefaultsModule, generateRegistry, generatedBody } from '../src/codegen.js';
+import * as root from '../src/index.js';
 import {
   DESCRIPTOR_SCHEMA,
   SEO_SEVERITY,
@@ -56,12 +59,8 @@ import {
   checkLimits,
   checkVars,
   deriveLabel,
-  generateDefaultsModule,
-  generateRegistry,
-  generatedBody,
   htmlEmailTarget,
   loadDescriptor,
-  mintPreviewToken,
   pageSpan,
   readBundle,
   resolve,
@@ -72,7 +71,6 @@ import {
   targetAdapter,
   targetAdapterIfShipped,
   validateSave,
-  verifyPreviewToken,
   webTarget,
 } from '../src/index.js';
 import type { Bundle, SeoFinding, SeoRule, StoreAdapter, StoreRow } from '../src/index.js';
@@ -712,6 +710,47 @@ describe('content-read', () => {
     expect(
       resolvePreview(descriptor, snapshot, live, { rows: [draft] }, { key: 'hero_headline' }),
     ).toMatchObject({ value: 'A headline still in progress.', source: 'active' });
+
+    // The pair ships on `@getstet/stet/server` — the layer that holds the
+    // signing secret — and nowhere else: both calls above resolve from that
+    // barrel, and the root entry answers for neither. That is what keeps the
+    // signature's builtin off the entry a browser bundle walks.
+    expect({ root: ['mintPreviewToken', 'verifyPreviewToken'].filter((k) => k in root) }).toEqual({
+      root: [],
+    });
+  });
+
+  it('Requirement: The read surface ships free of Node builtins', () => {
+    // The two entries a host's bundler resolves. Whatever they reach at
+    // runtime, webpack has to load: one `node:` specifier in the closure is
+    // where a pages-router build stops, naming Node's module and never stet.
+    const generatorHalf = /(^|\/)(codegen|preview-token)\.ts$/;
+    for (const entry of ['../src/index.ts', '../react/index.ts']) {
+      const closure = runtimeImportClosure(new URL(entry, import.meta.url));
+      // The react closure legitimately names `react`; only builtins are the
+      // property under test.
+      expect({ entry, builtins: closure.bare.filter(isNodeBuiltin) }).toEqual({ entry, builtins: [] });
+      expect({ entry, generator: closure.modules.filter((m) => generatorHalf.test(m)) }).toEqual({
+        entry,
+        generator: [],
+      });
+    }
+
+    // The walker is proven to SEE a builtin before it vouches for none: the two
+    // modules that carry the crypto import are outside both closures above, and
+    // walking from either one finds it.
+    for (const owner of ['../src/codegen.ts', '../src/preview-token.ts']) {
+      const closure = runtimeImportClosure(new URL(owner, import.meta.url));
+      expect({ owner, bare: closure.bare }).toEqual({ owner, bare: expect.arrayContaining(['node:crypto']) });
+    }
+
+    // The predicate closes both spellings — a bundler refuses the `node:`
+    // scheme whether or not the module behind it exists, and the unprefixed
+    // form is closed by the builtin list.
+    expect(isNodeBuiltin('crypto')).toBe(true);
+    expect(isNodeBuiltin('node:crypto')).toBe(true);
+    expect(isNodeBuiltin('react')).toBe(false);
+    expect(isNodeBuiltin('ajv/dist/2020.js')).toBe(false);
   });
 });
 
@@ -3685,7 +3724,7 @@ describe('cli', () => {
     const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
       bin: Record<string, string>;
     };
-    expect(manifest.bin).toEqual({ stet: './dist/cli/main.js' });
+    expect(manifest.bin).toEqual({ stet: 'dist/cli/main.js' });
     expect(readFileSync(new URL('../cli/main.ts', import.meta.url), 'utf8').split('\n')[0]).toBe(
       '#!/usr/bin/env node',
     );

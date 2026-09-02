@@ -18,12 +18,8 @@ import {
   makeCliHost as makeHost,
   type CliHost as Host,
 } from '../conformance/cli-host.js';
-import {
-  generateDefaultsModule,
-  generateRegistry,
-  loadDescriptor,
-  loadSnapshot,
-} from '../src/index.js';
+import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import { loadDescriptor, loadSnapshot } from '../src/index.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
 import type { Snapshot } from '../src/snapshot.js';
 

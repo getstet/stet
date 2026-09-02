@@ -15,13 +15,13 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { generateRegistry } from '../src/codegen.js';
+import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import {
   checkDescriptorStructure,
   DescriptorError,
   type DescriptorWarning,
 } from '../src/descriptor.js';
-import { generateDefaultsModule, type Snapshot } from '../src/snapshot.js';
+import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
 import { flag, parse, refuseEnv } from './args.js';
 import { asUpdate, planJson, planWrite, writePlanned, type WritePlan } from './artifacts.js';

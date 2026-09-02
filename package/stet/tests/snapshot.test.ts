@@ -2,15 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import { miniDescriptor, miniSnapshot, mutable, readFixture } from '../conformance/fixture.js';
 import {
-  checkCurrency,
   checkGeneratedCurrent,
   embeddedHash,
   generateDefaultsModule,
   generateRegistry,
   generatedBody,
-  loadSnapshot,
-  snapshotSmells,
-} from '../src/index.js';
+} from '../src/codegen.js';
+import { checkCurrency, loadSnapshot, snapshotSmells } from '../src/index.js';
 import type { Snapshot } from '../src/index.js';
 
 const descriptor = miniDescriptor();

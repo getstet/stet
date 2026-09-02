@@ -38,9 +38,9 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 
-import { generateRegistry } from '../src/codegen.js';
+import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { route as normalizeRoute } from '../src/seo.js';
-import { generateDefaultsModule, type Snapshot } from '../src/snapshot.js';
+import type { Snapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, type Descriptor, type PageDef } from '../src/types.js';
 import { flag, parse, positionalsAround, refuseEnv } from './args.js';
 import { asUpdate, planJson, planWrite, writePlanned, type WritePlan } from './artifacts.js';

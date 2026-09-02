@@ -19,8 +19,9 @@
 import { join } from 'node:path';
 
 import type { Bundle } from '../src/bundle.js';
+import { generateDefaultsModule } from '../src/codegen.js';
 import { activeRow, resolve } from '../src/resolve.js';
-import { generateDefaultsModule, type Snapshot } from '../src/snapshot.js';
+import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { shapeSchema } from '../src/validate.js';
 import { writeJsonDeterministic, writeText } from './artifacts.js';

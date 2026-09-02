@@ -18,8 +18,7 @@ import { basename, join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { generateRegistry } from '../src/codegen.js';
-import { generateDefaultsModule } from '../src/snapshot.js';
+import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { DEFAULT_TARGET, EMAIL_TARGET, type Descriptor, type Target } from '../src/types.js';
 import { parse, flag, text as argText, noPositionals } from './args.js';
 import { writeJsonDeterministic, writeText } from './artifacts.js';

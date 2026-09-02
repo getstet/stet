@@ -18,7 +18,8 @@ import { describe, expect, it } from 'vitest';
 
 import { runInit } from '../cli/init.js';
 import { packageRoot } from '../cli/installed.js';
-import { generateRegistry, loadDescriptor } from '../src/index.js';
+import { generateRegistry } from '../src/codegen.js';
+import { loadDescriptor } from '../src/index.js';
 
 const tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc');
 const pkg = packageRoot();

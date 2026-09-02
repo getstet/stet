@@ -30,8 +30,8 @@ import { basename, join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { generateRegistry } from '../src/codegen.js';
-import { generateDefaultsModule, type Snapshot } from '../src/snapshot.js';
+import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import type { Snapshot } from '../src/snapshot.js';
 import { opensMarkupTag } from '../src/targets/html-email.js';
 import { EMAIL_TARGET, type Descriptor, type KeyDef, type TemplateDef } from '../src/types.js';
 import { validateSave } from '../src/validate.js';

@@ -15,16 +15,20 @@ layer; the change files under `openspec/` are the specification.
 ## Module map
 
 One line per `src/` file — where things live. It never lists which helpers
-exist: `src/index.ts` is the inventory, and it is the only place that enumerates
-the public surface.
+exist: the three barrels enumerate the shipped surface of their layers —
+`src/index.ts` the root, `react/index.ts` the React layer, `server/index.ts` the
+server layer — and every remaining door is an alias or a single module:
+`./core` (the root's alias), `./react/server`, the four adapter subpaths
+(`store-memory`, `store-snapshot`, `store-pg`, `store-postgrest`) and `./schema`.
+Nothing else lists what the package exports.
 
 | File | Holds |
 |---|---|
-| `src/index.ts` | the public surface — every export the package ships |
+| `src/index.ts` | the root surface — the read path and the host-side checks; the generator half is reached by the CLI by module path, and the preview token pair ships on `@getstet/stet/server` |
 | `src/types.ts` | hand-declared contract types: `Descriptor`, `KeyDef`, `PageDef`, `TemplateDef`, the registry augmentation point |
 | `src/descriptor.ts` | loading and validating a descriptor against the published schema, plus its structural rules |
-| `src/codegen.ts` | descriptor → generated artifacts (the key registry with both its unions — every key, and the string-valued keys a `Record<StringKey, string>` map is typed over — plus the ambient types) and the source hash they carry |
-| `src/snapshot.ts` | the committed snapshot: loading, the generated defaults module, currency and generated-file checks |
+| `src/codegen.ts` | descriptor → generated artifacts (the key registry with both its unions — every key, and the string-valued keys a `Record<StringKey, string>` map is typed over — plus the ambient types and the defaults module), the source hash they carry, and the generated-file currency check over it |
+| `src/snapshot.ts` | the committed snapshot: loading, the descriptor-vs-snapshot currency check, and the smells |
 | `src/resolve.ts` | key → value: the resolution order, the locale chain, quarantine of malformed stored values |
 | `src/bundle.ts` | the read bundle's format and its read semantics (both forms), and `resolveAll` — every declared key resolved once into the map an accessor takes |
 | `src/access.ts` | the framework-free ambient-access contract |
@@ -34,7 +38,8 @@ the public surface.
 | `src/targets/html-email.ts` | the html-email target — the same HTML escaping, the line metrics derived from the email-safe content width, and the element list behind the markup-in-content construct rule |
 | `src/targets/web.ts` | the web target — HTML-entity escaping, the line metrics a budget estimate reads, and the decision that web has no illegal constructs |
 | `src/store.ts` | the normative store interface, and the answers an adapter may return |
-| `src/preview.ts` | the preview seam: the states a preview can name, the signed token that names one, the per-identity override resolver, and a change's page-span |
+| `src/preview.ts` | the preview seam: the states a preview can name, the per-identity override resolver, and a change's page-span |
+| `src/preview-token.ts` | the signed token that names one preview state — mint and verify, the one HMAC in `src/` |
 
 `migrations/` holds the numbered SQL, copied as-is into an adopting project.
 `templates/` holds the four assets stet ships and either writes into a host or
@@ -115,15 +120,17 @@ both are thin over
 | `react/server.ts` | `createServerCopy` — the server-component accessor, a thin wrapper over `createAccessor`, importing no `react` |
 | `react/index.ts` | the `@getstet/stet/react` surface: `CopyProvider`, `useCopy`, `createServerCopy` |
 | `server/mount.ts` | `createStetHandler` — the Bearer-authenticated catch-all `{ GET, POST }`: constant-time auth, the RPC-delegating POST routes, the render proxy and Bearer reads, and the fire-and-forget publish hooks |
-| `server/index.ts` | the `@getstet/stet/server` surface: `createStetHandler` and its event types |
+| `server/index.ts` | the `@getstet/stet/server` surface: `createStetHandler`, its event types, and the preview token pair |
 
 ## Rules
 
 1. **Zero I/O in `src/`.** Every function takes parsed data and returns data —
-   no `fs`, no `fetch`, no `process.env`, no store access. `node:crypto` is the
-   one permitted builtin (the source hash). I/O belongs to adapters, the CLI and
-   tests. This is what makes the offline guarantee structural rather than
-   disciplined.
+   no `fs`, no `fetch`, no `process.env`, no store access. `node:crypto` is
+   permitted in exactly two modules — `codegen.ts` (the source hash) and
+   `preview-token.ts` (the token signature) — and neither is reachable from the
+   root or React entries; the offline guard and the conformance walk assert both
+   halves. I/O belongs to adapters, the CLI and tests. This is what makes the
+   offline guarantee structural rather than disciplined.
 2. **Determinism.** No `Date.now()`, no `Math.random()`, no locale-sensitive
    comparison in `src/`. Same inputs produce byte-identical generated output, so
    a CI diff is trustworthy.

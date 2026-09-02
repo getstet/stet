@@ -13,14 +13,12 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { checkDescriptorStructure, loadDescriptorWithWarnings } from '../src/descriptor.js';
-import { generateRegistry } from '../src/codegen.js';
 import {
-  checkCurrency,
   checkGeneratedCurrent,
   generateDefaultsModule,
-  loadSnapshot,
-  type Snapshot,
-} from '../src/snapshot.js';
+  generateRegistry,
+} from '../src/codegen.js';
+import { checkCurrency, loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { loadConfig, type StetConfig } from './config.js';

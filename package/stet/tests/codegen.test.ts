@@ -1,14 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { miniDescriptor, mutable } from '../conformance/fixture.js';
-import {
-  DESCRIPTOR_SCHEMA,
-  embeddedHash,
-  generateRegistry,
-  generatedBody,
-  loadDescriptor,
-  sourceHash,
-} from '../src/index.js';
+import { embeddedHash, generateRegistry, generatedBody, sourceHash } from '../src/codegen.js';
+import { DESCRIPTOR_SCHEMA, loadDescriptor } from '../src/index.js';
 import { installRegistryDts, typecheckHost } from './helpers/ts-host.js';
 
 const descriptor = miniDescriptor();

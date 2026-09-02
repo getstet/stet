@@ -3,8 +3,9 @@ import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 
 import { miniDescriptor, miniRows, miniSnapshot, mutable } from '../conformance/fixture.js';
-import { mintPreviewToken, pageSpan, resolve, resolvePreview, verifyPreviewToken } from '../src/index.js';
+import { pageSpan, resolve, resolvePreview } from '../src/index.js';
 import type { PreviewState, StoreRow } from '../src/index.js';
+import { mintPreviewToken, verifyPreviewToken } from '../src/preview-token.js';
 
 const descriptor = miniDescriptor();
 const snapshot = miniSnapshot();

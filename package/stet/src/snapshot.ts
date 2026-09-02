@@ -1,5 +1,9 @@
-import { embeddedHash, generatedBody, generatedHeader, sourceHash } from './codegen.js';
 import type { Descriptor, Warning } from './types.js';
+
+/**
+ * The committed snapshot: loading, the descriptor-vs-snapshot currency check,
+ * and the smells. Types are its only import.
+ */
 
 /**
  * The committed values, per locale. `default` is required and is the only
@@ -27,25 +31,6 @@ export function loadSnapshot(raw: unknown): Snapshot {
     throw new Error('snapshot must carry the "default" locale');
   }
   return snapshot as Snapshot;
-}
-
-/**
- * `defaults.ts` from `defaults.json`. Locales and keys sort, so a one-value
- * change is a one-line diff; regeneration from the same JSON is byte-identical.
- */
-export function generateDefaultsModule(s: Snapshot): string {
-  const sorted: Snapshot = {};
-  for (const locale of Object.keys(s).sort()) {
-    const values = s[locale] ?? {};
-    const sortedValues: Record<string, unknown> = {};
-    for (const key of Object.keys(values).sort()) sortedValues[key] = values[key];
-    sorted[locale] = sortedValues;
-  }
-  return (
-    generatedHeader('defaults.json', sourceHash(s)) +
-    '\n' +
-    `export const DEFAULTS = ${JSON.stringify(sorted, null, 2)} as const;\n`
-  );
 }
 
 export interface CurrencyReport {
@@ -100,34 +85,4 @@ export function snapshotSmells(s: Snapshot): Warning[] {
     }
   }
   return warnings;
-}
-
-export type GeneratedState = 'current' | 'staleSource' | 'handEdited';
-
-export interface GeneratedCheck {
-  status: GeneratedState;
-  /** The hash the file carries, or null when it carries no stet header. */
-  embedded: string | null;
-  /** The hash the source produces now. */
-  fresh: string;
-}
-
-/**
- * Two distinct states, because they need two distinct fixes. `staleSource`: the
- * source moved and the file did not — regenerate. `handEdited`: the hashes
- * agree and the body does not, which a hash alone cannot see — the mechanism is
- * regenerate-and-byte-compare.
- */
-export function checkGeneratedCurrent<T>(
-  fileText: string,
-  source: T,
-  generate: (source: T) => string,
-): GeneratedCheck {
-  const embedded = embeddedHash(fileText);
-  const fresh = sourceHash(source);
-  if (embedded !== fresh) return { status: 'staleSource', embedded, fresh };
-  if (generatedBody(fileText) !== generatedBody(generate(source))) {
-    return { status: 'handEdited', embedded, fresh };
-  }
-  return { status: 'current', embedded, fresh };
 }

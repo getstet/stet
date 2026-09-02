@@ -25,9 +25,10 @@ import { dirname, join, relative, resolve as resolvePath, sep } from 'node:path'
 
 import type * as TS from 'typescript';
 
+import { generateDefaultsModule } from '../src/codegen.js';
 import { activeRow, resolve } from '../src/resolve.js';
 import type { StoreRow } from '../src/resolve.js';
-import { generateDefaultsModule, type Snapshot } from '../src/snapshot.js';
+import type { Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter, VersionRow } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
 import {
