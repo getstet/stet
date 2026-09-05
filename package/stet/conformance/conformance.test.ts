@@ -58,6 +58,7 @@ import {
   checkClassRules,
   checkCurrency,
   checkLimits,
+  plainOf,
   checkVars,
   deriveLabel,
   htmlEmailTarget,
@@ -76,11 +77,14 @@ import {
 } from '../src/index.js';
 import type { Bundle, Descriptor, SeoFinding, SeoRule, Snapshot, StoreAdapter, StoreRow } from '../src/index.js';
 import {
+  bareHtmlHost,
   cleanupCliHosts,
   countingStore,
   fakeFetch,
+  htmlFixture,
   makeAdoptionHost,
   makeCliHost,
+  makeHtmlHost,
   publishFailsOnce,
   type CliHost,
 } from './cli-host.js';
@@ -300,6 +304,43 @@ describe('descriptor', () => {
       'brand__footer_address',
     ]);
     expect(descriptor.keys['hero_headline']?.agentPublish).toBeUndefined();
+  });
+
+  it('Requirement: A text key may declare placeholder tags', async () => {
+    // The field is written by `register` on the static-HTML host, for an element
+    // that mixes text with child elements, and read by the save gate and the
+    // length rule. The identity of a tag — the element's name and attributes —
+    // lives in the document, never in the value.
+    const host = await makeHtmlHost({ register: true });
+    const written = JSON.parse(host.file('content/descriptor.json')) as {
+      keys: Record<string, { shape: string; target: string; tags?: number }>;
+    };
+    const values = (JSON.parse(host.file('content/defaults.json')) as { default: Record<string, string> })
+      .default;
+    expect(written.keys['you_may_already_have_the_data_our_ai']).toEqual({
+      shape: 'text',
+      target: 'web',
+      tags: 1,
+    });
+    expect(values['you_may_already_have_the_data_our_ai']).toBe(
+      'You may already have the data<1> our AI lab partners need.</1>',
+    );
+    // A nested pair declares two; an element with no descendants declares none.
+    const nested = Object.entries(values).find(([, v]) => v === 'Hello <1>big <2>world</2></1>!')![0];
+    expect(written.keys[nested]?.tags).toBe(2);
+    const plain = Object.entries(values).find(([, v]) => v === 'Imaging archives')![0];
+    expect(written.keys[plain]).toEqual({ shape: 'text', target: 'web' });
+
+    // The schema rejects a count below one, naming the path.
+    const document = mutable(readFixture('descriptor.json') as Record<string, never>);
+    (document as Record<string, any>)['keys']['hero_headline']['tags'] = 0;
+    let rejected: DescriptorError | null = null;
+    try {
+      loadDescriptor(document);
+    } catch (error) {
+      rejected = error as DescriptorError;
+    }
+    expect(rejected?.path).toBe('keys/hero_headline/tags');
   });
 
   it('Requirement: Variables are a declared whitelist', () => {
@@ -835,6 +876,44 @@ describe('validation', () => {
     expect(checkLimits(structured, 'theme_mode', 'system').findings).toEqual([]);
     expect(checkLimits(structured, 'brand__radius', 8).findings).toEqual([]);
     expect(checkLimits(structured, 'brand__primary', '#1d4ed8').findings).toEqual([]);
+
+    // A key declaring `tags` is measured over its PLAIN text, and reports that
+    // length, so the counter and a reader agree on what the value says.
+    const tagged = mutable(descriptor);
+    tagged.keys['hero_headline']!.limits = { max: 20, severity: 'hard' };
+    tagged.keys['hero_headline']!.tags = 1;
+    const value = '<1>Nineteen chars here</1>';
+    expect(value.length).toBe(26);
+    expect(plainOf(value).length).toBe(19);
+    expect(checkLimits(tagged, 'hero_headline', value).findings).toEqual([]);
+    const untagged = mutable(tagged);
+    delete untagged.keys['hero_headline']!.tags;
+    expect(checkLimits(untagged, 'hero_headline', value).findings[0]).toMatchObject({
+      length: 26,
+      max: 20,
+    });
+  });
+
+  it('Requirement: Placeholder tags are kept whole at save', () => {
+    const tagged = mutable(descriptor);
+    tagged.keys['hero_headline']!.tags = 1;
+    const save = (value: string) => validateSave(tagged, { key: 'hero_headline', value });
+    const fault = (value: string) => save(value).findings.find((f) => f.rule === 'tags')?.message ?? '';
+
+    // Exactly 1..n, each once, properly nested.
+    expect(save('You may<1> need.</1>').ok).toBe(true);
+    expect(fault('You may need.')).toContain('tag 1 missing');
+    expect(fault('<1>a</1><1>b</1>')).toContain('tag 1 twice');
+    expect(fault('</1>a<1>')).toContain('</1> before <1>');
+    expect(fault('<1>a')).toContain('<1> never closed');
+    expect(fault('<1>a</1><2/>')).toContain('tag 2 beyond 1..1');
+
+    // Reordering is allowed — a translation may move the emphasised part.
+    expect(save('<1> our partners</1> may already have your data').ok).toBe(true);
+    // Only placeholder-shaped tokens are tags: any other `<` is prose.
+    expect(save('a <b>c</b><1/>').ok).toBe(true);
+    // A key without `tags` is not checked at all.
+    expect(validateSave(descriptor, { key: 'hero_headline', value: 'the <1> shape' }).ok).toBe(true);
   });
 
   it('Requirement: Undeclared variables are rejected at save', () => {
@@ -1588,6 +1667,44 @@ describe('seo', () => {
     expect(seeded.seo_tour_title).toBe('The tour');
     expect(seeded.seo_tour_desc).toBe('Read this first');
     expect(seeded.seo_guide_title).toBe('Old');
+
+    // On the static-HTML host the convention is the `html` arm — the ONE arm the
+    // config selects rather than a directory probe. Its one content read is the
+    // document's marks, and it mints nothing.
+    const html = await makeHtmlHost({
+      register: true,
+      files: {
+        'about.html': '<html><head><meta charset="utf-8"></head><body><p>About the team.</p></body></html>\n',
+        'review/shot.png': 'not a page',
+      },
+    });
+    expect(await html.run('pages', 'scan')).toBe(0);
+    expect(html.stdout()).toContain('  title: bound to psyon_data_partnerships_for_ai_labs');
+    expect(html.stdout()).toContain('  description: bound to psyon_connects_hospitals_labs_and');
+    expect(html.stdout()).toContain('  title: no marked <title> — run stet register first, or declare it by hand');
+    expect(html.stdout()).not.toContain('shot');
+
+    html.out.length = 0;
+    expect(await html.run('pages', 'scan', '--apply')).toBe(0);
+    const bound = JSON.parse(html.file('content/descriptor.json')) as {
+      pages: Record<string, { seo?: Record<string, string> }>;
+      keys: Record<string, { pages?: string[] }>;
+    };
+    expect(bound.pages['home']?.seo).toEqual({
+      title: 'psyon_data_partnerships_for_ai_labs',
+      description: 'psyon_connects_hospitals_labs_and',
+    });
+    // No `seo_home_*` was minted, and the page with no marks scaffolds nothing.
+    expect(bound.keys['seo_home_title']).toBeUndefined();
+    expect(bound.keys['seo_about_title']).toBeUndefined();
+    expect(bound.pages['about']?.seo).toBeUndefined();
+    // The bound key carries the page in its reverse index.
+    expect(bound.keys['psyon_data_partnerships_for_ai_labs']?.pages).toEqual(['home']);
+    // The gap is `seo check`'s to report, honestly.
+    html.out.length = 0;
+    html.err.length = 0;
+    expect(await html.run('seo', 'check')).toBe(1);
+    expect(html.stderr()).toContain('page "about" declares no SEO title');
   });
 });
 
@@ -2996,6 +3113,23 @@ describe('cli', () => {
     const rejected = makeCliHost({ config: { seoCheck: { 'anchor-txt': 'error' } } });
     expect(await rejected.run('seo', 'check')).toBe(1);
     expect(rejected.stderr()).toContain('seoCheck.anchor-txt');
+
+    // The static-HTML host's config carries the host and nothing it does not use.
+    const html = await makeHtmlHost();
+    const written = JSON.parse(html.file('stet.config.json')) as Record<string, unknown>;
+    expect(written['host']).toBe('html');
+    expect(written['managedSurfaces']).toEqual(['**/*.html']);
+    for (const absent of ['readPath', 'codegen', 'router', 'rootLayout']) {
+      expect(Object.hasOwn(written, absent)).toBe(false);
+    }
+    // …and the loader fills them in memory, where nothing on this host reads them.
+    const htmlConfig = loadConfig(html.cwd);
+    expect(htmlConfig.host).toBe('html');
+    expect(htmlConfig.router).toBe('app');
+    expect(htmlConfig.readPath.file).toBe('lib/content.ts');
+    // Any other value is a config error naming the two states.
+    writeFileSync(join(html.cwd, 'stet.config.json'), JSON.stringify({ host: 'static' }));
+    expect(() => loadConfig(html.cwd)).toThrow(/host must be "html", or absent for a JavaScript host/);
   });
 
   it('Requirement: Every store-touching command accepts --env', async () => {
@@ -3068,11 +3202,13 @@ describe('cli', () => {
   });
 
   it('Requirement: Mode is detected, never asked', async () => {
-    // No store block: snapshot-only, silently. Nothing asks, nothing warns.
+    // No store block: snapshot-only, silently. Nothing asks, and nothing warns
+    // ABOUT THE MODE — the temp host is not a git checkout, so the publish-route
+    // warn the doctor requirement adds is present and is a different subject.
     const silent = makeCliHost({ config: {} });
     expect(await silent.run('doctor')).toBe(0);
     expect(silent.stdout()).toContain('store: snapshot-only');
-    expect(silent.stderr()).toBe('');
+    expect(silent.stderr()).toBe('warn: git: not a repository — publish cannot be a commit; run git init');
 
     // Configured and broken is the opposite of silent: the variable is named.
     const broken = makeCliHost({ config: { store: { adapter: 'pg' } }, env: {} });
@@ -3218,6 +3354,21 @@ describe('cli', () => {
     expect(defaults.stderr()).toContain('content/defaults.ts: stale — its source moved; run stet pull');
     expect(await defaults.run('pull')).toBe(0);
     expect(await defaults.run('check')).toBe(0);
+
+    // On the static-HTML host the generated files ARE the marked documents.
+    const html = await makeHtmlHost({ register: true });
+    expect(await html.run('check')).toBe(0);
+    expect(html.stdout()).toContain('document: index.html current (28 marks)');
+    expect(html.stdout()).not.toContain('generated:');
+    // A mark naming no declared key is an error naming both remedies.
+    writeFileSync(
+      join(html.cwd, 'index.html'),
+      html.file('index.html').replace('<h2 data-stet="', '<h2 data-stet="nope" x-data-stet="'),
+    );
+    html.out.length = 0;
+    html.err.length = 0;
+    expect(await html.run('check')).toBe(1);
+    expect(html.stderr()).toContain('names no descriptor key — run stet register, or remove the mark');
   });
 
   it('Requirement: pull materializes the truth into the repo forms', async () => {
@@ -3255,6 +3406,20 @@ describe('cli', () => {
     const snapshotOnly = makeCliHost({ config: {} });
     expect(await snapshotOnly.run('pull')).toBe(0);
     expect(snapshotOnly.exists('.stet/bundle.json')).toBe(false);
+
+    // On the static-HTML host the repo forms are the snapshot and the documents.
+    const html = await makeHtmlHost({ register: true });
+    const values = JSON.parse(html.file('content/defaults.json')) as { default: Record<string, string> };
+    const key = Object.entries(values.default).find(([, v]) => v === 'Imaging archives')![0];
+    values.default[key] = 'Imaging collections';
+    writeFileSync(join(html.cwd, 'content/defaults.json'), `${JSON.stringify(values, null, 2)}\n`);
+    expect(await html.run('pull')).toBe(0);
+    expect(html.file('index.html')).toContain('<li data-stet="' + key + '">Imaging collections</li>');
+    expect(html.exists('content/defaults.ts')).toBe(false);
+    // A second pull writes nothing and says so.
+    html.out.length = 0;
+    expect(await html.run('pull')).toBe(0);
+    expect(html.stdout()).toContain('pull: documents current');
   });
 
   it('Requirement: seed writes version 1, idempotently', async () => {
@@ -3493,6 +3658,18 @@ describe('cli', () => {
     forms.forEach((rel, i) => {
       expect(`${rel}: ${readFileSync(join(unknown.cwd, rel)).equals(untouched[i]!)}`).toBe(`${rel}: true`);
     });
+
+    // On the static-HTML host the forms include the MARKS: the plan names each
+    // one, and the batch strips it with the text kept.
+    const html = await makeHtmlHost({ register: true });
+    expect(await html.run('remove', 'how_it_works')).toBe(0);
+    expect(html.stdout()).toContain('the mark is removed and the text stays');
+    expect(html.stdout()).toContain('every other mark is regenerated in the same write');
+    html.out.length = 0;
+    expect(await html.run('remove', 'how_it_works', '--write')).toBe(0);
+    expect(html.file('index.html')).not.toContain('data-stet="how_it_works"');
+    expect(html.file('index.html')).toContain('<a href="#how">How it works</a>');
+    expect(await html.run('check')).toBe(0);
   });
 
   it('Requirement: publish is one path — click, agent and clock', async () => {
@@ -3786,6 +3963,16 @@ describe('cli', () => {
     pointAt(emitted, 'welcome-email.ts');
     expect(await emitted.run('doctor')).toBe(0);
     expect(emitted.stderr()).not.toContain('wrapperProvides declares "unsubscribe_url"');
+
+    // The static-HTML host is named, and a snapshot-only checkout outside git
+    // is told that publish cannot be a commit.
+    const html = await makeHtmlHost({ register: true });
+    expect(await html.run('doctor')).toBe(0);
+    expect(html.stdout()).toContain('host: html — the marked documents are the rendered form; publish = commit');
+    expect(html.stderr()).toContain('git: not a repository — publish cannot be a commit; run git init');
+    const inGit = await makeHtmlHost({ register: true, git: true });
+    expect(await inGit.run('doctor')).toBe(0);
+    expect(inGit.stderr()).not.toContain('git: not a repository');
   });
 
   it('Requirement: upgrade knows what it upgrades from', async () => {
@@ -3833,6 +4020,12 @@ describe('cli', () => {
 
     // The registry regenerates from the descriptor, always.
     expect(verified.stdout()).toContain('content/keys.ts: unchanged');
+
+    // There is no registry to regenerate on the static-HTML host.
+    const html = await makeHtmlHost({ register: true });
+    expect(await html.run('upgrade', '--dry-run')).toBe(0);
+    expect(html.stdout()).toContain('codegen: none on an html host — the documents are regenerated by stet pull');
+    expect(html.exists('content/keys.ts')).toBe(false);
   });
 
   it('Requirement: The Python helper reads the bundle contract', () => {
@@ -3947,6 +4140,154 @@ describe('cli', () => {
 });
 
 describe('adoption', () => {
+  it("Requirement: A static-HTML host's documents are generated forms of the snapshot", async () => {
+    // ONE walk over a real static-HTML host: adopt it, prove the page is a
+    // generated form of the snapshot in both directions, bind its SEO, drop a
+    // key, and eject back to plain markup.
+    const host = bareHtmlHost({
+      'about.html': '<html><head><meta charset="utf-8"></head><body><p>About the team.</p></body></html>\n',
+    });
+    const original = host.file('index.html');
+
+    // init — the host is named, the shape is written, and nothing JavaScript is.
+    expect(await host.run('init', '--yes')).toBe(0);
+    // The evidence names the first `.html` at the root in sorted order.
+    expect(host.stdout()).toContain('host: html (about.html at the root, no framework in package.json)');
+    expect(host.exists('content/descriptor.json')).toBe(true);
+    expect(host.exists('lib/content.ts')).toBe(false);
+    expect(host.exists('content/keys.ts')).toBe(false);
+    expect(host.exists('stet/migrations')).toBe(false);
+    expect(JSON.parse(host.file('content/descriptor.json'))).toEqual({ version: 1, keys: {} });
+
+    // scan — the elements are located and keyed.
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('scan')).toBe(0);
+    expect(host.stdout()).toContain('scan: 2 files, 29 unkeyed literals');
+    expect(host.stderr()).toContain('propose key software_product_and_engineering');
+
+    // register — the plain run writes nothing, `--write` lands one batch.
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(host.file('index.html')).toBe(original);
+    expect(JSON.parse(host.file('content/descriptor.json')).keys).toEqual({});
+
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const descriptor = () => JSON.parse(host.file('content/descriptor.json')) as {
+      keys: Record<string, { tags?: number; pages?: string[] }>;
+      pages?: Record<string, { route: string; seo?: Record<string, string> }>;
+    };
+    const snapshot = () => JSON.parse(host.file('content/defaults.json')) as {
+      default: Record<string, string>;
+    };
+    // The mark is the ONLY edit: the document is byte-identical without it.
+    expect(host.file('index.html').replace(/ data-stet[^ >]*="[^"]*"/g, '')).toBe(original);
+    // A mixed element declares its placeholder count; identical text shares one key.
+    expect(descriptor().keys['you_may_already_have_the_data_our_ai']?.tags).toBe(1);
+    expect(host.file('index.html').match(/data-stet="how_it_works"/g)).toHaveLength(2);
+
+    // check — every mark walked, the documents current.
+    host.out.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('document: index.html current (28 marks)');
+
+    // A hand edit to the page is caught, and `pull` puts the snapshot back.
+    const key = Object.entries(snapshot().default).find(
+      ([, v]) => v === 'Software, product and engineering histories',
+    )![0];
+    writeFileSync(
+      join(host.cwd, 'index.html'),
+      host.file('index.html').replace('Software, product and engineering histories', 'Edited by hand'),
+    );
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain(`${key} differs from the snapshot — run stet pull`);
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('index.html')).toContain('>Software, product and engineering histories<');
+    expect(await host.run('check')).toBe(0);
+
+    // And a snapshot edit reaches the page the same way.
+    const edited = snapshot();
+    edited.default[key] = 'Engineering histories';
+    writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(edited, null, 2)}\n`);
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('index.html')).toContain('>Engineering histories<');
+    // Every byte outside the mark's content is unchanged: strip the marks the
+    // adoption inserted, put the old text back, and the original page returns.
+    expect(
+      host
+        .file('index.html')
+        .replace(/ data-stet[^ >]*="[^"]*"/g, '')
+        .replace('Engineering histories', 'Software, product and engineering histories'),
+    ).toBe(original);
+
+    // A value that lost its placeholder is refused, and nothing is written.
+    const broken = snapshot();
+    const mixed = 'you_may_already_have_the_data_our_ai';
+    broken.default[mixed] = 'You may already have the data our AI lab partners need.';
+    writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(broken, null, 2)}\n`);
+    const beforeRefusal = host.file('index.html');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('could not be regenerated');
+    expect(host.stderr()).toContain('tag-count-mismatch');
+    expect(host.file('index.html')).toBe(beforeRefusal);
+    // Put it back so the walk continues from a green host.
+    broken.default[mixed] = 'You may already have the data<1> our AI lab partners need.</1>';
+    writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(broken, null, 2)}\n`);
+    expect(await host.run('check')).toBe(0);
+
+    // pages scan — the marks are the binding, and nothing is minted.
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(descriptor().pages?.['home']?.seo).toEqual({
+      title: 'psyon_data_partnerships_for_ai_labs',
+      description: 'psyon_connects_hospitals_labs_and',
+    });
+    expect(descriptor().pages?.['about']?.seo).toBeUndefined();
+    expect(descriptor().keys['seo_about_title']).toBeUndefined();
+    // No unmarked key was scaffolded, so check stays free of that warn.
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).not.toContain('marked in no document');
+    // The honest red is seo check's own.
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('seo', 'check')).toBe(1);
+    expect(host.stderr()).toContain('over the 160-character bound');
+    expect(host.stderr()).toContain('page "about" declares no SEO title');
+
+    // remove — the mark is stripped and its text stays.
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('remove', 'how_it_works', '--write')).toBe(0);
+    expect(host.file('index.html')).not.toContain('data-stet="how_it_works"');
+    expect(host.file('index.html')).toContain('<a href="#how">How it works</a>');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+
+    // eject — every mark gone, the text standing as the snapshot says.
+    expect(await host.run('hook', 'install')).toBe(0);
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('eject', '--write')).toBe(0);
+    expect(/data-stet/.test(host.file('index.html'))).toBe(false);
+    expect(host.file('index.html')).toContain('>Engineering histories<');
+    expect(host.stdout()).toContain('stays (no stet imports): stet.config.json');
+    expect(host.exists('.git/hooks/pre-commit')).toBe(false);
+    expect(host.file('package.json')).not.toContain('@getstet/stet');
+  });
+
   it('Requirement: init scaffolds a project with a single, shown edit to existing code', async () => {
     const host = makeAdoptionHost();
     expect(await host.run('init', '--yes')).toBe(0);
@@ -4212,6 +4553,43 @@ describe('adoption', () => {
     const nextConfig = JSON.parse(next.file('stet.config.json')) as Record<string, unknown>;
     expect(nextConfig['router']).toBe('app');
     expect(nextConfig['rootLayout']).toBe('app/layout.tsx');
+
+    // A plain HTML site is detected and scaffolded as its own host kind. Its
+    // config carries the paths and settings alone, the descriptor is EMPTY, and
+    // no read path, codegen, migration or hook is written.
+    const plain = bareHtmlHost();
+    expect(await plain.run('init', '--yes')).toBe(0);
+    expect(plain.stdout()).toContain('host: html (index.html at the root, no framework in package.json)');
+    expect(plain.stdout()).not.toContain('router:');
+    expect(plain.stdout()).not.toContain('note:');
+    expect(plain.exists('lib/content.ts')).toBe(false);
+    expect(plain.exists('content/keys.ts')).toBe(false);
+    expect(plain.exists('.git/hooks/pre-commit')).toBe(false);
+    expect(JSON.parse(plain.file('content/descriptor.json'))).toEqual({ version: 1, keys: {} });
+    expect(plain.file('AGENTS.md')).toContain('data-stet');
+    expect(plain.file('AGENTS.md')).toContain('stet pull');
+    expect(plain.stdout()).toContain('1 page, 22 text elements, 6 attributes — next: stet scan, then stet hook install');
+    // A re-run changes nothing.
+    const before = plain.file('index.html');
+    expect(await plain.run('init', '--yes')).toBe(0);
+    expect(plain.file('index.html')).toBe(before);
+
+    // A Vite host carrying a root index.html stays a JavaScript host — the
+    // manifest is the tell, not the markup — while `--host html` forces it.
+    const vite = bareHtmlHost();
+    writeFileSync(
+      join(vite.cwd, 'package.json'),
+      JSON.stringify({ name: 'spa', private: true, devDependencies: { vite: '^5' } }, null, 2),
+    );
+    expect(await vite.run('init', '--yes')).toBe(0);
+    expect(vite.stdout()).toContain('router: app (default — no route files found)');
+    const forced = bareHtmlHost();
+    writeFileSync(
+      join(forced.cwd, 'package.json'),
+      JSON.stringify({ name: 'spa', private: true, devDependencies: { vite: '^5' } }, null, 2),
+    );
+    expect(await forced.run('init', '--host', 'html', '--yes')).toBe(0);
+    expect(forced.stdout()).toContain('host: html (--host html)');
   });
 
   it('Requirement: agents install writes the routing guidance into an already-adopted host', async () => {
@@ -4580,6 +4958,44 @@ describe('adoption', () => {
     unopted.write('src/pages/team.astro', '<h1>Team</h1>\n');
     expect(await unopted.run('scan')).toBe(0);
     expect(unopted.stderr()).not.toContain('has no page record');
+
+    // The fifth dialect: an `.html` on a JavaScript host is text-warned with no
+    // proposed key, like every other dialect.
+    const htmlDialect = makeCliHost({ config: { router: 'astro', managedSurfaces: ['src/**/*.html'] } });
+    mkdirSync(join(htmlDialect.cwd, 'src'), { recursive: true });
+    writeFileSync(join(htmlDialect.cwd, 'src/legacy.html'), '<html><body><h1>A legacy label</h1></body></html>');
+    expect(await htmlDialect.run('scan')).toBe(0);
+    expect(htmlDialect.stderr()).toContain('possible copy "A legacy label"');
+    expect(htmlDialect.stderr()).not.toContain('propose key');
+
+    // On the static-HTML host scan goes further: the element behind each run is
+    // located, and the finding carries a key.
+    const html = await makeHtmlHost();
+    expect(await html.run('scan', '--json')).toBe(0);
+    const located = html.json<{
+      html: { proposals: Array<{ tag: string; section?: string; tags: number; value: string }>; skips: unknown[] };
+    }>().html;
+    expect(located.skips).toEqual([]);
+    const heading = located.proposals.find((p) => p.tag === 'h3');
+    expect(heading).toMatchObject({ section: 'qualify' });
+    // A mixed element is ONE proposal carrying numbered placeholder tags.
+    expect(located.proposals.find((p) => p.tag === 'h1')).toMatchObject({
+      tags: 1,
+      value: 'You may already have the data<1> our AI lab partners need.</1>',
+    });
+    expect(located.proposals.find((p) => p.value === 'Hello <1>big <2>world</2></1>!')?.tags).toBe(2);
+
+    // A claimed mark is silent; a refused one is a named skip.
+    const marked = await makeHtmlHost({ register: true });
+    marked.out.length = 0;
+    marked.err.length = 0;
+    expect(await marked.run('scan')).toBe(0);
+    expect(marked.stderr()).not.toContain('Software, product and engineering histories');
+    const edges = await makeHtmlHost({ files: { 'index.html': htmlFixture('edges.html') } });
+    expect(await edges.run('scan')).toBe(0);
+    expect(edges.stderr()).toContain('skipped (mark-on-non-key-element)');
+    expect(edges.stderr()).toContain('skipped (mark-in-refused-context)');
+    expect(edges.stderr()).toContain('skipped (unknown-entity)');
   });
 
   it('Requirement: register adds a key and rewrites the consuming leaf', async () => {
@@ -4770,6 +5186,46 @@ describe('adoption', () => {
     const listed = refusing.out.slice(beforeVerbose);
     expect(listed.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toHaveLength(4);
     expect(listed.join('\n')).not.toContain('run with --verbose to list them');
+
+    // On the static-HTML host the ONE edit is the mark, and the plain run writes
+    // nothing at all — a departure from the JavaScript branch above, kept
+    // because a descriptor entry without its mark is half a batch.
+    const html = await makeHtmlHost();
+    const original = html.file('index.html');
+    const emptyDescriptor = html.file('content/descriptor.json');
+    expect(await html.run('register', '--from', 'scan')).toBe(0);
+    expect(html.file('index.html')).toBe(original);
+    expect(html.file('content/descriptor.json')).toBe(emptyDescriptor);
+
+    html.out.length = 0;
+    expect(await html.run('register', '--from', 'scan', '--write')).toBe(0);
+    // Byte-identical outside the inserted attributes; no typescript, no alias.
+    expect(html.file('index.html').replace(/ data-stet[^ >]*="[^"]*"/g, '')).toBe(original);
+    expect(html.exists('content/keys.ts')).toBe(false);
+    const keys = (JSON.parse(html.file('content/descriptor.json')) as {
+      keys: Record<string, { tags?: number }>;
+    }).keys;
+    const values = (JSON.parse(html.file('content/defaults.json')) as {
+      default: Record<string, string>;
+    }).default;
+    expect(keys['you_may_already_have_the_data_our_ai']?.tags).toBe(1);
+    // `&amp;` read back as the character it denotes.
+    expect(values['research_development_notes']).toBe('Research & development notes.');
+    // Identical text shares ONE key; the near-misses take the suffixes in order.
+    expect(Object.keys(keys).filter((k) => k.startsWith('how_it_works')).sort()).toEqual([
+      'how_it_works',
+      'how_it_works_2',
+      'how_it_works_3',
+    ]);
+    expect(html.file('index.html').match(/data-stet="how_it_works"/g)).toHaveLength(2);
+    // A link carrying both a copy title and text takes both marks on one tag.
+    expect(html.file('index.html')).toContain(
+      '<a href="/book" title="Book now" data-stet="book_now" data-stet-title="book_now">',
+    );
+    // A second run adopts nothing.
+    html.out.length = 0;
+    expect(await html.run('register', '--from', 'scan')).toBe(0);
+    expect(html.stdout()).toContain('register: nothing to adopt');
   });
 
   it('Requirement: eject un-rewrites the host, writes content back, and removes the dependency', async () => {
@@ -5042,6 +5498,31 @@ describe('adoption', () => {
     const wallListed = wall.out.slice(beforeWallVerbose);
     expect(wallListed.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toHaveLength(5);
     expect(wallListed.join('\n')).not.toContain('run with --verbose to list them');
+
+    // On the static-HTML host there is nothing to un-rewrite, unwrap or delete:
+    // the marks are the whole install.
+    const html = await makeHtmlHost({ register: true, git: true });
+    expect(await html.run('agents', 'install')).toBe(0);
+    expect(await html.run('hook', 'install')).toBe(0);
+    html.out.length = 0;
+    html.err.length = 0;
+    // Plan-only touches nothing.
+    const beforePlan = html.file('index.html');
+    expect(await html.run('eject')).toBe(0);
+    expect(html.stdout()).toContain('document: index.html — every mark removed, the text stays');
+    expect(html.stdout()).not.toContain('un-rewrite');
+    expect(html.file('index.html')).toBe(beforePlan);
+
+    html.out.length = 0;
+    expect(await html.run('eject', '--write')).toBe(0);
+    expect(/data-stet/.test(html.file('index.html'))).toBe(false);
+    expect(html.file('index.html')).toBe(htmlFixture('index.html'));
+    expect(html.exists('AGENTS.md')).toBe(false);
+    expect(html.exists('.git/hooks/pre-commit')).toBe(false);
+    expect(html.file('package.json')).not.toContain('@getstet/stet');
+    expect(html.stdout()).toContain(
+      'stays (no stet imports): stet.config.json, content/descriptor.json, content/defaults.json',
+    );
   });
 
   it('Requirement: hook install adds the pre-commit gate, opt-in and executable', async () => {

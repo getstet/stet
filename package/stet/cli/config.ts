@@ -84,6 +84,14 @@ export interface StetConfig {
    */
   router: 'app' | 'pages' | 'astro';
   /**
+   * The host kind. Absent is a JavaScript host — a framework with a build, read
+   * through a scaffolded module. `"html"` is the static-HTML host, whose
+   * written config carries no `readPath`, `codegen`, `router` or `rootLayout`:
+   * the loader fills defaults nothing on that host reads, and every consumer of
+   * those fields branches on `isHtmlHost` at its own seam.
+   */
+  host?: 'html';
+  /**
    * The module `init` scaffolds the server accessor into. `file` is where it
    * was written; `import` is the specifier `register` inserts into a server
    * leaf, which is a host path alias a bare relative path would not match.
@@ -264,6 +272,9 @@ export function loadConfig(cwd: string): StetConfig {
   config.descriptorPath = str(source, 'descriptorPath', config.descriptorPath);
   config.snapshotPath = str(source, 'snapshotPath', config.snapshotPath);
   config.bundlePath = str(source, 'bundlePath', config.bundlePath);
+
+  const kind = host(source);
+  if (kind !== undefined) config.host = kind;
 
   config.router = router(source);
   // The default is filled for a Next host only: on Astro `undefined` is the
@@ -540,6 +551,30 @@ function readJsonc(path: string): unknown {
       return null;
     }
   }
+}
+
+/**
+ * The host kind, constrained at the parse the way `router` is: absent, or the
+ * one named state. A typo names both accepted spellings rather than silently
+ * scaffolding a JavaScript host over a page that has no build.
+ */
+function host(source: Record<string, unknown>): 'html' | undefined {
+  const value = source['host'];
+  if (value === undefined) return undefined;
+  if (value !== 'html') {
+    throw new CliError(
+      `${CONFIG_FILE}: host must be "html", or absent for a JavaScript host — got ${JSON.stringify(value)}`,
+    );
+  }
+  return 'html';
+}
+
+/**
+ * The ONE predicate every seam asks. Nothing tests `config.host === 'html'`
+ * inline, so the proof that a seam branched is a grep for this name.
+ */
+export function isHtmlHost(config: Pick<StetConfig, 'host'>): boolean {
+  return config.host === 'html';
 }
 
 /** The three routers, constrained at the parse so `register` never branches on a typo. */

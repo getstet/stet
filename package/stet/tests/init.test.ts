@@ -6,9 +6,18 @@
  * the CP5 compile-proof fixture.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
@@ -792,5 +801,174 @@ describe('runInit — the declared copy modules', () => {
     expect(await runCli(['init'], io)).toBe(1);
     expect(io.err.join('\n')).toContain('refusing to overwrite');
     expect(readConfig(dir)['copyModules']).toEqual(['src/copy.ts']);
+  });
+});
+
+describe('runInit — the static-HTML host', () => {
+  /** The shared fixture page: the reduced psyon shape every html section reads. */
+  const PAGE = readFileSync(
+    fileURLToPath(new URL('./fixtures/html-host/index.html', import.meta.url)),
+    'utf8',
+  );
+
+  /** A folder carrying a page and a manifest that names only stet. */
+  function htmlProject(manifest: Record<string, unknown> = {}): string {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-init-html-'));
+    writeFileSync(
+      join(dir, 'package.json'),
+      `${JSON.stringify({ name: 'site', private: true, devDependencies: { '@getstet/stet': '^0.1.2' }, ...manifest }, null, 2)}\n`,
+    );
+    writeFileSync(join(dir, 'index.html'), PAGE, 'utf8');
+    return dir;
+  }
+
+  it('detects the host from a root page and a framework-free manifest', async () => {
+    const dir = htmlProject();
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('host: html (index.html at the root, no framework in package.json)');
+    expect(io.out.join('\n')).not.toContain('router:');
+  });
+
+  it('leaves a Vite host with a root index.html a JavaScript host', async () => {
+    const dir = htmlProject({ devDependencies: { vite: '^5' } });
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('router: app (default — no route files found)');
+    expect(readConfig(dir)['host']).toBeUndefined();
+  });
+
+  it('forces the shape with --host html, even on a folder with no page yet', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-init-html-'));
+    writeFileSync(join(dir, 'package.json'), '{"name":"site","private":true}\n');
+    const io = makeIo(dir);
+    expect(await runInit(['--host', 'html', '--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('host: html (--host html)');
+    expect(readConfig(dir)['host']).toBe('html');
+  });
+
+  it('refuses any other --host value, naming the one it takes', async () => {
+    const dir = htmlProject();
+    const io = makeIo(dir);
+    const code = await runCli(['init', '--host', 'next', '--yes'], io);
+    expect(code).toBe(2);
+    expect(io.err.join('\n')).toContain('stet init --host takes one value, html');
+  });
+
+  it('reads root names only — a page under docs/ is not a host, nor is a directory named x.html', async () => {
+    const nested = mkdtempSync(join(tmpdir(), 'stet-init-html-'));
+    writeFileSync(join(nested, 'package.json'), '{"name":"site","private":true}\n');
+    write(nested, 'docs/index.html', PAGE);
+    const io = makeIo(nested);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('router: app (default — no route files found)');
+
+    const dirNamed = mkdtempSync(join(tmpdir(), 'stet-init-html-'));
+    writeFileSync(join(dirNamed, 'package.json'), '{"name":"site","private":true}\n');
+    mkdirSync(join(dirNamed, 'x.html'));
+    const io2 = makeIo(dirNamed);
+    expect(await runInit(['--yes'], io2)).toBe(0);
+    expect(io2.out[0]).toBe('router: app (default — no route files found)');
+  });
+
+  it('writes three files and no JavaScript scaffold at all', async () => {
+    const dir = htmlProject();
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+
+    expect(new Set(readdirSync(dir))).toEqual(
+      new Set(['package.json', 'index.html', 'content', 'stet.config.json', 'AGENTS.md', 'CLAUDE.md']),
+    );
+    expect(new Set(readdirSync(join(dir, 'content')))).toEqual(
+      new Set(['descriptor.json', 'defaults.json']),
+    );
+    expect(existsSync(join(dir, 'lib'))).toBe(false);
+    expect(existsSync(join(dir, 'stet'))).toBe(false);
+  });
+
+  it('writes the config projection and nothing this host does not use', async () => {
+    const dir = htmlProject();
+    await runInit(['--yes'], makeIo(dir));
+
+    // Buffer-compared against the canonical form the deterministic serializer
+    // produces, so an extra key is a failure rather than a passing superset.
+    const expected = `${JSON.stringify(
+      {
+        bundlePath: '.stet/bundle.json',
+        copyModules: [],
+        descriptorPath: 'content/descriptor.json',
+        emailSurfaces: [],
+        host: 'html',
+        locales: { default: 'default', enabled: ['default'] },
+        managedSurfaces: ['**/*.html'],
+        project: 'default',
+        scan: { baseline: '.stet/scan-baseline.json', severity: 'warn' },
+        snapshotPath: 'content/defaults.json',
+      },
+      null,
+      2,
+    )}\n`;
+    expect(readFileSync(join(dir, CONFIG_FILE))).toEqual(Buffer.from(expected, 'utf8'));
+
+    // And it still loads, with the unwritten fields defaulted in memory.
+    const config = loadConfig(dir);
+    expect(config.host).toBe('html');
+    expect(config.readPath.file).toBe('lib/content.ts');
+  });
+
+  it('writes an EMPTY descriptor and snapshot — the page already carries its copy', async () => {
+    const dir = htmlProject();
+    const io = makeIo(dir);
+    await runInit(['--yes'], io);
+    expect(JSON.parse(readFileSync(join(dir, 'content/descriptor.json'), 'utf8'))).toEqual({
+      version: 1,
+      keys: {},
+    });
+    expect(JSON.parse(readFileSync(join(dir, 'content/defaults.json'), 'utf8'))).toEqual({
+      default: {},
+    });
+    expect(io.out).toContain('snapshot: 0 keys declared, 0 missing, 0 stale');
+    expect(io.out).toContain('document: index.html current (0 marks)');
+  });
+
+  it('closes with the page’s own counts and names the hook as the next step', async () => {
+    const dir = htmlProject();
+    const io = makeIo(dir);
+    await runInit(['--yes'], io);
+    expect(io.out[io.out.length - 1]).toBe(
+      '1 page, 22 text elements, 6 attributes — next: stet scan, then stet hook install',
+    );
+    // No read path was written, so its alias was never resolved and never noted.
+    expect(io.out.join('\n')).not.toContain('note:');
+    expect(io.out.join('\n')).not.toContain('CopyProvider');
+  });
+
+  it('writes the guidance block in its html wording', async () => {
+    const dir = htmlProject();
+    await runInit(['--yes'], makeIo(dir));
+    const block = readFileSync(join(dir, 'AGENTS.md'), 'utf8');
+    expect(block).toContain('data-stet');
+    expect(block).toContain('stet pull');
+    expect(block).toContain('content/defaults.json');
+    expect(readFileSync(join(dir, 'CLAUDE.md'), 'utf8')).toBe(block);
+  });
+
+  it('never writes the hook, on this host as on every other', async () => {
+    const dir = htmlProject();
+    execFileSync('git', ['init'], { cwd: dir, stdio: 'ignore' });
+    await runInit(['--yes'], makeIo(dir));
+    expect(existsSync(join(dir, '.git/hooks/pre-commit'))).toBe(false);
+  });
+
+  it('changes nothing on a second run', async () => {
+    const dir = htmlProject();
+    await runInit(['--yes'], makeIo(dir));
+    const before = readFileSync(join(dir, 'index.html'));
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    for (const name of ['content/descriptor.json', 'content/defaults.json', CONFIG_FILE]) {
+      expect(io.out).toContain(`${name}: already present, identical`);
+    }
+    expect(readFileSync(join(dir, 'index.html'))).toEqual(before);
   });
 });

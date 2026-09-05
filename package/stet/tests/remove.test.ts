@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
+import { makeHtmlHost } from '../conformance/cli-host.js';
 import { refuseDanglingReferences } from '../cli/remove.js';
 import { CliError } from '../cli/report.js';
 import {
@@ -685,5 +686,59 @@ describe('remove — the scaffolded host adopts its own copy (R3)', () => {
     expect(values['cta_label']).toBe('Start free');
 
     expect(await host.run('check')).toBe(0);
+  });
+});
+
+describe('remove — the static-HTML host', () => {
+  it('names each mark it will strip, then strips it and keeps the text', async () => {
+    const host = await makeHtmlHost({ register: true });
+    // `how_it_works` is the shared key: two identical links carry it.
+    expect(await host.run('remove', 'how_it_works')).toBe(0);
+    const plan = host.stdout();
+    expect(plan).toContain('  index.html:20 the mark is removed and the text stays');
+    expect(plan).toContain('  index.html:21 the mark is removed and the text stays');
+    expect(plan).toContain('  every other mark is regenerated in the same write');
+    expect(host.file('index.html')).toContain('data-stet="how_it_works"');
+
+    host.out.length = 0;
+    expect(await host.run('remove', 'how_it_works', '--write')).toBe(0);
+    const page = host.file('index.html');
+    expect(page).not.toContain('data-stet="how_it_works"');
+    // Both texts remain exactly where they were.
+    expect(page).toContain('<a href="#how">How it works</a>');
+    expect(page).toContain('<a href="#detail">How it works</a>');
+
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as {
+      keys: Record<string, unknown>;
+    };
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as {
+      default: Record<string, unknown>;
+    };
+    expect(descriptor.keys['how_it_works']).toBeUndefined();
+    expect(snapshot.default['how_it_works']).toBeUndefined();
+
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('never reads a mark as a mention, and still finds one in a script', async () => {
+    // The mark IS what the batch strips, so naming it would put "un-wire the
+    // read first" on every page the removal already handles.
+    const host = await makeHtmlHost({ register: true });
+    expect(host.file('index.html')).toContain('data-stet="how_it_works"');
+    expect(await host.run('remove', 'how_it_works')).toBe(0);
+    expect(host.stdout()).not.toContain('mentions');
+
+    // A mention in a script is a real read, and it still prints.
+    const scripted = await makeHtmlHost({ register: true });
+    writeFileSync(
+      join(scripted.cwd, 'index.html'),
+      scripted.file('index.html').replace('</body>', '<script>const k = "how_it_works";</script>\n</body>'),
+    );
+    expect(await scripted.run('remove', 'how_it_works')).toBe(0);
+    expect(scripted.stdout()).toContain(
+      'index.html mentions "how_it_works" — un-wire the read first, or the regenerated types surface it',
+    );
   });
 });

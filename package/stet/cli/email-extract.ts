@@ -49,6 +49,7 @@ import {
   jsxTextSuppression,
   loadTypescript,
   scriptKindFor,
+  undecodedEntity,
   type JsxTextSuppression,
 } from './source-scan.js';
 
@@ -299,7 +300,7 @@ function applyProposals(
       // The five repo forms, and the codegen trio among them rides the key add
       // exactly as `register` regenerates it: the slot keys this run wrote must
       // typecheck in the host's editor without an intervening `stet upgrade`.
-      plans.push(...planRepoForms(io.cwd, config, descriptor, snapshot));
+      plans.push(...planRepoForms(io.cwd, config, descriptor, snapshot, report));
       for (const proposal of landed) {
         plans.push(asUpdate(planWrite(at(proposal.file), proposal.edited, proposal.file)));
       }
@@ -1412,15 +1413,6 @@ function isSingleLineWhitespace(c: number): boolean {
     c === 0x1680 || (c >= 0x2000 && c <= 0x200b) || c === 0x202f || c === 0x205f ||
     c === 0x3000 || c === 0xfeff
   );
-}
-
-/** The first `&name;` the entity table does not know, where there is one. */
-function undecodedEntity(text: string): string | undefined {
-  for (const match of text.matchAll(/&[a-zA-Z][a-zA-Z0-9]*;/g)) {
-    const entity = match[0];
-    if (decodeEntities(entity) === entity) return entity;
-  }
-  return undefined;
 }
 
 // --- Props ------------------------------------------------------------------

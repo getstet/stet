@@ -21,7 +21,9 @@ import {
 import { checkCurrency, loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
-import { loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { filesForGlobs } from './files.js';
+import { checkDocuments } from './html-host.js';
 import type { CliIo } from './main.js';
 import { Report } from './report.js';
 import { validateValue } from './validate.js';
@@ -45,7 +47,13 @@ export function check(config: StetConfig, cwd: string, report: Report): void {
   if (!snapshot) return;
 
   currency(descriptor, snapshot, report);
-  generated(config, cwd, descriptor, snapshot, report);
+  // On an html host the generated files ARE the marked documents: there is no
+  // codegen trio to regenerate and compare.
+  if (isHtmlHost(config)) {
+    checkDocuments(cwd, filesForGlobs(cwd, config.managedSurfaces), descriptor, snapshot, report);
+  } else {
+    generated(config, cwd, descriptor, snapshot, report);
+  }
   values(descriptor, snapshot, report);
 }
 

@@ -198,7 +198,7 @@ export function usage(): string {
     'stet — typed, versioned content keys with a committed snapshot fallback',
     '',
     'Setup (write or edit files in the adopting project):',
-    '  init [--app DIR] [--yes]   scaffold a project; the shown edits mount the CopyProvider and write the agent guidance',
+    '  init [--app DIR] [--host html] [--yes]   scaffold a project; the shown edits mount the CopyProvider and write the agent guidance',
     '  scan                       report unkeyed copy in the managed surfaces — warn by default',
     '  register --from scan [--write] [--verbose]   add a key and rewrite the consuming leaf; --verbose lists every parse refusal',
     '  remove <key> [<key>...] [--write]   delete keys from descriptor + snapshot; plan first, --write applies',

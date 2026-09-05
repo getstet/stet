@@ -18,24 +18,42 @@ import { basename, join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import type { Snapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, EMAIL_TARGET, type Descriptor, type Target } from '../src/types.js';
 import { parse, flag, text as argText, noPositionals } from './args.js';
-import { writeJsonDeterministic, writeText } from './artifacts.js';
+import {
+  asUpdate,
+  planJson,
+  planRepoForms,
+  planWrite,
+  rethrowBatchFailure,
+  writePlanned,
+  writeText,
+} from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import {
   CONFIG_FILE,
+  isHtmlHost,
   loadConfig,
   normalizeNoExt,
   pathAliasMappings,
   resolveSpecifier,
   type StetConfig,
 } from './config.js';
+import { filesForGlobs } from './files.js';
+import { planHtmlRegister } from './html-host.js';
 import type { CliIo } from './main.js';
 import { clip, collapseLines, CliError, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff, planRewrite, type Edit } from './rewrite.js';
-import { isJsxFile, matchGlob, scanModule, scanSource, type Span } from './source-scan.js';
-import { classifyAdoption, filesForGlobs } from './scan.js';
+import {
+  freeKey,
+  isJsxFile,
+  matchGlob,
+  scanModule,
+  scanSource,
+  type Span,
+} from './source-scan.js';
+import { classifyAdoption } from './scan.js';
 import { validateValue } from './validate.js';
 
 /** App-Router files that are server components by default — every other .tsx is ambiguous without a directive. */
@@ -65,10 +83,23 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   const verbose = flag(values, 'verbose');
 
   const config = loadConfig(io.cwd);
+  const report = new Report();
+
+  // The html branch runs FIRST — ahead of the alias guard, which throws on the
+  // defaulted `@/lib/content` of a config that writes no read path, and ahead of
+  // the surface loop, which would hand every `.html` to a compiler that refuses
+  // it. Nothing on this path loads `typescript`, and `--kind` selects nothing.
+  if (isHtmlHost(config)) {
+    const htmlDescriptor = descriptorOf(config, io.cwd, report);
+    if (!htmlDescriptor) return report.emit(io);
+    const htmlSnapshot = snapshotOf(config, io.cwd, report);
+    if (!htmlSnapshot) return report.emit(io);
+    return registerHtml({ io, config, descriptor: htmlDescriptor, snapshot: htmlSnapshot, write, report });
+  }
+
   // Before ANY write, the descriptor and snapshot included: a rewrite that
   // inserts an import the host cannot resolve breaks every file it touched.
   if (write) refuseUnresolvableAlias(io.cwd, config);
-  const report = new Report();
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);
@@ -229,15 +260,16 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   }
 
   if (added > 0) {
-    writeJsonDeterministic(join(io.cwd, config.descriptorPath), descriptor);
-    writeJsonDeterministic(join(io.cwd, config.snapshotPath), snapshot);
-    // Regenerate the codegen modules so the `copy('new_key')` leaf register just
-    // wrote typechecks immediately — the Accessor sig is narrow (`ContentKey`),
-    // so a stale `.d.ts` would red the host tsc until a separate `stet upgrade`.
-    const { keysTs, dts } = generateRegistry(descriptor);
-    writeText(join(io.cwd, config.codegen.registry), keysTs);
-    writeText(join(io.cwd, config.codegen.dts), dts);
-    writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(snapshot));
+    // ONE batch, with rollback: the descriptor, the snapshot and the codegen
+    // modules land together or not at all. The codegen regenerates here so the
+    // `copy('new_key')` leaf register just wrote typechecks immediately — the
+    // Accessor sig is narrow (`ContentKey`), so a stale `.d.ts` would red the
+    // host tsc until a separate `stet upgrade`.
+    try {
+      writePlanned(planRepoForms(io.cwd, config, descriptor, snapshot, report));
+    } catch (error) {
+      rethrowBatchFailure('stet register', error);
+    }
     report.line(`wrote ${config.descriptorPath}, ${config.snapshotPath} and the codegen modules: ${added} key${added === 1 ? '' : 's'} added`);
   }
   // The closing line turns on whether there were LEAF EDITS, not on `--write`:
@@ -309,6 +341,63 @@ function isRouteFile(file: string): boolean {
 const ADOPTED_EXCERPT = 60;
 
 /**
+ * `register` on the static-HTML host: every located proposal becomes a key and
+ * a mark, in one batch with the descriptor and the snapshot.
+ *
+ * The plain run writes NOTHING — a departure from the JavaScript branch, whose
+ * descriptor and snapshot land either way. A descriptor entry written without
+ * its mark is half a batch, and the next `check` would report every such key as
+ * marked in no document.
+ */
+function registerHtml(d: {
+  io: CliIo;
+  config: StetConfig;
+  descriptor: Descriptor;
+  snapshot: Snapshot;
+  write: boolean;
+  report: Report;
+}): number {
+  const { io, config, descriptor, snapshot, write, report } = d;
+  const plan = planHtmlRegister({
+    cwd: io.cwd,
+    files: filesForGlobs(io.cwd, config.managedSurfaces),
+    descriptor,
+    snapshot,
+    report,
+  });
+  for (const document of plan.edited) {
+    if (document.diff !== '') report.line(document.diff);
+  }
+  if (plan.marked === 0) {
+    report.line('register: nothing to adopt');
+    return report.emit(io);
+  }
+  if (!write) {
+    report.line(
+      `register: run with --write to apply ${plan.marked} mark${plan.marked === 1 ? '' : 's'} ` +
+        `across ${plan.edited.length} document${plan.edited.length === 1 ? '' : 's'}`,
+    );
+    return report.emit(io);
+  }
+  try {
+    writePlanned([
+      asUpdate(planJson(join(io.cwd, config.descriptorPath), descriptor, config.descriptorPath)),
+      asUpdate(planJson(join(io.cwd, config.snapshotPath), snapshot, config.snapshotPath)),
+      ...plan.edited.map((e) => asUpdate(planWrite(e.abs, e.text, e.rel))),
+    ]);
+  } catch (error) {
+    rethrowBatchFailure('stet register --write', error);
+  }
+  report.line(
+    `wrote ${config.descriptorPath}, ${config.snapshotPath} and ${plan.edited.length} ` +
+      `document${plan.edited.length === 1 ? '' : 's'}: ${plan.added} key${plan.added === 1 ? '' : 's'} added, ` +
+      `${plan.shared} shared`,
+  );
+  report.line('register: applied');
+  return report.emit(io);
+}
+
+/**
  * The target a file's keys take. Derived from the SURFACE the file matched — an
  * email surface gets email rules — never from a send-arg heuristic, which
  * misfires on `res.send`/`socket.send`. A copy module declared into the email
@@ -316,15 +405,6 @@ const ADOPTED_EXCERPT = 60;
  */
 function targetFor(file: string, config: StetConfig): Target {
   return config.emailSurfaces.some((g) => matchGlob(g, file)) ? EMAIL_TARGET : DEFAULT_TARGET;
-}
-
-/** A key derived from `base`, suffixed `_2`, `_3`, … until free in the descriptor. */
-function freeKey(descriptor: Descriptor, base: string): string {
-  if (!(base in descriptor.keys)) return base;
-  for (let n = 2; ; n++) {
-    const candidate = `${base}_${n}`;
-    if (!(candidate in descriptor.keys)) return candidate;
-  }
 }
 
 /** The live grep P1-H uses: a `CopyProvider` import from `@getstet/stet/react` in the root layout. */

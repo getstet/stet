@@ -18,10 +18,12 @@ import type * as TS from 'typescript';
 
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { writeJsonDeterministic } from './artifacts.js';
-import { loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { filesForGlobs } from './files.js';
+import { proposeHtml } from './html-host.js';
 import type { CliIo } from './main.js';
-import { detectPagesRoots, proposePages, walk } from './pages.js';
-import { CliError, clip, posixRelative, Report } from './report.js';
+import { detectPagesRoots, proposePages } from './pages.js';
+import { CliError, clip, lineCol, posixRelative, Report } from './report.js';
 import {
   dialectOf,
   isJsxFile,
@@ -42,7 +44,7 @@ const LITERAL_EXCERPT = 60;
 interface BaselineEntry {
   file: string;
   /** A literal's own context, plus `'dialect'` — the text detector's, which no `LocatedLiteral` can carry. */
-  context: LocatedLiteral['context'] | 'dialect';
+  context: LocatedLiteral['context'] | 'dialect' | 'html';
   text: string;
 }
 
@@ -194,6 +196,15 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     return suppressed.has(entryKey(entry));
   };
 
+  // The static-HTML host's whole walk, computed ONCE ahead of the loop over the
+  // same files: the locator reads each document once, and the loop reports what
+  // it found per file. The lazy readers stay report-free, so a bare html host
+  // with no descriptor yet scans against an empty one rather than failing.
+  // The forms are handed in EMPTY: the locator's only read is the document's
+  // own marks, so scan's raw descriptor and snapshot — which it deliberately
+  // never validates — have nothing to contribute and are not converted here.
+  const html = isHtmlHost(config) ? proposeHtml(io.cwd, files, { version: 1, keys: {} }, {}) : null;
+
   let refused = 0;
   for (const file of files) {
     const source = readFileSync(join(io.cwd, file), 'utf8');
@@ -203,6 +214,33 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     // pure text — a branch placed downstream of the compiler would never run on
     // the very hosts it exists for.
     const dialect = dialectOf(file);
+    // On an html host a `.html` file goes further than the text detector: the
+    // locator found the ELEMENT behind each run, so the warn carries a proposed
+    // key the way the JSX line does. A claimed mark is silent — whether its text
+    // still equals the snapshot is `stet check`'s question, never scan's.
+    if (dialect === 'html' && html !== null) {
+      for (const proposal of html.proposals.filter((p) => p.file === file)) {
+        if (baselined({ file, context: 'html', text: proposal.value })) continue;
+        const suffix =
+          proposal.kind !== 'attribute'
+            ? ''
+            : proposal.metaName === undefined
+              ? ` (${proposal.attr})`
+              : ` (meta ${proposal.metaName})`;
+        report.warn(
+          'scan',
+          `${file}:${proposal.line} possible copy ${JSON.stringify(clip(proposal.value, LITERAL_EXCERPT))}${suffix} — ` +
+            `propose key ${proposal.proposedKey}`,
+        );
+        warned += 1;
+      }
+      // A skip is text stet could not adopt, so it counts as unkeyed too.
+      for (const skip of html.skips.filter((s) => s.file === file)) {
+        report.warn('scan', `${file}:${skip.line} skipped (${skip.reason}) — ${skip.detail}; ${skip.remedy}`);
+        warned += 1;
+      }
+      continue;
+    }
     if (dialect !== null) {
       for (const found of scanDialect(file, source, dialect)) {
         if (baselined({ file, context: 'dialect', text: found.text })) continue;
@@ -340,7 +378,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   if (compilerRefusal !== null && neededCompiler) report.error('scan', compilerRefusal);
 
   await unrenderedSlots(io.cwd, config, report, descriptorOnce());
-  uncoveredRoutes(io.cwd, report, descriptorOnce());
+  uncoveredRoutes(io.cwd, config, report, descriptorOnce());
 
   // A run that scanned nothing must never read as a clean bill. Ahead of the
   // `--baseline` return, so a baseline written over nothing warns too; silent
@@ -365,6 +403,15 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     // apply: `--baseline` is the run that ACCEPTS the findings, and failing it
     // under a `fail` posture would block the only workflow that clears them.
     return report.emit(io, { json: flag(values, 'json') });
+  }
+
+  if (html !== null) {
+    // The structured records the local dashboard reads. `insertAt` is an
+    // internal offset the mark edit uses and no consumer of the payload needs.
+    report.data('html', {
+      proposals: html.proposals.map(({ insertAt: _insertAt, ...rest }) => rest),
+      skips: html.skips,
+    });
   }
 
   report.line(
@@ -465,7 +512,12 @@ async function unrenderedSlots(
  * drift, and scan does not re-report them. Scan calls the detector with no seed
  * option, so it reads names only.
  */
-function uncoveredRoutes(cwd: string, report: Report, descriptor: RawDescriptor | null): void {
+function uncoveredRoutes(
+  cwd: string,
+  config: StetConfig,
+  report: Report,
+  descriptor: RawDescriptor | null,
+): void {
   if (descriptor === null) return;
   const raw = descriptor.pages;
   if (!isRecord(raw)) return;
@@ -477,7 +529,7 @@ function uncoveredRoutes(cwd: string, report: Report, descriptor: RawDescriptor 
   }
   if (declared.length === 0) return;
 
-  const roots = detectPagesRoots(cwd);
+  const roots = detectPagesRoots(cwd, { html: isHtmlHost(config) });
   if (roots.length === 0) return;
   // Built through `fromEntries`, never by assignment: a page legitimately named
   // `__proto__` would otherwise replace this object's prototype rather than
@@ -487,7 +539,14 @@ function uncoveredRoutes(cwd: string, report: Report, descriptor: RawDescriptor 
   // minting over somebody's work, and scan mints nothing — an undeclared route
   // whose scaffold name is taken is still an undeclared route, and this warn's
   // job is to say so.
-  const set = proposePages(cwd, roots, { pages: Object.fromEntries(declared), keys: {}, values: {} });
+  // `bind: false` by omission — scan's drift warn reads file names alone and
+  // mints nothing, on this host as on every other.
+  const set = proposePages(
+    cwd,
+    roots,
+    { pages: Object.fromEntries(declared), keys: {}, values: {} },
+    { config },
+  );
   for (const proposal of set.proposals) {
     report.warn('scan', `route ${proposal.route} (${proposal.file}) has no page record — run stet pages scan`);
   }
@@ -528,49 +587,9 @@ function dedupeEntries(entries: BaselineEntry[]): BaselineEntry[] {
 }
 
 /**
- * Every file matching one of the given globs — managed surfaces or declared
- * copy modules — walked from each glob's static prefix so nothing outside them
- * (node_modules included) is even enumerated, and the file CONTENT is never
- * read here: only the caller opens a matched file. Shared with `register`,
- * which re-walks the same declarations itself.
+ * The surface walker lives in `cli/files.ts` now that `html-host` lists files
+ * too. Re-exported here because `register`, `remove`, `eject` and
+ * `email extract` reach it by this name.
  */
-export function filesForGlobs(cwd: string, globs: string[]): string[] {
-  const found = new Set<string>();
-  for (const glob of globs) {
-    const root = staticPrefix(glob);
-    walk(join(cwd, root), (abs) => {
-      const rel = posixRelative(cwd, abs);
-      if (globs.some((g) => matchGlob(g, rel))) found.add(rel);
-    });
-  }
-  return [...found].sort();
-}
-
-/** The leading directory of a glob with no wildcard — the only one worth walking. */
-function staticPrefix(glob: string): string {
-  const parts = glob.split('/');
-  const solid: string[] = [];
-  for (const part of parts) {
-    if (/[*?{[]/.test(part)) break;
-    solid.push(part);
-  }
-  // A trailing solid segment that names a file (a wildcard-free glob like
-  // `app/page.tsx`) is not a directory — walk its parent instead.
-  const last = solid[solid.length - 1];
-  if (last !== undefined && last.includes('.') && solid.length === parts.length) solid.pop();
-  return solid.join('/');
-}
-
-/** 1-based line and column at a source offset. */
-function lineCol(source: string, pos: number): { line: number; col: number } {
-  let line = 1;
-  let last = -1;
-  for (let i = 0; i < pos && i < source.length; i++) {
-    if (source.charCodeAt(i) === 10) {
-      line += 1;
-      last = i;
-    }
-  }
-  return { line, col: pos - last };
-}
+export { filesForGlobs };
 

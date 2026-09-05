@@ -11,7 +11,14 @@ import { join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { CONFIG_FILE, defaultConfig, loadConfig, writeConfig, type StetConfig } from '../cli/config.js';
+import {
+  CONFIG_FILE,
+  defaultConfig,
+  isHtmlHost,
+  loadConfig,
+  writeConfig,
+  type StetConfig,
+} from '../cli/config.js';
 
 const made: string[] = [];
 function tempDir(): string {
@@ -90,6 +97,34 @@ describe('stet.config.json', () => {
     // Absent is empty, not an error — a downlevel config declares no copy modules.
     expect(config.copyModules).toEqual([]);
     expect(config.mountRoute).toBeUndefined();
+  });
+
+  it('round-trips the html host, and reads an absent host as a JavaScript one', () => {
+    const cwd = tempDir();
+    const config: StetConfig = {
+      ...defaultConfig(),
+      host: 'html',
+      managedSurfaces: ['**/*.html'],
+    };
+    writeConfig(join(cwd, CONFIG_FILE), config);
+    const read = loadConfig(cwd);
+    expect(read).toEqual(config);
+    expect(read.host).toBe('html');
+    expect(isHtmlHost(read)).toBe(true);
+
+    const plain = tempDir();
+    writeFileSync(join(plain, CONFIG_FILE), JSON.stringify({ project: 'x' }));
+    const javascript = loadConfig(plain);
+    expect(javascript.host).toBeUndefined();
+    expect(isHtmlHost(javascript)).toBe(false);
+  });
+
+  it('constrains host to "html" or absent, naming both states', () => {
+    const cwd = tempDir();
+    writeFileSync(join(cwd, CONFIG_FILE), JSON.stringify({ host: 'static' }));
+    expect(() => loadConfig(cwd)).toThrow(
+      /host must be "html", or absent for a JavaScript host — got "static"/,
+    );
   });
 
   it('constrains router to the three values and scan.severity to warn|fail', () => {

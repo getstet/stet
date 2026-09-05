@@ -5,8 +5,10 @@ import {
   checkBudget,
   checkClassRules,
   checkLimits,
+  checkTags,
   checkVars,
   htmlEmailTarget,
+  plainOf,
   resolve,
   shapeSchema,
   targetAdapter,
@@ -81,6 +83,25 @@ describe('checkLimits', () => {
   it('says nothing about a value inside its limit, or a key with no limit', () => {
     expect(checkLimits(descriptor, 'hero_headline', 'short').findings).toEqual([]);
     expect(checkLimits(descriptor, 'blog_intro', 'x'.repeat(9000)).findings).toEqual([]);
+  });
+
+  it('measures a tagged value over its plain text, and reports that length', () => {
+    // 19 characters of prose inside 26 characters of tagged value.
+    const value = '<1>Nineteen chars here</1>';
+    expect(value.length).toBe(26);
+    expect(plainOf(value).length).toBe(19);
+
+    const capped = mutable(descriptor);
+    capped.keys['hero_headline']!.limits = { max: 20, severity: 'hard' };
+    capped.keys['hero_headline']!.tags = 1;
+    expect(checkLimits(capped, 'hero_headline', value).findings).toEqual([]);
+
+    // The same 26 characters, untagged, is what the reader sees — and overruns.
+    const untagged = mutable(capped);
+    delete untagged.keys['hero_headline']!.tags;
+    const verdict = checkLimits(untagged, 'hero_headline', value);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.findings[0]).toMatchObject({ rule: 'limit', length: 26, max: 20 });
   });
 
   it('names the list entry that overruns, not just the key holding it', () => {
@@ -188,6 +209,85 @@ describe('checkVars', () => {
       key: 'contact_form_labels.email',
       vars: ['nope'],
     });
+  });
+});
+
+describe('checkTags', () => {
+  /** `hero_headline` is the fixture's `text` key; the count is per case. */
+  function tagged(count: number): Descriptor {
+    const d = mutable(descriptor);
+    d.keys['hero_headline']!.tags = count;
+    return d;
+  }
+
+  function faultOf(count: number, value: string): string | undefined {
+    return checkTags(tagged(count), 'hero_headline', value).findings[0]?.message;
+  }
+
+  it('accepts a value carrying its one tag', () => {
+    const verdict = checkTags(tagged(1), 'hero_headline', 'You may<1> need.</1>');
+    expect(verdict.ok).toBe(true);
+    expect(verdict.findings).toEqual([]);
+  });
+
+  it('rejects a value that dropped its tag', () => {
+    const verdict = checkTags(tagged(1), 'hero_headline', 'You may need.');
+    expect(verdict.ok).toBe(false);
+    expect(verdict.findings[0]).toMatchObject({
+      rule: 'tags',
+      severity: 'error',
+      key: 'hero_headline',
+    });
+    expect(verdict.findings[0]?.message).toContain('tag 1 missing');
+    expect(verdict.findings[0]?.message).toContain('1..1');
+  });
+
+  it('rejects a duplicated tag', () => {
+    expect(faultOf(1, '<1>a</1><1>b</1>')).toContain('tag 1 twice');
+  });
+
+  it('rejects a close before its open', () => {
+    expect(faultOf(1, '</1>a<1>')).toContain('</1> before <1>');
+  });
+
+  it('accepts nesting', () => {
+    expect(checkTags(tagged(2), 'hero_headline', '<1>a<2>b</2></1>').ok).toBe(true);
+  });
+
+  it('reads an ordinary angle bracket as prose, never as a tag', () => {
+    expect(faultOf(1, 'a <b>c</b>')).toContain('tag 1 missing');
+  });
+
+  it('rejects a tag left open', () => {
+    expect(faultOf(1, '<1>a')).toContain('<1> never closed');
+  });
+
+  it('rejects a tag beyond the declared count', () => {
+    expect(faultOf(1, '<1>a</1><2/>')).toContain('tag 2 beyond 1..1');
+  });
+
+  it('accepts a moved tag — the emphasised part may travel', () => {
+    expect(checkTags(tagged(1), 'hero_headline', '<1> our partners</1> may already have your data').ok).toBe(
+      true,
+    );
+  });
+
+  it('leaves a key without tags unchecked — a <1> in prose is prose', () => {
+    const verdict = checkTags(descriptor, 'hero_headline', 'the <1> shape');
+    expect(verdict.ok).toBe(true);
+    expect(verdict.findings).toEqual([]);
+  });
+});
+
+describe('plainOf', () => {
+  it('reads a self-closing placeholder as the one space its element renders', () => {
+    expect(plainOf('line<1/>break')).toBe('line break');
+  });
+
+  it('drops a paired placeholder and keeps its text', () => {
+    expect(plainOf('You may already have the data<1> our AI lab partners need.</1>')).toBe(
+      'You may already have the data our AI lab partners need.',
+    );
   });
 });
 
@@ -616,6 +716,17 @@ describe('validateSave', () => {
     expect(
       validateSave(descriptor, { key: 'hero_headline', value: 'Mirror your posts.' }),
     ).toEqual({ ok: true, findings: [] });
+  });
+
+  it('runs the tag rule, so a dropped placeholder cannot save', () => {
+    const tagged = mutable(descriptor);
+    tagged.keys['hero_headline']!.tags = 1;
+    const verdict = validateSave(tagged, { key: 'hero_headline', value: 'You may need.' });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.findings.some((f) => f.rule === 'tags')).toBe(true);
+    expect(validateSave(tagged, { key: 'hero_headline', value: 'You may<1> need.</1>' }).ok).toBe(
+      true,
+    );
   });
 
   it('composes limits, variables, class rules and budget, errors before warnings', () => {

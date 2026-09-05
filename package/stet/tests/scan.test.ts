@@ -7,6 +7,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
@@ -1589,5 +1590,104 @@ describe('runScan — a static route with no page record', () => {
     } finally {
       if (enforced) chmodSync(path, 0o644);
     }
+  });
+});
+
+describe('runScan — the static-HTML host', () => {
+  const PAGE = readFileSync(
+    fileURLToPath(new URL('./fixtures/html-host/index.html', import.meta.url)),
+    'utf8',
+  );
+
+  /** An html host carrying the shared fixture page. */
+  function htmlProject(config: Record<string, unknown> = {}): string {
+    const dir = project({ host: 'html', managedSurfaces: ['**/*.html'], ...config });
+    write(dir, 'index.html', PAGE);
+    return dir;
+  }
+
+  it('locates the element behind every run and proposes its key', async () => {
+    const dir = htmlProject();
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    const found = cap.err.join('\n');
+    expect(found).toContain(
+      'index.html:34 possible copy "Software, product and engineering histories" — propose key software_product_and_engineering',
+    );
+    // A tagged value prints with its tags.
+    expect(found).toContain('possible copy "You may already have the data<1> our AI lab partners need...');
+    // An attribute names itself; a meta names which meta it is.
+    expect(found).toContain('"A lab bench with sample trays" (alt) — propose key a_lab_bench_with_sample_trays');
+    expect(found).toContain('(meta description) — propose key psyon_connects_hospitals_labs_and');
+  });
+
+  it('counts the page as one file and every proposal as an unkeyed literal', async () => {
+    const cap = io(htmlProject());
+    await runScan([], cap);
+    expect(cap.out.join('\n')).toContain('scan: 1 file, 28 unkeyed literals');
+  });
+
+  it('carries the located records in --json', async () => {
+    const json = io(htmlProject());
+    expect(await runScan(['--json'], json)).toBe(0);
+    const payload = JSON.parse(json.out[json.out.length - 1] as string) as {
+      html: { proposals: Array<Record<string, unknown>>; skips: unknown[] };
+    };
+    expect(payload.html.skips).toEqual([]);
+    expect(payload.html.proposals).toHaveLength(28);
+    const heading = payload.html.proposals.find((p) => p['tag'] === 'h3');
+    expect(heading).toMatchObject({ section: 'qualify', tag: 'h3', kind: 'element' });
+    expect(payload.html.proposals.find((p) => p['tag'] === 'h1')).toMatchObject({ tags: 1 });
+    // The insert offset is the mark edit's business, not a record consumer's.
+    expect(heading).not.toHaveProperty('insertAt');
+  });
+
+  it('suppresses what --baseline accepted', async () => {
+    const dir = htmlProject();
+    expect(await runScan(['--baseline'], io(dir))).toBe(0);
+    const second = io(dir);
+    expect(await runScan([], second)).toBe(0);
+    expect(second.err.join('\n')).not.toContain('possible copy');
+    expect(second.out.join('\n')).toContain('scan: 1 file, 0 unkeyed literals');
+  });
+
+  it('says nothing about an element already claimed by a mark', async () => {
+    const dir = htmlProject();
+    write(dir, 'index.html', PAGE.replace('<h3>', '<h3 data-stet="already_keyed">'));
+    const cap = io(dir);
+    await runScan([], cap);
+    expect(cap.err.join('\n')).not.toContain('Software, product and engineering histories');
+    expect(cap.out.join('\n')).toContain('scan: 1 file, 27 unkeyed literals');
+  });
+
+  it('names a skip and counts it as text it could not adopt', async () => {
+    const dir = project({ host: 'html', managedSurfaces: ['**/*.html'] });
+    write(
+      dir,
+      'index.html',
+      readFileSync(fileURLToPath(new URL('./fixtures/html-host/edges.html', import.meta.url)), 'utf8'),
+    );
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    const found = cap.err.join('\n');
+    expect(found).toContain('skipped (unknown-entity) — &nosuch; is not an entity stet can decode; replace it with the character itself');
+    expect(found).toContain('skipped (text-in-structure) — text sits directly inside <ul>, which has no element to mark; wrap it in a p, span or li');
+    expect(found).toContain(
+      'skipped (text-beside-code) — text in <p> sits beside a script, style, comment or declaration stet cannot ' +
+        'regenerate whole; move the script, style, comment or declaration outside the element, or the text into one of its own',
+    );
+    // 5 proposals + 10 skips, every one an unkeyed literal.
+    expect(cap.out.join('\n')).toContain('scan: 1 file, 15 unkeyed literals');
+  });
+
+  it('text-warns an .html on a JavaScript host, with no key — the fifth dialect', async () => {
+    const dir = project({ router: 'astro', managedSurfaces: ['src/**/*.html'] });
+    write(dir, 'src/legacy.html', '<html><body><h1>A legacy label</h1></body></html>');
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    const found = cap.err.join('\n');
+    expect(found).toContain('possible copy "A legacy label"');
+    expect(found).not.toContain('propose key');
+    expect(cap.out.join('\n')).toContain('scan: 1 file, 1 unkeyed literal');
   });
 });

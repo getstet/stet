@@ -77,6 +77,28 @@ describe('loadDescriptor', () => {
     expect(error.message).toContain('theme_mode');
   });
 
+  it('accepts a text key declaring placeholder tags', () => {
+    const document = raw();
+    (document as Record<string, any>)['keys']['hero_headline']['tags'] = 1;
+    const { descriptor, warnings } = loadDescriptorWithWarnings(document);
+    expect(descriptor.keys['hero_headline']?.tags).toBe(1);
+    expect(warnings).toEqual([]);
+  });
+
+  it('rejects a tag count below one, naming the key and the field', () => {
+    const document = raw();
+    (document as Record<string, any>)['keys']['hero_headline']['tags'] = 0;
+    const error = rejects(document);
+    expect(error.path).toBe('keys/hero_headline/tags');
+  });
+
+  it('rejects a non-integer tag count', () => {
+    const document = raw();
+    (document as Record<string, any>)['keys']['hero_headline']['tags'] = '1';
+    const error = rejects(document);
+    expect(error.path).toBe('keys/hero_headline/tags');
+  });
+
   it('rejects a key naming an undeclared page', () => {
     const document = raw();
     (document as Record<string, any>)['keys']['footer_links']['pages'] = ['home', 'about'];

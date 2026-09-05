@@ -16,8 +16,9 @@ import type { SeoRule } from '../src/seo.js';
 import type { FindingRule } from '../src/validate.js';
 
 /**
- * What a finding is about. `src/validate.ts`'s save-time rules and
- * `src/seo.ts`'s audit rules, plus the six kinds the terminal owns: `shape`
+ * What a finding is about. `src/validate.ts`'s save-time rules — the
+ * placeholder-tag gate `tags` among them — and `src/seo.ts`'s audit rules, plus
+ * the six kinds the terminal owns: `shape`
  * (the declared shape rejected the value — a check that lives in `shapeSchema`,
  * not in `validateSave`), `store` (what the store answered, or — where a
  * command is offline by contract — that it deliberately did not read one),
@@ -127,6 +128,23 @@ export function formatFinding(finding: CliFinding): string {
  */
 export function posixRelative(from: string, abs: string): string {
   return relative(from, abs).split(sep).join('/');
+}
+
+/**
+ * 1-based line and column at a source offset — where a finding sits in the file
+ * it names. Moved here from `scan` when the static-HTML locator became its
+ * second consumer: a position in a message is a reporting concern.
+ */
+export function lineCol(source: string, pos: number): { line: number; col: number } {
+  let line = 1;
+  let last = -1;
+  for (let i = 0; i < pos && i < source.length; i++) {
+    if (source.charCodeAt(i) === 10) {
+      line += 1;
+      last = i;
+    }
+  }
+  return { line, col: pos - last };
 }
 
 /**

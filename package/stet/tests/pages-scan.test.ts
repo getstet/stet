@@ -20,6 +20,7 @@ import { describe, expect, it } from 'vitest';
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptor } from '../src/descriptor.js';
 import { loadSnapshot } from '../src/snapshot.js';
+import { makeHtmlHost } from '../conformance/cli-host.js';
 import { runCli, type CliIo } from '../cli/main.js';
 
 interface Host extends CliIo {
@@ -854,5 +855,182 @@ describe('pages scan — a markdown page seeds from its frontmatter', () => {
       'seo check will now report 1 more missing titles and 1 more missing descriptions — ' +
         'write the empty values and re-run stet seo check',
     );
+  });
+});
+
+describe('pages scan — the html arm', () => {
+  /** No `<title>` and no meta description: the page that binds neither field. */
+  const ABOUT = [
+    '<html>',
+    '<head><meta charset="utf-8"></head>',
+    '<body><p>A short page about the team.</p></body>',
+    '</html>',
+    '',
+  ].join('\n');
+
+  const DOCS = [
+    '<html>',
+    '<head><meta charset="utf-8"></head>',
+    '<body><p>Documentation index page.</p></body>',
+    '</html>',
+    '',
+  ].join('\n');
+
+  const site = () =>
+    makeHtmlHost({
+      register: true,
+      files: { 'about.html': ABOUT, 'docs/index.html': DOCS, 'review/shot.png': 'not a page' },
+    });
+
+  it('routes every managed .html by its path and says nothing about anything else', async () => {
+    const host = await site();
+    expect(await host.run('pages', 'scan')).toBe(0);
+    const out = host.stdout();
+    expect(out).toContain('home (/)');
+    expect(out).toContain('about (/about)');
+    expect(out).toContain('docs (/docs)');
+    expect(out).not.toContain('shot.png');
+    expect(host.stderr()).toBe('');
+    expect(host.json<{ skips: unknown[] }>);
+  });
+
+  it('names per field which key it bound, or that no mark exists yet', async () => {
+    const host = await site();
+    await host.run('pages', 'scan');
+    const out = host.stdout();
+    expect(out).toContain('  title: bound to psyon_data_partnerships_for_ai_labs');
+    expect(out).toContain('  description: bound to psyon_connects_hospitals_labs_and');
+    expect(out).toContain('  title: no marked <title> — run stet register first, or declare it by hand');
+    expect(out).toContain(
+      '  description: no marked meta description — run stet register first, or declare it by hand',
+    );
+  });
+
+  it('--apply binds the marked fields and mints nothing', async () => {
+    const host = await site();
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain(
+      'declared 3 pages, bound 2 fields; 2 pages lack a marked title or description — stet seo check names them',
+    );
+
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as {
+      pages: Record<string, { route: string; seo?: Record<string, string> }>;
+      keys: Record<string, { pages?: string[] }>;
+    };
+    expect(descriptor.pages['home']?.seo).toEqual({
+      title: 'psyon_data_partnerships_for_ai_labs',
+      description: 'psyon_connects_hospitals_labs_and',
+    });
+    // A page with neither mark gets a record and NO seo block at all.
+    expect(descriptor.pages['about']).toMatchObject({ route: '/about' });
+    expect(descriptor.pages['about']?.seo).toBeUndefined();
+    // And nothing was minted for it.
+    expect(descriptor.keys['seo_about_title']).toBeUndefined();
+    expect(descriptor.keys['seo_home_title']).toBeUndefined();
+    // The bound key carries the page in its reverse index.
+    expect(descriptor.keys['psyon_data_partnerships_for_ai_labs']?.pages).toEqual(['home']);
+  });
+
+  it('leaves check green — no key was scaffolded for anything to warn about', async () => {
+    const host = await site();
+    await host.run('pages', 'scan', '--apply');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).not.toContain('marked in no document');
+  });
+
+  it('hands the honest red to seo check', async () => {
+    const host = await site();
+    await host.run('pages', 'scan', '--apply');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('seo', 'check', '--json')).toBe(1);
+    const findings = host.json<{ findings: Array<{ kind: string; message: string; level: string }> }>().findings;
+    const overLength = findings.find((f) => f.kind === 'over-length');
+    expect(overLength?.level).toBe('error');
+    expect(overLength?.message).toContain('165 characters');
+    expect(findings.filter((f) => f.kind === 'missing-title')).toHaveLength(2);
+    expect(findings.filter((f) => f.kind === 'missing-description')).toHaveLength(2);
+  });
+
+  it('honours a severity override, and still fails on the missing fields alone', async () => {
+    const host = await makeHtmlHost({
+      register: true,
+      files: { 'about.html': ABOUT, 'docs/index.html': DOCS },
+      config: { seoCheck: { 'over-length': 'warn' } },
+    });
+    await host.run('pages', 'scan', '--apply');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('seo', 'check', '--json')).toBe(1);
+    const findings = host.json<{ findings: Array<{ kind: string; level: string }> }>().findings;
+    expect(findings.find((f) => f.kind === 'over-length')?.level).toBe('warn');
+
+    // A host declaring only `home` — whose two fields both bind — exits 0 under
+    // the same config: the over-length finding is the only one left, and it warns.
+    const only = await makeHtmlHost({
+      register: true,
+      config: { seoCheck: { 'over-length': 'warn' } },
+    });
+    await only.run('pages', 'scan', '--apply', 'home');
+    only.out.length = 0;
+    only.err.length = 0;
+    expect(await only.run('seo', 'check')).toBe(0);
+  });
+
+  it('reads only .html, even where the host declared a wider surface', async () => {
+    // A host that named more than pages in its managed surfaces. The arm is
+    // `.html` files and nothing else, so the extra declaration adds no routes
+    // and no skips rather than an unsupported-page-type wall.
+    const host = await makeHtmlHost({
+      register: true,
+      files: { 'about.html': ABOUT, 'review/shot.png': 'not a page' },
+      config: { managedSurfaces: ['**/*.html', '**/*.png'] },
+    });
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('about (/about)');
+    expect(host.stdout()).toContain('home (/)');
+    // The png names no route and lands in no skip — it is simply not a page.
+    expect(host.stdout()).not.toContain('/review/shot');
+    expect(host.stderr()).not.toContain('shot');
+    expect(host.json<{ pages: unknown[]; skips: unknown[] }>);
+    await host.run('pages', 'scan', '--json');
+    const payload = host.json<{ pages: Array<{ route: string }>; skips: unknown[] }>();
+    expect(payload.pages.map((p) => p.route).sort()).toEqual(['/', '/about']);
+    expect(payload.skips).toEqual([]);
+  });
+
+  it('warns an undeclared route at the next scan, and stays silent on the png', async () => {
+    const host = await site();
+    await host.run('pages', 'scan', '--apply', 'home');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('scan')).toBe(0);
+    const warns = host.stderr();
+    expect(warns).toContain('route /about (about.html) has no page record — run stet pages scan');
+    expect(warns).toContain('route /docs (docs/index.html) has no page record — run stet pages scan');
+    expect(warns).not.toContain('shot.png');
+  });
+});
+
+describe('pages scan — the stage-5 fold, two title elements', () => {
+  it('binds the FIRST marked title, the one a browser renders', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'docs/two-titles.html':
+          '<html><head><title data-stet="first_title">First title element</title>' +
+          '<title data-stet="second_title">Second title element</title></head>' +
+          '<body><p>Ordinary page copy here.</p></body></html>\n',
+      },
+      keys: {
+        first_title: { shape: 'text', target: 'web' },
+        second_title: { shape: 'text', target: 'web' },
+      },
+      defaults: { first_title: 'First title element', second_title: 'Second title element' },
+    });
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('title: bound to first_title');
+    expect(host.stdout()).not.toContain('bound to second_title');
   });
 });

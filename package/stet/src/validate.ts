@@ -17,7 +17,14 @@ const VARIABLE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 /** No bare `off` — "turn off notifications" is not a promotion. */
 const PROMOTIONAL = /(\d+\s*%|\bdiscount\b|\bsale\b)/i;
 
-export type FindingRule = 'limit' | 'vars' | 'class' | 'budget' | 'construct';
+/**
+ * A numbered placeholder tag: `<1>`, `</1>` or `<1/>`. These are the ONLY
+ * `<`-shapes the tag rule reads — values are stored raw and the emitter escapes
+ * them, so any other `<` in a value is prose and never a finding.
+ */
+const PLACEHOLDER = /<(\/?)(\d+)(\/?)>/g;
+
+export type FindingRule = 'limit' | 'vars' | 'class' | 'budget' | 'construct' | 'tags';
 
 export interface Finding {
   rule: FindingRule;
@@ -153,6 +160,10 @@ function stringsOf(
  * The limit applies to every string the value contains, one finding each, so a
  * long entry inside a list or a record cannot hide behind its container.
  *
+ * A key declaring `tags` is measured over its PLAIN text — the placeholders
+ * removed — and reports that length, so the counter and a reader agree on what
+ * the value says.
+ *
  * The unit is the UTF-16 code unit — `String.length`, which the fit estimate
  * counts too. An NFD `é` is 2 and an emoji is 2, so the count and an operator's
  * idea of "characters" can differ; the message keeps the colloquial word
@@ -164,16 +175,18 @@ export function checkLimits(d: Descriptor, key: string, value: unknown): Verdict
   if (!limits) return { ok: true, findings: [] };
 
   const severity = limits.severity === 'hard' ? 'error' : 'warning';
+  const tagged = d.keys[key]?.tags !== undefined;
   const findings: Finding[] = [];
   for (const { path, text } of stringsOf(d, key, value)) {
-    if (text.length <= limits.max) continue;
+    const measured = tagged ? plainOf(text) : text;
+    if (measured.length <= limits.max) continue;
     findings.push({
       rule: 'limit',
       severity,
       key: path,
-      length: text.length,
+      length: measured.length,
       max: limits.max,
-      message: `${path}: ${text.length} characters exceeds the ${limits.max}-character limit`,
+      message: `${path}: ${measured.length} characters exceeds the ${limits.max}-character limit`,
     });
   }
   return { ok: !findings.some((f) => f.severity === 'error'), findings };
@@ -208,6 +221,79 @@ export function checkVars(d: Descriptor, key: string, value: unknown): Verdict {
     });
   }
   return { ok: findings.length === 0, findings };
+}
+
+/**
+ * A tagged value's text as a reader sees it: the paired placeholders removed
+ * and each self-closing one standing for the one space its element renders as,
+ * so a `<br>` between two lines never fuses their words. It is the one
+ * placeholder grammar — the length rule measures it, and the static-HTML host's
+ * locator names its key from it.
+ */
+export function plainOf(text: string): string {
+  return text.replace(PLACEHOLDER, (_match, closing: string, _number: string, selfClosing: string) =>
+    closing === '' && selfClosing === '/' ? ' ' : '',
+  );
+}
+
+/**
+ * Placeholder tags are kept whole. A key declaring `tags: n` accepts only a
+ * value carrying exactly `1..n`, each opened once and closed once (or
+ * self-closed once), properly nested. Reordering is allowed — a translation may
+ * move the emphasised part — because the tags' identity lives in the document,
+ * never in the value.
+ *
+ * A key WITHOUT `tags` is not checked at all: a `<1>` in ordinary prose is
+ * prose. One finding per contained string, naming the first fault found, since
+ * the message states what the value must carry and what it does.
+ */
+export function checkTags(d: Descriptor, key: string, value: unknown): Verdict {
+  const declared = d.keys[key]?.tags;
+  if (declared === undefined) return { ok: true, findings: [] };
+
+  const findings: Finding[] = [];
+  for (const { path, text } of stringsOf(d, key, value)) {
+    const fault = tagFault(text, declared);
+    if (fault === null) continue;
+    findings.push({
+      rule: 'tags',
+      severity: 'error',
+      key: path,
+      message: `${path}: the value must carry placeholder tags 1..${declared}, each once and balanced — found ${fault}`,
+    });
+  }
+  return { ok: findings.length === 0, findings };
+}
+
+/** The first way `text` fails the tag rule for a count of `declared`, or null. */
+function tagFault(text: string, declared: number): string | null {
+  const open: number[] = [];
+  const seen = new Set<number>();
+  for (const found of text.matchAll(PLACEHOLDER)) {
+    const closing = found[1] === '/';
+    const number = Number(found[2]);
+    const selfClosing = found[3] === '/';
+    if (number < 1 || number > declared) return `tag ${number} beyond 1..${declared}`;
+    if (closing) {
+      // A close whose number is nowhere open closes nothing; one that is open
+      // but not innermost leaves the element above it hanging, which is the
+      // fault worth naming.
+      const top = open[open.length - 1];
+      if (top === number) open.pop();
+      else if (open.includes(number)) return `<${top}> never closed`;
+      else return `</${number}> before <${number}>`;
+      continue;
+    }
+    if (seen.has(number)) return `tag ${number} twice`;
+    seen.add(number);
+    if (!selfClosing) open.push(number);
+  }
+  const hanging = open[open.length - 1];
+  if (hanging !== undefined) return `<${hanging}> never closed`;
+  for (let number = 1; number <= declared; number += 1) {
+    if (!seen.has(number)) return `tag ${number} missing`;
+  }
+  return null;
 }
 
 /**
@@ -390,6 +476,7 @@ export function validateSave(
   const findings: Finding[] = [
     ...checkLimits(d, candidate.key, candidate.value).findings,
     ...checkVars(d, candidate.key, candidate.value).findings,
+    ...checkTags(d, candidate.key, candidate.value).findings,
   ];
 
   const template = templateOf(d, candidate.key);

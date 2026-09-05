@@ -24,8 +24,15 @@ import { activeRow, resolve } from '../src/resolve.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { shapeSchema } from '../src/validate.js';
-import { writeJsonDeterministic, writeText } from './artifacts.js';
+import {
+  planRepoForms,
+  rethrowBatchFailure,
+  writeJsonDeterministic,
+  writePlanned,
+  writeText,
+} from './artifacts.js';
 import { ENV_OPTION, noPositionals, parse, text } from './args.js';
+import { isHtmlHost } from './config.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence } from './project.js';
 import { Report } from './report.js';
@@ -109,10 +116,27 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
       bundleValues[locale] = bundleBlock;
     }
 
-    writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
-    writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged));
-    report.line(`wrote ${config.snapshotPath}`);
-    report.line(`wrote ${config.codegen.defaults}`);
+    if (isHtmlHost(config)) {
+      // The repo forms here are the snapshot and the MARKED DOCUMENTS. It goes
+      // through `planRepoForms` rather than a hand-built list because that
+      // function is the ONE place the skip refusal lives: a document stet
+      // cannot regenerate stops the whole write, snapshot included.
+      let written: string[];
+      try {
+        ({ written } = writePlanned(
+          planRepoForms(io.cwd, config, project.descriptor, merged, report),
+        ));
+      } catch (error) {
+        rethrowBatchFailure('stet pull', error);
+      }
+      if (written.length === 0) report.line('pull: documents current');
+      for (const name of written) report.line(`wrote ${name}`);
+    } else {
+      writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
+      writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged));
+      report.line(`wrote ${config.snapshotPath}`);
+      report.line(`wrote ${config.codegen.defaults}`);
+    }
 
     if (isStoreBacked(project.environment.block)) {
       const bundle: Bundle = { values: bundleValues, meta };

@@ -5,9 +5,10 @@
  * never-touch-a-published-value guarantee, idempotence, the server/client
  * choice, and every refusal (ambiguous, no-provider, foreign `copy`).
  */
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
@@ -638,5 +639,181 @@ describe('runRegister — the parse-refusal wall', () => {
     expect(dualCap.out.filter((l) => l.includes('could not be parsed cleanly'))).toEqual([
       'both/one.astro: could not be parsed cleanly — reported, not adopted',
     ]);
+  });
+});
+
+describe('runRegister — the static-HTML host', () => {
+  const PAGE = readFileSync(
+    fileURLToPath(new URL('./fixtures/html-host/index.html', import.meta.url)),
+    'utf8',
+  );
+
+  /**
+   * An html host, and deliberately NO tsconfig: the config's defaulted
+   * `@/lib/content` alias resolves nowhere, so a run that succeeds here is the
+   * witness that the alias guard never ran and the compiler was never asked for.
+   */
+  function htmlProject(opts: { keys?: Record<string, unknown>; defaults?: Record<string, unknown> } = {}): string {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-register-html-'));
+    write(
+      dir,
+      'stet.config.json',
+      JSON.stringify({
+        project: 't',
+        host: 'html',
+        managedSurfaces: ['**/*.html'],
+        descriptorPath: 'content/descriptor.json',
+        snapshotPath: 'content/defaults.json',
+      }),
+    );
+    write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: opts.keys ?? {} }));
+    write(dir, 'content/defaults.json', JSON.stringify({ default: opts.defaults ?? {} }));
+    write(dir, 'index.html', PAGE);
+    return dir;
+  }
+
+  it('prints the diff and writes NOTHING on the plain run', async () => {
+    const dir = htmlProject();
+    const before = {
+      descriptor: readFileSync(join(dir, 'content/descriptor.json')),
+      snapshot: readFileSync(join(dir, 'content/defaults.json')),
+      page: readFileSync(join(dir, 'index.html')),
+    };
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    const out = cap.out.join('\n');
+    expect(out).toContain('+      <h3 data-stet="software_product_and_engineering">');
+    expect(out).toContain('register: run with --write to apply 28 marks across 1 document');
+    // The divergence from the JavaScript branch: a descriptor entry without its
+    // mark is half a batch, so the plain run commits none of it.
+    expect(readFileSync(join(dir, 'content/descriptor.json'))).toEqual(before.descriptor);
+    expect(readFileSync(join(dir, 'content/defaults.json'))).toEqual(before.snapshot);
+    expect(readFileSync(join(dir, 'index.html'))).toEqual(before.page);
+  });
+
+  it('--write lands the keys, the values and the marks in one batch', async () => {
+    const dir = htmlProject();
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out.join('\n')).toContain(
+      'wrote content/descriptor.json, content/defaults.json and 1 document: 26 keys added, 2 shared',
+    );
+    expect(cap.out.join('\n')).toContain('register: applied');
+
+    const keys = descriptor(dir).keys;
+    expect(keys['you_may_already_have_the_data_our_ai']).toEqual({
+      shape: 'text',
+      target: 'web',
+      tags: 1,
+    });
+    expect(defaults(dir).default['you_may_already_have_the_data_our_ai']).toBe(
+      'You may already have the data<1> our AI lab partners need.</1>',
+    );
+    // `&amp;` read back as the character it denotes.
+    expect(defaults(dir).default['research_development_notes']).toBe('Research & development notes.');
+
+    // The document is byte-identical outside the inserted attributes.
+    const written = readFileSync(join(dir, 'index.html'), 'utf8');
+    expect(Buffer.from(written.replace(/ data-stet[^ >]*="[^"]*"/g, ''), 'utf8')).toEqual(
+      Buffer.from(PAGE, 'utf8'),
+    );
+    expect(written.match(/data-stet/g)).toHaveLength(28);
+  });
+
+  it('shares one key for identical text and suffixes the rest in document order', async () => {
+    const dir = htmlProject();
+    await runRegister(['--from', 'scan', '--write'], io(dir));
+    const keys = Object.keys(descriptor(dir).keys).filter((k) => k.startsWith('how_it_works'));
+    expect(keys.sort()).toEqual(['how_it_works', 'how_it_works_2', 'how_it_works_3']);
+    const values = defaults(dir).default;
+    expect(values['how_it_works']).toBe('How it works');
+    expect(values['how_it_works_2']).toBe('How it works.');
+    expect(values['how_it_works_3']).toBe('How it works →');
+    // One key, marked on BOTH links.
+    const page = readFileSync(join(dir, 'index.html'), 'utf8');
+    expect(page.match(/data-stet="how_it_works"/g)).toHaveLength(2);
+  });
+
+  it('marks a link carrying both text and a copy title with both, in the stated order', async () => {
+    const dir = htmlProject();
+    await runRegister(['--from', 'scan', '--write'], io(dir));
+    expect(readFileSync(join(dir, 'index.html'), 'utf8')).toContain(
+      '<a href="/book" title="Book now" data-stet="book_now" data-stet-title="book_now">',
+    );
+  });
+
+  it('shares an existing web text key, and never an email one', async () => {
+    const shared = htmlProject({
+      keys: { existing_heading: { shape: 'text', target: 'web' } },
+      defaults: { existing_heading: 'Software, product and engineering histories' },
+    });
+    await runRegister(['--from', 'scan', '--write'], io(shared));
+    expect(descriptor(shared).keys['software_product_and_engineering']).toBeUndefined();
+    expect(readFileSync(join(shared, 'index.html'), 'utf8')).toContain(
+      '<h3 data-stet="existing_heading">',
+    );
+
+    const email = htmlProject({
+      keys: { existing_heading: { shape: 'text', target: 'html-email' } },
+      defaults: { existing_heading: 'Software, product and engineering histories' },
+    });
+    await runRegister(['--from', 'scan', '--write'], io(email));
+    expect(descriptor(email).keys['software_product_and_engineering']).toEqual({
+      shape: 'text',
+      target: 'web',
+    });
+  });
+
+  it('adopts nothing on a second run, and changes no byte', async () => {
+    const dir = htmlProject();
+    await runRegister(['--from', 'scan', '--write'], io(dir));
+    const before = {
+      descriptor: readFileSync(join(dir, 'content/descriptor.json')),
+      snapshot: readFileSync(join(dir, 'content/defaults.json')),
+      page: readFileSync(join(dir, 'index.html')),
+    };
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(cap.out.join('\n')).toContain('register: nothing to adopt');
+    expect(readFileSync(join(dir, 'content/descriptor.json'))).toEqual(before.descriptor);
+    expect(readFileSync(join(dir, 'content/defaults.json'))).toEqual(before.snapshot);
+    expect(readFileSync(join(dir, 'index.html'))).toEqual(before.page);
+  });
+
+  it('never writes a codegen module, and never asks for the compiler', async () => {
+    const dir = htmlProject();
+    // No tsconfig at all, so the defaulted `@/lib/content` alias resolves
+    // nowhere: the run succeeding IS the alias-guard witness.
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(readdirSync(join(dir, 'content')).sort()).toEqual(['defaults.json', 'descriptor.json']);
+  });
+});
+
+describe('runRegister — the JavaScript branch writes through the same batch', () => {
+  it('rolls back the descriptor when a codegen write fails mid-batch', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Fresh key here</h1>'));
+    // The codegen directory exists and is read-only, so the third file in the
+    // batch cannot be written. `content/` is where the descriptor lives too, so
+    // the batch has already written two files by then.
+    mkdirSync(join(dir, 'content'), { recursive: true });
+    const before = readFileSync(join(dir, 'content/descriptor.json'));
+    chmodSync(join(dir, 'content'), 0o500);
+    const cap = io(dir);
+    let failed = false;
+    try {
+      await runRegister(['--from', 'scan', '--write'], cap);
+    } catch (error) {
+      failed = true;
+      expect((error as Error).message).toContain('the write batch failed');
+      expect((error as Error).message).toContain('Every file this run had already written was put back');
+    } finally {
+      chmodSync(join(dir, 'content'), 0o700);
+    }
+    expect(failed).toBe(true);
+    // F17 narrows rather than closes: `writeFileSync` gives no cross-file
+    // atomicity, so a scan landing INSIDE the batch can still read a half-written
+    // tree. What the batch does guarantee is that the failure put everything back.
+    expect(readFileSync(join(dir, 'content/descriptor.json'))).toEqual(before);
   });
 });

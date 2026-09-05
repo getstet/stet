@@ -45,10 +45,13 @@ import { writeJsonDeterministic, writeText } from './artifacts.js';
 import {
   CONFIG_FILE,
   HOST_MIGRATIONS,
+  isHtmlHost,
   normalizeNoExt,
   pathAliasMappings,
   resolveSpecifier,
+  type StetConfig,
 } from './config.js';
+import { planDocuments, stripMarks } from './html-host.js';
 import { hooksDir } from './hook.js';
 import { packageRoot } from './installed.js';
 import type { CliIo } from './main.js';
@@ -114,7 +117,13 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
     // parse. The gate covers the WHOLE un-rewrite loop, not one load:
     // `scanSource` loads the compiler itself, per file.
     let ts: typeof import('typescript') | null = null;
-    if (importers.length > 0) {
+    // On the static-HTML host there is no accessor call to reverse, no provider
+    // to unwrap and no stet-written module to delete — so no compiler is asked
+    // for, and the un-rewrite prints nothing at all rather than a line about
+    // reversing nothing.
+    if (isHtmlHost(config)) {
+      // nothing to un-rewrite
+    } else if (importers.length > 0) {
       try {
         ts = await loadTypescript();
       } catch (error) {
@@ -132,7 +141,7 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
             `(${importers.length} file(s) import the accessor)`,
         );
       }
-    } else {
+    } else if (!isHtmlHost(config)) {
       report.line('un-rewrite: nothing to reverse (no stet imports in the managed surfaces)');
     }
 
@@ -151,6 +160,10 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       if (r.value !== undefined) values[key] = r.value;
     }
     const merged = buildSnapshot(descriptor, snapshot, storeBacked ? rows : [], config);
+
+    if (isHtmlHost(config)) {
+      return ejectHtml({ io, config, descriptor, merged, write, report });
+    }
 
     // PLAN the host source edits: un-rewrite the leaves, reverse the layout
     // mount. Skipped WHOLE where the probe found nothing to reverse, or where
@@ -509,7 +522,9 @@ function backstop(
     // a file whose stet import it never sees.
     const isSource = /\.(tsx?|jsx?|mjs|cjs|mts|cts)$/.test(name);
     // The dialects are read for the consumers channel only: the survivors
-    // sweep does not parse one, but any of them can import the read path.
+    // sweep does not parse one, but any of them can import the read path. The
+    // set includes `.html` now, whose sweep finds no import specifier at all —
+    // a plain page carries none — so the file is read and contributes nothing.
     const isDialect = isDialectFile(name);
     if (!isSource && !isDialect) return;
     // The walk's own post-edit text (:372's idiom), so an import the
@@ -573,6 +588,76 @@ function importSpecifiers(text: string): string[] {
  * imports stet. Naming them makes the manifest complete on both sides, so a
  * host reading a refusal still knows what a successful run would have left.
  */
+/**
+ * `eject` on the static-HTML host.
+ *
+ * There is nothing to un-rewrite, unwrap or delete: the marks ARE the whole
+ * install. So each document is regenerated from the resolved snapshot — so the
+ * text left behind is the committed truth rather than whatever the page last
+ * held — and then every mark is stripped with its text kept. The guidance, hook
+ * and dependency stages run exactly as on every host.
+ *
+ * A document it cannot regenerate refuses the run WHOLE: under `--write` before
+ * a byte is written, and in plan-only after the full plan has printed, the way
+ * the survivors refusal does.
+ *
+ * The repo-wide backstop does not run here — there is no stet import anywhere
+ * to sweep for — so a guidance block a host moved into some other file is not
+ * reported on this host. Bounded residue, stated.
+ */
+function ejectHtml(d: {
+  io: CliIo;
+  config: StetConfig;
+  descriptor: Descriptor;
+  merged: Snapshot;
+  write: boolean;
+  report: Report;
+}): number {
+  const { io, config, descriptor, merged, write, report } = d;
+  const files = filesForGlobs(io.cwd, config.managedSurfaces).filter((f) => f.endsWith('.html'));
+  const { writes, skips } = planDocuments(io.cwd, files, descriptor, merged, report);
+  const first = skips[0];
+  const refusal =
+    first === undefined
+      ? null
+      : new CliError(
+          `eject found ${skips.length} document(s) it cannot regenerate — ` +
+            `${first.file}:${first.line} ${first.reason}; nothing was written`,
+        );
+  if (refusal !== null && write) throw refusal;
+
+  const rebuilt = new Map(writes.map((w) => [w.rel, w.text]));
+  const stripped = new Map<string, string>();
+  for (const file of files) {
+    const current = readFileSync(join(io.cwd, file), 'utf8');
+    stripped.set(file, stripMarks(rebuilt.get(file) ?? current));
+    report.line(`document: ${file} — every mark removed, the text stays`);
+  }
+
+  const keys = Object.keys(merged[config.locales.default] ?? {}).length;
+  report.line(`snapshot: ${keys} default key(s) → ${config.snapshotPath}`);
+  if (write && refusal === null) {
+    writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
+    for (const [file, text] of stripped) writeText(join(io.cwd, file), text);
+  }
+
+  // What stays: the config, the descriptor and the snapshot. No registry on
+  // this host, and no migration copies unless the operator put them there.
+  const stays = [CONFIG_FILE, config.descriptorPath, config.snapshotPath].filter((rel) =>
+    existsSync(join(io.cwd, rel)),
+  );
+  if (stays.length > 0) report.line(`stays (no stet imports): ${stays.join(', ')}`);
+
+  // The guidance goes first, then the hook, then the dependency — the same
+  // order, for the same reason, as on every other host.
+  removeGuidanceBlocks(io.cwd, buildGuidanceBlock(config), write, report, []);
+  removeHook(io.cwd, write, report);
+  dropDependency(io.cwd, write, report);
+
+  if (refusal !== null) throw refusal;
+  return report.emit(io);
+}
+
 function staysList(
   cwd: string,
   config: { descriptorPath: string; snapshotPath: string; codegen: { registry: string } },

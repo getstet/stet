@@ -24,6 +24,7 @@ import type * as TS from 'typescript';
 
 import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
 import { escapeRegExp } from '../src/seo.js';
+import type { Descriptor } from '../src/types.js';
 import { CliError } from './report.js';
 
 // `managedSurfaces` speaks a two-token glob — a single star for one path segment
@@ -258,22 +259,269 @@ const KEY_NAME = new RegExp(DESCRIPTOR_SCHEMA.$defs.keyName.pattern);
  * shows. Non-ASCII values go through `String.fromCharCode` rather than a `\u`
  * escape, which the authoring tools decode into a literal byte.
  */
+/**
+ * The HTML 4 named character references — the 252 the standard defines, plus
+ * `&apos;`, which HTML 5 added and every serializer writes. A name outside this
+ * table decodes to itself, which is what `undecodedEntity` reports and what the
+ * static-HTML locator refuses to adopt: a value carrying an entity stet cannot
+ * read would regenerate as its own escaped source.
+ *
+ * Non-ASCII replacements are written by code point so the module stays ASCII.
+ */
 const NAMED_ENTITIES: Record<string, string> = {
+  Aacute: String.fromCharCode(193),
+  aacute: String.fromCharCode(225),
+  Acirc: String.fromCharCode(194),
+  acirc: String.fromCharCode(226),
+  acute: String.fromCharCode(180),
+  AElig: String.fromCharCode(198),
+  aelig: String.fromCharCode(230),
+  Agrave: String.fromCharCode(192),
+  agrave: String.fromCharCode(224),
+  alefsym: String.fromCharCode(8501),
+  Alpha: String.fromCharCode(913),
+  alpha: String.fromCharCode(945),
   amp: '&',
-  lt: '<',
-  gt: '>',
-  quot: '"',
-  apos: "'",
-  nbsp: String.fromCharCode(160),
+  and: String.fromCharCode(8743),
+  ang: String.fromCharCode(8736),
+  Aring: String.fromCharCode(197),
+  aring: String.fromCharCode(229),
+  asymp: String.fromCharCode(8776),
+  Atilde: String.fromCharCode(195),
+  atilde: String.fromCharCode(227),
+  Auml: String.fromCharCode(196),
+  auml: String.fromCharCode(228),
+  bdquo: String.fromCharCode(8222),
+  Beta: String.fromCharCode(914),
+  beta: String.fromCharCode(946),
+  brvbar: String.fromCharCode(166),
+  bull: String.fromCharCode(8226),
+  cap: String.fromCharCode(8745),
+  Ccedil: String.fromCharCode(199),
+  ccedil: String.fromCharCode(231),
+  cedil: String.fromCharCode(184),
+  cent: String.fromCharCode(162),
+  Chi: String.fromCharCode(935),
+  chi: String.fromCharCode(967),
+  circ: String.fromCharCode(710),
+  clubs: String.fromCharCode(9827),
+  cong: String.fromCharCode(8773),
   copy: String.fromCharCode(169),
-  reg: String.fromCharCode(174),
+  crarr: String.fromCharCode(8629),
+  cup: String.fromCharCode(8746),
+  curren: String.fromCharCode(164),
+  Dagger: String.fromCharCode(8225),
+  dagger: String.fromCharCode(8224),
+  dArr: String.fromCharCode(8659),
+  darr: String.fromCharCode(8595),
+  deg: String.fromCharCode(176),
+  Delta: String.fromCharCode(916),
+  delta: String.fromCharCode(948),
+  diams: String.fromCharCode(9830),
+  divide: String.fromCharCode(247),
+  Eacute: String.fromCharCode(201),
+  eacute: String.fromCharCode(233),
+  Ecirc: String.fromCharCode(202),
+  ecirc: String.fromCharCode(234),
+  Egrave: String.fromCharCode(200),
+  egrave: String.fromCharCode(232),
+  empty: String.fromCharCode(8709),
+  emsp: String.fromCharCode(8195),
+  ensp: String.fromCharCode(8194),
+  Epsilon: String.fromCharCode(917),
+  epsilon: String.fromCharCode(949),
+  equiv: String.fromCharCode(8801),
+  Eta: String.fromCharCode(919),
+  eta: String.fromCharCode(951),
+  ETH: String.fromCharCode(208),
+  eth: String.fromCharCode(240),
+  Euml: String.fromCharCode(203),
+  euml: String.fromCharCode(235),
+  euro: String.fromCharCode(8364),
+  exist: String.fromCharCode(8707),
+  fnof: String.fromCharCode(402),
+  forall: String.fromCharCode(8704),
+  frac12: String.fromCharCode(189),
+  frac14: String.fromCharCode(188),
+  frac34: String.fromCharCode(190),
+  frasl: String.fromCharCode(8260),
+  Gamma: String.fromCharCode(915),
+  gamma: String.fromCharCode(947),
+  ge: String.fromCharCode(8805),
+  gt: '>',
+  hArr: String.fromCharCode(8660),
+  harr: String.fromCharCode(8596),
+  hearts: String.fromCharCode(9829),
   hellip: String.fromCharCode(8230),
-  mdash: String.fromCharCode(8212),
-  ndash: String.fromCharCode(8211),
-  lsquo: String.fromCharCode(8216),
-  rsquo: String.fromCharCode(8217),
+  Iacute: String.fromCharCode(205),
+  iacute: String.fromCharCode(237),
+  Icirc: String.fromCharCode(206),
+  icirc: String.fromCharCode(238),
+  iexcl: String.fromCharCode(161),
+  Igrave: String.fromCharCode(204),
+  igrave: String.fromCharCode(236),
+  image: String.fromCharCode(8465),
+  infin: String.fromCharCode(8734),
+  int: String.fromCharCode(8747),
+  Iota: String.fromCharCode(921),
+  iota: String.fromCharCode(953),
+  iquest: String.fromCharCode(191),
+  isin: String.fromCharCode(8712),
+  Iuml: String.fromCharCode(207),
+  iuml: String.fromCharCode(239),
+  Kappa: String.fromCharCode(922),
+  kappa: String.fromCharCode(954),
+  Lambda: String.fromCharCode(923),
+  lambda: String.fromCharCode(955),
+  lang: String.fromCharCode(9001),
+  laquo: String.fromCharCode(171),
+  lArr: String.fromCharCode(8656),
+  larr: String.fromCharCode(8592),
+  lceil: String.fromCharCode(8968),
   ldquo: String.fromCharCode(8220),
+  le: String.fromCharCode(8804),
+  lfloor: String.fromCharCode(8970),
+  lowast: String.fromCharCode(8727),
+  loz: String.fromCharCode(9674),
+  lrm: String.fromCharCode(8206),
+  lsaquo: String.fromCharCode(8249),
+  lsquo: String.fromCharCode(8216),
+  lt: '<',
+  macr: String.fromCharCode(175),
+  mdash: String.fromCharCode(8212),
+  micro: String.fromCharCode(181),
+  middot: String.fromCharCode(183),
+  minus: String.fromCharCode(8722),
+  Mu: String.fromCharCode(924),
+  mu: String.fromCharCode(956),
+  nabla: String.fromCharCode(8711),
+  nbsp: String.fromCharCode(160),
+  ndash: String.fromCharCode(8211),
+  ne: String.fromCharCode(8800),
+  ni: String.fromCharCode(8715),
+  not: String.fromCharCode(172),
+  notin: String.fromCharCode(8713),
+  nsub: String.fromCharCode(8836),
+  Ntilde: String.fromCharCode(209),
+  ntilde: String.fromCharCode(241),
+  Nu: String.fromCharCode(925),
+  nu: String.fromCharCode(957),
+  Oacute: String.fromCharCode(211),
+  oacute: String.fromCharCode(243),
+  Ocirc: String.fromCharCode(212),
+  ocirc: String.fromCharCode(244),
+  OElig: String.fromCharCode(338),
+  oelig: String.fromCharCode(339),
+  Ograve: String.fromCharCode(210),
+  ograve: String.fromCharCode(242),
+  oline: String.fromCharCode(8254),
+  Omega: String.fromCharCode(937),
+  omega: String.fromCharCode(969),
+  Omicron: String.fromCharCode(927),
+  omicron: String.fromCharCode(959),
+  oplus: String.fromCharCode(8853),
+  or: String.fromCharCode(8744),
+  ordf: String.fromCharCode(170),
+  ordm: String.fromCharCode(186),
+  Oslash: String.fromCharCode(216),
+  oslash: String.fromCharCode(248),
+  Otilde: String.fromCharCode(213),
+  otilde: String.fromCharCode(245),
+  otimes: String.fromCharCode(8855),
+  Ouml: String.fromCharCode(214),
+  ouml: String.fromCharCode(246),
+  para: String.fromCharCode(182),
+  part: String.fromCharCode(8706),
+  permil: String.fromCharCode(8240),
+  perp: String.fromCharCode(8869),
+  Phi: String.fromCharCode(934),
+  phi: String.fromCharCode(966),
+  Pi: String.fromCharCode(928),
+  pi: String.fromCharCode(960),
+  piv: String.fromCharCode(982),
+  plusmn: String.fromCharCode(177),
+  pound: String.fromCharCode(163),
+  Prime: String.fromCharCode(8243),
+  prime: String.fromCharCode(8242),
+  prod: String.fromCharCode(8719),
+  prop: String.fromCharCode(8733),
+  Psi: String.fromCharCode(936),
+  psi: String.fromCharCode(968),
+  quot: '"',
+  radic: String.fromCharCode(8730),
+  rang: String.fromCharCode(9002),
+  raquo: String.fromCharCode(187),
+  rArr: String.fromCharCode(8658),
+  rarr: String.fromCharCode(8594),
+  rceil: String.fromCharCode(8969),
   rdquo: String.fromCharCode(8221),
+  real: String.fromCharCode(8476),
+  reg: String.fromCharCode(174),
+  rfloor: String.fromCharCode(8971),
+  Rho: String.fromCharCode(929),
+  rho: String.fromCharCode(961),
+  rlm: String.fromCharCode(8207),
+  rsaquo: String.fromCharCode(8250),
+  rsquo: String.fromCharCode(8217),
+  sbquo: String.fromCharCode(8218),
+  Scaron: String.fromCharCode(352),
+  scaron: String.fromCharCode(353),
+  sdot: String.fromCharCode(8901),
+  sect: String.fromCharCode(167),
+  shy: String.fromCharCode(173),
+  Sigma: String.fromCharCode(931),
+  sigma: String.fromCharCode(963),
+  sigmaf: String.fromCharCode(962),
+  sim: String.fromCharCode(8764),
+  spades: String.fromCharCode(9824),
+  sub: String.fromCharCode(8834),
+  sube: String.fromCharCode(8838),
+  sum: String.fromCharCode(8721),
+  sup: String.fromCharCode(8835),
+  sup1: String.fromCharCode(185),
+  sup2: String.fromCharCode(178),
+  sup3: String.fromCharCode(179),
+  supe: String.fromCharCode(8839),
+  szlig: String.fromCharCode(223),
+  Tau: String.fromCharCode(932),
+  tau: String.fromCharCode(964),
+  there4: String.fromCharCode(8756),
+  Theta: String.fromCharCode(920),
+  theta: String.fromCharCode(952),
+  thetasym: String.fromCharCode(977),
+  thinsp: String.fromCharCode(8201),
+  THORN: String.fromCharCode(222),
+  thorn: String.fromCharCode(254),
+  tilde: String.fromCharCode(732),
+  times: String.fromCharCode(215),
+  trade: String.fromCharCode(8482),
+  Uacute: String.fromCharCode(218),
+  uacute: String.fromCharCode(250),
+  uArr: String.fromCharCode(8657),
+  uarr: String.fromCharCode(8593),
+  Ucirc: String.fromCharCode(219),
+  ucirc: String.fromCharCode(251),
+  Ugrave: String.fromCharCode(217),
+  ugrave: String.fromCharCode(249),
+  uml: String.fromCharCode(168),
+  upsih: String.fromCharCode(978),
+  Upsilon: String.fromCharCode(933),
+  upsilon: String.fromCharCode(965),
+  Uuml: String.fromCharCode(220),
+  uuml: String.fromCharCode(252),
+  weierp: String.fromCharCode(8472),
+  Xi: String.fromCharCode(926),
+  xi: String.fromCharCode(958),
+  Yacute: String.fromCharCode(221),
+  yacute: String.fromCharCode(253),
+  yen: String.fromCharCode(165),
+  Yuml: String.fromCharCode(376),
+  yuml: String.fromCharCode(255),
+  Zeta: String.fromCharCode(918),
+  zeta: String.fromCharCode(950),
+  zwj: String.fromCharCode(8205),
+  zwnj: String.fromCharCode(8204),
+  apos: "'",
 };
 
 /**
@@ -288,15 +536,40 @@ export function decodeEntities(text: string): string {
     if (body.charAt(0) === '#') {
       const hex = body.charAt(1) === 'x' || body.charAt(1) === 'X';
       const code = hex ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
-      return Number.isNaN(code) ? match : String.fromCodePoint(code);
+      // `String.fromCodePoint` THROWS above U+10FFFF, and a lone surrogate is
+      // not a character any source should carry. Both return the match
+      // unchanged, so the text routes through `undecodedEntity`'s named skip
+      // instead of killing the command that read the file.
+      if (Number.isNaN(code) || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return match;
+      return String.fromCodePoint(code);
     }
     return NAMED_ENTITIES[body] ?? match;
   });
 }
 
-/** Runs of whitespace (a multi-line JSX node's indentation included) → one space. */
-function collapseWhitespace(text: string): string {
+/**
+ * Runs of whitespace (a multi-line JSX node's indentation included) → one space.
+ * Exported for the static-HTML locator, which collapses a document's runs on the
+ * same rule so a reindent is never read as an edit.
+ */
+export function collapseWhitespace(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * The first entity reference the table cannot decode, where there is one — a
+ * name outside the HTML 4 set, or a numeric reference naming no character.
+ *
+ * Moved here beside the table when the static-HTML locator became its second
+ * consumer: a run carrying an entity stet cannot decode is never adopted, since
+ * its value would regenerate as the escaped source rather than the character.
+ */
+export function undecodedEntity(text: string): string | undefined {
+  for (const match of text.matchAll(/&(?:#\d+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);/g)) {
+    const entity = match[0];
+    if (decodeEntities(entity) === entity) return entity;
+  }
+  return undefined;
 }
 
 /**
@@ -314,6 +587,19 @@ export function proposeKey(text: string): string {
     .replace(/^_+|_+$/g, '');
   const key = s.length <= 40 ? s : s.slice(0, 40).replace(/_[^_]*$/, '') || s.slice(0, 40);
   return key || 'key';
+}
+
+/**
+ * `base`, or the first `base_2`, `base_3` … the descriptor does not already
+ * declare. Beside `proposeKey` because the pair is one act: propose a name, then
+ * take a free one. `register` mints with it on both hosts.
+ */
+export function freeKey(descriptor: Descriptor, base: string): string {
+  if (!(base in descriptor.keys)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base}_${n}`;
+    if (!(candidate in descriptor.keys)) return candidate;
+  }
 }
 
 /**
@@ -903,8 +1189,12 @@ function lineSpan(source: string, pos: number, nodeEnd: number): Span {
  * between the brackets and with it the finding — and it carried the last of the
  * adversarial backtracking, since the bar runs per dialect run and per module
  * literal alike.
+ *
+ * Exported for the static-HTML locator: an element is a key element when a text
+ * segment of its own passes this same bar, so a page and a `.vue` agree on what
+ * counts as copy.
  */
-function qualifiesAsCopy(text: string): boolean {
+export function qualifiesAsCopy(text: string): boolean {
   return /[A-Za-z]\w|\w[A-Za-z]/.test(text.replace(TAG, ' '));
 }
 
@@ -1221,7 +1511,7 @@ export function isJsxFile(name: string): boolean {
 }
 
 /** The template dialects — files the TypeScript compiler refuses and the text detector reads instead. */
-export type Dialect = 'astro' | 'vue' | 'svelte' | 'mdx';
+export type Dialect = 'astro' | 'vue' | 'svelte' | 'mdx' | 'html';
 
 /**
  * The ONE dialect-extension test. `eject` reads it for the files it sweeps for
@@ -1233,7 +1523,7 @@ export type Dialect = 'astro' | 'vue' | 'svelte' | 'mdx';
  * a dialect here, and a case-insensitive widening is a change to what eject
  * sweeps, not a tidy-up.
  */
-const DIALECT_EXTENSION = /\.(astro|vue|svelte|mdx)$/;
+const DIALECT_EXTENSION = /\.(astro|vue|svelte|mdx|html)$/;
 
 export function isDialectFile(name: string): boolean {
   return DIALECT_EXTENSION.test(name);
@@ -1264,6 +1554,16 @@ const FRONTMATTER = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?=\r?\n|$)/;
 const SCRIPT_OR_STYLE = /<(script|style)\b[^>]*>[\s\S]*?<\/\1[ \t]*>/gi;
 const CODE_FENCE = /^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[^\n]*$/gm;
 const ESM_LINE = /^[ \t]*(?:import|export)\b[^\n]*$/gm;
+/** `<![CDATA[ … ]]>` — its body may carry `>`, so it is matched to the real terminator. */
+const CDATA_SECTION = /<!\[CDATA\[[\s\S]*?\]\]>/g;
+
+/**
+ * The remaining bogus-comment forms — a processing instruction (`<? … ?>`), a
+ * markup declaration and the doctype (`<! … >`). HTML terminates each at the
+ * first `>`, and so does this.
+ */
+const BOGUS_COMMENT = /<[?!][^>]*>/g;
+
 const HTML_COMMENT = /<!--[\s\S]*?-->/g;
 /**
  * A tag, whose body cannot contain another `<`. The looser `<[^>]*>` treats a
@@ -1304,6 +1604,43 @@ function isCodeSpillover(text: string): boolean {
 }
 
 /**
+ * Everything that is not markup, blanked — comments, script and style bodies,
+ * code fences, an MDX ESM line and (on `astro`/`mdx` alone) the front matter.
+ * `.html` keeps no front matter: three leading dashes on a page are prose.
+ *
+ * Blanked material becomes NUL rather than going away, so every surviving
+ * character keeps its original offset and a reported line is the real one. It
+ * doubles as the run delimiter: two labels either side of a stripped tag are two
+ * findings, not one.
+ *
+ * `scanDialect` calls this and then strips tags and braces; the static-HTML
+ * locator calls it and reads the TAGS the strip would have eaten. The two can
+ * never disagree about what was blanked, because there is one blanking.
+ */
+export function blankNonMarkup(source: string, dialect: Dialect): string {
+  let work = source;
+  const strip = (pattern: RegExp): void => {
+    work = work.replace(pattern, (match) => match.replace(/[^\n]/g, '\0'));
+  };
+
+  if (dialect === 'astro' || dialect === 'mdx') strip(FRONTMATTER);
+  // Script and style blocks go for every dialect: a `<script>` body is code
+  // wherever it is written, and MDX admits one as readily as a `.vue` does.
+  strip(SCRIPT_OR_STYLE);
+  strip(CODE_FENCE);
+  if (dialect === 'mdx') strip(ESM_LINE);
+  strip(HTML_COMMENT);
+  // The other bogus-comment forms, blanked for every dialect on the same rule as
+  // a comment: a browser renders none of them as text, so a run beside one is
+  // never adopted. Without this the tokenizer — which matches `<[A-Za-z]` alone —
+  // reads the construct as prose, and the first regeneration would print it on
+  // the page escaped. CDATA goes first: its body may hold a bare `>`.
+  strip(CDATA_SECTION);
+  strip(BOGUS_COMMENT);
+  return work;
+}
+
+/**
  * The template-dialect detector — pure text, and deliberately compiler-free, so
  * it works on the typescript-less hosts `eject` now serves and its answers do
  * not change under TypeScript 7.
@@ -1319,22 +1656,10 @@ function isCodeSpillover(text: string): boolean {
  * declares in its frontmatter const is not found here.
  */
 export function scanDialect(file: string, source: string, dialect: Dialect): DialectFinding[] {
-  // Stripped material is blanked to NUL rather than deleted, so every surviving
-  // character keeps its original offset and the reported line is the real one.
-  // It doubles as the run delimiter: two labels either side of a stripped tag
-  // are two findings, not one.
-  let work = source;
+  let work = blankNonMarkup(source, dialect);
   const strip = (pattern: RegExp): void => {
     work = work.replace(pattern, (match) => match.replace(/[^\n]/g, '\0'));
   };
-
-  if (dialect === 'astro' || dialect === 'mdx') strip(FRONTMATTER);
-  // Script and style blocks go for every dialect: a `<script>` body is code
-  // wherever it is written, and MDX admits one as readily as a `.vue` does.
-  strip(SCRIPT_OR_STYLE);
-  strip(CODE_FENCE);
-  if (dialect === 'mdx') strip(ESM_LINE);
-  strip(HTML_COMMENT);
   strip(TAG);
   strip(BRACED);
 

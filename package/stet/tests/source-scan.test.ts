@@ -6,20 +6,82 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  blankNonMarkup,
   carriesToken,
+  decodeEntities,
   loadTypescript,
   matchGlob,
   mentionsToken,
   proposeKey,
   rendersToken,
+  scanDialect,
   scanModule,
   scanSource,
+  undecodedEntity,
 } from '../cli/source-scan.js';
 
 /** descriptor.schema.json:44 — every proposed key must satisfy it. */
 const KEY_REGEX = /^[a-z0-9]+(?:_{1,2}[a-z0-9]+)*$/;
 
 const scan = (file: string, source: string) => scanSource(file, source, { readPathImport: '@/lib/content' });
+
+describe('the html dialect', () => {
+  const page = [
+    '<!DOCTYPE html>',
+    '<html><head>',
+    '<style>.a { color: red }</style>',
+    '<script>const t = "a script string";</script>',
+    '</head><body>',
+    '<!-- a comment holding prose -->',
+    '<h1>Software histories</h1>',
+    '</body></html>',
+  ].join('\n');
+
+  it('text-warns a label between tags and reads nothing out of a comment, script or style', () => {
+    const texts = scanDialect('index.html', page, 'html').map((f) => f.text);
+    expect(texts).toContain('Software histories');
+    expect(texts.join(' | ')).not.toContain('a comment holding prose');
+    expect(texts.join(' | ')).not.toContain('a script string');
+    expect(texts.join(' | ')).not.toContain('color');
+  });
+
+  it('keeps no front matter — three leading dashes on a page are prose', () => {
+    const framed = ['---', 'This looks like front matter.', '---', '<p>And a paragraph.</p>'].join(
+      '\n',
+    );
+    // The dashes never delimit here, so the block is read as the prose it is —
+    // one run carrying the whole thing, rather than a stripped span.
+    const texts = scanDialect('index.html', framed, 'html').map((f) => f.text);
+    expect(texts.join(' | ')).toContain('This looks like front matter.');
+    expect(texts).toContain('And a paragraph.');
+  });
+
+  it('blanks without moving a byte, so every offset survives', () => {
+    const blanked = blankNonMarkup(page, 'html');
+    expect(blanked.length).toBe(page.length);
+
+    // The comment's span is NUL and its brackets are gone with it; the tags the
+    // locator reads are untouched.
+    const at = page.indexOf('<!-- a comment holding prose -->');
+    expect(blanked.slice(at, at + '<!-- a comment holding prose -->'.length)).toBe(
+      '\0'.repeat('<!-- a comment holding prose -->'.length),
+    );
+    expect(blanked).toContain('<h1>Software histories</h1>');
+  });
+});
+
+describe('decodeEntities over the HTML 4 named set', () => {
+  it('reads the names a page actually writes', () => {
+    expect(decodeEntities('a &rarr; b &hellip; &mdash;')).toBe('a \u2192 b \u2026 \u2014');
+    expect(decodeEntities('&trade; &euro; &laquo; &middot; &times; &eacute; &alpha;')).toBe(
+      '\u2122 \u20ac \u00ab \u00b7 \u00d7 \u00e9 \u03b1',
+    );
+  });
+
+  it('returns a name it does not know unchanged, so the caller can refuse it', () => {
+    expect(decodeEntities('&nosuch;')).toBe('&nosuch;');
+  });
+});
 
 describe('managed-surface glob matcher', () => {
   it('a double-star-slash matches zero or more intermediate segments', () => {
@@ -599,5 +661,54 @@ describe('scanModule — the ignore summary', () => {
         '};\n',
     );
     expect(result.ignoreSummaries).toEqual([{ line: 1, count: 2 }]);
+  });
+});
+
+describe('the stage-5 fold — entity references that name no character', () => {
+  it('returns an out-of-range numeric reference unchanged instead of throwing', () => {
+    // `String.fromCodePoint` throws above U+10FFFF, which killed every command
+    // that read the page — `init` among them, after the scaffold had landed.
+    expect(decodeEntities('&#1114112;')).toBe('&#1114112;');
+    expect(decodeEntities('Overflow test &#1114112; here')).toBe('Overflow test &#1114112; here');
+  });
+
+  it('returns a lone surrogate unchanged', () => {
+    expect(decodeEntities('&#xD800;')).toBe('&#xD800;');
+    expect(decodeEntities('&#55296;')).toBe('&#55296;');
+  });
+
+  it('still decodes every reference that names a real character', () => {
+    expect(decodeEntities('&#65;&#x42;&#1114111;')).toBe(`AB${String.fromCodePoint(0x10ffff)}`);
+  });
+
+  it('names an undecodable numeric reference the way it names an unknown entity', () => {
+    expect(undecodedEntity('Overflow test &#1114112; here')).toBe('&#1114112;');
+    expect(undecodedEntity('A surrogate &#xD800; here')).toBe('&#xD800;');
+    expect(undecodedEntity('An ordinary &#65; here')).toBeUndefined();
+    expect(undecodedEntity('An unknown &nosuch; here')).toBe('&nosuch;');
+  });
+});
+
+describe('the stage-5 fold — bogus-comment forms blank like a comment', () => {
+  it('blanks a CDATA section, a processing instruction and a markup declaration', () => {
+    for (const [source, visible] of [
+      ['<div><![CDATA[ raw text here ]]>Hello there</div>', 'Hello there'],
+      ['<div><?php echo $x; ?>Hello there</div>', 'Hello there'],
+      ['<div><!ENTITY x "y">Hello there</div>', 'Hello there'],
+    ] as const) {
+      const blanked = blankNonMarkup(source, 'html');
+      // Length-preserving, so every reported offset is still the real one.
+      expect(blanked).toHaveLength(source.length);
+      expect(blanked).toContain(visible);
+      expect(blanked.includes('\0')).toBe(true);
+    }
+  });
+
+  it('blanks the doctype too, and keeps the page byte-aligned', () => {
+    const source = '<!DOCTYPE html>\n<html><body><p>Ordinary page copy.</p></body></html>';
+    const blanked = blankNonMarkup(source, 'html');
+    expect(blanked).toHaveLength(source.length);
+    expect(blanked.startsWith('\0'.repeat(15))).toBe(true);
+    expect(blanked).toContain('Ordinary page copy.');
   });
 });

@@ -161,6 +161,11 @@ export const DESCRIPTOR_SCHEMA = {
             "type": "string"
           }
         },
+        "tags": {
+          "description": "The number of numbered placeholder tags (<1>…</1>) a value of this key carries, one per descendant element of the marked element, numbered depth-first; the save gate keeps them whole.",
+          "type": "integer",
+          "minimum": 1
+        },
         "derivesFrom": {
           "type": "string"
         },

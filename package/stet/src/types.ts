@@ -54,6 +54,12 @@ export interface KeyDef {
   /** Required if and only if `shape` is `enum`. */
   values?: string[];
   vars?: string[];
+  /**
+   * The number of numbered placeholder tags (`<1>…</1>`) a value carries, one per
+   * descendant element of the marked element, numbered depth-first. The save gate
+   * keeps them whole and the length rule measures the value without them.
+   */
+  tags?: number;
   derivesFrom?: string;
   tmpl?: string;
   pages?: string[];

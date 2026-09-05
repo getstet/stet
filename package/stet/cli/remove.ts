@@ -32,10 +32,11 @@ import type { Descriptor, KeyDef } from '../src/types.js';
 import { flag, parse, refuseEnv } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { checkValues, descriptorOf, snapshotOf } from './check.js';
-import { loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { proposeHtml, stripMarks } from './html-host.js';
 import type { CliIo } from './main.js';
 import { clip, CliError, Report, UsageError } from './report.js';
-import { filesForGlobs } from './scan.js';
+import { filesForGlobs } from './files.js';
 import { mentionsToken } from './source-scan.js';
 import { isStoreBacked } from './store.js';
 
@@ -165,6 +166,25 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
     report.line(`  after this removal, stet check will report: ${key}: declared in the descriptor with no value in the snapshot`);
   }
 
+  // On the static-HTML host a key's repo form includes its MARKS, so the plan
+  // names each one the batch will strip. The text stays where it is; only the
+  // attribute goes.
+  if (isHtmlHost(config)) {
+    const set = proposeHtml(
+      io.cwd,
+      filesForGlobs(io.cwd, config.managedSurfaces),
+      descriptor,
+      snapshot,
+    );
+    const marks = set.claimed.filter((mark) => keys.includes(mark.key));
+    if (marks.length > 0) {
+      for (const mark of marks) {
+        report.line(`  ${mark.file}:${mark.line} the mark is removed and the text stays`);
+      }
+      report.line('  every other mark is regenerated in the same write');
+    }
+  }
+
   // A config-level test over the default block and every declared environment:
   // a host with a snapshot default and a pg prod block still has live rows to
   // care about. The command never dials — structurally it cannot.
@@ -190,7 +210,7 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
     return report.emit(io);
   }
 
-  apply(io, config, cleaned, cleanedSnapshot);
+  apply(io, config, cleaned, cleanedSnapshot, report);
   report.line(`removed ${keys.length} key(s); run stet check`);
   return report.emit(io);
 }
@@ -203,10 +223,19 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
  * The bundle is not among them: the next `pull` regenerates it from the cleaned
  * snapshot base, and every descriptor-driven read path is blind to the stale
  * entry meanwhile.
+ *
+ * The caller's report goes through because the batch reports as it plans: on
+ * the static-HTML host it names each mark it strips as it regenerates.
  */
-function apply(io: CliIo, config: StetConfig, cleaned: Descriptor, snapshot: Snapshot): void {
+function apply(
+  io: CliIo,
+  config: StetConfig,
+  cleaned: Descriptor,
+  snapshot: Snapshot,
+  report: Report,
+): void {
   try {
-    writePlanned(planRepoForms(io.cwd, config, cleaned, snapshot));
+    writePlanned(planRepoForms(io.cwd, config, cleaned, snapshot, report));
   } catch (error) {
     rethrowBatchFailure('stet remove --write', error);
   }
@@ -347,9 +376,15 @@ function withoutKeys(snapshot: Snapshot, keys: string[]): Snapshot {
 function surfaceSources(cwd: string, config: StetConfig): { file: string; source: string }[] {
   const globs = [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules];
   const found: { file: string; source: string }[] = [];
+  const html = isHtmlHost(config);
   for (const file of filesForGlobs(cwd, globs)) {
     try {
-      found.push({ file, source: readFileSync(join(cwd, file), 'utf8') });
+      const text = readFileSync(join(cwd, file), 'utf8');
+      // On this host a document's marks are the very thing the batch strips, so
+      // a `data-stet="<key>"` is not a read to un-wire and naming it would put a
+      // caution on every page the removal already handles. The mark goes; a
+      // mention of the key in prose or in a script is left to be found.
+      found.push({ file, source: html && file.endsWith('.html') ? stripMarks(text) : text });
     } catch {
       // A file the walk listed and this read cannot open mentions nothing.
     }

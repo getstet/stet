@@ -7,7 +7,7 @@
  * The host builder, the counting store and the crash simulator are shared with
  * that walk (`conformance/cli-host.ts`), so both drive an identical project.
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
@@ -17,10 +17,13 @@ import { PAGE_DEFAULT, isStoreError } from '../adapters/store-shared.js';
 import { ok } from '../conformance/store.suite.js';
 import { CONNECT_TIMEOUT_MS } from '../cli/store.js';
 import {
+  bareHtmlHost,
   cleanupCliHosts,
   countingStore as counting,
   fakeFetch,
+  htmlFixture,
   makeCliHost as makeHost,
+  makeHtmlHost,
   publishFailsOnce,
   type CliHost as Host,
 } from '../conformance/cli-host.js';
@@ -2030,5 +2033,579 @@ describe('key membership is an own-property test', () => {
     expect(host.err.slice(before).join('\n')).toContain(
       'constructor: in the store, not in the descriptor — an orphan, reported never deleted',
     );
+  });
+});
+
+describe('the static-HTML host — check', () => {
+  /** The key whose default is exactly `value`, read off the adopted host. */
+  function keyFor(host: Host, value: string): string {
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as {
+      default: Record<string, string>;
+    };
+    const found = Object.entries(snapshot.default).find(([, v]) => v === value);
+    if (found === undefined) throw new Error(`no key holds ${JSON.stringify(value)}`);
+    return found[0];
+  }
+
+  function editSnapshot(host: Host, key: string, value: string): void {
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as {
+      default: Record<string, string>;
+    };
+    snapshot.default[key] = value;
+    writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(snapshot, null, 2)}\n`);
+  }
+
+  it('walks every mark and reports the document current', async () => {
+    const host = await makeHtmlHost({ register: true });
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('document: index.html current (28 marks)');
+    // No codegen trio is checked, planned or named on this host.
+    expect(host.stdout()).not.toContain('generated:');
+    expect(host.exists('content/keys.ts')).toBe(false);
+  });
+
+  it('names both fixes when a page and its snapshot disagree, whichever side moved', async () => {
+    const edited = await makeHtmlHost({ register: true });
+    const key = keyFor(edited, 'Software, product and engineering histories');
+    writeFileSync(
+      join(edited.cwd, 'index.html'),
+      edited.file('index.html').replace('Software, product and engineering histories', 'Something else entirely'),
+    );
+    expect(await edited.run('check')).toBe(1);
+    const finding = `index.html:34 ${key} differs from the snapshot — run stet pull to apply the snapshot, or edit the snapshot to keep the page's text`;
+    expect(edited.stderr()).toContain(finding);
+
+    // The snapshot moving instead is the SAME observation, so it is the same line.
+    const moved = await makeHtmlHost({ register: true });
+    editSnapshot(moved, keyFor(moved, 'Software, product and engineering histories'), 'Something else entirely');
+    expect(await moved.run('check')).toBe(1);
+    expect(moved.stderr()).toContain(finding);
+  });
+
+  it('stays green over an unmarked run that shares its element with a comment', async () => {
+    // `text-beside-code` is adoption scope: scan names it, the hook does not
+    // fail on it, and nothing about it reaches the regenerator.
+    const host = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<html><body><p>A paragraph stet adopts.</p>' +
+          '<p>Hello <!-- note --> world</p></body></html>\n',
+      },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).not.toContain('text-beside-code');
+    expect(host.stdout()).toContain('document: index.html current (1 marks)');
+  });
+
+  it('reads a reindent as no change at all', async () => {
+    const host = await makeHtmlHost({ register: true });
+    writeFileSync(
+      join(host.cwd, 'index.html'),
+      host.file('index.html').replace(
+        /(<h3 data-stet="[^"]*">)(Software, product and engineering histories)(<\/h3>)/,
+        '$1\n        $2\n      $3',
+      ),
+    );
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('current (28 marks)');
+  });
+
+  it('names a mark that points at no declared key', async () => {
+    const host = await makeHtmlHost({ register: true });
+    writeFileSync(
+      join(host.cwd, 'index.html'),
+      host.file('index.html').replace('<h2 data-stet="', '<h2 data-stet="nope" x-data-stet="'),
+    );
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain(
+      'data-stet="nope" names no descriptor key — run stet register, or remove the mark',
+    );
+  });
+
+  it('warns a declared key that no document marks, and stays green', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as {
+      version: number;
+      keys: Record<string, unknown>;
+    };
+    descriptor.keys['orphan_key'] = { shape: 'text', target: 'web' };
+    writeFileSync(join(host.cwd, 'content/descriptor.json'), `${JSON.stringify(descriptor, null, 2)}\n`);
+    editSnapshot(host, 'orphan_key', 'A value nothing renders');
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).toContain('orphan_key: marked in no document');
+  });
+
+  it('carries the per-document record in --json', async () => {
+    const host = await makeHtmlHost({ register: true });
+    expect(await host.run('check', '--json')).toBe(0);
+    expect(host.json<{ documents: Record<string, { marks: number; status: string }> }>().documents).toEqual({
+      'index.html': { marks: 28, status: 'current' },
+    });
+  });
+
+  it('never fails on markup no mark touches, and always on markup one does', async () => {
+    // An unknown entity and a bare run in a `<ul>`, both away from every mark:
+    // markup stet does not manage is not stet's red, and the hook must not fail
+    // a commit over it.
+    const quiet = [
+      '<html>',
+      '<body>',
+      '  <p data-stet="edge_intro">An ordinary marked paragraph.</p>',
+      '  <p>An unknown &nosuch; entity sits here.</p>',
+      '  <ul>',
+      '    A bare run sits directly inside this list.',
+      '    <li>An item that is a key element of its own.</li>',
+      '  </ul>',
+      '</body>',
+      '</html>',
+      '',
+    ].join('\n');
+    const host = await makeHtmlHost({
+      files: { 'index.html': quiet },
+      keys: { edge_intro: { shape: 'text', target: 'web' } },
+      defaults: { edge_intro: 'An ordinary marked paragraph.' },
+    });
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('document: index.html current (1 marks)');
+
+    const marked = await makeHtmlHost({
+      files: {
+        'index.html': quiet.replace('<p>An unknown &nosuch;', '<p data-stet="edge_broken">An unknown &nosuch;'),
+      },
+      keys: {
+        edge_intro: { shape: 'text', target: 'web' },
+        edge_broken: { shape: 'text', target: 'web' },
+      },
+      defaults: { edge_intro: 'An ordinary marked paragraph.', edge_broken: 'x' },
+    });
+    expect(await marked.run('check')).toBe(1);
+    expect(marked.stderr()).toContain('skipped (unknown-entity)');
+  });
+});
+
+describe('the static-HTML host — pull and upgrade', () => {
+  function editSnapshot(host: Host, key: string, value: string): void {
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as {
+      default: Record<string, string>;
+    };
+    snapshot.default[key] = value;
+    writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(snapshot, null, 2)}\n`);
+  }
+
+  function keyFor(host: Host, value: string): string {
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as {
+      default: Record<string, string>;
+    };
+    const found = Object.entries(snapshot.default).find(([, v]) => v === value);
+    if (found === undefined) throw new Error(`no key holds ${JSON.stringify(value)}`);
+    return found[0];
+  }
+
+  it('regenerates the documents from the snapshot, and says so', async () => {
+    const host = await makeHtmlHost({ register: true });
+    editSnapshot(host, keyFor(host, 'Software, product and engineering histories'), 'Engineering histories');
+    expect(await host.run('pull')).toBe(0);
+    expect(host.stdout()).toContain('wrote index.html');
+    expect(host.file('index.html')).toContain('>Engineering histories<');
+    // No defaults module is written on this host — there is none to write.
+    expect(host.exists('content/defaults.ts')).toBe(false);
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('says the documents are current and writes nothing on a second run', async () => {
+    const host = await makeHtmlHost({ register: true });
+    editSnapshot(host, keyFor(host, 'Imaging archives'), 'Imaging collections');
+    expect(await host.run('pull')).toBe(0);
+    const after = Buffer.from(host.file('index.html'), 'utf8');
+    host.out.length = 0;
+    expect(await host.run('pull')).toBe(0);
+    expect(host.stdout()).toContain('pull: documents current');
+    expect(Buffer.from(host.file('index.html'), 'utf8')).toEqual(after);
+  });
+
+  it('writes nothing at all when one document cannot be regenerated', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const key = keyFor(host, 'You may already have the data<1> our AI lab partners need.</1>');
+    editSnapshot(host, key, 'You may already have the data our AI lab partners need.');
+    const snapshotBefore = Buffer.from(host.file('content/defaults.json'), 'utf8');
+    const pageBefore = Buffer.from(host.file('index.html'), 'utf8');
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain(
+      '1 document(s) could not be regenerated — index.html:25 tag-count-mismatch; nothing was written',
+    );
+    // Nothing half-written: the snapshot the run was about to canonicalise is
+    // exactly as the operator left it, and so is the page.
+    expect(Buffer.from(host.file('content/defaults.json'), 'utf8')).toEqual(snapshotBefore);
+    expect(Buffer.from(host.file('index.html'), 'utf8')).toEqual(pageBefore);
+  });
+
+  it('has no registry to regenerate', async () => {
+    const host = await makeHtmlHost({ register: true });
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    expect(host.stdout()).toContain(
+      'codegen: none on an html host — the documents are regenerated by stet pull',
+    );
+    expect(host.exists('content/keys.ts')).toBe(false);
+    expect(host.exists('content/stet-env.d.ts')).toBe(false);
+  });
+});
+
+describe('the static-HTML host — entities as the source spells them', () => {
+  it('adopts prose that spells `&amp;nosuch;` and writes it back byte-identically', async () => {
+    const page =
+      '<html><body><p>Use &amp;nosuch; literally in this sentence.</p></body></html>\n';
+    const host = await makeHtmlHost({ files: { 'index.html': page } });
+    // The entity test runs on the RAW text, so this is the literal text
+    // `&nosuch;` and not an entity the table failed to decode.
+    expect(await host.run('scan')).toBe(0);
+    expect(host.stderr()).not.toContain('unknown-entity');
+    host.out.length = 0;
+    host.err.length = 0;
+
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as {
+      default: Record<string, string>;
+    };
+    expect(Object.values(snapshot.default)).toContain('Use &nosuch; literally in this sentence.');
+
+    // Nothing normalises: the mark is the only byte the document gained.
+    const marked = host.file('index.html');
+    expect(marked).toContain('Use &amp;nosuch; literally in this sentence.');
+    host.out.length = 0;
+    expect(await host.run('pull')).toBe(0);
+    expect(Buffer.from(host.file('index.html'), 'utf8').equals(Buffer.from(marked, 'utf8'))).toBe(true);
+    expect(host.stdout()).toContain('pull: documents current');
+  });
+
+  it('still refuses a source that really spells an entity it cannot decode', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<html><body><p>An unknown &nosuch; entity.</p></body></html>\n' },
+    });
+    expect(await host.run('scan')).toBe(0);
+    expect(host.stderr()).toContain('skipped (unknown-entity) — &nosuch; is not an entity stet can decode');
+  });
+});
+
+describe('the static-HTML host — the stage-5 fold', () => {
+  /** Every command that writes, run in turn over one adopted host. */
+  async function everyWriteCommand(host: Awaited<ReturnType<typeof makeHtmlHost>>, key: string) {
+    const codes: Record<string, number> = {};
+    for (const argv of [
+      ['check'],
+      ['pull'],
+      ['pages', 'scan', '--apply'],
+      ['remove', key, '--write'],
+      ['eject', '--write'],
+    ] as const) {
+      host.out.length = 0;
+      host.err.length = 0;
+      codes[argv.join(' ')] = await host.run(...argv);
+    }
+    return codes;
+  }
+
+  for (const value of ['', '19', '€19']) {
+    it(`keeps every write command green when a value becomes ${JSON.stringify(value)}`, async () => {
+      const host = await makeHtmlHost({
+        files: { 'index.html': '<html><body><h3>Software product engineering</h3></body></html>\n' },
+      });
+      expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+      const snapshot = JSON.parse(host.file('content/defaults.json')) as { default: Record<string, string> };
+      const key = Object.keys(snapshot.default)[0] as string;
+      snapshot.default[key] = value;
+      writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(snapshot, null, 2)}\n`);
+
+      host.out.length = 0;
+      host.err.length = 0;
+      expect(await host.run('pull')).toBe(0);
+      expect(host.file('index.html')).toContain(`<h3 data-stet="${key}">${value}</h3>`);
+      // The mark is the declaration: an ordinary edit to a value cannot
+      // un-declare it, so nothing downstream refuses the document.
+      expect(await everyWriteCommand(host, key)).toEqual({
+        check: 0,
+        pull: 0,
+        'pages scan --apply': 0,
+        [`remove ${key} --write`]: 0,
+        'eject --write': 0,
+      });
+    });
+  }
+
+  it('adopts prose carrying a literal placeholder and agrees with itself about it', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<html><body><p>See footnote <1> for the details.</p></body></html>\n' },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as { default: Record<string, string> };
+    expect(Object.values(snapshot.default)).toContain('See footnote <1> for the details.');
+
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(await host.run('pull')).toBe(0);
+    // The key declares no tags, so the `<1>` is prose and is escaped as prose.
+    expect(host.file('index.html')).toContain('See footnote &lt;1&gt; for the details.');
+    const after = host.file('index.html');
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('index.html')).toBe(after);
+    expect(await host.run('check')).toBe(0);
+    expect(await host.run('eject', '--write')).toBe(0);
+  });
+
+  it('names the same refusal in check that pull would raise', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<html><body><p data-stet="k">Hello <b>big</b> world</p></body></html>\n' },
+      keys: { k: { shape: 'text', target: 'web' } },
+      defaults: { k: 'Hello big world' },
+    });
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain(
+      'skipped (tag-count-mismatch) — the key declares no tags, the element has 1 descendant element(s); ' +
+        'declare tags: 1 on the key and give the value its placeholders, or mark the elements inside it instead',
+    );
+    host.err.length = 0;
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('tag-count-mismatch');
+  });
+
+  it('survives an entity reference that names no character, from init onward', async () => {
+    const bare = bareHtmlHost({
+      'index.html':
+        '<html><body><p>Overflow test &#1114112; here</p><p>Surrogate &#xD800; test here</p></body></html>\n',
+    });
+    expect(await bare.run('init', '--yes')).toBe(0);
+    expect(bare.exists('content/descriptor.json')).toBe(true);
+    bare.out.length = 0;
+    bare.err.length = 0;
+    expect(await bare.run('scan')).toBe(0);
+    expect(bare.stderr()).toContain('skipped (unknown-entity) — &#1114112; is not an entity stet can decode');
+    expect(bare.stderr()).toContain('&#xD800; is not an entity stet can decode');
+    bare.err.length = 0;
+    // Adoption scope: the hook does not fail on unmarked prose.
+    expect(await bare.run('check')).toBe(0);
+  });
+
+  it('refuses a document it cannot read, and writes nothing', async () => {
+    const host = await makeHtmlHost({ register: true, files: { 'about.html': '<html><body><p>Beta paragraph text here</p></body></html>\n' } });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const before = host.file('index.html');
+    chmodSync(join(host.cwd, 'about.html'), 0o000);
+    try {
+      host.out.length = 0;
+      host.err.length = 0;
+      expect(await host.run('check')).toBe(1);
+      expect(host.stderr()).toContain('about.html: could not be read (EACCES) — fix its permissions, or remove it from the managed surfaces');
+      host.err.length = 0;
+      expect(await host.run('pull')).toBe(1);
+      expect(host.file('index.html')).toBe(before);
+    } finally {
+      chmodSync(join(host.cwd, 'about.html'), 0o644);
+    }
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('never adopts a run beside a CDATA section or a processing instruction', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<html><body><div><![CDATA[ raw text here ]]>Hello there friend</div>' +
+          '<div><?php echo $x; ?>Second run of text</div></body></html>\n',
+      },
+    });
+    expect(await host.run('scan')).toBe(0);
+    const found = host.stderr();
+    expect(found).toContain(
+      'skipped (text-beside-code) — text in <div> sits beside a script, style, comment or declaration stet cannot regenerate whole',
+    );
+    expect(found).not.toContain('propose key');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    // Nothing was adopted, so the page keeps every byte it had.
+    expect(host.file('index.html')).toContain('<![CDATA[ raw text here ]]>');
+    expect(host.file('index.html')).toContain('<?php echo $x; ?>');
+    expect(host.file('index.html')).not.toContain('data-stet');
+  });
+
+  it('keeps a literal non-breaking space through register, pull and check', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<html><body><p>1\u00a0000 members of the team</p></body></html>\n' },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as { default: Record<string, string> };
+    expect(Object.values(snapshot.default)[0]).toBe('1\u00a0000 members of the team');
+    const marked = host.file('index.html');
+    host.out.length = 0;
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('index.html')).toBe(marked);
+    expect(host.file('index.html')).toContain('1\u00a0000 members');
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('closes its own loop over a padded value: pull once, then green and stable', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<html><body><p data-stet="k">Old text</p></body></html>\n' },
+      keys: { k: { shape: 'text', target: 'web' } },
+      // Not a fixed point of the read-back: the old splice targeted the trimmed
+      // content span, so the trailing run landed outside it and was re-appended
+      // on every pull — 199, 201, 203, 205, 207 bytes over five runs.
+      defaults: { k: 'Padded  text   here  ' },
+    });
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('index.html')).toContain('<p data-stet="k">Padded text here</p>');
+
+    // check compares BOTH sides through the read-back form, so the value the
+    // page renders is not a difference the operator is asked to act on.
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('document: index.html current (1 marks)');
+
+    const sizes = new Set<number>();
+    for (let i = 0; i < 5; i++) {
+      expect(await host.run('pull')).toBe(0);
+      sizes.add(Buffer.byteLength(host.file('index.html'), 'utf8'));
+    }
+    expect(sizes.size).toBe(1);
+    expect(await host.run('check')).toBe(0);
+    // The snapshot keeps the operator's own spelling.
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as { default: Record<string, string> };
+    expect(snapshot.default['k']).toBe('Padded  text   here  ');
+  });
+
+  it('refuses a mark on a void element through every command, and never grows the page', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<html><body><img src="a.png" data-stet="k"></body></html>\n' },
+      keys: { k: { shape: 'text', target: 'web' } },
+      defaults: { k: 'A lab bench' },
+    });
+    const before = host.file('index.html');
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain(
+      'skipped (mark-on-non-key-element) — data-stet="k" sits on <img>, which has no content to hold text; ' +
+        'mark a copy attribute with data-stet-<attr> instead',
+    );
+    host.err.length = 0;
+    for (let i = 0; i < 3; i++) expect(await host.run('pull')).toBe(1);
+    expect(host.file('index.html')).toBe(before);
+  });
+
+  it('leaves a marked <pre> alone and names why', async () => {
+    const page = '<html><body><pre data-stet="k">line one\nline two\nline three</pre></body></html>\n';
+    const host = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: { k: { shape: 'text', target: 'web' } },
+      defaults: { k: 'line one line two line three' },
+    });
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain(
+      'data-stet="k" sits on <pre>, whose whitespace stet does not manage; mark the elements around it instead',
+    );
+    host.err.length = 0;
+    expect(await host.run('pull')).toBe(1);
+    // The three lines are still three lines.
+    expect(host.file('index.html')).toBe(page);
+  });
+
+  it('round-trips a value padded with non-breaking spaces', async () => {
+    const value = ' Lead and trail ';
+    const host = await makeHtmlHost({
+      files: { 'index.html': `<html><body><p data-stet="k">${value}</p></body></html>\n` },
+      keys: { k: { shape: 'text', target: 'web' } },
+      defaults: { k: value },
+    });
+    const before = host.file('index.html');
+    expect(await host.run('check')).toBe(0);
+    host.out.length = 0;
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('index.html')).toBe(before);
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('names the key declaration, not the value, when the key declares no tags', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<html><body><div data-stet="k"><p>First para here.</p><p>Second para here.</p></div></body></html>\n' },
+      keys: { k: { shape: 'text', target: 'web' } },
+      defaults: { k: 'First para here. Second para here.' },
+    });
+    const wanted =
+      'skipped (tag-count-mismatch) — the key declares no tags, the element has 2 descendant element(s); ' +
+      'declare tags: 2 on the key and give the value its placeholders, or mark the elements inside it instead';
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain(wanted);
+    host.err.length = 0;
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('tag-count-mismatch');
+  });
+
+  it('strips a prototype-named mark and reports it, on both channels', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<html><body><p data-stet="constructor">First run of text.</p>' +
+          '<p data-stet="toString">Second run of text.</p></body></html>\n',
+      },
+    });
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('data-stet="constructor" names no descriptor key');
+    expect(host.stderr()).toContain('data-stet="toString" names no descriptor key');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('pull')).toBe(0);
+    const page = host.file('index.html');
+    expect(page).not.toContain('data-stet=');
+    expect(page).toContain('First run of text.');
+    expect(page).toContain('Second run of text.');
+  });
+});
+
+describe('the static-HTML host — doctor and the usage', () => {
+  it('names the host and the publish route, and tells a checkout outside git', async () => {
+    const host = await makeHtmlHost({ register: true });
+    expect(await host.run('doctor')).toBe(0);
+    expect(host.stdout()).toContain(
+      'host: html — the marked documents are the rendered form; publish = commit',
+    );
+    expect(host.stderr()).toContain('git: not a repository — publish cannot be a commit; run git init');
+  });
+
+  it('drops the git warn once the checkout is a repository', async () => {
+    const host = await makeHtmlHost({ register: true, git: true });
+    expect(await host.run('doctor')).toBe(0);
+    expect(host.stdout()).toContain('host: html —');
+    expect(host.stderr()).not.toContain('git: not a repository');
+  });
+
+  it('warns a JavaScript snapshot-only host too, and names no host line', async () => {
+    const host = makeHost({ config: {} });
+    expect(await host.run('doctor')).toBe(0);
+    expect(host.stderr()).toContain('git: not a repository — publish cannot be a commit; run git init');
+    expect(host.stdout()).not.toContain('host: html');
+  });
+
+  it('never warns a store-backed host — its publish is a store write', async () => {
+    const host = makeHost({
+      config: { store: { adapter: 'memory' } },
+      store: createMemoryStore({ project: 'default' }),
+    });
+    expect(await host.run('doctor')).toBe(0);
+    expect(host.stderr()).not.toContain('git: not a repository');
+  });
+
+  it('carries the host in the pasteable --report block', async () => {
+    const host = await makeHtmlHost({ register: true, git: true });
+    expect(await host.run('doctor', '--report')).toBe(0);
+    expect(host.stdout()).toContain('host: html');
+  });
+
+  it('names --host html in the usage', async () => {
+    const host = await makeHtmlHost();
+    expect(await host.run('help')).toBe(0);
+    expect(host.stdout()).toContain('init [--app DIR] [--host html] [--yes]');
   });
 });

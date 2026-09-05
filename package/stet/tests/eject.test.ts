@@ -13,9 +13,10 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
+import { cleanupCliHosts, htmlFixture, makeHtmlHost } from '../conformance/cli-host.js';
 import { runEject } from '../cli/eject.js';
 import { packageRoot } from '../cli/installed.js';
 import type { CliIo } from '../cli/main.js';
@@ -1028,5 +1029,100 @@ describe('runEject — the sweep walks what every other host walk walks', () => 
     const cap = io(dir);
     expect(await runEject([], cap)).toBe(0);
     expect(cap.out.join('\n')).not.toContain('dangling.ts');
+  });
+});
+
+describe('eject — the static-HTML host', () => {
+  afterAll(cleanupCliHosts);
+
+  /** An adopted html host with the guidance and hook installed, inside a git checkout. */
+  async function adopted() {
+    const host = await makeHtmlHost({ register: true, git: true });
+    expect(await host.run('agents', 'install')).toBe(0);
+    expect(await host.run('hook', 'install')).toBe(0);
+    host.out.length = 0;
+    host.err.length = 0;
+    return host;
+  }
+
+  it('plans the strip and touches nothing', async () => {
+    const host = await adopted();
+    const before = Buffer.from(host.file('index.html'), 'utf8');
+    expect(await host.run('eject')).toBe(0);
+    expect(host.stdout()).toContain('document: index.html — every mark removed, the text stays');
+    expect(host.stdout()).toContain(
+      'stays (no stet imports): stet.config.json, content/descriptor.json, content/defaults.json',
+    );
+    // There is nothing to reverse on this host, so the line about reversing
+    // nothing never prints.
+    expect(host.stdout()).not.toContain('un-rewrite');
+    expect(Buffer.from(host.file('index.html'), 'utf8')).toEqual(before);
+    expect(host.exists('AGENTS.md')).toBe(true);
+  });
+
+  it('--write strips every mark and leaves the page as its snapshot says', async () => {
+    const host = await adopted();
+    expect(await host.run('eject', '--write')).toBe(0);
+    const page = host.file('index.html');
+    expect(/data-stet/.test(page)).toBe(false);
+    // The text stands exactly as the fixture wrote it: nothing in that document
+    // normalises, so the regenerated-then-stripped page is byte-identical.
+    expect(Buffer.from(page, 'utf8')).toEqual(Buffer.from(htmlFixture('index.html'), 'utf8'));
+
+    expect(host.exists('AGENTS.md')).toBe(false);
+    expect(host.exists('CLAUDE.md')).toBe(false);
+    expect(host.exists('.git/hooks/pre-commit')).toBe(false);
+    expect(host.file('package.json')).not.toContain('@getstet/stet');
+    // The forms stay, exactly as the plan said.
+    expect(host.exists('stet.config.json')).toBe(true);
+    expect(host.exists('content/descriptor.json')).toBe(true);
+    expect(host.exists('content/defaults.json')).toBe(true);
+  });
+
+  it('refuses whole when a document cannot be regenerated', async () => {
+    const host = await adopted();
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as {
+      default: Record<string, string>;
+    };
+    const key = Object.entries(snapshot.default).find(
+      ([, v]) => v === 'You may already have the data<1> our AI lab partners need.</1>',
+    )![0];
+    snapshot.default[key] = 'You may already have the data our AI lab partners need.';
+    writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(snapshot, null, 2)}\n`);
+    const before = Buffer.from(host.file('index.html'), 'utf8');
+
+    expect(await host.run('eject', '--write')).toBe(1);
+    expect(host.stderr()).toContain(
+      'eject found 1 document(s) it cannot regenerate — index.html:25 tag-count-mismatch; nothing was written',
+    );
+    expect(Buffer.from(host.file('index.html'), 'utf8')).toEqual(before);
+    expect(host.file('package.json')).toContain('@getstet/stet');
+  });
+});
+
+describe('eject — the stage-5 fold, prose that quotes stet\'s own syntax', () => {
+  it('removes every real mark and leaves a quoted one byte-identical', async () => {
+    const page =
+      '<html><body>\n' +
+      '<p data-stet="lead">The attribute form is <code>data-stet-alt="image_caption"</code> instead.</p>\n' +
+      '<p>Write data-stet="unclosed and then keep going</p>\n' +
+      '<p>Second para with a "quote" here</p>\n' +
+      '</body></html>\n';
+    const host = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: { lead: { shape: 'text', target: 'web', tags: 1 } },
+      defaults: { lead: 'The attribute form is <1>data-stet-alt="image_caption"</1> instead.' },
+    });
+    expect(await host.run('eject', '--write')).toBe(0);
+    const out = host.file('index.html');
+    // The real mark goes.
+    expect(out).not.toContain('data-stet="lead"');
+    // Every literal in prose survives: a regex strip deleted the <code> sample
+    // outright, and its unbounded quote match ate 89 characters across two
+    // paragraphs including a </p> and a <p>.
+    expect(out).toContain('<code>data-stet-alt="image_caption"</code>');
+    expect(out).toContain('Write data-stet="unclosed and then keep going');
+    expect(out).toContain('<p>Second para with a "quote" here</p>');
+    expect(out.split('</p>')).toHaveLength(4);
   });
 });

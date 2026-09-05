@@ -13,6 +13,7 @@
  * currency section for `check` and `doctor` to report on.
  */
 
+import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -273,4 +274,144 @@ export function publishFailsOnce(inner: MemoryStore): StoreAdapter {
 /** One canned HTTP response — `doctor --url` and the PostgREST meta reads. */
 export function fakeFetch(body: string, status = 200): typeof globalThis.fetch {
   return (async () => new Response(body, { status })) as typeof globalThis.fetch;
+}
+
+// --- The static-HTML host ---------------------------------------------------
+
+/** The shared fixture documents every html section reads. */
+const HTML_FIXTURE = new URL('../tests/fixtures/html-host/', import.meta.url);
+
+/** One of the shared fixture documents, by name. */
+export function htmlFixture(name: string): string {
+  return readFileSync(new URL(name, HTML_FIXTURE), 'utf8');
+}
+
+export interface HtmlHostOptions {
+  /** Repo-relative path → content. `index.html` defaults to the shared fixture page. */
+  files?: Record<string, string>;
+  /** Merged over the config this writes. */
+  config?: Record<string, unknown>;
+  /** Descriptor keys and default values, where a case wants them pre-declared. */
+  keys?: Record<string, unknown>;
+  defaults?: Record<string, unknown>;
+  /** Run `register --from scan --write`, so the host arrives with its marks. */
+  register?: boolean;
+  /** `git init` the checkout — what "publish is a commit" needs to be true. */
+  git?: boolean;
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * A static-HTML host in a temp directory: the shared fixture page, an html
+ * config, and empty forms — the shape `stet init` writes on that host, built
+ * directly so a case does not depend on `init` to reach `check` or `pull`.
+ *
+ * `register: true` adopts it first, which is the state most cases start from.
+ * The output buffers are cleared after any setup run, so a case reads only its
+ * own lines.
+ */
+export async function makeHtmlHost(opts: HtmlHostOptions = {}): Promise<CliHost> {
+  const cwd = mkdtempSync(join(tmpdir(), 'stet-html-'));
+  made.push(cwd);
+  writeFileSync(
+    join(cwd, 'package.json'),
+    `${JSON.stringify({ name: 'site', private: true, devDependencies: { '@getstet/stet': '^0.1.2' } }, null, 2)}\n`,
+  );
+  const files = { 'index.html': htmlFixture('index.html'), ...opts.files };
+  for (const [rel, text] of Object.entries(files)) {
+    mkdirSync(dirname(join(cwd, rel)), { recursive: true });
+    writeFileSync(join(cwd, rel), text, 'utf8');
+  }
+  mkdirSync(join(cwd, 'content'), { recursive: true });
+  writeFileSync(
+    join(cwd, 'content/descriptor.json'),
+    `${JSON.stringify({ version: 1, keys: opts.keys ?? {} }, null, 2)}\n`,
+  );
+  writeFileSync(
+    join(cwd, 'content/defaults.json'),
+    `${JSON.stringify({ default: opts.defaults ?? {} }, null, 2)}\n`,
+  );
+  writeFileSync(
+    join(cwd, 'stet.config.json'),
+    `${JSON.stringify(
+      {
+        project: 'default',
+        host: 'html',
+        managedSurfaces: ['**/*.html'],
+        emailSurfaces: [],
+        copyModules: [],
+        scan: { severity: 'warn', baseline: '.stet/scan-baseline.json' },
+        descriptorPath: 'content/descriptor.json',
+        snapshotPath: 'content/defaults.json',
+        bundlePath: '.stet/bundle.json',
+        locales: { default: 'default', enabled: ['default'] },
+        ...opts.config,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  if (opts.git === true) execFileSync('git', ['init'], { cwd, stdio: 'ignore' });
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const io: CliIo = {
+    cwd,
+    env: opts.env ?? {},
+    stdout: (line) => out.push(line),
+    stderr: (line) => err.push(line),
+  };
+  const host: CliHost = {
+    cwd,
+    io,
+    out,
+    err,
+    run: (...argv: string[]) => runCli(argv, io),
+    stdout: () => out.join('\n'),
+    stderr: () => err.join('\n'),
+    json: <T,>() => JSON.parse(out[out.length - 1] ?? 'null') as T,
+    file: (rel: string) => readFileSync(join(cwd, rel), 'utf8'),
+    exists: (rel: string) => existsSync(join(cwd, rel)),
+  };
+  if (opts.register === true) {
+    const code = await host.run('register', '--from', 'scan', '--write');
+    if (code !== 0) throw new Error(`register failed in the html fixture host: ${host.stderr()}`);
+    out.length = 0;
+    err.length = 0;
+  }
+  return host;
+}
+
+/**
+ * A folder an `init` has NOT yet touched: the fixture page, a manifest naming
+ * only stet, and a git checkout. What the adoption walk starts from.
+ */
+export function bareHtmlHost(files: Record<string, string> = {}): CliHost {
+  const cwd = mkdtempSync(join(tmpdir(), 'stet-html-bare-'));
+  made.push(cwd);
+  writeFileSync(
+    join(cwd, 'package.json'),
+    `${JSON.stringify({ name: 'site', private: true, devDependencies: { '@getstet/stet': '^0.1.2' } }, null, 2)}\n`,
+  );
+  for (const [rel, text] of Object.entries({ 'index.html': htmlFixture('index.html'), ...files })) {
+    mkdirSync(dirname(join(cwd, rel)), { recursive: true });
+    writeFileSync(join(cwd, rel), text, 'utf8');
+  }
+  execFileSync('git', ['init'], { cwd, stdio: 'ignore' });
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const io: CliIo = { cwd, env: {}, stdout: (l) => out.push(l), stderr: (l) => err.push(l) };
+  return {
+    cwd,
+    io,
+    out,
+    err,
+    run: (...argv: string[]) => runCli(argv, io),
+    stdout: () => out.join('\n'),
+    stderr: () => err.join('\n'),
+    json: <T,>() => JSON.parse(out[out.length - 1] ?? 'null') as T,
+    file: (rel: string) => readFileSync(join(cwd, rel), 'utf8'),
+    exists: (rel: string) => existsSync(join(cwd, rel)),
+  };
 }

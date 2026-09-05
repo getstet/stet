@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>An edge case: read the <docs> section first</title>
+  <meta property="og:url" content="https://psyon.ai/edges" data-stet-content="edge_url">
+</head>
+<body>
+  <p data-stet="edge_intro">An ordinary marked paragraph.</p>
+  <p>Go &rarr; now</p>
+  <p>An unknown &nosuch; entity sits here.</p>
+  <p>Use &amp;nosuch; literally in this sentence.</p>
+  <p>Hello <!-- note --> world</p>
+  <img src="/x.jpg" alt="&nosuch;">
+  <template>
+    <p>Prose inside a template is never adopted.</p>
+  </template>
+  <noscript>
+    <p data-stet="edge_noscript">A mark inside noscript.</p>
+  </noscript>
+  <ul data-stet="edge_list">
+    A bare run sits directly inside this list.
+    <li>An item that is a key element of its own.</li>
+  </ul>
+  <a href="/somewhere" data-stet-href="edge_href">A link whose href carries a mark.</a>
+  <div><p>Popped past by the div's close.</div>
+  </span>
+</body>
+</html>

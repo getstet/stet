@@ -3,11 +3,12 @@
  * AI agent session working in an adopting repo that copy here is stet's, before
  * it hardcodes a string that the drift gate then catches at commit time.
  *
- * The block is a REMINDER, not a manual: two lines, one interpolation (the
- * descriptor path), no store-mode or surface variants. The detail lives in the
- * CLI's own output, because a workflow taught in a doc block goes stale and a
- * workflow taught by the tool does not — and a block whose content almost never
- * changes is what keeps the differs refusal a rarity.
+ * The block is a REMINDER, not a manual: two lines, and its interpolations are
+ * the descriptor path and, on the static-HTML host, the snapshot path. The block
+ * varies by HOST KIND alone — never by store mode, email state or surface. The
+ * detail lives in the CLI's own output, because a workflow taught in a doc block
+ * goes stale and a workflow taught by the tool does not — and a block whose
+ * content almost never changes is what keeps the differs refusal a rarity.
  *
  * `init` writes it at adoption (approval-gated), `agents install` writes it into
  * a host that adopted before it existed, and `eject` removes it on the way out.
@@ -23,7 +24,7 @@ import { join } from 'node:path';
 
 import { noPositionals, parse, refuseEnv } from './args.js';
 import { writeText } from './artifacts.js';
-import { CONFIG_FILE, loadConfig, type StetConfig } from './config.js';
+import { CONFIG_FILE, isHtmlHost, loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
 import { CliError, posixRelative, Report } from './report.js';
 import { dominantEol } from './rewrite.js';
@@ -57,23 +58,29 @@ export interface GuidancePlan {
 }
 
 /**
- * The block, deterministic and LF-terminated. The ONE interpolation is the
- * descriptor path: no store-mode, email or surface variants, no version string
- * and no timestamp, so the same config builds byte-identical text every time
- * and the three-state compare stays meaningful.
+ * The block, deterministic and LF-terminated. Its interpolations are the
+ * descriptor path and, on the static-HTML host, the snapshot path; the block
+ * varies by HOST KIND alone — no store-mode, email or surface variants, no
+ * version string and no timestamp — so the same config builds byte-identical
+ * text every time and the three-state compare stays meaningful.
+ *
+ * The html wording names the marks and the snapshot because that host's edit
+ * route is different in kind: the document is a generated form, so editing the
+ * marked text is the one thing an agent must not do.
  *
  * The pointer line names bare `stet`, which prints the command listing
  * (`main.ts`'s `usage()` on the no-command path).
  */
 export function buildGuidanceBlock(config: StetConfig): string {
-  return [
-    GUIDANCE_BEGIN,
-    `Copy in this project is managed by stet — \`${config.descriptorPath}\` names the keys. ` +
+  const body = isHtmlHost(config)
+    ? `Copy in this project is managed by stet — \`${config.descriptorPath}\` names the keys and ` +
+      'data-stet attributes mark where each renders. Change copy by editing ' +
+      `\`${config.snapshotPath}\` and running \`stet pull\`, never by editing the marked text; ` +
+      'route copy work through the stet CLI (run `stet` for the commands).'
+    : `Copy in this project is managed by stet — \`${config.descriptorPath}\` names the keys. ` +
       'Never hardcode user-facing copy; route copy work through the stet CLI ' +
-      '(run `stet` for the commands), not source edits.',
-    GUIDANCE_END,
-    '',
-  ].join('\n');
+      '(run `stet` for the commands), not source edits.';
+  return [GUIDANCE_BEGIN, body, GUIDANCE_END, ''].join('\n');
 }
 
 /**

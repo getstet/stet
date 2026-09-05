@@ -21,7 +21,8 @@ import type * as TS from 'typescript';
 import { resolve } from '../src/resolve.js';
 import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { check } from './check.js';
-import { CONFIG_FILE } from './config.js';
+import { CONFIG_FILE, isHtmlHost } from './config.js';
+import { hooksDir } from './hook.js';
 import { packageVersion } from './installed.js';
 import type { CliIo } from './main.js';
 import { readProjectMeta } from './meta.js';
@@ -61,6 +62,9 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
     );
     report.line('  (the config is read from the working directory only; there is no upward search)');
     report.line(`descriptor: ${config.descriptorPath}, ${Object.keys(project.descriptor.keys).length} keys`);
+    if (isHtmlHost(config)) {
+      report.line('host: html — the marked documents are the rendered form; publish = commit');
+    }
 
     // The descriptor, snapshot, currency and generated-file sections are `stet
     // check`'s own output, folded in at warn: one implementation of the rules,
@@ -72,6 +76,12 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
     environmentsSection(project, report);
     await wrapperChainSection(io, project, report);
     await storeSection(io, project, report);
+    // On any host whose publish IS a commit, a checkout outside git has no way
+    // to publish at all. Never on a store-backed host, where publish is a store
+    // write and git is beside the point.
+    if (!isStoreBacked(project.environment.block) && hooksDir(io.cwd) === null) {
+      report.warn('config', 'git: not a repository — publish cannot be a commit; run git init');
+    }
     if (url !== undefined && key !== undefined) await liveCheck(io, project, report, url, key);
 
     if (flag(values, 'report')) {
@@ -84,6 +94,7 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
         // pg` under `--env staging` sends a triager at the wrong database.
         ...(name === 'default' ? [] : [`environment: ${name}`]),
         `store: ${selected?.adapter ?? 'none (snapshot-only)'}`,
+        ...(isHtmlHost(config) ? ['host: html'] : []),
         `descriptor: ${config.descriptorPath} · snapshot: ${config.snapshotPath}`,
         // Through the one formatter, not a second copy of its template: this
         // block is store-controlled text on a human channel, and it travels

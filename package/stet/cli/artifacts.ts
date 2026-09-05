@@ -15,8 +15,10 @@ import { dirname, join } from 'node:path';
 import { canonicalize, generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
-import type { StetConfig } from './config.js';
-import { CliError, UsageError } from './report.js';
+import { isHtmlHost, type StetConfig } from './config.js';
+import { filesForGlobs } from './files.js';
+import { planDocuments } from './html-host.js';
+import { CliError, UsageError, type Report } from './report.js';
 
 /** JSON, keys sorted at every depth, two-space indent, one trailing newline. */
 export function writeJsonDeterministic(path: string, value: unknown): void {
@@ -167,17 +169,45 @@ export function writePlanned(
  * compiling in the host, and it is the residue a write that outran its codegen
  * leaves behind.
  *
- * The `StetConfig` import is type-only and erased under `verbatimModuleSyntax`;
- * config.ts's runtime import of this module is the only runtime edge between
- * the two.
+ * `config.ts`'s runtime import of this module is one runtime edge between the
+ * two; `isHtmlHost` is the other, and it runs the other way. This module also
+ * reaches `html-host.ts` and `files.ts` at runtime — one way, since neither of
+ * those imports anything from here.
  */
 export function planRepoForms(
   cwd: string,
-  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen'>,
+  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces'>,
   descriptor: Descriptor,
   snapshot: Snapshot,
+  report: Report,
 ): WritePlan[] {
   const at = (rel: string): string => join(cwd, rel);
+  // On the static-HTML host the repo forms are the descriptor, the snapshot and
+  // the MARKED DOCUMENTS: there is no codegen trio, and each document is
+  // regenerated from the snapshot rather than written from a generator.
+  if (isHtmlHost(config)) {
+    const { writes, skips } = planDocuments(
+      cwd,
+      filesForGlobs(cwd, config.managedSurfaces),
+      descriptor,
+      snapshot,
+      report,
+    );
+    // The batch NEVER runs with a document left half-true. This is the one place
+    // the refusal lives, so every command that writes on this host inherits it.
+    const first = skips[0];
+    if (first !== undefined) {
+      throw new CliError(
+        `${skips.length} document(s) could not be regenerated — ` +
+          `${first.file}:${first.line} ${first.reason}; nothing was written`,
+      );
+    }
+    return [
+      asUpdate(planJson(at(config.descriptorPath), descriptor, config.descriptorPath)),
+      asUpdate(planJson(at(config.snapshotPath), snapshot, config.snapshotPath)),
+      ...writes.map((w) => asUpdate(planWrite(w.abs, w.text, w.rel))),
+    ];
+  }
   const { keysTs, dts } = generateRegistry(descriptor);
   return [
     asUpdate(planJson(at(config.descriptorPath), descriptor, config.descriptorPath)),

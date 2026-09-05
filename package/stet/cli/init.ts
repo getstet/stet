@@ -18,7 +18,7 @@
  * changes nothing, a run after a real edit is a named refusal.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
 
 import type * as TS from 'typescript';
@@ -38,48 +38,53 @@ import {
   pathAliasMappings,
   type StetConfig,
 } from './config.js';
+import { filesForGlobs } from './files.js';
+import { proposeHtml } from './html-host.js';
 import { packageRoot, migrations } from './installed.js';
 import { detectPagesRoots } from './pages.js';
 import type { CliIo } from './main.js';
-import { posixRelative, Report } from './report.js';
+import { posixRelative, Report, UsageError } from './report.js';
 import { applyFileEdits, dominantEol, formatDiff, type Edit } from './rewrite.js';
 import { loadTypescript, scriptKindFor } from './source-scan.js';
 
 export async function runInit(args: string[], io: CliIo): Promise<number> {
-  const { values, positionals } = parse(args, { app: 'string', yes: 'boolean' });
+  const { values, positionals } = parse(args, { app: 'string', host: 'string', yes: 'boolean' });
   noPositionals(positionals, 'init');
   const app = text(values, 'app');
+  const forced = text(values, 'host');
+  if (forced !== undefined && forced !== 'html') {
+    throw new UsageError('stet init --host takes one value, html');
+  }
   const yes = flag(values, 'yes');
   const target = app === undefined ? io.cwd : join(io.cwd, app);
   const report = new Report();
 
-  const { base, router, evidence } = detectLayout(target);
-  report.line(`router: ${router} (${evidence})`);
+  // `--host html` forces the shape and skips detection: a folder about to
+  // receive its page has no `.html` to detect yet.
+  const { base, router, host, evidence } =
+    forced === 'html'
+      ? ({ base: '', router: 'app', host: 'html', evidence: '--host html' } as const)
+      : detectLayout(target);
+  const isHtml = host === 'html';
+  // The host line REPLACES the router line: a static-HTML host has no router,
+  // and naming one would be the lie the arm exists to stop.
+  if (isHtml) report.line(`host: html (${evidence})`);
+  else report.line(`router: ${router} (${evidence})`);
   // An Astro host has no root React layout, and a placeholder path is the lie
-  // this absence exists to stop.
-  const rootLayout = router === 'astro' ? undefined : probeRootLayout(target, base, router);
+  // this absence exists to stop. Neither does a page with no build.
+  const rootLayout = isHtml || router === 'astro' ? undefined : probeRootLayout(target, base, router);
   const storeBacked = detectStore(target, io.env);
   // The sub-package OR the invocation root: a hoisted monorepo declares react
   // once at the top, and reading only the app would call it react-less while
   // its layout sits there waiting to be wrapped.
-  const hasReact = detectReact(target) || (target !== io.cwd && detectReact(io.cwd));
+  const hasReact = isHtml ? false : detectReact(target) || (target !== io.cwd && detectReact(io.cwd));
 
   // The two §13.1 questions. Both default in a non-interactive context (no
   // `ask`/`confirm` on the io), with a printed note — never a blocked run.
   const pack = await askPack(io, report);
   const sendsEmail = await askEmail(io, target, base, report);
 
-  const config = buildConfig({ base, router, rootLayout, storeBacked, sendsEmail, target, report });
-
-  // The starter descriptor and its snapshot ship as package assets: inlining
-  // them here would put `target` literals in `cli/`, which the conformance guard
-  // forbids, and the snapshot has to populate every declared key or init's own
-  // completion check would error on currency.
-  const starterDescriptor = readJson(join(packageRoot(), 'templates', 'starter-descriptor.json'));
-  const starterDefaults = readJson(join(packageRoot(), 'templates', 'starter-defaults.json'));
-  const descriptor = loadDescriptorWithWarnings(starterDescriptor).descriptor;
-  const snapshot = loadSnapshot(starterDefaults);
-  const { keysTs, dts } = generateRegistry(descriptor);
+  const config = buildConfig({ base, router, host, rootLayout, storeBacked, sendsEmail, target, report });
 
   const label = (diskPath: string): string => posixRelative(io.cwd, diskPath);
   const plan = (relPath: string, text: string): WritePlan =>
@@ -87,33 +92,54 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   const planJsonAt = (relPath: string, value: unknown): WritePlan =>
     planJson(join(target, relPath), value, label(join(target, relPath)));
 
-  const plans: WritePlan[] = [
-    planJsonAt(config.descriptorPath, starterDescriptor),
-    planJsonAt(config.snapshotPath, starterDefaults),
-    plan(config.codegen.registry, keysTs),
-    plan(config.codegen.dts, dts),
-    plan(config.codegen.defaults, generateDefaultsModule(snapshot)),
-    plan(
-      config.readPath.file,
-      // An Astro host takes the react-free scaffold whether or not react is
-      // declared: an island's React tree is not the site's layout, and
-      // `stet/react`'s server accessor is a Next server-component tool.
-      readPathModule(config, join(target, config.readPath.file), target, storeBacked, hasReact && router !== 'astro'),
-    ),
-  ];
-  for (const migration of migrations()) {
-    plans.push(plan(join(HOST_MIGRATIONS, migration.name), readFileSync(migration.path, 'utf8')));
+  const plans: WritePlan[] = [];
+  if (isHtml) {
+    // An EMPTY descriptor and snapshot: the page already carries its copy, and
+    // a starter key has nowhere to render on a document stet did not write. The
+    // brand group arrives when a page needs it.
+    plans.push(planJsonAt(config.descriptorPath, { version: 1, keys: {} }));
+    plans.push(planJsonAt(config.snapshotPath, { default: {} }));
+    plans.push(planJsonAt(CONFIG_FILE, htmlConfigProjection(config)));
+  } else {
+    // The starter descriptor and its snapshot ship as package assets: inlining
+    // them here would put `target` literals in `cli/`, which the conformance
+    // guard forbids, and the snapshot has to populate every declared key or
+    // init's own completion check would error on currency.
+    const starterDescriptor = readJson(join(packageRoot(), 'templates', 'starter-descriptor.json'));
+    const starterDefaults = readJson(join(packageRoot(), 'templates', 'starter-defaults.json'));
+    const descriptor = loadDescriptorWithWarnings(starterDescriptor).descriptor;
+    const snapshot = loadSnapshot(starterDefaults);
+    const { keysTs, dts } = generateRegistry(descriptor);
+
+    plans.push(
+      planJsonAt(config.descriptorPath, starterDescriptor),
+      planJsonAt(config.snapshotPath, starterDefaults),
+      plan(config.codegen.registry, keysTs),
+      plan(config.codegen.dts, dts),
+      plan(config.codegen.defaults, generateDefaultsModule(snapshot)),
+      plan(
+        config.readPath.file,
+        // An Astro host takes the react-free scaffold whether or not react is
+        // declared: an island's React tree is not the site's layout, and
+        // `stet/react`'s server accessor is a Next server-component tool.
+        readPathModule(config, join(target, config.readPath.file), target, storeBacked, hasReact && router !== 'astro'),
+      ),
+    );
+    for (const migration of migrations()) {
+      plans.push(plan(join(HOST_MIGRATIONS, migration.name), readFileSync(migration.path, 'utf8')));
+    }
+    if (config.mountRoute !== undefined) {
+      plans.push(plan(config.mountRoute, routeModule(config, join(target, config.mountRoute), target)));
+    }
+    plans.push(planJsonAt(CONFIG_FILE, config));
   }
-  if (config.mountRoute !== undefined) {
-    plans.push(plan(config.mountRoute, routeModule(config, join(target, config.mountRoute), target)));
-  }
-  plans.push(planJsonAt(CONFIG_FILE, config));
 
   // typescript parses the layout for the ONE mount edit. Load it BEFORE any
   // write, so its absence degrades that edit to a printed snippet rather than
   // leaving a half-adopted repo — the writes commit, then the mount can't parse
-  // (P3-12). The read path and codegen writes need no typescript.
-  const ts = await loadTypescriptOrNull();
+  // (P3-12). The read path and codegen writes need no typescript. An html host
+  // has no layout and no read path, so it never asks for the compiler.
+  const ts = isHtml ? null : await loadTypescriptOrNull();
 
   const { written, unchanged } = writePlanned(plans, {
     refusal: (labels) =>
@@ -138,8 +164,13 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
         "either copy('key') for text or copyMap.key by property",
     );
   };
-  if (rootLayout === undefined || router === 'astro') skipMount('an Astro host has no root React layout');
-  else if (!hasReact) skipMount('this host declares no react');
+  // On an html host the step is skipped WHOLE and silently: there is no
+  // provider, no read path and no import — nothing the line could name.
+  if (isHtml) {
+    // nothing to mount
+  } else if (rootLayout === undefined || router === 'astro') {
+    skipMount('an Astro host has no root React layout');
+  } else if (!hasReact) skipMount('this host declares no react');
   else await mountProvider({ io, target, config, rootLayout, router, yes, report, ts });
   // Outside the all-or-nothing batch above: that batch is over NEW files stet
   // owns, while the guidance append edits files it does not, under per-file
@@ -150,7 +181,7 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   // Where the Next-shaped mount route was not written, the endpoint is a hand
   // step and the report says so rather than leaving a store-backed host with
   // no server surface named.
-  if (storeBacked && config.mountRoute === undefined) {
+  if (!isHtml && storeBacked && config.mountRoute === undefined) {
     report.line('mount route: not scaffolded on an Astro host — mount createStetHandler in an Astro endpoint by hand');
   }
 
@@ -162,7 +193,24 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   // resolves. Keyed on the STORE rather than on the mount route, which the read
   // path already is: an Astro store host writes no route and still carries an
   // accessor that throws until `pull` runs.
-  if (storeBacked) {
+  if (isHtml) {
+    // What the page holds, counted the way `scan` will report it — so the
+    // operator sees the size of the adoption before running it. The hook is
+    // named because `init` never writes one on any host.
+    const set = proposeHtml(
+      target,
+      filesForGlobs(target, config.managedSurfaces),
+      { version: 1, keys: {} },
+      {},
+    );
+    const pages = set.documents.length;
+    const elements = set.proposals.filter((p) => p.kind === 'element').length;
+    const attributes = set.proposals.filter((p) => p.kind === 'attribute').length;
+    report.line(
+      `${pages} page${pages === 1 ? '' : 's'}, ${elements} text element${elements === 1 ? '' : 's'}, ` +
+        `${attributes} attribute${attributes === 1 ? '' : 's'} — next: stet scan, then stet hook install`,
+    );
+  } else if (storeBacked) {
     report.line('next: stet pull (populate the store bundle the read path serves), then stet scan');
   } else {
     report.line('next: stet scan');
@@ -200,20 +248,26 @@ const ASTRO_CONFIGS = ['astro.config.mjs', 'astro.config.ts', 'astro.config.js',
  * still scaffolds as `app`. The evidence rides back so the report can say what
  * decided it.
  */
-function detectLayout(target: string): { base: '' | 'src/'; router: 'app' | 'pages' | 'astro'; evidence: string } {
+function detectLayout(target: string): {
+  base: '' | 'src/';
+  router: 'app' | 'pages' | 'astro';
+  host: 'html' | undefined;
+  evidence: string;
+} {
   const roots = detectPagesRoots(target);
   if (roots.some((root) => root.arm === 'astro')) {
-    return { base: 'src/', router: 'astro', evidence: 'src/pages carries .astro files' };
+    return { base: 'src/', router: 'astro', host: undefined, evidence: 'src/pages carries .astro files' };
   }
   const astroConfig = ASTRO_CONFIGS.find((name) => existsSync(join(target, name)));
   if (astroConfig !== undefined) {
-    return { base: 'src/', router: 'astro', evidence: `${astroConfig} at the root` };
+    return { base: 'src/', router: 'astro', host: undefined, evidence: `${astroConfig} at the root` };
   }
   const app = roots.find((root) => root.arm === 'next-app');
   if (app !== undefined) {
     return {
       base: app.root.startsWith('src/') ? 'src/' : '',
       router: 'app',
+      host: undefined,
       evidence: `${app.root} carries a page file`,
     };
   }
@@ -222,11 +276,96 @@ function detectLayout(target: string): { base: '' | 'src/'; router: 'app' | 'pag
     return {
       base: pages.root.startsWith('src/') ? 'src/' : '',
       router: 'pages',
+      host: undefined,
       evidence: `${pages.root} carries a page file`,
     };
   }
+  const html = detectHtmlHost(target);
+  if (html !== null) return { base: '', router: 'app', host: 'html', evidence: html };
   const base = detectSourceBase(target);
-  return { base, router: detectRouter(target, base), evidence: 'default — no route files found' };
+  return { base, router: detectRouter(target, base), host: undefined, evidence: 'default — no route files found' };
+}
+
+/**
+ * The dependencies that mean a build stands between the source and the page. A
+ * Vite SPA carries a root `index.html` too, so the MANIFEST is the deterministic
+ * tell and the markup is not — `--host html` is the override where a host
+ * declares one of these and means the page anyway.
+ */
+const BUNDLED_HOST_DEPS = [
+  'next',
+  'astro',
+  'vite',
+  'react',
+  'react-dom',
+  'vue',
+  'svelte',
+  '@sveltejs/kit',
+  'nuxt',
+  'gatsby',
+  '@remix-run/react',
+];
+
+/**
+ * The static-HTML host's evidence, or null. It reads the root directory's own
+ * entries — names only, files only, one level — so an `.html` under `docs/` is
+ * not a host and a DIRECTORY named `x.html` is not a page.
+ */
+function detectHtmlHost(target: string): string | null {
+  let names: string[];
+  try {
+    names = readdirSync(target, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.html'))
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return null;
+  }
+  const first = names[0];
+  if (first === undefined || !manifestDeclaresNone(target, BUNDLED_HOST_DEPS)) return null;
+  return `${first} at the root, no framework in package.json`;
+}
+
+/**
+ * Whether the manifest declares NONE of the given dependencies — read the way
+ * `detectReact` reads react. A missing or unreadable manifest declares nothing,
+ * which is the common shape of a hand-written site.
+ */
+function manifestDeclaresNone(target: string, names: string[]): boolean {
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8')) as Record<string, unknown>;
+  } catch {
+    return true;
+  }
+  for (const field of ['dependencies', 'devDependencies']) {
+    const deps = raw[field];
+    if (typeof deps !== 'object' || deps === null) continue;
+    if (names.some((name) => Object.hasOwn(deps, name))) return false;
+  }
+  return true;
+}
+
+/**
+ * The config an html host WRITES: the paths and settings it uses, and nothing
+ * else. No read path, codegen, router, root layout, API token or mount route —
+ * `loadConfig` fills those in memory and no seam on this host reads them, so
+ * writing them would put four lies in a stranger's repo.
+ */
+function htmlConfigProjection(config: StetConfig): Record<string, unknown> {
+  return {
+    project: config.project,
+    host: 'html',
+    ...(config.store === undefined ? {} : { store: config.store }),
+    managedSurfaces: config.managedSurfaces,
+    emailSurfaces: config.emailSurfaces,
+    copyModules: config.copyModules,
+    scan: config.scan,
+    descriptorPath: config.descriptorPath,
+    snapshotPath: config.snapshotPath,
+    bundlePath: config.bundlePath,
+    locales: config.locales,
+  };
 }
 
 /** App Router unless only `pages/` exists. A bare repo defaults to app. */
@@ -316,6 +455,7 @@ async function askEmail(io: CliIo, target: string, base: '' | 'src/', report: Re
 function buildConfig(d: {
   base: '' | 'src/';
   router: 'app' | 'pages' | 'astro';
+  host: 'html' | undefined;
   rootLayout: string | undefined;
   storeBacked: boolean;
   sendsEmail: boolean;
@@ -323,6 +463,21 @@ function buildConfig(d: {
   report: Report;
 }): StetConfig {
   const config = defaultConfig();
+  // The html arm returns FIRST, ahead of `resolveReadPathImport` — there is no
+  // import to resolve on a host that writes no read path, and its alias note
+  // would name a mapping nothing on this host ever reads.
+  if (d.host === 'html') {
+    config.host = 'html';
+    // Every `.html` below the repository root: a page with no build has no
+    // framework tree, so the root IS the layout.
+    config.managedSurfaces = ['**/*.html'];
+    config.emailSurfaces = [];
+    config.copyModules = [];
+    // A store block on an html host is legal and dormant — recorded where one
+    // is detected, read by nothing until a later surface asks.
+    if (d.storeBacked) config.store = defaultStoreBlock('pg');
+    return config;
+  }
   config.router = d.router;
   config.rootLayout = d.rootLayout;
   // A JS host (probed `app/layout.js`) writes a `.js` read path, and its

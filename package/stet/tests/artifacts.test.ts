@@ -7,22 +7,34 @@
  * `emitMigrations` is the first consumer and its refusal-message assertions live
  * in `cli.test.ts`; these are the writers' own edges.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   asUpdate,
   planJson,
+  planRepoForms,
   planWrite,
   writeExecutable,
   writeJsonDeterministic,
   writePlanned,
   writeText,
 } from '../cli/artifacts.js';
-import { CliError } from '../cli/report.js';
+import { defaultConfig } from '../cli/config.js';
+import { CliError, Report } from '../cli/report.js';
 
 /**
  * A path whose write fails, planned as an ordinary one.
@@ -219,5 +231,67 @@ describe('writeExecutable', () => {
     writeExecutable(hook, '#!/bin/sh\nnpx stet check\n');
     expect(readFileSync(hook, 'utf8')).toBe('#!/bin/sh\nnpx stet check\n');
     expect(statSync(hook).mode & 0o111).not.toBe(0);
+  });
+});
+
+describe('planRepoForms — which forms a host has', () => {
+  const PAGE = readFileSync(
+    fileURLToPath(new URL('./fixtures/html-host/index.html', import.meta.url)),
+    'utf8',
+  );
+
+  it('plans the five codegen-carrying forms on a JavaScript host', () => {
+    const cwd = tempDir();
+    const plans = planRepoForms(
+      cwd,
+      defaultConfig(),
+      { version: 1, keys: { a: { shape: 'text', target: 'web' } } },
+      { default: { a: 'A' } },
+      new Report(),
+    );
+    expect(plans.map((p) => p.label)).toEqual([
+      'content/descriptor.json',
+      'content/defaults.json',
+      'content/keys.ts',
+      'content/stet-env.d.ts',
+      'content/defaults.ts',
+    ]);
+  });
+
+  it('plans the descriptor, the snapshot and one document per marked page on an html host', () => {
+    const cwd = tempDir();
+    writeFileSync(join(cwd, 'index.html'), PAGE.replace('<h3>', '<h3 data-stet="heading">'), 'utf8');
+    writeFileSync(join(cwd, 'quiet.html'), '<html><body><p>No mark here.</p></body></html>', 'utf8');
+    const config = { ...defaultConfig(), host: 'html' as const, managedSurfaces: ['**/*.html'] };
+    const plans = planRepoForms(
+      cwd,
+      config,
+      { version: 1, keys: { heading: { shape: 'text', target: 'web' } } },
+      { default: { heading: 'A different heading' } },
+      new Report(),
+    );
+    expect(plans.map((p) => p.label)).toEqual([
+      'content/descriptor.json',
+      'content/defaults.json',
+      'index.html',
+    ]);
+    // No `.ts` anywhere: the codegen trio is not a form this host has.
+    expect(plans.some((p) => p.path.endsWith('.ts'))).toBe(false);
+  });
+
+  it('refuses the whole batch while any document cannot be regenerated', () => {
+    const cwd = tempDir();
+    // The mixed `h1` keeps its span, but the value it is given has no placeholder.
+    writeFileSync(join(cwd, 'index.html'), PAGE.replace('<h1>', '<h1 data-stet="hero">'), 'utf8');
+    const config = { ...defaultConfig(), host: 'html' as const, managedSurfaces: ['**/*.html'] };
+    expect(() =>
+      planRepoForms(
+        cwd,
+        config,
+        { version: 1, keys: { hero: { shape: 'text', target: 'web', tags: 1 } } },
+        { default: { hero: 'A heading with no placeholder at all.' } },
+        new Report(),
+      ),
+    ).toThrow(/1 document\(s\) could not be regenerated — index\.html:25 tag-count-mismatch; nothing was written/);
   });
 });

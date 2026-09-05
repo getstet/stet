@@ -37,7 +37,7 @@
  * not, so the whole host bricks at `descriptorOf` in either direction.
  */
 
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join, sep } from 'node:path';
 
 import { route as normalizeRoute } from '../src/seo.js';
@@ -46,38 +46,19 @@ import { DEFAULT_TARGET, type Descriptor, type PageDef } from '../src/types.js';
 import { flag, parse, positionalsAround, refuseEnv } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { filesForGlobs, walk } from './files.js';
+import { proposeHtml } from './html-host.js';
 import type { CliIo } from './main.js';
 import { clip, posixRelative, CliError, Report, UsageError } from './report.js';
 
 // --- The dirent walk --------------------------------------------------------
 
-/** Directories a walk never descends into — a `**`-prefixed glob has an empty static prefix and would otherwise enumerate them. */
-const WALK_SKIP = new Set(['node_modules', '.git', 'dist', '.next']);
-
 /**
- * Recursive directory walk over dirents — no file content is read. Shared with
- * `scan`, whose `filesForGlobs` walks each glob's static prefix through it.
+ * The walk lives in `cli/files.ts` now that `html-host` reads file lists too.
+ * Re-exported here because `eject` and `email extract` reach it by this name.
  */
-export function walk(dir: string, onFile: (absPath: string) => void): void {
-  const entries = safeReaddir(dir);
-  if (entries === null) return; // a static prefix that does not exist yet is empty
-  for (const entry of entries) {
-    if (entry.isDirectory() && WALK_SKIP.has(entry.name)) continue; // P3-17: never enumerate these
-    const abs = join(dir, entry.name);
-    if (entry.isDirectory()) walk(abs, onFile);
-    else if (entry.isFile()) onFile(abs);
-  }
-}
-
-/** `readdirSync` with dirents, or null when the directory is absent. */
-function safeReaddir(dir: string) {
-  try {
-    return readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-}
+export { walk };
 
 // --- The name grammar -------------------------------------------------------
 
@@ -102,7 +83,7 @@ export function normalize(raw: string): string | null {
 
 // --- The detector -----------------------------------------------------------
 
-export type PagesArm = 'astro' | 'next-app' | 'next-pages';
+export type PagesArm = 'astro' | 'next-app' | 'next-pages' | 'html';
 
 export interface PagesRoot {
   arm: PagesArm;
@@ -140,7 +121,13 @@ const NEXT_PAGES_RESERVED = new Set(['_app', '_document', '_error', '404', '500'
  * host whose Astro `srcDir` moves the tree lands here, which is the fail-safe
  * side of a bounded residue rather than a guess at where the pages went.
  */
-export function detectPagesRoots(cwd: string): PagesRoot[] {
+export function detectPagesRoots(cwd: string, options: { html?: boolean } = {}): PagesRoot[] {
+  // The ONE arm the CONFIG selects rather than a directory probe, and the
+  // stated exception to this detector's never-`config.router` rule: a
+  // static-HTML host has no framework tree to probe, and `host: "html"` is the
+  // developer's own declaration, confirmed by `init`. The root is the
+  // repository root, and the managed surfaces name the files.
+  if (options.html === true) return [{ arm: 'html', root: '' }];
   const roots: PagesRoot[] = [];
   // Decisive, and therefore first: Next cannot serve `.astro`, so a `src/pages`
   // tree carrying one is Astro's and the Next Pages arm never claims it.
@@ -207,6 +194,12 @@ export interface PageProposal {
   parent?: string;
   /** A markdown page's frontmatter title and description, where seeding is on and the block yields either. */
   seed?: { title?: string; description?: string };
+  /**
+   * The keys an html page's `<title>` and meta description are already MARKED
+   * with, under `bind`. A field with no mark is absent, and the apply scaffolds
+   * nothing for it.
+   */
+  bound?: { title?: string; description?: string };
 }
 
 export interface PageProposalSet {
@@ -258,19 +251,43 @@ export function proposePages(
   cwd: string,
   roots: PagesRoot[],
   declared: DeclaredState,
-  options: { seed?: boolean } = {},
+  options: {
+    seed?: boolean;
+    /** Read each html page's MARKS and bind its title and description to them. */
+    bind?: boolean;
+    config?: Pick<StetConfig, 'managedSurfaces'>;
+  } = {},
 ): PageProposalSet {
   // Every arm's files in ONE path-sorted union. Walk order is what decides
   // which of two colliding routes is the LATER one, so it has to be
   // deterministic across arms rather than per-arm.
   const files: Array<{ arm: PagesArm; file: string; rel: string }> = [];
   for (const root of roots) {
+    // The html arm's files come from the managed surfaces rather than a walk of
+    // the root: the glob's own walk already skips `node_modules`, `.git` and
+    // `dist`, and every non-`.html` file is silent by construction.
+    if (root.arm === 'html') {
+      for (const rel of filesForGlobs(cwd, options.config?.managedSurfaces ?? [])) {
+        if (rel.endsWith('.html')) files.push({ arm: 'html', file: rel, rel });
+      }
+      continue;
+    }
     const base = join(cwd, root.root);
     walk(base, (abs) => {
       files.push({ arm: root.arm, file: posixRelative(cwd, abs), rel: posixRelative(base, abs) });
     });
   }
   files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+
+  // The arm's ONE content read: which key each page's `<title>` and meta
+  // description already carry. Computed once, over the html files alone.
+  const bound =
+    options.bind === true && files.some((f) => f.arm === 'html')
+      ? boundFields(
+          cwd,
+          files.filter((f) => f.arm === 'html').map((f) => f.file),
+        )
+      : new Map<string, { title?: string; description?: string }>();
 
   // The routes and names the descriptor already holds. `Object.hasOwn` on the
   // name side, never a bare `in`: this map is JSON-parsed and `/constructor`
@@ -286,7 +303,14 @@ export function proposePages(
   const proposedByName = new Map<string, PageProposal>();
 
   for (const { arm, file, rel } of files) {
-    const read = arm === 'astro' ? readAstro(rel) : arm === 'next-app' ? readNextApp(rel) : readNextPages(rel);
+    const read =
+      arm === 'html'
+        ? { route: fileRoute(rel) }
+        : arm === 'astro'
+          ? readAstro(rel)
+          : arm === 'next-app'
+            ? readNextApp(rel)
+            : readNextPages(rel);
     if (read === null) continue;
     if ('skip' in read) {
       skips.push({ file, ...read.skip });
@@ -382,6 +406,9 @@ export function proposePages(
       const seed = readFrontmatter(join(cwd, proposal.file));
       if (seed) proposal.seed = seed;
     }
+    // Always set on the html arm, empty included: its presence is what tells
+    // the print and the apply that this page binds rather than scaffolds.
+    if (arm === 'html') proposal.bound = bound.get(file) ?? {};
     proposals.push(proposal);
     proposedByRoute.set(trimmed, proposal);
     proposedByName.set(name, proposal);
@@ -396,6 +423,41 @@ export function proposePages(
   }
 
   return { proposals, skips };
+}
+
+/**
+ * Which key each html page's `<title>` and `<meta name="description">` already
+ * carry — the html arm's ONE content read.
+ *
+ * The mark is the binding: a field with no mark yields nothing, because
+ * scaffolding a key no element renders would trip `check`'s unmarked-key warn
+ * on every later run. The honest red is `seo check`'s own missing-field rule.
+ */
+function boundFields(
+  cwd: string,
+  files: string[],
+): Map<string, { title?: string; description?: string }> {
+  const bound = new Map<string, { title?: string; description?: string }>();
+  const set = proposeHtml(cwd, files, { version: 1, keys: {} }, {});
+  for (const mark of set.claimed) {
+    const field =
+      mark.kind === 'element' && mark.tag === 'title'
+        ? 'title'
+        : mark.kind === 'attribute' &&
+            mark.attr === 'content' &&
+            mark.element.attrs.some((a) => a.name === 'name' && a.value === 'description')
+          ? 'description'
+          : null;
+    if (field === null) continue;
+    const entry = bound.get(mark.file) ?? {};
+    // The FIRST marked one wins, the rule an HTML parser follows: a document
+    // with two `<title>` elements renders the first, so binding the second
+    // would name a key the browser never shows. Marks arrive in document order.
+    if (entry[field] !== undefined) continue;
+    entry[field] = mark.key;
+    bound.set(mark.file, entry);
+  }
+  return bound;
 }
 
 /** A markdown page — the one file type whose contents this command opens. */
@@ -675,7 +737,7 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io, { json });
 
-  const roots = detectPagesRoots(io.cwd);
+  const roots = detectPagesRoots(io.cwd, { html: isHtmlHost(config) });
   if (roots.length === 0) {
     report.line('pages scan: no routing convention detected — expected src/pages, app/ or pages/');
     return report.emit(io, { json });
@@ -689,7 +751,7 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
       keys: descriptor.keys,
       values: committedValues(io.cwd, config),
     },
-    { seed: true },
+    { seed: true, bind: true, config },
   );
   printPages(report, set);
 
@@ -750,6 +812,19 @@ function printPages(report: Report, set: PageProposalSet): void {
   for (const proposal of set.proposals) {
     const keys = seoKeys(proposal.name);
     report.line(`${proposal.name} (${proposal.route})`);
+    // On the html arm the two fields are reported one by one: each is either
+    // bound to the key its element carries, or absent with `register` named.
+    if (proposal.bound !== undefined) {
+      for (const field of ['title', 'description'] as const) {
+        const key = proposal.bound[field];
+        report.line(
+          key === undefined
+            ? `  ${field}: no marked ${field === 'title' ? '<title>' : 'meta description'} — run stet register first, or declare it by hand`
+            : `  ${field}: bound to ${key}`,
+        );
+      }
+      continue;
+    }
     const origin = proposal.seed === undefined ? 'scaffolded empty' : 'seeded from frontmatter';
     report.line(`  seo: ${keys.title}, ${keys.description} — ${origin}`);
     // The value the apply is about to write, shown before it lands: a seed is
@@ -831,6 +906,30 @@ function applyPages(
   const records = new Map<string, PageDef>();
   for (const proposal of chosen) {
     const keys = seoKeys(proposal.name);
+    // The html arm BINDS: the record references the keys the page's own
+    // elements are marked with, and only those. It mints nothing — a scaffolded
+    // key no element marks would trip `check`'s unmarked-key warn forever, so
+    // the honest red for a missing field is `seo check`'s own.
+    if (proposal.bound !== undefined) {
+      const seo: PageDef['seo'] = {};
+      if (proposal.bound.title !== undefined) seo.title = proposal.bound.title;
+      if (proposal.bound.description !== undefined) seo.description = proposal.bound.description;
+      const record: PageDef = { route: proposal.route };
+      if (Object.keys(seo).length > 0) record.seo = seo;
+      pages[proposal.name] = record;
+      records.set(proposal.name, record);
+      // The bound key gains the page in its `pages` array — the reverse index a
+      // scaffolded key gets, without which the changeset preview's page span is
+      // silently empty.
+      for (const key of Object.values(seo)) {
+        const def = descriptor.keys[key];
+        if (def === undefined) continue;
+        const listed = def.pages ?? [];
+        if (!listed.includes(proposal.name)) def.pages = [...listed, proposal.name];
+      }
+      landed.push(proposal);
+      continue;
+    }
     // `locales` is omitted deliberately: the rule site defaults to `['default']`
     // and naming it here would be a second place for that default to live.
     const record: PageDef = {
@@ -890,7 +989,7 @@ function applyPages(
   let written: string[] = [];
   let unchanged: string[] = [];
   try {
-    ({ written, unchanged } = writePlanned(planRepoForms(io.cwd, config, descriptor, snapshot)));
+    ({ written, unchanged } = writePlanned(planRepoForms(io.cwd, config, descriptor, snapshot, report)));
   } catch (error) {
     rethrowBatchFailure('pages scan --apply', error);
   }
@@ -899,6 +998,24 @@ function applyPages(
   for (const label of written) report.line(`wrote ${label}`);
   if (backfilled > 0) report.line(`backfilled parent on ${backfilled} page(s)`);
   if (landed.length === 0) return;
+  // The html arm's own close: this run scaffolded nothing and seeded nothing,
+  // so today's two lines would both be zero. What matters instead is how many
+  // fields bound and how many pages still lack one.
+  if (landed.every((proposal) => proposal.bound !== undefined)) {
+    const fields = landed.reduce(
+      (total, proposal) => total + Object.keys(proposal.bound ?? {}).length,
+      0,
+    );
+    const short = landed.filter(
+      (proposal) => proposal.bound?.title === undefined || proposal.bound?.description === undefined,
+    ).length;
+    report.line(
+      `declared ${landed.length} page${landed.length === 1 ? '' : 's'}, ` +
+        `bound ${fields} field${fields === 1 ? '' : 's'}; ` +
+        `${short} page${short === 1 ? '' : 's'} lack a marked title or description — stet seo check names them`,
+    );
+    return;
+  }
   report.line(`declared ${landed.length} page(s), scaffolded ${landed.length * 2} key(s); next: stet seo check`);
   // The red this run just created, announced rather than met at the next
   // command: a scaffolded value left empty is exactly what the `missing-title`

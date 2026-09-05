@@ -47,6 +47,18 @@ npx stet register --from scan --write    # adopt those strings as keys, byte-ide
 npx stet check                           # descriptor, snapshot and types — offline
 ```
 
+For a plain HTML site with no build, the same three steps run against the pages
+themselves:
+
+```sh
+npm init -y
+npm i -D @getstet/stet
+npx stet init                            # detects the html host, writes no read path
+npx stet scan                            # locate the element behind every run
+npx stet register --from scan --write    # mark each one with data-stet="<key>"
+npx stet hook install                    # the pre-commit gate
+```
+
 ## What you get
 
 - **A committed snapshot, no database required.** `defaults.json` is the
@@ -78,9 +90,10 @@ store later with `stet upgrade`.
 ## Frameworks
 
 Next.js (both routers), React and Astro are first-class for scanning and
-adoption. Any JavaScript host reads through `@getstet/stet/core`. Non-JS
-services read the committed bundle directly — a stdlib-only Python helper
-ships in the package.
+adoption. A plain HTML site with no build is a host too: stet marks the
+elements it manages and regenerates them from the committed snapshot. Any
+JavaScript host reads through `@getstet/stet/core`. Non-JS services read the
+committed bundle directly — a stdlib-only Python helper ships in the package.
 
 ## Requirements
 
