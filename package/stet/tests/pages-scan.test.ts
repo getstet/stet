@@ -21,7 +21,9 @@ import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptor } from '../src/descriptor.js';
 import { loadSnapshot } from '../src/snapshot.js';
 import { makeHtmlHost } from '../conformance/cli-host.js';
+import { loadConfig } from '../cli/config.js';
 import { runCli, type CliIo } from '../cli/main.js';
+import { proposeForHost } from '../cli/pages.js';
 
 interface Host extends CliIo {
   cwd: string;
@@ -1032,5 +1034,41 @@ describe('pages scan — the stage-5 fold, two title elements', () => {
     expect(await host.run('pages', 'scan')).toBe(0);
     expect(host.stdout()).toContain('title: bound to first_title');
     expect(host.stdout()).not.toContain('bound to second_title');
+  });
+});
+
+/**
+ * The propose half, called on its own. The local dashboard's Declare control
+ * runs the same walk the command does rather than a second one, so the set it
+ * gets back has to be the set the command prints.
+ */
+describe('proposeForHost — the propose half, split out', () => {
+  it('answers null on a host with no routing convention', () => {
+    const host = project();
+    const config = loadConfig(host.cwd);
+    const descriptor = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    expect(proposeForHost(host.cwd, config, descriptor)).toBeNull();
+  });
+
+  it('a host with no routing convention carries neither pages nor skips in --json', async () => {
+    const host = project();
+    expect(await host.run('pages', 'scan', '--json')).toBe(0);
+    const payload = host.json<Record<string, unknown>>();
+    expect('pages' in payload).toBe(false);
+    expect('skips' in payload).toBe(false);
+  });
+
+  it('returns the same set pages scan --json prints, proposals and skips alike', async () => {
+    const host = project();
+    tree(host, 'src/pages', ['index.astro', 'about.astro', '[slug].astro']);
+    const payload = await proposed(host);
+    const config = loadConfig(host.cwd);
+    const descriptor = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    const set = proposeForHost(host.cwd, config, descriptor);
+    expect(set).not.toBeNull();
+    // Round-tripped through JSON: the payload the report emitted is the set with
+    // its undefined members dropped, so the compare is over the same shape.
+    expect(JSON.parse(JSON.stringify(set?.proposals))).toEqual(payload.pages);
+    expect(JSON.parse(JSON.stringify(set?.skips))).toEqual(payload.skips);
   });
 });

@@ -15,6 +15,7 @@
     "codegen:schema": "node stet/scripts/gen-schema.mjs"
   },
   "devDependencies": {
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^22.15.0",
     "@types/pg": "^8.23.1",
     "@types/react": "^19.2.18",

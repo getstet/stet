@@ -40,7 +40,7 @@ import { descriptorOf, snapshotOf } from './check.js';
 import { CONFIG_FILE, defaultConfig, loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
 import { normalize } from './pages.js';
-import { clip, CliError, Report, UsageError } from './report.js';
+import { clip, plural, CliError, Report, UsageError } from './report.js';
 import { applyFileEdits, dominantEol, formatDiff, type Edit } from './rewrite.js';
 import { filesForGlobs } from './scan.js';
 import {
@@ -331,7 +331,7 @@ function applyProposals(
     return;
   }
   report.line(
-    `email extract --apply: ${landed.length} template${landed.length === 1 ? '' : 's'} declared ` +
+    `email extract --apply: ${plural(landed.length, 'template')} declared ` +
       `(${landed.reduce((n, p) => n + p.slots.length, 0)} slots)`,
   );
   // The state the run just put the host in, stated as the fact it is. The
@@ -373,7 +373,7 @@ function untrackedAmong(io: CliIo, files: string[]): string[] {
 }
 
 function surfaceCount(globs: string[]): string {
-  return `${globs.length} email surface${globs.length === 1 ? '' : 's'}`;
+  return plural(globs.length, 'email surface');
 }
 
 /**

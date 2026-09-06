@@ -54,23 +54,9 @@ export function createStetHandler(opts: StetHandlerOptions): {
   GET: (req: Request) => Promise<Response>;
   POST: (req: Request) => Promise<Response>;
 } {
-  // 401 unless the request Bearer equals the configured token, constant-time. An
-  // absent or empty configured token authenticates NOTHING (an empty === empty
-  // would otherwise pass), and the compare guards on BYTE length so a multibyte
-  // length mismatch is a clean 401, never a thrown 500. The env value is TRIMMED:
-  // a `.env`/secret-file token carries a trailing newline the HTTP layer strips
-  // from the request header, so an untrimmed compare could never match (P2-5).
-  const unauthorized = (req: Request): Response | null => {
-    const expected = process.env[opts.auth]?.trim();
-    if (expected === undefined || expected === '') return json({ error: 'unauthorized' }, 401);
-    const provided = bearer(req);
-    if (provided === undefined) return json({ error: 'unauthorized' }, 401);
-    const a = Buffer.from(expected, 'utf8');
-    const b = Buffer.from(provided, 'utf8');
-    if (a.byteLength !== b.byteLength) return json({ error: 'unauthorized' }, 401);
-    if (!timingSafeEqual(a, b)) return json({ error: 'unauthorized' }, 401);
-    return null;
-  };
+  // 401 unless the request Bearer equals the configured token, constant-time.
+  const unauthorized = (req: Request): Response | null =>
+    bearerMatches(req, process.env[opts.auth]) ? null : json({ error: 'unauthorized' }, 401);
 
   // A hook failure never fails the publish — fire-and-forget, never awaited. A
   // sync throw is caught here; an async `onPublish` that rejects is swallowed by
@@ -385,6 +371,32 @@ export function createStetHandler(opts: StetHandlerOptions): {
   };
 
   return { GET, POST };
+}
+
+/**
+ * Whether a request's Bearer equals the expected token, in constant time.
+ *
+ * An absent or empty expected token authenticates NOTHING (an empty === empty
+ * would otherwise pass), and the compare guards on BYTE length so a multibyte
+ * length mismatch is a clean false rather than a throw out of
+ * `timingSafeEqual`. The expected value is TRIMMED: a `.env`/secret-file token
+ * carries a trailing newline the HTTP layer strips from the request header, so
+ * an untrimmed compare could never match (P2-5).
+ *
+ * Exported for `cli/dev.ts`'s local server, which authenticates its own routes
+ * against a per-run token with exactly this rule — one compare, so the
+ * dashboard's API and the mounted API cannot drift apart on what a valid Bearer
+ * is. It is package-internal: `server/index.ts` does not re-export it.
+ */
+export function bearerMatches(req: Request, expected: string | undefined): boolean {
+  const want = expected?.trim();
+  if (want === undefined || want === '') return false;
+  const provided = bearer(req);
+  if (provided === undefined) return false;
+  const a = Buffer.from(want, 'utf8');
+  const b = Buffer.from(provided, 'utf8');
+  if (a.byteLength !== b.byteLength) return false;
+  return timingSafeEqual(a, b);
 }
 
 /** JSON response with the right content type. */

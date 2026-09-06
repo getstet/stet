@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createSnapshotStore } from '../adapters/store-snapshot.js';
 import { miniDescriptor } from '../conformance/fixture.js';
-import { createStetHandler, type PublishEvent } from '../server/mount.js';
+import { bearerMatches, createStetHandler, type PublishEvent } from '../server/mount.js';
 import type {
   ChangesetOps,
   ChangesetRow,
@@ -169,6 +169,23 @@ describe('auth', () => {
     const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
     expect((await h.GET(get('/api/stet/keys', `Bearer ${spacey}`))).status).toBe(200);
     expect((await h.GET(get('/api/stet/keys', `bearer ${spacey}`))).status).toBe(200);
+  });
+
+  /**
+   * The compare itself, called directly — the mount's cases above reach it
+   * through a handler, and the local dashboard's server reaches it on its own.
+   * The SAME-LENGTH wrong token is the case that tells a constant-time compare
+   * from a byte-length test: nothing else here would notice the difference.
+   */
+  it('bearerMatches refuses a same-length wrong token, a length mismatch and an empty expected', () => {
+    expect(bearerMatches(get('/api/stet/keys', `Bearer ${TOKEN}`), TOKEN)).toBe(true);
+    // A trailing newline on the EXPECTED side is trimmed — the secret-file shape.
+    expect(bearerMatches(get('/api/stet/keys', `Bearer ${TOKEN}`), `${TOKEN}\n`)).toBe(true);
+    expect(bearerMatches(get('/api/stet/keys', 'Bearer sekret-tokeM'), TOKEN)).toBe(false);
+    expect(bearerMatches(get('/api/stet/keys', 'Bearer short'), TOKEN)).toBe(false);
+    expect(bearerMatches(get('/api/stet/keys', 'Bearer '), '')).toBe(false);
+    expect(bearerMatches(get('/api/stet/keys', 'Bearer x'), undefined)).toBe(false);
+    expect(bearerMatches(get('/api/stet/keys', null), TOKEN)).toBe(false);
   });
 });
 

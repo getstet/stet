@@ -43,7 +43,7 @@ import {
 import { filesForGlobs } from './files.js';
 import { planHtmlRegister } from './html-host.js';
 import type { CliIo } from './main.js';
-import { clip, collapseLines, CliError, Report, UsageError } from './report.js';
+import { clip, collapseLines, plural, CliError, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff, planRewrite, type Edit } from './rewrite.js';
 import {
   freeKey,
@@ -182,7 +182,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report.line(formatDiff(file, source, edited));
     if (write) {
       writeText(join(io.cwd, file), edited);
-      report.line(`${file}: rewrote ${edits.length === 1 ? '1 edit' : `${edits.length} edits`}`);
+      report.line(`${file}: rewrote ${plural(edits.length, 'edit')}`);
     }
   }
 
@@ -270,7 +270,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     } catch (error) {
       rethrowBatchFailure('stet register', error);
     }
-    report.line(`wrote ${config.descriptorPath}, ${config.snapshotPath} and the codegen modules: ${added} key${added === 1 ? '' : 's'} added`);
+    report.line(`wrote ${config.descriptorPath}, ${config.snapshotPath} and the codegen modules: ${plural(added, 'key')} added`);
   }
   // The closing line turns on whether there were LEAF EDITS, not on `--write`:
   // a `--write` run that adopted only module shapes applied nothing, and
@@ -374,8 +374,8 @@ function registerHtml(d: {
   }
   if (!write) {
     report.line(
-      `register: run with --write to apply ${plan.marked} mark${plan.marked === 1 ? '' : 's'} ` +
-        `across ${plan.edited.length} document${plan.edited.length === 1 ? '' : 's'}`,
+      `register: run with --write to apply ${plural(plan.marked, 'mark')} ` +
+        `across ${plural(plan.edited.length, 'document')}`,
     );
     return report.emit(io);
   }
@@ -389,8 +389,8 @@ function registerHtml(d: {
     rethrowBatchFailure('stet register --write', error);
   }
   report.line(
-    `wrote ${config.descriptorPath}, ${config.snapshotPath} and ${plan.edited.length} ` +
-      `document${plan.edited.length === 1 ? '' : 's'}: ${plan.added} key${plan.added === 1 ? '' : 's'} added, ` +
+    `wrote ${config.descriptorPath}, ${config.snapshotPath} and ` +
+      `${plural(plan.edited.length, 'document')}: ${plural(plan.added, 'key')} added, ` +
       `${plan.shared} shared`,
   );
   report.line('register: applied');

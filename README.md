@@ -80,6 +80,36 @@ npx stet hook install                    # the pre-commit gate
 - **A real exit.** `stet eject` un-rewrites your source, writes the content
   back, and removes the dependency. Adoption is reversible by construction.
 
+## Dashboard
+
+```sh
+npx stet dev
+```
+
+A server on the loopback interface, and a browser opened on it:
+
+```
+dashboard: http://127.0.0.1:4400/?t=<run token>
+```
+
+The page edits the checkouts listed in `~/.stet/projects.json`. Running `stet
+dev` inside a checkout adds that checkout to the list; `--add <path>` adds one
+from anywhere else.
+
+On a snapshot-only project the page saves through the same gate and the same
+all-or-nothing write batch the terminal uses, then commits and pushes the files
+that batch wrote. On a store-backed project it writes drafts and publishes them
+through the project's own mounted API, against the environment selected in the
+header. Health runs `check`, `doctor`, `scan` and `audit` in the same process;
+the SEO tab runs `seo check` and `pages scan`; Setup runs `stet upgrade
+--dry-run`.
+
+The server binds `127.0.0.1` and nothing else, and it has no identity model. A
+token is minted per run, carried in the URL the terminal prints, and taken out
+of every child process the server starts. Anyone who can reach the port and
+holds that token can edit every checkout in the workspace file and run commands
+as you: the dev command a site's Setup names is run through your shell.
+
 ## The store, when you want one
 
 Publishing without deploys is the optional half: Postgres adapters, draft and

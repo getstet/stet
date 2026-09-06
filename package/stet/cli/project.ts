@@ -63,6 +63,19 @@ export interface LoadedProject {
   dispose(): Promise<void>;
 }
 
+/**
+ * One adapter, closed.
+ *
+ * `StoreAdapter` declares no teardown — a memory or snapshot adapter has
+ * nothing to close — so the connection-holding ones are found by the `end`
+ * they do declare. This is the one place that duck-type lives: the loaded
+ * project's `dispose` and the dashboard's `close()` both come here.
+ */
+export async function disposeStore(store: StoreAdapter): Promise<void> {
+  const closable = store as { end?: () => Promise<void> };
+  if (typeof closable.end === 'function') await closable.end();
+}
+
 export interface LoadProjectOptions {
   /** `upgrade --store` seeds against a store block the repo does not have yet. */
   config?: StetConfig;
@@ -124,8 +137,7 @@ export async function loadProject(
     },
     async dispose(): Promise<void> {
       if (injected) return;
-      const closable = store as { end?: () => Promise<void> };
-      if (typeof closable.end === 'function') await closable.end();
+      await disposeStore(store);
     },
   };
   return storeProblem === undefined ? project : { ...project, storeProblem };

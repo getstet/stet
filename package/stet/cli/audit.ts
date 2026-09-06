@@ -14,7 +14,7 @@
 import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence } from './project.js';
-import { Report } from './report.js';
+import { plural, Report } from './report.js';
 
 export async function runAudit(args: string[], io: CliIo): Promise<number> {
   const { values, positionals } = parse(args, { ...ENV_OPTION, strict: 'boolean', json: 'boolean' });
@@ -74,7 +74,7 @@ export async function runAudit(args: string[], io: CliIo): Promise<number> {
     }
 
     report.line(
-      `audit: ${noRow.length} unseeded · ${orphans.length} orphan${orphans.length === 1 ? '' : 's'} · ${drift.length} target drift`,
+      `audit: ${noRow.length} unseeded · ${plural(orphans.length, 'orphan')} · ${drift.length} target drift`,
     );
     report.data('unseeded', noRow);
     report.data('orphans', orphans);

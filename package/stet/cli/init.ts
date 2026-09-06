@@ -43,7 +43,7 @@ import { proposeHtml } from './html-host.js';
 import { packageRoot, migrations } from './installed.js';
 import { detectPagesRoots } from './pages.js';
 import type { CliIo } from './main.js';
-import { posixRelative, Report, UsageError } from './report.js';
+import { plural, posixRelative, Report, UsageError } from './report.js';
 import { applyFileEdits, dominantEol, formatDiff, type Edit } from './rewrite.js';
 import { loadTypescript, scriptKindFor } from './source-scan.js';
 
@@ -197,18 +197,13 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
     // What the page holds, counted the way `scan` will report it — so the
     // operator sees the size of the adoption before running it. The hook is
     // named because `init` never writes one on any host.
-    const set = proposeHtml(
-      target,
-      filesForGlobs(target, config.managedSurfaces),
-      { version: 1, keys: {} },
-      {},
-    );
+    const set = proposeHtml(target, filesForGlobs(target, config.managedSurfaces));
     const pages = set.documents.length;
     const elements = set.proposals.filter((p) => p.kind === 'element').length;
     const attributes = set.proposals.filter((p) => p.kind === 'attribute').length;
     report.line(
-      `${pages} page${pages === 1 ? '' : 's'}, ${elements} text element${elements === 1 ? '' : 's'}, ` +
-        `${attributes} attribute${attributes === 1 ? '' : 's'} — next: stet scan, then stet hook install`,
+      `${plural(pages, 'page')}, ${plural(elements, 'text element')}, ` +
+        `${plural(attributes, 'attribute')} — next: stet scan, then stet hook install`,
     );
   } else if (storeBacked) {
     report.line('next: stet pull (populate the store bundle the read path serves), then stet scan');
@@ -632,13 +627,40 @@ function readPathModule(
   // same either way; only the accessor and what the module exports differ.
   const bundleRead = [
     '// The committed bundle (or the snapshot, snapshot-only), read at request',
-    '// time so a published change is served without a rebuild.',
-    'function currentBundle() {',
-    `  const raw${js ? '' : ': unknown'} = JSON.parse(readFileSync(join(process.cwd(), '${readFrom}'), 'utf8'));`,
-    '  return readBundle(raw);',
+    '// time so a published change is served without a rebuild. Re-read when the',
+    '// file changes, so a running dev server serves an edit on the next request.',
+    `const READ_FROM = join(process.cwd(), '${readFrom}');`,
+    `let cache${js ? '' : ': { mtimeMs: number; size: number; resolved: Record<string, unknown> } | undefined'};`,
+    'function current() {',
+    '  try {',
+    '    const { mtimeMs, size } = statSync(READ_FROM);',
+    '    if (cache === undefined || cache.mtimeMs !== mtimeMs || cache.size !== size) {',
+    "      const raw = JSON.parse(readFileSync(READ_FROM, 'utf8'));",
+    '      cache = { mtimeMs, size, resolved: resolveAll(descriptor, readBundle(raw)).resolved };',
+    '    }',
+    '    return cache.resolved;',
+    '  } catch (error) {',
+    '    // Mid-publish the file is briefly truncated, absent or half-written. The',
+    '    // last good resolution is served across that window; with nothing read',
+    '    // yet there is nothing to serve and the error is the answer.',
+    '    if (cache === undefined) throw error;',
+    '    return cache.resolved;',
+    '  }',
     '}',
     '',
-    'const { resolved } = resolveAll(descriptor, currentBundle());',
+    "// A live view over the current resolution: property reads, `in` and key",
+    "// enumeration all consult the file's mtime first.",
+    `const resolved${js ? '' : ': Record<string, unknown>'} = new Proxy({}, {`,
+    '  get: (_, key) => current()[key' + (js ? '' : ' as string') + '],',
+    '  has: (_, key) => key in current(),',
+    '  ownKeys: () => Reflect.ownKeys(current()),',
+    '  getOwnPropertyDescriptor: (_, key) => Object.getOwnPropertyDescriptor(current(), key),',
+    '  // Sealing this view would leave it permanently broken: the empty target',
+    '  // would become non-extensible and every later key enumeration would throw',
+    '  // for reporting keys the target does not have. Refusing makes the freeze',
+    '  // itself throw, which a caller can catch, and leaves the view working.',
+    '  preventExtensions: () => false,',
+    '});',
     '',
     `// stet register inserts: import { copy } from '${config.readPath.import}'`,
   ];
@@ -649,7 +671,7 @@ function readPathModule(
     // exactly the host this branch is written for. Both resolutions accept it.
     const relRegistry = `${relImport(readPathFile, join(target, config.codegen.registry), { stripExt: true })}.js`;
     return `${[
-      "import { readFileSync } from 'node:fs';",
+      "import { readFileSync, statSync } from 'node:fs';",
       "import { join } from 'node:path';",
       '',
       js
@@ -680,7 +702,7 @@ function readPathModule(
 
   const relDescriptor = relImport(readPathFile, join(target, config.descriptorPath));
   return `${[
-    "import { readFileSync } from 'node:fs';",
+    "import { readFileSync, statSync } from 'node:fs';",
     "import { join } from 'node:path';",
     '',
     "import { createServerCopy } from '@getstet/stet/react';",

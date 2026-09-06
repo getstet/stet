@@ -36,7 +36,7 @@ import { descriptorOf, snapshotOf } from './check.js';
 import { loadConfig, type StetConfig } from './config.js';
 import { MAX_OUTPUT, renderTemplate, type RenderResult } from './email-render.js';
 import type { CliIo } from './main.js';
-import { clip, Report, shapeOf } from './report.js';
+import { clip, plural, Report, shapeOf } from './report.js';
 
 /** `src/validate.ts`'s own placeholder form — one spelling of what a `{{var}}` is. */
 const VARIABLE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
@@ -121,7 +121,7 @@ export async function runEmailVerify(args: string[], io: CliIo): Promise<number>
     for (const plan of fixtures) report.line(`capture ${plan.label}`);
     const { written } = writePlanned(fixtures);
     report.line(
-      `email verify --capture: wrote ${written.length} baseline${written.length === 1 ? '' : 's'} — commit them, ` +
+      `email verify --capture: wrote ${plural(written.length, 'baseline')} — commit them, ` +
         'so the proof survives the migration commit',
     );
   }

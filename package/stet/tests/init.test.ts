@@ -440,9 +440,11 @@ describe('runInit — the read path matches the host (F5)', () => {
     execFileSync('npm', ['run', 'build'], { cwd: packageRoot(), stdio: 'pipe' });
   }
 
-  // The react branch, pinned whole: F5 changed which module a react-LESS host
-  // gets, and a host that declares react must still receive exactly this.
-  const REACT_READ_PATH = `import { readFileSync } from 'node:fs';
+  // The three scaffold variants, pinned whole. F5 changed which module a
+  // react-LESS host gets, and the per-request read (D9) changed the body all
+  // three share: a pin per variant is what makes an accidental edit to one of
+  // them visible rather than absorbed by a `toContain`.
+  const REACT_READ_PATH = `import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createServerCopy } from '@getstet/stet/react';
@@ -453,16 +455,153 @@ import descriptorJson from '../content/descriptor.json';
 const descriptor = descriptorJson as unknown as Descriptor;
 
 // The committed bundle (or the snapshot, snapshot-only), read at request
-// time so a published change is served without a rebuild.
-function currentBundle() {
-  const raw: unknown = JSON.parse(readFileSync(join(process.cwd(), 'content/defaults.json'), 'utf8'));
-  return readBundle(raw);
+// time so a published change is served without a rebuild. Re-read when the
+// file changes, so a running dev server serves an edit on the next request.
+const READ_FROM = join(process.cwd(), 'content/defaults.json');
+let cache: { mtimeMs: number; size: number; resolved: Record<string, unknown> } | undefined;
+function current() {
+  try {
+    const { mtimeMs, size } = statSync(READ_FROM);
+    if (cache === undefined || cache.mtimeMs !== mtimeMs || cache.size !== size) {
+      const raw = JSON.parse(readFileSync(READ_FROM, 'utf8'));
+      cache = { mtimeMs, size, resolved: resolveAll(descriptor, readBundle(raw)).resolved };
+    }
+    return cache.resolved;
+  } catch (error) {
+    // Mid-publish the file is briefly truncated, absent or half-written. The
+    // last good resolution is served across that window; with nothing read
+    // yet there is nothing to serve and the error is the answer.
+    if (cache === undefined) throw error;
+    return cache.resolved;
+  }
 }
 
-const { resolved } = resolveAll(descriptor, currentBundle());
+// A live view over the current resolution: property reads, \`in\` and key
+// enumeration all consult the file's mtime first.
+const resolved: Record<string, unknown> = new Proxy({}, {
+  get: (_, key) => current()[key as string],
+  has: (_, key) => key in current(),
+  ownKeys: () => Reflect.ownKeys(current()),
+  getOwnPropertyDescriptor: (_, key) => Object.getOwnPropertyDescriptor(current(), key),
+  // Sealing this view would leave it permanently broken: the empty target
+  // would become non-extensible and every later key enumeration would throw
+  // for reporting keys the target does not have. Refusing makes the freeze
+  // itself throw, which a caller can catch, and leaves the view working.
+  preventExtensions: () => false,
+});
 
 // stet register inserts: import { copy } from '@/lib/content'
 export const copy = createServerCopy(descriptor, resolved);
+`;
+
+  const REACT_FREE_TS_READ_PATH = `import { readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { createAccessor, readBundle, resolveAll, type Descriptor } from '@getstet/stet';
+
+import type { StringKey } from '../content/keys.js';
+
+// The descriptor is READ, never imported: a JSON import needs an import
+// attribute under plain node, and a host with no bundler supplies none.
+const descriptor = JSON.parse(readFileSync(join(process.cwd(), 'content/descriptor.json'), 'utf8')) as Descriptor;
+
+// The committed bundle (or the snapshot, snapshot-only), read at request
+// time so a published change is served without a rebuild. Re-read when the
+// file changes, so a running dev server serves an edit on the next request.
+const READ_FROM = join(process.cwd(), 'content/defaults.json');
+let cache: { mtimeMs: number; size: number; resolved: Record<string, unknown> } | undefined;
+function current() {
+  try {
+    const { mtimeMs, size } = statSync(READ_FROM);
+    if (cache === undefined || cache.mtimeMs !== mtimeMs || cache.size !== size) {
+      const raw = JSON.parse(readFileSync(READ_FROM, 'utf8'));
+      cache = { mtimeMs, size, resolved: resolveAll(descriptor, readBundle(raw)).resolved };
+    }
+    return cache.resolved;
+  } catch (error) {
+    // Mid-publish the file is briefly truncated, absent or half-written. The
+    // last good resolution is served across that window; with nothing read
+    // yet there is nothing to serve and the error is the answer.
+    if (cache === undefined) throw error;
+    return cache.resolved;
+  }
+}
+
+// A live view over the current resolution: property reads, \`in\` and key
+// enumeration all consult the file's mtime first.
+const resolved: Record<string, unknown> = new Proxy({}, {
+  get: (_, key) => current()[key as string],
+  has: (_, key) => key in current(),
+  ownKeys: () => Reflect.ownKeys(current()),
+  getOwnPropertyDescriptor: (_, key) => Object.getOwnPropertyDescriptor(current(), key),
+  // Sealing this view would leave it permanently broken: the empty target
+  // would become non-extensible and every later key enumeration would throw
+  // for reporting keys the target does not have. Refusing makes the freeze
+  // itself throw, which a caller can catch, and leaves the view working.
+  preventExtensions: () => false,
+});
+
+// stet register inserts: import { copy } from '@/lib/content'
+export const copy = createAccessor(descriptor, resolved);
+
+// The accessor is callable only — \`copy.some_key\` on it is undefined with
+// no error, so a template that reads copy by property reads this map.
+// String-shaped keys land here; number-, list- and record-shaped keys are
+// compile errors on this map — read them through the accessor's .get().
+export const copyMap = resolved as Record<StringKey, string>;
+`;
+
+  const REACT_FREE_JS_READ_PATH = `import { readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { createAccessor, readBundle, resolveAll } from '@getstet/stet';
+
+// The descriptor is READ, never imported: a JSON import needs an import
+// attribute under plain node, and a host with no bundler supplies none.
+const descriptor = JSON.parse(readFileSync(join(process.cwd(), 'content/descriptor.json'), 'utf8'));
+
+// The committed bundle (or the snapshot, snapshot-only), read at request
+// time so a published change is served without a rebuild. Re-read when the
+// file changes, so a running dev server serves an edit on the next request.
+const READ_FROM = join(process.cwd(), 'content/defaults.json');
+let cache;
+function current() {
+  try {
+    const { mtimeMs, size } = statSync(READ_FROM);
+    if (cache === undefined || cache.mtimeMs !== mtimeMs || cache.size !== size) {
+      const raw = JSON.parse(readFileSync(READ_FROM, 'utf8'));
+      cache = { mtimeMs, size, resolved: resolveAll(descriptor, readBundle(raw)).resolved };
+    }
+    return cache.resolved;
+  } catch (error) {
+    // Mid-publish the file is briefly truncated, absent or half-written. The
+    // last good resolution is served across that window; with nothing read
+    // yet there is nothing to serve and the error is the answer.
+    if (cache === undefined) throw error;
+    return cache.resolved;
+  }
+}
+
+// A live view over the current resolution: property reads, \`in\` and key
+// enumeration all consult the file's mtime first.
+const resolved = new Proxy({}, {
+  get: (_, key) => current()[key],
+  has: (_, key) => key in current(),
+  ownKeys: () => Reflect.ownKeys(current()),
+  getOwnPropertyDescriptor: (_, key) => Object.getOwnPropertyDescriptor(current(), key),
+  // Sealing this view would leave it permanently broken: the empty target
+  // would become non-extensible and every later key enumeration would throw
+  // for reporting keys the target does not have. Refusing makes the freeze
+  // itself throw, which a caller can catch, and leaves the view working.
+  preventExtensions: () => false,
+});
+
+// stet register inserts: import { copy } from '@/lib/content'
+export const copy = createAccessor(descriptor, resolved);
+
+// The accessor is callable only — \`copy.some_key\` on it is undefined with
+// no error, so a template that reads copy by property reads this map.
+export const copyMap = resolved;
 `;
 
   it('a host declaring react gets the @getstet/stet/react module, byte for byte', async () => {
@@ -480,6 +619,7 @@ export const copy = createServerCopy(descriptor, resolved);
     await runInit(['--yes'], makeIo(dir));
 
     const readPath = readFileSync(join(dir, 'lib/content.ts'), 'utf8');
+    expect(readFileSync(join(dir, 'lib/content.ts'))).toEqual(Buffer.from(REACT_FREE_TS_READ_PATH, 'utf8'));
     // Nothing under @getstet/stet/react: its index re-exports the provider, which
     // imports the optional react peer this host does not have.
     expect(readPath).not.toContain('@getstet/stet/react');
@@ -518,6 +658,124 @@ export const copy = createServerCopy(descriptor, resolved);
     // Why the map is exported at all: the accessor is callable-only, so
     // `{copy.hero_headline}` in a template renders nothing and says nothing.
     expect(seen.prop).toBe('undefined');
+  });
+
+  /**
+   * The per-request read (journey B19). A running dev server holds the module
+   * in its cache, so a snapshot edit is only served if the module itself
+   * re-resolves — and it must NOT re-read a file that has not moved, or every
+   * property access would parse the snapshot again.
+   *
+   * The whole walk runs in ONE child process, because a fresh process always
+   * resolves the current bytes: the control read only means anything inside the
+   * process that already resolved once. The stamp is pinned to a whole second
+   * on both sides — a sub-second `mtimeMs` does not round-trip through
+   * `utimesSync` on APFS, and the control would miss for a reason that has
+   * nothing to do with the mechanism. The edit is an in-place TEXT replacement
+   * of the same byte length: a re-serialisation would move the file's size,
+   * which is the other half of the cache key.
+   */
+  it('serves a snapshot edit on the next request with nothing touched (journey B19)', async () => {
+    ensureBuilt();
+    const dir = project({ react: false, type: 'module' });
+    await runInit(['--yes'], makeIo(dir));
+    // One key declared with no value anywhere — the `has` trap's own case.
+    const declared = JSON.parse(readFileSync(join(dir, 'content/descriptor.json'), 'utf8')) as {
+      keys: Record<string, unknown>;
+    };
+    declared.keys['declared_but_absent'] = { shape: 'text', target: 'web' };
+    write(dir, 'content/descriptor.json', `${JSON.stringify(declared, null, 2)}\n`);
+    symlinkSync(WORKSPACE_MODULES, join(dir, 'node_modules'), 'dir');
+
+    const probe = execFileSync(
+      process.execPath,
+      [
+        '--experimental-strip-types',
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        [
+          "const { readFileSync, writeFileSync, unlinkSync, utimesSync } = await import('node:fs');",
+          "const file = 'content/defaults.json';",
+          'const T = Math.floor(Date.now() / 1000) - 10;',
+          'utimesSync(file, T, T);',
+          "const m = await import('./lib/content.ts');",
+          "const one = m.copy('hero_headline');",
+          // Same byte length, same key order, same indentation: only the value's
+          // characters change, so `size` cannot move.
+          "const text = readFileSync(file, 'utf8');",
+          "const next = text.replace(JSON.stringify(one), JSON.stringify(one.replace(/./g, 'X')));",
+          "writeFileSync(file, next, 'utf8');",
+          'utimesSync(file, T, T);',
+          "const two = m.copy('hero_headline');",
+          'const now = Date.now() / 1000;',
+          'utimesSync(file, now, now);',
+          "const three = m.copy('hero_headline');",
+          'let undeclared = null;',
+          "try { m.copy('not_a_key'); } catch (error) { undeclared = error.message; }",
+          // A key the descriptor DECLARES with no value anywhere. This is the
+          // one the `has` trap answers: the accessor asks `key in resolved`,
+          // and a trap that said yes would hand back `undefined` in place of
+          // the refusal the contract promises.
+          'let unresolved = null;',
+          "try { m.copy.get('declared_but_absent'); } catch (error) { unresolved = error.message; }",
+          // A host that freezes what it exports must get a refusal it can
+          // catch, not a view that throws on every later key enumeration.
+          'let froze = null;',
+          'try { Object.freeze(m.copyMap); } catch (error) { froze = error.constructor.name; }',
+          'let keysAfterFreeze = null;',
+          'try { keysAfterFreeze = Object.keys(m.copyMap).length; }',
+          'catch (error) { keysAfterFreeze = error.message; }',
+          'let afterFreeze = null;',
+          "try { afterFreeze = m.copy('hero_headline'); } catch (error) { afterFreeze = error.message; }",
+          // A publish truncates the file and writes it again. Across that
+          // window the last good resolution is what the page gets.
+          "const good = readFileSync(file, 'utf8');",
+          "writeFileSync(file, good.slice(0, Math.floor(good.length / 2)), 'utf8');",
+          'let truncated = null;',
+          "try { truncated = m.copy('hero_headline'); }",
+          "catch (error) { truncated = 'threw: ' + error.message; }",
+          'unlinkSync(file);',
+          'let absent = null;',
+          "try { absent = m.copy('hero_headline'); } catch (error) { absent = 'threw: ' + error.message; }",
+          "writeFileSync(file, good.replace(JSON.stringify(three), JSON.stringify('Restored headline')), 'utf8');",
+          "const restored = m.copy('hero_headline');",
+          'process.stdout.write(JSON.stringify({ one, two, three, undeclared, unresolved,',
+          ' froze, keysAfterFreeze, afterFreeze, truncated, absent, restored }));',
+        ].join(''),
+      ],
+      { cwd: dir, encoding: 'utf8' },
+    );
+    const seen = JSON.parse(probe) as {
+      one: string;
+      two: string;
+      three: string;
+      undeclared: string | null;
+      unresolved: string | null;
+      froze: string | null;
+      keysAfterFreeze: number | string;
+      afterFreeze: string;
+      truncated: string;
+      absent: string;
+      restored: string;
+    };
+    expect(seen.one).toBe('Your headline goes here');
+    // The stamp and the size are unmoved, so the resolution already in hand is
+    // the one served — the bytes underneath it are not read again.
+    expect(seen.two).toBe(seen.one);
+    // The stamp moves, so the next read re-resolves.
+    expect(seen.three).toBe('XXXXXXXXXXXXXXXXXXXXXXX');
+    // Both halves of the accessor's absent-key contract survive the proxy.
+    expect(seen.undeclared).toContain('not a key in this descriptor');
+    expect(seen.unresolved).toContain('declared but absent from the resolved map');
+    // The freeze is refused where the caller can see it, and the view survives.
+    expect(seen.froze).toBe('TypeError');
+    expect(seen.keysAfterFreeze).toBeGreaterThan(0);
+    expect(seen.afterFreeze).toBe(seen.three);
+    // Half a file and no file at all both serve the last good resolution.
+    expect(seen.truncated).toBe(seen.three);
+    expect(seen.absent).toBe(seen.three);
+    expect(seen.restored).toBe('Restored headline');
   });
 
   it('mounts no provider on a react-less host, on the TS and the JS layout shape alike', async () => {
@@ -611,6 +869,7 @@ export const copy = createServerCopy(descriptor, resolved);
     write(dir, 'app/layout.js', JS_LAYOUT);
     await runInit([], makeIo(dir));
     const readPath = readFileSync(join(dir, 'lib/content.js'), 'utf8');
+    expect(readFileSync(join(dir, 'lib/content.js'))).toEqual(Buffer.from(REACT_FREE_JS_READ_PATH, 'utf8'));
     expect(readPath).toContain("import { createAccessor, readBundle, resolveAll } from '@getstet/stet';");
     expect(readPath).toContain('export const copyMap = resolved;');
     for (const ts of ['type Descriptor', 'StringKey', ': unknown', ' as Descriptor', 'Record<']) {

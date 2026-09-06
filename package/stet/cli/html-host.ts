@@ -904,16 +904,11 @@ function attrCandidates(document: Document): AttrCandidate[] {
  * Every document's proposals, claimed marks and skips.
  *
  * The caller lists the files (each does so with `filesForGlobs` over its own
- * managed surfaces), and this reads each once. The descriptor and snapshot are
- * the forms the caller holds; the walk itself consults neither, because a
- * document's marks are the only read it makes.
+ * managed surfaces), and this reads each once. It takes no descriptor and no
+ * snapshot: a document's marks are the only read the walk makes, so the forms
+ * the caller holds have nothing to contribute.
  */
-export function proposeHtml(
-  cwd: string,
-  files: string[],
-  _descriptor: Descriptor,
-  _snapshot: Snapshot,
-): HtmlProposalSet {
+export function proposeHtml(cwd: string, files: string[]): HtmlProposalSet {
   const proposals: HtmlProposal[] = [];
   const claimed: HtmlMark[] = [];
   const skips: HtmlSkip[] = [];
@@ -1450,7 +1445,7 @@ export function planDocuments(
   snapshot: Snapshot,
   report: Report,
 ): { writes: Array<{ abs: string; text: string; rel: string }>; skips: HtmlSkip[] } {
-  const set = proposeHtml(cwd, files, descriptor, snapshot);
+  const set = proposeHtml(cwd, files);
   const skips = set.skips.filter((s) => s.scope === 'mark');
   const writes: Array<{ abs: string; text: string; rel: string }> = [];
   const values = snapshot['default'] ?? {};
@@ -1533,7 +1528,7 @@ export function planHtmlRegister(input: {
   report: Report;
 }): HtmlRegisterPlan {
   const { cwd, files, descriptor, snapshot, report } = input;
-  const set = proposeHtml(cwd, files, descriptor, snapshot);
+  const set = proposeHtml(cwd, files);
   const byValue = new Map<string, string>();
   for (const key of Object.keys(snapshot['default'] ?? {}).sort()) {
     // `Object.hasOwn`, not a bare index: the name comes from the SNAPSHOT's own
@@ -1633,7 +1628,7 @@ export function checkDocuments(
   snapshot: Snapshot,
   report: Report,
 ): void {
-  const set = proposeHtml(cwd, files, descriptor, snapshot);
+  const set = proposeHtml(cwd, files);
   const values = snapshot['default'] ?? {};
   const states: Record<string, { marks: number; status: string }> = {};
   const carried = new Set<string>();
@@ -1652,6 +1647,7 @@ export function checkDocuments(
           'config',
           `${document.file}:${mark.line} data-stet="${mark.key}" names no descriptor key — run stet register, or remove the mark`,
           mark.key,
+          { at: { file: document.file, line: mark.line } },
         );
         clean = false;
         continue;
@@ -1681,6 +1677,7 @@ export function checkDocuments(
         `${document.file}:${mark.line} ${mark.key} differs from the snapshot — run stet pull to apply the snapshot, ` +
           "or edit the snapshot to keep the page's text",
         mark.key,
+        { at: { file: document.file, line: mark.line } },
       );
       clean = false;
     }

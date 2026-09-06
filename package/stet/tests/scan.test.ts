@@ -1691,3 +1691,79 @@ describe('runScan — the static-HTML host', () => {
     expect(cap.out.join('\n')).toContain('scan: 1 file, 1 unkeyed literal');
   });
 });
+
+/**
+ * The structured fields a finding carries beside its message: where it sits,
+ * and — on the unread-slot warn — which template slot it is about. The local
+ * dashboard badges a file and a slot from these rather than by parsing the
+ * sentence, and the human channel is unmoved by their arrival.
+ */
+describe('runScan --json — findings carry their location and slot as structure', () => {
+  it('gives the JSX warn the line and column its own message names', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', COMPONENT('<h1>Your week, sorted</h1>'));
+    const cap = io(dir);
+    expect(await runScan(['--json'], cap)).toBe(0);
+    const payload = JSON.parse(cap.out[cap.out.length - 1] as string) as {
+      findings: Array<{ message: string; at?: { file: string; line?: number; col?: number } }>;
+    };
+    const unkeyed = payload.findings.find((f) => f.message.includes('unkeyed copy'));
+    expect(unkeyed?.at?.file).toBe('app/page.tsx');
+    // The numbers in the message and the numbers in the structure are one pair.
+    const [, line, col] = /app\/page\.tsx:(\d+):(\d+)/.exec(unkeyed?.message ?? '') ?? [];
+    expect(unkeyed?.at?.line).toBe(Number(line));
+    expect(unkeyed?.at?.col).toBe(Number(col));
+  });
+
+  it('gives the unread-slot warn its template, its slot and its file', async () => {
+    const dir = project({
+      managedSurfaces: ['lib/email/**/*.ts'],
+      emailSurfaces: ['lib/email/**/*.ts'],
+    });
+    write(
+      dir,
+      'content/descriptor.json',
+      JSON.stringify({
+        version: 1,
+        keys: {},
+        templates: {
+          welcome: {
+            class: 'transactional',
+            trigger: 'manual',
+            slots: ['headline'],
+            render: { file: 'lib/email/welcome.ts', export: 'welcome', sampleProps: {} },
+          },
+        },
+      }),
+    );
+    write(dir, 'lib/email/welcome.ts', 'export function welcome(): string {\n  return "<h1>hi</h1>";\n}\n');
+    const cap = io(dir);
+    expect(await runScan(['--json'], cap)).toBe(0);
+    const payload = JSON.parse(cap.out[cap.out.length - 1] as string) as {
+      findings: Array<{
+        message: string;
+        at?: { file: string };
+        slot?: { template: string; name: string };
+      }>;
+    };
+    const unread = payload.findings.find((f) => f.message.includes('is declared as a slot'));
+    expect(unread?.slot).toEqual({ template: 'welcome', name: 'headline' });
+    expect(unread?.at).toEqual({ file: 'lib/email/welcome.ts' });
+  });
+
+  it('gives the dialect and route warns a file, and a locationless warn nothing', async () => {
+    const dir = project({ router: 'astro', managedSurfaces: ['src/**/*.astro', 'app/**/*.tsx'] });
+    write(dir, 'src/pages/index.astro', '<h1>A dialect label</h1>\n');
+    const cap = io(dir);
+    expect(await runScan(['--json'], cap)).toBe(0);
+    const payload = JSON.parse(cap.out[cap.out.length - 1] as string) as {
+      findings: Array<{ message: string; at?: { file: string; line?: number } }>;
+    };
+    const dialect = payload.findings.find((f) => f.message.includes('A dialect label'));
+    expect(dialect?.at).toEqual({ file: 'src/pages/index.astro', line: 1 });
+    // The dead-glob warn points at no file, so it grows no `at` at all.
+    const dead = payload.findings.find((f) => f.message.startsWith('glob matched no files'));
+    expect(dead).toBeDefined();
+    expect(dead !== undefined && 'at' in dead).toBe(false);
+  });
+});

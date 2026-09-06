@@ -17,6 +17,7 @@ import type { StoreAdapter } from '../src/store.js';
 import { runAgentsInstall } from './agents.js';
 import { runAudit } from './audit.js';
 import { runCheck } from './check.js';
+import { runDev } from './dev.js';
 import { runDoctor } from './doctor.js';
 import { runEject } from './eject.js';
 import { runEmailExtract } from './email-extract.js';
@@ -175,6 +176,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return await runDoctor(rest, io);
       case 'upgrade':
         return await runUpgrade(rest, io);
+      case 'dev':
+        return await runDev(rest, io);
       default:
         io.stderr(`unknown command: ${command}`);
         io.stderr(usage());
@@ -231,7 +234,10 @@ export function usage(): string {
     '  doctor [--report] [--url U --key K]      mode, health, and what is serving production',
     '  upgrade [--store A] [--dry-run] [--verify]   migrations, the registry, the version stamp',
     '',
-    'Options: --json on check, seo check, pages scan, list, get, audit, doctor and both email commands.',
+    'Dashboard:',
+    '  dev [--port N] [--no-open] [--add PATH]   the local dashboard on 127.0.0.1:4400 over your workspace of checkouts',
+    '',
+    'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor and both email commands.',
     '  --env <name>             the environments-map connection to run against; check and seo check take none',
     '',
     'Global flags:',

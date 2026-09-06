@@ -13,8 +13,9 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
 import { makeHtmlHost } from '../conformance/cli-host.js';
-import { refuseDanglingReferences } from '../cli/remove.js';
-import { CliError } from '../cli/report.js';
+import { loadConfig } from '../cli/config.js';
+import { planRemoval, refuseDanglingReferences } from '../cli/remove.js';
+import { CliError, Report } from '../cli/report.js';
 import {
   cleanupCliHosts,
   countingStore as counting,
@@ -739,6 +740,23 @@ describe('remove — the static-HTML host', () => {
     expect(await scripted.run('remove', 'how_it_works')).toBe(0);
     expect(scripted.stdout()).toContain(
       'index.html mentions "how_it_works" — un-wire the read first, or the regenerated types surface it',
+    );
+  });
+});
+
+/**
+ * The planner, called on its own. The local dashboard's Remove control shows
+ * the terminal's plan rather than a second rendering of it, so the refusal it
+ * inherits has to be the terminal's refusal too.
+ */
+describe('planRemoval — the plan half, split out', () => {
+  it('throws the same CliError message runRemove prints for an unknown key', () => {
+    const host = makeHost();
+    const config = loadConfig(host.cwd);
+    const descriptor = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
+    const snapshot = loadSnapshot(JSON.parse(host.file('content/defaults.json')));
+    expect(() => planRemoval(host.cwd, config, descriptor, snapshot, ['nope'], new Report())).toThrow(
+      new CliError('"nope" is not a key in content/descriptor.json'),
     );
   });
 });

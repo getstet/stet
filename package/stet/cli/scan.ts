@@ -23,7 +23,7 @@ import { filesForGlobs } from './files.js';
 import { proposeHtml } from './html-host.js';
 import type { CliIo } from './main.js';
 import { detectPagesRoots, proposePages } from './pages.js';
-import { CliError, clip, lineCol, posixRelative, Report } from './report.js';
+import { CliError, clip, lineCol, plural, posixRelative, Report } from './report.js';
 import {
   dialectOf,
   isJsxFile,
@@ -203,7 +203,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   // The forms are handed in EMPTY: the locator's only read is the document's
   // own marks, so scan's raw descriptor and snapshot — which it deliberately
   // never validates — have nothing to contribute and are not converted here.
-  const html = isHtmlHost(config) ? proposeHtml(io.cwd, files, { version: 1, keys: {} }, {}) : null;
+  const html = isHtmlHost(config) ? proposeHtml(io.cwd, files) : null;
 
   let refused = 0;
   for (const file of files) {
@@ -231,12 +231,19 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
           'scan',
           `${file}:${proposal.line} possible copy ${JSON.stringify(clip(proposal.value, LITERAL_EXCERPT))}${suffix} — ` +
             `propose key ${proposal.proposedKey}`,
+          undefined,
+          { at: { file, line: proposal.line } },
         );
         warned += 1;
       }
       // A skip is text stet could not adopt, so it counts as unkeyed too.
       for (const skip of html.skips.filter((s) => s.file === file)) {
-        report.warn('scan', `${file}:${skip.line} skipped (${skip.reason}) — ${skip.detail}; ${skip.remedy}`);
+        report.warn(
+          'scan',
+          `${file}:${skip.line} skipped (${skip.reason}) — ${skip.detail}; ${skip.remedy}`,
+          undefined,
+          { at: { file, line: skip.line } },
+        );
         warned += 1;
       }
       continue;
@@ -247,7 +254,12 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
         const { line } = lineCol(source, found.pos);
         // No proposed key: nothing text-level can tell an attribute from
         // content, and a guessed key poisons the registry register would trust.
-        report.warn('scan', `${file}:${line} possible copy ${JSON.stringify(clip(found.text, LITERAL_EXCERPT))}`);
+        report.warn(
+          'scan',
+          `${file}:${line} possible copy ${JSON.stringify(clip(found.text, LITERAL_EXCERPT))}`,
+          undefined,
+          { at: { file, line } },
+        );
         warned += 1;
       }
       continue;
@@ -285,6 +297,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
           'scan',
           `${file}:${line}:${col} unkeyed copy ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))} — propose key ${literal.proposedKey}`,
           literal.proposedKey,
+          { at: { file, line, col } },
         );
         warned += 1;
       }
@@ -415,8 +428,8 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   }
 
   report.line(
-    `scan: ${files.length} ${files.length === 1 ? 'file' : 'files'}, ` +
-      `${warned} unkeyed ${warned === 1 ? 'literal' : 'literals'}`,
+    `scan: ${plural(files.length, 'file')}, ` +
+      `${plural(warned, 'unkeyed literal')}`,
   );
   report.data('scan', { files: files.length, warned });
   // `fail` severity promotes the warnings to errors (exit 1); `warn` keeps exit 0.
@@ -485,6 +498,7 @@ async function unrenderedSlots(
         `${file}: ${key} is declared as a slot of ${name}, and the file that renders it never reads the value — ` +
           'an editor can still change this copy in the dashboard, and the change will not reach the send',
         key,
+        { at: { file }, slot: { template: name, name: slot } },
       );
     }
   }
@@ -548,7 +562,12 @@ function uncoveredRoutes(
     { config },
   );
   for (const proposal of set.proposals) {
-    report.warn('scan', `route ${proposal.route} (${proposal.file}) has no page record — run stet pages scan`);
+    report.warn(
+      'scan',
+      `route ${proposal.route} (${proposal.file}) has no page record — run stet pages scan`,
+      undefined,
+      { at: { file: proposal.file } },
+    );
   }
 }
 

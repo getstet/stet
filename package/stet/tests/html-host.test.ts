@@ -48,10 +48,10 @@ afterAll(() => {
 function readSource(source: string) {
   const dir = tempDir();
   writeFileSync(join(dir, 'x.html'), source);
-  return proposeHtml(dir, ['x.html'], EMPTY_DESCRIPTOR, {});
+  return proposeHtml(dir, ['x.html']);
 }
 
-const fixture = (name: string) => proposeHtml(FIXTURES, [name], EMPTY_DESCRIPTOR, {});
+const fixture = (name: string) => proposeHtml(FIXTURES, [name]);
 
 describe('cli/html-host.ts is a leaf', () => {
   it('imports nothing from artifacts, check, scan, pages or config', () => {
@@ -678,7 +678,7 @@ describe('the stage-5 fold — whitespace, marks and unknown keys', () => {
     const page = `<html><body><p data-stet="k">1 000 members</p></body></html>\n`;
     const dir = tempDir();
     writeFileSync(join(dir, 'x.html'), page, 'utf8');
-    const set = proposeHtml(dir, ['x.html'], EMPTY_DESCRIPTOR, {});
+    const set = proposeHtml(dir, ['x.html']);
     expect(set.claimed[0]?.value).toBe('1 000 members');
 
     const descriptor = { version: 1, keys: { k: { shape: 'text', target: 'web' } } } as unknown as Descriptor;
@@ -776,7 +776,7 @@ describe('the stage-5 fold — whitespace, marks and unknown keys', () => {
     const dir = tempDir();
     writeFileSync(join(dir, 'x.html'), `<html><body>\n${body}\n</body></html>\n`, 'utf8');
     const started = Date.now();
-    const set = proposeHtml(dir, ['x.html'], EMPTY_DESCRIPTOR, {});
+    const set = proposeHtml(dir, ['x.html']);
     const elapsed = Date.now() - started;
     expect(set.claimed).toHaveLength(5000);
     expect(readFileSync(join(dir, 'x.html')).byteLength).toBeGreaterThan(2_000_000);
@@ -829,7 +829,7 @@ describe('the delta fold — <pre> keeps its own whitespace', () => {
   it('refuses a mark on a <pre> and leaves the block untouched', () => {
     const dir = tempDir();
     writeFileSync(join(dir, 'x.html'), THREE_LINE, 'utf8');
-    const set = proposeHtml(dir, ['x.html'], EMPTY_DESCRIPTOR, {});
+    const set = proposeHtml(dir, ['x.html']);
     expect(set.claimed).toEqual([]);
     expect(set.skips.map((s) => `${s.detail} | ${s.remedy}`)).toContain(
       'data-stet="k" sits on <pre>, whose whitespace stet does not manage | mark the elements around it instead',
@@ -845,7 +845,7 @@ describe('the delta fold — <pre> keeps its own whitespace', () => {
     const page = '<html><body><div data-stet="k">Read this first:<pre>  a\n  b</pre></div></body></html>\n';
     const dir = tempDir();
     writeFileSync(join(dir, 'x.html'), page, 'utf8');
-    const set = proposeHtml(dir, ['x.html'], EMPTY_DESCRIPTOR, {});
+    const set = proposeHtml(dir, ['x.html']);
     expect(set.claimed[0]?.value).toBe('Read this first:<1/>');
     const descriptor = { version: 1, keys: { k: { shape: 'text', target: 'web', tags: 1 } } } as unknown as Descriptor;
     const plan = planDocuments(dir, ['x.html'], descriptor, { default: { k: 'Read this first:<1/>' } }, new Report());
@@ -866,7 +866,7 @@ describe('the delta fold — the trim matches the collapse', () => {
     const dir = tempDir();
     writeFileSync(join(dir, 'x.html'), `<html><body><p data-stet="k">${value}</p></body></html>\n`, 'utf8');
     const descriptor = { version: 1, keys: { k: { shape: 'text', target: 'web' } } } as unknown as Descriptor;
-    const set = proposeHtml(dir, ['x.html'], EMPTY_DESCRIPTOR, {});
+    const set = proposeHtml(dir, ['x.html']);
     expect(set.claimed[0]?.value).toBe(value);
     // `.trim()` strips U+00A0, which would lose at the edge exactly what the
     // collapse is careful to keep in the middle.
@@ -886,7 +886,7 @@ describe('the delta fold — a page too deep for the argument limit', () => {
       'utf8',
     );
     const started = Date.now();
-    const set = proposeHtml(dir, ['x.html'], EMPTY_DESCRIPTOR, {});
+    const set = proposeHtml(dir, ['x.html']);
     const elapsed = Date.now() - started;
     // The spread form threw `RangeError: Maximum call stack size exceeded`
     // (too many arguments) near 40,000 under one parent.

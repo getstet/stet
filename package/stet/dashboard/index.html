@@ -1,0 +1,1462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>stet dashboard</title>
+<style nonce="__STET_NONCE__">
+:root{--bg:0 0% 100%;--fg:222 84% 5%;--card:0 0% 100%;--muted:210 40% 96%;--mf:215 16% 47%;
+ --pri:222 47% 11%;--pf:210 40% 98%;--sec:210 40% 96%;--bd:214 32% 91%;--dest:0 84% 60%;--r:.5rem;
+ --sb:0 0% 98%;--sba:240 5% 96%;--sbd:220 13% 91%;--am:38 92% 50%;--gr:142 71% 40%;--bl:217 91% 60%;--vi:262 83% 58%}
+[data-theme="dark"]{--bg:222 84% 5%;--fg:210 40% 98%;--card:222 84% 5%;--muted:217 33% 18%;--mf:215 20% 65%;
+ --pri:210 40% 98%;--pf:222 47% 11%;--sec:217 33% 18%;--bd:217 33% 18%;--dest:0 63% 31%;
+ --sb:240 6% 10%;--sba:240 4% 16%;--sbd:240 4% 16%;--am:48 96% 53%;--gr:142 69% 58%;--bl:213 94% 68%;--vi:263 90% 71%}
+*{box-sizing:border-box}
+body{margin:0;background:hsl(var(--bg));color:hsl(var(--fg));font:13px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif}
+.shell{display:grid;grid-template-columns:200px 1fr;min-height:100vh}
+.side{background:hsl(var(--sb));border-right:1px solid hsl(var(--sbd));padding:12px 9px}
+.brand{display:flex;gap:8px;align-items:center;padding:5px 7px 4px}
+.brand .m{width:26px;height:26px;border-radius:6px;background:hsl(var(--pri));color:hsl(var(--pf));display:grid;place-items:center;font-weight:700;font-size:13px}
+.brand b{font-size:14px;letter-spacing:-.01em}
+.edsub{font-size:10px;color:hsl(var(--mf));padding:0 7px 10px;font-family:ui-monospace,Menlo,monospace}
+.lbl{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:hsl(var(--mf));padding:10px 7px 4px}
+.it{display:block;width:100%;text-align:left;font:inherit;background:transparent;border:1px solid transparent;border-radius:6px;
+ padding:6px 8px;cursor:pointer;color:inherit;margin-bottom:2px;font-size:12.5px;position:relative}
+.it:hover{background:hsl(var(--sba))}.it.on{background:hsl(var(--sba));font-weight:600}
+.it .u{display:block;font-size:10.5px;color:hsl(var(--mf));font-family:ui-monospace,Menlo,monospace;font-weight:400}
+.it .n{position:absolute;right:7px;top:6px;background:hsl(var(--am));color:#000;border-radius:999px;font-size:10px;font-weight:700;padding:0 5px}
+.side .sep{border-top:1px solid hsl(var(--sbd));margin:11px 3px 0}
+.scoped{font-size:10px;color:hsl(var(--mf));padding:2px 7px 9px;font-style:italic}
+.hdr{height:46px;border-bottom:1px solid hsl(var(--bd));display:flex;align-items:center;justify-content:space-between;padding:0 16px}
+.who{display:flex;gap:7px;align-items:center;font-size:12px}
+.av{width:22px;height:22px;border-radius:50%;background:hsl(var(--vi));color:#fff;display:grid;place-items:center;font-size:10px;font-weight:700}
+.tabs{display:flex;gap:1px;border-bottom:1px solid hsl(var(--bd));padding:0 16px;overflow-x:auto}
+.tabs button{font:inherit;font-size:13px;padding:9px 13px;border:0;background:transparent;color:hsl(var(--mf));cursor:pointer;
+ border-bottom:2px solid transparent;white-space:nowrap;margin-bottom:-1px}
+.tabs button:hover{color:hsl(var(--fg))}
+.tabs button.on{color:hsl(var(--fg));font-weight:600;border-bottom-color:hsl(var(--pri))}
+.wrap{padding:14px 16px 60px}
+.card{border:1px solid hsl(var(--bd));border-radius:var(--r);background:hsl(var(--card));margin-bottom:12px}
+.ch{padding:9px 12px;border-bottom:1px solid hsl(var(--bd));display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.ch h3{margin:0;font-size:12px;font-weight:600}
+.cb{padding:12px}
+.btn{font:inherit;font-size:12px;padding:5px 11px;border-radius:6px;border:1px solid hsl(var(--bd));background:hsl(var(--bg));color:inherit;cursor:pointer}
+.btn:hover:not(:disabled){background:hsl(var(--muted))}
+.btn.pri{background:hsl(var(--pri));color:hsl(var(--pf));border-color:hsl(var(--pri))}
+.btn.vio{background:hsl(var(--vi));color:#fff;border-color:hsl(var(--vi))}
+.btn.dg{color:hsl(var(--dest));border-color:hsl(var(--dest))}
+.btn.sm{padding:3px 8px;font-size:11.5px}.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.dgo{border-color:hsl(var(--am));color:hsl(var(--am));font-weight:600}
+.tg{display:inline-flex;border:1px solid hsl(var(--bd));border-radius:6px;overflow:hidden}
+.tg button{font:inherit;font-size:12px;padding:4px 11px;border:0;border-right:1px solid hsl(var(--bd));background:transparent;color:inherit;cursor:pointer}
+.tg button:last-child{border-right:0}.tg button.on{background:hsl(var(--sec));font-weight:600}
+.in{width:100%;font:inherit;font-size:12.5px;padding:6px 9px;border:1px solid hsl(var(--bd));border-radius:6px;background:hsl(var(--bg));color:inherit}
+.in.sm{padding:4px 7px;font-size:11.5px}
+textarea.in{resize:vertical;line-height:1.6}
+.bdg{font-size:10.5px;padding:1px 6px;border-radius:999px;border:1px solid hsl(var(--bd));color:hsl(var(--mf));white-space:nowrap}
+.bdg.d{border-color:hsl(var(--am));color:hsl(var(--am));font-weight:600}
+.bdg.g{border-color:hsl(var(--gr));color:hsl(var(--gr))}
+.bdg.b{border-color:hsl(var(--bl));color:hsl(var(--bl))}
+.bdg.v{border-color:hsl(var(--vi));color:hsl(var(--vi))}
+.bdg.r{border-color:hsl(var(--dest));color:hsl(var(--dest))}
+.mono{font-family:ui-monospace,Menlo,monospace}.muted{color:hsl(var(--mf))}
+.panes{display:grid;grid-template-columns:200px 226px minmax(0,1fr);gap:11px;align-items:start}
+@media(max-width:1180px){.panes{grid-template-columns:1fr}}
+.cpanes{display:grid;grid-template-columns:300px minmax(0,1fr);gap:11px;align-items:start}
+@media(max-width:900px){.cpanes{grid-template-columns:1fr}}
+.scroll{max-height:430px;overflow:auto}
+.gh{display:flex;align-items:center;gap:5px;width:100%;text-align:left;font:inherit;background:hsl(var(--card));border:0;cursor:pointer;
+ color:hsl(var(--mf));font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:9px 12px 3px;position:sticky;top:0}
+.gh:hover{color:hsl(var(--fg))}.gh .c{width:9px;font-size:9px}
+.row{display:block;width:100%;text-align:left;font:inherit;background:transparent;border:0;border-left:2px solid transparent;padding:5px 12px;cursor:pointer;color:inherit}
+.row:hover{background:hsl(var(--muted))}.row.on{background:hsl(var(--muted));border-left-color:hsl(var(--pri))}
+.row .t{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.row .t b{font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .t .k{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .s{font-size:10.5px;color:hsl(var(--mf));display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dot{width:6px;height:6px;border-radius:50%;background:hsl(var(--am));flex:none}
+.note{font-size:11.5px;color:hsl(var(--mf));border-left:2px solid hsl(var(--bd));padding-left:9px;margin:10px 0 0}
+.bar{display:flex;gap:8px;align-items:center;padding:10px 12px;border-top:1px solid hsl(var(--bd));flex-wrap:wrap}
+.cnt{font-size:11px;color:hsl(var(--mf))}.cnt.bad{color:hsl(var(--dest));font-weight:600}
+.err{font-size:11.5px;color:hsl(var(--dest));margin-top:6px;font-weight:500}
+.inf{font-size:11.5px;color:hsl(var(--bl));margin-top:6px}
+.term{background:hsl(var(--muted));border-radius:var(--r);padding:13px;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.65;white-space:pre-wrap;overflow-x:auto}
+.term .pl{color:hsl(var(--gr))}.term .mn{color:hsl(var(--dest))}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;font-weight:600;font-size:11px;color:hsl(var(--mf));padding:6px 11px;border-bottom:1px solid hsl(var(--bd))}
+td{padding:6px 11px;border-bottom:1px solid hsl(var(--bd));vertical-align:top}tr:last-child td{border-bottom:0}
+.art{max-width:620px;font-size:13.5px;line-height:1.7}
+.art h1{font-size:24px;margin:0 0 6px;line-height:1.2}.art h2{font-size:18px;margin:22px 0 7px}
+.art p{margin:0 0 12px}.art blockquote{margin:14px 0;padding:6px 0 6px 13px;border-left:3px solid hsl(var(--bd));color:hsl(var(--mf));font-style:italic}
+.art ul{margin:0 0 12px;padding-left:19px}.art code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:hsl(var(--muted));padding:1px 5px;border-radius:4px}
+.imgph{background:hsl(var(--muted));border-radius:7px;height:110px;display:grid;place-items:center;color:hsl(var(--mf));font-size:11.5px;margin:0 0 12px;max-width:100%}
+.work{display:grid;grid-template-columns:238px minmax(0,0.92fr) minmax(0,1fr);gap:11px;align-items:start}
+@media(max-width:1240px){.work{grid-template-columns:1fr}}
+.devwrap{overflow:hidden;position:relative}
+.dscale{transform-origin:top left;position:relative}
+.bguide{position:absolute;left:0;right:0;border-top:2px dashed hsl(0 65% 55%/.55);pointer-events:none;z-index:3}
+.bguide .bt{position:absolute;right:2px;top:-13px;font-size:9px;color:hsl(0 65% 55%)}
+.btn.amb{border-color:hsl(38 75% 45%);color:hsl(38 80% 38%);font-weight:700}
+[data-theme="dark"] .btn.amb{color:hsl(38 85% 62%)}
+.pg{border:1px solid hsl(var(--bd));border-radius:8px;overflow:hidden}
+.pg .cr{display:flex;gap:13px;padding:9px 16px;border-bottom:1px solid hsl(var(--bd));font-size:12px}
+.pg .bd{padding:28px 22px;text-align:center}
+.pg h1{font-size:clamp(20px,3vw,31px);line-height:1.13;margin:0 0 11px}
+.pg .ld{max-width:560px;margin:0 auto 16px;color:hsl(var(--mf));font-size:13px}
+.chg{outline:2px solid hsl(var(--am));outline-offset:2px;border-radius:4px}
+.ml{background:#e9f3ff;border:1px solid hsl(var(--bd));border-radius:6px;padding:14px;max-width:560px;color:#4b5563;font-size:12px}
+.ml .b{background:#fff;border-radius:4px;padding:14px;margin-top:9px}
+.ml h4{margin:0 0 9px;font-size:16px;font-weight:400;color:#111827}
+.tgm{background:#e7ebf0;border-radius:6px;padding:14px;max-width:420px}
+.tgm .bb{background:#fff;border-radius:10px 10px 10px 2px;padding:9px 11px;font-size:12.5px;color:#0f172a;white-space:pre-wrap}
+[data-theme="dark"] .tgm{background:#17212b}[data-theme="dark"] .tgm .bb{background:#212d3b;color:#e7eef7}
+.cmp{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+@media(max-width:760px){.cmp{grid-template-columns:1fr}}
+.cmp .col{border:1px solid hsl(var(--bd));border-radius:var(--r);padding:13px}
+.cmp .col.hl{border-color:hsl(var(--vi))}
+.cmp h4{margin:0 0 3px;font-size:13px}.cmp .p{font-size:11.5px;color:hsl(var(--mf));margin-bottom:9px}
+.cmp li{font-size:12px;margin-bottom:4px;list-style:none;padding-left:16px;position:relative}
+.cmp li:before{content:"✓";position:absolute;left:0;color:hsl(var(--gr))}
+.cmp li.no:before{content:"—";color:hsl(var(--mf))}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.stat{border:1px solid hsl(var(--bd));border-radius:var(--r);padding:11px 13px}
+.stat .n{font-size:21px;font-weight:600;letter-spacing:-.02em}.stat .l{font-size:11px;color:hsl(var(--mf))}
+.diff{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.7}
+.diff .m{background:hsl(var(--dest)/.13);text-decoration:line-through;padding:1px 3px;border-radius:3px}
+.diff .p{background:hsl(var(--gr)/.16);padding:1px 3px;border-radius:3px}
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:9px}
+.tile{border:1px solid hsl(var(--bd));border-radius:7px;overflow:hidden;cursor:pointer}
+.tile:hover{border-color:hsl(var(--vi))}
+.tile .th{height:74px;display:grid;place-items:center;font-size:22px}
+.tile .cap{padding:5px 7px;font-size:10.5px;border-top:1px solid hsl(var(--bd))}
+.tile .cap .mm{color:hsl(var(--mf));font-family:ui-monospace,Menlo,monospace;font-size:9.5px}
+.tl{border-left:2px solid hsl(var(--bd));margin-left:7px;padding-left:13px}
+.tl .e{position:relative;padding-bottom:11px;font-size:12px}
+.tl .e:before{content:"";position:absolute;left:-18px;top:5px;width:7px;height:7px;border-radius:50%;background:hsl(var(--bd))}
+.tl .e.v:before{background:hsl(var(--vi))}.tl .e.g:before{background:hsl(var(--gr))}.tl .e.a:before{background:hsl(var(--am))}
+.hint{font-size:11px;color:hsl(var(--mf));background:hsl(var(--muted));padding:8px 10px;border-radius:6px;margin-bottom:12px}
+.stripe{height:5px;background:hsl(var(--c))}
+.envchip{display:inline-flex;align-items:center;gap:8px;font:inherit;font-weight:700;font-size:12.5px;letter-spacing:.08em;
+ text-transform:uppercase;padding:5px 13px;border-radius:7px;border:2px solid hsl(var(--c));background:hsl(var(--c)/.12);
+ color:hsl(var(--c));cursor:pointer;font-family:ui-monospace,Menlo,monospace}
+.envchip:hover{background:hsl(var(--c)/.2)}
+.envchip .h{font-weight:400;font-size:11px;letter-spacing:0;text-transform:none;opacity:.85}
+.e-prod{--c:var(--dest)}.e-staging{--c:var(--bl)}.e-preview{--c:var(--am)}.e-local{--c:var(--mf)}
+.btn.env{background:hsl(var(--c));border-color:hsl(var(--c));color:#fff}
+.envwarn{font-size:11.5px;border-left:3px solid hsl(var(--c));padding:7px 10px;background:hsl(var(--c)/.07);border-radius:0 5px 5px 0;margin-bottom:11px}
+.step{display:grid;grid-template-columns:26px 1fr;gap:11px;margin-bottom:15px}
+.step .n{width:22px;height:22px;border-radius:50%;background:hsl(var(--pri));color:hsl(var(--pf));display:grid;place-items:center;font-size:11px;font-weight:700}
+.step h4{margin:2px 0 5px;font-size:13px}
+#tst{position:fixed;right:16px;bottom:16px;background:hsl(var(--pri));color:hsl(var(--pf));padding:9px 14px;border-radius:8px;
+ font-size:12.5px;opacity:0;transform:translateY(8px);transition:.18s;pointer-events:none;max-width:380px}
+#tst.show{opacity:1;transform:none}
+.notbuilt{opacity:.45;pointer-events:none;filter:grayscale(1)}
+/* `.btn:hover` outranks `.btn.pri` on specificity, which would put the
+   light label of a filled button on the light hover ground. */
+.btn.pri:hover:not(:disabled){background:hsl(var(--pri))}
+.btn.vio:hover:not(:disabled){background:hsl(var(--vi))}
+.btn.env:hover:not(:disabled){background:hsl(var(--c))}
+.reopen{max-width:520px;margin:80px auto;font-size:14px;line-height:1.6}
+.findings li{list-style:none;margin:0 0 5px;font-size:11.5px}
+.findings{margin:8px 0 0;padding:0}
+.paneframe{width:100%;height:460px;border:1px solid hsl(var(--bd));border-radius:7px;background:#fff}
+.lrow{display:flex;gap:6px;align-items:flex-start;margin-bottom:6px}
+.lrow textarea{flex:1}
+.lrow .ctl{display:flex;flex-direction:column;gap:3px}
+fieldset.rec{border:1px solid hsl(var(--bd));border-radius:7px;padding:9px 11px;margin:0}
+fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
+</style>
+</head>
+<body data-theme="light">
+<div class="shell" id="shell">
+  <aside class="side">
+    <div class="brand"><div class="m">s</div><b>stet</b></div>
+    <div class="edsub" id="edsub"></div>
+    <div class="lbl">Checkouts</div><div id="projs"></div>
+    <div style="padding:4px 3px 0">
+      <input class="in sm" id="addpath" placeholder="/absolute/path/to/checkout">
+      <button class="btn sm" style="margin-top:5px;width:100%" data-act="addSite">Add a checkout</button>
+      <div class="err" id="adderr" style="display:none"></div>
+    </div>
+    <div class="scoped" id="pjnote">from ~/.stet/projects.json — select one to edit</div>
+    <div class="sep"></div>
+    <div class="lbl">This machine</div>
+    <button class="it" id="n-Health" data-act="tab:Health">Health</button>
+    <button class="it" id="n-Setup" data-act="tab:Setup">Setup</button>
+  </aside>
+  <main>
+    <div class="stripe" id="stripe"></div>
+    <div class="hdr"><div style="display:flex;gap:12px;align-items:center">
+        <button class="envchip" id="envchip" data-act="cycleEnv"></button>
+        <div class="muted" id="crumb"></div></div>
+      <div style="display:flex;gap:10px;align-items:center"><span class="bdg d" id="dc"></span>
+        <button class="btn sm" data-act="theme">Theme</button></div></div>
+    <div class="tabs" id="tabs"></div>
+    <div class="wrap" id="main"></div>
+  </main>
+</div>
+<div id="tst"></div>
+<script nonce="__STET_NONCE__">
+// The local dashboard. Everything on this page is a call to a route on the
+// server that served it, and every route is a call the CLI already makes.
+//
+// No inline event-handler attribute exists here: the page is served under a
+// content-security policy that nonces this script, so an on-attribute would
+// silently do nothing. Every control carries `data-act` and one delegated
+// listener per event dispatches it.
+
+// --- the run token ----------------------------------------------------------
+// It arrives once in the address bar, moves into this tab's session storage,
+// and is taken out of the bar so a copied URL carries no credential.
+const fromBar = new URLSearchParams(location.search).get('t');
+if (fromBar) {
+  try { sessionStorage.setItem('stet.token', fromBar); } catch (e) { /* private window */ }
+  history.replaceState(null, '', location.pathname + location.hash);
+}
+let TOKEN = fromBar || '';
+if (!TOKEN) { try { TOKEN = sessionStorage.getItem('stet.token') || ''; } catch (e) { TOKEN = ''; } }
+
+const WANTED = new URLSearchParams(location.search).get('site');
+
+let stale = false;
+function reopen() {
+  if (stale) return;
+  stale = true;
+  const shell = document.getElementById('shell');
+  // The shell is a two-column grid; the line is the whole page instead.
+  shell.style.display = 'block';
+  shell.innerHTML =
+    '<div class="reopen"><b>This tab&rsquo;s token is from an earlier run.</b><br>' +
+    'Open the link the terminal printed.</div>';
+}
+
+/** One request to this server, with the run token. */
+async function api(path, init) {
+  const opts = init || {};
+  const headers = Object.assign({ authorization: 'Bearer ' + TOKEN }, opts.headers || {});
+  if (opts.body !== undefined) headers['content-type'] = 'application/json';
+  const res = await fetch(path, {
+    method: opts.method || 'GET',
+    headers: headers,
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+  });
+  if (res.status === 401) { reopen(); throw new Error('unauthorized'); }
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  return { status: res.status, ok: res.ok, body: body || {} };
+}
+
+const post = (path, body) => api(path, { method: 'POST', body: body || {} });
+
+// --- state ------------------------------------------------------------------
+const S = {
+  editor: '',
+  version: '',
+  sites: [],
+  path: null,
+  site: null,
+  tab: 'Content',
+  sel: null,
+  group: null,
+  locale: 'default',
+  env: 'default',
+  q: '',
+  draft: {},
+  note: '',
+  findings: [],
+  pending: [],
+  health: null,
+  seo: null,
+  setup: null,
+  verify: null,
+  history: null,
+  recent: null,
+  preview: null,
+  devlog: null,
+  rows: null,
+  changes: null,
+  removal: null,
+  message: '',
+  savedKeys: [],
+};
+
+const esc = (s) => String(s === undefined || s === null ? '' : s)
+  .replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const tst = (m) => {
+  const t = document.getElementById('tst');
+  t.textContent = m;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove('show'), 3300);
+};
+const plural = (n, one, many) => n + ' ' + (n === 1 ? one : (many || one + 's'));
+const query = () => '?site=' + encodeURIComponent(S.path);
+const envQuery = () => query() + (S.env === 'default' ? '' : '&env=' + encodeURIComponent(S.env));
+
+const TABS = [
+  ['Content', 'Content'], ['Templates', 'Templates'], ['Sends', 'Sends'], ['Contacts', 'Contacts'],
+  ['Media', 'Media'], ['Brand', 'Brand'], ['SEO', 'SEO'], ['Scheduled', 'Scheduled'],
+  ['Packs', 'Packs'], ['Environments', 'Environments'], ['Recent', 'Recent'],
+];
+const MACHINE_TABS = ['Health', 'Setup'];
+const ready = () => !!(S.site && S.site.state === 'ready');
+const storeBacked = () => !!(ready() && S.site.mode !== 'snapshot');
+const keyDef = (id) => (ready() && Object.prototype.hasOwnProperty.call(S.site.descriptor.keys, id))
+  ? S.site.descriptor.keys[id] : null;
+
+/** The value shown for a key: the unsaved edit, else the snapshot's. */
+function valueOf(id, locale) {
+  const loc = locale || S.locale;
+  const held = S.draft[loc + ' ' + id];
+  if (held !== undefined) return held;
+  const block = (S.site && S.site.snapshot && S.site.snapshot[loc]) || {};
+  return Object.prototype.hasOwnProperty.call(block, id) ? block[id] : undefined;
+}
+/** The default locale's value, for the fallback line a translated key shows. */
+function defaultValue(id) {
+  const block = (S.site && S.site.snapshot && S.site.snapshot['default']) || {};
+  return Object.prototype.hasOwnProperty.call(block, id) ? block[id] : undefined;
+}
+const edited = (id) => S.draft[S.locale + ' ' + id] !== undefined;
+const dirty = () => Object.keys(S.draft).length > 0;
+function setDraft(id, value) { S.draft[S.locale + ' ' + id] = value; }
+
+// --- loading ----------------------------------------------------------------
+async function loadWorkspace() {
+  const res = await api('/api/workspace');
+  S.editor = readEditor() || res.body.editor || '';
+  S.version = res.body.version || '';
+  S.sites = res.body.sites || [];
+  if (S.path === null) {
+    const wanted = WANTED && S.sites.some((s) => s.path === WANTED) ? WANTED : null;
+    S.path = wanted || (S.sites[0] ? S.sites[0].path : null);
+  }
+  if (S.path !== null) await loadSite(S.path);
+  else render();
+}
+
+async function loadSite(path) {
+  S.path = path;
+  S.draft = {};
+  S.findings = [];
+  S.pending = [];
+  S.message = '';
+  S.removal = null;
+  S.health = null; S.seo = null; S.setup = null; S.verify = null;
+  S.history = null; S.recent = null; S.preview = null; S.devlog = null;
+  S.rows = null; S.changes = null;
+  const res = await api('/api/site' + query());
+  S.site = res.body;
+  S.env = 'default';
+  if (ready()) {
+    S.locale = S.site.config.locales.default;
+    S.group = firstGroup();
+    S.sel = keysInGroup(S.group)[0] || null;
+  } else {
+    S.sel = null;
+  }
+  render();
+}
+
+function readEditor() {
+  try { return localStorage.getItem('stet.editor') || ''; } catch (e) { return ''; }
+}
+function writeEditor(value) {
+  S.editor = value;
+  try { localStorage.setItem('stet.editor', value); } catch (e) { /* private window */ }
+}
+
+// --- grouping ---------------------------------------------------------------
+// Keys group by declared page where the site declares any, and by the key's
+// first underscore segment otherwise, unmerged: `principle` and `principles`
+// are two groups. Everything a page selector cannot place lands in `Other`.
+function pageNames() {
+  return ready() ? Object.keys(S.site.descriptor.pages || {}).sort() : [];
+}
+const prefixOf = (id) => (id.indexOf('_') === -1 ? id : id.slice(0, id.indexOf('_')));
+function keysOfPage(page) {
+  return Object.keys(S.site.descriptor.keys).filter((id) => {
+    const def = S.site.descriptor.keys[id];
+    return Array.isArray(def.pages) && def.pages.indexOf(page) !== -1;
+  }).sort();
+}
+function unplaced() {
+  const placed = new Set();
+  for (const page of pageNames()) for (const id of keysOfPage(page)) placed.add(id);
+  return Object.keys(S.site.descriptor.keys).filter((id) => !placed.has(id)).sort();
+}
+function groups() {
+  if (!ready()) return [];
+  const pages = pageNames();
+  if (pages.length > 0) return unplaced().length > 0 ? pages.concat(['Other']) : pages;
+  const prefixes = new Set();
+  for (const id of Object.keys(S.site.descriptor.keys)) prefixes.add(prefixOf(id));
+  return [...prefixes].sort();
+}
+function keysInGroup(group) {
+  if (!ready() || group === null) return [];
+  if (pageNames().length > 0) return group === 'Other' ? unplaced() : keysOfPage(group);
+  return Object.keys(S.site.descriptor.keys).filter((id) => prefixOf(id) === group).sort();
+}
+const firstGroup = () => groups()[0] || null;
+
+/** The keys the list shows: the selected group, narrowed by the search box. */
+function listedKeys() {
+  const q = S.q.toLowerCase();
+  return keysInGroup(S.group).filter((id) => {
+    if (!q) return true;
+    if (id.toLowerCase().indexOf(q) !== -1) return true;
+    const value = valueOf(id);
+    return String(value === undefined ? '' : shown(value)).toLowerCase().indexOf(q) !== -1;
+  });
+}
+/** A value as one line of text, whatever shape it is. */
+const shown = (v) => (typeof v === 'string' ? v : JSON.stringify(v === undefined ? '' : v));
+
+// --- the shell --------------------------------------------------------------
+function render() {
+  if (stale) return;
+  captureFocus();
+  barDirty = dirty();
+  document.getElementById('edsub').innerHTML =
+    'local dashboard' + (S.version ? '<br>v' + esc(S.version) : '');
+  document.getElementById('pjnote').textContent = S.sites.length
+    ? 'from ~/.stet/projects.json — select one to edit'
+    : 'no checkouts yet — add one below';
+
+  document.getElementById('projs').innerHTML = S.sites.map((s) => {
+    const on = s.path === S.path ? ' on' : '';
+    const sub = s.state === 'ready'
+      ? esc(s.mode === 'snapshot' ? 'snapshot-only' : s.mode) + ' &middot; ' + plural(s.keys, 'key')
+      : s.state === 'not-adopted'
+        ? 'not adopted — run stet init here'
+        : 'cannot load: ' + esc(s.message);
+    return '<button class="it' + on + '" data-act="site:' + esc(s.path) + '">' +
+      esc(s.name) + '<span class="u">' + sub + '</span></button>';
+  }).join('');
+
+  for (const t of MACHINE_TABS) {
+    const b = document.getElementById('n-' + t);
+    if (b) b.classList.toggle('on', S.tab === t);
+  }
+
+  const inSite = TABS.some((t) => t[0] === S.tab);
+  const stripe = document.getElementById('stripe');
+  stripe.className = inSite && ready() ? 'stripe e-' + envClass() : 'stripe';
+  stripe.style.background = inSite && ready() ? '' : 'hsl(var(--bd))';
+
+  const chip = document.getElementById('envchip');
+  chip.style.display = ready() ? '' : 'none';
+  chip.className = 'envchip e-' + envClass();
+  chip.innerHTML = esc(S.env) + '<span class="h">' + esc(adapterOf(S.env)) + '</span>';
+
+  paintDirty();
+
+  document.getElementById('tabs').innerHTML = ready()
+    ? TABS.filter((t) => t[0] !== 'Scheduled' || storeBacked())
+      .map((t) => '<button class="' + (S.tab === t[0] ? 'on' : '') + '" data-act="tab:' + t[0] + '">' + t[1] + '</button>')
+      .join('')
+    : '';
+
+  document.getElementById('crumb').innerHTML = S.site
+    ? '<b style="color:hsl(var(--fg))">' + esc(S.site.name) + '</b> <span class="muted mono">' + esc(S.site.path) + '</span>'
+    : '<b style="color:hsl(var(--fg))">stet</b> <span class="muted">/ this machine</span>';
+
+  document.getElementById('main').innerHTML = view();
+  restoreFocus();
+}
+
+/**
+ * The unsaved-edit count, painted on its own so typing never rebuilds the field
+ * the caret is in. The bar's Push turns on whether anything is unsaved, so the
+ * keystroke that FLIPS that repaints; the ones in between only move the count.
+ */
+let barDirty = false;
+function paintDirty() {
+  if (dirty() !== barDirty) {
+    render();
+    return;
+  }
+  document.getElementById('dc').textContent = dirty() ? plural(Object.keys(S.draft).length, 'unsaved edit') : '';
+}
+
+const ENV_CLASSES = { default: 'local', prod: 'prod', production: 'prod', staging: 'staging', preview: 'preview' };
+const envClass = () => ENV_CLASSES[S.env] || 'staging';
+function adapterOf(name) {
+  if (!ready()) return '';
+  const found = (S.site.environments || []).find((e) => e.name === name);
+  return found ? found.adapter : '';
+}
+
+function view() {
+  if (S.tab === 'Health') return vHealth();
+  if (S.tab === 'Setup') return vSetup();
+  if (!S.site) return '<div class="hint">Add a checkout to begin. The path must be absolute and hold a stet project.</div>';
+  if (S.site.state === 'not-adopted') {
+    return '<div class="hint"><b>' + esc(S.site.name) + ' is not adopted.</b> Run <span class="mono">stet init</span> in ' +
+      '<span class="mono">' + esc(S.site.path) + '</span>, then reload this page.</div>';
+  }
+  if (S.site.state === 'broken') {
+    return '<div class="hint"><b>' + esc(S.site.name) + ' cannot be loaded.</b></div>' +
+      '<div class="card"><div class="cb"><div class="err">cannot load: ' + esc(S.site.message) + '</div></div></div>';
+  }
+  if (S.tab === 'Content') return vContent();
+  if (S.tab === 'Templates') return vTemplates();
+  if (S.tab === 'Brand') return vBrand();
+  if (S.tab === 'SEO') return vSeo();
+  if (S.tab === 'Scheduled') return vScheduled();
+  if (S.tab === 'Environments') return vEnvironments();
+  if (S.tab === 'Recent') return vRecent();
+  if (S.tab === 'Sends') return dark('Sends', 'Sending an announcement to a group through your own email provider is planned.', fxSends());
+  if (S.tab === 'Contacts') return dark('Contacts', 'Capturing form submissions into your store is planned.', fxContacts());
+  if (S.tab === 'Media') return dark('Media', 'Uploading images to your own bucket is planned.', fxMedia());
+  if (S.tab === 'Packs') return dark('Packs', 'Installing a pack of starter keys and templates is planned.', fxPacks());
+  return '';
+}
+
+/** A tab with nothing behind it yet: its title, one plain line, and the shape it will take. */
+function dark(title, line, fixture) {
+  return '<div class="card"><div class="ch"><h3>' + esc(title) + '</h3><span class="bdg">Not built yet.</span></div>' +
+    '<div class="cb"><p style="margin:0">' + esc(line) + '</p></div></div>' +
+    '<div class="notbuilt">' + fixture + '</div>';
+}
+
+// --- Content -----------------------------------------------------------------
+function vContent() {
+  return '<div class="work">' + keyList() + editorColumn() + previewColumn() + '</div>';
+}
+
+function keyList() {
+  const items = listedKeys();
+  const locales = ready() ? S.site.config.locales.enabled : ['default'];
+  const selector = groups().length > 1 ? chooser('group', groups(), S.group, 'gsel') : '';
+  const localeSelector = locales.length > 1 ? chooser('locale', locales, S.locale, 'lsel') : '';
+  return '<div class="card"><div class="ch" style="display:block">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center"><h3>Keys</h3>' +
+    '<span class="bdg">' + items.length + '</span></div>' + selector + localeSelector +
+    '<input class="in sm" id="ksearch" style="margin-top:6px" placeholder="Search…" value="' + esc(S.q) + '" data-act-input="search"></div>' +
+    '<div class="scroll">' + (items.length === 0
+      ? '<div class="cb muted">No keys.</div>'
+      : items.map((id) => {
+        const def = keyDef(id) || {};
+        const value = valueOf(id);
+        const badge = edited(id) ? '<span class="bdg d">edited</span>'
+          : def.shape === 'media' ? '<span class="bdg">img</span>'
+            : def.shape === 'richtext' ? '<span class="bdg">rich</span>'
+              : def.shape === 'list' ? '<span class="bdg b">list</span>'
+                : def.shape === 'record' ? '<span class="bdg b">record</span>'
+                  : '';
+        return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
+          '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + healthBadge(id) + '</span>' +
+          '<span class="s">' + esc(String(value === undefined ? '' : shown(value)).replace(/\n/g, ' ').slice(0, 40) || '—') + '</span></button>';
+      }).join('')) + '</div></div>';
+}
+
+/**
+ * What is wrong with this key: a template slot the code no longer reads, a row
+ * in the store the descriptor dropped, or a declared key with no value.
+ *
+ * Every one reads a STRUCTURED field, never a message: `slot` on the scan
+ * finding, audit's own `orphans` key list, and the site's snapshot. A message
+ * is copy the operator may rewrite, and a badge that matched on one would go
+ * quiet the day it changed.
+ */
+function healthBadge(id) {
+  if (unreadSlots().some((f) => f.slot.template + '__' + f.slot.name === id)) {
+    return '<span class="bdg r">not rendered</span>';
+  }
+  const orphans = (S.health && S.health.audit && S.health.audit.orphans) || [];
+  if (orphans.indexOf(id) !== -1) return '<span class="bdg d">orphan</span>';
+  // The page holds the snapshot, so this one needs no Health run at all.
+  if (defaultValue(id) === undefined) return '<span class="bdg r">no value</span>';
+  return '';
+}
+
+function unreadSlots() {
+  const findings = (S.health && S.health.scan && S.health.scan.findings) || [];
+  return findings.filter((f) => f.slot !== undefined);
+}
+const healthStamp = () => (S.health && S.health.at && S.health.at.head) ? S.health.at.head : null;
+
+/** A select over a list of values, dispatching on change through `data-act-change`. */
+function chooser(act, values, current, id, cls) {
+  return '<select class="in ' + (cls === 'in' ? '' : 'sm') + '"' +
+    (id === undefined ? '' : ' id="' + esc(id) + '"') +
+    (cls === 'in' ? '' : ' style="margin-top:6px"') +
+    ' data-act-change="' + esc(act) + '">' +
+    values.map((v) => '<option value="' + esc(v) + '"' + (v === current ? ' selected' : '') + '>' +
+      esc(v) + '</option>').join('') + '</select>';
+}
+
+/** The commits that touched the snapshot. Content's History card and Recent show the same table. */
+function commitTable(rows, loaded) {
+  return '<table><thead><tr><th style="width:80px">Commit</th><th style="width:150px">When</th>' +
+    '<th>Subject</th><th style="width:90px">By</th></tr></thead><tbody>' +
+    (rows.length === 0
+      ? '<tr><td colspan="4" class="muted">' + (loaded ? 'No commits touch the snapshot yet.' : 'Not loaded.') + '</td></tr>'
+      : rows.map((r) => '<tr><td class="mono">' + esc(r.short) + '</td><td class="muted">' + esc(r.at) +
+        '</td><td>' + esc(r.subject) + '</td><td class="muted mono" style="font-size:11px">' +
+        esc(r.author) + '</td></tr>').join('')) + '</tbody></table>';
+}
+
+function editorColumn() {
+  return '<div style="display:flex;flex-direction:column;gap:11px;min-width:0">' +
+    '<div class="card">' + editorCard() + '</div>' +
+    historyCard() + '</div>';
+}
+
+function editorCard() {
+  if (S.sel === null) return '<div class="cb muted">Select a key.</div>';
+  const id = S.sel;
+  const def = keyDef(id) || {};
+  const value = valueOf(id);
+  const max = def.limits ? def.limits.max : null;
+  const head = '<div class="ch"><h3><span class="mono">' + esc(id) + '</span></h3>' +
+    '<span style="display:flex;gap:5px;flex-wrap:wrap">' +
+    '<span class="bdg">' + esc(def.target || '') + '</span>' +
+    '<span class="bdg">' + esc(def.shape || 'text') + '</span>' +
+    (edited(id) ? '<span class="bdg d">edited</span>' : '') +
+    (S.locale !== 'default' ? '<span class="bdg b">' + esc(S.locale) + '</span>' : '') +
+    '</span></div>';
+
+  const fallback = (S.locale !== 'default' && value === undefined && defaultValue(id) !== undefined)
+    ? '<div class="inf">falls back to default — ' + esc(String(shown(defaultValue(id))).slice(0, 90)) + '</div>'
+    : '';
+
+  return head + '<div class="cb">' + fallback + field(id, def, value, max) +
+    findingsBlock(id) + '</div>' + bar(id);
+}
+
+/** The editor for one key, by its declared shape. */
+function field(id, def, value, max) {
+  const shape = def.shape || 'text';
+  if (shape === 'richtext' || shape === 'media') {
+    return '<div class="term">' + esc(String(shown(value === undefined ? '' : value))) + '</div>' +
+      '<p class="note">' + (shape === 'media' ? 'A media reference' : 'Rich text') +
+      ' is read-only here. Edit it in the terminal for now.</p>';
+  }
+  if (shape === 'enum') {
+    const values = def.values || [];
+    return chooser('enum:' + id, values, value, undefined, 'in');
+  }
+  if (shape === 'number') {
+    return '<input class="in" type="number" value="' + esc(value === undefined ? '' : value) + '" data-act-input="number:' + esc(id) + '">';
+  }
+  if (shape === 'color') {
+    return '<div style="display:flex;gap:8px;align-items:center">' +
+      '<input type="color" value="' + esc(value === undefined ? '#000000' : value) + '" data-act-input="color:' + esc(id) + '" ' +
+      'style="width:34px;height:28px;padding:0;border:1px solid hsl(var(--bd));border-radius:6px;background:none">' +
+      '<input class="in sm" value="' + esc(value === undefined ? '' : value) + '" data-act-input="color:' + esc(id) + '"></div>';
+  }
+  if (shape === 'list') {
+    const entries = Array.isArray(value) ? value : [];
+    const rows = entries.map((entry, i) =>
+      '<div class="lrow"><textarea class="in" rows="1" data-act-input="list:' + esc(id) + ' ' + i + '">' + esc(entry) + '</textarea>' +
+      '<div class="ctl">' +
+      '<button class="btn sm" data-act="list-up:' + esc(id) + ' ' + i + '">↑</button>' +
+      '<button class="btn sm" data-act="list-down:' + esc(id) + ' ' + i + '">↓</button>' +
+      '<button class="btn sm dg" data-act="list-remove:' + esc(id) + ' ' + i + '">Remove</button></div>' +
+      '<span class="cnt ' + (max !== null && String(entry).length > max ? 'bad' : '') + '">' +
+      String(entry).length + (max === null ? '' : ' / ' + max) + '</span></div>').join('');
+    return rows + '<button class="btn sm" data-act="list-add:' + esc(id) + '">Add an entry</button>';
+  }
+  if (shape === 'record') {
+    const record = (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+    const fields = Object.keys(record).map((name) =>
+      '<div style="margin-bottom:7px"><div class="muted" style="font-size:11px">' + esc(name) + '</div>' +
+      '<textarea class="in" rows="1" data-act-input="record:' + esc(id) + ' ' + esc(name) + '">' + esc(record[name]) + '</textarea>' +
+      '<span class="cnt ' + (max !== null && String(record[name]).length > max ? 'bad' : '') + '">' +
+      String(record[name]).length + (max === null ? '' : ' / ' + max) + '</span></div>').join('');
+    return '<fieldset class="rec"><legend>' + esc(id) + '</legend>' + fields + '</fieldset>';
+  }
+  const text = value === undefined ? '' : String(value);
+  return '<textarea class="in" rows="3" data-act-input="text:' + esc(id) + '">' + esc(text) + '</textarea>' +
+    '<div style="display:flex;justify-content:space-between;margin-top:5px">' +
+    '<span class="cnt ' + (max !== null && text.length > max ? 'bad' : '') + '">' +
+    text.length + (max === null ? '' : ' / ' + max + (def.limits && def.limits.severity === 'hard' ? ' · hard' : '')) +
+    '</span></div>';
+}
+
+/** What the last save said about this key, under the field it is about. */
+function findingsBlock(id) {
+  const mine = S.findings.filter((f) => f.key === id || (f.key || '').indexOf(id) === 0);
+  if (mine.length === 0 && S.message === '') return '';
+  return (S.message ? '<div class="err">' + esc(S.message) + '</div>' : '') +
+    (mine.length === 0 ? '' : '<ul class="findings">' + mine.map((f) =>
+      '<li class="' + (f.level === 'error' ? 'err' : 'muted') + '">' + esc(f.message) + '</li>').join('') + '</ul>');
+}
+
+/**
+ * The save bar, and what a save left behind.
+ *
+ * Commit appears while this checkout holds stet-written files that are not yet
+ * in a commit, and goes when the commit lands. Push is not tied to that: a
+ * checkout with commits in it can be ahead of its upstream at any time, so Push
+ * appears whenever there is nothing left to save.
+ */
+function bar(id) {
+  const repo = !storeBacked() && ready() && S.site.git.head !== null;
+  const written = S.pending.length > 0
+    ? '<span class="muted" style="font-size:11px">wrote ' + S.pending.map((f) => esc(f)).join(', ') + '</span>'
+    : '';
+  const commit = (repo && S.pending.length > 0 ? '<button class="btn" data-act="commit">Commit</button>' : '') +
+    (repo && !dirty() ? '<button class="btn" data-act="push">Push</button>' : '');
+  const removal = S.removal
+    ? '<div class="cb"><div class="term">' + esc(S.removal.lines.join('\n')) + '</div>' +
+      '<div style="margin-top:8px"><button class="btn dg sm" data-act="removeApply">Remove</button>' +
+      '<button class="btn sm" data-act="removeCancel">Cancel</button></div></div>'
+    : '';
+  return '<div class="bar e-' + envClass() + '">' +
+    '<button class="btn pri" data-act="save">' + (storeBacked() ? 'Save draft' : 'Save to repo') + '</button>' +
+    (storeBacked()
+      ? '<button class="btn env" data-act="publish">Publish</button><button class="btn" data-act="discard">Discard</button>'
+      : commit) +
+    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button>' +
+    '<span style="flex:1"></span>' + written + '</div>' + removal;
+}
+
+function historyCard() {
+  const rows = (S.history && S.history.commits) || [];
+  const body = S.history === null
+    ? '<div class="cb muted">Not loaded. <button class="btn sm" data-act="history">Load</button></div>'
+    : S.history.mount
+      ? '<div class="cb muted">This site is store-backed — its history is the store&rsquo;s, at ' +
+        '<span class="mono">' + esc(S.history.mount) + '</span>.</div>'
+      : commitTable(rows, S.history !== null);
+  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">History</h3>' +
+    '<span class="bdg">the commits that touched the snapshot</span></div>' + body + '</div>';
+}
+
+function previewColumn() {
+  const p = S.preview;
+  const head = '<div class="ch"><h3>Preview</h3>' +
+    '<div style="display:flex;gap:6px;align-items:center">' +
+    '<button class="btn sm" data-act="previewLoad">Reload</button>' +
+    (p && !p.static ? '<button class="btn sm" data-act="devLog">Log</button>' : '') +
+    (p && !p.static && p.up ? '<button class="btn sm" data-act="devStop">Stop</button>' : '') +
+    (p && !p.static && !p.up ? '<button class="btn sm pri" data-act="devStart">Start the dev server</button>' : '') +
+    '</div></div>';
+  let body;
+  if (p === null) {
+    body = '<div class="cb muted">Not probed. <button class="btn sm" data-act="previewLoad">Probe</button></div>';
+  } else if (p.error) {
+    body = '<div class="cb"><div class="err">' + esc(p.error) + '</div></div>';
+  } else if (p.static) {
+    body = '<div class="cb"><iframe class="paneframe" src="' + esc(p.url) +
+      '" sandbox="allow-scripts allow-forms allow-popups" title="the site"></iframe>' +
+      '<p class="note">Served read-only from the checkout by this server. A root-absolute reference in the page ' +
+      'resolves against the dashboard rather than the site and is not served here.</p></div>';
+  } else if (p.up) {
+    body = '<div class="cb"><iframe class="paneframe" src="' + esc(p.url) +
+      '" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" title="the site"></iframe></div>';
+  } else {
+    body = '<div class="cb"><p style="margin:0 0 8px">Nothing answers at <span class="mono">' + esc(p.url) +
+      '</span> — start it, or set the URL in Setup.</p>' +
+      '<div class="term">' + esc(p.start || '') + '</div>' +
+      (S.devlog ? '<div class="term" style="margin-top:8px">' + esc((S.devlog.lines || []).join('\n')) + '</div>' : '') +
+      '</div>';
+  }
+  return '<div class="card">' + head + body + '</div>';
+}
+
+// --- Templates ---------------------------------------------------------------
+function vTemplates() {
+  const templates = (ready() && S.site.descriptor.templates) || {};
+  const names = Object.keys(templates).sort();
+  const verdicts = (S.verify && S.verify.templates) || [];
+  const stamp = healthStamp();
+  const rows = names.map((name) => {
+    const def = templates[name];
+    const verdict = verdicts.find((v) => v.template === name);
+    const slots = (def.slots || []).map((slot) => {
+      const id = name + '__' + slot;
+      const unread = unreadSlots().some((f) => f.slot.template === name && f.slot.name === slot);
+      return '<tr><td class="mono" style="padding-left:24px">' + esc(slot) + '</td>' +
+        '<td class="mono">' + esc(id) + '</td>' +
+        '<td>' + (unread
+          ? '<span class="bdg r">not rendered by the code as of ' + esc(stamp || 'the last run') + '</span>'
+          : '<span class="muted">—</span>') + '</td></tr>';
+    }).join('');
+    return '<tr><td><b>' + esc(name) + '</b></td><td class="muted">' + esc(def.class || '') + '</td>' +
+      '<td>' + (verdict ? '<span class="bdg ' + (verdict.state === 'PASS' ? 'g' : 'd') + '">' + esc(verdict.state) + '</span>' +
+        (verdict.detail ? ' <span class="muted">' + esc(verdict.detail) + '</span>' : '') : '<span class="muted">—</span>') +
+      '</td></tr>' + slots;
+  }).join('');
+  return '<div class="card"><div class="ch"><h3>Templates</h3>' +
+    '<button class="btn sm" data-act="verify">Run</button></div>' +
+    '<table><thead><tr><th style="width:170px">Template</th><th style="width:120px">Class</th><th>Verdict</th></tr></thead>' +
+    '<tbody>' + (rows || '<tr><td colspan="3" class="muted">No templates declared.</td></tr>') + '</tbody></table>' +
+    '<div class="bar"><span class="muted" style="font-size:11.5px">' +
+    (storeBacked()
+      ? 'The assembled preview is not built yet.'
+      : 'the assembled preview needs a store-backed site — a snapshot site has no render route') +
+    '</span></div></div>';
+}
+
+// --- Brand -------------------------------------------------------------------
+function vBrand() {
+  const keys = ready() ? Object.keys(S.site.descriptor.keys).filter((id) => id.indexOf('brand__') === 0).sort() : [];
+  if (keys.length === 0) return '<div class="hint">This site declares no <span class="mono">brand__</span> keys.</div>';
+  return '<div class="card"><div class="ch"><h3>Brand</h3><span class="bdg">' + plural(keys.length, 'key') + '</span></div>' +
+    '<table><thead><tr><th style="width:220px">Key</th><th>Value</th><th style="width:90px"></th></tr></thead><tbody>' +
+    keys.map((id) => '<tr><td class="mono">' + esc(id) + '</td><td>' +
+      esc(String(shown(valueOf(id) === undefined ? '' : valueOf(id))).slice(0, 90)) + '</td>' +
+      '<td><button class="btn sm" data-act="edit:' + esc(id) + '">Edit</button></td></tr>').join('') +
+    '</tbody></table><div class="bar"><span class="muted" style="font-size:11.5px">' +
+    'The email preview these values frame is not built yet.</span></div></div>';
+}
+
+// --- SEO ---------------------------------------------------------------------
+function vSeo() {
+  if (S.seo === null) {
+    return '<div class="card"><div class="ch"><h3>SEO</h3><button class="btn sm" data-act="seoLoad">Run</button></div>' +
+      '<div class="cb muted">Not run yet.</div></div>';
+  }
+  const findings = (S.seo.seo && S.seo.seo.seo) || [];
+  const proposals = (S.seo.pages && S.seo.pages.pages) || [];
+  const skips = (S.seo.pages && S.seo.pages.skips) || [];
+  const pages = ready() ? S.site.descriptor.pages || {} : {};
+
+  const rules = '<div class="card"><div class="ch"><h3>Findings</h3>' +
+    '<button class="btn sm" data-act="seoLoad">Run</button></div>' +
+    '<table><thead><tr><th style="width:150px">Rule</th><th style="width:80px">Severity</th>' +
+    '<th style="width:120px">Page</th><th style="width:150px">Key</th><th>What it says</th></tr></thead><tbody>' +
+    (findings.length === 0
+      ? '<tr><td colspan="5" class="muted">Nothing to report.</td></tr>'
+      : findings.map((f) => '<tr><td class="mono">' + esc(f.rule) + '</td>' +
+        '<td><span class="bdg ' + (f.severity === 'error' ? 'r' : 'd') + '">' + esc(f.severity) + '</span></td>' +
+        '<td>' + esc(f.page || '—') + '</td><td class="mono">' + esc(f.key || '—') + '</td>' +
+        '<td>' + esc(f.message) + '</td></tr>').join('')) + '</tbody></table></div>';
+
+  const undeclared = '<div class="card"><div class="ch"><h3>Routes with no page record</h3>' +
+    (proposals.length > 0 ? '<button class="btn sm pri" data-act="declareAll">Declare</button>' : '') + '</div>' +
+    '<table><thead><tr><th style="width:170px">Name</th><th style="width:170px">Route</th><th>File</th>' +
+    '<th style="width:90px"></th></tr></thead><tbody>' +
+    (proposals.length === 0
+      ? '<tr><td colspan="4" class="muted">Every route the host serves has a page record.</td></tr>'
+      : proposals.map((p) => '<tr><td><b>' + esc(p.name) + '</b></td><td class="mono">' + esc(p.route) + '</td>' +
+        '<td class="mono muted">' + esc(p.file) + '</td>' +
+        '<td><button class="btn sm" data-act="declare:' + esc(p.name) + '">Declare</button></td></tr>').join('')) +
+    '</tbody></table>' +
+    (skips.length === 0 ? '' : '<div class="cb"><p class="note" style="margin:0">Skipped, by name:</p><ul class="findings">' +
+      skips.map((s) => '<li class="muted"><span class="mono">' + esc(s.file) + '</span> — ' + esc(s.reason) +
+        ': ' + esc(s.detail) + '</li>').join('') + '</ul></div>') + '</div>';
+
+  const perPage = '<div class="card"><div class="ch"><h3>Per page</h3>' +
+    '<span class="bdg">' + plural(Object.keys(pages).length, 'page') + '</span></div>' +
+    '<table><thead><tr><th style="width:150px">Page</th><th style="width:150px">Route</th>' +
+    '<th>Title</th><th>Description</th></tr></thead><tbody>' +
+    (Object.keys(pages).length === 0
+      ? '<tr><td colspan="4" class="muted">No pages declared.</td></tr>'
+      : Object.keys(pages).sort().map((name) => {
+        const record = pages[name];
+        const seo = record.seo || {};
+        const title = seo.title ? valueOf(seo.title) : undefined;
+        const desc = seo.description ? valueOf(seo.description) : undefined;
+        return '<tr><td><b>' + esc(name) + '</b></td><td class="mono">' + esc(record.route) + '</td>' +
+          '<td>' + (title ? esc(String(title).slice(0, 70)) : '<span class="bdg d">missing</span>') + '</td>' +
+          '<td>' + (desc ? esc(String(desc).slice(0, 70)) : '<span class="bdg d">missing</span>') + '</td></tr>';
+      }).join('')) + '</tbody></table></div>';
+
+  return rules + undeclared + perPage;
+}
+
+// --- Scheduled, Environments, Recent ----------------------------------------
+function vScheduled() {
+  const rows = (S.rows && S.rows.rows) || [];
+  const scheduled = rows.filter((r) => r.publishAt);
+  const changes = (S.changes && S.changes.changes) || [];
+  const grouped = '<div class="card"><div class="ch"><h3>Scheduled changes</h3>' +
+    '<span class="bdg">a change publishes as one unit</span></div>' +
+    '<table><thead><tr><th style="width:200px">When</th><th style="width:200px">Change</th>' +
+    '<th>Note</th><th style="width:90px">Opened</th></tr></thead><tbody>' +
+    (changes.length === 0
+      ? '<tr><td colspan="4" class="muted">' + (S.changes === null ? 'Not loaded.' : 'No change is scheduled.') + '</td></tr>'
+      : changes.map((c) => '<tr><td>' + esc(c.publishAt) + '</td><td><b>' + esc(c.name) + '</b></td>' +
+        '<td class="muted">' + esc(c.note || '') + '</td>' +
+        '<td class="muted">' + esc(c.authorKind) + '</td></tr>').join('')) + '</tbody></table></div>';
+  const drafts = '<div class="card"><div class="ch"><h3>Scheduled drafts</h3>' +
+    '<button class="btn sm" data-act="rowsLoad">Load</button></div>' +
+    '<table><thead><tr><th style="width:200px">When</th><th style="width:200px">Key</th><th>Value</th></tr></thead><tbody>' +
+    (scheduled.length === 0
+      ? '<tr><td colspan="3" class="muted">' + (S.rows === null ? 'Not loaded.' : 'Nothing is scheduled.') + '</td></tr>'
+      : scheduled.map((r) => '<tr><td>' + esc(r.publishAt) + '</td><td class="mono">' + esc(r.key) + '</td>' +
+        '<td>' + esc(String(shown(r.value)).slice(0, 60)) + '</td></tr>').join('')) + '</tbody></table></div>';
+  return grouped + drafts;
+}
+
+function vEnvironments() {
+  const environments = (ready() && S.site.environments) || [];
+  return '<div class="hint">An environment is a store connection — a name, an adapter and the variables it reads. ' +
+    'The dashboard reads them from <span class="mono">stet.config.json</span> and writes none of them.</div>' +
+    '<div class="card"><div class="ch"><h3>Environments</h3><span class="bdg">read-only</span></div>' +
+    '<table><thead><tr><th style="width:150px">Name</th><th style="width:130px">Adapter</th>' +
+    '<th>Variables</th><th style="width:96px"></th></tr></thead><tbody>' +
+    environments.map((e) => '<tr' + (e.name === S.env ? ' style="background:hsl(var(--muted))"' : '') + '>' +
+      '<td><span class="envchip e-' + (ENV_CLASSES[e.name] || 'staging') + '" style="padding:2px 9px;font-size:11px;border-width:1.5px">' +
+      esc(e.name) + '</span></td><td class="mono">' + esc(e.adapter) + '</td>' +
+      '<td>' + (e.vars.length === 0
+        ? '<span class="muted">none — this environment needs no connection</span>'
+        : e.vars.map((v) => '<span class="mono">' + esc(v.name) + '</span> ' +
+          (v.set ? '<span class="bdg g">set</span>' : '<span class="bdg d">unset</span>')).join('<br>')) + '</td>' +
+      '<td>' + (e.name === S.env ? '<span class="bdg g">selected</span>'
+        : '<button class="btn sm" data-act="env:' + esc(e.name) + '">Switch</button>') + '</td></tr>').join('') +
+    '</tbody></table>' +
+    (environments.length === 1
+      ? '<div class="bar"><span class="muted" style="font-size:11.5px">The config declares no other environment.</span></div>'
+      : '') + '</div>';
+}
+
+function vRecent() {
+  if (storeBacked()) {
+    const rows = (S.recent && S.recent.rows) || [];
+    return '<div class="card"><div class="ch"><h3>Recent</h3>' +
+      '<button class="btn sm" data-act="recentLoad">Load</button></div>' +
+      '<table><thead><tr><th style="width:70px">Version</th><th style="width:170px">When</th>' +
+      '<th style="width:180px">Key</th><th>Went live as</th></tr></thead><tbody>' +
+      (rows.length === 0
+        ? '<tr><td colspan="4" class="muted">' + (S.recent === null ? 'Not loaded.' : 'Nothing published yet.') + '</td></tr>'
+        : rows.map((r) => '<tr><td class="mono">v' + esc(r.id) + '</td><td class="muted">' + esc(r.publishedAt) +
+          '</td><td class="mono">' + esc(r.key) + '</td><td>' + esc(String(shown(r.value)).slice(0, 60)) +
+          '</td></tr>').join('')) + '</tbody></table></div>';
+  }
+  const rows = (S.history && S.history.commits) || [];
+  return '<div class="card"><div class="ch"><h3>Recent</h3>' +
+    '<button class="btn sm" data-act="history">Load</button></div>' +
+    commitTable(rows, S.history !== null) +
+    '<div class="bar"><span class="muted" style="font-size:11.5px">' +
+    'On a snapshot site a publish is a commit, so this is the snapshot file&rsquo;s own log.</span></div></div>';
+}
+
+// --- Health ------------------------------------------------------------------
+function vHealth() {
+  if (!S.site) return '<div class="hint">Add a checkout to run Health against it.</div>';
+  const head = '<div class="card"><div class="ch"><h3>Health</h3>' +
+    '<button class="btn sm pri" data-act="health">Run</button></div>' +
+    (S.health === null ? '<div class="cb muted">Not run yet.</div>' : '<div class="cb">' + stampLine() + '</div>') + '</div>';
+  if (S.health === null) return head;
+  const h = S.health;
+  const doctor = '<div class="card"><div class="ch"><h3>doctor</h3></div><div class="cb">' +
+    '<div class="term">' + esc((h.doctor.out || []).concat(h.doctor.err || []).join('\n')) + '</div></div></div>';
+  const check = findingsCard('check', h.check || []);
+  const scan = findingsCard('scan', (h.scan && h.scan.findings) || []);
+  const audit = h.audit === null ? '' : findingsCard('audit', h.audit.findings || []);
+  return head + doctor + check + scan + audit;
+}
+
+function stampLine() {
+  const at = S.health.at || {};
+  return '<p style="margin:0">as of <span class="mono">' + esc(at.head || 'no commit') + '</span>' +
+    (at.branch ? ' on <span class="mono">' + esc(at.branch) + '</span>' : '') +
+    (at.dirty ? ' — working tree has uncommitted changes' : '') + '</p>';
+}
+
+function findingsCard(title, findings) {
+  const stamp = healthStamp();
+  return '<div class="card"><div class="ch"><h3>' + esc(title) + '</h3>' +
+    '<span class="bdg">' + plural(findings.length, 'finding') + '</span></div>' +
+    (findings.length === 0
+      ? '<div class="cb muted">Nothing to report.</div>'
+      : '<table><thead><tr><th style="width:80px">Level</th><th style="width:110px">Kind</th>' +
+      '<th style="width:170px">Where</th><th>What it says</th></tr></thead><tbody>' +
+      findings.map((f) => '<tr><td><span class="bdg ' + (f.level === 'error' ? 'r' : 'd') + '">' + esc(f.level) + '</span></td>' +
+        '<td class="mono">' + esc(f.kind) + '</td>' +
+        '<td class="mono muted" style="font-size:11px">' + esc(f.at ? f.at.file : (f.key || '—')) + '</td>' +
+        '<td>' + esc(f.message) +
+        (f.slot ? '<br><span class="bdg r">not rendered by the code as of ' + esc(stamp || 'this run') + '</span>' : '') +
+        '</td></tr>').join('') + '</tbody></table>') + '</div>';
+}
+
+// --- Setup -------------------------------------------------------------------
+function vSetup() {
+  const entry = (ready() && S.site.entry) || {};
+  const attribution = '<div class="card"><div class="ch"><h3>Attribution</h3></div><div class="cb">' +
+    '<p style="margin:0 0 6px" class="muted">Every store write from this page records who made it.</p>' +
+    '<input class="in sm" id="editorfield" value="' + esc(S.editor) + '" data-act-input="editor">' +
+    (S.editor.trim() === '' ? '<div class="err">editor is required</div>' : '') + '</div></div>';
+
+  const workspace = !S.site ? '' : '<div class="card"><div class="ch"><h3>' + esc(S.site.name) + '</h3>' +
+    '<span class="bdg mono">' + esc(S.site.path) + '</span></div><div class="cb">' +
+    '<div class="muted" style="font-size:11px">Dev URL</div>' +
+    '<input class="in sm" id="devurl" value="' + esc(entry.dev || '') + '" placeholder="http://localhost:4321" data-act-change="entryDev">' +
+    '<div class="muted" style="font-size:11px;margin-top:7px">Dev command</div>' +
+    '<input class="in sm" id="devcmd" value="' + esc(entry.devCommand || '') + '" placeholder="npm run dev" data-act-change="entryCommand">' +
+    '<label style="display:flex;gap:7px;align-items:center;margin-top:9px;font-size:12px">' +
+    '<input type="checkbox"' + (entry.pushAfterCommit ? ' checked' : '') + ' data-act-change="entryPush">Push after commit</label>' +
+    '<div style="margin-top:10px"><button class="btn sm dg" data-act="removeSite">Remove this checkout</button></div>' +
+    '</div></div>';
+
+  const upgrades = '<div class="card"><div class="ch"><h3>Pending upgrades — run stet upgrade in the terminal</h3>' +
+    '<button class="btn sm" data-act="setupLoad">Run</button></div>' +
+    (S.setup === null
+      ? '<div class="cb muted">Not run yet.</div>'
+      : '<div class="cb"><div class="term">' +
+      esc((S.setup.lines || []).concat(S.setup.stderr || []).join('\n')) + '</div></div>') + '</div>';
+
+  return attribution + workspace + upgrades;
+}
+
+// --- the greyed fixtures the dark tabs show ----------------------------------
+function fxSends() {
+  return '<div class="card"><div class="ch"><h3>Announcements</h3><span class="bdg">3 groups</span></div>' +
+    '<table><thead><tr><th style="width:180px">Send</th><th style="width:120px">Audience</th><th>Subject</th>' +
+    '<th style="width:110px">State</th></tr></thead><tbody>' +
+    '<tr><td><b>August roundup</b></td><td class="muted">every subscriber</td><td>What shipped in August</td>' +
+    '<td><span class="bdg g">sent</span></td></tr>' +
+    '<tr><td><b>Price change</b></td><td class="muted">paying customers</td><td>New pricing from 1 September</td>' +
+    '<td><span class="bdg d">draft</span></td></tr></tbody></table></div>';
+}
+function fxContacts() {
+  return '<div class="card"><div class="ch"><h3>Form submissions</h3><span class="bdg">128 rows</span></div>' +
+    '<table><thead><tr><th style="width:220px">Email</th><th style="width:150px">Form</th><th>Message</th>' +
+    '<th style="width:110px">When</th></tr></thead><tbody>' +
+    '<tr><td class="mono">marco@lightfield.co</td><td class="muted">contact</td><td>Could you send the studio rate card?</td>' +
+    '<td class="muted">yesterday</td></tr>' +
+    '<tr><td class="mono">priya@northbeam.studio</td><td class="muted">contact</td><td>Booking the September slot.</td>' +
+    '<td class="muted">3 days ago</td></tr></tbody></table></div>';
+}
+function fxMedia() {
+  const files = [['hero-channel-2x.png', '2560x1440 · 412 KB'], ['post-cover.jpg', '1600x900 · 188 KB'],
+    ['thread-render.png', '1200x2100 · 340 KB'], ['og-home.png', '1200x630 · 96 KB'],
+    ['demo-sync.mp4', '0:22 · 4.1 MB'], ['logo-mark.svg', 'vector · 3 KB']];
+  return '<div class="card"><div class="ch"><h3>Media library</h3><span class="bdg">6 files</span></div>' +
+    '<div class="cb"><div class="mgrid">' + files.map((f) =>
+      '<div class="tile"><div class="th">&#128444;</div><div class="cap">' +
+      '<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(f[0]) + '</div>' +
+      '<div class="mm">' + esc(f[1]) + '</div></div></div>').join('') + '</div></div></div>';
+}
+function fxPacks() {
+  return '<div class="card"><div class="ch"><h3>Installed</h3></div>' +
+    '<table><thead><tr><th style="width:130px">Pack</th><th style="width:76px">Version</th>' +
+    '<th>What it seeded</th></tr></thead><tbody>' +
+    '<tr><td><b>core</b></td><td class="mono">1.2</td><td class="muted">contact autoresponder, consent label, 404, og defaults</td></tr>' +
+    '<tr><td><b>saas</b></td><td class="mono">1.2</td><td class="muted">13 email templates</td></tr></tbody></table></div>';
+}
+
+// --- the actions -------------------------------------------------------------
+// One entry per control. The delegated listeners below look a name up here and
+// call it with the element, the argument the attribute carried, and the event.
+const ACTIONS = {
+  theme: () => {
+    document.body.dataset.theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
+  },
+  tab: (el, name) => { S.tab = name; render(); },
+  site: (el, path) => { void guard(loadSite(path)); },
+  addSite: () => {
+    const input = document.getElementById('addpath');
+    const path = input.value.trim();
+    if (path === '') return;
+    void guard((async () => {
+      const res = await post('/api/workspace/add', { path: path });
+      const err = document.getElementById('adderr');
+      if (!res.ok) { err.style.display = ''; err.textContent = res.body.error || 'could not add that path'; return; }
+      input.value = '';
+      S.sites = res.body.sites || [];
+      await loadSite(res.body.path);
+    })());
+  },
+  removeSite: () => {
+    void guard((async () => {
+      const res = await post('/api/workspace/remove', { path: S.path });
+      S.sites = res.body.sites || [];
+      S.path = null;
+      S.site = null;
+      await loadWorkspace();
+    })());
+  },
+  key: (el, id) => { S.sel = id; S.message = ''; render(); },
+  edit: (el, id) => { S.tab = 'Content'; S.sel = id; S.group = groupOf(id); render(); },
+  cycleEnv: () => {
+    const names = ((ready() && S.site.environments) || []).map((e) => e.name);
+    if (names.length < 2) return;
+    S.env = names[(names.indexOf(S.env) + 1) % names.length];
+    S.rows = null;
+    S.changes = null;
+    S.recent = null;
+    render();
+  },
+  env: (el, name) => { S.env = name; S.rows = null; S.changes = null; S.recent = null; render(); },
+  'list-add': (el, arg) => {
+    const id = arg;
+    const held = valueOf(id);
+    setDraft(id, (Array.isArray(held) ? held.slice() : []).concat(['']));
+    render();
+  },
+  'list-remove': (el, arg) => { listEdit(arg, (entries, i) => { entries.splice(i, 1); }); },
+  'list-up': (el, arg) => {
+    listEdit(arg, (entries, i) => {
+      if (i === 0) return;
+      const held = entries[i - 1];
+      entries[i - 1] = entries[i];
+      entries[i] = held;
+    });
+  },
+  'list-down': (el, arg) => {
+    listEdit(arg, (entries, i) => {
+      if (i >= entries.length - 1) return;
+      const held = entries[i + 1];
+      entries[i + 1] = entries[i];
+      entries[i] = held;
+    });
+  },
+  save: () => { void guard(save()); },
+  publish: () => { void guard(mountWrite('publish')); },
+  discard: () => { void guard(mountWrite('discard')); },
+  commit: () => { void guard(commit()); },
+  push: () => { void guard(push()); },
+  removePlan: (el, id) => { void guard(removeKey(id, false)); },
+  removeCancel: () => { S.removal = null; render(); },
+  removeApply: () => { void guard(removeKey(S.removal.key, true)); },
+  history: () => {
+    void guard((async () => {
+      S.history = (await api('/api/site/history' + query())).body;
+      render();
+    })());
+  },
+  recentLoad: () => {
+    void guard((async () => {
+      S.recent = (await api(mountPath('recent'))).body;
+      render();
+    })());
+  },
+  rowsLoad: () => {
+    void guard((async () => {
+      S.rows = (await api(mountPath('keys'))).body;
+      S.changes = (await api(mountPath('changes', 'status=scheduled'))).body;
+      render();
+    })());
+  },
+  health: () => {
+    void guard((async () => {
+      S.health = (await api('/api/site/health' + envQuery())).body;
+      tst('Health ran against ' + (S.health.at && S.health.at.head ? S.health.at.head : 'this checkout'));
+      render();
+    })());
+  },
+  seoLoad: () => { void guard(loadSeo()); },
+  setupLoad: () => {
+    void guard((async () => {
+      S.setup = (await api('/api/site/setup' + envQuery())).body;
+      render();
+    })());
+  },
+  verify: () => {
+    void guard((async () => {
+      S.verify = (await api('/api/site/verify' + query())).body;
+      render();
+    })());
+  },
+  declare: (el, name) => { void guard(declare([name])); },
+  declareAll: () => { void guard(declare([])); },
+  previewLoad: () => { void guard(loadPreview()); },
+  devStart: () => {
+    void guard((async () => {
+      const res = await post('/api/site/dev-start' + query(), {});
+      if (!res.ok) { S.preview = { error: res.body.error, url: '' }; render(); return; }
+      S.devlog = res.body;
+      render();
+      // A dev server takes a moment to bind, so the log and the probe follow it
+      // rather than the start call.
+      setTimeout(() => { void guard(loadDevLog().then(loadPreview)); }, 1200);
+    })());
+  },
+  devLog: () => { void guard(loadDevLog().then(render)); },
+  devStop: () => {
+    void guard((async () => {
+      S.devlog = (await post('/api/site/dev-stop' + query(), {})).body;
+      await loadPreview();
+    })());
+  },
+};
+
+const ACTIONS_CHANGE = {
+  group: (el) => { S.group = el.value; S.sel = keysInGroup(S.group)[0] || null; render(); },
+  locale: (el) => { S.locale = el.value; render(); },
+  enum: (el, id) => { setDraft(id, el.value); render(); },
+  entryDev: (el) => { void guard(updateEntry({ dev: el.value })); },
+  entryCommand: (el) => { void guard(updateEntry({ devCommand: el.value })); },
+  entryPush: (el) => { void guard(updateEntry({ pushAfterCommit: el.checked })); },
+};
+
+const ACTIONS_INPUT = {
+  search: (el) => { S.q = el.value; render(); },
+  editor: (el) => { writeEditor(el.value); },
+  text: (el, id) => { setDraft(id, el.value); softCount(el, id); paintDirty(); },
+  number: (el, id) => { setDraft(id, el.value === '' ? '' : Number(el.value)); paintDirty(); },
+  color: (el, id) => { setDraft(id, el.value); paintDirty(); },
+  list: (el, arg) => { listEdit(arg, (entries, i) => { entries[i] = el.value; }); },
+  record: (el, arg) => {
+    const cut = arg.indexOf(' ');
+    const id = arg.slice(0, cut);
+    const name = arg.slice(cut + 1);
+    const held = valueOf(id);
+    const record = Object.assign({}, (held && typeof held === 'object' && !Array.isArray(held)) ? held : {});
+    record[name] = el.value;
+    setDraft(id, record);
+    paintDirty();
+  },
+};
+
+/** A list edit that keeps the caret where it was: only the counter repaints. */
+function listEdit(arg, change) {
+  const cut = arg.indexOf(' ');
+  const id = arg.slice(0, cut);
+  const index = Number(arg.slice(cut + 1));
+  const held = valueOf(id);
+  const entries = Array.isArray(held) ? held.slice() : [];
+  change(entries, index);
+  setDraft(id, entries);
+  render();
+}
+
+/** The character counter, updated without repainting the field the caret is in. */
+function softCount(el, id) {
+  const def = keyDef(id) || {};
+  const max = def.limits ? def.limits.max : null;
+  const counter = el.parentElement && el.parentElement.querySelector('.cnt');
+  if (counter === null || counter === undefined) return;
+  counter.textContent = max === null
+    ? String(el.value.length)
+    : el.value.length + ' / ' + max + (def.limits.severity === 'hard' ? ' · hard' : '');
+  counter.className = 'cnt' + (max !== null && el.value.length > max ? ' bad' : '');
+}
+
+function groupOf(id) {
+  for (const group of groups()) if (keysInGroup(group).indexOf(id) !== -1) return group;
+  return firstGroup();
+}
+
+// --- what the actions do -----------------------------------------------------
+/** Any failure lands as a toast rather than an unhandled rejection. */
+async function guard(work) {
+  try { await work; } catch (e) {
+    if (!stale) tst(String(e && e.message ? e.message : e));
+  }
+}
+
+async function save() {
+  const values = Object.keys(S.draft).map((held) => {
+    const cut = held.indexOf(' ');
+    return { key: held.slice(cut + 1), locale: held.slice(0, cut), value: S.draft[held] };
+  });
+  if (values.length === 0) { tst('Nothing to save.'); return; }
+  if (storeBacked()) {
+    for (const value of values) {
+      const res = await post(mountPath('draft'), {
+        editor: S.editor, key: value.key, locale: value.locale, value: value.value,
+      });
+      if (!res.ok) { S.message = res.body.error || 'the store refused that draft'; render(); return; }
+    }
+    S.draft = {};
+    S.message = '';
+    tst(plural(values.length, 'draft') + ' saved');
+    render();
+    return;
+  }
+  const res = await post('/api/site/save' + query(), { values: values });
+  S.findings = res.body.findings || [];
+  if (!res.ok) {
+    // A refused save wrote nothing, so whatever was already pending still is.
+    S.message = res.body.error || 'the save was refused';
+    render();
+    return;
+  }
+  S.message = '';
+  S.draft = {};
+  // The union since the last commit, not this save alone: a second save that
+  // changes nothing must not hide the first save's files from Commit.
+  const wrote = res.body.written || [];
+  S.pending = [...new Set([...S.pending, ...wrote])];
+  S.savedKeys = [...new Set([...S.savedKeys, ...values.map((value) => value.key)])];
+  S.site.snapshot = mergedSnapshot(values);
+  tst(wrote.length === 0 ? 'Nothing changed.' : 'Wrote ' + wrote.join(', '));
+  render();
+  await loadPreview();
+}
+
+/** The snapshot as the save left it, so the page shows what is now on disk. */
+function mergedSnapshot(values) {
+  const next = JSON.parse(JSON.stringify(S.site.snapshot));
+  for (const value of values) {
+    if (next[value.locale] === undefined) next[value.locale] = {};
+    next[value.locale][value.key] = value.value;
+  }
+  return next;
+}
+
+async function commit() {
+  if (S.pending.length === 0 || S.savedKeys.length === 0) { tst('Nothing to commit.'); return; }
+  const res = await post('/api/site/commit' + query(), { files: S.pending, keys: S.savedKeys });
+  if (!res.ok) {
+    S.message = (res.body.error || 'the commit failed') + (res.body.output ? '\n' + res.body.output : '');
+    render();
+    return;
+  }
+  tst('Committed ' + res.body.short + ' — ' + res.body.subject);
+  S.pending = [];
+  S.savedKeys = [];
+  S.site.git = res.body.at || S.site.git;
+  const entry = (ready() && S.site.entry) || {};
+  if (entry.pushAfterCommit) await push();
+  else render();
+}
+
+async function push() {
+  const res = await post('/api/site/push' + query(), {});
+  if (!res.ok) {
+    S.message = (res.body.error || 'the push failed') + (res.body.output ? '\n' + res.body.output : '');
+    render();
+    return;
+  }
+  tst('Pushed.');
+  render();
+}
+
+
+async function mountWrite(route) {
+  if (S.sel === null) return;
+  const res = await post(mountPath(route), { editor: S.editor, key: S.sel, locale: S.locale });
+  if (!res.ok) { S.message = res.body.error || 'the store refused that write'; render(); return; }
+  S.message = '';
+  tst(route === 'publish' ? 'Published ' + S.sel : 'Discarded the draft for ' + S.sel);
+  render();
+}
+
+function mountPath(route, search) {
+  const query = [
+    ...(search === undefined ? [] : [search]),
+    ...(S.env === 'default' ? [] : ['env=' + encodeURIComponent(S.env)]),
+  ];
+  return '/s/' + encodeURIComponent(S.site.id) + '/api/stet/' + route +
+    (query.length === 0 ? '' : '?' + query.join('&'));
+}
+
+async function declare(names) {
+  const res = await post('/api/site/pages/declare' + query(), { names: names });
+  if (!res.ok) { tst(res.body.error || 'nothing was declared'); return; }
+  tst((res.body.lines || []).slice(-1)[0] || 'Declared.');
+  await loadWorkspace();
+  S.tab = 'SEO';
+  await loadSeo();
+}
+
+/** A key's removal: the plan first, then the same call with `apply`. */
+async function removeKey(key, apply) {
+  const res = await post('/api/site/remove' + query(), { keys: [key], apply: apply });
+  if (!res.ok) {
+    S.message = res.body.error || (apply ? 'could not remove that key' : 'could not plan that removal');
+    render();
+    return;
+  }
+  if (!apply) { S.removal = { key: key, lines: res.body.lines || [] }; render(); return; }
+  S.removal = null;
+  tst('Removed ' + key);
+  await loadWorkspace();
+}
+
+/** The SEO rules and the routes with no page record, in one call. */
+async function loadSeo() {
+  S.seo = (await api('/api/site/seo' + query())).body;
+  render();
+}
+
+/** What the dev server has printed so far, and what the launcher turned out to be. */
+async function loadDevLog() {
+  S.devlog = (await api('/api/site/dev-log' + query())).body;
+}
+
+async function loadPreview() {
+  const route = S.tab === 'Content' && S.group !== null && pageNames().indexOf(S.group) !== -1
+    ? ((ready() && S.site.descriptor.pages[S.group]) || {}).route || '/'
+    : '/';
+  S.preview = (await api('/api/site/preview' + query() + '&route=' + encodeURIComponent(route))).body;
+  render();
+}
+
+async function updateEntry(patch) {
+  const res = await post('/api/workspace/update', Object.assign({ path: S.path }, patch));
+  if (!res.ok) { tst(res.body.error || 'the entry was refused'); return; }
+  S.site.entry = Object.assign({}, S.site.entry, patch);
+  tst('Saved.');
+  render();
+}
+
+// --- the delegated listeners -------------------------------------------------
+// Three listeners for the whole page: nothing here is an inline attribute, so
+// nothing here is refused by the policy the page is served under.
+function dispatch(table, event) {
+  const attribute = table === ACTIONS ? 'data-act' : table === ACTIONS_CHANGE ? 'data-act-change' : 'data-act-input';
+  const el = event.target.closest === undefined ? null : event.target.closest('[' + attribute + ']');
+  if (el === null) return;
+  const raw = el.getAttribute(attribute) || '';
+  const cut = raw.indexOf(':');
+  const name = cut === -1 ? raw : raw.slice(0, cut);
+  const arg = cut === -1 ? undefined : raw.slice(cut + 1);
+  const action = Object.prototype.hasOwnProperty.call(table, name) ? table[name] : undefined;
+  if (action === undefined) return;
+  action(el, arg, event);
+}
+
+const shell = document.getElementById('shell');
+shell.addEventListener('click', (event) => dispatch(ACTIONS, event));
+shell.addEventListener('change', (event) => dispatch(ACTIONS_CHANGE, event));
+shell.addEventListener('input', (event) => dispatch(ACTIONS_INPUT, event));
+
+// --- focus -------------------------------------------------------------------
+// A repaint replaces the field being typed in, so the caret is put back where
+// the reader left it.
+let focusKey = null;
+let focusAt = 0;
+
+/**
+ * The caret, read off the field that holds it at the moment of the repaint.
+ *
+ * The listeners below record the caret AFTER an event. A render that runs
+ * inside an `input` handler is earlier than that, so the recorded position is
+ * one keystroke stale: select all, type `T`, and the caret goes back to 0 and
+ * every later character lands before the `T`. The live element is the only
+ * position that is current. The listeners stay for the field that has since
+ * stopped being the active one.
+ */
+function captureFocus() {
+  const el = document.activeElement;
+  if (el === null || el.getAttribute === undefined) return;
+  const act = el.getAttribute('data-act-input') || el.getAttribute('data-act-change');
+  if (act === null) return;
+  focusKey = act;
+  focusAt = el.selectionStart === undefined || el.selectionStart === null ? 0 : el.selectionStart;
+}
+
+shell.addEventListener('focusin', (event) => {
+  const el = event.target;
+  const act = el.getAttribute === undefined ? null : (el.getAttribute('data-act-input') || el.getAttribute('data-act-change'));
+  focusKey = act;
+  focusAt = el.selectionStart === undefined || el.selectionStart === null ? 0 : el.selectionStart;
+});
+shell.addEventListener('keyup', (event) => {
+  const el = event.target;
+  if (el.selectionStart !== undefined && el.selectionStart !== null) focusAt = el.selectionStart;
+});
+function restoreFocus() {
+  if (focusKey === null) return;
+  const el = document.querySelector('[data-act-input="' + focusKey.replace(/"/g, '') + '"], [data-act-change="' + focusKey.replace(/"/g, '') + '"]');
+  if (el === null) return;
+  // Read BEFORE focusing: `focus()` fires `focusin`, and that listener would
+  // overwrite the position with the fresh field's own, which is not the one the
+  // reader was typing at.
+  const at = focusAt;
+  el.focus();
+  if (el.setSelectionRange !== undefined && el.type !== 'color' && el.type !== 'number') {
+    try { el.setSelectionRange(at, at); } catch (e) { /* an input that has no range */ }
+  }
+}
+
+// --- the first paint ---------------------------------------------------------
+// No token means this tab was opened by hand or carries one from an earlier
+// run: the reopen line is the whole page until the terminal's link is used.
+if (TOKEN === '') reopen();
+else void guard(loadWorkspace());
+</script>
+</body>
+</html>

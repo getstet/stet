@@ -27,6 +27,7 @@ import {
   publishFailsOnce,
   type CliHost as Host,
 } from '../conformance/cli-host.js';
+import { plural, Report } from '../cli/report.js';
 import { loadDescriptor, readBundle, resolveFromBundle } from '../src/index.js';
 
 afterAll(cleanupCliHosts);
@@ -1403,6 +1404,74 @@ describe('dispatch', () => {
     for (const c of ['init', 'scan', 'register', 'eject', 'hook install']) {
       expect(host.stdout()).toContain(c);
     }
+  });
+
+  it('help names scan among the --json commands', async () => {
+    const host = makeHost();
+    expect(await host.run('help')).toBe(0);
+    expect(host.stdout()).toContain(
+      'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor and both email commands.',
+    );
+  });
+
+  it('help carries the Dashboard group and its one command', async () => {
+    const host = makeHost();
+    expect(await host.run('help')).toBe(0);
+    expect(host.stdout()).toContain('Dashboard:');
+    expect(host.stdout()).toContain(
+      '  dev [--port N] [--no-open] [--add PATH]   the local dashboard on 127.0.0.1:4400 over your workspace of checkouts',
+    );
+  });
+});
+
+/**
+ * `report.ts`'s two small additions the dashboard's routes stand on: the
+ * structured fields a producer can attach beside a message, and the one
+ * pluralisation the six modules that spelled it inline now share.
+ */
+describe('report — structured findings and plural', () => {
+  it('carries at and slot into --json and leaves the printed message alone', () => {
+    const report = new Report();
+    report.warn('scan', 'src/x.tsx:12:4 unkeyed copy "Hello"', 'hello', {
+      at: { file: 'src/x.tsx', line: 12, col: 4 },
+    });
+    report.warn('scan', 'lib/mail.ts: welcome__headline is declared as a slot', 'welcome__headline', {
+      slot: { template: 'welcome', name: 'headline' },
+      at: { file: 'lib/mail.ts' },
+    });
+    const [located, slotted] = report.findings;
+    expect(located?.at).toEqual({ file: 'src/x.tsx', line: 12, col: 4 });
+    expect(slotted?.slot).toEqual({ template: 'welcome', name: 'headline' });
+    expect(slotted?.at).toEqual({ file: 'lib/mail.ts' });
+
+    const out: string[] = [];
+    const err: string[] = [];
+    report.emit({ stdout: (l) => out.push(l), stderr: (l) => err.push(l) });
+    expect(err).toEqual([
+      'warn: src/x.tsx:12:4 unkeyed copy "Hello"',
+      'warn: lib/mail.ts: welcome__headline is declared as a slot',
+    ]);
+  });
+
+  it('grows no field on a finding with nowhere to point', () => {
+    const report = new Report();
+    report.warn('config', 'nothing to locate');
+    report.error('store', 'nor here', 'some_key');
+    const [bare, keyed] = report.findings;
+    // The property must be ABSENT, not null: `--json` is read by a page that
+    // branches on whether a finding has a location at all.
+    expect(bare === undefined ? [] : Object.keys(bare)).toEqual(['kind', 'level', 'message']);
+    expect(keyed === undefined ? [] : Object.keys(keyed)).toEqual(['kind', 'level', 'key', 'message']);
+    expect(bare !== undefined && 'at' in bare).toBe(false);
+    expect(bare !== undefined && 'slot' in bare).toBe(false);
+  });
+
+  it('agrees a count with its noun, regular and irregular', () => {
+    expect(plural(1, 'key')).toBe('1 key');
+    expect(plural(2, 'key')).toBe('2 keys');
+    expect(plural(0, 'key')).toBe('0 keys');
+    expect(plural(1, 'entry', 'entries')).toBe('1 entry');
+    expect(plural(3, 'entry', 'entries')).toBe('3 entries');
   });
 });
 

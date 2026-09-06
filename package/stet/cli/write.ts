@@ -40,7 +40,13 @@ export function resolveEditor(flagValue: string | undefined): string {
   return editor;
 }
 
-function osUser(): string {
+/**
+ * Who the operating system says is running this. Exported because the local
+ * dashboard attributes its store writes the same way the terminal does —
+ * `dashboard:<os user>` beside `cli:<os user>` — and one reader is what keeps
+ * the two spellings of "who" from drifting.
+ */
+export function osUser(): string {
   try {
     return userInfo().username;
   } catch {

@@ -52,8 +52,23 @@ export interface CliFinding {
    * `--json` carries it as it stands.
    */
   key?: string;
+  /**
+   * Where in the host the finding sits, as structure rather than as prose in
+   * the message. The dashboard badges a finding against its file without
+   * parsing the sentence it is printed as; the message keeps the same numbers.
+   */
+  at?: { file: string; line?: number; col?: number };
+  /** The template slot a finding is about — the unread-slot warn's own pair. */
+  slot?: { template: string; name: string };
   message: string;
 }
+
+/**
+ * The structured fields a producer attaches beside the message. Passed as one
+ * optional trailing argument so the two-and-three-argument calls every command
+ * already makes are untouched.
+ */
+export type FindingLocation = Pick<CliFinding, 'at' | 'slot'>;
 
 /**
  * An actionable failure: the message is printed, the exit code is 1, and no
@@ -176,6 +191,20 @@ export function shapeOf(value: unknown): string {
 }
 
 /**
+ * A count and its noun, agreeing. The inline conditional this replaces was
+ * written out fifteen times across six modules, in three spellings of the same
+ * thought, and every one of them was a place the agreement could be got wrong
+ * in a string nobody re-reads. An irregular plural is named:
+ * `plural(1, 'entry', 'entries')`.
+ *
+ * The `(s)` family (`declared 1 page(s)`) is a different construct and stays as
+ * it is; new strings take this one.
+ */
+export function plural(count: number, one: string, many = `${one}s`): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+/**
  * A per-file block, collapsed to one count line once it stops being a list and
  * starts being a wall. Two refusals are information; twenty-nine bury the plan
  * they are printed beside — the site's eject printed a 29-line refusal block
@@ -208,12 +237,12 @@ export class Report {
   private readonly lines: string[] = [];
   private readonly payload: Record<string, unknown> = {};
 
-  error(kind: CliFindingKind, message: string, key?: string): void {
-    this.push('error', kind, message, key);
+  error(kind: CliFindingKind, message: string, key?: string, extra?: FindingLocation): void {
+    this.push('error', kind, message, key, extra);
   }
 
-  warn(kind: CliFindingKind, message: string, key?: string): void {
-    this.push('warn', kind, message, key);
+  warn(kind: CliFindingKind, message: string, key?: string, extra?: FindingLocation): void {
+    this.push('warn', kind, message, key, extra);
   }
 
   /** A line of the human report. `--json` never sees these. */
@@ -273,7 +302,24 @@ export class Report {
     return this.failed ? 1 : 0;
   }
 
-  private push(level: CliLevel, kind: CliFindingKind, message: string, key?: string): void {
-    this.findings.push(key === undefined ? { kind, level, message } : { kind, level, key, message });
+  /**
+   * The structured fields are SPREAD rather than assigned, so a finding with no
+   * location carries no `at` property at all: `--json` must not grow a null
+   * field on every finding that has nowhere to point.
+   */
+  private push(
+    level: CliLevel,
+    kind: CliFindingKind,
+    message: string,
+    key?: string,
+    extra?: FindingLocation,
+  ): void {
+    this.findings.push({
+      kind,
+      level,
+      ...(key === undefined ? {} : { key }),
+      ...(extra ?? {}),
+      message,
+    });
   }
 }

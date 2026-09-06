@@ -50,7 +50,7 @@ import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
 import { filesForGlobs, walk } from './files.js';
 import { proposeHtml } from './html-host.js';
 import type { CliIo } from './main.js';
-import { clip, posixRelative, CliError, Report, UsageError } from './report.js';
+import { clip, plural, posixRelative, CliError, Report, UsageError } from './report.js';
 
 // --- The dirent walk --------------------------------------------------------
 
@@ -438,7 +438,7 @@ function boundFields(
   files: string[],
 ): Map<string, { title?: string; description?: string }> {
   const bound = new Map<string, { title?: string; description?: string }>();
-  const set = proposeHtml(cwd, files, { version: 1, keys: {} }, {});
+  const set = proposeHtml(cwd, files);
   for (const mark of set.claimed) {
     const field =
       mark.kind === 'element' && mark.tag === 'title'
@@ -737,22 +737,11 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io, { json });
 
-  const roots = detectPagesRoots(io.cwd, { html: isHtmlHost(config) });
-  if (roots.length === 0) {
+  const set = proposeForHost(io.cwd, config, descriptor);
+  if (set === null) {
     report.line('pages scan: no routing convention detected — expected src/pages, app/ or pages/');
     return report.emit(io, { json });
   }
-
-  const set = proposePages(
-    io.cwd,
-    roots,
-    {
-      pages: descriptor.pages ?? {},
-      keys: descriptor.keys,
-      values: committedValues(io.cwd, config),
-    },
-    { seed: true, bind: true, config },
-  );
   printPages(report, set);
 
   if (!apply) {
@@ -771,8 +760,33 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
   // half-parsed snapshot would write the loss to disk.
   const snapshot = snapshotOf(config, io.cwd, report);
   if (!snapshot) return report.emit(io, { json });
-  applyPages(io, config, descriptor, snapshot, set, names, report);
+  applyPages(io.cwd, config, descriptor, snapshot, set, names, report);
   return report.emit(io, { json });
+}
+
+/**
+ * The host's own routing convention as a proposal set, seeded and bound —
+ * `pages scan`'s propose half, cut out so the local dashboard's Declare button
+ * runs the same walk rather than a second one. `null` where the host carries no
+ * routing convention at all; the caller says so in its own words.
+ */
+export function proposeForHost(
+  cwd: string,
+  config: StetConfig,
+  descriptor: Descriptor,
+): PageProposalSet | null {
+  const roots = detectPagesRoots(cwd, { html: isHtmlHost(config) });
+  if (roots.length === 0) return null;
+  return proposePages(
+    cwd,
+    roots,
+    {
+      pages: descriptor.pages ?? {},
+      keys: descriptor.keys,
+      values: committedValues(cwd, config),
+    },
+    { seed: true, bind: true, config },
+  );
 }
 
 /**
@@ -885,9 +899,13 @@ function selectPages(set: PageProposalSet, names: string[]): PageProposal[] {
  * must typecheck in the host's editor without an intervening `stet upgrade`,
  * and `generateRegistry` stamps the WHOLE descriptor's source hash, so even a
  * page record alone would leave `stet check`'s currency gate red without it.
+ *
+ * It takes the checkout PATH rather than an io: the working directory was the
+ * only thing it read from one, and the local dashboard's Declare route holds a
+ * path with no terminal behind it.
  */
-function applyPages(
-  io: CliIo,
+export function applyPages(
+  cwd: string,
   config: StetConfig,
   descriptor: Descriptor,
   snapshot: Snapshot,
@@ -989,7 +1007,7 @@ function applyPages(
   let written: string[] = [];
   let unchanged: string[] = [];
   try {
-    ({ written, unchanged } = writePlanned(planRepoForms(io.cwd, config, descriptor, snapshot, report)));
+    ({ written, unchanged } = writePlanned(planRepoForms(cwd, config, descriptor, snapshot, report)));
   } catch (error) {
     rethrowBatchFailure('pages scan --apply', error);
   }
@@ -1010,9 +1028,9 @@ function applyPages(
       (proposal) => proposal.bound?.title === undefined || proposal.bound?.description === undefined,
     ).length;
     report.line(
-      `declared ${landed.length} page${landed.length === 1 ? '' : 's'}, ` +
-        `bound ${fields} field${fields === 1 ? '' : 's'}; ` +
-        `${short} page${short === 1 ? '' : 's'} lack a marked title or description — stet seo check names them`,
+      `declared ${plural(landed.length, 'page')}, ` +
+        `bound ${plural(fields, 'field')}; ` +
+        `${plural(short, 'page')} lack a marked title or description — stet seo check names them`,
     );
     return;
   }

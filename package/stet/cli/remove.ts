@@ -62,6 +62,36 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
   const snapshot = snapshotOf(config, io.cwd, report);
   if (!snapshot) return report.emit(io);
 
+  const { cleaned, cleanedSnapshot } = planRemoval(io.cwd, config, descriptor, snapshot, keys, report);
+
+  if (!flag(values, 'write')) {
+    report.line('plan only — run with --write to apply');
+    return report.emit(io);
+  }
+
+  apply(io, config, cleaned, cleanedSnapshot, report);
+  report.line(`removed ${keys.length} key(s); run stet check`);
+  return report.emit(io);
+}
+
+/**
+ * The removal's PLAN: the post-removal forms, and every line and warning the
+ * command prints about them. Split out of `runRemove` so the local dashboard's
+ * Remove control shows the terminal's own plan rather than a second rendering
+ * of it, and applies the same cleaned forms.
+ *
+ * It prints into the report it is handed and writes nothing. The one line it
+ * does NOT print is `plan only — run with --write to apply`, which belongs to
+ * the command's flag rather than to the plan.
+ */
+export function planRemoval(
+  cwd: string,
+  config: StetConfig,
+  descriptor: Descriptor,
+  snapshot: Snapshot,
+  keys: string[],
+  report: Report,
+): { cleaned: Descriptor; cleanedSnapshot: Snapshot } {
   // All-or-nothing begins at the arguments: one unknown key refuses the whole
   // run, with nothing printed as removable. `hasOwn` rather than `in`, because
   // the key name arrives off the command line and `constructor` is the one
@@ -85,7 +115,7 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
   const warnings = refuseDanglingReferences(cleaned);
 
   // The plan, on the LINE channel: a plan is scriptable output, not findings.
-  const surfaces = surfaceSources(io.cwd, config);
+  const surfaces = surfaceSources(cwd, config);
   for (const { key, def } of removing) {
     report.line(`remove ${key} (${def.shape}, ${def.target})`);
     for (const locale of Object.keys(snapshot).sort()) {
@@ -170,12 +200,7 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
   // names each one the batch will strip. The text stays where it is; only the
   // attribute goes.
   if (isHtmlHost(config)) {
-    const set = proposeHtml(
-      io.cwd,
-      filesForGlobs(io.cwd, config.managedSurfaces),
-      descriptor,
-      snapshot,
-    );
+    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces));
     const marks = set.claimed.filter((mark) => keys.includes(mark.key));
     if (marks.length > 0) {
       for (const mark of marks) {
@@ -205,14 +230,7 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
     report.warn('config', slotRemedy(cleaned, warning));
   }
 
-  if (!flag(values, 'write')) {
-    report.line('plan only — run with --write to apply');
-    return report.emit(io);
-  }
-
-  apply(io, config, cleaned, cleanedSnapshot, report);
-  report.line(`removed ${keys.length} key(s); run stet check`);
-  return report.emit(io);
+  return { cleaned, cleanedSnapshot };
 }
 
 /**
