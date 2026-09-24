@@ -22,7 +22,7 @@ import { runDoctor } from './doctor.js';
 import { runEject } from './eject.js';
 import { runEmailExtract } from './email-extract.js';
 import { runEmailVerify } from './email-verify.js';
-import { runHookInstall } from './hook.js';
+import { runHookInstall, runHookRemove } from './hook.js';
 import { runInit } from './init.js';
 import { packageVersion } from './installed.js';
 import { runPagesScan } from './pages.js';
@@ -65,6 +65,11 @@ export interface CliIo {
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const command = argv[0];
   const rest = argv.slice(1);
+  const help = commandHelp(argv);
+  if (help !== null) {
+    io.stdout(help);
+    return 0;
+  }
   try {
     switch (command) {
       case undefined:
@@ -91,18 +96,19 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case 'eject':
         return await runEject(rest, io);
       case 'hook': {
-        // Two-token, like `seo`: `install` is its only subcommand today, so a
-        // bare or wrong `stet hook` teaches the form rather than guessing.
+        // Two-token, like `email`: both subcommands exist, so a bare or
+        // misspelled `stet hook` lists them rather than guessing at one.
         const sub = rest[0];
-        if (sub !== 'install') {
-          throw new UsageError(
-            sub === undefined ? 'stet hook install' : `stet hook has one subcommand, install — got "${sub}"`,
-          );
-        }
-        return await runHookInstall(rest.slice(1), io);
+        if (sub === 'install') return await runHookInstall(rest.slice(1), io);
+        if (sub === 'remove') return await runHookRemove(rest.slice(1), io);
+        throw new UsageError(
+          sub === undefined
+            ? 'stet hook install | stet hook remove'
+            : `stet hook has two subcommands, install and remove — got "${sub}"`,
+        );
       }
       case 'agents': {
-        // Two-token, like `hook`: `install` is its only subcommand today, so a
+        // Two-token, like `seo`: `install` is its only subcommand today, so a
         // bare or wrong `stet agents` teaches the form rather than guessing.
         const sub = rest[0];
         if (sub !== 'install') {
@@ -196,6 +202,40 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
   }
 }
 
+/** The commands whose second word is part of the name `--help` asks about. */
+const TWO_TOKEN = new Set(['hook', 'agents', 'pages', 'email', 'seo']);
+
+/**
+ * `stet <command> --help`: that command's own lines of the usage, then a
+ * pointer at the whole of it — or null where the arguments ask for no help, or
+ * name no command the usage lists, and the dispatch answers instead. Read out
+ * of `usage()` so a command's help can never disagree with the list.
+ */
+export function commandHelp(argv: string[]): string | null {
+  const cut = argv.indexOf('--');
+  const head = cut === -1 ? argv : argv.slice(0, cut);
+  if (!head.includes('--help') && !head.includes('-h')) return null;
+  const words = head.filter((word) => !word.startsWith('-'));
+  const first = words[0];
+  if (first === undefined) return null;
+  const second = words[1];
+  const name = TWO_TOKEN.has(first) && second !== undefined ? `${first} ${second}` : first;
+  const lines = usage().split('\n');
+  const picked: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? '';
+    if (line !== `  ${name}` && !line.startsWith(`  ${name} `)) continue;
+    picked.push(line);
+    // An entry that wraps continues on the lines indented deeper than two.
+    while (/^ {3,}\S/.test(lines[i + 1] ?? '')) {
+      i += 1;
+      picked.push(lines[i] ?? '');
+    }
+  }
+  if (picked.length === 0) return null;
+  return [...picked, '', 'stet --help lists every command.'].join('\n');
+}
+
 export function usage(): string {
   return [
     'stet — typed, versioned content keys with a committed snapshot fallback',
@@ -208,6 +248,7 @@ export function usage(): string {
     "  pages scan [--apply [names…]]   declare the host's static routes as pages; scaffold their SEO keys empty",
     '  eject --write [--verbose]  un-rewrite the host, write content back, remove the dependency; --verbose lists every parse refusal',
     '  hook install               the opt-in pre-commit gate (stet check + stet scan)',
+    '  hook remove                take this checkout out of the pre-commit gate; the last one out removes it',
     '  agents install             write the agent-routing guidance (AGENTS.md / CLAUDE.md)',
     '',
     'Email templates (the bulk adoption pair):',
@@ -284,9 +325,32 @@ if (import.meta.url === entryUrl()) {
     };
     const code = await runCli(process.argv.slice(2), io);
     rl.close();
-    process.exit(code);
+    exitWhenFlushed(code);
+  } else {
+    exitWhenFlushed(await runCli(process.argv.slice(2), io));
   }
-  process.exit(await runCli(process.argv.slice(2), io));
+}
+
+/**
+ * Exit with `code` once stdout and stderr have handed everything written to
+ * them to the operating system.
+ *
+ * On a pipe both streams are asynchronous, and `process.exit` drops whatever is
+ * still queued: `stet scan --json | wc -c` read 65536 bytes of a payload five
+ * times that size. A write's callback runs after every earlier write on the
+ * same stream has finished, so the empty write's callback is the moment the
+ * output is out. The exit stays explicit, so a command that leaves a handle
+ * open still ends.
+ */
+function exitWhenFlushed(code: number): void {
+  process.exitCode = code;
+  let open = 2;
+  const done = (): void => {
+    open -= 1;
+    if (open === 0) process.exit(code);
+  };
+  process.stdout.write('', done);
+  process.stderr.write('', done);
 }
 
 /** The resolved URL of the file Node was pointed at, or null when there is none. */

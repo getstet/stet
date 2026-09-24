@@ -79,6 +79,8 @@ npx stet hook install                    # the pre-commit gate
   own renderer.
 - **A real exit.** `stet eject` un-rewrites your source, writes the content
   back, and removes the dependency. Adoption is reversible by construction.
+  `stet hook remove` takes a checkout out of the pre-commit gate and leaves stet
+  installed.
 
 ## Dashboard
 
@@ -97,12 +99,13 @@ dev` inside a checkout adds that checkout to the list; `--add <path>` adds one
 from anywhere else.
 
 On a snapshot-only project the page saves through the same gate and the same
-all-or-nothing write batch the terminal uses, then commits and pushes the files
-that batch wrote. On a store-backed project it writes drafts and publishes them
-through the project's own mounted API, against the environment selected in the
-header. Health runs `check`, `doctor`, `scan` and `audit` in the same process;
-the SEO tab runs `seo check` and `pages scan`; Setup runs `stet upgrade
---dry-run`.
+all-or-nothing write batch the terminal uses, then commits the stet files the
+checkout holds uncommitted and pushes the commit. On a store-backed project it
+writes drafts and publishes them through the project's own mounted API, against
+the environment selected in the header. Health runs `check`, `doctor`, `scan`
+and `audit` in the same process; the SEO tab runs `seo check` and `pages scan`;
+Setup runs `stet upgrade --dry-run`. Every command answers `--help` with its own
+usage.
 
 The server binds `127.0.0.1` and nothing else, and it has no identity model. A
 token is minted per run, carried in the URL the terminal prints, and taken out

@@ -8,8 +8,9 @@
  * that DO need a socket — the bind address, the Host check through the adapter,
  * and the page's own headers — use `node:net`, which the guard does not touch.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -22,16 +23,18 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:http';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 import { JSDOM, VirtualConsole } from 'jsdom';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
-import { cleanupCliHosts, fakeFetch, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
+import { cleanupCliHosts, fakeFetch, htmlFixture, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
 import { cleanupEmailHosts, makeEmailHost } from './helpers/email-host.js';
+import { builtBinExists, installStetShim } from './helpers/stet-shim.js';
 import { writeJsonDeterministic } from '../cli/artifacts.js';
 import { check } from '../cli/check.js';
 import { loadConfig } from '../cli/config.js';
@@ -40,11 +43,15 @@ import { Report } from '../cli/report.js';
 import {
   captured,
   createDevHandler,
+  stopEveryChild,
   withEnvFilesHint,
   type DevContext,
 } from '../cli/dev-routes.js';
+import { packageRoot } from '../cli/installed.js';
 import { dashboardPage, runDev, startDevServer, type DevServerHandle } from '../cli/dev.js';
-import { git, gitRun, gitState } from '../cli/git.js';
+import { git, gitData, gitRun, gitState, operationInProgress, uncommittedPaths } from '../cli/git.js';
+import { runHookInstall } from '../cli/hook.js';
+import { gone } from '../cli/liveness.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptor, loadSnapshot } from '../src/index.js';
@@ -232,6 +239,187 @@ describe('git', () => {
   });
 });
 
+/** The snapshot's first key set to `value` — one line, so two branches setting it conflict. */
+function setHeadline(cwd: string, value: string): void {
+  const file = join(cwd, 'content/defaults.json');
+  const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+  snapshot.default['hero_headline'] = value;
+  writeFileSync(file, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * A checkout left part-way through a git operation, the snapshot in conflict:
+ * a merge, a cherry-pick or a revert that stopped on it, or a rebase stopped
+ * by `edit` with nothing in conflict at all.
+ */
+function midOperation(kind: 'merge' | 'cherry-pick' | 'revert' | 'rebase', host: CliHost = gitHost()): CliHost {
+  const cwd = host.cwd;
+  const base = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).out.trim();
+  if (kind === 'rebase') {
+    setHeadline(cwd, 'One');
+    git(cwd, ['commit', '-qam', 'one']);
+    const stopped = git(cwd, ['-c', 'sequence.editor=sed -i 1s/^pick/edit/', 'rebase', '-i', 'HEAD~1']);
+    expect(stopped.code, stopped.out).toBe(0);
+    return host;
+  }
+  if (kind === 'revert') {
+    setHeadline(cwd, 'One');
+    git(cwd, ['commit', '-qam', 'one']);
+    setHeadline(cwd, 'Two');
+    git(cwd, ['commit', '-qam', 'two']);
+    expect(git(cwd, ['revert', '--no-edit', 'HEAD~1']).code).not.toBe(0);
+    return host;
+  }
+  git(cwd, ['checkout', '-qb', 'theirs']);
+  setHeadline(cwd, 'Theirs');
+  git(cwd, ['commit', '-qam', 'theirs']);
+  git(cwd, ['checkout', '-q', base]);
+  setHeadline(cwd, 'Ours');
+  git(cwd, ['commit', '-qam', 'ours']);
+  const stopped = kind === 'merge' ? git(cwd, ['merge', 'theirs']) : git(cwd, ['cherry-pick', 'theirs']);
+  expect(stopped.code).not.toBe(0);
+  return host;
+}
+
+/** A repository whose checkout is its `site/` folder, holding the mini host, committed. */
+function subfolderHost(): { top: string; cwd: string } {
+  const top = tempDir('stet-top-');
+  const host = snapshotHost();
+  const cwd = join(top, 'site');
+  cpSync(host.cwd, cwd, { recursive: true, filter: (src) => !src.split('/').includes('.git') });
+  gitInit(top);
+  return { top: realpathSync(top), cwd: realpathSync(cwd) };
+}
+
+describe('git — the reads that return data', () => {
+  it('lists the modified, staged and untracked paths under the pathspecs, and never a deletion', () => {
+    const host = gitHost();
+    setHeadline(host.cwd, 'Modified');
+    write(host.cwd, 'content/keys.ts', `${host.file('content/keys.ts')}\n// staged\n`);
+    git(host.cwd, ['add', 'content/keys.ts']);
+    write(host.cwd, 'content/extra.json', '{}\n');
+    rmSync(join(host.cwd, 'content/stet-env.d.ts'));
+    write(host.cwd, 'notes.txt', 'outside\n');
+    expect(uncommittedPaths(host.cwd, ['content'])).toEqual([
+      'content/defaults.json',
+      'content/extra.json',
+      'content/keys.ts',
+    ]);
+  });
+
+  it('reads a rename as its new path, in either column', () => {
+    const staged = gitHost();
+    git(staged.cwd, ['mv', 'content/keys.ts', 'content/registry.ts']);
+    expect(git(staged.cwd, ['status', '--porcelain']).out).toContain('R  content/keys.ts -> content/registry.ts');
+    expect(uncommittedPaths(staged.cwd, ['content'])).toEqual(['content/registry.ts']);
+
+    // Moved in the worktree and added with intent: git prints ` R new\0old\0`,
+    // the R in the second column.
+    const moved = gitHost();
+    write(moved.cwd, 'page.html', '<p>A page.</p>\n');
+    git(moved.cwd, ['add', 'page.html']);
+    git(moved.cwd, ['commit', '-qm', 'page']);
+    writeFileSync(join(moved.cwd, 'about.html'), readFileSync(join(moved.cwd, 'page.html')));
+    rmSync(join(moved.cwd, 'page.html'));
+    git(moved.cwd, ['add', '-N', 'about.html']);
+    expect(gitData(moved.cwd, ['status', '--porcelain=v1', '-z']).stdout).toBe(' R about.html\0page.html\0');
+    expect(uncommittedPaths(moved.cwd, ['.'])).toEqual(['about.html']);
+  });
+
+  it('leaves an unmerged path to the merge', () => {
+    const host = midOperation('merge');
+    expect(git(host.cwd, ['status', '--porcelain']).out).toContain('UU content/defaults.json');
+    expect(uncommittedPaths(host.cwd, ['content'])).toEqual([]);
+  });
+
+  it('answers nothing outside a repository', () => {
+    expect(uncommittedPaths(tempDir(), ['.'])).toEqual([]);
+  });
+
+  it('names a subfolder checkout’s paths relative to the checkout, not the repository', () => {
+    const { top, cwd } = subfolderHost();
+    setHeadline(cwd, 'In the subfolder');
+    expect(git(top, ['status', '--porcelain']).out).toContain(' M site/content/defaults.json');
+    expect(uncommittedPaths(cwd, ['content/defaults.json'])).toEqual(['content/defaults.json']);
+  });
+
+  it('reads a file at HEAD from a subfolder whole, with git’s warnings kept off stdout', () => {
+    const { top, cwd } = subfolderHost();
+    const committed = readFileSync(join(cwd, 'content/defaults.json'));
+    setHeadline(cwd, 'Not yet committed');
+    const read = gitData(cwd, ['show', 'HEAD:./content/defaults.json']);
+    expect(read.code).toBe(0);
+    expect(Buffer.from(read.stdout, 'utf8')).toEqual(committed);
+
+    // A branch and a tag of one name: git warns the name is ambiguous, on
+    // stderr, and answers anyway.
+    git(top, ['branch', 'twice']);
+    git(top, ['tag', 'twice']);
+    expect(git(cwd, ['show', 'twice:./content/defaults.json']).out).toContain("warning: refname 'twice' is ambiguous");
+    const warned = gitData(cwd, ['show', 'twice:./content/defaults.json']);
+    expect(warned.code).toBe(0);
+    expect(Buffer.from(warned.stdout, 'utf8')).toEqual(committed);
+  });
+
+  it('knows a cherry-pick between its picks, and a squash merge not yet committed', () => {
+    // Two picks, the first in conflict and committed by hand: CHERRY_PICK_HEAD
+    // is gone, and the sequence still waits on `--continue`.
+    const host = gitHost();
+    const cwd = host.cwd;
+    const base = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).out.trim();
+    git(cwd, ['checkout', '-qb', 'theirs']);
+    setHeadline(cwd, 'Theirs');
+    git(cwd, ['commit', '-qam', 'a']);
+    write(cwd, 'notes.txt', 'b\n');
+    git(cwd, ['add', 'notes.txt']);
+    git(cwd, ['commit', '-qm', 'b']);
+    git(cwd, ['checkout', '-q', base]);
+    setHeadline(cwd, 'Ours');
+    git(cwd, ['commit', '-qam', 'ours']);
+    expect(git(cwd, ['cherry-pick', 'theirs~1', 'theirs']).code).not.toBe(0);
+    git(cwd, ['checkout', '--theirs', '--', 'content/defaults.json']);
+    git(cwd, ['add', 'content/defaults.json']);
+    expect(git(cwd, ['commit', '-qm', 'a resolved']).code).toBe(0);
+    expect(git(cwd, ['rev-parse', '-q', '--verify', 'CHERRY_PICK_HEAD']).code).not.toBe(0);
+    expect(operationInProgress(cwd)).toBe(true);
+
+    // `merge --squash` stages the branch and leaves SQUASH_MSG, with no MERGE_HEAD.
+    const squash = gitHost();
+    const main = git(squash.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).out.trim();
+    git(squash.cwd, ['checkout', '-qb', 'feature']);
+    write(squash.cwd, 'notes.txt', 'feature\n');
+    git(squash.cwd, ['add', 'notes.txt']);
+    git(squash.cwd, ['commit', '-qm', 'feature']);
+    git(squash.cwd, ['checkout', '-q', main]);
+    expect(git(squash.cwd, ['merge', '--squash', 'feature']).code).toBe(0);
+    expect(git(squash.cwd, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).code).not.toBe(0);
+    expect(operationInProgress(squash.cwd)).toBe(true);
+  });
+
+  it('reads the status and the site without writing the index, so the terminal keeps index.lock', async () => {
+    const host = gitHost();
+    const index = join(host.cwd, '.git/index');
+    // A tracked file whose stat no longer matches the index: a status allowed
+    // to refresh the index would rewrite it.
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(host.cwd, 'content/defaults.json'), later, later);
+    const old = new Date(2000, 0, 1);
+    utimesSync(index, old, old);
+    uncommittedPaths(host.cwd, ['content']);
+    gitState(host.cwd);
+    const { handler } = handlerOver([host.cwd]);
+    await get(handler, `/api/site?site=${encodeURIComponent(realpathSync(host.cwd))}`);
+    expect(statSync(index).mtimeMs).toBe(old.getTime());
+  });
+
+  it('knows a merge, a cherry-pick, a revert and a rebase in progress, and a clean tree', () => {
+    expect(operationInProgress(gitHost().cwd)).toBe(false);
+    for (const kind of ['merge', 'cherry-pick', 'revert', 'rebase'] as const) {
+      expect(operationInProgress(midOperation(kind).cwd), kind).toBe(true);
+    }
+  });
+});
+
 describe('the workspace file', () => {
   it('reads an absent file as empty and refuses a broken one by name', () => {
     const file = workspaceFile();
@@ -354,6 +542,19 @@ describe('loadSite', () => {
     expect(site.locales).toEqual(['default']);
     expect(site.environments).toEqual([]);
     expect(site.git.head).toMatch(/^[0-9a-f]{7,}$/);
+    expect(site.project).toBe('t');
+    expect(site.router).toBe(loadConfig(host.cwd).router);
+  });
+
+  it('carries the project id and the router into the workspace listing', async () => {
+    const astro = gitHost({ config: { project: 'site-one', router: 'astro' } });
+    const html = await makeHtmlHost();
+    const { handler } = handlerOver([astro.cwd, html.cwd]);
+    const listed = (await (await handler(req('/api/workspace'))).json()) as { sites: Array<Record<string, unknown>> };
+    expect(listed.sites.map((row) => [row['project'], row['router'], row['host']])).toEqual([
+      ['site-one', 'astro', 'js'],
+      ['default', loadConfig(html.cwd).router, 'html'],
+    ]);
   });
 
   it('names the adapter as the mode on a store-backed site, and html as the host kind', async () => {
@@ -725,6 +926,33 @@ function raw(port: number, request: string): Promise<string> {
       socket.destroy();
       resolve(seen);
     });
+  });
+}
+
+/**
+ * Whether an HTTP server answers on a loopback port: a status line back for a
+ * `HEAD`. A bare connect cannot say so here: a connect to a free ephemeral port
+ * can be given that port as its own and connect to itself, and a container's
+ * port forwarder may accept on a port for a moment after its server let go.
+ */
+function answers(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let seen = '';
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write(`HEAD / HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`);
+    });
+    const done = (answered: boolean): void => {
+      socket.destroy();
+      resolve(answered);
+    };
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string) => {
+      seen += chunk;
+      if (seen.startsWith('HTTP/1.')) done(true);
+    });
+    socket.on('error', () => done(false));
+    socket.on('close', () => done(seen.startsWith('HTTP/1.')));
+    socket.setTimeout(1_000, () => done(false));
   });
 }
 
@@ -1309,6 +1537,7 @@ describe('POST /api/site/commit and /push', () => {
     });
     expect(refused.status).toBe(400);
     expect(refused.body['error']).toBe('notes.txt is not a stet-written form of this site');
+    expect(refused.body['pending']).toEqual([]);
   });
 
   it('returns a failing hook’s output and commits nothing', async () => {
@@ -1329,6 +1558,19 @@ describe('POST /api/site/commit and /push', () => {
     expect(refused.body['error']).toBe('git commit failed');
     expect(String(refused.body['output'])).toContain('nope');
     expect(gitState(host.cwd).head).toBe(head);
+  });
+
+  it('names only the changed key when HEAD’s snapshot is larger than a mebibyte', async () => {
+    const host = snapshotHost();
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    snapshot.default['blog_intro'] = 'x'.repeat(2 * 1024 * 1024);
+    writeFileSync(file, `${JSON.stringify(snapshot, null, 2)}\n`);
+    git(host.cwd, ['commit', '-qam', 'a large snapshot']);
+    setHeadline(host.cwd, 'Only this one');
+    const made = await post(handler0(host), `/api/site/commit${at(host)}`, { files: ['content/defaults.json'] });
+    expect(made.status).toBe(200);
+    expect(made.body['subject']).toBe('stet: 1 key updated — hero_headline');
   });
 
   it('agrees the count with the noun, and clips a long list at 72', async () => {
@@ -1497,6 +1739,450 @@ describe('POST /api/site/commit and /push', () => {
     expect(pushed.status).toBe(200);
     expect(git(bare, ['rev-parse', 'HEAD']).out.trim()).toBe(git(host.cwd, ['rev-parse', 'HEAD']).out.trim());
   });
+});
+
+/**
+ * A second page for the static-HTML twin, whose marks `index.html` does not
+ * share — so a save of an index key leaves it alone, and a conflict on it
+ * leaves the site loadable.
+ */
+const ABOUT_PAGE =
+  '<!DOCTYPE html>\n<html><body><h1>About the partner team at the lab</h1>\n' +
+  '<p>Every partner we work with signs one agreement first.</p></body></html>\n';
+
+/** Hand-written html, written after the adoption so it carries no mark. */
+const NOTES_PAGE = '<html><body><p>Working notes, mine.</p></body></html>\n';
+
+/** The keys a document carries a mark for. */
+function marksIn(cwd: string, rel: string): string[] {
+  return [...readFileSync(join(cwd, rel), 'utf8').matchAll(/data-stet="([^"]+)"/g)].map((m) => m[1] as string);
+}
+
+/** The checkout committed at `top` with `left` out of the first commit, which leaves it untracked. */
+function gitInitWithout(top: string, left: string): void {
+  git(top, ['init', '-q']);
+  git(top, ['config', 'user.email', 'dev@test']);
+  git(top, ['config', 'user.name', 'dev']);
+  git(top, ['config', 'commit.gpgsign', 'false']);
+  git(top, ['add', '-A']);
+  git(top, ['reset', '-q', '--', left]);
+  git(top, ['commit', '-qm', 'base']);
+}
+
+/** A subject as the commit route clips it. */
+const clip72 = (text: string): string => (text.length <= 72 ? text : `${text.slice(0, 71)}…`);
+
+type Kind = 'js' | 'html';
+
+/**
+ * One checkout of either host kind, committed, and the key a save changes.
+ * On the JavaScript twin that is the mini project's `hero_headline`; on the
+ * static-HTML twin a key marked in `index.html` alone. `folder` builds the
+ * checkout as that folder of its repository; `untracked` leaves the snapshot
+ * out of the first commit.
+ */
+interface Twin {
+  kind: Kind;
+  /** The checkout. */
+  cwd: string;
+  /** The repository's top — the checkout itself unless `folder` was given. */
+  top: string;
+  key: string;
+  /** What a save of `key` writes. */
+  written: string[];
+}
+
+async function twin(
+  kind: Kind,
+  opts: { folder?: string; config?: Record<string, unknown>; files?: Record<string, string>; untracked?: boolean } = {},
+): Promise<Twin> {
+  let source: string;
+  if (kind === 'js') {
+    const host = makeCliHost({ config: { project: 't', ...opts.config } });
+    const at = (rel: string): string => join(host.cwd, rel);
+    const descriptor = loadDescriptor(JSON.parse(readFileSync(at('content/descriptor.json'), 'utf8')));
+    writeJsonDeterministic(at('content/descriptor.json'), descriptor);
+    const snapshot = loadSnapshot(JSON.parse(readFileSync(at('content/defaults.json'), 'utf8')));
+    writeJsonDeterministic(at('content/defaults.json'), snapshot);
+    const registry = generateRegistry(descriptor);
+    writeFileSync(at('content/keys.ts'), registry.keysTs);
+    writeFileSync(at('content/stet-env.d.ts'), registry.dts);
+    writeFileSync(at('content/defaults.ts'), generateDefaultsModule(snapshot));
+    mkdirSync(at('lib'), { recursive: true });
+    writeFileSync(at('lib/content.ts'), 'export const copy = () => "";\n', 'utf8');
+    for (const [rel, text] of Object.entries(opts.files ?? {})) write(host.cwd, rel, text);
+    source = host.cwd;
+  } else {
+    const host = await makeHtmlHost({
+      files: { 'about.html': ABOUT_PAGE, ...opts.files },
+      register: true,
+      ...(opts.config === undefined ? {} : { config: opts.config }),
+    });
+    source = host.cwd;
+  }
+  const top = opts.folder === undefined ? source : tempDir('stet-top-');
+  const cwd = opts.folder === undefined ? source : join(top, opts.folder);
+  if (opts.folder !== undefined) cpSync(source, cwd, { recursive: true });
+  if (opts.untracked === true) gitInitWithout(top, relative(top, join(cwd, 'content/defaults.json')));
+  else gitInit(top);
+  const key =
+    kind === 'js'
+      ? 'hero_headline'
+      : (marksIn(cwd, 'index.html').filter((k) => !marksIn(cwd, 'about.html').includes(k)).sort()[0] as string);
+  expect(key).toBeDefined();
+  return {
+    kind,
+    cwd: realpathSync(cwd),
+    top: realpathSync(top),
+    key,
+    written: kind === 'js' ? ['content/defaults.json', 'content/defaults.ts'] : ['content/defaults.json', 'index.html'],
+  };
+}
+
+describe('the committable files', () => {
+  const at = (t: Twin): string => `?site=${encodeURIComponent(t.cwd)}`;
+  const porcelain = (cwd: string): string => git(cwd, ['status', '--porcelain']).out;
+  const subject = (cwd: string): string => git(cwd, ['log', '-1', '--format=%s']).out.trim();
+  const head = (cwd: string): string => git(cwd, ['rev-parse', 'HEAD']).out.trim();
+  const save = (handler: (r: Request) => Promise<Response>, t: Twin, value = 'A pending line') =>
+    post(handler, `/api/site/save${at(t)}`, { values: [{ key: t.key, value }] });
+  /** Two branches that append different lines to `rel`, merged or picked into a conflict on it. */
+  const conflictOn = (t: Twin, rel: string, how: 'merge' | 'cherry-pick'): void => {
+    const base = git(t.top, ['rev-parse', '--abbrev-ref', 'HEAD']).out.trim();
+    const file = join(t.cwd, rel);
+    const text = readFileSync(file, 'utf8');
+    git(t.top, ['checkout', '-qb', 'theirs']);
+    writeFileSync(file, `${text}// theirs\n`);
+    git(t.top, ['commit', '-qam', 'theirs']);
+    git(t.top, ['checkout', '-q', base]);
+    writeFileSync(file, `${text}// ours\n`);
+    git(t.top, ['commit', '-qam', 'ours']);
+    expect(git(t.top, how === 'merge' ? ['merge', 'theirs'] : ['cherry-pick', 'theirs']).code).not.toBe(0);
+  };
+
+  for (const kind of ['js', 'html'] as const) {
+    describe(`on the ${kind === 'js' ? 'JavaScript' : 'static-HTML'} host`, () => {
+      it('answers the saved forms on every read, across a restart and a same-value re-save (journey B18)', async () => {
+        const t = await twin(kind);
+        const { handler } = handlerOver([t.cwd]);
+        const saved = await save(handler, t);
+        expect([...(saved.body['written'] as string[])].sort()).toEqual(t.written);
+        expect(saved.body['pending']).toEqual(t.written);
+        expect((await get(handler, `/api/site${at(t)}`)).pending).toEqual(t.written);
+        // A fresh server over the same checkout: nothing remembered, the same answer.
+        expect((await get(handlerOver([t.cwd]).handler, `/api/site${at(t)}`)).pending).toEqual(t.written);
+        const again = await save(handler, t);
+        expect(again.body['written']).toEqual([]);
+        expect(again.body['pending']).toEqual(t.written);
+      });
+
+      it('leaves the forms unstaged when a hook refuses, so the operator’s next commit carries only its own file', async () => {
+        // The snapshot untracked too: it reaches the commit through `add -N`.
+        const t = await twin(kind, { untracked: true });
+        const { handler } = handlerOver([t.cwd]);
+        const saved = await save(handler, t);
+        const hook = join(t.top, '.git/hooks/pre-commit');
+        mkdirSync(dirname(hook), { recursive: true });
+        writeFileSync(hook, '#!/bin/sh\necho refusing\nexit 1\n', { mode: 0o755 });
+        const before = head(t.top);
+        const refused = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+        expect(refused.status).toBe(409);
+        expect(head(t.top)).toBe(before);
+        expect(git(t.top, ['diff', '--cached', '--name-only']).out).toBe('');
+
+        rmSync(hook);
+        write(t.top, 'mine.md', 'the operator’s own\n');
+        git(t.top, ['add', 'mine.md']);
+        git(t.top, ['commit', '-qm', 'mine']);
+        expect(git(t.top, ['show', '--name-only', '--format=', 'HEAD']).out.trim()).toBe('mine.md');
+        // The page's own commit still carries every form.
+        const made = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+        expect(made.status).toBe(200);
+        expect(made.body['pending']).toEqual([]);
+      });
+
+      it('never lists an unrelated file, an unmarked document or a deletion', async () => {
+        const t = await twin(kind);
+        write(t.cwd, 'notes.txt', 'stray\n');
+        if (kind === 'html') {
+          // Written after the adoption, so no mark: hand-written html the managed glob matches.
+          write(t.cwd, 'notes.html', NOTES_PAGE);
+          git(t.cwd, ['add', 'notes.html']);
+          git(t.cwd, ['commit', '-qm', 'notes']);
+          write(t.cwd, 'notes.html', '<html><body><p>Half a thought.</p></body></html>\n');
+          rmSync(join(t.cwd, 'about.html'));
+        } else {
+          rmSync(join(t.cwd, 'content/keys.ts'));
+        }
+        const { handler } = handlerOver([t.cwd]);
+        expect((await get(handler, `/api/site${at(t)}`)).pending).toEqual([]);
+      });
+
+      it('commits the pending forms with no keys named, titled by the key the snapshot changed', async () => {
+        const t = await twin(kind);
+        const { handler } = handlerOver([t.cwd]);
+        const saved = await save(handler, t);
+        const made = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+        expect(made.status).toBe(200);
+        expect(made.body['subject']).toBe(`stet: 1 key updated — ${t.key}`);
+        expect(made.body['pending']).toEqual([]);
+        expect(git(t.cwd, ['show', '--name-only', '--format=', 'HEAD']).out.trim().split('\n').sort()).toEqual(t.written);
+      });
+
+      it('titles a commit that changes no value by its files', async () => {
+        const t = await twin(kind);
+        const rel = kind === 'js' ? 'content/keys.ts' : 'content/descriptor.json';
+        write(t.cwd, rel, `${readFileSync(join(t.cwd, rel), 'utf8')}${kind === 'js' ? '// a comment\n' : '\n'}`);
+        const { handler } = handlerOver([t.cwd]);
+        expect((await get(handler, `/api/site${at(t)}`)).pending).toEqual([rel]);
+        const made = await post(handler, `/api/site/commit${at(t)}`, { files: [rel] });
+        expect(made.status).toBe(200);
+        expect(subject(t.cwd)).toBe(`stet: 1 file updated — ${rel}`);
+      });
+
+      it('names every key an untracked snapshot holds, clipped at 72', async () => {
+        const t = await twin(kind, { untracked: true });
+        expect(porcelain(t.cwd)).toContain('?? content/defaults.json');
+        const { handler } = handlerOver([t.cwd]);
+        expect((await get(handler, `/api/site${at(t)}`)).pending).toEqual(['content/defaults.json']);
+        const made = await post(handler, `/api/site/commit${at(t)}`, { files: ['content/defaults.json'] });
+        expect(made.status).toBe(200);
+        const snapshot = JSON.parse(readFileSync(join(t.cwd, 'content/defaults.json'), 'utf8')) as Record<string, object>;
+        const keys = [...new Set(Object.values(snapshot).flatMap((block) => Object.keys(block)))].sort();
+        expect(keys.length).toBeGreaterThan(1);
+        expect(subject(t.cwd)).toBe(clip72(`stet: ${keys.length} keys updated — ${keys.join(', ')}`));
+      });
+
+      it('uses the checkout’s own paths where the checkout is a folder of its repository (journey B18)', async () => {
+        const t = await twin(kind, { folder: 'site' });
+        const { handler } = handlerOver([t.cwd]);
+        const saved = await save(handler, t);
+        expect(saved.body['pending']).toEqual(t.written);
+        const made = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+        expect(made.status).toBe(200);
+        expect(made.body['pending']).toEqual([]);
+        expect(git(t.top, ['show', '--name-only', '--format=', 'HEAD']).out.trim().split('\n').sort()).toEqual(
+          t.written.map((rel) => `site/${rel}`),
+        );
+      });
+
+      it('commits a form the config spells with ./ (journey B18)', async () => {
+        const t = await twin(kind, {
+          ...(kind === 'html' ? { folder: 'site' } : {}),
+          config: { descriptorPath: './content/descriptor.json', snapshotPath: './content/defaults.json' },
+        });
+        const { handler } = handlerOver([t.cwd]);
+        const saved = await save(handler, t);
+        expect(saved.body['pending']).toContain('content/defaults.json');
+        const made = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+        expect(made.status).toBe(200);
+        expect(made.body['pending']).toEqual([]);
+        expect(porcelain(t.top)).toBe('');
+      });
+
+      it('refuses a stale list naming a form committed in the terminal since, or deleted, and commits nothing', async () => {
+        const t = await twin(kind);
+        const { handler } = handlerOver([t.cwd]);
+        const saved = await save(handler, t);
+        const stale = saved.body['pending'] as string[];
+        const other = stale.find((rel) => rel !== 'content/defaults.json') as string;
+        git(t.cwd, ['commit', '-qm', 'from the terminal', '--', other]);
+        const before = head(t.cwd);
+        const refused = await post(handler, `/api/site/commit${at(t)}`, { files: stale });
+        expect(refused.status).toBe(400);
+        expect(refused.body['error']).toBe(`${other} has nothing to commit`);
+        expect(refused.body['pending']).toEqual(['content/defaults.json']);
+        expect(head(t.cwd)).toBe(before);
+
+        rmSync(join(t.cwd, other));
+        const deleted = await post(handler, `/api/site/commit${at(t)}`, { files: ['content/defaults.json', other] });
+        expect(deleted.status).toBe(400);
+        // A deleted document no longer carries the mark that made it stet's, so
+        // it is refused as no form at all; a codegen file is a form by its path.
+        expect(deleted.body['error']).toBe(
+          kind === 'js' ? `${other} has nothing to commit` : `${other} is not a stet-written form of this site`,
+        );
+        expect(head(t.cwd)).toBe(before);
+      });
+
+      it('titles a commit without the snapshot by its files, and leaves the snapshot pending', async () => {
+        const t = await twin(kind);
+        const { handler } = handlerOver([t.cwd]);
+        await save(handler, t);
+        const other = t.written.find((rel) => rel !== 'content/defaults.json') as string;
+        const made = await post(handler, `/api/site/commit${at(t)}`, { files: [other] });
+        expect(made.status).toBe(200);
+        expect(subject(t.cwd)).toBe(`stet: 1 file updated — ${other}`);
+        expect(made.body['pending']).toEqual(['content/defaults.json']);
+      });
+
+      it('leaves a conflicted form out, and refuses a commit while the merge runs', async () => {
+        const t = await twin(kind);
+        const rel = kind === 'js' ? 'content/keys.ts' : 'about.html';
+        conflictOn(t, rel, 'merge');
+        const { handler } = handlerOver([t.cwd]);
+        expect((await get(handler, `/api/site${at(t)}`)).pending).toEqual([]);
+        const refused = await post(handler, `/api/site/commit${at(t)}`, { files: [rel] });
+        expect(refused.status).toBe(409);
+        expect(refused.body['error']).toBe('a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal');
+        expect(refused.body['pending']).toEqual([]);
+        expect(porcelain(t.cwd)).toContain(`UU ${rel}`);
+      });
+
+      for (const how of ['merge', 'cherry-pick'] as const) {
+        it(`stages nothing into a conflicted ${how}, even after a save`, async () => {
+          const t = await twin(kind);
+          const rel = kind === 'js' ? 'content/keys.ts' : 'about.html';
+          conflictOn(t, rel, how);
+          const { handler } = handlerOver([t.cwd]);
+          const saved = await save(handler, t);
+          expect(saved.status).toBe(200);
+          expect(saved.body['pending']).toEqual(t.written);
+          const before = head(t.cwd);
+          const refused = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+          // The forms stay unstaged: `git add` never ran into the operation's index.
+          const status = porcelain(t.cwd);
+          for (const form of t.written) expect(status).toContain(` M ${form}`);
+          expect(status).toContain(`UU ${rel}`);
+          expect(refused.status).toBe(409);
+          expect(refused.body['error']).toBe('a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal');
+          expect(head(t.cwd)).toBe(before);
+        });
+      }
+
+      it('refuses an empty list, carrying the pending forms', async () => {
+        const t = await twin(kind);
+        const { handler } = handlerOver([t.cwd]);
+        await save(handler, t);
+        const refused = await post(handler, `/api/site/commit${at(t)}`, { files: [] });
+        expect(refused.status).toBe(400);
+        expect(refused.body).toEqual({ error: 'files is required', pending: t.written });
+      });
+
+      for (const folder of [undefined, 'site'] as const) {
+        it(`lets the checkout’s own hook select the staged files by glob${folder === undefined ? '' : ' from a subfolder checkout'} (journey B18)`, async () => {
+          const t = await twin(kind, folder === undefined ? {} : { folder });
+          const glob = kind === 'js' ? '*.json' : '*.html';
+          const hooks = join(t.top, '.git', 'hooks');
+          mkdirSync(hooks, { recursive: true });
+          writeFileSync(
+            join(hooks, 'pre-commit'),
+            '#!/bin/sh\necho "literal=${GIT_LITERAL_PATHSPECS-unset}"\n' +
+              `staged=$(git diff --cached --name-only -- '${glob}')\n` +
+              'if [ -n "$staged" ]; then echo "refusing: $staged"; exit 1; fi\n',
+            { mode: 0o755 },
+          );
+          const { handler } = handlerOver([t.cwd]);
+          const saved = await save(handler, t);
+          const before = head(t.cwd);
+          const refused = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+          expect(refused.status).toBe(409);
+          expect(String(refused.body['output'])).toContain('literal=unset');
+          expect(String(refused.body['output'])).toContain('refusing: ');
+          expect(refused.body['pending']).toEqual(t.written);
+          expect(head(t.cwd)).toBe(before);
+        });
+      }
+
+      it('titles a commit repairing a null locale block with every key on disk', async () => {
+        const t = await twin(kind, { config: { locales: { default: 'default', enabled: ['default', 'de'] } } });
+        const file = join(t.cwd, 'content/defaults.json');
+        const snapshot = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+        writeFileSync(file, `${JSON.stringify({ ...snapshot, de: null }, null, 2)}\n`);
+        git(t.cwd, ['commit', '-qam', 'a null block']);
+        const repaired = { ...snapshot, de: { [t.key]: 'Eine Zeile' } };
+        writeFileSync(file, `${JSON.stringify(repaired, null, 2)}\n`);
+        const { handler } = handlerOver([t.cwd]);
+        const made = await post(handler, `/api/site/commit${at(t)}`, { files: ['content/defaults.json'] });
+        expect(made.status).toBe(200);
+        const keys = [...new Set(Object.values(repaired).flatMap((block) => Object.keys(block as object)))].sort();
+        expect(subject(t.cwd)).toBe(clip72(`stet: ${keys.length} keys updated — ${keys.join(', ')}`));
+      });
+    });
+  }
+
+  it('commits a marked p[ab].html and never stages the unmarked pb.html beside it', async () => {
+    const t = await twin('html', { files: { 'p[ab].html': ABOUT_PAGE.replace('partner team', 'bracketed team') } });
+    expect(marksIn(t.cwd, 'p[ab].html').length).toBeGreaterThan(0);
+    write(t.cwd, 'pb.html', NOTES_PAGE);
+    git(t.cwd, ['add', 'pb.html']);
+    git(t.cwd, ['commit', '-qm', 'an unmarked page']);
+    write(t.cwd, 'pb.html', '<html><body><p>Edited by hand.</p></body></html>\n');
+    const key = marksIn(t.cwd, 'p[ab].html')[0] as string;
+    const { handler } = handlerOver([t.cwd]);
+    const saved = await post(handler, `/api/site/save${at(t)}`, { values: [{ key, value: 'A bracketed line' }] });
+    expect(saved.body['pending']).toEqual(['content/defaults.json', 'p[ab].html']);
+    const made = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+    expect(made.status).toBe(200);
+    expect(porcelain(t.cwd)).toBe(' M pb.html\n');
+  });
+
+  // Root reads through mode 000, so the case proves nothing there.
+  it.skipIf(process.getuid?.() === 0)('opens a site whose managed glob holds a document it cannot read', async () => {
+    const t = await twin('html');
+    write(t.cwd, 'locked.html', NOTES_PAGE);
+    chmodSync(join(t.cwd, 'locked.html'), 0o000);
+    try {
+      const { handler } = handlerOver([t.cwd]);
+      const res = await handler(req(`/api/site${at(t)}`));
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { pending: string[] }).pending).toEqual([]);
+    } finally {
+      chmodSync(join(t.cwd, 'locked.html'), 0o644);
+    }
+  });
+
+  it('lists a document by stet’s reading of the managed glob, which git reads otherwise', async () => {
+    // `[` is a character to stet and a class to git; `**` beside a name
+    // crosses folders for stet and is a plain `*` for git.
+    for (const [glob, file] of [
+      ['[en]/*.html', '[en]/index.html'],
+      ['docs/**.html', 'docs/a/index.html'],
+    ] as const) {
+      const host = await makeHtmlHost({
+        files: { [file]: htmlFixture('index.html') },
+        register: true,
+        config: { managedSurfaces: [glob] },
+      });
+      gitInit(host.cwd);
+      const cwd = realpathSync(host.cwd);
+      const key = marksIn(cwd, file).sort()[0] as string;
+      expect(key, glob).toBeDefined();
+      const { handler } = handlerOver([cwd]);
+      const site = `?site=${encodeURIComponent(cwd)}`;
+      const saved = await post(handler, `/api/site/save${site}`, { values: [{ key, value: 'A line both readings agree on' }] });
+      expect([...(saved.body['pending'] as string[])].sort(), glob).toEqual(['content/defaults.json', file].sort());
+      const made = await post(handler, `/api/site/commit${site}`, { files: saved.body['pending'] });
+      expect(made.status, glob).toBe(200);
+      expect(git(cwd, ['status', '--porcelain']).out, glob).toBe('');
+    }
+  });
+
+  for (const kind of ['js', 'html'] as const) {
+    // The shipped gate runs the stet installed in the checkout — here the built
+    // bin, behind a resolve hook that hides `typescript`.
+    it.skipIf(!builtBinExists())(
+      `shows the shipped gate’s refusal where scan cannot load typescript, on the ${kind} host (journey B18)`,
+      async () => {
+        const t = await twin(kind, {
+          config: { copyModules: ['src/copy.ts'] },
+          files: { 'src/copy.ts': "export const copy = { tagline: 'A line of copy' };\n" },
+        });
+        installStetShim(t.cwd, { hideTypescript: true });
+        const io: CliIo = { cwd: t.cwd, env: {}, stdout: () => {}, stderr: () => {} };
+        expect(await runHookInstall([], io)).toBe(0);
+        const { handler } = handlerOver([t.cwd]);
+        const saved = await save(handler, t);
+        const before = head(t.cwd);
+        const refused = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
+        expect(refused.status).toBe(409);
+        expect(String(refused.body['output'])).toContain("stet needs 'typescript' to read your source");
+        expect(refused.body['pending']).toEqual(t.written);
+        expect(head(t.cwd)).toBe(before);
+      },
+      30_000,
+    );
+  }
 });
 
 describe('GET /api/site/history', () => {
@@ -2088,25 +2774,96 @@ function fetchOverSocket(port: number, path: string): Promise<string> {
 // --- the preview, the dev child, the static files ----------------------------
 
 describe('GET /api/site/preview', () => {
-  it('answers up with the URL and route, and down with the command that starts it', async () => {
+  it('answers up through the site’s own proxy with the route, the dev server’s URL as dev, and the channel', async () => {
     const host = snapshotHost();
     const file = workspaceFile();
     addSite(file, host.cwd);
     const path = realpathSync(host.cwd);
     updateSite(file, path, { dev: 'http://localhost:4321', devCommand: 'npm start' });
 
-    const answering = createDevHandler(contextOver(file, { fetchImpl: fakeFetch('') }));
-    const up = (await (await answering(req(`/api/site/preview?site=${encodeURIComponent(path)}&route=/about`))).json()) as any;
-    expect(up.up).toBe(true);
-    expect(up.url).toBe('http://localhost:4321/about');
-    expect(up.source).toBe('entry');
+    const ctx = contextOver(file, { fetchImpl: fakeFetch('') });
+    const answering = createDevHandler(ctx);
+    try {
+      const probe = async (): Promise<any> =>
+        (await answering(req(`/api/site/preview?site=${encodeURIComponent(path)}&route=/about`))).json();
+      const up = await probe();
+      expect(up.up).toBe(true);
+      const proxy = new URL(up.url);
+      expect(proxy.hostname).toBe('127.0.0.1');
+      expect(proxy.port).not.toBe('4321');
+      expect(proxy.pathname).toBe('/about');
+      expect(up.dev).toBe('http://localhost:4321/about');
+      expect(up.source).toBe('entry');
+      expect(up.channel).toMatch(/^[0-9a-f]{32}$/);
+      const again = await probe();
+      expect(again.url).toBe(up.url);
+      expect(again.channel).toBe(up.channel);
 
+      // The entry's dev URL moves: a new proxy, and the old port lets go.
+      updateSite(file, path, { dev: 'http://localhost:4322' });
+      const moved = await probe();
+      expect(moved.url).not.toBe(up.url);
+      expect(await answers(Number(proxy.port))).toBe(false);
+      expect(await answers(Number(new URL(moved.url).port))).toBe(true);
+
+      // The site leaves the workspace: its proxy closes with it.
+      const removed = await answering(req('/api/workspace/remove', { method: 'POST', body: { path } }));
+      expect(removed.status).toBe(200);
+      expect(await answers(Number(new URL(moved.url).port))).toBe(false);
+    } finally {
+      await stopEveryChild(ctx);
+    }
+
+    addSite(file, host.cwd);
+    updateSite(file, path, { dev: 'http://localhost:4321', devCommand: 'npm start' });
     const refusing = createDevHandler(
       contextOver(file, { fetchImpl: (async () => Promise.reject(new Error('down'))) as typeof fetch }),
     );
     const down = (await (await refusing(req(`/api/site/preview?site=${encodeURIComponent(path)}`))).json()) as any;
     expect(down.up).toBe(false);
     expect(down.start).toBe('npm start');
+    expect(down.url).toBe('http://localhost:4321/');
+  });
+
+  it('closes every proxy when the server closes', async () => {
+    const host = snapshotHost();
+    const file = workspaceFile();
+    addSite(file, host.cwd);
+    const path = realpathSync(host.cwd);
+    updateSite(file, path, { dev: 'http://localhost:4321' });
+    const handle = await startDevServer({
+      port: 0,
+      workspaceFile: file,
+      io: { cwd: tempDir(), env: {}, stdout: () => {}, stderr: () => {} },
+      token: TOKEN,
+      page: PAGE,
+      fetchImpl: fakeFetch(''),
+    });
+    const reply = await raw(
+      handle.port,
+      `GET /api/site/preview?site=${encodeURIComponent(path)} HTTP/1.1\r\nHost: 127.0.0.1:${handle.port}\r\n` +
+        `Authorization: Bearer ${TOKEN}\r\nConnection: close\r\n\r\n`,
+    );
+    const port = Number(new URL(/"url":"([^"]+)"/.exec(reply)?.[1] ?? 'http://x').port);
+    expect(await answers(port)).toBe(true);
+    await handle.close();
+    expect(await answers(port)).toBe(false);
+  });
+
+  it('names one channel on both panes', async () => {
+    const html = await makeHtmlHost();
+    const js = snapshotHost();
+    const { handler, ctx } = handlerOver([html.cwd, js.cwd]);
+    try {
+      const read = async (cwd: string): Promise<any> =>
+        (await handler(req(`/api/site/preview?site=${encodeURIComponent(realpathSync(cwd))}`))).json();
+      const a = await read(html.cwd);
+      const b = await read(js.cwd);
+      expect(a.channel).toMatch(/^[0-9a-f]{32}$/);
+      expect(b.channel).toBe(a.channel);
+    } finally {
+      await stopEveryChild(ctx);
+    }
   });
 
   it('takes the router’s own pair where the entry names none', async () => {
@@ -2136,6 +2893,19 @@ describe('GET /api/site/preview', () => {
     expect(body.url).toBe(`http://127.0.0.1:4400/s/${siteId(realpathSync(html.cwd))}/site/`);
   });
 
+  it('holds a static site’s route to a path too, and gives a bare route its slash', async () => {
+    const html = await makeHtmlHost();
+    const { handler } = handlerOver([html.cwd]);
+    const path = encodeURIComponent(realpathSync(html.cwd));
+    for (const route of ['//example.com/', 'https://example.com/x']) {
+      const res = await handler(req(`/api/site/preview?site=${path}&route=${encodeURIComponent(route)}`));
+      expect(res.status, route).toBe(400);
+      expect(((await res.json()) as { error: string }).error, route).toBe('route must be a path on the dev server');
+    }
+    const bare = (await (await handler(req(`/api/site/preview?site=${path}&route=about%2F`))).json()) as any;
+    expect(bare.url).toBe(`http://127.0.0.1:4400/s/${siteId(realpathSync(html.cwd))}/site/about/`);
+  });
+
   it('keeps ?route= on the dev server, whatever spelling it carries', async () => {
     const host = snapshotHost();
     const file = workspaceFile();
@@ -2148,7 +2918,8 @@ describe('GET /api/site/preview', () => {
       seen.push(String(input));
       return new Response('');
     }) as typeof fetch;
-    const handler = createDevHandler(contextOver(file, { fetchImpl: recording }));
+    const ctx = contextOver(file, { fetchImpl: recording });
+    const handler = createDevHandler(ctx);
 
     // The three spellings that carry a host, refused before the route is used.
     for (const route of ['//example.com/', 'https://example.com/x', '\\\\example.com', 'javascript:alert(1)']) {
@@ -2164,12 +2935,16 @@ describe('GET /api/site/preview', () => {
         req(`/api/site/preview?site=${encodeURIComponent(path)}&route=${encodeURIComponent(route)}`),
       );
       expect(res.status, route).toBe(200);
-      const body = (await res.json()) as { url: string };
-      expect(new URL(body.url).origin, route).toBe('http://localhost:4321');
+      const body = (await res.json()) as { url: string; dev: string };
+      // Framed through the site's proxy, on a port of its own, at the route.
+      expect(new URL(body.url).hostname, route).toBe('127.0.0.1');
+      expect(new URL(body.dev).origin, route).toBe('http://localhost:4321');
+      expect(new URL(body.url).pathname, route).toBe(new URL(body.dev).pathname);
     }
     // Not one probe left the dev server the entry declares.
     expect(seen.length).toBe(4);
     expect(seen.every((url) => url.startsWith('http://localhost:4321/'))).toBe(true);
+    await stopEveryChild(ctx);
   });
 
   it('settles within its own deadline when the probe ignores the abort signal', async () => {
@@ -2188,23 +2963,94 @@ describe('GET /api/site/preview', () => {
   });
 });
 
+describe('GET /api/site/marks', () => {
+  /** An adopted checkout with a folder index and a flat page, one sentence shared with index.html. */
+  async function markedSite(): Promise<CliHost> {
+    return makeHtmlHost({
+      files: {
+        'about/index.html': ABOUT_PAGE,
+        'notes.html': "<html><body><p>Working notes, mine.</p><p>We'll reply within a day.</p></body></html>\n",
+      },
+      register: true,
+    });
+  }
+  const marksOf = async (host: CliHost): Promise<any> => {
+    const { handler } = handlerOver([host.cwd]);
+    return get(handler, `/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`);
+  };
+
+  it('answers each document at the route the static arm serves it, and the page it is (journeys B17, B19)', async () => {
+    const host = await markedSite();
+    const before = await marksOf(host);
+    expect(before.documents).toEqual([
+      { file: 'about/index.html', route: '/about/', page: null },
+      { file: 'index.html', route: '/', page: null },
+      { file: 'notes.html', route: '/notes.html', page: null },
+    ]);
+
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    const after = await marksOf(host);
+    expect(after.documents).toEqual([
+      { file: 'about/index.html', route: '/about/', page: 'about' },
+      { file: 'index.html', route: '/', page: 'home' },
+      { file: 'notes.html', route: '/notes.html', page: 'notes' },
+    ]);
+
+    // Every key names the documents its mark sits in, each once.
+    for (const [key, files] of Object.entries(after.keys as Record<string, string[]>)) {
+      expect(new Set(files).size, key).toBe(files.length);
+      for (const file of files) expect(readFileSync(join(host.cwd, file), 'utf8'), key).toContain(`"${key}"`);
+    }
+    const shared = Object.entries(after.keys as Record<string, string[]>).filter(([, files]) => files.length > 1);
+    expect(shared.map(([, files]) => [...files].sort())).toEqual([['index.html', 'notes.html']]);
+  });
+
+  it('answers nothing on a JavaScript host, and 401 without the Bearer', async () => {
+    const js = snapshotHost();
+    expect(await marksOf(js)).toEqual({ documents: [], keys: {} });
+    const { handler } = handlerOver([js.cwd]);
+    const refused = await handler(
+      req(`/api/site/marks?site=${encodeURIComponent(realpathSync(js.cwd))}`, { token: null }),
+    );
+    expect(refused.status).toBe(401);
+  });
+});
+
 /**
  * Whether a process is really gone. Polled rather than asserted once: an exited
  * child stays visible to `kill(pid, 0)` as a zombie until its parent reaps it,
  * and under a loaded suite that lands after the stop returns.
  */
 async function waitGone(pid: number, ms = 5_000): Promise<boolean> {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return true;
-    }
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+  return gone(pid, ms);
 }
+
+describe('gone', () => {
+  // Linux only: the case reads `/proc`, and on macOS a zombie under a live
+  // non-reaping parent stays reachable by `kill`, while launchd reaps every
+  // orphan — the case the helper fixes does not arise there.
+  it.skipIf(process.platform !== 'linux')('counts a zombie, and a group of zombies, as ended', async () => {
+    // `sh` backgrounds a child in a group of its own, prints its pid, and execs
+    // into `sleep`, which never waits for it: the child becomes a zombie that
+    // `kill(pid, 0)` and `kill(-pid, 0)` both still reach.
+    const shell = spawn('sh', ['-c', 'setsid sleep 0.1 & echo $!; exec sleep 30'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    try {
+      const zombie = await new Promise<number>((resolve) => {
+        shell.stdout.once('data', (chunk: Buffer) => resolve(Number(chunk.toString('utf8').split('\n')[0])));
+      });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      // The premise: a zombie, and `kill` still answers for it.
+      expect(readFileSync(`/proc/${zombie}/stat`, 'utf8')).toMatch(/\) Z /);
+      expect(() => process.kill(-zombie, 0)).not.toThrow();
+
+      expect(await gone(zombie, 1_000)).toBe(true);
+      expect(await gone(-zombie, 1_000)).toBe(true);
+      expect(await gone(shell.pid as number, 200)).toBe(false);
+    } finally {
+      shell.kill('SIGKILL');
+    }
+  });
+});
 
 describe('the dev child', () => {
   /** Poll `dev-log` until the predicate holds, or give up. */
@@ -2363,8 +3209,9 @@ describe('the dev child', () => {
         `'${pidFile}'],{detached:true,stdio:'ignore'});c.unref();console.log('launched')"; true`,
       devStopCommand: `kill $(cat ${pidFile})`,
     });
-    // The probe answers up, which is what tells an exited launcher from a dead one.
-    const ctx = contextOver(file, { fetchImpl: fakeFetch('') });
+    // The probe answers while the server does, which is what tells an exited
+    // launcher from a dead one, and what the stop path waits on.
+    const ctx = contextOver(file, { fetchImpl: portFetch });
     const handler = createDevHandler(ctx);
     const query = `?site=${encodeURIComponent(path)}`;
     await post(handler, `/api/site/dev-start${query}`, {});
@@ -2383,8 +3230,136 @@ describe('the dev child', () => {
   }, 20_000);
 });
 
+/** A fetch that answers only while an HTTP server answers on the URL's port: the suite's offline guard blocks real fetches. */
+const portFetch = (async (input: RequestInfo | URL) => {
+  if (await answers(Number(new URL(String(input)).port))) return new Response('');
+  throw new Error('connection refused');
+}) as typeof fetch;
+
+describe('the server’s exit ends every dev server it started', () => {
+  /** A listening server over a workspace of `entries`, whose Start goes through its real listener. */
+  async function serverOver(
+    entries: Array<Partial<WorkspaceEntry>>,
+    fetchImpl: typeof fetch,
+  ): Promise<{ handle: DevServerHandle; paths: string[]; start(path: string): Promise<number> }> {
+    const file = workspaceFile();
+    const paths: string[] = [];
+    for (const entry of entries) {
+      const host = snapshotHost();
+      addSite(file, host.cwd);
+      const path = realpathSync(host.cwd);
+      updateSite(file, path, entry);
+      paths.push(path);
+    }
+    const handle = await startDevServer({
+      port: 0,
+      workspaceFile: file,
+      io: { cwd: tempDir(), env: {}, stdout: () => {}, stderr: () => {} },
+      token: TOKEN,
+      page: PAGE,
+      fetchImpl,
+    });
+    const start = async (path: string): Promise<number> => {
+      const reply = await raw(
+        handle.port,
+        `POST /api/site/dev-start?site=${encodeURIComponent(path)} HTTP/1.1\r\nHost: 127.0.0.1:${handle.port}\r\n` +
+          `Authorization: Bearer ${TOKEN}\r\ncontent-length: 2\r\nConnection: close\r\n\r\n{}`,
+      );
+      expect(reply.split('\r\n')[0]).toContain('200');
+      return Number(/"pid":(\d+)/.exec(reply)?.[1]);
+    };
+    return { handle, paths, start };
+  }
+
+  /** Wait for `holds`, polling, up to `ms`. */
+  async function waitFor(holds: () => boolean | Promise<boolean>, ms = 8_000): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await holds()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+  }
+
+  /**
+   * A launcher that spawns a detached server writing its pid to `pidFile` and
+   * listening on `port`, then `after`. The server shuts down 700 ms after
+   * SIGTERM, as a dev server finishing its requests does, so the port is held
+   * for a moment after the stop command returns.
+   */
+  const launcher = (port: number, pidFile: string, after: string): string =>
+    `node -e "const c=require('child_process').spawn(process.execPath,['-e',` +
+    `'require(\\"fs\\").writeFileSync(process.argv[1],String(process.pid));process.on(\\"SIGTERM\\",()=>setTimeout(()=>process.exit(0),700));require(\\"http\\").createServer((q,s)=>s.end()).listen(${port},\\"127.0.0.1\\")',` +
+    `'${pidFile}'],{detached:true,stdio:'ignore'});c.unref();console.log('launched')"; ${after}`;
+
+  for (const [name, port, after] of [
+    ['exits once it has spawned', 45_931, 'true'],
+    ['keeps running beside', 45_932, 'sleep 30'],
+  ] as const) {
+    it(`ends a server its launcher left behind, a launcher that ${name} it, within five seconds of close`, async () => {
+      expect(await answers(port)).toBe(false);
+      const pidDir = tempDir('stet-pid-');
+      const pidFile = join(pidDir, 'server.pid');
+      const { handle, paths, start } = await serverOver(
+        [{ dev: `http://127.0.0.1:${port}`, devCommand: launcher(port, pidFile, after), devStopCommand: `kill $(cat ${pidFile})` }],
+        portFetch,
+      );
+      await start(paths[0] as string);
+      expect(await waitFor(() => existsSync(pidFile))).toBe(true);
+      expect(await waitFor(() => answers(port))).toBe(true);
+      const began = Date.now();
+      await handle.close();
+      expect(Date.now() - began).toBeLessThan(5_500);
+      expect(await answers(port)).toBe(false);
+    }, 20_000);
+  }
+
+  it('leaves the operator’s own server alone where the launcher failed on its port', async () => {
+    const port = 45_933;
+    expect(await answers(port)).toBe(false);
+    const theirs = createServer((_, res) => res.end('theirs'));
+    await new Promise<void>((resolve) => theirs.listen(port, '127.0.0.1', () => resolve()));
+    try {
+      const marker = join(tempDir('stet-marker-'), 'stop-ran');
+      const { handle, paths, start } = await serverOver(
+        [{ dev: `http://127.0.0.1:${port}`, devCommand: 'exit 1', devStopCommand: `touch ${marker}` }],
+        portFetch,
+      );
+      const pid = await start(paths[0] as string);
+      // The launcher has failed on its own before the close.
+      expect(await waitFor(() => gone(pid, 0))).toBe(true);
+      await handle.close();
+      expect(existsSync(marker)).toBe(false);
+      expect(await answers(port)).toBe(true);
+    } finally {
+      theirs.closeAllConnections();
+      await new Promise<void>((resolve) => theirs.close(() => resolve()));
+    }
+  }, 20_000);
+
+  it('ends two children that trap SIGTERM together', async () => {
+    const trap = `node -e "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"; true`;
+    const { handle, paths, start } = await serverOver([{ devCommand: trap }, { devCommand: trap }], fakeFetch(''));
+    const pids = [await start(paths[0] as string), await start(paths[1] as string)];
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const began = Date.now();
+    await handle.close();
+    expect(Date.now() - began).toBeLessThan(3_500);
+    for (const pid of pids) expect(await gone(-pid, 0)).toBe(true);
+  }, 20_000);
+});
+
 describe('the static-HTML site’s own files', () => {
   const at = (host: CliHost, rel: string): string => `/s/${siteId(realpathSync(host.cwd))}/site/${rel}`;
+
+  /** The html host with its context, for the channel it minted; `files` join the shared ones. */
+  async function htmlServerWithContext(
+    files: Record<string, string> = {},
+  ): Promise<{ host: CliHost; handler: (r: Request) => Promise<Response>; ctx: DevContext }> {
+    const host = await makeHtmlHost({ files });
+    const { handler, ctx } = handlerOver([host.cwd]);
+    return { host, handler, ctx };
+  }
 
   async function htmlServer(): Promise<{ host: CliHost; handler: (r: Request) => Promise<Response> }> {
     const host = await makeHtmlHost({
@@ -2429,6 +3404,63 @@ describe('the static-HTML site’s own files', () => {
       'application/manifest+json',
     );
     expect((await handler(req(at(host, 'clip.mp4'), { token: null }))).headers.get('content-type')).toBe('video/mp4');
+  });
+
+  // 8.2 — the preview agent, served and added to documents as they are served
+  const AGENT_TAG = /<script src="\/preview-agent\.js" data-parent="([^"]*)" data-channel="([0-9a-f]{32})"><\/script>/;
+
+  it('serves the preview agent with no Bearer, as script, and still checks the Host', async () => {
+    const { handler } = await htmlServer();
+    const agent = await handler(req('/preview-agent.js', { token: null }));
+    expect(agent.status).toBe(200);
+    expect(agent.headers.get('content-type')).toBe('text/javascript; charset=utf-8');
+    expect(agent.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(Buffer.from(await agent.arrayBuffer())).toEqual(readFileSync(join(packageRoot(), 'templates', 'preview-agent.js')));
+    expect((await handler(req('/preview-agent.js', { token: null, host: 'evil.example' }))).status).toBe(403);
+  });
+
+  it('adds the agent to a document as it serves it, sandboxed, and never writes the file', async () => {
+    const { host, handler, ctx } = await htmlServerWithContext();
+    const onDisk = readFileSync(join(host.cwd, 'index.html'));
+    const served = await handler(req(at(host, ''), { token: null }));
+    const text = await served.text();
+    const tag = AGENT_TAG.exec(text);
+    expect(tag?.[1]).toBe('http://127.0.0.1:4400');
+    expect(text.indexOf(tag?.[0] ?? '<none>')).toBe(text.search(/<\/head\s*>/i) - (tag?.[0].length ?? 0));
+    expect(served.headers.get('content-security-policy')).toBe('sandbox allow-scripts allow-forms allow-popups');
+    expect(readFileSync(join(host.cwd, 'index.html'))).toEqual(onDisk);
+    // The tag carries the channel the preview reply names.
+    const preview = (await (await handler(req(`/api/site/preview?site=${encodeURIComponent(realpathSync(host.cwd))}`))).json()) as {
+      channel: string;
+    };
+    expect(tag?.[2]).toBe(preview.channel);
+    expect(ctx.previewChannel).toBe(preview.channel);
+  });
+
+  it('serves every other file byte for byte, under the same sandbox', async () => {
+    const { host, handler } = await htmlServerWithContext({ 'site.css': 'body { color: #123; } /* é */\n' });
+    const css = await handler(req(at(host, 'site.css'), { token: null }));
+    expect(Buffer.from(await css.arrayBuffer())).toEqual(readFileSync(join(host.cwd, 'site.css')));
+    expect(css.headers.get('content-security-policy')).toBe('sandbox allow-scripts allow-forms allow-popups');
+  });
+
+  it('puts the tag after <body> where a document has no </head>, and keeps every byte of any charset', async () => {
+    const { host, handler } = await htmlServerWithContext();
+    writeFileSync(join(host.cwd, 'bare.html'), '<html><body class="x"><p>Bare page</p></body></html>\n');
+    const bare = await (await handler(req(at(host, 'bare.html'), { token: null }))).text();
+    expect(bare).toMatch(/^<html><body class="x"><script src="\/preview-agent\.js" [^>]*><\/script><p>Bare page/);
+
+    // A latin-1 byte and a UTF-8 `é` in one document: both come back as they are.
+    const bytes = Buffer.concat([
+      Buffer.from('<html><head><title>T</title></head><body><p>caf', 'latin1'),
+      Buffer.from([0xe9]),
+      Buffer.from(' and café</p></body></html>\n', 'utf8'),
+    ]);
+    writeFileSync(join(host.cwd, 'mixed.html'), bytes);
+    const served = Buffer.from(await (await handler(req(at(host, 'mixed.html'), { token: null }))).arrayBuffer());
+    const tag = AGENT_TAG.exec(served.toString('latin1'))?.[0] ?? '';
+    expect(tag).not.toBe('');
+    expect(Buffer.from(served.toString('latin1').replace(tag, ''), 'latin1')).toEqual(bytes);
   });
 
   it('refuses the checkout’s own dot files, its node_modules, and a malformed escape', async () => {
@@ -2561,9 +3593,28 @@ describe('the page', () => {
       ],
       dev: { dev: 'http://localhost:4321', devCommand: 'npx astro dev', source: 'astro' },
       entry: { path: '/checkouts/mini', pushAfterCommit: false },
+      pending: [],
+      project: 'default',
+      router: 'astro',
       ...over,
     };
   }
+
+  /** The fixture descriptor with no key naming a page, and `home` declared at `/` — the shape an html host's marks group. */
+  const unpaged: Descriptor = {
+    ...descriptor,
+    keys: Object.fromEntries(
+      Object.entries(descriptor.keys).map(([id, def]) => {
+        const { pages: _pages, ...rest } = def;
+        return [id, rest];
+      }),
+    ),
+  };
+  /** Every fixture key marked in one document. */
+  const allMarkedIn = (file: string, page: string | null): Record<string, unknown> => ({
+    documents: [{ file, route: '/', page }],
+    keys: Object.fromEntries(Object.keys(descriptor.keys).map((id) => [id, [file]])),
+  });
 
   /** Every route the page can reach, with a body shaped like the real one. */
   function routeTable(site: Record<string, unknown>): Array<[string, number, unknown]> {
@@ -2573,9 +3624,10 @@ describe('the page', () => {
         200,
         {
           editor: 'dashboard:test',
-          version: '0.3.0',
+          version: '0.3.1',
           sites: [
-            { state: 'ready', name: 'mini', path: '/checkouts/mini', id: SITE_ID, mode: site['mode'], keys: 11 },
+            { state: 'ready', name: 'mini', path: '/checkouts/mini', id: SITE_ID, mode: site['mode'], keys: 11, host: 'js', router: 'astro', project: 'default' },
+            { state: 'ready', name: 'other', path: '/checkouts/other', id: 'dddddddddddd', mode: 'snapshot', keys: 4, host: 'html', router: 'app', project: 'other-site' },
             { state: 'not-adopted', name: 'blank', path: '/checkouts/blank', id: 'bbbbbbbbbbbb' },
             { state: 'broken', name: 'bent', path: '/checkouts/bent', id: 'cccccccccccc', message: 'stet.config.json: not JSON' },
           ],
@@ -2621,6 +3673,7 @@ describe('the page', () => {
       ['/api/site/dev-log', 200, { running: false, state: 'none', lines: [] }],
       ['/api/site/dev-start', 200, { running: true, state: 'running', pid: 1234, command: 'npx astro dev', lines: [] }],
       ['/api/site/dev-stop', 200, { running: false, state: 'stopped', lines: [] }],
+      ['/api/site/marks', 200, { documents: [], keys: {} }],
       [`/s/${SITE_ID}/api/stet/recent`, 200, { rows: [{ id: 3, key: 'hero_headline', locale: 'default', status: 'published', value: 'Ship the copy', publishedAt: '2026-09-01T10:00:00Z' }], nextBeforeId: null }],
       [`/s/${SITE_ID}/api/stet/keys`, 200, { descriptor, rows: [{ key: 'hero_headline', locale: 'default', status: 'draft', value: 'Later', publishAt: '2026-09-09T09:00:00Z' }] }],
       [`/s/${SITE_ID}/api/stet/changes`, 200, { changes: [{ id: 2, name: 'September prices', note: 'the whole page', status: 'scheduled', authorKind: 'human', publishAt: '2026-09-30T09:00:00Z', createdAt: '2026-09-01T09:00:00Z', revertedAt: null }], nextBeforeId: null }],
@@ -2640,8 +3693,12 @@ describe('the page', () => {
     workspace: { sites: Array<Record<string, unknown>> };
     /** Every request the page made, in order, with the body it sent. */
     sent: Array<{ path: string; body: unknown }>;
-    /** Change what one route answers from here on. */
-    answer(path: string, status: number, body: unknown): void;
+    /** Change what one route answers from here on: a body, or a function called per request; `delay` holds the reply back. */
+    answer(path: string, status: number, body: unknown, delay?: number): void;
+    /** The paths of every request sent so far whose path starts with `prefix`. */
+    requested(prefix: string): string[];
+    /** This page's local storage, as a map a second page can be seeded with. */
+    storage(): Record<string, string>;
     /** Clicks the one control carrying this `data-act`, then lets the page settle. */
     act(name: string): Promise<void>;
     /** Sets a `data-act-change` select and fires the event the page listens for. */
@@ -2661,14 +3718,32 @@ describe('the page', () => {
    * The real page, booted in jsdom over stubbed routes. The token rides the
    * address bar exactly as the terminal's link delivers it.
    */
-  async function paint(opts: { site?: Record<string, unknown>; preview?: unknown; token?: string; expects?: string } = {}): Promise<Painted> {
+  async function paint(
+    opts: {
+      site?: Record<string, unknown>;
+      preview?: unknown;
+      token?: string;
+      expects?: string;
+      /** The query after `/`; `?t=<token>` by default. */
+      url?: string;
+      /** The workspace rows, in place of the fixture's. */
+      sites?: Array<Record<string, unknown>>;
+      /** Routes answered otherwise from the first request: path, status, body (or a function), delay. */
+      routes?: Array<[string, number, unknown, number?]>;
+      /** Local and session storage as a page before this one left them. */
+      storage?: Record<string, string>;
+      session?: Record<string, string>;
+    } = {},
+  ): Promise<Painted> {
     const site = opts.site ?? siteBody();
-    const table = new Map<string, [number, unknown]>();
+    const table = new Map<string, [number, unknown, number?]>();
     for (const [path, status, body] of routeTable(site)) table.set(path, [status, body]);
     const workspace = (table.get('/api/workspace') as [number, { sites: Array<Record<string, unknown>> }])[1];
+    if (opts.sites !== undefined) workspace.sites = opts.sites;
     const sent: Array<{ path: string; body: unknown }> = [];
     table.set('/api/site', [200, site]);
     table.set('/api/site/preview', [200, opts.preview ?? { url: 'http://localhost:4321/', up: false, start: 'npx astro dev', source: 'astro' }]);
+    for (const [path, status, body, delay] of opts.routes ?? []) table.set(path, [status, body, delay]);
 
     const errors: string[] = [];
     const virtualConsole = new VirtualConsole();
@@ -2678,10 +3753,12 @@ describe('the page', () => {
     const token = opts.token ?? 'fixture-token';
     const accepted = opts.expects ?? token;
     const dom = new JSDOM(dashboardPage().split('__STET_NONCE__').join(NONCE), {
-      url: `http://127.0.0.1:4400/${token === '' ? '' : `?t=${token}`}`,
+      url: `http://127.0.0.1:4400/${opts.url ?? (token === '' ? '' : `?t=${token}`)}`,
       runScripts: 'dangerously',
       virtualConsole,
       beforeParse(window) {
+        for (const [name, value] of Object.entries(opts.storage ?? {})) window.localStorage.setItem(name, value);
+        for (const [name, value] of Object.entries(opts.session ?? {})) window.sessionStorage.setItem(name, value);
         (window as unknown as { fetch: unknown }).fetch = async (
           path: string,
           init?: { headers?: Record<string, string>; body?: string },
@@ -2697,12 +3774,14 @@ describe('the page', () => {
           });
           const found = table.get(String(path).split('?')[0] ?? '');
           if (found === undefined) return { status: 404, ok: false, json: async () => ({ error: 'not found' }) };
+          if (found[2] !== undefined) await new Promise((resolve) => setTimeout(resolve, found[2]));
+          const payload = typeof found[1] === 'function' ? (found[1] as () => unknown)() : found[1];
           // A fresh copy per answer, as a real reply is: the page must not hold
           // a reference into the fixture's own tables.
           return {
             status: found[0],
             ok: found[0] < 400,
-            json: async () => JSON.parse(JSON.stringify(found[1])) as unknown,
+            json: async () => JSON.parse(JSON.stringify(payload)) as unknown,
           };
         };
       },
@@ -2718,8 +3797,18 @@ describe('the page', () => {
       errors,
       workspace,
       sent,
-      answer(path: string, status: number, body: unknown): void {
-        table.set(path, [status, body]);
+      answer(path: string, status: number, body: unknown, delay?: number): void {
+        table.set(path, [status, body, delay]);
+      },
+      requested: (prefix: string) => sent.map((r) => r.path).filter((path) => path.startsWith(prefix)),
+      storage(): Record<string, string> {
+        const held = dom.window.localStorage;
+        const out: Record<string, string> = {};
+        for (let i = 0; i < held.length; i += 1) {
+          const name = held.key(i) as string;
+          out[name] = held.getItem(name) as string;
+        }
+        return out;
       },
       settle,
       html: () => dom.window.document.body.outerHTML,
@@ -2785,10 +3874,14 @@ describe('the page', () => {
     collect();
     expect(page.errors).toEqual([]);
 
-    // Content, with one key of every declared shape selected in turn. The keys
-    // a page does not claim live under `Other`, so the walk changes group.
+    // Content, with one key of every declared shape selected in turn. A key no
+    // page claims groups by its prefix, so the walk visits every group.
     const walked: string[] = [];
-    for (const group of ['home', 'Other']) {
+    const groupIds = [...page.dom.window.document.querySelectorAll('#gsel option')].map(
+      (option) => (option as HTMLOptionElement).value,
+    );
+    expect(groupIds).toEqual(['page:home', 'prefix:brand', 'prefix:loose', 'prefix:unseeded', 'prefix:welcome']);
+    for (const group of groupIds) {
       await page.change('group', group);
       for (const key of page.keys()) {
         await page.act(`key:${key}`);
@@ -2801,7 +3894,7 @@ describe('the page', () => {
     collect();
     expect(page.html()).toContain('falls back to default');
     await page.change('locale', 'default');
-    await page.change('group', 'home');
+    await page.change('group', 'page:home');
     await page.act('key:hero_headline');
     await page.act('history');
     await page.act('previewLoad');
@@ -2868,9 +3961,10 @@ describe('the page', () => {
   });
 
   it('the two preview panes differ by exactly one sandbox token', async () => {
+    // Both panes load on open: nothing is clicked. The static site's marks come
+    // through the harness's own marks route.
     const dev = await paint({ preview: { url: 'http://localhost:4321/', up: true, start: 'npx astro dev' } });
-    await dev.act('previewLoad');
-    const devFrame = dev.dom.window.document.querySelector('iframe');
+    const devFrame = dev.dom.window.document.querySelector('#devwrap iframe');
     expect(devFrame?.getAttribute('sandbox')).toBe('allow-scripts allow-same-origin allow-forms allow-popups');
     dev.dom.window.close();
 
@@ -2878,8 +3972,8 @@ describe('the page', () => {
       site: siteBody({ host: 'html' }),
       preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
     });
-    await stat.act('previewLoad');
-    const staticFrame = stat.dom.window.document.querySelector('iframe');
+    expect(stat.requested('/api/site/marks')).toHaveLength(1);
+    const staticFrame = stat.dom.window.document.querySelector('#devwrap iframe');
     expect(staticFrame?.getAttribute('sandbox')).toBe('allow-scripts allow-forms allow-popups');
     expect(staticFrame?.getAttribute('sandbox')).not.toContain('allow-same-origin');
     expect(inlineHandlers(stat.html())).toEqual([]);
@@ -2921,10 +4015,12 @@ describe('the page', () => {
       return [...(row?.querySelectorAll('.bdg') ?? [])].map((b) => b.textContent).join(' ');
     };
     expect(badgeOn('hero_tone')).toContain('orphan');
-    await page.change('group', 'Other');
+    await page.change('group', 'prefix:welcome');
     expect(badgeOn('welcome__subject')).toContain('not rendered');
     // Declared and absent from the snapshot: the site says so on its own.
+    await page.change('group', 'prefix:unseeded');
     expect(badgeOn('unseeded_key')).toContain('no value');
+    await page.change('group', 'prefix:loose');
     expect(badgeOn('loose_key')).toBe('');
     expect(page.errors).toEqual([]);
     page.dom.window.close();
@@ -2945,7 +4041,7 @@ describe('the page', () => {
 
   it('follows the typing with the counter on a key that declares no limit', async () => {
     const page = await paint();
-    await page.change('group', 'Other');
+    await page.change('group', 'prefix:loose');
     await page.act('key:loose_key');
     const counter = (): string =>
       page.dom.window.document.querySelector('.cnt')?.textContent ?? '';
@@ -2977,62 +4073,58 @@ describe('the page', () => {
     page.dom.window.close();
   });
 
-  it('offers Push once a commit has landed, and Commit only while files are uncommitted', async () => {
-    const page = await paint();
+  it('offers Push once a commit has landed, and Commit only while stet files are uncommitted (journey B18)', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json'] }) });
     const shows = (act: string): boolean =>
-      page.dom.window.document.querySelector(`[data-act="${act}"]`) !== null;
-    // Nothing saved and nothing unsaved: the checkout has commits, so Push
-    // stands on its own and Commit has nothing to send.
+      page.dom.window.document.querySelector(`#gitbar [data-act="${act}"]`) !== null;
+    // Files a save left uncommitted, read from the checkout: Commit, no Push.
+    expect(shows('commit')).toBe(true);
+    expect(shows('push')).toBe(false);
+
+    page.answer('/api/site/commit', 200, {
+      sha: 'def5678abc',
+      short: 'def5678',
+      subject: 'stet: 1 key updated — hero_headline',
+      at: { head: 'def5678', branch: 'main', dirty: false },
+      pending: [],
+    });
+    await page.act('commit');
+    // The commit landed and the reply lists nothing: Commit goes, Push stays.
     expect(shows('commit')).toBe(false);
     expect(shows('push')).toBe(true);
 
-    page.answer('/api/site/save', 200, {
-      written: ['content/defaults.json', 'content/defaults.ts'],
-      unchanged: [],
-      findings: [],
-      at: { head: 'abc1234', branch: 'main', dirty: true },
-    });
+    // Unsaved work: Push goes until it is saved.
     await page.act('key:hero_headline');
     await page.type('text:hero_headline', 'A headline that fits');
-    // Unsaved work: Push goes until it is saved.
     expect(shows('push')).toBe(false);
-    await page.act('save');
-    expect(shows('commit')).toBe(true);
-    await page.act('commit');
-    // The commit landed: Commit goes, Push stays.
-    expect(shows('commit')).toBe(false);
-    expect(shows('push')).toBe(true);
     expect(page.errors).toEqual([]);
     page.dom.window.close();
   });
 
-  it('commits every file written since the last commit, not just the last save', async () => {
+  it('commits the files the last reply listed, and names no keys (journey B18)', async () => {
     const page = await paint();
     page.answer('/api/site/save', 200, {
-      written: ['content/defaults.json', 'content/defaults.ts'],
+      written: ['stet/defaults.json', 'src/stet.ts'],
       unchanged: [],
       findings: [],
       at: { head: 'abc1234', branch: 'main', dirty: true },
+      pending: ['stet/defaults.json', 'src/stet.ts'],
     });
     await page.act('key:hero_headline');
     await page.type('text:hero_headline', 'A headline that fits');
     await page.act('save');
 
-    // The second save changes nothing on disk. Without the union the first
-    // save's two files would never reach a commit.
-    page.answer('/api/site/save', 200, { written: [], unchanged: [], findings: [], at: {} });
+    // A same-value re-save writes nothing, and the server still lists what the
+    // first save left uncommitted — so Commit stays.
+    page.answer('/api/site/save', 200, { written: [], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
     await page.act('key:hero_tone');
-    await page.change('enum:hero_tone', 'loud');
+    await page.change('enum:hero_tone', 'calm');
     await page.act('save');
-    expect(page.dom.window.document.querySelector('[data-act="commit"]')).not.toBeNull();
+    expect(page.dom.window.document.querySelector('#gitbar [data-act="commit"]')).not.toBeNull();
 
     await page.act('commit');
-    const body = page.sent.filter((r) => r.path.startsWith('/api/site/commit')).at(-1)?.body as {
-      files: string[];
-      keys: string[];
-    };
-    expect(body.files).toEqual(['content/defaults.json', 'content/defaults.ts']);
-    expect(body.keys.sort()).toEqual(['hero_headline', 'hero_tone']);
+    const body = page.sent.filter((r) => r.path.startsWith('/api/site/commit')).at(-1)?.body;
+    expect(body).toEqual({ files: ['stet/defaults.json'] });
     expect(page.errors).toEqual([]);
     page.dom.window.close();
   });
@@ -3075,5 +4167,1002 @@ describe('the page', () => {
     // The one network call the page makes is same-origin and relative.
     expect(page.match(/fetch\(/g)).toHaveLength(1);
     expect(page).toContain('await fetch(path, {');
+  });
+
+  // --- the hotfix: fix-dashboard-first-consumers ------------------------------
+
+  const docOf = (page: Painted): Document => page.dom.window.document;
+  /** What the page painted — the shell, without the script whose source holds every string. */
+  const painted = (page: Painted): string => docOf(page).getElementById('shell')?.innerHTML ?? '';
+  /** Poll until `holds`, or give up after `ms` — for the cases that run a real start wait. */
+  async function until(holds: () => boolean, ms = 4_000): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (holds()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return holds();
+  }
+  const DOWN = { url: 'http://localhost:4321/', up: false, start: 'npx astro dev', source: 'astro' };
+  const UP = { url: 'http://localhost:4321/', up: true, start: 'npx astro dev', source: 'astro' };
+
+  // 5.1 — the address bar
+  it('opens on the site the address bar names, keeps it there, and reopens it after a reload (journey A18)', async () => {
+    const page = await paint({ url: '?t=fixture-token&site=%2Fcheckouts%2Fother' });
+    expect(page.requested('/api/site?')[0]).toBe('/api/site?site=%2Fcheckouts%2Fother');
+    expect(page.dom.window.location.search).toBe('?site=%2Fcheckouts%2Fother');
+    await page.act('site:/checkouts/mini');
+    expect(page.dom.window.location.search).toBe('?site=%2Fcheckouts%2Fmini');
+    const session = { 'stet.token': page.dom.window.sessionStorage.getItem('stet.token') as string };
+    page.dom.window.close();
+
+    // The reload: the site in the bar, no token in it, the token in session
+    // storage. The stub refuses any request not carrying the stored token.
+    const reload = await paint({ url: '?site=%2Fcheckouts%2Fmini', session });
+    expect(reload.requested('/api/site?')[0]).toBe('/api/site?site=%2Fcheckouts%2Fmini');
+    expect(painted(reload)).not.toContain('token is from an earlier run');
+    expect(painted(reload)).toContain('project other-site');
+    expect(reload.errors).toEqual([]);
+    reload.dom.window.close();
+  });
+
+  // 5.2 — the committable files in the header, the refusal under it
+  it('counts the uncommitted stet files in the header, names them, and offers Commit with no key selected (journey B18)', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json', 'src/stet.ts'] }) });
+    const doc = docOf(page);
+    const line = doc.querySelector('#gitbar span') as HTMLElement;
+    expect(line.textContent).toBe('2 stet files not yet committed');
+    expect(line.getAttribute('title')).toBe('stet/defaults.json\nsrc/stet.ts');
+    expect(doc.querySelector('#gitbar [data-act="commit"]')).not.toBeNull();
+    expect(doc.querySelector('[data-act="push"]')).toBeNull();
+    expect(doc.querySelector('.row.on')).toBeNull();
+    // The unsaved-edit badge is hidden until there is an edit.
+    expect((doc.getElementById('dc') as HTMLElement).hidden).toBe(true);
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'x');
+    expect((doc.getElementById('dc') as HTMLElement).hidden).toBe(false);
+    expect(doc.getElementById('dc')?.textContent).toBe('1 unsaved edit');
+    page.dom.window.close();
+  });
+
+  it('shows a refused commit and a failed push under the header with git’s output, until Dismiss (journey B18)', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json', 'src/stet.ts'] }) });
+    const doc = docOf(page);
+    const card = (): HTMLElement => doc.getElementById('giterr') as HTMLElement;
+    page.answer('/api/site/commit', 409, {
+      error: 'git commit failed',
+      output: '\u001b[31merror:\u001b[0m hook says no',
+      pending: ['stet/defaults.json'],
+    });
+    // No key selected: the card is the page's, not the editor's.
+    await page.act('commit');
+    expect(card().hidden).toBe(false);
+    expect(card().textContent).toContain("The commit was refused. Git's output is below.");
+    expect(card().querySelector('.term')?.textContent).toBe('git commit failed\nerror: hook says no');
+    expect(card().innerHTML).not.toContain('\u001b');
+    // The refusal's own list is the one the header shows now.
+    expect(doc.querySelector('#gitbar span')?.textContent).toBe('1 stet file not yet committed');
+
+    page.answer('/api/site/commit', 200, {
+      sha: 'def5678abc',
+      short: 'def5678',
+      subject: 'stet: 1 file updated — stet/defaults.json',
+      at: { head: 'def5678', branch: 'main', dirty: false },
+      pending: [],
+    });
+    await page.act('commit');
+    page.answer('/api/site/push', 409, { error: 'git push failed', output: 'fatal: No configured push destination.' });
+    await page.act('push');
+    expect(card().textContent).toContain("The push failed. Git's output is below.");
+    expect(card().querySelector('.term')?.textContent).toBe('git push failed\nfatal: No configured push destination.');
+
+    // Dismiss takes the card down and refits the frame it had pushed down.
+    let fits = 0;
+    (page.dom.window as unknown as { fitFrame: () => void }).fitFrame = () => {
+      fits += 1;
+    };
+    await page.act('gitErrorDismiss');
+    expect(card().hidden).toBe(true);
+    expect(card().innerHTML).toBe('');
+    expect(fits).toBeGreaterThan(0);
+    page.dom.window.close();
+  });
+
+  it('shows a hook’s output as text, never as markup, and drops terminal link codes (journey B18)', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json'] }) });
+    const doc = docOf(page);
+    const images = doc.querySelectorAll('img').length;
+    const output =
+      '<img src=x onerror="window.__pwned=1"><b id="inj">bold</b></div></div><script>window.__pwned=2</script>\n' +
+      '\u001b]8;;http://lint.example/rule\u0007see the rule\u001b]8;;\u0007 and \u001b]0;a title\u001b\\done';
+    page.answer('/api/site/commit', 409, { error: 'git commit failed', output, pending: ['stet/defaults.json'] });
+    await page.act('commit');
+    const card = doc.getElementById('giterr') as HTMLElement;
+    expect(card.hidden).toBe(false);
+    expect(card.querySelector('img, script, b')).toBeNull();
+    expect(doc.getElementById('inj')).toBeNull();
+    expect(doc.querySelectorAll('img')).toHaveLength(images);
+    expect(card.querySelector('.term')?.textContent).toBe(
+      'git commit failed\n' +
+        '<img src=x onerror="window.__pwned=1"><b id="inj">bold</b></div></div><script>window.__pwned=2</script>\n' +
+        'see the rule and done',
+    );
+    expect((page.dom.window as unknown as { __pwned?: number }).__pwned).toBeUndefined();
+    page.dom.window.close();
+  });
+
+  it('clears the last refusal before the next commit posts', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json'] }) });
+    const card = (): HTMLElement => docOf(page).getElementById('giterr') as HTMLElement;
+    page.answer('/api/site/commit', 409, { error: 'git commit failed', output: 'no', pending: ['stet/defaults.json'] });
+    await page.act('commit');
+    expect(card().hidden).toBe(false);
+    // Held back, so the card is read while the commit is still in flight.
+    page.answer('/api/site/commit', 409, { error: 'git commit failed', output: 'no', pending: ['stet/defaults.json'] }, 300);
+    await page.act('commit');
+    expect(page.requested('/api/site/commit')).toHaveLength(2);
+    expect(card().hidden).toBe(true);
+    // The held reply lands before the window goes, so nothing paints into a closed page.
+    expect(await until(() => !card().hidden)).toBe(true);
+    page.dom.window.close();
+  });
+
+  // 5.3 — the sidebar
+  it('tells two checkouts named alike apart, and names each ready row’s host and project (journey A19)', async () => {
+    const row = (path: string, host: string, router: string, project: string): Record<string, unknown> => ({
+      state: 'ready',
+      name: path.split('/').pop(),
+      path,
+      id: path.replace(/\W/g, '').slice(-12),
+      mode: 'snapshot',
+      keys: 3,
+      host,
+      router,
+      project,
+    });
+    const rows = (page: Painted): string[][] =>
+      [...docOf(page).querySelectorAll('#projs .it')].map((button) => [
+        button.childNodes[0]?.textContent ?? '',
+        ...[...button.querySelectorAll('.u')].slice(1).map((line) => line.textContent ?? ''),
+      ]);
+
+    const first = await paint({
+      sites: [
+        row('/a/stet-website-v1/site', 'js', 'astro', 'default'),
+        row('/a/stet-planning/site', 'js', 'astro', 'default'),
+        row('/a/psyon-site', 'html', 'app', 'psyon'),
+      ],
+    });
+    expect(rows(first)).toEqual([
+      ['stet-website-v1/site', 'js host · astro', 'project default'],
+      ['stet-planning/site', 'js host · astro', 'project default'],
+      ['psyon-site', 'html host', 'project psyon'],
+    ]);
+    first.dom.window.close();
+
+    const second = await paint({
+      sites: [row('/a/x/site', 'js', 'app', 'a'), row('/b/x/site', 'js', 'app', 'b'), row('/c/y/site', 'js', 'app', 'c')],
+    });
+    expect(rows(second).map((r) => r[0])).toEqual(['a/x/site', 'b/x/site', 'y/site']);
+    second.dom.window.close();
+  });
+
+  // 5.4 — the layout and the widths
+  it('opens on the key column beside the pane, with no key selected and Desktop on (journey B19)', async () => {
+    const page = await paint();
+    const doc = docOf(page);
+    const work = (): string => (doc.getElementById('work') as HTMLElement).className;
+    expect(work()).toBe('wrap content');
+    expect(doc.querySelector('.row.on')).toBeNull();
+    expect(doc.querySelector('[data-act="width:desktop"]')?.className).toBe('on');
+    await page.act('keys');
+    expect(work()).toBe('wrap content wide');
+    expect(doc.querySelector('[data-act="keys"]')?.textContent).toBe('Show keys');
+    await page.act('key:hero_headline');
+    expect(work()).toBe('wrap content');
+    expect(doc.querySelector('.row.on')?.getAttribute('data-act')).toBe('key:hero_headline');
+    await page.act('tab:Recent');
+    expect(work()).toBe('wrap');
+    expect((doc.getElementById('pane') as HTMLElement).hidden).toBe(true);
+    page.dom.window.close();
+  });
+
+  it('shows a not-adopted checkout its hint in the plain layout', async () => {
+    const page = await paint({ site: { state: 'not-adopted', name: 'mini', path: '/checkouts/mini', id: SITE_ID } });
+    expect(painted(page)).toContain('is not adopted');
+    expect((docOf(page).getElementById('work') as HTMLElement).className).toBe('wrap');
+    page.dom.window.close();
+  });
+
+  it('fits the frame: Desktop scaled down or centred, Tablet centred, Fit pane one to one (journey B19)', async () => {
+    const page = await paint();
+    const fit = (page.dom.window as unknown as { frameFit: (pane: number, preset: string) => unknown }).frameFit;
+    expect(fit(895, 'desktop')).toEqual({ width: 1280, scale: 895 / 1280, left: 0 });
+    expect(fit(1686, 'desktop')).toEqual({ width: 1280, scale: 1, left: 203 });
+    expect(fit(1206, 'tablet')).toEqual({ width: 768, scale: 1, left: 219 });
+    expect(fit(895, 'pane')).toEqual({ width: 895, scale: 1, left: 0 });
+    // A name on the prototype chain is not a width.
+    expect(fit(895, 'constructor')).toEqual(fit(895, 'desktop'));
+    page.dom.window.close();
+  });
+
+  it('remembers the column and the width for the next visit', async () => {
+    const page = await paint();
+    await page.act('keys');
+    await page.act('width:tablet');
+    const storage = page.storage();
+    page.dom.window.close();
+    const next = await paint({ storage });
+    expect((docOf(next).getElementById('work') as HTMLElement).className).toBe('wrap content wide');
+    expect(docOf(next).querySelector('[data-act="width:tablet"]')?.className).toBe('on');
+    expect(docOf(next).querySelector('[data-act="width:desktop"]')?.className).toBe('');
+    next.dom.window.close();
+  });
+
+  // 5.5 — the pane
+  it('keeps the frame through typing, searching, selecting and a width change (journeys B18, B19)', async () => {
+    const page = await paint({ preview: UP });
+    const doc = docOf(page);
+    const frame = doc.querySelector('#devwrap iframe');
+    expect(frame).not.toBeNull();
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'A new line');
+    expect(doc.querySelector('#devwrap iframe')).toBe(frame);
+    await page.type('search', 'loose');
+    expect(doc.querySelector('#devwrap iframe')).toBe(frame);
+    await page.act('key:loose_key');
+    expect(doc.querySelector('#devwrap iframe')).toBe(frame);
+    await page.act('width:tablet');
+    expect(doc.querySelector('#devwrap iframe')).toBe(frame);
+    page.dom.window.close();
+  });
+
+  for (const pane of ['static', 'dev'] as const) {
+    it(`${pane === 'static' ? 'navigates the static frame again after a save' : 'leaves the dev server’s frame to its own reload after a save'}, and Reload navigates it`, async () => {
+      const page = await paint(
+        pane === 'static'
+          ? { site: siteBody({ host: 'html' }), preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true } }
+          : { preview: UP },
+      );
+      const frame = docOf(page).querySelector('#devwrap iframe') as HTMLIFrameElement;
+      const navigations: string[] = [];
+      const set = frame.setAttribute.bind(frame);
+      frame.setAttribute = (name: string, value: string): void => {
+        navigations.push(name);
+        set(name, value);
+      };
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'Saved');
+      await page.act('save');
+      expect(docOf(page).querySelector('#devwrap iframe')).toBe(frame);
+      expect(navigations).toEqual(pane === 'static' ? ['src'] : []);
+      await page.act('previewLoad');
+      expect(navigations).toEqual(pane === 'static' ? ['src', 'src'] : ['src']);
+      page.dom.window.close();
+    });
+  }
+
+  it('moves the pane to where a key renders, for the visit only (journeys B17, B19)', async () => {
+    const html = await paint({
+      site: siteBody({ host: 'html' }),
+      preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+      routes: [
+        ['/api/site/marks', 200, { documents: [{ file: 'about/index.html', route: '/about/', page: null }], keys: { hero_headline: ['about/index.html'], loose_key: ['about/index.html'] } }],
+      ],
+    });
+    await html.act('key:hero_headline');
+    expect(html.requested('/api/site/preview').at(-1)).toContain('route=%2Fabout%2F');
+    expect(Object.keys(html.storage()).filter((name) => name.startsWith('stet.route.'))).toEqual([]);
+    html.dom.window.close();
+
+    const group = await paint({
+      site: siteBody({ host: 'html' }),
+      preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+      routes: [['/api/site/marks', 200, { documents: [{ file: 'about/index.html', route: '/about/', page: null }], keys: { loose_key: ['about/index.html'] } }]],
+    });
+    await group.change('group', 'doc:about/index.html');
+    expect(group.requested('/api/site/preview').at(-1)).toContain('route=%2Fabout%2F');
+    group.dom.window.close();
+
+    // A JavaScript site: the first static page the key's entry names, never a dynamic one.
+    const js = await paint({
+      site: siteBody({
+        descriptor: {
+          ...descriptor,
+          keys: {
+            ...descriptor.keys,
+            pricing_price: { shape: 'text', target: 'web', pages: ['pricing'] },
+            blog_title: { shape: 'text', target: 'web', pages: ['blog'] },
+          },
+          pages: { ...descriptor.pages, pricing: { route: '/pricing' }, blog: { route: '/blog/[slug]' } },
+        },
+      }),
+    });
+    await js.change('group', 'page:pricing');
+    await js.act('key:pricing_price');
+    expect(js.requested('/api/site/preview').at(-1)).toContain('route=%2Fpricing');
+    const sent = js.requested('/api/site/preview').length;
+    await js.change('group', 'page:blog');
+    await js.act('key:blog_title');
+    expect(js.requested('/api/site/preview')).toHaveLength(sent);
+    js.dom.window.close();
+  });
+
+  it('takes a typed route, remembers it for the site, and cuts a pasted dev-server origin (journey B19)', async () => {
+    const page = await paint();
+    const route = docOf(page).getElementById('route') as HTMLInputElement;
+    expect(route.value).toBe('/');
+    route.value = 'docs/quickstart/';
+    route.dispatchEvent(new page.dom.window.Event('change', { bubbles: true }));
+    await page.settle();
+    expect(page.requested('/api/site/preview').at(-1)).toContain('route=%2Fdocs%2Fquickstart%2F');
+    expect(route.value).toBe('/docs/quickstart/');
+    expect(page.storage()[`stet.route.${SITE_ID}`]).toBe('/docs/quickstart/');
+
+    route.value = 'http://localhost:4321/docs/';
+    route.dispatchEvent(new page.dom.window.Event('change', { bubbles: true }));
+    await page.settle();
+    expect(page.requested('/api/site/preview').at(-1)).toContain('route=%2Fdocs%2F');
+    route.value = 'docs/quickstart/';
+    route.dispatchEvent(new page.dom.window.Event('change', { bubbles: true }));
+    await page.settle();
+    const storage = page.storage();
+    page.dom.window.close();
+
+    const next = await paint({ storage });
+    expect(next.requested('/api/site/preview')[0]).toContain('route=%2Fdocs%2Fquickstart%2F');
+    expect((docOf(next).getElementById('route') as HTMLInputElement).value).toBe('/docs/quickstart/');
+    next.dom.window.close();
+  });
+
+  it('keeps only the path of a pasted address of the site itself, and leaves any other address a path (journey B19)', async () => {
+    const paste = async (page: Awaited<ReturnType<typeof paint>>, value: string): Promise<string> => {
+      const route = docOf(page).getElementById('route') as HTMLInputElement;
+      route.value = value;
+      route.dispatchEvent(new page.dom.window.Event('change', { bubbles: true }));
+      await page.settle();
+      return (docOf(page).getElementById('route') as HTMLInputElement).value;
+    };
+    // The dev server is http://localhost:4321/.
+    const dev = await paint();
+    expect(await paste(dev, 'http://127.0.0.1:4321/docs/?a=1#b')).toBe('/docs/?a=1#b');
+    expect(await paste(dev, 'http://localhost:43210/docs/')).toBe('/http://localhost:43210/docs/');
+    expect(await paste(dev, 'http://localhost:4321.evil.example/x')).toBe('/http://localhost:4321.evil.example/x');
+    dev.dom.window.close();
+
+    const html = await paint({
+      site: siteBody({ host: 'html' }),
+      preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+    });
+    expect(await paste(html, `http://127.0.0.1:4400/s/${SITE_ID}/site/about/#team`)).toBe('/about/#team');
+    expect(await paste(html, `http://127.0.0.1:4400/s/${SITE_ID}/site`)).toBe('/');
+    expect(await paste(html, 'http://127.0.0.1:4400/s/bbbbbbbbbbbb/site/about/')).toBe(
+      '/http://127.0.0.1:4400/s/bbbbbbbbbbbb/site/about/',
+    );
+    html.dom.window.close();
+  });
+
+  // 8.4 — the page's side of the preview agent. The frame's agent is played
+  // by the test: what the page posts to the frame is recorded on its window,
+  // and the agent's answers are dispatched from the frame's window.
+  describe('finding the key in the preview', () => {
+    const PROXY = 'http://127.0.0.1:45123';
+    const CHANNEL = 'chan-1';
+    const DEV_PREVIEW = { url: `${PROXY}/`, dev: 'http://localhost:4321/', up: true, channel: CHANNEL, start: 'npx astro dev', source: 'astro' };
+    const STATIC_PREVIEW = { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true, channel: CHANNEL };
+    const LOCATED = (over: Record<string, unknown>): Record<string, unknown> => ({
+      stet: 'located', key: 'hero_headline', found: 1, by: 'text', draft: null, route: '/', channel: CHANNEL, ...over,
+    });
+    type Post = { message: Record<string, unknown>; target: string };
+
+    /** The frame's side: what the page posted to it, and a voice to answer as its agent with. */
+    function agentOf(page: Painted, auto?: (message: Record<string, unknown>) => Record<string, unknown> | null) {
+      const doc = docOf(page);
+      const frame = (): HTMLIFrameElement => doc.querySelector('#devwrap iframe') as HTMLIFrameElement;
+      const posts: Post[] = [];
+      const say = (data: unknown, source: unknown = frame().contentWindow): void => {
+        page.dom.window.dispatchEvent(new page.dom.window.MessageEvent('message', { data, source: source as Window }));
+      };
+      const spy = (): void => {
+        const win = frame().contentWindow as unknown as { __spied?: boolean; postMessage: unknown };
+        if (win.__spied === true) return;
+        win.__spied = true;
+        win.postMessage = (message: Record<string, unknown>, target: string): void => {
+          posts.push({ message: JSON.parse(JSON.stringify(message)) as Record<string, unknown>, target });
+          const reply = auto?.(message) ?? null;
+          if (reply !== null) setTimeout(() => say(reply), 0);
+        };
+      };
+      spy();
+      return {
+        posts,
+        say,
+        spy,
+        frame,
+        /** The frame's `load`, as a navigation ends. */
+        load: async (): Promise<void> => {
+          spy();
+          frame().dispatchEvent(new page.dom.window.Event('load'));
+          await page.settle();
+        },
+        ready: async (route = '/'): Promise<void> => {
+          say({ stet: 'ready', route, channel: CHANNEL });
+          await page.settle();
+        },
+        locates: (): Array<Record<string, unknown>> => posts.map((p) => p.message).filter((m) => m['stet'] === 'locate'),
+      };
+    }
+    const note = (page: Painted): HTMLElement => docOf(page).getElementById('panenote') as HTMLElement;
+    const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+    it('posts a locate for the picked key to the proxy’s origin, and to * on the static pane', async () => {
+      const dev = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(dev);
+      await agent.load();
+      await agent.ready();
+      await dev.act('key:hero_headline');
+      expect(agent.locates().at(-1)).toMatchObject({
+        stet: 'locate', key: 'hero_headline', texts: ['Ship the copy'], draft: null, scroll: true, guess: true,
+      });
+      expect(agent.posts.at(-1)?.target).toBe(PROXY);
+      dev.dom.window.close();
+
+      const html = await paint({
+        site: siteBody({ host: 'html', descriptor: unpaged }),
+        preview: STATIC_PREVIEW,
+        routes: [['/api/site/marks', 200, allMarkedIn('index.html', null)]],
+      });
+      const statik = agentOf(html);
+      await statik.load();
+      await statik.ready(`/s/${SITE_ID}/site/`);
+      await html.act('key:hero_headline');
+      expect(statik.locates().at(-1)).toMatchObject({ key: 'hero_headline', scroll: true });
+      expect(statik.posts.at(-1)?.target).toBe('*');
+      html.dom.window.close();
+    });
+
+    it('posts one locate for three quick keystrokes, with the draft and no scroll', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(page);
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      const before = agent.locates().length;
+      await page.type('text:hero_headline', 'S');
+      await page.type('text:hero_headline', 'Sh');
+      await page.type('text:hero_headline', 'Shi');
+      await wait(150);
+      expect(agent.locates().slice(before)).toEqual([
+        expect.objectContaining({ key: 'hero_headline', draft: 'Shi', scroll: false }),
+      ]);
+      page.dom.window.close();
+    });
+
+    it('names a key the page does not show, a draft shown after Save, and reads only the selected key’s answers', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(page);
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      const seq = (): number => agent.locates().at(-1)?.['seq'] as number;
+      agent.say(LOCATED({ found: 0, seq: seq() }));
+      await page.settle();
+      expect(note(page).hidden).toBe(false);
+      expect(note(page).textContent).toBe('hero_headline was not found on /.');
+      agent.say(LOCATED({ draft: 'after-save', seq: seq() }));
+      await page.settle();
+      expect(note(page).textContent).toBe('This draft is shown after Save.');
+      // An answer about another key is not this key's.
+      agent.say(LOCATED({ key: 'loose_key', found: 0, seq: seq() }));
+      await page.settle();
+      expect(note(page).textContent).toBe('This draft is shown after Save.');
+      // One from a window other than the frame's changes nothing.
+      agent.say(LOCATED({ found: 0, seq: seq() }), page.dom.window);
+      await page.settle();
+      expect(note(page).textContent).toBe('This draft is shown after Save.');
+      // A reply to a request that no longer stands changes nothing.
+      agent.say(LOCATED({ found: 0, seq: seq() - 1 }));
+      await page.settle();
+      expect(note(page).textContent).toBe('This draft is shown after Save.');
+      page.dom.window.close();
+    });
+
+    it('spells a static route as the Route field does, and locates with scroll once a moved page is ready', async () => {
+      const page = await paint({
+        site: siteBody({ host: 'html', descriptor: unpaged }),
+        preview: STATIC_PREVIEW,
+        routes: [['/api/site/marks', 200, {
+          documents: [{ file: 'index.html', route: '/', page: null }, { file: 'about/index.html', route: '/about/', page: null }],
+          keys: { hero_headline: ['about/index.html'], loose_key: ['index.html'] },
+        }]],
+      });
+      const agent = agentOf(page);
+      await agent.load();
+      await agent.ready(`/s/${SITE_ID}/site/`);
+      // Found by search, so picking it is what moves the pane.
+      await page.type('search', 'hero_headline');
+      await page.act('key:hero_headline');
+      // Moved: nothing is located until the page it moved to reports ready.
+      expect(agent.locates().filter((m) => m['key'] === 'hero_headline')).toEqual([]);
+      await agent.load();
+      await agent.ready(`/s/${SITE_ID}/site/about/`);
+      expect(agent.locates().at(-1)).toMatchObject({ key: 'hero_headline', scroll: true });
+      agent.say(LOCATED({ found: 0, route: `/s/${SITE_ID}/site/about/`, seq: agent.locates().at(-1)?.['seq'] }));
+      await page.settle();
+      expect(note(page).textContent).toBe('hero_headline was not found on /about/.');
+      page.dom.window.close();
+    });
+
+    it('says highlighting is not available where the frame’s page stays silent for 3 s', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(page);
+      await agent.load();
+      await wait(3_100);
+      expect(note(page).textContent).toBe('Highlighting is not available on this page.');
+      page.dom.window.close();
+    }, 10_000);
+
+    it('never posts the run token, and cuts a pasted address of the proxy or the dev server', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(page);
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'A draft');
+      await wait(150);
+      for (const post of agent.posts) expect(JSON.stringify(post.message)).not.toContain('fixture-token');
+      const route = docOf(page).getElementById('route') as HTMLInputElement;
+      for (const pasted of [`${PROXY}/docs/`, 'http://localhost:4321/docs/']) {
+        route.value = pasted;
+        route.dispatchEvent(new page.dom.window.Event('change', { bubbles: true }));
+        await page.settle();
+        expect(page.requested('/api/site/preview').at(-1), pasted).toContain('route=%2Fdocs%2F');
+      }
+      page.dom.window.close();
+    });
+
+    it('posts nothing before a ready carrying the channel, nothing after a bye, and only hello on a load', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(page);
+      await page.act('key:hero_headline');
+      expect(agent.posts).toEqual([]);
+      agent.say({ stet: 'ready', route: '/' });
+      await page.settle();
+      expect(agent.posts).toEqual([]);
+      await agent.load();
+      expect(agent.posts.map((p) => p.message)).toEqual([{ stet: 'hello' }]);
+      await agent.ready();
+      expect(agent.locates()).toHaveLength(1);
+      agent.say({ stet: 'bye', channel: CHANNEL });
+      await page.settle();
+      const held = agent.posts.length;
+      await page.type('text:hero_headline', 'Typed after bye');
+      await wait(150);
+      expect(agent.posts).toHaveLength(held);
+      await agent.ready();
+      expect(agent.locates().at(-1)).toMatchObject({ draft: 'Typed after bye' });
+      page.dom.window.close();
+    });
+
+    it('counts a ready sent before the frame’s load, through the hello it answers', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(page, (message) => (message['stet'] === 'hello' ? { stet: 'ready', route: '/', channel: CHANNEL } : null));
+      await agent.ready();
+      await agent.load();
+      await page.settle();
+      await page.act('key:hero_headline');
+      expect(agent.locates().at(-1)).toMatchObject({ key: 'hero_headline', scroll: true });
+      page.dom.window.close();
+    });
+
+    it('turns a text match solid once a save shows its text changing', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+      // The saved text is on the page: every look finds it.
+      const agent = agentOf(page, (message) =>
+        message['stet'] === 'locate' ? LOCATED({ seq: message['seq'], found: 1, by: 'text' }) : null,
+      );
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      await page.settle();
+      await page.type('text:hero_headline', 'Saved words');
+      await wait(150);
+      expect(agent.locates().at(-1)).toMatchObject({ guess: true });
+      await page.act('save');
+      await agent.ready();
+      await page.settle();
+      const looks = agent.locates();
+      expect(looks.some((m) => JSON.stringify(m['texts']) === JSON.stringify(['Saved words']))).toBe(true);
+      expect(looks.at(-1)).toMatchObject({ key: 'hero_headline', guess: false });
+      expect(note(page).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('checks a match inside more text after a save as it does a whole one, and never a mark', async () => {
+      for (const [by, confirmed] of [['contained', true], ['mark', false]] as const) {
+        const page = await paint({ preview: DEV_PREVIEW });
+        page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+        const agent = agentOf(page, (message) =>
+          message['stet'] === 'locate' ? LOCATED({ seq: message['seq'], found: 1, by }) : null,
+        );
+        await agent.load();
+        await agent.ready();
+        await page.act('key:hero_headline');
+        await page.settle();
+        await page.type('text:hero_headline', 'Saved words');
+        await wait(150);
+        await page.act('save');
+        await agent.ready();
+        await page.settle();
+        expect(agent.locates().at(-1)).toMatchObject({ key: 'hero_headline', guess: !confirmed });
+        page.dom.window.close();
+      }
+    });
+
+    it('says when the key is on the page but hidden there', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(page, (message) =>
+        message['stet'] === 'locate' ? LOCATED({ seq: message['seq'], found: 1, hidden: true }) : null,
+      );
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      await page.settle();
+      expect(note(page).hidden).toBe(false);
+      expect(note(page).textContent).toBe('hero_headline is on this page but hidden, so the preview cannot show it.');
+      page.dom.window.close();
+    });
+
+    it('names text the template writes out itself when a save leaves a match inside more text unchanged', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+      const agent = agentOf(page, (message) =>
+        message['stet'] === 'locate'
+          ? LOCATED({ seq: message['seq'], by: 'contained', found: (message['texts'] as string[])[0] === 'Ship the copy' ? 1 : 0 })
+          : null,
+      );
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      await page.settle();
+      expect(agent.locates().at(-1)).toMatchObject({ guess: true });
+      await page.type('text:hero_headline', 'Saved words');
+      await wait(150);
+      await page.act('save');
+      await agent.ready();
+      for (let turn = 0; turn < 4; turn += 1) await page.settle();
+      expect(note(page).textContent).toBe(
+        "The outlined text does not come from stet — the page's template writes it out itself, so saving hero_headline does not change it.",
+      );
+      page.dom.window.close();
+    });
+
+    it('names text the template writes out itself, and keeps saying so, when the saved text is not on the page', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+      const HARDCODED =
+        "The outlined text does not come from stet — the page's template writes it out itself, so saving hero_headline does not change it.";
+      // The page shows the old text whatever is saved: the template writes it.
+      const agent = agentOf(page, (message) =>
+        message['stet'] === 'locate'
+          ? LOCATED({ seq: message['seq'], found: (message['texts'] as string[])[0] === 'Ship the copy' ? 1 : 0 })
+          : null,
+      );
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      await page.settle();
+      await page.type('text:hero_headline', 'Saved words');
+      await wait(150);
+      await page.act('save');
+      // Announced twice: only the reply to the latest look is read.
+      agent.say({ stet: 'ready', route: '/', channel: CHANNEL });
+      agent.say({ stet: 'ready', route: '/', channel: CHANNEL });
+      for (let turn = 0; turn < 4; turn += 1) await page.settle();
+      expect(note(page).textContent).toBe(HARDCODED);
+      // The page re-applying its request later changes nothing about it.
+      agent.say(LOCATED({ seq: agent.locates().at(-1)?.['seq'], found: 1 }));
+      await page.settle();
+      expect(note(page).textContent).toBe(HARDCODED);
+      page.dom.window.close();
+    });
+
+    it('runs the save’s check after 3 s where the page sends no new ready', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+      const agent = agentOf(page, (message) =>
+        message['stet'] === 'locate' ? LOCATED({ seq: message['seq'], found: 1 }) : null,
+      );
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      await page.settle();
+      await page.type('text:hero_headline', 'In place');
+      await wait(150);
+      await page.act('save');
+      const before = agent.locates().length;
+      await wait(3_200);
+      expect(agent.locates().slice(before).some((m) => JSON.stringify(m['texts']) === JSON.stringify(['In place']))).toBe(true);
+      page.dom.window.close();
+    }, 10_000);
+
+    it('shows a list’s draft after Save, before any reply and after one', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      const agent = agentOf(page);
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_bullets');
+      await page.type('list:hero_bullets 0', 'uno');
+      await wait(150);
+      expect(note(page).textContent).toBe('This draft is shown after Save.');
+      expect(agent.locates().at(-1)).toMatchObject({ key: 'hero_bullets', draft: null, texts: ['one', 'two'] });
+      agent.say(LOCATED({ key: 'hero_bullets', draft: null, seq: agent.locates().at(-1)?.['seq'] }));
+      await page.settle();
+      expect(note(page).textContent).toBe('This draft is shown after Save.');
+      page.dom.window.close();
+    });
+  });
+
+  it('loads the pane when a site opens, and starts nothing (F37)', async () => {
+    const html = await paint({
+      site: siteBody({ host: 'html' }),
+      preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+    });
+    expect(html.requested('/api/site/preview')).toHaveLength(1);
+    expect(docOf(html).querySelector('#devwrap iframe')?.getAttribute('sandbox')).toBe('allow-scripts allow-forms allow-popups');
+    html.dom.window.close();
+
+    const js = await paint();
+    expect(js.requested('/api/site/preview')).toHaveLength(1);
+    expect(js.requested('/api/site/dev-start')).toEqual([]);
+    js.dom.window.close();
+  });
+
+  it('chooses the first group only once the marks have answered', async () => {
+    const late = await paint({
+      site: siteBody({ host: 'html', descriptor: unpaged }),
+      routes: [['/api/site/marks', 200, allMarkedIn('index.html', null), 50]],
+    });
+    expect(await until(() => late.keys().length > 0 || painted(late).includes('No keys.'))).toBe(true);
+    expect((docOf(late).getElementById('gsel') as HTMLSelectElement | null)?.value ?? 'doc:index.html').toBe('doc:index.html');
+    expect(late.keys()).toEqual(Object.keys(descriptor.keys).sort());
+    late.dom.window.close();
+
+    const refused = await paint({
+      site: siteBody({ host: 'html', descriptor: unpaged }),
+      routes: [['/api/site/marks', 409, { error: 'index.html could not be read' }]],
+    });
+    expect((docOf(refused).getElementById('gsel') as HTMLSelectElement).value).toBe('prefix:brand');
+    refused.dom.window.close();
+  });
+
+  it('keeps a route typed while the start wait repaints the pane, and its caret (journey B19)', async () => {
+    let reads = 0;
+    const page = await paint({
+      routes: [['/api/site/dev-log', 200, () => ({ running: true, state: 'running', lines: [`line ${(reads += 1)}`] })]],
+    });
+    const doc = docOf(page);
+    await page.act('devStart');
+    expect(painted(page)).toContain('Starting');
+    const route = doc.getElementById('route') as HTMLInputElement;
+    route.focus();
+    const typeInto = (text: string): void => {
+      for (const ch of text) {
+        route.value += ch;
+        route.selectionStart = route.value.length;
+        route.selectionEnd = route.value.length;
+        route.dispatchEvent(new page.dom.window.Event('input', { bubbles: true }));
+      }
+    };
+    typeInto('docs/quick');
+    const before = reads;
+    expect(await until(() => reads > before, 3_000)).toBe(true);
+    await page.settle();
+    typeInto('start/');
+    expect(doc.getElementById('route')).toBe(route);
+    expect(doc.activeElement).toBe(route);
+    expect(route.value).toBe('/docs/quickstart/');
+    expect(route.selectionStart).toBe(route.value.length);
+    expect(page.requested('/api/site/preview').every((path) => path.endsWith('route=%2F'))).toBe(true);
+    route.dispatchEvent(new page.dom.window.Event('change', { bubbles: true }));
+    await page.settle();
+    expect(page.requested('/api/site/preview').filter((path) => path.endsWith('route=%2Fdocs%2Fquickstart%2F'))).toHaveLength(1);
+    page.dom.window.close();
+  }, 10_000);
+
+  // 5.6 — Start shows the site
+  it('shows the start, then the site once the dev server answers, with no click (journey B19)', async () => {
+    const page = await paint({ preview: DOWN });
+    await page.act('devStart');
+    expect(painted(page)).toContain('Starting <span class="mono">npx astro dev</span> — waiting for <span class="mono">http://localhost:4321/</span>.');
+    expect(docOf(page).querySelector('[data-act="devStart"]')).toBeNull();
+    page.answer('/api/site/preview', 200, UP);
+    expect(await until(() => docOf(page).querySelector('#devwrap iframe') !== null, 3_000)).toBe(true);
+    page.dom.window.close();
+  }, 10_000);
+
+  it('ends the wait on a launcher that exits non-zero, with its log', async () => {
+    const page = await paint({ preview: DOWN });
+    await page.act('devStart');
+    page.answer('/api/site/dev-log', 200, { running: false, state: 'exited', code: 1, lines: ['boom'] });
+    expect(await until(() => painted(page).includes('The dev server exited before it answered. Its log is below.'), 3_000)).toBe(true);
+    expect(docOf(page).querySelector('#panebody .term')?.textContent).toBe('boom');
+    page.dom.window.close();
+  }, 10_000);
+
+  it('keeps waiting through a launcher’s clean exit, and loads the site it left running', async () => {
+    const page = await paint({ preview: DOWN });
+    let polls = 0;
+    page.answer('/api/site/preview', 200, () => ((polls += 1) >= 2 ? UP : DOWN));
+    page.answer('/api/site/dev-log', 200, { running: false, state: 'exited', code: 0, lines: [] });
+    await page.act('devStart');
+    expect(await until(() => docOf(page).querySelector('#devwrap iframe') !== null, 4_000)).toBe(true);
+    expect(painted(page)).not.toContain('exited before it answered');
+    page.dom.window.close();
+  }, 10_000);
+
+  it('ends a start wait when the site changes', async () => {
+    const page = await paint({ preview: DOWN });
+    await page.act('devStart');
+    await page.act('site:/checkouts/other');
+    const mini = (): number => page.requested('/api/site/preview?site=%2Fcheckouts%2Fmini').length;
+    const held = mini();
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(mini()).toBe(held);
+    page.dom.window.close();
+  }, 10_000);
+
+  it('ends a start wait on Stop, says it is stopping, and never reads the kill as a failed start (journey B19)', async () => {
+    const page = await paint({ preview: DOWN, routes: [['/api/site/dev-log', 200, { running: true, state: 'running', lines: ['up soon'] }]] });
+    const doc = docOf(page);
+    await page.act('devStart');
+    page.answer('/api/site/dev-stop', 200, { running: false, state: 'stopped', lines: [] }, 300);
+    page.answer('/api/site/dev-log', 200, { running: false, state: 'exited', code: 143, lines: ['terminated'] });
+    const before = page.requested('/api/site/preview').length;
+    await page.act('devStop');
+    expect(painted(page)).toContain('Stopping the dev server…');
+    expect(doc.querySelector('[data-act="devStart"]')).toBeNull();
+    expect(doc.querySelector('[data-act="devStop"]')).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 1_600));
+    // One probe after Stop answers — the pane's own — and no wait probe.
+    expect(page.requested('/api/site/preview').length - before).toBe(1);
+    expect(painted(page)).not.toContain('exited before it answered');
+    expect(doc.querySelector('[data-act="devStart"]')).not.toBeNull();
+    page.dom.window.close();
+  }, 10_000);
+
+  it('offers Stop while the log says the dev server runs, though the probe answers down', async () => {
+    const page = await paint({ preview: DOWN, routes: [['/api/site/dev-log', 200, { running: true, state: 'running', lines: [] }]] });
+    expect(docOf(page).querySelector('[data-act="devStop"]')).toBeNull();
+    await page.act('devLog');
+    expect(docOf(page).querySelector('[data-act="devStop"]')).not.toBeNull();
+    page.dom.window.close();
+  });
+
+  // 5.7 — groups, search, the row preview, the refusal lines
+  it('groups keys by page, then by prefix, with no Other (journey A19)', async () => {
+    const page = await paint();
+    const labels = [...docOf(page).querySelectorAll('#gsel option')].map((option) => option.textContent);
+    expect(labels).toEqual(['home — page', 'brand', 'loose', 'unseeded', 'welcome']);
+    expect(painted(page)).not.toContain('>Other<');
+    page.dom.window.close();
+  });
+
+  it('groups an html host’s keys by the document they are marked in, then by its page (journeys A19, B17)', async () => {
+    // One group, so no selector: a query that every key name matches puts each
+    // row's group label beside it.
+    const groupOfEveryRow = async (page: Painted): Promise<string[]> => {
+      expect(docOf(page).getElementById('gsel')).toBeNull();
+      expect(page.keys()).toEqual(Object.keys(descriptor.keys).sort());
+      await page.type('search', '_');
+      return [
+        ...new Set(
+          [...docOf(page).querySelectorAll('[data-act^="key:"]')].map(
+            (row) => [...row.querySelectorAll('.bdg')].at(-1)?.textContent ?? '',
+          ),
+        ),
+      ];
+    };
+    const byDocument = await paint({
+      site: siteBody({ host: 'html', descriptor: unpaged }),
+      routes: [['/api/site/marks', 200, allMarkedIn('index.html', null)]],
+    });
+    expect(await groupOfEveryRow(byDocument)).toEqual(['index.html']);
+    byDocument.dom.window.close();
+
+    const byPage = await paint({
+      site: siteBody({ host: 'html', descriptor: unpaged }),
+      routes: [['/api/site/marks', 200, allMarkedIn('index.html', 'home')]],
+    });
+    expect(await groupOfEveryRow(byPage)).toEqual(['home — page']);
+    byPage.dom.window.close();
+  });
+
+  it('searches every group and keeps the key being edited, its row following the typing (journey B18)', async () => {
+    const page = await paint({ preview: UP });
+    const doc = docOf(page);
+    const frame = doc.querySelector('#devwrap iframe');
+    await page.change('group', 'prefix:brand');
+    await page.type('search', 'Ship');
+    expect(page.keys()).toEqual(['hero_headline']);
+    const badges = [...(doc.querySelector('[data-act="key:hero_headline"]')?.querySelectorAll('.bdg') ?? [])].map((b) => b.textContent);
+    expect(badges).toContain('home — page');
+    expect(doc.getElementById('gsel')).toBeNull();
+
+    await page.act('key:hero_headline');
+    // The first keystroke flips the page dirty and repaints; the second repaints
+    // only the row.
+    await page.type('text:hero_headline', 'Unrelated');
+    await page.type('text:hero_headline', 'Unrelated words');
+    expect(page.keys()).toEqual(['hero_headline']);
+    expect(doc.querySelector('.row.on .s')?.textContent).toBe('Unrelated words');
+    expect(doc.querySelector('#devwrap iframe')).toBe(frame);
+
+    // Saved: the value on disk no longer matches the query and nothing is
+    // unsaved, so only being the key in the editor keeps it listed.
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.act('save');
+    expect(page.keys()).toEqual(['hero_headline']);
+    page.dom.window.close();
+  });
+
+  it('clears a save’s refusal once the value changes, and draws it again on the next refusal (journey B18)', async () => {
+    const page = await paint();
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'x'.repeat(71));
+    await page.act('save');
+    expect(painted(page)).toContain('71 characters over a 60 limit');
+    await page.type('text:hero_headline', 'x'.repeat(72));
+    expect(painted(page)).not.toContain('71 characters over a 60 limit');
+    expect(docOf(page).getElementById('refusal')).toBeNull();
+    await page.act('save');
+    expect(painted(page)).toContain('71 characters over a 60 limit');
+    page.dom.window.close();
+  });
+
+  it('clears the add-path error on a successful add', async () => {
+    const page = await paint();
+    const doc = docOf(page);
+    const err = (): HTMLElement => doc.getElementById('adderr') as HTMLElement;
+    page.answer('/api/workspace/add', 400, { error: 'relative: a workspace path must be absolute' });
+    (doc.getElementById('addpath') as HTMLInputElement).value = 'relative';
+    await page.act('addSite');
+    expect(err().style.display).toBe('');
+    expect(err().textContent).toBe('relative: a workspace path must be absolute');
+    page.answer('/api/workspace/add', 200, { added: true, path: '/checkouts/mini', sites: page.workspace.sites });
+    (doc.getElementById('addpath') as HTMLInputElement).value = '/checkouts/mini';
+    await page.act('addSite');
+    expect(err().style.display).toBe('none');
+    expect(err().textContent).toBe('');
+    page.dom.window.close();
+  });
+
+  // 5.8 — History, Recent and Setup by host
+  it('labels History and Recent by what an html host logs, and gives its Setup no dev-server fields (journeys B17, B19)', async () => {
+    const html = await paint({
+      site: siteBody({ host: 'html', config: { ...(siteBody()['config'] as object), host: 'html' }, dev: null }),
+      preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+      routes: [['/api/site/history', 200, { commits: [] }]],
+    });
+    expect(painted(html)).toContain('the commits that touched the snapshot or the pages');
+    await html.act('history');
+    expect(painted(html)).toContain('No commits touch the snapshot or the pages yet.');
+    await html.act('tab:Recent');
+    expect(painted(html)).toContain('A publish here is a commit, so this is the log of the snapshot and the pages.');
+    await html.act('tab:Setup');
+    expect(painted(html)).toContain('stet dev serves this site’s pages itself, so it needs no dev server.');
+    expect(docOf(html).querySelector('[data-act-change="entryDev"]')).toBeNull();
+    html.dom.window.close();
+
+    const js = await paint({ routes: [['/api/site/history', 200, { commits: [] }]] });
+    expect(painted(js)).toContain('the commits that touched the snapshot</span>');
+    await js.act('history');
+    expect(painted(js)).toContain('No commits touch the snapshot yet.');
+    await js.act('tab:Setup');
+    expect((docOf(js).getElementById('devcmd') as HTMLInputElement).placeholder).toBe('npx astro dev');
+    expect((docOf(js).getElementById('devurl') as HTMLInputElement).placeholder).toBe('http://localhost:4321');
+    js.dom.window.close();
   });
 });

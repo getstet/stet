@@ -4,5 +4,13 @@
 # unkeyed copy without blocking by default; with scan.severity: "fail" in
 # stet.config.json it exits non-zero and blocks the commit too — the opted-in
 # strict gate, which is correct when a project has chosen it.
-npx stet check || exit 1
-npx stet scan
+#
+# The gate runs both in each stet checkout of this worktree that the commit
+# touches, with the stet installed in that checkout, and never fetches one.
+# The checkouts are listed in stet-gate.json, read by stet-gate.mjs, both in
+# git's common directory.
+command -v node >/dev/null || {
+  echo "stet pre-commit gate: node is not on PATH — commit from a shell where node runs, or add node to the PATH your git client uses" >&2
+  exit 1
+}
+exec node "$(git rev-parse --git-common-dir)/stet-gate.mjs"

@@ -206,6 +206,10 @@ export type SiteState =
       environments: string[];
       locales: string[];
       git: { head: string | null; branch: string | null; dirty: boolean };
+      /** The config's `project` id — shown beside the folder name, never an identity. */
+      project: string;
+      /** The config's router: the page names a JavaScript host by it. */
+      router: StetConfig['router'];
     };
 
 /**
@@ -252,6 +256,8 @@ export function loadSite(entry: WorkspaceEntry): SiteState {
     environments: Object.keys(config.environments ?? {}),
     locales: config.locales.enabled,
     git: gitState(path),
+    project: config.project,
+    router: config.router,
   };
 }
 

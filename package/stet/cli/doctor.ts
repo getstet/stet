@@ -21,14 +21,15 @@ import type * as TS from 'typescript';
 import { resolve } from '../src/resolve.js';
 import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { check } from './check.js';
-import { CONFIG_FILE, isHtmlHost } from './config.js';
-import { hooksDir } from './hook.js';
+import { CONFIG_FILE, isHtmlHost, type StetConfig } from './config.js';
+import { filesForGlobs } from './files.js';
+import { GATE_LINE, gateSite, hookKind, hooksDir, insideDir, operatorHook, readGate, worktreeTop, type GateEntry } from './hook.js';
 import { packageVersion } from './installed.js';
 import type { CliIo } from './main.js';
 import { readProjectMeta } from './meta.js';
 import { loadProject, type LoadedProject } from './project.js';
-import { Report, UsageError, formatFinding, posixRelative, shapeOf } from './report.js';
-import { TS7_REFUSAL, carriesToken, loadTypescript, mentionsToken, scriptKindFor } from './source-scan.js';
+import { Report, UsageError, formatFinding, plural, posixRelative, shapeOf } from './report.js';
+import { TS7_REFUSAL, carriesToken, dialectOf, loadTypescript, mentionsToken, scriptKindFor } from './source-scan.js';
 import { isStoreBacked } from './store.js';
 
 export async function runDoctor(args: string[], io: CliIo): Promise<number> {
@@ -72,6 +73,7 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
     const checks = new Report();
     check(config, io.cwd, checks);
     report.absorb(checks, 'warn');
+    await compilerSection(io.cwd, config, report);
 
     environmentsSection(project, report);
     await wrapperChainSection(io, project, report);
@@ -82,6 +84,7 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
     if (!isStoreBacked(project.environment.block) && hooksDir(io.cwd) === null) {
       report.warn('config', 'git: not a repository — publish cannot be a commit; run git init');
     }
+    hookSection(io.cwd, report);
     if (url !== undefined && key !== undefined) await liveCheck(io, project, report, url, key);
 
     if (flag(values, 'report')) {
@@ -211,6 +214,55 @@ async function wrapperChainSection(io: CliIo, project: LoadedProject, report: Re
   }
 }
 
+/**
+ * The older pre-commit gate runs a bare `npx stet` from the top of the
+ * repository: in a checkout that is a folder of its repository no local stet
+ * is found there, and npx asks the registry for the unscoped `stet`, a package
+ * that is not this one.
+ */
+function hookSection(cwd: string, report: Report): void {
+  const dir = hooksDir(cwd);
+  const where = gateSite(cwd);
+  if (dir === null || where === null) return;
+  const hook = join(dir, 'pre-commit');
+  if (!insideDir(dir, where.common)) {
+    const top = worktreeTop(cwd);
+    if (top === null || !insideDir(dir, top)) {
+      report.line(
+        `hook: core.hooksPath points at ${dir}, outside this repository — stet hook install leaves it alone; add the gate's line there by hand`,
+      );
+      return;
+    }
+    // A hooks manager's folder in the worktree: the gate joins its pre-commit by
+    // one line, in the file that actually runs (husky v9's `.husky/pre-commit`).
+    const theirs = operatorHook(dir);
+    const runs = existsSync(theirs.path) && readFileSync(theirs.path, 'utf8').includes(GATE_LINE);
+    report.line(
+      runs
+        ? `hook: ${theirs.path} runs the stet pre-commit gate`
+        : theirs.husky
+          ? `hook: ${theirs.path} does not run the stet pre-commit gate — add this line to it, which husky runs from ${dir}: ${GATE_LINE}`
+          : `hook: ${theirs.path} does not run the stet pre-commit gate — add this line to it: ${GATE_LINE}`,
+    );
+    return;
+  }
+  const kind = existsSync(hook) ? hookKind(readFileSync(hook, 'utf8')) : null;
+  let listed: GateEntry[] = [];
+  try {
+    listed = readGate(where.common);
+  } catch {
+    /* a list that does not parse is named by the gate itself, on the next commit */
+  }
+  if (kind === 'this' && listed.some((entry) => entry.worktree === where.worktree && entry.checkout === where.checkout)) {
+    report.line('hook: the stet pre-commit gate runs here — stet hook remove takes this checkout out of it');
+  }
+  if (kind !== 'older') return;
+  report.warn(
+    'config',
+    'hook: the stet pre-commit gate is the older form, which runs npx stet from the top of the repository and can fetch a package that is not stet — run stet hook install to replace it',
+  );
+}
+
 /** The postal token a marketing wrapper is expected to emit. */
 const POSTAL_TOKEN = 'postal_address';
 
@@ -239,10 +291,7 @@ async function chainCompiler(report: Report): Promise<typeof import('typescript'
   try {
     return await loadTypescript();
   } catch (error) {
-    const cause =
-      error instanceof Error && error.message === TS7_REFUSAL
-        ? TS7_REFUSAL
-        : 'typescript is not installed (npm i -D typescript)';
+    const cause = compilerCause(error) ?? 'typescript is not installed (npm i -D typescript)';
     report.line(
       `wrapper chains: degraded — ${cause}. Each pointer file is searched on its own, as plain text; ` +
         'a token missing from it is reported unchecked rather than unfound, because the wrapper that would ' +
@@ -250,6 +299,43 @@ async function chainCompiler(report: Report): Promise<typeof import('typescript'
     );
     return null;
   }
+}
+
+/**
+ * The compiler `scan` and `register` need, named before either runs.
+ *
+ * A declared surface or copy module that is not a template-dialect file is
+ * handed to the TypeScript compiler — scan's own branch — so a host declaring
+ * `copyModules: ["src/copy.ts"]` without `typescript` installed fails every
+ * scan, and the pre-commit gate with it. Doctor says so first, as a warn: it
+ * never moves the exit, and a compiler that fails to load for any reason never
+ * stops the diagnosis.
+ */
+async function compilerSection(cwd: string, config: StetConfig, report: Report): Promise<void> {
+  const globs = [...new Set([...config.managedSurfaces, ...config.copyModules])];
+  const needing = filesForGlobs(cwd, globs).filter((file) => dialectOf(file) === null);
+  const first = needing[0];
+  if (first === undefined) return;
+  try {
+    await loadTypescript();
+  } catch (error) {
+    const where = needing.length === 1 ? first : `${first} and ${plural(needing.length - 1, 'other file')}`;
+    report.warn(
+      'config',
+      compilerCause(error) === TS7_REFUSAL
+        ? `${TS7_REFUSAL} — stet scan and stet register read ${where} with it`
+        : `typescript: not installed — stet scan and stet register read ${where} with it; npm i -D typescript`,
+    );
+  }
+}
+
+/**
+ * Why `loadTypescript` failed, for doctor's two readers: TypeScript 7's
+ * refusal, or null for every other failure — a missing, truncated or broken
+ * install all read as not installed, and none of them stops doctor.
+ */
+function compilerCause(error: unknown): typeof TS7_REFUSAL | null {
+  return error instanceof Error && error.message === TS7_REFUSAL ? TS7_REFUSAL : null;
 }
 
 /** The files a wrapper claim was searched in, and whether that was all of them. */

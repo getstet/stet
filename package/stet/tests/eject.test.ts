@@ -18,6 +18,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { createMemoryStore } from '../adapters/store-memory.js';
 import { cleanupCliHosts, htmlFixture, makeHtmlHost } from '../conformance/cli-host.js';
 import { runEject } from '../cli/eject.js';
+import { HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
 import { packageRoot } from '../cli/installed.js';
 import type { CliIo } from '../cli/main.js';
 
@@ -318,6 +319,14 @@ describe('runEject --write — the pre-commit hook', () => {
     gitInit(dir);
     const shipped = readFileSync(join(pkg, 'templates', 'pre-commit'), 'utf8');
     write(dir, '.git/hooks/pre-commit', shipped);
+    await runEject(['--write'], io(dir));
+    expect(existsSync(join(dir, '.git/hooks/pre-commit'))).toBe(false);
+  });
+
+  it('deletes the older gate 0.3.0 and earlier shipped', async () => {
+    const dir = host();
+    gitInit(dir);
+    write(dir, '.git/hooks/pre-commit', HOOK_BEFORE_0_3_1);
     await runEject(['--write'], io(dir));
     expect(existsSync(join(dir, '.git/hooks/pre-commit'))).toBe(false);
   });

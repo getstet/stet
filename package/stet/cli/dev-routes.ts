@@ -15,24 +15,26 @@
  * the same exit codes and the same text the terminal gives.
  */
 
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { readFileSync, realpathSync, statSync, utimesSync } from 'node:fs';
-import { join, resolve as resolvePath, sep } from 'node:path';
+import { closeSync, openSync, readFileSync, realpathSync, statSync, utimesSync } from 'node:fs';
+import { join, posix, resolve as resolvePath, sep } from 'node:path';
 
 import { bearerMatches, createStetHandler } from '../server/mount.js';
-import type { Snapshot } from '../src/snapshot.js';
+import { route as normalizeRoute } from '../src/seo.js';
+import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
 import type { StetConfig } from './config.js';
-import { filesForGlobs } from './files.js';
-import { git, gitRun, gitState } from './git.js';
+import { filesForGlobs, staticPrefix } from './files.js';
+import { git, gitData, gitRun, gitState, operationInProgress, uncommittedPaths } from './git.js';
 import { proposeHtml } from './html-host.js';
 import { runCli, type CliIo } from './main.js';
-import { applyPages, proposeForHost } from './pages.js';
+import { applyPages, fileRoute, proposeForHost } from './pages.js';
 import { planRemoval } from './remove.js';
+import { matchGlob } from './source-scan.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
 import { validateValue } from './validate.js';
@@ -51,9 +53,11 @@ import {
   type WorkspaceEntry,
 } from './workspace.js';
 import { osUser } from './write.js';
-import { packageVersion } from './installed.js';
+import { packageRoot, packageVersion } from './installed.js';
+import { gone } from './liveness.js';
+import { injectAgent, startPreviewProxy, type PreviewProxy } from './preview-proxy.js';
 
-/** A dev-server child the dashboard started. Section 8 fills it; the context carries it from the start. */
+/** A dev-server child the dashboard started: Start creates it, and the context holds it until Stop, the site's removal or the server's close ends it. */
 export interface DevChild {
   pid: number;
   command: string;
@@ -62,6 +66,8 @@ export interface DevChild {
   code: number | null;
   /** The entry's stop command, for a server that outlived its launcher. */
   stop?: string;
+  /** The dev URL at Start, which the stop path polls until the server lets go of it. */
+  dev?: string;
   /** Whether the exited-or-detached question has been answered once. */
   checked?: boolean;
   handle?: ChildProcess;
@@ -83,6 +89,10 @@ export interface DevContext {
   queues: Map<string, Promise<unknown>>;
   /** Test seam: an adapter to use in place of the one the config would build. */
   storeFor?: (path: string, env: string | undefined) => StoreAdapter | undefined;
+  /** One preview proxy per JavaScript site, keyed by checkout, started on its first answering probe. */
+  proxies?: Map<string, PreviewProxy>;
+  /** The run's preview channel, minted on first use. */
+  previewChannel?: string;
 }
 
 /** A JSON reply. Every route answers one, bar the page, the static files and the mount's own. */
@@ -300,6 +310,15 @@ export function createDevHandler(ctx: DevContext): (req: Request) => Promise<Res
       return pageResponse(ctx, req.method === 'HEAD');
     }
 
+    // The preview agent: public script carrying no data, loaded by the static
+    // pane's documents, whose sandboxed frame can send no token.
+    if ((req.method === 'GET' || req.method === 'HEAD') && path === PREVIEW_AGENT_ROUTE) {
+      return new Response(req.method === 'HEAD' ? null : agentScript(), {
+        status: 200,
+        headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
+      });
+    }
+
     const id = idSegment(url);
     const isMount = id !== null && url.pathname.split('/').filter(Boolean)[2] === 'api';
     const isStatic = id !== null && url.pathname.split('/').filter(Boolean)[2] === 'site';
@@ -370,6 +389,7 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
     const path = reqStr(body, 'path');
     // A site that leaves the workspace takes its dev server with it.
     await stopChild(ctx, path);
+    await closeProxy(ctx, path);
     removeSite(ctx.workspaceFile, path);
     return json({ sites: listing(ctx).map(summary) });
   }
@@ -407,6 +427,8 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await verify(ctx, site);
       case 'GET site/preview':
         return await preview(ctx, url, site, entry);
+      case 'GET site/marks':
+        return marks(site);
       case 'POST site/dev-start':
         return await devStart(ctx, site, entry);
       case 'POST site/dev-stop':
@@ -478,6 +500,7 @@ function siteReply(site: SiteState, entry: WorkspaceEntry): Response {
     environments,
     dev: devDefaults(config, entry),
     entry,
+    pending: pendingForms(site),
   });
 }
 
@@ -530,6 +553,7 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
     touched,
     findings: [...gate.findings, ...report.findings],
     at: gitState(ready.path),
+    pending: pendingForms(ready),
   });
 }
 
@@ -577,52 +601,177 @@ function touchReadPath(site: Extract<SiteState, { state: 'ready' }>): string | n
   return site.config.readPath.file;
 }
 
+/** A ready site, as every route past `requireReady` holds it. */
+type Ready = Extract<SiteState, { state: 'ready' }>;
+
 /**
- * The batch's own files, staged and committed — and nothing else in the working
- * tree.
+ * The stet-written forms git reports as uncommitted, staged and committed —
+ * and nothing else in the working tree.
  *
- * Every named file must be one of the labels the repo-form batch would produce
- * right now, so a request naming an unrelated file cannot make the dashboard
- * commit it; the pathspec form then commits exactly those paths whatever the
- * index already holds.
+ * The list is read from git when the commit runs, not taken from the page: a
+ * list gone stale since the page last asked would otherwise commit a deletion
+ * or a file already committed in the terminal. Every name reaches git as a
+ * literal pathspec, and every refusal carries the list as it now stands.
  */
 async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
   const body = await readJson(req);
   const files = body['files'];
   const keys = body['keys'];
-  if (!Array.isArray(files) || files.length === 0) throw new UsageError('files is required');
-  if (!Array.isArray(keys) || keys.length === 0) throw new UsageError('keys is required');
-
-  const labels = stetWrittenForms(
-    ready,
-    files.filter((file): file is string => typeof file === 'string'),
-  );
-  for (const file of files) {
-    if (typeof file !== 'string' || !labels.has(file)) {
-      return json({ error: `${String(file)} is not a stet-written form of this site` }, 400);
-    }
+  // Every refusal carries the list as git reads it now, so the page never
+  // keeps offering a Commit the server just refused.
+  const refuse = (error: string, status: number, output?: string): Response =>
+    json({ error, ...(output === undefined ? {} : { output }), pending: pendingForms(ready) }, status);
+  if (!Array.isArray(files) || files.length === 0) return refuse('files is required', 400);
+  // `git add` would stage the forms into the operation's own index — a merge
+  // commit would then carry the stet edit — and mid-rebase the commit would
+  // land inside it.
+  if (operationInProgress(ready.path)) {
+    return refuse('a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal', 409);
   }
 
-  const named = keys.map((key) => String(key));
+  // Read from git now, not from the page's last reply: a list gone stale since
+  // would otherwise commit a deletion or a file already committed elsewhere.
+  const pending = pendingForms(ready);
+  for (const file of files) {
+    if (typeof file === 'string' && pending.includes(file)) continue;
+    const form = typeof file === 'string' && stetWrittenForms(ready, [file]).has(file);
+    return refuse(form ? `${String(file)} has nothing to commit` : `${String(file)} is not a stet-written form of this site`, 400);
+  }
+  const named = files as string[];
+
+  // The keys the caller names, else — when the snapshot is in the commit — the
+  // keys whose value it changes; a commit without the snapshot names its files.
+  const subject =
+    Array.isArray(keys) && keys.length > 0
+      ? keys.map((key) => String(key))
+      : named.includes(gitSpelling(ready.config.snapshotPath))
+        ? changedKeys(ready)
+        : [];
   const message =
     typeof body['message'] === 'string' && body['message'] !== ''
       ? body['message']
-      : clipTo72(`stet: ${plural(named.length, 'key')} updated — ${named.join(', ')}`);
+      : clipTo72(
+          subject.length > 0
+            ? `stet: ${plural(subject.length, 'key')} updated — ${subject.join(', ')}`
+            : `stet: ${plural(named.length, 'file')} updated — ${named.join(', ')}`,
+        );
 
   // Through the async twin: a pre-commit hook that runs a real check would
   // otherwise block the page and every other checkout for as long as it ran.
-  const staged = await gitRun(ready.path, ['add', '--', ...(files as string[])]);
-  if (staged.code !== 0) return json({ error: 'git commit failed', output: staged.out }, 409);
-  const made = await gitRun(ready.path, ['commit', '-m', message, '--', ...(files as string[])]);
-  if (made.code !== 0) return json({ error: 'git commit failed', output: made.out }, 409);
+  // Each name literal: a document named `p[ab].html` is that file, never a
+  // pattern that stages an unrelated `pb.html`. Per path, not git's global
+  // `--literal-pathspecs`, which exports GIT_LITERAL_PATHSPECS to the
+  // operator's hook and blinds every glob it selects staged files with.
+  //
+  // Nothing is staged into the operator's index: `add -N` records only that an
+  // untracked form will be added (a tracked one is left as it is), and a commit
+  // limited to paths builds its own index. A hook that refuses the commit then
+  // leaves the forms unstaged, and the operator's next commit never carries them.
+  const literal = named.map((file) => `:(literal)${file}`);
+  const intent = await gitRun(ready.path, ['add', '-N', '--', ...literal]);
+  if (intent.code !== 0) return refuse('git commit failed', 409, intent.out);
+  const made = await gitRun(ready.path, ['commit', '-m', message, '--', ...literal]);
+  if (made.code !== 0) return refuse('git commit failed', 409, made.out);
 
   return json({
     sha: git(ready.path, ['rev-parse', 'HEAD']).out.trim(),
     short: git(ready.path, ['rev-parse', '--short', 'HEAD']).out.trim(),
     subject: git(ready.path, ['log', '-1', '--format=%s']).out.trim(),
     at: gitState(ready.path),
+    pending: pendingForms(ready),
   });
+}
+
+/**
+ * The keys whose value differs between HEAD's snapshot and the one on disk, in
+ * any locale. A snapshot HEAD does not hold, or one `loadSnapshot` refuses — a
+ * locale block that is `null`, which is exactly the commit that repairs it —
+ * makes every key on disk a change.
+ */
+function changedKeys(site: Ready): string[] {
+  const before = gitData(site.path, ['show', `HEAD:./${gitSpelling(site.config.snapshotPath)}`]);
+  let committed: Snapshot = {};
+  if (before.code === 0) {
+    try {
+      committed = loadSnapshot(JSON.parse(before.stdout));
+    } catch {
+      committed = {};
+    }
+  }
+  const own = (block: Record<string, unknown> | undefined, key: string): unknown =>
+    block !== undefined && Object.hasOwn(block, key) ? block[key] : undefined;
+  const keys = new Set<string>();
+  for (const locale of new Set([...Object.keys(committed), ...Object.keys(site.snapshot)])) {
+    const a = Object.hasOwn(committed, locale) ? committed[locale] : undefined;
+    const b = Object.hasOwn(site.snapshot, locale) ? site.snapshot[locale] : undefined;
+    for (const key of new Set([...Object.keys(a ?? {}), ...Object.keys(b ?? {})])) {
+      if (JSON.stringify(own(a, key)) !== JSON.stringify(own(b, key))) keys.add(key);
+    }
+  }
+  return [...keys].sort();
+}
+
+/**
+ * The forms stet writes on this site, enumerated once for the commit's accept
+ * set and the pending list: the descriptor and the snapshot, then either the
+ * codegen trio or — on the static-HTML host — the managed globs whose marked
+ * documents count.
+ */
+function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
+  const { config } = site;
+  if (site.host === 'html') {
+    return { files: [config.descriptorPath, config.snapshotPath].map(gitSpelling), globs: config.managedSurfaces };
+  }
+  return {
+    files: [
+      config.descriptorPath,
+      config.snapshotPath,
+      config.codegen.registry,
+      config.codegen.dts,
+      config.codegen.defaults,
+    ].map(gitSpelling),
+    globs: [],
+  };
+}
+
+/** A configured path as git reports it: `./content/defaults.json` is `content/defaults.json`. */
+function gitSpelling(path: string): string {
+  return posix.normalize(path).replace(/^\.\//, '');
+}
+
+/**
+ * The committable files: the stet-written forms git reports as differing from
+ * HEAD — staged, unstaged or untracked — deletions and unmerged paths left out,
+ * a document counting only where it carries a mark. Read from the checkout
+ * every time, so a reload, a restart or a save made in the terminal all give
+ * the same answer.
+ */
+function pendingForms(site: Ready): string[] {
+  const { files, globs } = stetFormPaths(site);
+  // Git reads a glob its own way (`[` is a class to git and a character to
+  // stet; `**` beside a name is a plain `*` to git), so git is asked only for
+  // the folders the globs walk, as literal paths, and stet's own matcher picks
+  // the documents.
+  const roots = [...new Set(globs.map(staticPrefix))].map((root) => (root === '' ? '.' : `:(literal)${root}`));
+  const changed = uncommittedPaths(site.path, [...files, ...roots]).filter(
+    (file) => files.includes(file) || globs.some((glob) => matchGlob(glob, file)),
+  );
+  // A document that cannot be read is left out, so one unreadable file never
+  // stops the site opening.
+  const readable = changed.filter((file) => files.includes(file) || canRead(join(site.path, file)));
+  const accepted = stetWrittenForms(site, readable);
+  return readable.filter((file) => accepted.has(file));
+}
+
+/** Opened, not asked: `access()` answers readable on some mounts (virtiofs, ACLs) where `open()` fails. */
+function canRead(path: string): boolean {
+  try {
+    closeSync(openSync(path, 'r'));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -634,9 +783,9 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
  * commit of exactly the document the save had written — the html half of
  * journeys B17 and A17 could not be committed from the page.
  *
- * The enumeration is the one `planRepoForms` itself walks, so the two cannot
- * drift: the descriptor, the snapshot, and then either the marked documents or
- * the codegen trio.
+ * The enumeration is `stetFormPaths`, the one `planRepoForms` itself walks, so
+ * the two cannot drift: the descriptor, the snapshot, and then either the
+ * marked documents or the codegen trio, each in git's spelling.
  *
  * Scoped to the request's own files because the html arm PARSES what it
  * answers about, and parsing a whole checkout of documents on every commit
@@ -645,25 +794,22 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
  * is unchanged by the scoping: a file the managed surfaces do not match is
  * never parsed and never accepted either way.
  */
-function stetWrittenForms(site: Extract<SiteState, { state: 'ready' }>, files: string[]): Set<string> {
-  const { config } = site;
-  const labels = new Set([config.descriptorPath, config.snapshotPath]);
-  if (site.host !== 'html') {
-    for (const form of [config.codegen.registry, config.codegen.dts, config.codegen.defaults]) labels.add(form);
-    return labels;
-  }
+function stetWrittenForms(site: Ready, files: string[]): Set<string> {
+  const { files: forms, globs } = stetFormPaths(site);
+  const labels = new Set(forms);
+  if (globs.length === 0) return labels;
   // The documents are NOT every file `managedSurfaces` matches: that set holds
   // html this project wrote by hand, and committing one of those under a
   // `stet:` subject would carry unrelated work with it. A document carrying a
   // mark is one stet regenerates, which is a property of the file rather than
   // of this process's memory — so a document written by a previous run is
   // still committable after a restart.
-  const managed = filesForGlobs(site.path, config.managedSurfaces).filter((file) => files.includes(file));
+  const managed = filesForGlobs(site.path, globs).filter((file) => files.includes(file));
   for (const mark of proposeHtml(site.path, managed).claimed) labels.add(mark.file);
   return labels;
 }
 
-/** A commit subject, held to one readable line. *//** A commit subject, held to one readable line. */
+/** A commit subject, held to one readable line. */
 function clipTo72(text: string): string {
   return text.length <= 72 ? text : `${text.slice(0, 71)}…`;
 }
@@ -715,9 +861,9 @@ function history(site: SiteState): Response {
  *
  * The request is forwarded AS IS: the mount reads the last path segment, so the
  * mount point is transparent to it. Its Bearer is the run token through
- * `STET_DEV_TOKEN`, which `runDev` set in this process's environment before the
- * server started; the site's own `apiTokenEnv` is never read, because the
- * dashboard is not the site's production API.
+ * `STET_DEV_TOKEN`, which `startDevServer` sets in this process's environment
+ * as the server starts; the site's own `apiTokenEnv` is never read, because
+ * the dashboard is not the site's production API.
  */
 async function mountRoute(ctx: DevContext, req: Request, url: URL): Promise<Response> {
   return withSite(ctx, url, async (site) => {
@@ -793,10 +939,23 @@ async function staticRoute(ctx: DevContext, req: Request, url: URL): Promise<Res
     const file = insideCheckout(site.path, resolvePath(site.path, ...parts));
     if (file === null) return json({ error: 'not found' }, 404);
 
-    const body = readFileSync(file);
+    // A document gains the preview agent's tag as it is served; the file on
+    // disk is never written.
+    const read = readFileSync(file);
+    const body = file.endsWith('.html')
+      ? Buffer.from(injectAgent(read.toString('latin1'), ctx.origin, previewChannel(ctx), PREVIEW_AGENT_ROUTE), 'latin1')
+      : read;
     return new Response(req.method === 'HEAD' ? null : new Uint8Array(body), {
       status: 200,
-      headers: { 'content-type': contentTypeOf(file), 'cache-control': 'no-store' },
+      // Sandboxed wherever it is framed: a checkout's document nested in the
+      // dev pane's frame, whose sandbox would otherwise pass it the
+      // dashboard's origin, still runs with an opaque one and cannot reach
+      // the run token.
+      headers: {
+        'content-type': contentTypeOf(file),
+        'cache-control': 'no-store',
+        'content-security-policy': 'sandbox allow-scripts allow-forms allow-popups',
+      },
     });
   });
 }
@@ -906,31 +1065,118 @@ async function preview(
 ): Promise<Response> {
   const ready = requireReady(site);
   const route = url.searchParams.get('route') ?? '/';
-  if (ready.host === 'html') {
-    return json({ url: `${ctx.origin}/s/${ready.id}/site${route}`, up: true, static: true });
-  }
-  const defaults = devDefaults(ready.config, entry);
-  if (defaults === null) return json({ error: 'this site has no dev server' }, 400);
-  // The route is refused before it is used, not after: `new URL(route, base)`
-  // lets `//example.com/` or an absolute URL REPLACE the base, which would turn
-  // the probe into an outbound fetch and a local port scanner. A scheme, a
-  // protocol-relative `//` and a Windows `\\` are the three spellings that
+  // The route is refused before it is used, on both panes, not after: `new
+  // URL(route, base)` lets `//example.com/` or an absolute URL REPLACE the
+  // base, which would turn the probe into an outbound fetch and a local port
+  // scanner, and the operator types the static pane's route as well. A scheme,
+  // a protocol-relative `//` and a Windows `\\` are the three spellings that
   // carry a host; everything else is a path. The entry's own `dev` is
   // loopback-checked when it is set, so the base keeps the probe there.
   if (ABSOLUTE_ROUTE.test(route) || route.startsWith('//') || route.startsWith('\\\\')) {
     return json({ error: 'route must be a path on the dev server' }, 400);
   }
+  if (ready.host === 'html') {
+    const path = route.startsWith('/') ? route : `/${route}`;
+    return json({ url: `${ctx.origin}/s/${ready.id}/site${path}`, up: true, static: true, channel: previewChannel(ctx) });
+  }
+  const defaults = devDefaults(ready.config, entry);
+  if (defaults === null) return json({ error: 'this site has no dev server' }, 400);
   const target = new URL(defaults.dev);
   target.pathname = route.startsWith('/') ? route : `/${route}`;
   target.search = '';
   target.hash = '';
+  const up = await probe(ctx, target.toString());
+  // The frame shows the site through its proxy, whose own origin keeps the
+  // site's code away from the dashboard's; a down server has no frame to show.
+  const proxied = up ? await proxyFor(ctx, ready.path, new URL(defaults.dev).origin) : null;
   return json({
-    url: target.toString(),
-    up: await probe(ctx, target.toString()),
+    url: proxied === null ? target.toString() : proxied.origin + target.pathname,
+    dev: target.toString(),
+    up,
+    channel: previewChannel(ctx),
     start: defaults.devCommand,
     source: defaults.source,
     router: ready.config.router,
   });
+}
+
+/**
+ * The run's preview channel: a random value the agent carries on every message
+ * it sends, so the page can tell its own agent from a page the frame navigated
+ * to. Served inside the documents and in the Bearer-guarded preview reply,
+ * never readable across origins.
+ */
+function previewChannel(ctx: DevContext): string {
+  ctx.previewChannel ??= randomBytes(16).toString('hex');
+  return ctx.previewChannel;
+}
+
+/** Where the dashboard serves the preview agent the static documents load. */
+const PREVIEW_AGENT_ROUTE = '/preview-agent.js';
+
+let agentText: string | undefined;
+/** The preview agent, read once from the package. */
+function agentScript(): string {
+  agentText ??= readFileSync(join(packageRoot(), 'templates', 'preview-agent.js'), 'utf8');
+  return agentText;
+}
+
+/** The site's preview proxy, started on first use and replaced when the entry's dev URL moves. */
+async function proxyFor(ctx: DevContext, path: string, dev: string): Promise<PreviewProxy> {
+  const proxies = (ctx.proxies ??= new Map());
+  const held = proxies.get(path);
+  if (held !== undefined && held.target === dev) return held;
+  if (held !== undefined) await held.close();
+  const started = await startPreviewProxy(dev, ctx.origin, agentScript(), previewChannel(ctx));
+  proxies.set(path, started);
+  return started;
+}
+
+async function closeProxy(ctx: DevContext, path: string): Promise<void> {
+  const held = ctx.proxies?.get(path);
+  if (held === undefined) return;
+  ctx.proxies?.delete(path);
+  await held.close();
+}
+
+/**
+ * Where each key is marked on a static-HTML host, because the page cannot read
+ * a document itself: each managed document with the route the static arm
+ * serves it at and the declared page whose route it is, and per key the
+ * documents carrying its mark. Empty on a JavaScript host.
+ *
+ * The page route is compared the way `pages scan` compares it — `fileRoute`
+ * and `src/seo.ts`'s `route` — so a page the html arm declared matches its
+ * document. The served route differs on purpose: `about.html` is the page
+ * `/about` and is served at `/about.html`, because the static arm serves files
+ * by path and a folder's index at the folder, where relative references
+ * inside the page resolve.
+ */
+function marks(site: SiteState): Response {
+  const ready = requireReady(site);
+  if (ready.host !== 'html') return json({ documents: [], keys: {} });
+  const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
+  const pages = new Map<string, string>();
+  for (const [name, page] of Object.entries(ready.descriptor.pages ?? {})) pages.set(normalizeRoute(page.route), name);
+  const documents = set.documents.map((document) => ({
+    file: document.file,
+    route: servedRoute(document.file),
+    page: pages.get(normalizeRoute(fileRoute(document.file))) ?? null,
+  }));
+  const keys = new Map<string, string[]>();
+  for (const mark of set.claimed) {
+    const held = keys.get(mark.key) ?? [];
+    if (!held.includes(mark.file)) held.push(mark.file);
+    keys.set(mark.key, held);
+  }
+  return json({ documents, keys: Object.fromEntries(keys) });
+}
+
+/** A document's path as the static arm serves it: a folder's index at the folder, anything else at itself. */
+function servedRoute(file: string): string {
+  if (file === 'index.html') return '/';
+  if (file.endsWith('/index.html')) return `/${file.slice(0, -'index.html'.length)}`;
+  return `/${file}`;
 }
 
 /** A route that names a scheme rather than a path — `https:`, `javascript:`, `file:`. */
@@ -985,6 +1231,7 @@ async function devStart(ctx: DevContext, site: SiteState, entry: WorkspaceEntry)
     state: 'running',
     code: null,
     ...(stop === undefined ? {} : { stop }),
+    ...(defaults === null ? {} : { dev: defaults.dev }),
     handle: spawned,
   };
   const keep = (chunk: Buffer): void => {
@@ -1051,19 +1298,92 @@ async function devStop(ctx: DevContext, site: SiteState, entry: WorkspaceEntry):
   const child = ctx.children.get(ready.path);
   if (child === undefined) return json({ running: false, state: 'none', lines: [] });
   await settleDetached(ctx, ready, entry, child);
-  const ended = await endChild(child);
-  if (!ended) {
-    const stop = child.stop;
-    if (stop === undefined) {
-      return json({
-        ...childReply(child),
-        error: 'this dev server outlived its launcher and the workspace entry names no stop command — set one in Setup',
-      });
-    }
-    spawnSync(stop, { cwd: ready.path, shell: true, stdio: 'ignore', env: childEnv() });
+  if (!(await endDevServer(ctx, ready.path, child, Date.now() + STOP_COMMAND_MS))) {
+    return json({
+      ...childReply(child),
+      error: 'this dev server outlived its launcher and the workspace entry names no stop command — set one in Setup',
+    });
   }
   ctx.children.delete(ready.path);
   return json({ running: false, state: 'stopped', lines: child.lines });
+}
+
+/** How long Stop gives the entry's stop command. */
+const STOP_COMMAND_MS = 30_000;
+
+/** How long the server's close gives every child together. */
+const SHUTDOWN_MS = 5_000;
+
+/**
+ * One dev server ended — the path Stop, a site's removal and the server's close
+ * share. Its process group first. Then, where the entry names a stop command
+ * and the dev URL still answers, that command, run in the checkout and ended at
+ * `until`: a launcher that daemonised (Astro 7) left a server no group signal
+ * reaches, whether it had exited before the kill or was still exiting. A
+ * launcher that failed on its own never had a server, so a dev URL answering
+ * then is another one's — the operator's own on that port — and is left be.
+ * False only for a server that outlived its launcher with no stop command.
+ */
+async function endDevServer(ctx: DevContext, path: string, child: DevChild, until: number): Promise<boolean> {
+  const hadGroup = await endChild(child);
+  await launcherExit(child, EXIT_WAIT_MS);
+  const failed = child.state === 'exited' && child.code !== null && child.code !== 0;
+  if (failed) return true;
+  if (child.stop === undefined) return hadGroup;
+  if (child.dev !== undefined && !(await probe(ctx, child.dev))) return true;
+  await runStop(child.stop, path, until - Date.now());
+  // A stop command signals and returns; the port is free only once the server
+  // has let go of it.
+  while (child.dev !== undefined && Date.now() < until && (await probe(ctx, child.dev))) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return true;
+}
+
+/** How long a launcher whose group is gone gets to report its exit code. */
+const EXIT_WAIT_MS = 500;
+
+/** The launcher's own exit, once its group is gone: the code tells a launcher that failed from one that was ended. */
+async function launcherExit(child: DevChild, ms: number): Promise<void> {
+  const handle = child.handle;
+  if (child.state !== 'running' || handle === undefined) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    new Promise<void>((resolve) => handle.once('exit', () => resolve())),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms);
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+}
+
+/** The entry's stop command, in the checkout, in a group of its own that is killed at the deadline. */
+function runStop(command: string, cwd: string, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (ms <= 0) {
+      resolve();
+      return;
+    }
+    const run = spawn(command, { cwd, shell: true, detached: true, stdio: 'ignore', env: childEnv() });
+    const timer = setTimeout(() => {
+      // Never `kill(-0)`: a spawn that failed has no pid, and -0 is this
+      // process's own group.
+      if (run.pid !== undefined) {
+        try {
+          process.kill(-run.pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      resolve();
+    }, ms);
+    const done = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    run.on('exit', done);
+    run.on('error', done);
+  });
 }
 
 /** Whether the group was there to end. */
@@ -1074,7 +1394,7 @@ async function endChild(child: DevChild): Promise<boolean> {
   } catch {
     return false;
   }
-  if (await gone(child.pid, 2_000)) return true;
+  if (await gone(-child.pid, 2_000)) return true;
   try {
     process.kill(-child.pid, 'SIGKILL');
   } catch {
@@ -1082,38 +1402,27 @@ async function endChild(child: DevChild): Promise<boolean> {
   }
   // SIGKILL is delivered asynchronously: without this the caller can answer
   // "stopped" while the port is still held.
-  await gone(child.pid, 2_000);
+  await gone(-child.pid, 2_000);
   return true;
 }
 
-/** Whether a process group has emptied, within a deadline. */
-async function gone(pid: number, ms: number): Promise<boolean> {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    try {
-      process.kill(-pid, 0);
-    } catch {
-      return true;
-    }
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-}
-
 /**
- * Every child this run started, ended. Called by the server's own `close()`, so
- * a dev server the dashboard launched never outlives the dashboard.
+ * Every child this run started, ended together, within `SHUTDOWN_MS` in all.
+ * Called by the server's own `close()`, so a dev server the dashboard launched
+ * never outlives the dashboard — a daemonised one included.
  */
 export async function stopEveryChild(ctx: DevContext): Promise<void> {
-  for (const path of [...ctx.children.keys()]) await stopChild(ctx, path);
+  const until = Date.now() + SHUTDOWN_MS;
+  await Promise.all([...ctx.children.keys()].map((path) => stopChild(ctx, path, until)));
+  await Promise.all([...(ctx.proxies?.keys() ?? [])].map((path) => closeProxy(ctx, path)));
 }
 
-/** One site's child, ended. The one door to the kill, so nothing else spells it out. */
-async function stopChild(ctx: DevContext, path: string): Promise<void> {
+/** One site's child, ended through the path Stop takes, by the deadline the caller holds. */
+async function stopChild(ctx: DevContext, path: string, until = Date.now() + SHUTDOWN_MS): Promise<void> {
   const child = ctx.children.get(path);
   if (child === undefined) return;
-  await endChild(child);
   ctx.children.delete(path);
+  await endDevServer(ctx, path, child, until);
 }
 
 /** The `?env=` selector, where a route takes one. */

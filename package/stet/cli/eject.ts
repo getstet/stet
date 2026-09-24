@@ -52,8 +52,7 @@ import {
   type StetConfig,
 } from './config.js';
 import { planDocuments, stripMarks } from './html-host.js';
-import { hooksDir } from './hook.js';
-import { packageRoot } from './installed.js';
+import { removeFromGate } from './hook.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence } from './project.js';
 import { walk } from './pages.js';
@@ -310,7 +309,7 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
     // rather than dependency-gone-guidance-still-routing agents at a stet that
     // is no longer installed.
     removeGuidanceBlocks(io.cwd, buildGuidanceBlock(config), write, report, markerCarriers);
-    removeHook(io.cwd, write, report);
+    removeFromGate(io.cwd, write, report);
     dropDependency(io.cwd, write, report);
 
     if (refusal !== null) throw refusal;
@@ -651,7 +650,7 @@ function ejectHtml(d: {
   // The guidance goes first, then the hook, then the dependency — the same
   // order, for the same reason, as on every other host.
   removeGuidanceBlocks(io.cwd, buildGuidanceBlock(config), write, report, []);
-  removeHook(io.cwd, write, report);
+  removeFromGate(io.cwd, write, report);
   dropDependency(io.cwd, write, report);
 
   if (refusal !== null) throw refusal;
@@ -827,17 +826,3 @@ function removeGuidanceBlocks(
   }
 }
 
-/** Remove a byte-identical shipped pre-commit hook; report a differing one rather than clobber it. */
-function removeHook(cwd: string, write: boolean, report: Report): void {
-  const dir = hooksDir(cwd);
-  if (dir === null) return;
-  const hook = join(dir, 'pre-commit');
-  if (!existsSync(hook)) return;
-  const shipped = readFileSync(join(packageRoot(), 'templates', 'pre-commit'), 'utf8');
-  if (readFileSync(hook, 'utf8') === shipped) {
-    report.line('remove the stet pre-commit hook');
-    if (write) rmSync(hook);
-  } else {
-    report.line(`${hook} differs from the shipped hook — remove its "npx stet check" and "npx stet scan" lines by hand`);
-  }
-}

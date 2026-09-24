@@ -7,6 +7,7 @@
  * The host builder, the counting store and the crash simulator are shared with
  * that walk (`conformance/cli-host.ts`), so both drive an identical project.
  */
+import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -16,6 +17,8 @@ import { createMemoryStore } from '../adapters/store-memory.js';
 import { PAGE_DEFAULT, isStoreError } from '../adapters/store-shared.js';
 import { ok } from '../conformance/store.suite.js';
 import { CONNECT_TIMEOUT_MS } from '../cli/store.js';
+import { packageRoot } from '../cli/installed.js';
+import { usage } from '../cli/main.js';
 import {
   bareHtmlHost,
   cleanupCliHosts,
@@ -1385,9 +1388,9 @@ describe('dispatch', () => {
   it('hook is two-token: a bare or wrong subcommand is a usage error', async () => {
     const host = makeHost();
     expect(await host.run('hook')).toBe(2);
-    expect(host.stderr()).toContain('stet hook install');
+    expect(host.stderr()).toContain('stet hook install | stet hook remove');
     expect(await host.run('hook', 'uninstall')).toBe(2);
-    expect(host.stderr()).toContain('got "uninstall"');
+    expect(host.stderr()).toContain('stet hook has two subcommands, install and remove — got "uninstall"');
   });
 
   it('import is a named, declined fast-follow — not "unknown command"', async () => {
@@ -2676,5 +2679,148 @@ describe('the static-HTML host — doctor and the usage', () => {
     const host = await makeHtmlHost();
     expect(await host.run('help')).toBe(0);
     expect(host.stdout()).toContain('init [--app DIR] [--host html] [--yes]');
+  });
+});
+
+/**
+ * `stet <command> --help` — the command's own lines of the usage, read out of
+ * it, so a command added to the usage is covered here without an edit.
+ */
+describe('per-command help', () => {
+  /** Every command the usage lists: its two-space entries, the words before the first option or argument. */
+  const commands = [
+    ...new Set(
+      usage()
+        .split('\n')
+        .filter((line) => /^ {2}[^ -]/.test(line))
+        .map((line) => {
+          const words: string[] = [];
+          for (const word of (line.slice(2).split('  ')[0] ?? '').split(' ')) {
+            if (word === '' || /^[-<[]/.test(word)) break;
+            words.push(word);
+          }
+          return words.join(' ');
+        }),
+    ),
+  ];
+
+  it('reads every command word out of the usage', () => {
+    expect(commands).toEqual([
+      'init', 'scan', 'register', 'remove', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
+      'email extract', 'email verify', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
+      'seed', 'pull', 'audit', 'doctor', 'upgrade', 'dev',
+    ]);
+  });
+
+  it('answers every command with its own usage lines, then the pointer, exit 0', async () => {
+    for (const command of commands) {
+      const host = makeHost({ config: null });
+      expect(await host.run(...command.split(' '), '--help'), command).toBe(0);
+      const lines = host.stdout().split('\n');
+      expect(lines[0]?.startsWith(`  ${command} `) || lines[0] === `  ${command}`, command).toBe(true);
+      expect(lines.at(-1), command).toBe('stet --help lists every command.');
+      expect(lines.at(-2), command).toBe('');
+      expect(host.stderr(), command).toBe('');
+    }
+  });
+
+  it('carries a wrapped entry whole, and both entries of a command listed twice', async () => {
+    const draft = makeHost();
+    expect(await draft.run('draft', '--help')).toBe(0);
+    expect(draft.stdout().split('\n')).toEqual([
+      '  draft <key> --value=V | --value-file F   [--locale L] [--label T] [--note N]',
+      '                                           [--publish-at ISO] [--force] [--editor E]',
+      '',
+      'stet --help lists every command.',
+    ]);
+
+    const publish = makeHost();
+    expect(await publish.run('publish', '--help')).toBe(0);
+    expect(publish.stdout()).toContain('  publish <key> [--locale L] [--editor E]');
+    expect(publish.stdout()).toContain('  publish --due [--editor E]');
+  });
+
+  it('answers a two-token command by its first word, and -h as --help', async () => {
+    const pages = makeHost();
+    expect(await pages.run('pages', '--help')).toBe(0);
+    expect(pages.stdout().split('\n')[0]).toMatch(/^ {2}pages scan /);
+
+    const email = makeHost();
+    expect(await email.run('email', '--help')).toBe(0);
+    expect(email.stdout()).toContain('  email extract ');
+    expect(email.stdout()).toContain('  email verify ');
+
+    // The second word narrows it: one entry, not the pair.
+    const verify = makeHost();
+    expect(await verify.run('email', 'verify', '--help')).toBe(0);
+    expect(verify.stdout().split('\n')).toHaveLength(3);
+    expect(verify.stdout().split('\n')[0]).toMatch(/^ {2}email verify /);
+
+    const hook = makeHost();
+    expect(await hook.run('hook', '-h')).toBe(0);
+    expect(hook.stdout().split('\n')[0]).toMatch(/^ {2}hook install /);
+    const both = makeHost();
+    expect(await both.run('hook', '--help')).toBe(0);
+    expect(both.stdout().split('\n').slice(0, 2).map((line) => line.split('  ')[1])).toEqual(['hook install', 'hook remove']);
+  });
+
+  it('guesses nothing: an unlisted word falls to the dispatch, and --help after -- is an argument', async () => {
+    const nope = makeHost();
+    expect(await nope.run('email', 'nope', '--help')).toBe(2);
+    expect(nope.stderr()).toContain('stet email has two subcommands');
+
+    const get = makeHost({ config: { project: 't' } });
+    expect(await get.run('get', '--', '--help')).toBe(1);
+    expect(get.stderr()).toContain('"--help" is not a key');
+    expect(get.stdout()).not.toContain('stet --help lists every command.');
+  });
+});
+
+/**
+ * The built bin with its stdout a pipe. `spawnSync` gives the child a pipe,
+ * which is the reproduction: at 0.3.0 the bin exited before a large `--json`
+ * payload drained and the reader got the first 64 KiB of it, unparseable.
+ */
+describe('the bin through a pipe', () => {
+  const bin = join(packageRoot(), 'dist', 'cli', 'main.js');
+
+  // The built bin is what is proven; `npm test` builds first, a bare vitest run may not have.
+  it.skipIf(!existsSync(bin))('hands a large --json payload to the reader whole, three times', async () => {
+    const lines = Array.from(
+      { length: 600 },
+      (_, i) => `<p>Paragraph number ${i} of plain copy for the pipe test.</p>`,
+    );
+    const host = await makeHtmlHost({
+      files: { 'index.html': `<!DOCTYPE html>\n<html><body>\n${lines.join('\n')}\n</body></html>\n` },
+    });
+    expect(await host.run('scan', '--json')).toBe(0);
+    const expected = host.json<{ html: { proposals: unknown[] } }>().html.proposals.length;
+    expect(expected).toBeGreaterThan(0);
+
+    for (let run = 0; run < 3; run += 1) {
+      const child = spawnSync(process.execPath, [bin, 'scan', '--json'], {
+        cwd: host.cwd,
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      expect(child.status, `run ${run}`).toBe(0);
+      expect(child.stdout.length, `run ${run}`).toBeGreaterThan(65_536);
+      expect((JSON.parse(child.stdout) as { html: { proposals: unknown[] } }).html.proposals, `run ${run}`).toHaveLength(
+        expected,
+      );
+    }
+  }, 60_000);
+});
+
+describe('doctor — the compiler, where it is installed', () => {
+  it('says nothing about typescript on an Astro host whose copy module it can read', async () => {
+    const host = makeHost({
+      config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'] },
+    });
+    mkdirSync(join(host.cwd, 'src/pages'), { recursive: true });
+    writeFileSync(join(host.cwd, 'src/pages/index.astro'), '---\n---\n<h1>Hello</h1>\n');
+    writeFileSync(join(host.cwd, 'src/copy.ts'), "export const copy = { hero: 'Hello' };\n");
+    expect(await host.run('doctor')).toBe(0);
+    expect(`${host.stdout()}\n${host.stderr()}`).not.toContain('typescript:');
   });
 });

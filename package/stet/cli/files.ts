@@ -59,8 +59,8 @@ export function filesForGlobs(cwd: string, globs: string[]): string[] {
   return [...found].sort();
 }
 
-/** The leading directory of a glob with no wildcard — the only one worth walking. */
-function staticPrefix(glob: string): string {
+/** The leading directory of a glob with no wildcard — the only one worth walking. Shared with the dashboard's pending list. */
+export function staticPrefix(glob: string): string {
   const parts = glob.split('/');
   const solid: string[] = [];
   for (const part of parts) {

@@ -8,15 +8,17 @@
  * run token, prompting disabled, and stdout and stderr merged — a hook's output
  * and git's own refusal arrive on different channels and the reader needs both.
  *
- * The four ad hoc `execFileSync` calls elsewhere stay where they are: `email
- * verify`'s `show` and `email extract`'s `ls-files -z` return DATA on stdout —
- * a template's bytes, a NUL-separated list — which a merged stream would
- * corrupt, and `hooksDir` and the `check-ignore` probe each want their own
- * stdio. A data-returning variant beside this one is the promotion those four
- * are waiting for.
+ * `gitData` is the data-returning variant beside it: stdout alone, because a
+ * status list or a file's bytes at HEAD is corrupted by a merged stream. The
+ * dashboard's two reads over it — the uncommitted forms and the sequencer
+ * check — are its first consumers. The four ad hoc `execFileSync` calls
+ * elsewhere (`email verify`'s `show`, `email extract`'s `ls-files -z`,
+ * `hooksDir` and the `check-ignore` probe) still wait to move onto it.
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
 
 import { hooksDir } from './hook.js';
 import { childEnv } from './workspace.js';
@@ -55,6 +57,79 @@ export function git(cwd: string, args: string[]): { code: number; out: string } 
 }
 
 /**
+ * One git read whose answer is DATA: stdout alone, never merged with stderr,
+ * so a warning git prints cannot land inside a status list or a file's bytes.
+ * Never throws; a spawn that never ran answers code 1 and nothing.
+ */
+export function gitData(cwd: string, args: string[]): { code: number; stdout: string } {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    // No optional lock: a status read on every site load must not take
+    // `index.lock` from the operator's own terminal.
+    env: { ...childEnv(), GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
+    timeout: GIT_TIMEOUT_MS,
+    // A snapshot read at HEAD is the largest answer; the default 1 MiB cap would cut it.
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.error !== undefined) return { code: 1, stdout: '' };
+  return { code: result.status ?? 1, stdout: result.stdout ?? '' };
+}
+
+/**
+ * The paths under `pathspecs` that differ from HEAD — staged, unstaged or
+ * untracked — relative to `cwd`, sorted. A deletion is left out, since it is
+ * the terminal's to commit, and so is an unmerged path, which is a merge's.
+ *
+ * Porcelain paths are relative to the repository's top whatever the working
+ * directory, so the checkout's own prefix (`site/` where the checkout is a
+ * folder of its repository) is stripped; the pathspecs themselves are read
+ * relative to `cwd`. A directory that is not a repository answers nothing.
+ */
+export function uncommittedPaths(cwd: string, pathspecs: string[]): string[] {
+  const prefix = gitData(cwd, ['rev-parse', '--show-prefix']);
+  if (prefix.code !== 0) return [];
+  const base = prefix.stdout.trim();
+  const status = gitData(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...pathspecs]);
+  if (status.code !== 0) return [];
+  const records = status.stdout.split('\0');
+  const paths = new Set<string>();
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i] ?? '';
+    if (record.length < 4) continue;
+    const x = record[0];
+    const y = record[1];
+    // A rename or a copy, in either column, carries its source path as the NEXT record.
+    if (x === 'R' || x === 'C' || y === 'R' || y === 'C') i += 1;
+    // A deletion is the terminal's to commit, and an unmerged path is a merge's.
+    if (x === 'D' || y === 'D' || x === 'U' || y === 'U' || (x === 'A' && y === 'A')) continue;
+    const path = record.slice(3);
+    if (path.startsWith(base)) paths.add(path.slice(base.length));
+  }
+  return [...paths].sort();
+}
+
+/**
+ * Whether git is part-way through a merge, a cherry-pick, a revert or a
+ * rebase, read from its own sequencer state. A commit of named files then
+ * either stages them into that operation's index or, mid-rebase, lands inside
+ * it; both are the terminal's to finish. `sequencer/` outlives `CHERRY_PICK_HEAD`
+ * between the picks of a multi-commit cherry-pick or revert, and `SQUASH_MSG`
+ * holds a `merge --squash` the operator has not committed yet, which a commit
+ * here would consume.
+ */
+export function operationInProgress(cwd: string): boolean {
+  for (const ref of ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD']) {
+    if (gitData(cwd, ['rev-parse', '-q', '--verify', ref]).code === 0) return true;
+  }
+  for (const dir of ['rebase-merge', 'rebase-apply', 'sequencer', 'SQUASH_MSG']) {
+    const path = gitData(cwd, ['rev-parse', '--git-path', dir]);
+    if (path.code === 0 && existsSync(resolvePath(cwd, path.stdout.trim()))) return true;
+  }
+  return false;
+}
+
+/**
  * Where a checkout stands: its short HEAD, its branch, and whether anything is
  * uncommitted. Every badge the dashboard paints names the commit it was
  * measured against, so this rides every reply that measured something.
@@ -68,13 +143,16 @@ export function gitState(cwd: string): { head: string | null; branch: string | n
   if (hooksDir(cwd) === null) return { head: null, branch: null, dirty: false };
   const head = git(cwd, ['rev-parse', '--short', 'HEAD']);
   const branch = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
-  const status = git(cwd, ['status', '--porcelain']);
+  // Through the data read, without the optional lock: this runs on every site
+  // load, and a status that refreshes the index takes `index.lock` from the
+  // operator's own terminal.
+  const status = gitData(cwd, ['status', '--porcelain']);
   return {
     // An unborn HEAD is a repo with no commit yet: `rev-parse` fails and the
     // stamp is honestly absent rather than invented.
     head: head.code === 0 ? head.out.trim() : null,
     branch: branch.code === 0 ? branch.out.trim() : null,
-    dirty: status.code === 0 && status.out.trim() !== '',
+    dirty: status.code === 0 && status.stdout.trim() !== '',
   };
 }
 

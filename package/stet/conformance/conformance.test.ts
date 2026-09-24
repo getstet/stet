@@ -4,13 +4,14 @@
  * `add-store-and-publish`'s adapters extend this suite rather than starting a
  * second one — a run here is the evidence that an install works.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   cpSync,
   existsSync,
   linkSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -42,8 +43,10 @@ import { loadConfig } from '../cli/config.js';
 import { createStetHandler, type PublishEvent } from '../server/mount.js';
 import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
+import { GATE_LINE, HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
 import { refuseDanglingReferences } from '../cli/remove.js';
 import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
+import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
 import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { installRegistryDts, typecheckHost } from '../tests/helpers/ts-host.js';
@@ -4137,6 +4140,103 @@ describe('cli', () => {
     );
     expect(typeof runCli).toBe('function');
   });
+
+  it('Requirement: Every command answers --help with its own usage', async () => {
+    // A directory with no stet project: help reads the usage, never the project.
+    const dir = mkdtempSync(join(tmpdir(), 'stet-help-'));
+    const run = async (...argv: string[]): Promise<{ code: number; out: string[]; err: string }> => {
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(argv, { cwd: dir, env: {}, stdout: (l) => out.push(l), stderr: (l) => err.push(l) });
+      return { code, out: out.join('\n').split('\n'), err: err.join('\n') };
+    };
+    try {
+      const check = await run('check', '--help');
+      expect(check.code).toBe(0);
+      expect(check.out[0]).toMatch(/^ {2}check /);
+      expect(check.out.slice(-2)).toEqual(['', 'stet --help lists every command.']);
+      // A wrapped entry carries its continuation line.
+      const draft = await run('draft', '--help');
+      expect(draft.code).toBe(0);
+      expect(draft.out).toHaveLength(4);
+      // A two-token command, by both words and by the first; -h as --help.
+      for (const argv of [['pages', 'scan', '--help'], ['pages', '--help']]) {
+        const pages = await run(...argv);
+        expect(pages.code).toBe(0);
+        expect(pages.out[0]).toMatch(/^ {2}pages scan /);
+      }
+      const dev = await run('dev', '-h');
+      expect(dev.code).toBe(0);
+      expect(dev.out[0]).toMatch(/^ {2}dev/);
+      // Help is not guessed: an unlisted word goes to the dispatch, and --help after -- is a key.
+      expect(await run('email', 'nope', '--help').then((r) => r.code)).toBe(2);
+      const project = makeCliHost();
+      expect(await project.run('get', '--', '--help')).toBe(1);
+      expect(project.stdout()).not.toContain('stet --help lists every command.');
+      expect(project.stderr()).toContain('"--help" is not a key');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The built bin is what is proven; `npm test` builds first, a bare vitest run may not have.
+  it.skipIf(!builtBinExists())("Requirement: The CLI's output reaches a pipe whole", async () => {
+    const lines = Array.from({ length: 600 }, (_, i) => `<p>Paragraph number ${i} of plain copy for the pipe.</p>`);
+    const host = await makeHtmlHost({
+      files: { 'index.html': `<!DOCTYPE html>\n<html><body>\n${lines.join('\n')}\n</body></html>\n` },
+    });
+    expect(await host.run('scan', '--json')).toBe(0);
+    const expected = host.json<{ html: { proposals: unknown[] } }>().html.proposals.length;
+    // spawnSync gives the child a pipe for stdout: at 0.3.0 the reader got the first 64 KiB.
+    const child = spawnSync(process.execPath, [BUILT_BIN, 'scan', '--json'], {
+      cwd: host.cwd,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    expect(child.status).toBe(0);
+    expect(child.stdout.length).toBeGreaterThan(65_536);
+    expect((JSON.parse(child.stdout) as { html: { proposals: unknown[] } }).html.proposals).toHaveLength(expected);
+    // The exit code is the command's own.
+    const refused = spawnSync(process.execPath, [BUILT_BIN, 'get', 'no_such_key'], { cwd: host.cwd, encoding: 'utf8' });
+    expect(refused.status).toBe(await host.run('get', 'no_such_key'));
+    expect(refused.status).not.toBe(0);
+  });
+
+  it.skipIf(!builtBinExists())('Requirement: doctor names the compiler scan and register need', async () => {
+    const NOT_INSTALLED = 'typescript: not installed — stet scan and stet register read src/copy.ts with it; npm i -D typescript';
+    /** An Astro host whose `.astro` surfaces are dialect files and whose copy modules only the compiler reads. */
+    const astro = (copyModules: string[]): CliHost => {
+      const host = makeCliHost({
+        config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], emailSurfaces: [], copyModules },
+      });
+      mkdirSync(join(host.cwd, 'src/pages'), { recursive: true });
+      writeFileSync(join(host.cwd, 'src/pages/index.astro'), '---\n---\n<h1>Hello</h1>\n');
+      writeFileSync(join(host.cwd, 'src/copy.ts'), "export const copy = { hero: 'Hello' };\n");
+      return host;
+    };
+    // The built bin behind a resolve hook that hides or breaks `typescript`.
+    const doctor = (host: CliHost, opts: { hideTypescript?: boolean; breakTypescript?: boolean }) => {
+      installStetShim(host.cwd, opts);
+      const run = spawnSync(join(host.cwd, 'node_modules/.bin/stet'), ['doctor'], { cwd: host.cwd, encoding: 'utf8' });
+      return { code: run.status, text: `${run.stdout}${run.stderr}` };
+    };
+
+    const installed = astro(['src/copy.ts']);
+    expect(await installed.run('doctor')).toBe(0);
+    expect(`${installed.stdout()}\n${installed.stderr()}`).not.toContain('typescript:');
+
+    const missing = doctor(astro(['src/copy.ts']), { hideTypescript: true });
+    expect(missing.code).toBe(0);
+    expect(missing.text).toContain(NOT_INSTALLED);
+
+    const dialectOnly = doctor(astro([]), { hideTypescript: true });
+    expect(dialectOnly.code).toBe(0);
+    expect(dialectOnly.text).not.toContain('typescript:');
+
+    const broken = doctor(astro(['src/copy.ts']), { breakTypescript: true });
+    expect(broken.code).toBe(0);
+    expect(broken.text).toContain(NOT_INSTALLED);
+  });
 });
 
 describe('adoption', () => {
@@ -5528,15 +5628,98 @@ describe('adoption', () => {
   it('Requirement: hook install adds the pre-commit gate, opt-in and executable', async () => {
     const host = makeAdoptionHost();
     execFileSync('git', ['init', '-q'], { cwd: host.cwd });
+    // Only a stet checkout's own folder is gated.
+    expect(await host.run('hook', 'install')).toBe(1);
+    expect(host.stderr()).toContain('hook install runs in a stet checkout — cd to the folder that holds stet.config.json');
+    host.write('stet.config.json', '{}\n');
     expect(await host.run('hook', 'install')).toBe(0);
     const hookPath = join(host.cwd, '.git/hooks/pre-commit');
     expect(existsSync(hookPath)).toBe(true);
     expect(statSync(hookPath).mode & 0o111).not.toBe(0); // executable
-    expect(host.file('.git/hooks/pre-commit')).toContain('stet check');
-    // a differing existing hook is refused, not clobbered
+    // One fixed hook; the runner and the list of checkouts sit in git's common directory.
+    expect(host.file('.git/hooks/pre-commit')).toContain('stet-gate.mjs');
+    expect(host.exists('.git/stet-gate.mjs')).toBe(true);
+    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '' }] });
+    // a differing existing hook is refused, not clobbered, naming the line to add
     host.write('.git/hooks/pre-commit', '#!/bin/sh\necho custom\n');
     expect(await host.run('hook', 'install')).toBe(1);
+    expect(host.stderr()).toContain(GATE_LINE);
     expect(host.file('.git/hooks/pre-commit')).toContain('echo custom');
+
+    // A checkout that is a folder of its repository, committed from the top
+    // with the registry unreachable: the gate runs the stet installed there,
+    // only when a commit touches it, and never fetches one.
+    const top = mkdtempSync(join(tmpdir(), 'stet-conf-gate-'));
+    const log = join(top, '.git-log-outside');
+    const commit = (message: string): { code: number | null; out: string } => {
+      execFileSync('git', ['add', '-A'], { cwd: top });
+      const run = spawnSync('git', ['commit', '-qm', message], {
+        cwd: top,
+        encoding: 'utf8',
+        env: { ...process.env, npm_config_registry: 'http://127.0.0.1:9' },
+      });
+      return { code: run.status, out: `${run.stdout}${run.stderr}` };
+    };
+    const logged = (): string => {
+      const text = existsSync(log) ? readFileSync(log, 'utf8') : '';
+      rmSync(log, { force: true });
+      return text;
+    };
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: top });
+      for (const [key, value] of [['user.email', 'gate@conformance'], ['user.name', 'gate'], ['commit.gpgsign', 'false']]) {
+        execFileSync('git', ['config', key as string, value as string], { cwd: top });
+      }
+      writeFileSync(join(top, '.gitignore'), 'node_modules\n.git-log-outside\n');
+      mkdirSync(join(top, 'site/node_modules/.bin'), { recursive: true });
+      writeFileSync(join(top, 'site/stet.config.json'), '{}\n');
+      // A stand-in local stet that records what the gate asked of it.
+      writeFileSync(join(top, 'site/node_modules/.bin/stet'), `#!/bin/sh\necho "$1 in \${PWD##*/}" >> '${log}'\n`, {
+        mode: 0o755,
+      });
+      writeFileSync(join(top, 'notes.md'), 'notes\n');
+      expect(commit('base').code).toBe(0);
+      // The older gate is replaced, and said so.
+      writeFileSync(join(top, '.git/hooks/pre-commit'), HOOK_BEFORE_0_3_1, { mode: 0o755 });
+      const out: string[] = [];
+      const code = await runCli(['hook', 'install'], {
+        cwd: join(top, 'site'),
+        env: {},
+        stdout: (l) => out.push(l),
+        stderr: (l) => out.push(l),
+      });
+      expect(code).toBe(0);
+      expect(out.join('\n')).toContain('replaced the older gate with the pre-commit gate at ');
+
+      writeFileSync(join(top, 'site/page.txt'), 'an edit\n');
+      expect(commit('touches site/').code).toBe(0);
+      expect(logged()).toBe('check in site\nscan in site\n');
+      writeFileSync(join(top, 'notes.md'), 'more notes\n');
+      expect(commit('touches no checkout').code).toBe(0);
+      expect(logged()).toBe('');
+
+      rmSync(join(top, 'site/node_modules'), { recursive: true });
+      writeFileSync(join(top, 'site/page.txt'), 'another edit\n');
+      const missing = commit('no stet in site/');
+      expect(missing.code).not.toBe(0);
+      expect(missing.out).toContain(
+        'stet pre-commit gate: stet is not installed in site/ — run npm install there, or take it out of the gate with stet hook remove there',
+      );
+
+      // A hooks folder outside the repository may be every repository's: refused.
+      const shared = mkdtempSync(join(tmpdir(), 'stet-conf-shared-hooks-'));
+      try {
+        execFileSync('git', ['config', 'core.hooksPath', shared], { cwd: top });
+        await expect(
+          runCli(['hook', 'install'], { cwd: join(top, 'site'), env: {}, stdout: () => {}, stderr: () => {} }),
+        ).resolves.toBe(1);
+        expect(readdirSync(shared)).toEqual([]);
+      } finally {
+        rmSync(shared, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(top, { recursive: true, force: true });
+    }
   });
 });
 

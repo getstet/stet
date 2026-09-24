@@ -704,7 +704,7 @@ function extensionOf(path: string): string {
 }
 
 /** The file-mapped route: the path minus its last extension, an `index` file collapsing to its directory. */
-function fileRoute(rel: string): string {
+export function fileRoute(rel: string): string {
   const segments = rel.slice(0, rel.length - extensionOf(rel).length).split('/');
   if (segments[segments.length - 1] === 'index') segments.pop();
   return `/${segments.join('/')}`;

@@ -29,6 +29,12 @@ const shapes = vi.hoisted(() => ({
     error.code = 'ERR_MODULE_NOT_FOUND';
     throw error;
   },
+  // A `typescript` that resolves and then throws on import: a truncated
+  // install, a bad postinstall. Not a missing module, so `loadTypescript`
+  // rethrows it as it is.
+  broken: () => {
+    throw new Error('typescript/lib/typescript.js: Unexpected end of input');
+  },
 }));
 
 vi.mock('typescript', shapes.ts7);
@@ -54,8 +60,8 @@ const LIMITS =
  * is swapped for the call and put back after it, so the file's other cases keep
  * the TS7 shape whatever order they run in.
  */
-async function withoutTypescript<T>(run: () => Promise<T>): Promise<T> {
-  vi.doMock('typescript', shapes.absent);
+async function withoutTypescript<T>(run: () => Promise<T>, shape: typeof shapes.absent = shapes.absent): Promise<T> {
+  vi.doMock('typescript', shape);
   vi.resetModules();
   try {
     return await run();
@@ -139,6 +145,60 @@ describe('doctor — the wrapper chain without a compiler', () => {
     const result = await withoutTypescript(async () => doctor(dir));
     expect(result.out).toContain('wrapper chain (welcome): 1 file(s), 1 declared token(s), 1 unchecked');
     expect(result.out).not.toContain('the chain reaches an import it does not follow');
+    expect(result.code).toBe(0);
+  });
+});
+
+/**
+ * An Astro-shaped host whose one copy module is TypeScript: the website's own
+ * shape. Its `.astro` surfaces are a template dialect scan reads as text; the
+ * copy module goes to the compiler.
+ */
+function astroHost(copyModules: string[]): string {
+  const dir = project({});
+  write(
+    dir,
+    'stet.config.json',
+    JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], emailSurfaces: [], copyModules }),
+  );
+  write(dir, 'src/pages/index.astro', '---\n---\n<h1>Hello</h1>\n');
+  write(dir, 'src/copy.ts', "export const copy = { hero: 'Hello' };\n");
+  write(dir, 'src/more.ts', "export const more = { tagline: 'More' };\n");
+  return dir;
+}
+
+describe('doctor — the compiler scan and register need', () => {
+  const NOT_INSTALLED = (where: string): string =>
+    `typescript: not installed — stet scan and stet register read ${where} with it; npm i -D typescript`;
+
+  it('names the copy module and the install where typescript is absent, and exits 0', async () => {
+    const result = await withoutTypescript(async () => doctor(astroHost(['src/copy.ts'])));
+    expect(result.err).toContain(NOT_INSTALLED('src/copy.ts'));
+    expect(result.code).toBe(0);
+  });
+
+  it('counts the other files the compiler would read', async () => {
+    const result = await withoutTypescript(async () => doctor(astroHost(['src/copy.ts', 'src/more.ts'])));
+    expect(result.err).toContain(NOT_INSTALLED('src/copy.ts and 1 other file'));
+    expect(result.code).toBe(0);
+  });
+
+  it('says nothing where every declared file is a dialect file', async () => {
+    const result = await withoutTypescript(async () => doctor(astroHost([])));
+    expect(`${result.out}\n${result.err}`).not.toContain('typescript:');
+    expect(result.code).toBe(0);
+  });
+
+  it('reads a typescript whose import throws as not installed, and never stops on it', async () => {
+    const result = await withoutTypescript(async () => doctor(astroHost(['src/copy.ts'])), shapes.broken);
+    expect(result.err).toContain(NOT_INSTALLED('src/copy.ts'));
+    expect(result.code).toBe(0);
+  });
+
+  it('gives a TypeScript 7 host the refusal, not the install line', async () => {
+    const result = await doctor(astroHost(['src/copy.ts']));
+    expect(result.err).toContain(`${TS7_REFUSAL} — stet scan and stet register read src/copy.ts with it`);
+    expect(result.err).not.toContain('typescript: not installed');
     expect(result.code).toBe(0);
   });
 });
