@@ -1,0 +1,442 @@
+{
+  "keys": {
+    "alerts_count_many": {
+      "label": "Alerts banner, more than one alert",
+      "shape": "text",
+      "target": "web",
+      "vars": [
+        "count"
+      ]
+    },
+    "alerts_count_one": {
+      "label": "Alerts banner, one alert",
+      "shape": "text",
+      "target": "web"
+    },
+    "app_name": {
+      "label": "App name, in the browser tab",
+      "shape": "text",
+      "target": "web"
+    },
+    "city_not_found_body": {
+      "label": "City not found paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "city_not_found_title": {
+      "label": "City not found headline",
+      "shape": "text",
+      "target": "web",
+      "vars": [
+        "city"
+      ]
+    },
+    "city_search_placeholder": {
+      "label": "City search placeholder",
+      "shape": "text",
+      "target": "web"
+    },
+    "city_search_submit": {
+      "label": "City search button",
+      "shape": "text",
+      "target": "web"
+    },
+    "create_account_password_hint": {
+      "label": "Password rule under the field",
+      "shape": "text",
+      "target": "web"
+    },
+    "create_account_submit": {
+      "label": "Create account button",
+      "shape": "text",
+      "target": "web"
+    },
+    "create_account_title": {
+      "label": "Create account headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "email_label": {
+      "label": "Email field label",
+      "shape": "text",
+      "target": "web"
+    },
+    "home_empty_body": {
+      "label": "No city yet paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "home_empty_title": {
+      "label": "No city yet headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "home_greeting": {
+      "label": "Home greeting with the user's name",
+      "shape": "text",
+      "target": "web",
+      "vars": [
+        "name"
+      ]
+    },
+    "home_greeting_anonymous": {
+      "label": "Home greeting when no name is set",
+      "shape": "text",
+      "target": "web"
+    },
+    "home_profile_button_label": {
+      "label": "Profile button, read by screen readers",
+      "shape": "text",
+      "target": "web"
+    },
+    "home_setup_body": {
+      "label": "Unfinished setup card paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "home_setup_cta": {
+      "label": "Unfinished setup card button",
+      "shape": "text",
+      "target": "web"
+    },
+    "home_setup_title": {
+      "label": "Unfinished setup card headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "nav_back_label": {
+      "label": "Back button",
+      "shape": "text",
+      "target": "web"
+    },
+    "notifications_allow": {
+      "label": "Allow notifications button",
+      "shape": "text",
+      "target": "web"
+    },
+    "notifications_ask_body": {
+      "label": "Notifications ask paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "notifications_ask_title": {
+      "label": "Notifications ask headline, repeated as the settings row",
+      "shape": "text",
+      "target": "web"
+    },
+    "notifications_deny": {
+      "label": "Deny notifications button",
+      "shape": "text",
+      "target": "web"
+    },
+    "offline_body": {
+      "label": "Offline banner paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "offline_retry_label": {
+      "label": "Offline banner retry button",
+      "shape": "text",
+      "target": "web"
+    },
+    "offline_title": {
+      "label": "Offline banner headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_continue": {
+      "label": "Onboarding continue button",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_done_body_allowed": {
+      "label": "Done paragraph, notifications allowed",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_done_body_denied": {
+      "label": "Done paragraph, notifications denied",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_done_cta": {
+      "label": "Done button",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_done_title": {
+      "label": "Done step headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_name_placeholder": {
+      "label": "Name field placeholder",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_name_title": {
+      "label": "Name step headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_skip": {
+      "label": "Onboarding skip link",
+      "shape": "text",
+      "target": "web"
+    },
+    "onboarding_step": {
+      "label": "Onboarding progress",
+      "shape": "text",
+      "target": "web",
+      "vars": [
+        "step"
+      ]
+    },
+    "onboarding_units_title": {
+      "label": "Units step headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "password_label": {
+      "label": "Password field label",
+      "shape": "text",
+      "target": "web"
+    },
+    "profile_plan_ended": {
+      "label": "Plan line after the trial",
+      "shape": "text",
+      "target": "web"
+    },
+    "profile_plan_trial": {
+      "label": "Plan line during the trial",
+      "shape": "text",
+      "target": "web",
+      "vars": [
+        "days"
+      ]
+    },
+    "profile_settings_link": {
+      "label": "Profile row to Settings",
+      "shape": "text",
+      "target": "web"
+    },
+    "profile_sign_out": {
+      "label": "Sign out button",
+      "shape": "text",
+      "target": "web"
+    },
+    "profile_title": {
+      "label": "Profile headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "session_expired_body": {
+      "label": "Session expired paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "session_expired_cta": {
+      "label": "Session expired button",
+      "shape": "text",
+      "target": "web"
+    },
+    "session_expired_title": {
+      "label": "Session expired headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "settings_title": {
+      "label": "Settings headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "settings_units_body": {
+      "label": "Units settings paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "settings_units_row": {
+      "label": "Settings row for units",
+      "shape": "text",
+      "target": "web"
+    },
+    "settings_units_saved": {
+      "label": "Units saved confirmation",
+      "shape": "text",
+      "target": "web"
+    },
+    "settings_units_title": {
+      "label": "Units settings headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "sign_in_error": {
+      "label": "Wrong email or password message",
+      "shape": "text",
+      "target": "web"
+    },
+    "sign_in_submit": {
+      "label": "Sign in button",
+      "shape": "text",
+      "target": "web"
+    },
+    "sign_in_title": {
+      "label": "Sign in headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "trial_ended_body": {
+      "label": "Trial ended banner paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "trial_ended_cta": {
+      "label": "Trial ended banner button",
+      "shape": "text",
+      "target": "web"
+    },
+    "trial_ended_title": {
+      "label": "Trial ended banner headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "units_celsius_label": {
+      "label": "Celsius option",
+      "shape": "text",
+      "target": "web"
+    },
+    "units_fahrenheit_label": {
+      "label": "Fahrenheit option",
+      "shape": "text",
+      "target": "web"
+    },
+    "units_save_label": {
+      "label": "Units save button",
+      "shape": "text",
+      "target": "web"
+    },
+    "unsaved_changes_body": {
+      "label": "Unsaved changes dialog paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "unsaved_changes_discard": {
+      "label": "Unsaved changes dialog discard button",
+      "shape": "text",
+      "target": "web"
+    },
+    "unsaved_changes_save": {
+      "label": "Unsaved changes dialog save button",
+      "shape": "text",
+      "target": "web"
+    },
+    "unsaved_changes_title": {
+      "label": "Unsaved changes dialog headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_clear": {
+      "label": "Condition: clear",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_cloudy": {
+      "label": "Condition: cloudy",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_drizzle": {
+      "label": "Condition: drizzle",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_fog": {
+      "label": "Condition: fog",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_partly_cloudy": {
+      "label": "Condition: partly cloudy",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_rain": {
+      "label": "Condition: rain",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_showers": {
+      "label": "Condition: showers",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_snow": {
+      "label": "Condition: snow",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_condition_storm": {
+      "label": "Condition: thunderstorm",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_error_body": {
+      "label": "Weather failed paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_error_title": {
+      "label": "Weather failed headline",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_high_low": {
+      "label": "Today's high and low",
+      "shape": "text",
+      "target": "web",
+      "vars": [
+        "high",
+        "low"
+      ]
+    },
+    "weather_loading": {
+      "label": "Weather loading message",
+      "shape": "text",
+      "target": "web"
+    },
+    "weather_now_label": {
+      "label": "Current weather heading",
+      "shape": "text",
+      "target": "web",
+      "vars": [
+        "city"
+      ]
+    },
+    "weather_retry_label": {
+      "label": "Weather failed retry button",
+      "shape": "text",
+      "target": "web"
+    },
+    "welcome_body": {
+      "label": "Welcome paragraph",
+      "shape": "text",
+      "target": "web"
+    },
+    "welcome_create_account": {
+      "label": "Welcome button to create an account",
+      "shape": "text",
+      "target": "web"
+    },
+    "welcome_sign_in": {
+      "label": "Welcome button to sign in",
+      "shape": "text",
+      "target": "web"
+    },
+    "welcome_title": {
+      "label": "Welcome headline",
+      "shape": "text",
+      "target": "web"
+    }
+  },
+  "version": 1
+}

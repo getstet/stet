@@ -1,0 +1,48 @@
+# Returning: Sign in (a wrong password first) → Home with the saved city's weather
+# from Open-Meteo. The seeded account exists in development builds only.
+appId: dev.getstet.examples.weather
+name: Returning
+---
+- launchApp:
+    stopApp: true
+- extendedWaitUntil:
+    visible:
+      id: welcome-sign-in
+    timeout: 60000
+- tapOn:
+    id: welcome-sign-in
+- tapOn:
+    id: email
+- inputText: returning@example.com
+- tapOn:
+    id: password
+- inputText: not-the-password
+- hideKeyboard
+- tapOn:
+    id: sign-in-submit
+- waitForAnimationToEnd
+- runFlow:
+    when:
+      visible: Not Now
+    commands:
+      - tapOn: Not Now
+- assertVisible: That email and password don't match. Check them and try again.
+- takeScreenshot: returning-1-wrong-password
+- tapOn:
+    id: password
+- eraseText: 30
+- inputText: weather-demo
+- hideKeyboard
+- tapOn:
+    id: sign-in-submit
+- waitForAnimationToEnd
+- runFlow:
+    when:
+      visible: Not Now
+    commands:
+      - tapOn: Not Now
+- assertVisible: Hello, Ada
+- extendedWaitUntil:
+    visible: Now in Lisbon
+    timeout: 20000
+- takeScreenshot: returning-2-home
