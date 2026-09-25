@@ -26,9 +26,11 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { keyDefOf } from '../src/descriptor.js';
+import { derivedText, resolve } from '../src/resolve.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { targetAdapter } from '../src/targets/adapter.js';
-import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
+import { DEFAULT_TARGET, type Descriptor, type KeyDef } from '../src/types.js';
 import { plainOf } from '../src/validate.js';
 import { CliError, type Report } from './report.js';
 import { applyFileEdits, formatDiff, type Edit } from './rewrite.js';
@@ -36,6 +38,7 @@ import { validateValue } from './validate.js';
 import {
   blankNonMarkup,
   decodeEntities,
+  type Dialect,
   freeKey,
   proposeKey,
   qualifiesAsCopy,
@@ -242,6 +245,8 @@ export interface HtmlProposal {
   attr?: string;
   /** The `name`/`property` of a `<meta>` whose `content` is proposed. */
   metaName?: string;
+  /** Inside an `<svg>`, where a `<title>` names the graphic rather than the page. */
+  inSvg?: true;
   /** Decoded, whitespace-collapsed, with placeholder tags where the element has descendants. */
   value: string;
   /** The value with its placeholders removed — what the key is named from. */
@@ -258,6 +263,10 @@ export interface HtmlMark {
   tag: string;
   kind: 'element' | 'attribute';
   attr?: string;
+  /** The `name`/`property` of a `<meta>` whose `content` the mark binds. */
+  metaName?: string;
+  /** Inside an `<svg>`, where a `<title>` names the graphic rather than the page. */
+  inSvg?: true;
   key: string;
   /** What the document says NOW, read the way a proposal's value is; null where a skip says why not. */
   value: string | null;
@@ -276,19 +285,13 @@ export interface HtmlProposalSet {
 // --- The reader -------------------------------------------------------------
 
 /**
- * One document's element tree, over `blankNonMarkup`'s output.
- *
- * The stack rule is fail-safe: a close tag pops to the nearest open element of
- * its name, and every element it pops PAST is a fault at its own open offset.
- * The tokenizer never absorbs a stray element, and an element still open when
- * the text ends is a fault too.
+ * The 1-based line of an offset in `source`, over one index of its newlines
+ * built once — every lookup a binary search, however many a caller makes.
  */
-export function readDocument(file: string, source: string): Document {
-  const blanked = blankNonMarkup(source, 'html');
-  // Every newline offset, ascending — the index every line lookup binary-searches.
+export function lineIndex(source: string): (offset: number) => number {
   const newlines: number[] = [];
   for (let i = source.indexOf('\n'); i !== -1; i = source.indexOf('\n', i + 1)) newlines.push(i);
-  const lineAt = (offset: number): number => {
+  return (offset: number): number => {
     let lo = 0;
     let hi = newlines.length;
     while (lo < hi) {
@@ -298,6 +301,19 @@ export function readDocument(file: string, source: string): Document {
     }
     return lo + 1;
   };
+}
+
+/**
+ * One document's element tree, over `blankNonMarkup`'s output.
+ *
+ * The stack rule is fail-safe: a close tag pops to the nearest open element of
+ * its name, and every element it pops PAST is a fault at its own open offset.
+ * The tokenizer never absorbs a stray element, and an element still open when
+ * the text ends is a fault too.
+ */
+export function readDocument(file: string, source: string, dialect: Dialect = 'html'): Document {
+  const blanked = blankNonMarkup(source, dialect);
+  const lineAt = lineIndex(source);
   const roots: Element[] = [];
   const stack: Element[] = [];
   const opaque: Document['opaque'] = [];
@@ -859,7 +875,7 @@ function locate(document: Document): Located {
 // --- Attribute candidates ---------------------------------------------------
 
 /** The `name`/`property` a `<meta>`'s `content` is copy under, or null. */
-function metaCopyName(el: Element): string | null {
+export function metaCopyName(el: Element): string | null {
   if (el.tag !== 'meta') return null;
   const name = el.attrs.find((a) => a.name === 'name')?.value;
   if (name !== undefined && META_NAME_COPY.has(name)) return name;
@@ -960,6 +976,15 @@ function readOne(
     preMarks,
   } = locate(document);
   const line = document.lineAt;
+  // Every element inside an `<svg>`: a `<title>` there names the graphic, not the page.
+  const svg = new Set<Element>();
+  const underSvg = (els: Element[], under: boolean): void => {
+    for (const el of els) {
+      if (under) svg.add(el);
+      underSvg(el.children, under || el.tag === 'svg');
+    }
+  };
+  underSvg(document.roots, false);
 
   // Which attributes a `data-stet-<attr>` already binds, so an attribute is
   // proposed exactly once and a bound one is silent.
@@ -989,6 +1014,7 @@ function readOne(
         line: line(el.openStart),
         tag: el.tag,
         kind: 'element',
+        ...(svg.has(el) ? { inSvg: true as const } : {}),
         key: mark.value,
         value: unknown === undefined ? read.value : null,
         tags: read.tags,
@@ -1016,6 +1042,7 @@ function readOne(
       tag: el.tag,
       ...(el.section === undefined ? {} : { section: el.section }),
       kind: 'element',
+      ...(svg.has(el) ? { inSvg: true as const } : {}),
       value: read.value,
       plain: read.plain,
       tags: read.tags,
@@ -1054,6 +1081,7 @@ function readOne(
       bound.add(`${el.openStart}:${target}`);
       markScopes.push({ start: el.openStart, end: el.closeEnd });
       const text = attrValueOf(on);
+      const metaName = target === 'content' ? metaCopyName(el) : null;
       const unknown = undecodedEntity(on.value);
       if (unknown !== undefined) {
         skips.push(
@@ -1073,6 +1101,7 @@ function readOne(
         tag: el.tag,
         kind: 'attribute',
         attr: target,
+        ...(metaName === null ? {} : { metaName }),
         key: attr.value,
         value: unknown === undefined ? text : null,
         tags: 0,
@@ -1370,12 +1399,12 @@ function rebuild(
 }
 
 /**
- * A key's declared `tags`, read through `Object.hasOwn` because the name comes
- * off the DOCUMENT and the map is JSON-parsed. The regenerator and `check` both
+ * A key's declared `tags`, read as an own property (`keyDefOf`) because the name
+ * comes off the DOCUMENT and the map is JSON-parsed. The regenerator and `check` both
  * read it here, so the hook and the write can never disagree about a value.
  */
 function tagsOf(descriptor: Descriptor, key: string): number | undefined {
-  return Object.hasOwn(descriptor.keys, key) ? descriptor.keys[key]?.tags : undefined;
+  return keyDefOf(descriptor, key)?.tags;
 }
 
 /**
@@ -1430,6 +1459,18 @@ function trimmedContent(document: Document, el: Element): { start: number; end: 
 }
 
 /**
+ * The text a mark renders: a derived key's resolution, else the key's own
+ * default-locale value. `planDocuments` and `checkDocuments` both read it, so a
+ * derived key's element or attribute is regenerated and checked like any other.
+ */
+function markValue(descriptor: Descriptor, snapshot: Snapshot, key: string): unknown {
+  const def = keyDefOf(descriptor, key);
+  if (def?.derivesFrom !== undefined) return resolve(descriptor, snapshot, null, { key }).value;
+  const values = snapshot['default'] ?? {};
+  return Object.hasOwn(values, key) ? values[key] : undefined;
+}
+
+/**
  * Every managed document regenerated from the snapshot — one write triple per
  * document whose rebuilt text differs from what is on disk.
  *
@@ -1448,7 +1489,6 @@ export function planDocuments(
   const set = proposeHtml(cwd, files);
   const skips = set.skips.filter((s) => s.scope === 'mark');
   const writes: Array<{ abs: string; text: string; rel: string }> = [];
-  const values = snapshot['default'] ?? {};
 
   for (const document of set.documents) {
     const edits: Edit[] = [];
@@ -1469,7 +1509,7 @@ export function planDocuments(
         );
         continue;
       }
-      const value = values[mark.key];
+      const value = markValue(descriptor, snapshot, mark.key);
       if (typeof value !== 'string') continue; // a missing value is `check`'s `missing` finding
       if (mark.kind === 'attribute') {
         const attr = mark.element.attrs.find((a) => a.name === mark.attr);
@@ -1508,17 +1548,122 @@ export interface HtmlRegisterPlan {
   added: number;
   shared: number;
   marked: number;
+  /** Head texts this run minted as derived keys. */
+  derived: HtmlDerivation[];
+  /** Existing literal head keys this run turns into derived ones; no document changes for them. */
+  converted: HtmlDerivation[];
+}
+
+/** One head text's derivation, where register reports it. */
+export interface HtmlDerivation {
+  key: string;
+  source: string;
+  tmpl: string;
+  file: string;
+  line: number;
 }
 
 /**
- * Every proposal turned into a key and a mark, the descriptor and snapshot
+ * A head text: the page's `<title>` element's text — a `<title>` inside an
+ * `<svg>` names the graphic and is not one — or the `content` of a meta whose
+ * text is copy: the description, and the share title and description. The page
+ * shows these outside its body, and each may carry text the body shows.
+ */
+export function isHeadText(at: {
+  kind: 'element' | 'attribute';
+  tag: string;
+  attr?: string;
+  metaName?: string;
+  inSvg?: true;
+}): boolean {
+  return at.kind === 'element' ? at.tag === 'title' && at.inSvg !== true : at.attr === 'content' && at.metaName !== undefined;
+}
+
+/** Visible text: an element's text anywhere but `<title>`. */
+function isVisibleText(at: { kind: 'element' | 'attribute'; tag: string }): boolean {
+  return at.kind === 'element' && at.tag !== 'title';
+}
+
+/** A visible text shorter than this is never read as the heart of a longer head text. */
+const DERIVE_MIN = 12;
+
+/** A letter or a digit: what a word boundary may not cut through. */
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+
+/** The first occurrence of `part` in `text` with no letter or digit against either end, or -1. */
+function wordBoundedIndex(text: string, part: string): number {
+  for (let at = text.indexOf(part); at !== -1; at = text.indexOf(part, at + 1)) {
+    const before = at === 0 ? '' : text.charAt(at - 1);
+    const after = text.charAt(at + part.length);
+    if (!WORD_CHAR.test(before) && !WORD_CHAR.test(after)) return at;
+  }
+  return -1;
+}
+
+/**
+ * The derivation a head text carries, or null: the visible key whose text it
+ * holds — whole, or with words before or after it — and the template that
+ * rebuilds the head text from it.
+ *
+ * The visible text is read through `derivedText`, the resolver's own rule, so a
+ * headline's placeholder tags are dropped before the comparison, and a
+ * template is kept only when the derivation renders the head text exactly —
+ * which is what keeps the documents byte-identical when a literal becomes a
+ * derivation. An equal text always qualifies. A text found inside a longer one
+ * qualifies only when it is at least `DERIVE_MIN` characters, at least half the
+ * head text, and word-bounded: a one-word button inside a description is not
+ * what the description says. The longest visible text wins, then the first key
+ * by name. A head text that already holds `{v}` is never templated, since the
+ * resolver fills the first `{v}` alone.
+ */
+export function derivationOf(
+  descriptor: Descriptor,
+  text: string,
+  visible: ReadonlyArray<{ key: string; value: string }>,
+): { source: string; tmpl: string } | null {
+  if (text === '' || text.includes('{v}')) return null;
+  let best: { source: string; tmpl: string; length: number } | null = null;
+  for (const { key, value } of visible) {
+    const plain = derivedText(descriptor, key, value, '{v}');
+    if (plain === '') continue;
+    if (plain !== text && (plain.length < DERIVE_MIN || plain.length * 2 < text.length)) continue;
+    const at = plain === text ? 0 : wordBoundedIndex(text, plain);
+    if (at === -1) continue;
+    const tmpl = `${text.slice(0, at)}{v}${text.slice(at + plain.length)}`;
+    if (derivedText(descriptor, key, value, tmpl) !== text) continue;
+    if (best === null || plain.length > best.length || (plain.length === best.length && key < best.source)) {
+      best = { source: key, tmpl, length: plain.length };
+    }
+  }
+  return best === null ? null : { source: best.source, tmpl: best.tmpl };
+}
+
+/**
+ * Every proposal turned into a key and a mark, and every literal head key that
+ * carries visible text turned into a derivation — the descriptor and snapshot
  * mutated in place and the edited documents returned for the caller's batch.
  *
- * Identical text SHARES one key: the reverse map is built once from the
- * default-locale snapshot and extended as keys land, so a run's second
- * occurrence of a value is marked rather than minted. Only a `text` key of the
- * web target with no derivation is shared onto a page — an email key's value
- * carries email rules, and a derived one has no value of its own.
+ * Visible text is placed first, in document order, then the head texts, so a
+ * head text can derive from a key this same run mints. Identical visible text
+ * SHARES one key: the reverse map is built once from the default-locale
+ * snapshot and extended as keys land, so a run's second occurrence of a value is
+ * marked rather than minted. Only a `text` key of the web target with no
+ * derivation is shared onto a page — an email key's value carries email rules,
+ * and a derived one has no value of its own.
+ *
+ * A head text never shares a key with visible text. Identical head texts share
+ * one key (a page's title and its share title, where they match); a head text
+ * holding a visible key's text derives from that key (`derivationOf`); any
+ * other head text takes a literal key. A source is a visible key marked in the
+ * head text's own document and in no other: a nav label or a footer line
+ * carried by every page belongs to none of them, and a title derived from it
+ * would change on every page at once. For the same reason a derived key is
+ * shared only onto a head text in its source's document, and a source is never
+ * shared onto visible text in another document. The conversion reads
+ * the same rule over the keys a document already carries: a key marked only on
+ * head texts, all in one document, whose literal a derivation renders exactly,
+ * gains `derivesFrom` and `tmpl` and leaves the snapshot, and no document
+ * changes, because the resolved value is the literal it replaces.
  */
 export function planHtmlRegister(input: {
   cwd: string;
@@ -1529,74 +1674,195 @@ export function planHtmlRegister(input: {
 }): HtmlRegisterPlan {
   const { cwd, files, descriptor, snapshot, report } = input;
   const set = proposeHtml(cwd, files);
-  const byValue = new Map<string, string>();
-  for (const key of Object.keys(snapshot['default'] ?? {}).sort()) {
-    // `Object.hasOwn`, not a bare index: the name comes from the SNAPSHOT's own
-    // JSON and is read against the DESCRIPTOR's map, so `constructor` would
-    // otherwise resolve to a prototype member. remove.ts:71's idiom.
-    const def = Object.hasOwn(descriptor.keys, key) ? descriptor.keys[key] : undefined;
-    const value = snapshot['default']?.[key];
-    if (def === undefined || def.shape !== 'text' || def.target !== DEFAULT_TARGET) continue;
-    if (def.derivesFrom !== undefined || typeof value !== 'string') continue;
-    // Keyed by value AND declared tag count: sharing a `tags: 1` key onto an
-    // element with no descendants writes a value the regenerator must refuse.
-    const slot = `${def.tags ?? 0}\u0000${value}`;
-    if (!byValue.has(slot)) byValue.set(slot, key);
+  const defaults = (): Record<string, unknown> => snapshot['default'] ?? {};
+  // An own-property read (`keyDefOf`), not a bare index: a name from the
+  // SNAPSHOT or a DOCUMENT is read against the DESCRIPTOR's map, so
+  // `constructor` would otherwise resolve to a prototype member.
+  const defOf = (key: string): KeyDef | undefined => keyDefOf(descriptor, key);
+  /** A key's own text, where it is a web `text` key with no derivation. */
+  const literalOf = (key: string): string | null => {
+    const def = defOf(key);
+    const value = Object.hasOwn(defaults(), key) ? defaults()[key] : undefined;
+    if (def === undefined || def.shape !== 'text' || def.target !== DEFAULT_TARGET) return null;
+    return def.derivesFrom === undefined && typeof value === 'string' ? value : null;
+  };
+
+  // Where the documents already carry each key.
+  const marksOf = new Map<string, HtmlMark[]>();
+  for (const mark of set.claimed) marksOf.set(mark.key, [...(marksOf.get(mark.key) ?? []), mark]);
+  const headOnly = new Set([...marksOf].filter(([, marks]) => marks.every(isHeadText)).map(([key]) => key));
+  // The documents each key is marked in, before the run and as it marks.
+  const docsOf = new Map<string, Set<string>>();
+  const markedIn = (key: string, file: string): void => {
+    docsOf.set(key, (docsOf.get(key) ?? new Set<string>()).add(file));
+  };
+  for (const mark of set.claimed) markedIn(mark.key, mark.file);
+  /** Whether every mark of `key` is in `file`. */
+  const onlyIn = (key: string, file: string): boolean => {
+    const docs = docsOf.get(key);
+    return docs !== undefined && docs.size === 1 && docs.has(file);
+  };
+  // Visible keys and their text, the sources a head text may derive from.
+  const visible = new Map<string, string>();
+  for (const [key, marks] of marksOf) {
+    const text = literalOf(key);
+    if (text !== null && marks.some(isVisibleText)) visible.set(key, text);
   }
 
-  const edited: HtmlRegisterPlan['edited'] = [];
+  // Keyed by value AND declared tag count: sharing a `tags: 1` key onto an
+  // element with no descendants writes a value the regenerator must refuse. A
+  // key marked only on head texts is left out: visible text never shares one.
+  const byValue = new Map<string, string>();
+  for (const key of Object.keys(defaults()).sort()) {
+    const text = literalOf(key);
+    if (text === null || headOnly.has(key)) continue;
+    const slot = `${defOf(key)?.tags ?? 0}\u0000${text}`;
+    if (!byValue.has(slot)) byValue.set(slot, key);
+  }
+  // Head texts by the text they render, derived keys by their resolution.
+  const byHeadText = new Map<string, string>();
+  for (const key of [...headOnly].sort()) {
+    const text = resolve(descriptor, snapshot, null, { key }).value;
+    if (typeof text === 'string' && !byHeadText.has(text)) byHeadText.set(text, key);
+  }
+
+  const edits = new Map<Document, Edit[]>();
   let added = 0;
   let shared = 0;
   let marked = 0;
+  const derived: HtmlDerivation[] = [];
 
-  for (const document of set.documents) {
-    const mine = set.proposals
-      .filter((p) => p.file === document.file)
-      .sort(
-        (a, b) =>
-          a.insertAt - b.insertAt ||
-          // Symmetric: the old form answered -1 in BOTH directions for two
-          // attribute proposals at one offset, which is an ill-formed
-          // comparator even where a stable sort hides it.
-          (a.kind === 'attribute' ? 0 : 1) - (b.kind === 'attribute' ? 0 : 1),
-      );
-    const edits: Edit[] = [];
-    for (const proposal of mine) {
-      let key = byValue.get(`${proposal.tags}\u0000${proposal.value}`);
-      if (key === undefined) {
-        key = freeKey(descriptor, proposal.proposedKey);
-        // Tentatively added so the save gate can read the key's own rules;
-        // reverted on any refusal, the JSX loop's idiom.
-        descriptor.keys[key] = {
-          shape: 'text',
-          target: DEFAULT_TARGET,
-          ...(proposal.tags > 0 ? { tags: proposal.tags } : {}),
-        };
-        (snapshot['default'] ??= {})[key] = proposal.value;
-        if (!validateValue(descriptor, snapshot, key, proposal.value, 'default', report)) {
-          delete descriptor.keys[key];
-          delete snapshot['default']?.[key];
-          continue;
-        }
-        byValue.set(`${proposal.tags}\u0000${proposal.value}`, key);
-        added += 1;
-      } else {
-        shared += 1;
-      }
-      // The ONE edit: an attribute at the end of the open tag. The text is
-      // never touched.
-      edits.push({
-        pos: proposal.insertAt,
-        end: proposal.insertAt,
-        text:
-          proposal.kind === 'element'
-            ? ` data-stet="${key}"`
-            : ` data-stet-${proposal.attr}="${key}"`,
-      });
-      marked += 1;
+  const markWith = (proposal: HtmlProposal, key: string): void => {
+    const document = set.documents.find((d) => d.file === proposal.file) as Document;
+    // The ONE edit: an attribute at the end of the open tag. The text is
+    // never touched.
+    const list = edits.get(document) ?? [];
+    list.push({
+      pos: proposal.insertAt,
+      end: proposal.insertAt,
+      text: proposal.kind === 'element' ? ` data-stet="${key}"` : ` data-stet-${proposal.attr}="${key}"`,
+    });
+    edits.set(document, list);
+    markedIn(key, proposal.file);
+    marked += 1;
+  };
+  /** A fresh key, tentatively added so the save gate can read its own rules; reverted on a refusal, the JSX loop's idiom. */
+  const mint = (proposal: HtmlProposal, def: KeyDef, value: string | null): string | null => {
+    const key = freeKey(descriptor, proposal.proposedKey);
+    descriptor.keys[key] = def;
+    if (value !== null) (snapshot['default'] ??= {})[key] = value;
+    if (!validateValue(descriptor, snapshot, key, proposal.value, 'default', report)) {
+      delete descriptor.keys[key];
+      delete snapshot['default']?.[key];
+      return null;
     }
-    if (edits.length === 0) continue;
-    const out = applyFileEdits(document.source, edits);
+    added += 1;
+    return key;
+  };
+
+  // Document order within a file; an attribute before the element text at one offset.
+  const order = [...set.proposals].sort(
+    (a, b) =>
+      a.file.localeCompare(b.file) ||
+      a.insertAt - b.insertAt ||
+      (a.kind === 'attribute' ? 0 : 1) - (b.kind === 'attribute' ? 0 : 1),
+  );
+
+  // A derivation source keeps its single document: visible text elsewhere that
+  // repeats it takes a key of its own, so the head texts derived from it never
+  // start following a second page.
+  const sources = new Set(Object.values(descriptor.keys).map((def) => def.derivesFrom));
+  const tiedElsewhere = (key: string, file: string): boolean =>
+    sources.has(key) && [...(docsOf.get(key) ?? [])].some((doc) => doc !== file);
+
+  for (const proposal of order.filter((p) => !isHeadText(p))) {
+    let key = byValue.get(`${proposal.tags}\u0000${proposal.value}`);
+    if (key !== undefined && tiedElsewhere(key, proposal.file)) key = undefined;
+    if (key === undefined) {
+      const minted = mint(
+        proposal,
+        { shape: 'text', target: DEFAULT_TARGET, ...(proposal.tags > 0 ? { tags: proposal.tags } : {}) },
+        proposal.value,
+      );
+      if (minted === null) continue;
+      key = minted;
+      byValue.set(`${proposal.tags}\u0000${proposal.value}`, key);
+    } else {
+      shared += 1;
+    }
+    if (isVisibleText(proposal)) visible.set(key, proposal.value);
+    markWith(proposal, key);
+  }
+
+  /** The visible keys a head text in `file` may derive from: those marked in that document alone. */
+  const sourcesIn = (file: string): Array<{ key: string; value: string }> =>
+    [...visible]
+      .filter(([key]) => onlyIn(key, file))
+      .map(([key, value]) => ({ key, value }))
+      .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+
+  for (const proposal of order.filter(isHeadText)) {
+    let key = byHeadText.get(proposal.value);
+    const from = key === undefined ? undefined : defOf(key)?.derivesFrom;
+    if (key !== undefined && (from === undefined || onlyIn(from, proposal.file))) {
+      shared += 1;
+      markWith(proposal, key);
+      continue;
+    }
+    const found = derivationOf(descriptor, proposal.value, sourcesIn(proposal.file));
+    const unmarked = byValue.get(`0\u0000${proposal.value}`);
+    if (found !== null) {
+      const minted = mint(proposal, { shape: 'text', target: DEFAULT_TARGET, derivesFrom: found.source, tmpl: found.tmpl }, null);
+      if (minted === null) continue;
+      key = minted;
+      derived.push({ key, ...found, file: proposal.file, line: proposal.line });
+    } else if (unmarked !== undefined && !docsOf.has(unmarked)) {
+      // A key declared before the run and marked nowhere, before it or in it, is shared, as ever.
+      key = unmarked;
+      shared += 1;
+    } else {
+      const minted = mint(proposal, { shape: 'text', target: DEFAULT_TARGET }, proposal.value);
+      if (minted === null) continue;
+      key = minted;
+    }
+    byHeadText.set(proposal.value, key);
+    markWith(proposal, key);
+  }
+
+  // The conversion: literal head keys the documents already carry.
+  const converted: HtmlDerivation[] = [];
+  const derivedFrom = new Set(Object.values(descriptor.keys).map((def) => def.derivesFrom));
+  // `headOnly` holds only keys no visible text carries: visible text never shares one, so none is a source.
+  for (const key of [...headOnly].sort()) {
+    const text = literalOf(key);
+    if (text === null || defOf(key)?.tags !== undefined || derivedFrom.has(key)) continue;
+    // Only a key whose value lives in the default locale alone: a derivation replaces every locale's literal.
+    if (Object.keys(snapshot).some((locale) => locale !== 'default' && Object.hasOwn(snapshot[locale] ?? {}, key))) continue;
+    // Only a key marked in one document, deriving from a key marked in that document alone.
+    const docs = [...(docsOf.get(key) as Set<string>)];
+    if (docs.length !== 1) continue;
+    const found = derivationOf(descriptor, text, sourcesIn(docs[0] as string));
+    if (found === null) continue;
+    const def = defOf(key) as KeyDef;
+    descriptor.keys[key] = { ...def, derivesFrom: found.source, tmpl: found.tmpl };
+    delete snapshot['default']?.[key];
+    // The byte-identity guard: the resolution must give back the literal, or the
+    // key stays as it was. A cross-check: `derivationOf` keeps a template only
+    // where the derivation renders the text exactly, so this never fires.
+    if (resolve(descriptor, snapshot, null, { key }).value !== text) {
+      descriptor.keys[key] = def;
+      (snapshot['default'] ??= {})[key] = text;
+      continue;
+    }
+    const first = (marksOf.get(key) as HtmlMark[])[0] as HtmlMark;
+    converted.push({ key, ...found, file: first.file, line: first.line });
+  }
+
+  const edited: HtmlRegisterPlan['edited'] = [];
+  for (const document of set.documents) {
+    const list = edits.get(document);
+    if (list === undefined) continue;
+    const out = applyFileEdits(document.source, list);
     edited.push({
       abs: join(cwd, document.file),
       text: out,
@@ -1604,7 +1870,7 @@ export function planHtmlRegister(input: {
       diff: formatDiff(document.file, document.source, out),
     });
   }
-  return { edited, added, shared, marked };
+  return { edited, added, shared, marked, derived, converted };
 }
 
 // --- check's documents ------------------------------------------------------
@@ -1629,7 +1895,6 @@ export function checkDocuments(
   report: Report,
 ): void {
   const set = proposeHtml(cwd, files);
-  const values = snapshot['default'] ?? {};
   const states: Record<string, { marks: number; status: string }> = {};
   const carried = new Set<string>();
 
@@ -1652,7 +1917,7 @@ export function checkDocuments(
         clean = false;
         continue;
       }
-      const value = values[mark.key];
+      const value = markValue(descriptor, snapshot, mark.key);
       if (typeof value !== 'string' || mark.value === null) continue;
       // The SAME refusal the regenerator would raise, so the hook and the write
       // agree about a value: a `check` that passes what `pull` then rejects is
@@ -1688,7 +1953,7 @@ export function checkDocuments(
   for (const key of Object.keys(descriptor.keys).sort()) {
     const def = descriptor.keys[key];
     if (def === undefined || def.target !== DEFAULT_TARGET) continue;
-    if (typeof values[key] !== 'string' || carried.has(key)) continue;
+    if (typeof markValue(descriptor, snapshot, key) !== 'string' || carried.has(key)) continue;
     report.warn('config', `${key}: marked in no document`, key);
   }
   report.data('documents', states);

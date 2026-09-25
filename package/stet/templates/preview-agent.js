@@ -63,6 +63,7 @@
 
   /** Put back every outline and swapped text; the <details> this script opened close too, unless `keepOpen` (a new request settles them). */
   function clear(keepOpen) {
+    endSettle();
     marked.forEach(function (m) { m.el.style.outline = m.outline; m.el.style.outlineOffset = m.offset; });
     swapped.forEach(function (s) {
       if (s.node) s.node.data = s.text;
@@ -117,6 +118,37 @@
   function hiddenEl(el) {
     var box = el.getBoundingClientRect();
     return el.getClientRects().length === 0 || (box.width === 0 && box.height === 0);
+  }
+
+  /**
+   * A hit hidden at the moment it is found may only be on its way in: an
+   * entrance animation or transition on it or an ancestor, or a frame not laid
+   * out yet. `ask` is asked again on every `animationend` and `transitionend`
+   * whose target is a hit or holds one, and a last time after SETTLE_MS with
+   * `final` set; the wait ends at the first answer of true. A new locate, a
+   * clear and a page leaving the frame end the wait.
+   */
+  var SETTLE_MS = 1000;
+  var unsettle = null;
+  function whenSettled(els, ask) {
+    // Its one caller, `locate`, has already ended any earlier wait through `clear`.
+    var onEnd = function (event) {
+      var target = event.target;
+      if (!els.some(function (el) { return target === el || (target.contains && target.contains(el)); })) return;
+      if (ask(false)) endSettle();
+    };
+    var timer = setTimeout(function () { endSettle(); ask(true); }, SETTLE_MS);
+    document.addEventListener('animationend', onEnd, true);
+    document.addEventListener('transitionend', onEnd, true);
+    unsettle = function () {
+      clearTimeout(timer);
+      document.removeEventListener('animationend', onEnd, true);
+      document.removeEventListener('transitionend', onEnd, true);
+    };
+  }
+  function endSettle() {
+    if (unsettle !== null) unsettle();
+    unsettle = null;
   }
 
   /**
@@ -257,6 +289,58 @@
     return true;
   }
 
+  /**
+   * A draft carrying numbered placeholder tags, on the element a key is marked
+   * on: the tags number the element's descendants depth-first, as the value
+   * does, and each run of text between two tags replaces the text between the
+   * same two element boundaries, so the draft shows in the page's own styling.
+   * It maps only when the draft's tags come in the order the element's do and
+   * every non-empty run has a text node to go into; the first run keeps the
+   * element's leading whitespace and the last its trailing whitespace. Returns
+   * false, changing nothing, when the draft does not map.
+   */
+  function draftTagged(el, draft) {
+    var number = new Map();
+    var all = el.querySelectorAll('*');
+    for (var i = 0; i < all.length; i += 1) number.set(all[i], i + 1);
+    var boundaries = [];
+    var slots = [[]];
+    var walk = function (node) {
+      for (var child = node.firstChild; child; child = child.nextSibling) {
+        if (child.nodeType === 3) { slots[slots.length - 1].push(child); continue; }
+        if (child.nodeType !== 1) continue;
+        var n = number.get(child);
+        if (child.firstElementChild === null && norm(child.textContent) === '') {
+          boundaries.push('<' + n + '/>');
+          slots.push([]);
+          continue;
+        }
+        boundaries.push('<' + n + '>');
+        slots.push([]);
+        walk(child);
+        boundaries.push('</' + n + '>');
+        slots.push([]);
+      }
+    };
+    walk(el);
+    var parts = draft.split(/(<\/?\d+\/?>)/);
+    var runs = parts.filter(function (part, k) { return k % 2 === 0; });
+    var tags = parts.filter(function (part, k) { return k % 2 === 1; });
+    if (tags.join('') !== boundaries.join('')) return false;
+    for (var r = 0; r < runs.length; r += 1) if (runs[r] !== '' && slots[r].length === 0) return false;
+    slots.forEach(function (nodes, k) {
+      if (nodes.length === 0) return;
+      var text = nodes.map(function (node) { return node.data; }).join('');
+      var lead = k === 0 ? /^\s*/.exec(text)[0] : '';
+      var trail = k === slots.length - 1 ? /\s*$/.exec(text)[0] : '';
+      nodes.forEach(function (node, j) {
+        swapped.push({ node: node, text: node.data });
+        node.data = j === 0 ? lead + runs[k] + trail : '';
+      });
+    });
+    return true;
+  }
+
   function locate(request, scroll) {
     // A key picked anew may open again what another hand closed.
     if (last === null || request.key !== last.key || scroll) declined = [];
@@ -265,7 +349,8 @@
     var texts = request.texts || [];
     var draft = typeof request.draft === 'string' ? request.draft : null;
     var by = 'mark';
-    var hits = byMark(request.key);
+    // A derived key is shown where its source renders: the page names the source's mark.
+    var hits = byMark(typeof request.mark === 'string' ? request.mark : request.key);
     // A draft mapped piece by piece: one line per hit, else the whole draft.
     var pieces = null;
     var unmapped = false;
@@ -296,10 +381,12 @@
         if (hits.length === 0 && lines !== null) hits = byLines(byContained);
       }
     }
-    // A draft with numbered placeholder tags has markup this script does not build.
-    var mapped = draft !== null && !unmapped && !/<\/?\d+\/?>/.test(draft);
-    // Text found inside more text is always a guess; a whole-text match is one until a save confirms it.
-    var outline = by === 'contained' || (by === 'text' && request.guess === true) ? DASHED : SOLID;
+    // A key that declares numbered placeholder tags maps its draft onto the marked element's structure.
+    var tagged = typeof request.tags === 'number';
+    var mapped = draft !== null && !unmapped;
+    // Text found inside more text is always a guess; a whole-text match is one until a save confirms it;
+    // the source of a derived key is outlined dashed, since the key itself is not what the page shows.
+    var outline = request.dashed === true || by === 'contained' || (by === 'text' && request.guess === true) ? DASHED : SOLID;
     hits.forEach(function (hit) {
       // Two lines in one element outline it once, so its own outline is what comes back.
       if (!marked.some(function (m) { return m.el === hit.el; })) {
@@ -308,7 +395,14 @@
         hit.el.style.outlineOffset = '2px';
       }
       var piece = pieces !== null ? pieces[hit.index] : draft;
-      if (mapped && !(hit.pattern ? draftContained(hit, piece) : draftInto(hit, piece))) mapped = false;
+      if (!mapped) return;
+      // A tagged draft maps only onto the element its key is marked on; text found inside more text waits for Save.
+      var done = hit.pattern
+        ? !tagged && draftContained(hit, piece)
+        : tagged
+          ? by === 'mark' && hit.attr === null && draftTagged(hit.el, piece)
+          : draftInto(hit, piece);
+      if (!done) mapped = false;
     });
     // A key inside a closed <details> opens it; one opened for an earlier key closes.
     var needed = [];
@@ -317,17 +411,32 @@
     settle();
     // The page's own content, as against <title> and <meta> in the head, and of it what can be seen.
     var inBody = hits.filter(function (hit) { return document.body !== null && document.body.contains(hit.el); });
-    var shown = inBody.filter(function (hit) { return !hiddenEl(hit.el); });
+    var shownOf = function () { return inBody.filter(function (hit) { return !hiddenEl(hit.el); }); };
+    var shown = shownOf();
     if (scroll && shown.length > 0) scrollToCentre(shown[0].el);
-    tell({
-      stet: 'located',
-      key: request.key,
-      seq: request.seq,
-      found: hits.length,
-      by: by,
-      draft: draft === null ? null : mapped ? 'shown' : 'after-save',
-      hidden: inBody.length > 0 && shown.length === 0,
-      route: location.pathname,
+    var answer = function (hidden) {
+      tell({
+        stet: 'located',
+        key: request.key,
+        seq: request.seq,
+        found: hits.length,
+        by: by,
+        draft: draft === null ? null : mapped ? 'shown' : 'after-save',
+        hidden: hidden,
+        route: location.pathname,
+      });
+    };
+    // Every hit hidden: answer as shown for now, and name it hidden only if it still is once the page settles.
+    answer(false);
+    if (inBody.length === 0 || shown.length > 0) return;
+    whenSettled(inBody.map(function (hit) { return hit.el; }), function (final) {
+      var now = shownOf();
+      if (now.length > 0) {
+        if (scroll) scrollToCentre(now[0].el);
+        return true;
+      }
+      if (final) answer(true);
+      return false;
     });
   }
 
@@ -346,7 +455,7 @@
 
   // A page leaving the frame says so, so the dashboard stops posting before a
   // page it navigated to could receive anything.
-  window.addEventListener('pagehide', function () { tell({ stet: 'bye' }); });
+  window.addEventListener('pagehide', function () { endSettle(); tell({ stet: 'bye' }); });
 
   // A dev server that re-renders part of the page in place keeps the outline
   // and the draft on it. This script's own changes are taken off the

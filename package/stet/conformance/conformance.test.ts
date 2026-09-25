@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -23,7 +24,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
 
 import { revertChange } from '../adapters/changesets.js';
 import { createMemoryDb, createMemoryStore } from '../adapters/store-memory.js';
@@ -49,6 +50,9 @@ import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpe
 import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
 import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
+import { handlerOver, paintPage, req, TOKEN, type PaintedPage } from '../tests/helpers/dashboard-page.js';
+import { dashboardPage } from '../cli/dev.js';
+import { DASHED, closeFrames, frame, located, tick } from '../tests/helpers/preview-frame.js';
 import { installRegistryDts, typecheckHost } from '../tests/helpers/ts-host.js';
 import { generateDefaultsModule, generateRegistry, generatedBody } from '../src/codegen.js';
 import * as root from '../src/index.js';
@@ -560,6 +564,29 @@ describe('content-read', () => {
         resolve(descriptor, snapshot, rows, { key }),
       );
     }
+
+    // A tagged source derives without its tags, on every read path; a `$` stays literal.
+    const tagged = mutable(descriptor);
+    (tagged.keys['hero_headline'] as Descriptor['keys'][string]).tags = 1;
+    tagged.keys['seo_home_title'] = { ...tagged.keys['seo_home_title'], tmpl: '{v} No raw data is needed to start.' } as Descriptor['keys'][string];
+    const headline: Snapshot = mutable(snapshot);
+    (headline['default'] as Record<string, unknown>)['hero_headline'] =
+      'You may already have the data<1> our AI lab partners need.</1>';
+    const sentence = 'You may already have the data our AI lab partners need. No raw data is needed to start.';
+    expect(resolve(tagged, headline, null, { key: 'seo_home_title' }).value).toBe(sentence);
+    expect(resolveFromBundle(tagged, readBundle(headline), { key: 'seo_home_title' }).value).toBe(sentence);
+    expect(root.resolveAll(tagged, readBundle(headline)).resolved['seo_home_title']).toBe(sentence);
+    (headline['default'] as Record<string, unknown>)['hero_headline'] = 'First line<1/>second line.';
+    expect(resolve(tagged, headline, null, { key: 'seo_home_title' }).value).toBe(
+      'First line second line. No raw data is needed to start.',
+    );
+    const dollars: Snapshot = mutable(snapshot);
+    for (const value of ['Costs $$ now', 'a$&b']) {
+      (dollars['default'] as Record<string, unknown>)['hero_headline'] = value;
+      expect(resolve(descriptor, dollars, null, { key: 'seo_home_title' }).value).toBe(`${value} — Mirra`);
+    }
+    (dollars['default'] as Record<string, unknown>)['hero_headline'] = 'Hi <1>there</1>';
+    expect(resolve(descriptor, dollars, null, { key: 'seo_home_title' }).value).toBe('Hi <1>there</1> — Mirra');
   });
 
   it('Requirement: The snapshot fallback is unconditional', () => {
@@ -4386,6 +4413,49 @@ describe('adoption', () => {
     expect(host.stdout()).toContain('stays (no stet imports): stet.config.json');
     expect(host.exists('.git/hooks/pre-commit')).toBe(false);
     expect(host.file('package.json')).not.toContain('@getstet/stet');
+
+    // A derived key's mark is its resolution: a headline edit reaches the share
+    // description derived from it, in check and in one pull.
+    const derived = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head>\n<meta property="og:description" content="You may already have the data our AI lab ' +
+          'partners need. No raw data is needed to start." data-stet-content="share_description">\n</head><body>\n' +
+          '<h1 data-stet="hero_headline">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>\n' +
+          '</body></html>\n',
+      },
+      keys: {
+        hero_headline: { shape: 'text', target: 'web', tags: 1 },
+        share_description: {
+          shape: 'text',
+          target: 'web',
+          derivesFrom: 'hero_headline',
+          tmpl: '{v} No raw data is needed to start.',
+        },
+      },
+      defaults: { hero_headline: 'You may already have the data<1> our AI lab partners need.</1>' },
+    });
+    expect(await derived.run('check')).toBe(0);
+    writeFileSync(
+      join(derived.cwd, 'content/defaults.json'),
+      `${JSON.stringify({ default: { hero_headline: 'You may already have data<1> our AI lab partners need.</1>' } }, null, 2)}\n`,
+    );
+    derived.err.length = 0;
+    expect(await derived.run('check')).toBe(1);
+    expect(derived.stderr()).toContain('index.html:5 hero_headline differs from the snapshot');
+    expect(derived.stderr()).toContain('index.html:3 share_description differs from the snapshot');
+    expect(await derived.run('pull')).toBe(0);
+    expect(derived.file('index.html')).toContain(
+      'content="You may already have data our AI lab partners need. No raw data is needed to start."',
+    );
+    expect(derived.file('index.html')).toContain('>You may already have data<span class="tail"> our AI lab partners need.</span></h1>');
+    derived.out.length = 0;
+    derived.err.length = 0;
+    expect(await derived.run('check')).toBe(0);
+    const pulled = readFileSync(join(derived.cwd, 'index.html'));
+    expect(await derived.run('pull')).toBe(0);
+    expect(derived.stdout()).toContain('pull: documents current');
+    expect(readFileSync(join(derived.cwd, 'index.html'))).toEqual(pulled);
   });
 
   it('Requirement: init scaffolds a project with a single, shown edit to existing code', async () => {
@@ -5326,6 +5396,64 @@ describe('adoption', () => {
     html.out.length = 0;
     expect(await html.run('register', '--from', 'scan')).toBe(0);
     expect(html.stdout()).toContain('register: nothing to adopt');
+
+    // A head text that repeats visible text derives from it; head texts share
+    // among themselves and never with visible text.
+    const derive = await makeHtmlHost({ files: { 'index.html': htmlFixture('derive.html') } });
+    expect(await derive.run('register', '--from', 'scan', '--write')).toBe(0);
+    const derivedKeys = (JSON.parse(derive.file('content/descriptor.json')) as {
+      keys: Record<string, { derivesFrom?: string; tmpl?: string }>;
+    }).keys;
+    const derivedValues = (JSON.parse(derive.file('content/defaults.json')) as { default: Record<string, string> }).default;
+    expect(derivedKeys['ship_the_catalogue_in_a_day_2']).toMatchObject({ derivesFrom: 'ship_the_catalogue_in_a_day', tmpl: '{v}' });
+    expect(derivedKeys['plans_from_and_up_for_every_product']).toMatchObject({
+      derivesFrom: 'plans_from_and_up_for_every_product_page',
+      tmpl: '{v} Book a call.',
+    });
+    expect(Object.hasOwn(derivedValues, 'ship_the_catalogue_in_a_day_2')).toBe(false);
+    expect(derive.file('index.html')).toContain(
+      '<meta property="og:title" content="Ship the catalogue in a day" data-stet-content="ship_the_catalogue_in_a_day_2">',
+    );
+    expect(derivedKeys['start_a_trial_today_and_see_the_whole']?.derivesFrom).toBeUndefined();
+    expect(derivedKeys['reship_the_whole_catalogue']?.derivesFrom).toBeUndefined();
+    expect(derive.file('index.html')).toContain('<nav aria-label="Everything we ship" data-stet-aria-label="everything_we_ship">');
+    expect(derive.file('index.html')).toContain('<h3 data-stet="everything_we_ship">');
+    expect(derive.stdout()).toContain(
+      'index.html:5 ship_the_catalogue_in_a_day_2 derives from ship_the_catalogue_in_a_day through "{v}"',
+    );
+    expect(derive.file('index.html').replace(/ data-stet[^ >]*="[^"]*"/g, '')).toBe(htmlFixture('derive.html'));
+    expect(await derive.run('check')).toBe(0);
+
+    // An adopted site's literal head key converts in place, and no document changes.
+    const adopted = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head>\n<meta property="og:description" content="You may already have the data our AI lab ' +
+          'partners need. No raw data is needed to start." data-stet-content="share_description">\n</head><body>\n' +
+          '<h1 data-stet="hero_headline">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>\n' +
+          '</body></html>\n',
+      },
+      keys: { hero_headline: { shape: 'text', target: 'web', tags: 1 }, share_description: { shape: 'text', target: 'web' } },
+      defaults: {
+        hero_headline: 'You may already have the data<1> our AI lab partners need.</1>',
+        share_description: 'You may already have the data our AI lab partners need. No raw data is needed to start.',
+      },
+    });
+    const adoptedPage = readFileSync(join(adopted.cwd, 'index.html'));
+    expect(await adopted.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(adopted.stdout()).toContain(
+      'index.html:3 share_description derives from hero_headline through "{v} No raw data is needed to start."',
+    );
+    expect(JSON.parse(adopted.file('content/descriptor.json')).keys.share_description).toMatchObject({
+      derivesFrom: 'hero_headline',
+      tmpl: '{v} No raw data is needed to start.',
+    });
+    expect(Object.hasOwn(JSON.parse(adopted.file('content/defaults.json')).default, 'share_description')).toBe(false);
+    expect(readFileSync(join(adopted.cwd, 'index.html'))).toEqual(adoptedPage);
+    adopted.out.length = 0;
+    expect(await adopted.run('pull')).toBe(0);
+    expect(adopted.stdout()).toContain('pull: documents current');
+    expect(readFileSync(join(adopted.cwd, 'index.html'))).toEqual(adoptedPage);
   });
 
   it('Requirement: eject un-rewrites the host, writes content back, and removes the dependency', async () => {
@@ -6018,4 +6146,233 @@ describe('email-custody', () => {
     expect(await host.run('email', 'verify')).toBe(0);
     expect(host.stdout()).toContain('welcome: PASS');
   });
+});
+
+describe('dashboard', () => {
+  afterEach(closeFrames);
+  /** A checkout committed as it stands, so the dashboard's commit has a HEAD to compare with. */
+  const committed = (cwd: string): void => {
+    for (const args of [
+      ['init', '-q'],
+      ['config', 'user.email', 'walk@test'],
+      ['config', 'user.name', 'walk'],
+      ['config', 'commit.gpgsign', 'false'],
+      ['add', '-A'],
+      ['commit', '-qm', 'base'],
+    ]) {
+      execFileSync('git', args, { cwd, stdio: 'ignore' });
+    }
+  };
+  const siteOf = (cwd: string): string => `?site=${encodeURIComponent(realpathSync(cwd))}`;
+  const call = async (
+    handler: (r: Request) => Promise<Response>,
+    path: string,
+    body?: unknown,
+  ): Promise<{ status: number; body: Record<string, any> }> => {
+    const res = await handler(req(path, body === undefined ? {} : { method: 'POST', body }));
+    return { status: res.status, body: (await res.json()) as Record<string, any> };
+  };
+
+  /** The page `stet dev` serves, over its own handler for a workspace holding `cwd`, booted in jsdom. */
+  const served = async (cwd: string): Promise<PaintedPage> => {
+    const { handler } = handlerOver([cwd], { page: dashboardPage() });
+    const html = await (await handler(req('/', { token: null }))).text();
+    return paintPage({
+      html,
+      token: TOKEN,
+      serve: async (path, body) => {
+        const res = await handler(req(path, body === undefined ? {} : { method: 'POST', body }));
+        return { status: res.status, body: (await res.json()) as unknown };
+      },
+    });
+  };
+  const groupOf = async (page: PaintedPage, id: string): Promise<string[]> => {
+    await page.change('group', id);
+    return page.keys();
+  };
+
+  it("Requirement: The page is the prototype's screens, shipped in the package, developer mode only", async () => {
+    const host = await makeHtmlHost({ register: true });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    const page = await served(host.cwd);
+    const doc = page.dom.window.document;
+    expect([...doc.querySelectorAll('#gsel option')].map((option) => option.textContent)).toEqual(['home — page', 'SEO']);
+    expect((doc.getElementById('gsel') as HTMLSelectElement).value).toBe('page:home');
+    // The SEO group holds exactly the keys every mark of which is a head text.
+    const marks = (await call(handlerOver([host.cwd]).handler, `/api/site/marks${siteOf(host.cwd)}`)).body;
+    const head = Object.keys(marks.places as Record<string, Array<{ head?: true }>>)
+      .filter((key) => (marks.places[key] as Array<{ head?: true }>).every((p) => p.head === true))
+      .sort();
+    expect(head.length).toBeGreaterThan(0);
+    expect(await groupOf(page, 'seo')).toEqual(head);
+    expect(page.html().match(/\bon[a-z]+="/g)).toBeNull();
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('Requirement: Each key says what it is and where it appears', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': htmlFixture('derive.html') }, register: true });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    const page = await served(host.cwd);
+    const doc = page.dom.window.document;
+    expect(await groupOf(page, 'seo')).toEqual([
+      'plans_from_and_up_for_every_product',
+      'reship_the_whole_catalogue',
+      'ship_the_catalogue_in_a_day_2',
+      'start_a_trial_today_and_see_the_whole',
+    ]);
+    // The derived title: its kinds and places, what it follows, and where it appears.
+    await page.act('key:ship_the_catalogue_in_a_day_2');
+    expect([...doc.querySelectorAll('.kline > div')].map((line) => line.textContent)).toEqual([
+      'page title · share title index.html:5, index.html:7',
+      'derived from: headline (ship_the_catalogue_in_a_day)',
+    ]);
+    expect(doc.getElementById('panenote')?.textContent).toBe(
+      'ship_the_catalogue_in_a_day_2 appears as the page title, in the browser tab and in search results, and as the share ' +
+        'title, when the page is shared as a link. It follows ship_the_catalogue_in_a_day (headline), outlined dashed on the page.',
+    );
+    // The headline's draft moves the share card's title as it is typed.
+    await page.change('group', 'page:home');
+    await page.act('key:ship_the_catalogue_in_a_day');
+    await page.type('text:ship_the_catalogue_in_a_day', 'Ship everything <1>this week</1>');
+    const share = [...doc.querySelectorAll('#panecards .share > div')].map((part) => part.textContent);
+    expect(share).toEqual([
+      'Share card',
+      '/',
+      'Ship everything this week',
+      'Start a trial today and see the whole catalogue for yourself.',
+    ]);
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it("Requirement: The preview is the site's own dev server, started only on request", async () => {
+    // On a static-HTML host each mark is a place: file, line, tag, and a meta's attribute and name.
+    const html = await makeHtmlHost({ files: { 'index.html': htmlFixture('derive.html') }, register: true });
+    const marks = (await call(handlerOver([html.cwd]).handler, `/api/site/marks${siteOf(html.cwd)}`)).body;
+    expect(marks.places['ship_the_catalogue_in_a_day_2']).toEqual([
+      { file: 'index.html', line: 5, tag: 'title', head: true },
+      { file: 'index.html', line: 7, tag: 'meta', attr: 'content', meta: 'og:title', head: true },
+    ]);
+    expect(marks.places['ship_the_catalogue_in_a_day']).toEqual([{ file: 'index.html', line: 14, tag: 'h1' }]);
+    expect(marks.documents).toEqual([{ file: 'index.html', route: '/', page: null }]);
+
+    // On a JavaScript host the places are the source reads: the element a
+    // template dialect's markup holds them in, else the file alone, and only
+    // for declared keys.
+    const js = makeCliHost({ config: { project: 't', managedSurfaces: ['src/**/*.astro'] } });
+    mkdirSync(join(js.cwd, 'src/pages'), { recursive: true });
+    writeFileSync(
+      join(js.cwd, 'src/pages/index.astro'),
+      "---\nconst name = copy('brand__name');\n---\n<head><meta name=\"description\" content={copy.get('hero_body')}></head>\n" +
+        "<h1>{copy.get('hero_headline')}</h1>\n<a href=\"/\">{copy.pricing_price}</a>\n<p>{copy.get('undeclared_key')}</p>\n",
+    );
+    const reads = (await call(handlerOver([js.cwd]).handler, `/api/site/marks${siteOf(js.cwd)}`)).body;
+    expect(reads).toEqual({
+      documents: [],
+      keys: {},
+      places: {
+        brand__name: [{ file: 'src/pages/index.astro', line: 2 }],
+        hero_body: [{ file: 'src/pages/index.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true }],
+        hero_headline: [{ file: 'src/pages/index.astro', line: 5, tag: 'h1' }],
+        pricing_price: [{ file: 'src/pages/index.astro', line: 6, tag: 'a' }],
+      },
+    });
+  });
+
+  it('Requirement: A snapshot-only site is edited through the save gate and published by commit', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head>\n<meta property="og:description" content="You may already have the data our AI lab ' +
+          'partners need. No raw data is needed to start." data-stet-content="share_description">\n</head><body>\n' +
+          '<h1 data-stet="hero_headline">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>\n' +
+          '</body></html>\n',
+      },
+      keys: {
+        hero_headline: { shape: 'text', target: 'web', tags: 1 },
+        share_description: {
+          shape: 'text',
+          target: 'web',
+          derivesFrom: 'hero_headline',
+          tmpl: '{v} No raw data is needed to start.',
+          limits: { max: 100, severity: 'hard' },
+        },
+      },
+      defaults: { hero_headline: 'You may already have the data<1> our AI lab partners need.</1>' },
+    });
+    expect(await host.run('pull')).toBe(0);
+    committed(host.cwd);
+    const { handler } = handlerOver([host.cwd]);
+    const save = (body: unknown) => call(handler, `/api/site/save${siteOf(host.cwd)}`, body);
+
+    // A derived key takes no value of its own; its template is the one free text.
+    expect(await save({ values: [{ key: 'share_description', value: 'Its own words' }] })).toEqual({
+      status: 400,
+      body: { error: 'share_description derives from hero_headline — edit its template instead' },
+    });
+    expect((await save({ templates: [{ key: 'hero_headline', tmpl: '{v}' }] })).body).toEqual({
+      error: 'hero_headline is not a derived key',
+    });
+    expect((await save({ templates: [{ key: 'share_description', tmpl: 'none' }] })).body).toEqual({
+      error: 'the template of share_description must hold {v} exactly once',
+    });
+
+    // A headline edit moves the derived key through the gate: past its limit, refused whole.
+    const page = readFileSync(join(host.cwd, 'index.html'));
+    const refused = await save({
+      values: [{ key: 'hero_headline', value: 'You may already have all of the data<1> our AI lab research partners need today.</1>' }],
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body['findings']).toEqual([expect.objectContaining({ key: 'share_description' })]);
+    expect(readFileSync(join(host.cwd, 'index.html'))).toEqual(page);
+
+    // Within it, the headline and the attribute land in one batch, and the commit names both.
+    const saved = await save({ values: [{ key: 'hero_headline', value: 'You may already have data<1> our AI lab partners need.</1>' }] });
+    expect(saved.status).toBe(200);
+    expect(host.file('index.html')).toContain(
+      'content="You may already have data our AI lab partners need. No raw data is needed to start."',
+    );
+    const made = await call(handler, `/api/site/commit${siteOf(host.cwd)}`, { files: saved.body['pending'] });
+    expect(made.body['subject']).toBe('stet: 2 keys updated — hero_headline, share_description');
+
+    // A template alone writes the descriptor and the document, and titles the commit by the derived key.
+    const retemplated = await save({ templates: [{ key: 'share_description', tmpl: '{v} Start with a call.' }] });
+    expect(retemplated.body['written']).toEqual(['content/descriptor.json', 'index.html']);
+    const again = await call(handler, `/api/site/commit${siteOf(host.cwd)}`, { files: retemplated.body['pending'] });
+    expect(again.body['subject']).toBe('stet: 1 key updated — share_description');
+  });
+
+  it('Requirement: The preview finds the selected key and shows its draft in place', async () => {
+    // The agent as `stet dev` serves it, publicly.
+    const { handler } = handlerOver([]);
+    const served = await handler(req('/preview-agent.js', { token: null }));
+    expect(served.status).toBe(200);
+    const agent = await served.text();
+
+    // A tagged draft fills the marked element's own structure, keeping its styling.
+    const framed = await frame(
+      '<h1 data-stet="hero">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>' +
+        '<div hidden><p data-stet="gone">Never shown</p></div>',
+      'c1',
+      '',
+      agent,
+    );
+    const h1 = framed.doc.querySelector('h1') as HTMLElement;
+    const drafted = await framed.locate({ key: 'hero', tags: 1, draft: 'You may already have data<1> our AI partners need.</1>' });
+    expect(drafted).toMatchObject({ key: 'hero', found: 1, draft: 'shown' });
+    expect(h1.innerHTML).toBe('You may already have data<span class="tail"> our AI partners need.</span>');
+
+    // A derived key outlines its source dashed, writes nothing there, and the reply names the key picked.
+    const derived = await framed.locate({ key: 'share', mark: 'hero', dashed: true, draft: null });
+    expect(derived).toMatchObject({ key: 'share', found: 1, by: 'mark' });
+    expect(h1.style.outline).toBe(DASHED);
+    expect(h1.innerHTML).toBe('You may already have the data<span class="tail"> our AI lab partners need.</span>');
+
+    // A key whose only element is hidden is named hidden only once the page has settled.
+    const hidden = await framed.locate({ key: 'gone' });
+    expect(hidden).toMatchObject({ found: 1, hidden: false });
+    await tick(1_100);
+    expect(located(framed).at(-1)).toMatchObject({ key: 'gone', hidden: true });
+  }, 5_000);
 });

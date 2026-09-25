@@ -22,7 +22,7 @@ const PROMOTIONAL = /(\d+\s*%|\bdiscount\b|\bsale\b)/i;
  * `<`-shapes the tag rule reads — values are stored raw and the emitter escapes
  * them, so any other `<` in a value is prose and never a finding.
  */
-const PLACEHOLDER = /<(\/?)(\d+)(\/?)>/g;
+export const PLACEHOLDER = /<(\/?)(\d+)(\/?)>/g;
 
 export type FindingRule = 'limit' | 'vars' | 'class' | 'budget' | 'construct' | 'tags';
 

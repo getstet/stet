@@ -28,6 +28,7 @@ import {
 } from '../src/descriptor.js';
 import { resolve } from '../src/resolve.js';
 import { checkCurrency, type Snapshot } from '../src/snapshot.js';
+import { keyDefOf } from '../src/descriptor.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
 import { flag, parse, refuseEnv } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
@@ -98,7 +99,7 @@ export function planRemoval(
   // prototype name the schema's key grammar admits.
   const removing: { key: string; def: KeyDef }[] = [];
   for (const key of keys) {
-    const def = Object.hasOwn(descriptor.keys, key) ? descriptor.keys[key] : undefined;
+    const def = keyDefOf(descriptor, key);
     if (def === undefined) throw new CliError(`"${key}" is not a key in ${config.descriptorPath}`);
     removing.push({ key, def });
   }

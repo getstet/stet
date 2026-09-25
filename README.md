@@ -107,6 +107,10 @@ and `audit` in the same process; the SEO tab runs `seo check` and `pages scan`;
 Setup runs `stet upgrade --dry-run`. Every command answers `--help` with its own
 usage.
 
+Each key says what it is — a headline, a paragraph, a page title, a share
+description — and where it appears; a key the page does not show says where it
+does, with a search result and a share card drawn from the drafts.
+
 The server binds `127.0.0.1` and nothing else, and it has no identity model. A
 token is minted per run, carried in the URL the terminal prints, and taken out
 of every child process the server starts. Anyone who can reach the port and
@@ -124,9 +128,12 @@ store later with `stet upgrade`.
 
 Next.js (both routers), React and Astro are first-class for scanning and
 adoption. A plain HTML site with no build is a host too: stet marks the
-elements it manages and regenerates them from the committed snapshot. Any
-JavaScript host reads through `@getstet/stet/core`. Non-JS services read the
-committed bundle directly — a stdlib-only Python helper ships in the package.
+elements it manages and regenerates them from the committed snapshot. A head
+text that repeats a key the page shows — the share description that is the
+headline plus a sentence — is registered as derived from it, so an edit to the
+headline reaches the share card. Any JavaScript host reads through
+`@getstet/stet/core`. Non-JS services read the committed bundle directly — a
+stdlib-only Python helper ships in the package.
 
 ## Requirements
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { miniDescriptor, miniRows, miniSnapshot, mutable } from '../conformance/fixture.js';
 import { resolve } from '../src/index.js';
+import { derivedText } from '../src/resolve.js';
 import type { Descriptor, Snapshot, StoreRow } from '../src/index.js';
 
 const descriptor = miniDescriptor();
@@ -219,5 +220,55 @@ describe('the snapshot read is an own-property read', () => {
       value: 'A declared value — Mirra',
       source: 'derived',
     });
+  });
+});
+
+describe('derivedText', () => {
+  const HEADLINE = 'You may already have the data<1> our AI lab partners need.</1>';
+  const TMPL = '{v} No raw data is needed to start.';
+  /** A descriptor whose `hero` source declares `tags` where asked, and whose `share` derives from it. */
+  function deriving(tmpl: string, tags?: number): Descriptor {
+    return {
+      version: 1,
+      keys: {
+        hero: { shape: 'text', target: 'web', ...(tags === undefined ? {} : { tags }) },
+        share: { shape: 'text', target: 'web', derivesFrom: 'hero', tmpl },
+      },
+    };
+  }
+  const read = (d: Descriptor, value: string): unknown =>
+    resolve(d, { default: { hero: value } }, null, { key: 'share' }).value;
+
+  it('drops a tagged source’s numbered tags, keeping the text between them', () => {
+    expect(derivedText(deriving(TMPL, 1), 'hero', HEADLINE, TMPL)).toBe(
+      'You may already have the data our AI lab partners need. No raw data is needed to start.',
+    );
+    expect(read(deriving(TMPL, 1), HEADLINE)).toBe(
+      'You may already have the data our AI lab partners need. No raw data is needed to start.',
+    );
+  });
+
+  it('reads a self-closing tag as one space', () => {
+    expect(read(deriving('{v}', 1), 'First line<1/>second line.')).toBe('First line second line.');
+  });
+
+  it('keeps `<1>` as text where the source declares no tags', () => {
+    expect(read(deriving(TMPL), HEADLINE)).toBe(`${HEADLINE} No raw data is needed to start.`);
+  });
+
+  it('writes every `$` in the source as it is', () => {
+    const d = deriving('{v} — Mirra');
+    expect(read(d, 'Costs $$ now')).toBe('Costs $$ now — Mirra');
+    expect(read(d, 'a$&b')).toBe('a$&b — Mirra');
+    expect(read(d, "x$`y$'z")).toBe("x$`y$'z — Mirra");
+  });
+
+  it('fills the first `{v}` alone', () => {
+    expect(read(deriving('{v} and {v}'), 'Hi')).toBe('Hi and {v}');
+  });
+
+  it('reads a `constructor` source through the own-property test, with no throw', () => {
+    const d = deriving('{v}');
+    expect(derivedText(d, 'constructor', 'Plain <1>text</1>', '{v}!')).toBe('Plain <1>text</1>!');
   });
 });

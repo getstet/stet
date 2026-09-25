@@ -19,6 +19,9 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import {
+  checkDocuments,
+  derivationOf,
+  isHeadText,
   planDocuments,
   planHtmlRegister,
   proposeHtml,
@@ -893,5 +896,189 @@ describe('the delta fold — a page too deep for the argument limit', () => {
     expect(set.proposals.length).toBeGreaterThan(59_000);
     expect(set.claimed[0]?.tags).toBe(50_000);
     expect(elapsed).toBeLessThan(30_000);
+  });
+});
+
+describe('derived marks', () => {
+  const HEAD = 'You may already have the data our AI lab partners need. No raw data is needed to start.';
+  const PAGE =
+    '<!DOCTYPE html>\n<html><head>\n' +
+    `<meta property="og:description" content="${HEAD}" data-stet-content="share">\n` +
+    '</head><body>\n' +
+    '<h1 data-stet="hero">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>\n' +
+    '</body></html>\n';
+  /** A marked page whose share description derives from its tagged headline. */
+  function derivedHost(value = 'You may already have the data<1> our AI lab partners need.</1>') {
+    const dir = tempDir();
+    writeFileSync(join(dir, 'index.html'), PAGE, 'utf8');
+    const descriptor: Descriptor = {
+      version: 1,
+      keys: {
+        hero: { shape: 'text', target: 'web', tags: 1 },
+        share: { shape: 'text', target: 'web', derivesFrom: 'hero', tmpl: '{v} No raw data is needed to start.' },
+      },
+    };
+    const snapshot: Snapshot = { default: { hero: value } };
+    return { dir, descriptor, snapshot };
+  }
+  const check = (host: ReturnType<typeof derivedHost>): string[] => {
+    const report = new Report();
+    checkDocuments(host.dir, ['index.html'], host.descriptor, host.snapshot, report);
+    return report.findings.map((f) => `${f.level} ${f.message}`);
+  };
+  const plan = (host: ReturnType<typeof derivedHost>) =>
+    planDocuments(host.dir, ['index.html'], host.descriptor, host.snapshot, new Report());
+
+  it('checks and regenerates a derived attribute from its source’s edit', () => {
+    const host = derivedHost();
+    expect(check(host)).toEqual([]);
+    expect(plan(host).writes).toEqual([]);
+
+    host.snapshot['default']!['hero'] = 'You may already have data<1> our AI lab partners need.</1>';
+    const findings = check(host);
+    expect(findings.filter((f) => f.includes('differs from the snapshot')).sort()).toEqual([
+      expect.stringContaining('index.html:3 share differs from the snapshot'),
+      expect.stringContaining('index.html:5 hero differs from the snapshot'),
+    ]);
+    const { writes, skips } = plan(host);
+    expect(skips).toEqual([]);
+    const text = (writes[0] as { text: string }).text;
+    expect(text).toContain(
+      'content="You may already have data our AI lab partners need. No raw data is needed to start."',
+    );
+    expect(text).toContain('<h1 data-stet="hero">You may already have data<span class="tail"> our AI lab partners need.</span></h1>');
+    writeFileSync(join(host.dir, 'index.html'), text, 'utf8');
+    expect(plan(host).writes).toEqual([]);
+    expect(check(host)).toEqual([]);
+  });
+
+  it('escapes a source’s quote and ampersand where the derivation lands in an attribute', () => {
+    const host = derivedHost('Say "hi" & go<1> our AI lab partners need.</1>');
+    const text = (plan(host).writes[0] as { text: string }).text;
+    expect(text).toContain('content="Say &quot;hi&quot; &amp; go our AI lab partners need. No raw data is needed to start."');
+  });
+
+  it('warns about a derived key marked in no document, since it renders nowhere', () => {
+    const host = derivedHost();
+    host.descriptor.keys['orphan'] = { shape: 'text', target: 'web', derivesFrom: 'hero', tmpl: '{v}!' };
+    expect(check(host)).toEqual(['warn orphan: marked in no document']);
+  });
+});
+
+describe('head texts', () => {
+  /** `derive.html`, registered and written, so every proposal is now a claimed mark. */
+  function registered(source: string) {
+    const dir = tempDir();
+    writeFileSync(join(dir, 'index.html'), source, 'utf8');
+    const descriptor: Descriptor = { version: 1, keys: {} };
+    const snapshot: Snapshot = { default: {} };
+    const plan = planHtmlRegister({ cwd: dir, files: ['index.html'], descriptor, snapshot, report: new Report() });
+    for (const document of plan.edited) writeFileSync(document.abs, document.text, 'utf8');
+    return proposeHtml(dir, ['index.html']);
+  }
+
+  it('carries a claimed meta mark’s name, and tells the head texts from the rest', () => {
+    const proposals = fixture('derive.html').proposals;
+    const set = registered(readFileSync(join(FIXTURES, 'derive.html'), 'utf8'));
+    expect(set.claimed.filter((m) => m.tag === 'meta').map((m) => m.metaName)).toEqual(
+      proposals.filter((p) => p.tag === 'meta').map((p) => p.metaName),
+    );
+    expect(set.claimed.filter((m) => m.tag === 'meta').map((m) => m.metaName)).toEqual([
+      'description',
+      'og:title',
+      'og:description',
+      'twitter:description',
+    ]);
+    const heads = set.claimed.filter(isHeadText).map((m) => `${m.tag} ${m.metaName ?? m.attr ?? ''}`.trim());
+    expect(heads).toEqual(['title', 'meta description', 'meta og:title', 'meta og:description', 'meta twitter:description']);
+    const rest = set.claimed.filter((m) => !isHeadText(m)).map((m) => `${m.tag} ${m.attr ?? ''}`.trim());
+    expect(rest).toEqual(['a', 'h1', 'p', 'button', 'h2', 'h3', 'nav aria-label']);
+    for (const p of proposals) expect(isHeadText(p)).toBe(p.tag === 'title' || p.tag === 'meta');
+  });
+
+  it('reads a `<title>` inside an `<svg>` as the graphic’s, not the page’s', () => {
+    const page =
+      '<!DOCTYPE html>\n<html><head><title>Acme</title></head><body>\n' +
+      '<button><svg viewBox="0 0 1 1"><title>Close the menu</title></svg><span>Close the menu</span></button>\n' +
+      '</body></html>\n';
+    const svgTitle = readSource(page).proposals.find((p) => p.tag === 'title' && p.value === 'Close the menu');
+    expect(svgTitle?.inSvg).toBe(true);
+    expect(isHeadText(svgTitle!)).toBe(false);
+    const marks = registered(page).claimed.filter((m) => m.tag === 'title');
+    expect(marks.map((m) => [m.inSvg ?? null, isHeadText(m)])).toEqual([
+      [null, true],
+      [true, false],
+    ]);
+  });
+});
+
+describe('derivationOf', () => {
+  const plain: Descriptor = { version: 1, keys: { a: { shape: 'text', target: 'web' }, b: { shape: 'text', target: 'web' } } };
+  const one = (value: string, key = 'a') => [{ key, value }];
+
+  it('derives an equal text as `{v}`', () => {
+    expect(derivationOf(plain, 'Ship the catalogue', one('Ship the catalogue'))).toEqual({ source: 'a', tmpl: '{v}' });
+  });
+
+  it('derives a word-bounded text of at least half the head text', () => {
+    const inner = 'ship the whole catalogue';
+    const head = 'We ship the whole catalogue every day.';
+    expect([inner.length, head.length]).toEqual([24, 38]);
+    expect(derivationOf(plain, head, one(inner))).toEqual({ source: 'a', tmpl: 'We {v} every day.' });
+  });
+
+  it('refuses a text directly after letters', () => {
+    expect(derivationOf(plain, 'We reship the whole catalogue every day', one('ship the whole catalogue'))).toBeNull();
+    expect(derivationOf(plain, 'Reship the whole catalogue', one('ship the whole catalogue'))).toBeNull();
+  });
+
+  it('refuses a text under half the head text', () => {
+    const head = 'Start a trial today and see the whole catalogue for yourself.';
+    expect(head.length).toBe(61);
+    expect(derivationOf(plain, head, one('Start a trial'))).toBeNull();
+  });
+
+  it('derives a short text equal to the whole head text', () => {
+    expect(derivationOf(plain, 'Book a call', one('Book a call'))).toEqual({ source: 'a', tmpl: '{v}' });
+  });
+
+  it('never lowers a capital', () => {
+    expect(derivationOf(plain, 'Psyon — data acquisition for labs', one('Data acquisition for labs'))).toBeNull();
+    expect(derivationOf(plain, 'data acquisition', one('Data acquisition'))).toBeNull();
+  });
+
+  it('takes the longest source, then the first by name', () => {
+    const head = 'Ship the whole catalogue in a day, today.';
+    expect(
+      derivationOf(plain, head, [
+        { key: 'a', value: 'Ship the whole catalogue' },
+        { key: 'b', value: 'Ship the whole catalogue in a day' },
+      ]),
+    ).toEqual({ source: 'b', tmpl: '{v}, today.' });
+    expect(
+      derivationOf(plain, 'Widgets for everyone', [
+        { key: 'b', value: 'Widgets for everyone' },
+        { key: 'a', value: 'Widgets for everyone' },
+      ]),
+    ).toEqual({ source: 'a', tmpl: '{v}' });
+  });
+
+  it('compares a tagged source without its tags', () => {
+    const tagged: Descriptor = { version: 1, keys: { a: { shape: 'text', target: 'web', tags: 1 } } };
+    expect(
+      derivationOf(
+        tagged,
+        'You may already have the data our AI lab partners need. No raw data is needed to start.',
+        one('You may already have the data<1> our AI lab partners need.</1>'),
+      ),
+    ).toEqual({ source: 'a', tmpl: '{v} No raw data is needed to start.' });
+  });
+
+  it('never templates a head text holding `{v}` after the source text', () => {
+    expect(derivationOf(plain, 'Ship the whole catalogue {v}', one('Ship the whole catalogue'))).toBeNull();
+  });
+
+  it('never templates a head text holding `{v}` before the source text', () => {
+    expect(derivationOf(plain, '{v} Ship the whole catalogue', one('Ship the whole catalogue'))).toBeNull();
   });
 });

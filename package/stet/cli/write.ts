@@ -14,6 +14,7 @@ import { resolve as resolvePath } from 'node:path';
 
 import { isNotSupported, isRefusal, isStoreError } from '../adapters/store-shared.js';
 import type { StoreRow } from '../src/resolve.js';
+import { keyDefOf } from '../src/descriptor.js';
 import type { Shape } from '../src/types.js';
 import { ENV_OPTION, flag, noPositionals, parse, required, text } from './args.js';
 import type { CliIo } from './main.js';
@@ -77,7 +78,7 @@ export async function runDraft(args: string[], io: CliIo): Promise<number> {
     // `keys['constructor']` answers with a function from the prototype — which
     // has no `shape`, so the value would reach `shapeSchema` and fall past every
     // switch arm as an uncaught TypeError.
-    const def = Object.hasOwn(project.descriptor.keys, key) ? project.descriptor.keys[key] : undefined;
+    const def = keyDefOf(project.descriptor, key);
     if (!def) throw new CliError(`"${key}" is not a key in ${project.config.descriptorPath}`);
 
     const value = parseValue(io, def.shape, key, text(values, 'value'), text(values, 'value-file'));

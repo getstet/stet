@@ -22,6 +22,8 @@ import { join, posix, resolve as resolvePath, sep } from 'node:path';
 
 import { bearerMatches, createStetHandler } from '../server/mount.js';
 import { route as normalizeRoute } from '../src/seo.js';
+import { keyDefOf, loadDescriptor } from '../src/descriptor.js';
+import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
@@ -30,11 +32,11 @@ import { check } from './check.js';
 import type { StetConfig } from './config.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, uncommittedPaths } from './git.js';
-import { proposeHtml } from './html-host.js';
+import { isHeadText, lineIndex, metaCopyName, proposeHtml, readDocument, type Document, type Element } from './html-host.js';
 import { runCli, type CliIo } from './main.js';
 import { applyPages, fileRoute, proposeForHost } from './pages.js';
 import { planRemoval } from './remove.js';
-import { matchGlob } from './source-scan.js';
+import { blankNonMarkup, dialectOf, matchGlob, type Dialect } from './source-scan.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
 import { validateValue } from './validate.js';
@@ -505,14 +507,20 @@ function siteReply(site: SiteState, entry: WorkspaceEntry): Response {
 }
 
 /**
- * One or more values through the CLI's save gate and then through its one
- * all-or-nothing write batch — the same pair `remove`, `pages scan --apply`,
- * `register` and `pull` go through.
+ * One or more values, and derived keys' templates, through the CLI's save gate
+ * and then through its one all-or-nothing write batch — the same pair `remove`,
+ * `pages scan --apply`, `register` and `pull` go through.
  *
  * The gate runs over the snapshot with the WHOLE batch applied, not over the
  * committed one: a template's class rule reads the body while checking the
  * subject, so two slots saved together have to see each other. One value that
  * errors refuses the whole save, and nothing is written.
+ *
+ * A derived key takes no value of its own — its text is its source's through
+ * its template, and the template is what a save changes. Each derived key the
+ * batch moves, by a new template or a new source value, is gated on the text it
+ * now resolves to, so a headline edit that pushes a share description past its
+ * limit is refused like the description itself.
  */
 async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
@@ -520,10 +528,14 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
     return json({ error: 'a store-backed site is edited through its mounted API — use Save draft' }, 409);
   }
   const body = await readJson(req);
-  const values = body['values'];
-  if (!Array.isArray(values) || values.length === 0) throw new UsageError('values is required');
+  const values = body['values'] ?? [];
+  const templates = body['templates'] ?? [];
+  if (!Array.isArray(values) || !Array.isArray(templates) || values.length + templates.length === 0) {
+    throw new UsageError('values or templates is required');
+  }
 
-  const { config, descriptor } = ready;
+  const { config } = ready;
+  const descriptor = structuredClone(ready.descriptor);
   const next = structuredClone(ready.snapshot);
   const edits: Array<{ key: string; locale: string; value: unknown }> = [];
   for (const raw of values) {
@@ -532,15 +544,56 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
     const key = typeof entry.key === 'string' ? entry.key : '';
     const locale = typeof entry.locale === 'string' ? entry.locale : config.locales.default;
     if (!Object.hasOwn(descriptor.keys, key)) return json({ error: `undeclared key: ${key}` }, 400);
+    const from = descriptor.keys[key]?.derivesFrom;
+    if (from !== undefined) return json({ error: `${key} derives from ${from} — edit its template instead` }, 400);
     if (!config.locales.enabled.includes(locale)) return json({ error: `locale ${locale} is not enabled` }, 400);
     (next[locale] ??= {})[key] = entry.value;
     edits.push({ key, locale, value: entry.value });
+  }
+  const retemplated: string[] = [];
+  for (const raw of templates) {
+    if (typeof raw !== 'object' || raw === null) throw new UsageError('each template is { key, tmpl }');
+    const entry = raw as { key?: unknown; tmpl?: unknown };
+    const key = typeof entry.key === 'string' ? entry.key : '';
+    const def = keyDefOf(descriptor, key);
+    if (def === undefined) return json({ error: `undeclared key: ${key}` }, 400);
+    if (def.derivesFrom === undefined) return json({ error: `${key} is not a derived key` }, 400);
+    if (typeof entry.tmpl !== 'string' || entry.tmpl.split('{v}').length !== 2) {
+      return json({ error: `the template of ${key} must hold {v} exactly once` }, 400);
+    }
+    def.tmpl = entry.tmpl;
+    retemplated.push(key);
   }
 
   const gate = new Report();
   let ok = true;
   for (const edit of edits) {
     ok = validateValue(descriptor, next, edit.key, edit.value, edit.locale, gate) && ok;
+  }
+  // Every derived key whose text this batch moves — through a new template, a
+  // new source value, or a source that is itself moved — in every locale.
+  const moved = new Set([...edits.map((edit) => edit.key), ...retemplated]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [key, def] of Object.entries(descriptor.keys)) {
+      if (def.derivesFrom === undefined || moved.has(key) || !moved.has(def.derivesFrom)) continue;
+      moved.add(key);
+      grew = true;
+    }
+  }
+  // Each is gated where its text changes, so a locale's own earlier overrun
+  // never refuses an edit that leaves it alone, and a locale that falls back to
+  // another's text is gated once.
+  for (const key of [...moved].sort()) {
+    if (descriptor.keys[key]?.derivesFrom === undefined) continue;
+    const gated = new Set<unknown>();
+    for (const locale of config.locales.enabled) {
+      const text = resolve(descriptor, next, null, { key, locale }).value;
+      const was = resolve(ready.descriptor, ready.snapshot, null, { key, locale }).value;
+      if (text === undefined || text === was || gated.has(text)) continue;
+      gated.add(text);
+      ok = validateValue(descriptor, next, key, text, locale, gate) && ok;
+    }
   }
   if (!ok) return json({ error: 'refused by the save gate', findings: gate.findings }, 409);
 
@@ -640,13 +693,14 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
   }
   const named = files as string[];
 
-  // The keys the caller names, else — when the snapshot is in the commit — the
-  // keys whose value it changes; a commit without the snapshot names its files.
+  // The keys the caller names, else — when the snapshot or the descriptor is in
+  // the commit — the keys whose value it changes, a derived key's included; a
+  // commit carrying neither names its files.
   const subject =
     Array.isArray(keys) && keys.length > 0
       ? keys.map((key) => String(key))
-      : named.includes(gitSpelling(ready.config.snapshotPath))
-        ? changedKeys(ready)
+      : named.includes(gitSpelling(ready.config.snapshotPath)) || named.includes(gitSpelling(ready.config.descriptorPath))
+        ? changedKeys(ready, named)
         : [];
   const message =
     typeof body['message'] === 'string' && body['message'] !== ''
@@ -683,30 +737,49 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
   });
 }
 
-/**
- * The keys whose value differs between HEAD's snapshot and the one on disk, in
- * any locale. A snapshot HEAD does not hold, or one `loadSnapshot` refuses — a
- * locale block that is `null`, which is exactly the commit that repairs it —
- * makes every key on disk a change.
- */
-function changedKeys(site: Ready): string[] {
-  const before = gitData(site.path, ['show', `HEAD:./${gitSpelling(site.config.snapshotPath)}`]);
-  let committed: Snapshot = {};
-  if (before.code === 0) {
-    try {
-      committed = loadSnapshot(JSON.parse(before.stdout));
-    } catch {
-      committed = {};
-    }
+/** A form as HEAD holds it, through its loader; null where HEAD does not hold it or the loader refuses it. */
+function formAtHead<T>(site: Ready, path: string, load: (raw: unknown) => T): T | null {
+  const found = gitData(site.path, ['show', `HEAD:./${gitSpelling(path)}`]);
+  if (found.code !== 0) return null;
+  try {
+    return load(JSON.parse(found.stdout));
+  } catch {
+    return null;
   }
+}
+
+/**
+ * The keys whose value the commit changes: between HEAD's forms and the forms
+ * as the commit leaves them — the disk's for the snapshot and the descriptor
+ * where `named` carries them, HEAD's where it does not — a literal key's value
+ * in any locale, and a derived key's resolution, which a template edit or a
+ * source edit moves. A snapshot HEAD does not hold, or one `loadSnapshot`
+ * refuses — a locale block that is `null`, which is exactly the commit that
+ * repairs it — makes every key on disk a change; a descriptor HEAD does not
+ * hold, or one `loadDescriptor` refuses, is read as the one on disk.
+ */
+function changedKeys(site: Ready, named: string[]): string[] {
+  const committed: Snapshot = formAtHead(site, site.config.snapshotPath, loadSnapshot) ?? {};
+  const described: Descriptor = formAtHead(site, site.config.descriptorPath, loadDescriptor) ?? site.descriptor;
+  // A form the commit leaves out stays as HEAD has it.
+  const snapshot = named.includes(gitSpelling(site.config.snapshotPath)) ? site.snapshot : committed;
+  const descriptor = named.includes(gitSpelling(site.config.descriptorPath)) ? site.descriptor : described;
   const own = (block: Record<string, unknown> | undefined, key: string): unknown =>
     block !== undefined && Object.hasOwn(block, key) ? block[key] : undefined;
   const keys = new Set<string>();
-  for (const locale of new Set([...Object.keys(committed), ...Object.keys(site.snapshot)])) {
+  for (const locale of new Set([...Object.keys(committed), ...Object.keys(snapshot)])) {
     const a = Object.hasOwn(committed, locale) ? committed[locale] : undefined;
-    const b = Object.hasOwn(site.snapshot, locale) ? site.snapshot[locale] : undefined;
+    const b = Object.hasOwn(snapshot, locale) ? snapshot[locale] : undefined;
     for (const key of new Set([...Object.keys(a ?? {}), ...Object.keys(b ?? {})])) {
       if (JSON.stringify(own(a, key)) !== JSON.stringify(own(b, key))) keys.add(key);
+    }
+  }
+  for (const [key, def] of Object.entries(descriptor.keys)) {
+    if (def.derivesFrom === undefined) continue;
+    for (const locale of site.config.locales.enabled) {
+      const was = resolve(described, committed, null, { key, locale }).value;
+      const is = resolve(descriptor, snapshot, null, { key, locale }).value;
+      if (JSON.stringify(was) !== JSON.stringify(is)) keys.add(key);
     }
   }
   return [...keys].sort();
@@ -1140,21 +1213,26 @@ async function closeProxy(ctx: DevContext, path: string): Promise<void> {
 }
 
 /**
- * Where each key is marked on a static-HTML host, because the page cannot read
- * a document itself: each managed document with the route the static arm
- * serves it at and the declared page whose route it is, and per key the
- * documents carrying its mark. Empty on a JavaScript host.
+ * Where each key renders, because the page cannot read the site's files itself.
  *
- * The page route is compared the way `pages scan` compares it — `fileRoute`
- * and `src/seo.ts`'s `route` — so a page the html arm declared matches its
- * document. The served route differs on purpose: `about.html` is the page
- * `/about` and is served at `/about.html`, because the static arm serves files
- * by path and a folder's index at the folder, where relative references
- * inside the page resolve.
+ * On a static-HTML host: each managed document with the route the static arm
+ * serves it at and the declared page whose route it is, per key the documents
+ * carrying its mark, and per key each mark's PLACE — the file and line, the
+ * element's tag, for an attribute mark the attribute and a meta's
+ * `name`/`property`, and whether it is a head text. The page route is compared the way `pages scan` compares
+ * it — `fileRoute` and `src/seo.ts`'s `route` — so a page the html arm declared
+ * matches its document. The served route differs on purpose: `about.html` is
+ * the page `/about` and is served at `/about.html`, because the static arm
+ * serves files by path and a folder's index at the folder, where relative
+ * references inside the page resolve.
+ *
+ * On a JavaScript host no document carries a mark, and the places are the
+ * source reads `keyReads` finds, a read in a `<title>` or a copy meta's
+ * `content` marked as a head text the same way.
  */
 function marks(site: SiteState): Response {
   const ready = requireReady(site);
-  if (ready.host !== 'html') return json({ documents: [], keys: {} });
+  if (ready.host !== 'html') return json({ documents: [], keys: {}, places: keyReads(ready) });
   const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
   const pages = new Map<string, string>();
   for (const [name, page] of Object.entries(ready.descriptor.pages ?? {})) pages.set(normalizeRoute(page.route), name);
@@ -1164,12 +1242,175 @@ function marks(site: SiteState): Response {
     page: pages.get(normalizeRoute(fileRoute(document.file))) ?? null,
   }));
   const keys = new Map<string, string[]>();
+  const places = new Map<string, Place[]>();
   for (const mark of set.claimed) {
     const held = keys.get(mark.key) ?? [];
     if (!held.includes(mark.file)) held.push(mark.file);
     keys.set(mark.key, held);
+    places.set(mark.key, [
+      ...(places.get(mark.key) ?? []),
+      {
+        file: mark.file,
+        line: mark.line,
+        tag: mark.tag,
+        ...(mark.attr === undefined ? {} : { attr: mark.attr }),
+        ...(mark.metaName === undefined ? {} : { meta: mark.metaName }),
+        ...(mark.inSvg === undefined ? {} : { svg: true as const }),
+        ...(isHeadText(mark) ? { head: true as const } : {}),
+      },
+    ]);
   }
-  return json({ documents, keys: Object.fromEntries(keys) });
+  return json({ documents, keys: Object.fromEntries(keys), places: Object.fromEntries(places) });
+}
+
+/** Where a key renders: a file and line, and the element's tag and attribute where stet can read them. */
+interface Place {
+  file: string;
+  line: number;
+  tag?: string;
+  attr?: string;
+  meta?: string;
+  /** A `<title>` inside an `<svg>`: the graphic's name, which a browser shows as a tooltip. */
+  svg?: true;
+  /** A head text (`isHeadText`): the page's `<title>`, or a meta whose `content` is copy. */
+  head?: true;
+}
+
+/**
+ * A read of a key in a JavaScript host's source: `copy.get('<key>')`,
+ * `copy('<key>')` or `get('<key>')`, and `copy.<key>` or `copyMap.<key>` — the
+ * accessor `register` writes, the map the scaffolded read path exports, and
+ * the forms a host re-exports them under.
+ */
+const KEY_READ =
+  /\bcopy(?:Map)?\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1|\b(?:copy|get)\s*\(\s*(['"`])([^'"`\n]+)\3|\bcopy(?:Map)?\s*\.\s*([A-Za-z_$][\w$]*)/g;
+
+/**
+ * Every declared key's reads in the managed surfaces and copy modules of a
+ * JavaScript host, each with its file and line. A read inside a template
+ * dialect's markup also carries the innermost element around it, or the
+ * attribute it sits in — and on a `<meta>`'s `content`, the meta's name — through
+ * the static-HTML host's own tokenizer over the dialect's blanked text. A read
+ * in a JSX file, in frontmatter, a script or a comment, in markup the tokenizer
+ * could not pair, or in a file it cannot read at all carries none, and the page
+ * names the file instead. Only reads of declared keys count, so `copy.get` or
+ * an unrelated `.data` is never a place.
+ */
+function keyReads(site: Ready): Record<string, Place[]> {
+  const out = new Map<string, Place[]>();
+  const files = [...new Set([...filesForGlobs(site.path, site.config.managedSurfaces), ...filesForGlobs(site.path, site.config.copyModules)])].sort();
+  for (const file of files) {
+    let source: string;
+    try {
+      source = readFileSync(join(site.path, file), 'utf8');
+    } catch {
+      continue;
+    }
+    const dialect = dialectOf(file);
+    const lineAt = lineIndex(source);
+    // Markup stet cannot read — nesting deeper than the tokenizer's walk, say —
+    // leaves the file's reads with their file and line, and the route answers.
+    let document: Document | null = null;
+    try {
+      if (dialect === 'html') document = readDocument(file, source, dialect);
+      else if (dialect !== null && dialect !== 'mdx') {
+        document = readDocument(file, maskExpressions(dialect === 'vue' ? vueMarkup(source) : source, dialect), dialect);
+      }
+    } catch {
+      document = null;
+    }
+    for (const found of source.matchAll(KEY_READ)) {
+      const key = found[2] ?? found[4] ?? found[5] ?? '';
+      if (!Object.hasOwn(site.descriptor.keys, key)) continue;
+      const at = found.index;
+      const place: Place = { file, line: lineAt(at) };
+      if (document !== null && !document.blanked.slice(at, at + found[0].length).includes('\0')) {
+        try {
+          const element = elementAt(document.roots, at);
+          Object.assign(place, element);
+          if (element.tag !== undefined && isHeadText({
+            kind: element.attr === undefined ? 'element' : 'attribute',
+            tag: element.tag,
+            ...(element.attr === undefined ? {} : { attr: element.attr }),
+            ...(element.meta === undefined ? {} : { metaName: element.meta }),
+          })) place.head = true;
+        } catch {
+          document = null;
+        }
+      }
+      out.set(key, [...(out.get(key) ?? []), place]);
+    }
+  }
+  return Object.fromEntries(out);
+}
+
+/**
+ * A template dialect's markup with the inside of every `{…}` expression masked
+ * with `_`, its braces and newlines kept: `content={copy.get('k')}` then reads
+ * as one unquoted attribute value, where the quotes inside the expression would
+ * otherwise end the attribute and the tag early. Braces count only in the
+ * markup `blankNonMarkup` leaves, so a `'{'` in frontmatter or a script opens
+ * nothing. Every offset stays put.
+ */
+function maskExpressions(source: string, dialect: Dialect): string {
+  const markup = blankNonMarkup(source, dialect);
+  const out: string[] = [];
+  let depth = 0;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i] as string;
+    if (markup[i] === '\0') {
+      out.push(ch);
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}' && depth > 0) depth -= 1;
+    else if (depth > 0 && ch !== '\n') {
+      out.push('_');
+      continue;
+    }
+    out.push(ch);
+  }
+  return out.join('');
+}
+
+/**
+ * A `.vue` file with its top-level `<template>` open and close tags blanked to
+ * spaces. The tokenizer reads `<template>` as opaque, as HTML defines it; in a
+ * single-file component it is the markup itself. Every offset stays put.
+ */
+function vueMarkup(source: string): string {
+  const open = /^<template\b[^>]*>/m.exec(source);
+  const close = source.lastIndexOf('</template>');
+  if (open === null || close < open.index + open[0].length) return source;
+  const blank = (text: string): string => text.replace(/[^\n]/g, ' ');
+  return (
+    source.slice(0, open.index) +
+    blank(open[0]) +
+    source.slice(open.index + open[0].length, close) +
+    blank('</template>') +
+    source.slice(close + '</template>'.length)
+  );
+}
+
+/**
+ * The innermost element whose content holds `at`, or whose open tag's attribute
+ * does: its tag, the attribute's name, and for a `<meta>`'s `content` the meta's
+ * `name` or `property`, so a head read on a JavaScript host reads as its kind.
+ */
+function elementAt(roots: Element[], at: number): { tag?: string; attr?: string; meta?: string } {
+  for (const el of roots) {
+    if (at < el.openStart || at >= el.closeEnd) continue;
+    if (at < el.openEnd) {
+      const attr = el.attrs.find((a) => a.start <= at && at < a.end);
+      if (attr === undefined) return {};
+      const meta = attr.name === 'content' ? metaCopyName(el) : null;
+      return { tag: el.tag, attr: attr.name, ...(meta === null ? {} : { meta }) };
+    }
+    if (el.opaque) return {};
+    const inner = elementAt(el.children, at);
+    return inner.tag === undefined ? { tag: el.tag } : inner;
+  }
+  return {};
 }
 
 /** A document's path as the static arm serves it: a folder's index at the folder, anything else at itself. */

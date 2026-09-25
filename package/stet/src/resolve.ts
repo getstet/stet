@@ -1,6 +1,6 @@
 import type { Snapshot } from './snapshot.js';
 import type { Descriptor, Warning } from './types.js';
-import { shapeSchema } from './validate.js';
+import { plainOf, shapeSchema } from './validate.js';
 
 /**
  * A row as an adapter hands it over. No `project` field: adapters are
@@ -107,7 +107,7 @@ function resolveWith(
         warnings,
       );
       if (from.value !== undefined) {
-        return { value: def.tmpl.replace('{v}', String(from.value)), source: 'derived' };
+        return { value: derivedText(d, def.derivesFrom, from.value, def.tmpl), source: 'derived' };
       }
     }
   }
@@ -128,6 +128,20 @@ function resolveWith(
     reason: 'no stored, derived or committed value — the snapshot is incomplete for this key',
   });
   return { value: undefined, source: 'snapshot' };
+}
+
+/**
+ * What a derivation renders: the template with the source's text in place of
+ * `{v}`. A source that declares numbered placeholder tags gives its text with
+ * the tags dropped (`plainOf`), because the tags stand for elements inside the
+ * source's own element and mean nothing where the derived text lands. The
+ * replacement is a function, so a `$` in the source's text stays literal.
+ */
+export function derivedText(d: Descriptor, source: string, value: unknown, tmpl: string): string {
+  const text = String(value);
+  const tagged = Object.hasOwn(d.keys, source) && d.keys[source]?.tags !== undefined;
+  const plain = tagged ? plainOf(text) : text;
+  return tmpl.replace('{v}', () => plain);
 }
 
 /**

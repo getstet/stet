@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>stet dashboard</title>
+<link rel="icon" href="data:,">
 <style nonce="__STET_NONCE__">
 :root{--bg:0 0% 100%;--fg:222 84% 5%;--card:0 0% 100%;--muted:210 40% 96%;--mf:215 16% 47%;
  --pri:222 47% 11%;--pf:210 40% 98%;--sec:210 40% 96%;--bd:214 32% 91%;--dest:0 84% 60%;--r:.5rem;
@@ -14,7 +15,7 @@
  --sb:240 6% 10%;--sba:240 4% 16%;--sbd:240 4% 16%;--am:48 96% 53%;--gr:142 69% 58%;--bl:213 94% 68%;--vi:263 90% 71%}
 *{box-sizing:border-box}
 body{margin:0;background:hsl(var(--bg));color:hsl(var(--fg));font:13px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif}
-.shell{display:grid;grid-template-columns:200px 1fr;min-height:100vh}
+.shell{display:grid;grid-template-columns:200px minmax(0,1fr);min-height:100vh}
 .side{background:hsl(var(--sb));border-right:1px solid hsl(var(--sbd));padding:12px 9px}
 .brand{display:flex;gap:8px;align-items:center;padding:5px 7px 4px}
 .brand .m{width:26px;height:26px;border-radius:6px;background:hsl(var(--pri));color:hsl(var(--pf));display:grid;place-items:center;font-weight:700;font-size:13px}
@@ -28,7 +29,8 @@ body{margin:0;background:hsl(var(--bg));color:hsl(var(--fg));font:13px/1.5 ui-sa
 .it .n{position:absolute;right:7px;top:6px;background:hsl(var(--am));color:#000;border-radius:999px;font-size:10px;font-weight:700;padding:0 5px}
 .side .sep{border-top:1px solid hsl(var(--sbd));margin:11px 3px 0}
 .scoped{font-size:10px;color:hsl(var(--mf));padding:2px 7px 9px;font-style:italic}
-.hdr{height:46px;border-bottom:1px solid hsl(var(--bd));display:flex;align-items:center;justify-content:space-between;padding:0 16px}
+.hdr{min-height:46px;border-bottom:1px solid hsl(var(--bd));display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 12px;padding:6px 16px}
+.hdr>div{min-width:0;flex-wrap:wrap}#crumb{min-width:0;overflow-wrap:anywhere}
 .who{display:flex;gap:7px;align-items:center;font-size:12px}
 .av{width:22px;height:22px;border-radius:50%;background:hsl(var(--vi));color:#fff;display:grid;place-items:center;font-size:10px;font-weight:700}
 .tabs{display:flex;gap:1px;border-bottom:1px solid hsl(var(--bd));padding:0 16px;overflow-x:auto}
@@ -37,7 +39,7 @@ body{margin:0;background:hsl(var(--bg));color:hsl(var(--fg));font:13px/1.5 ui-sa
 .tabs button:hover{color:hsl(var(--fg))}
 .tabs button.on{color:hsl(var(--fg));font-weight:600;border-bottom-color:hsl(var(--pri))}
 .wrap{padding:14px 16px 60px}
-.card{border:1px solid hsl(var(--bd));border-radius:var(--r);background:hsl(var(--card));margin-bottom:12px}
+.card{border:1px solid hsl(var(--bd));border-radius:var(--r);background:hsl(var(--card));margin-bottom:12px;overflow-x:auto}
 .ch{padding:9px 12px;border-bottom:1px solid hsl(var(--bd));display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
 .ch h3{margin:0;font-size:12px;font-weight:600}
 .cb{padding:12px}
@@ -60,6 +62,7 @@ textarea.in{resize:vertical;line-height:1.6}
 .bdg.b{border-color:hsl(var(--bl));color:hsl(var(--bl))}
 .bdg.v{border-color:hsl(var(--vi));color:hsl(var(--vi))}
 .bdg.r{border-color:hsl(var(--dest));color:hsl(var(--dest))}
+.bdg.mono{white-space:normal;overflow-wrap:anywhere}
 .mono{font-family:ui-monospace,Menlo,monospace}.muted{color:hsl(var(--mf))}
 .panes{display:grid;grid-template-columns:200px 226px minmax(0,1fr);gap:11px;align-items:start}
 @media(max-width:1180px){.panes{grid-template-columns:1fr}}
@@ -81,24 +84,33 @@ textarea.in{resize:vertical;line-height:1.6}
 .cnt{font-size:11px;color:hsl(var(--mf))}.cnt.bad{color:hsl(var(--dest));font-weight:600}
 .err{font-size:11.5px;color:hsl(var(--dest));margin-top:6px;font-weight:500}
 .inf{font-size:11.5px;color:hsl(var(--bl));margin-top:6px}
-.term{background:hsl(var(--muted));border-radius:var(--r);padding:13px;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.65;white-space:pre-wrap;overflow-x:auto}
+.term{background:hsl(var(--muted));border-radius:var(--r);padding:13px;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere;overflow-x:auto}
 .term .pl{color:hsl(var(--gr))}.term .mn{color:hsl(var(--dest))}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th{text-align:left;font-weight:600;font-size:11px;color:hsl(var(--mf));padding:6px 11px;border-bottom:1px solid hsl(var(--bd))}
 td{padding:6px 11px;border-bottom:1px solid hsl(var(--bd));vertical-align:top}tr:last-child td{border-bottom:0}
+.tblx{overflow-x:auto}
+table.fixed{table-layout:fixed}table.fixed th,table.fixed td{padding:6px 8px;overflow-wrap:anywhere}
 .art{max-width:620px;font-size:13.5px;line-height:1.7}
 .art h1{font-size:24px;margin:0 0 6px;line-height:1.2}.art h2{font-size:18px;margin:22px 0 7px}
 .art p{margin:0 0 12px}.art blockquote{margin:14px 0;padding:6px 0 6px 13px;border-left:3px solid hsl(var(--bd));color:hsl(var(--mf));font-style:italic}
 .art ul{margin:0 0 12px;padding-left:19px}.art code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:hsl(var(--muted));padding:1px 5px;border-radius:4px}
 .imgph{background:hsl(var(--muted));border-radius:7px;height:110px;display:grid;place-items:center;color:hsl(var(--mf));font-size:11.5px;margin:0 0 12px;max-width:100%}
-.wrap.content{display:grid;grid-template-columns:300px minmax(0,1fr);gap:11px;align-items:start;padding-bottom:14px}
+.wrap.content{display:grid;grid-template-columns:var(--colw,300px) 11px minmax(0,1fr);align-items:start;padding-bottom:14px}
 .wrap.content.wide{grid-template-columns:minmax(0,1fr)}
 .wrap.content.wide>#main{display:none}
+#grip{display:none}
+.wrap.content:not(.wide)>#grip{display:block;align-self:stretch;position:relative;cursor:col-resize;touch-action:none;outline:none}
+#grip::after{content:'';position:absolute;top:0;bottom:0;left:5px;width:1px;background:hsl(var(--bd))}
+#grip:hover::after,#grip:focus-visible::after,body.dragging #grip::after{left:4px;width:3px;background:hsl(var(--vi))}
+body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-events:none}
 .pane{position:sticky;top:8px;min-width:0;margin-bottom:0}
-@media(max-width:1000px){.wrap.content{grid-template-columns:minmax(0,1fr)}.wrap.content>#pane{order:-1;position:static}}
+@media(max-width:1000px){.wrap.content{grid-template-columns:minmax(0,1fr);gap:11px}.wrap.content>#pane{order:-1;position:static}.wrap.content:not(.wide)>#grip{display:none}}
 .devwrap{position:relative;overflow:hidden;min-height:420px}
 .devwrap iframe{position:absolute;top:0;left:0;border:0;background:#fff;transform-origin:top left}
 #giterr{margin:10px 16px 0}
+#panetools{flex-wrap:wrap}
+@media(max-width:760px){.shell{grid-template-columns:minmax(0,1fr)}.side{border-right:0;border-bottom:1px solid hsl(var(--sbd))}.tg button{padding:4px 8px}}
 .btn.amb{border-color:hsl(38 75% 45%);color:hsl(38 80% 38%);font-weight:700}
 [data-theme="dark"] .btn.amb{color:hsl(38 85% 62%)}
 .pg{border:1px solid hsl(var(--bd));border-radius:8px;overflow:hidden}
@@ -167,6 +179,23 @@ td{padding:6px 11px;border-bottom:1px solid hsl(var(--bd));vertical-align:top}tr
 .lrow .ctl{display:flex;flex-direction:column;gap:3px}
 fieldset.rec{border:1px solid hsl(var(--bd));border-radius:7px;padding:9px 11px;margin:0}
 fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
+.row .s .kd{color:hsl(var(--vi));margin-right:6px}
+.kline{padding:7px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px;display:flex;flex-direction:column;gap:2px;overflow-wrap:anywhere}
+.tagged{position:relative}
+.tagged textarea,.tagmirror{scrollbar-gutter:stable}
+.tagged textarea{display:block;position:relative;background:transparent;color:transparent;caret-color:hsl(var(--fg))}
+.tagmirror{position:absolute;inset:0;padding:6px 9px;border:1px solid transparent;font:inherit;font-size:12.5px;line-height:1.6;
+ white-space:pre-wrap;overflow-wrap:break-word;overflow:hidden;color:hsl(var(--fg));pointer-events:none}
+.tagmirror .ptag{color:hsl(var(--mf));background:hsl(var(--muted));border-radius:3px}
+.tagmirror .pin{color:hsl(var(--mf))}
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:8px 12px;border-bottom:1px solid hsl(var(--bd))}
+@media(max-width:760px){.cards{grid-template-columns:1fr}}
+.cards>div{border:1px solid hsl(var(--bd));border-radius:8px;padding:9px 11px;min-width:0}
+.cards .lb{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:hsl(var(--mf));margin-bottom:5px}
+.cards .u{font-size:11px;color:hsl(var(--gr));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cards .tt{font-size:14px;color:hsl(var(--bl));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cards .share .tt{color:hsl(var(--fg));font-weight:600;font-size:13px}
+.cards .ds{font-size:12px;color:hsl(var(--mf));display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 </style>
 </head>
 <body data-theme="light">
@@ -197,7 +226,8 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
     <div id="giterr" hidden></div>
     <div class="tabs" id="tabs"></div>
     <div class="wrap" id="work"><div id="main"></div>
-      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panebody"></div></section></div>
+      <div id="grip" role="separator" aria-orientation="vertical" aria-controls="main" tabindex="0" aria-label="Resize the key column" title="Drag to resize the key column. Double-click to restore its width."></div>
+      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
   </main>
 </div>
 <div id="tst"></div>
@@ -287,7 +317,9 @@ const S = {
   changes: null,
   removal: null,
   message: '',
-  marks: { documents: [], keys: {} },
+  marks: { documents: [], keys: {}, places: {} },
+  // Unsaved templates of derived keys, by key; a template has no locale.
+  tmpl: {},
   route: '/',
   keysOpen: true,
   width: 'desktop',
@@ -314,6 +346,11 @@ S.keysOpen = readStore('stet.keys.open') !== '0';
 S.width = (function () {
   const held = readStore('stet.preview.width');
   return ['desktop', 'tablet', 'mobile', 'pane'].indexOf(held) !== -1 ? held : 'desktop';
+})();
+// The key column's width in pixels as the operator last set it, or null for the default.
+S.column = (function () {
+  const held = Number(readStore('stet.column.width'));
+  return Number.isFinite(held) && held > 0 ? held : null;
 })();
 
 const esc = (s) => String(s === undefined || s === null ? '' : s)
@@ -353,8 +390,42 @@ function defaultValue(id) {
   const block = (S.site && S.site.snapshot && S.site.snapshot['default']) || {};
   return Object.prototype.hasOwnProperty.call(block, id) ? block[id] : undefined;
 }
-const edited = (id) => S.draft[S.locale + ' ' + id] !== undefined;
-const dirty = () => Object.keys(S.draft).length > 0;
+/**
+ * src/resolve.ts's derivedText: the template with the source's text in place
+ * of {v}, the source's numbered placeholder tags dropped where it declares
+ * them (a self-closing one standing for a space, as plainOf has it). The
+ * replacement is a function, so a `$` in the text stays literal.
+ */
+function deriveText(tmpl, value, tagged) {
+  const text = String(value);
+  const plain = tagged ? text.replace(/<(\/?)(\d+)(\/?)>/g, (m, closing, n, self) => (closing === '' && self === '/' ? ' ' : '')) : text;
+  return tmpl.replace('{v}', () => plain);
+}
+/** A derived key's text as the page shows it: its template, the unsaved one where it is being edited, over its source's shown value. */
+function derivedValue(id, locale, seen) {
+  const def = keyDef(id);
+  if (!def || def.derivesFrom === undefined || def.tmpl === undefined) return undefined;
+  // A cycle answers nothing, as the resolver answers past it.
+  const trail = seen || new Set();
+  if (trail.has(id)) return undefined;
+  trail.add(id);
+  // The source through the resolver's locale chain: its value in this locale, else the default locale's.
+  const loc = locale || S.locale;
+  const base = S.site.config.locales.default;
+  let source = shownValue(def.derivesFrom, loc, trail);
+  if (source === undefined && loc !== base) source = shownValue(def.derivesFrom, base, new Set([id]));
+  if (source === undefined) return undefined;
+  const tagged = (keyDef(def.derivesFrom) || {}).tags !== undefined;
+  return deriveText(own(S.tmpl, id) ? S.tmpl[id] : def.tmpl, source, tagged);
+}
+/** The value a key shows: a derived key's derivation, else its unsaved edit or saved value. */
+function shownValue(id, locale, seen) {
+  const def = keyDef(id);
+  return def && def.derivesFrom !== undefined ? derivedValue(id, locale, seen) : valueOf(id, locale);
+}
+const edited = (id) => S.draft[S.locale + ' ' + id] !== undefined || own(S.tmpl, id);
+const edits = () => Object.keys(S.draft).length + Object.keys(S.tmpl).length;
+const dirty = () => edits() > 0;
 function setDraft(id, value) { S.draft[S.locale + ' ' + id] = value; draftChanged(); }
 
 // --- loading ----------------------------------------------------------------
@@ -382,7 +453,8 @@ async function loadSite(path) {
   S.health = null; S.seo = null; S.setup = null; S.verify = null;
   S.history = null; S.recent = null; S.preview = null; S.devlog = null;
   S.rows = null; S.changes = null;
-  S.marks = { documents: [], keys: {} };
+  S.marks = { documents: [], keys: {}, places: {} };
+  S.tmpl = {};
   S.gitError = null;
   S.starting = null;
   S.stopping = false;
@@ -402,10 +474,8 @@ async function loadSite(path) {
   if (ready()) {
     // Awaited before the first group is chosen: the marks decide the groups,
     // and a group chosen before they arrive would be one they dissolve.
-    if (S.site.host === 'html') {
-      const marks = await api('/api/site/marks' + query());
-      if (marks.ok) S.marks = marks.body;
-    }
+    const marks = await api('/api/site/marks' + query());
+    if (marks.ok) S.marks = Object.assign({ documents: [], keys: {}, places: {} }, marks.body);
     S.locale = S.site.config.locales.default;
     S.group = firstGroup();
     S.route = readStore('stet.route.' + S.site.id) || '/';
@@ -422,12 +492,81 @@ function writeEditor(value) {
   try { localStorage.setItem('stet.editor', value); } catch (e) { /* private window */ }
 }
 
+// --- where a key renders ------------------------------------------------------
+// The server's places (`GET /api/site/marks`) and the page records' SEO fields,
+// said in plain words. A place is { file, line, tag?, attr?, meta? }.
+const HEAD_META = {
+  description: 'meta description', 'og:title': 'share title', 'twitter:title': 'share title',
+  'og:description': 'share description', 'twitter:description': 'share description',
+};
+const ATTR_KINDS = { alt: 'image alt text', 'aria-label': 'aria label', title: 'tooltip', placeholder: 'placeholder' };
+const TAG_KINDS = { p: 'paragraph', a: 'link text', button: 'button text', li: 'list item', title: 'page title' };
+const SEO_KINDS = {
+  title: 'page title', description: 'meta description', ogImage: 'share image', ogImageAlt: 'share image alt text',
+  canonical: 'canonical address', robots: 'robots rule',
+};
+/** The kinds a page shows outside its visible text: the head's, and the SEO settings. */
+const HEAD_KINDS = ['page title', 'meta description', 'share title', 'share description', 'share image',
+  'share image alt text', 'canonical address', 'robots rule'];
+/** And the attributes no one sees on the page as it sits. */
+const UNSEEN_KINDS = HEAD_KINDS.concat(['aria label', 'image alt text', 'tooltip']);
+/** What element a place is, in plain words. */
+function kindOf(place) {
+  // A <title> inside an <svg> names the graphic; a browser shows it as a tooltip.
+  if (place.svg === true && place.tag === 'title') return 'tooltip';
+  if (place.attr === 'content' && own(HEAD_META, place.meta)) return HEAD_META[place.meta];
+  if (place.attr !== undefined) return own(ATTR_KINDS, place.attr) ? ATTR_KINDS[place.attr] : place.attr + ' attribute';
+  if (place.tag === undefined) return 'text in ' + place.file;
+  if (/^h[1-6]$/.test(place.tag)) return 'headline';
+  return own(TAG_KINDS, place.tag) ? TAG_KINDS[place.tag] : 'text in <' + place.tag + '>';
+}
+const placesOf = (id) => (own(S.marks.places, id) ? S.marks.places[id] : []);
+/** A place in the page's head — its `<title>` or a meta whose content is copy — as the server marks it. */
+const isHeadPlace = (place) => place.head === true;
+/** The page records' SEO fields that name a key, as [{ page, field }]. */
+function seoRoles(id) {
+  const pages = (ready() && S.site.descriptor.pages) || {};
+  const out = [];
+  for (const name of Object.keys(pages).sort()) {
+    const seo = pages[name].seo || {};
+    for (const field of Object.keys(SEO_KINDS)) if (seo[field] === id) out.push({ page: name, field: field });
+  }
+  return out;
+}
+/** A key's kinds, each once, in the order found: its places, then the SEO fields naming it. */
+function kindsOf(id) {
+  const out = [];
+  for (const kind of placesOf(id).map(kindOf).concat(seoRoles(id).map((r) => SEO_KINDS[r.field]))) {
+    if (out.indexOf(kind) === -1) out.push(kind);
+  }
+  return out;
+}
+/** A key the SEO group holds: one a page record's SEO field names, or one found only in head texts. */
+function seoKey(id) {
+  const places = placesOf(id);
+  return seoRoles(id).length > 0 || (places.length > 0 && places.every(isHeadPlace));
+}
+/** A key shown nowhere in the page's visible text. */
+function unseen(id) {
+  const kinds = kindsOf(id);
+  return kinds.length > 0 && kinds.every((k) => UNSEEN_KINDS.indexOf(k) !== -1);
+}
+/** The keys that derive from a key. */
+const dependents = (id) => Object.keys(S.site.descriptor.keys).sort().filter((k) => S.site.descriptor.keys[k].derivesFrom === id);
+/** A key named by what it is: `headline (key)`, or the key alone where stet knows no kind. */
+function named(id) {
+  const kind = kindsOf(id)[0];
+  return (kind === undefined ? '' : esc(kind) + ' ') + '(<span class="mono">' + esc(id) + '</span>)';
+}
+
 // --- grouping ---------------------------------------------------------------
 // Each key sits in the first group that takes it: a declared page holds the
 // keys that name it and, on a static-HTML host, the keys marked in its
-// document; a document no page claims is a group of its own; the rest group by
-// the key's first underscore segment, unmerged — `principle` and `principles`
-// are two groups. A group is `{ id, label, keys }`, and `S.group` holds an id.
+// document; a document no page claims is a group of its own; the SEO group
+// holds every key a page record's SEO field names or found only in head texts,
+// whichever page names it; the rest group by the key's first underscore
+// segment, unmerged — `principle` and `principles` are two groups. A group is
+// `{ id, label, keys }`, and `S.group` holds an id.
 const prefixOf = (id) => (id.indexOf('_') === -1 ? id : id.slice(0, id.indexOf('_')));
 function groups() {
   if (!ready()) return [];
@@ -437,8 +576,10 @@ function groups() {
   const pages = descriptor.pages || {};
   const out = [];
   const placed = new Set();
+  const seo = new Set(keys.filter(seoKey));
+  // A page or a document group never takes an SEO key; the SEO group does.
   const add = (id, label, members) => {
-    const fresh = members.filter((key) => !placed.has(key));
+    const fresh = members.filter((key) => !placed.has(key) && (id === 'seo' || !seo.has(key)));
     if (fresh.length === 0) return;
     for (const key of fresh) placed.add(key);
     const held = out.find((group) => group.id === id);
@@ -454,6 +595,7 @@ function groups() {
     for (const doc of marks.documents) if (doc.page === name) add('page:' + name, name + ' — page', markedIn(doc.file));
   }
   for (const doc of marks.documents) if (doc.page === null) add('doc:' + doc.file, doc.file, markedIn(doc.file));
+  add('seo', 'SEO', [...seo]);
   const prefixes = new Map();
   for (const key of keys) {
     if (placed.has(key)) continue;
@@ -467,7 +609,8 @@ function keysInGroup(id) {
   const group = groups().find((g) => g.id === id);
   return group ? group.keys : [];
 }
-const firstGroup = () => (groups()[0] || { id: null }).id;
+/** The group a site opens on: its visible text's, the SEO group only where no other group exists. */
+const firstGroup = () => (groups().find((g) => g.id !== 'seo') || groups()[0] || { id: null }).id;
 
 /** The keys the list shows: the selected group, or — while a query is set — every key it matches, and always the one being edited. */
 function listedKeys() {
@@ -481,7 +624,8 @@ function matches(id, q) {
   const block = (S.site.snapshot && own(S.site.snapshot, S.locale)) ? S.site.snapshot[S.locale] : {};
   const saved = own(block, id) ? block[id] : undefined;
   const held = S.draft[S.locale + ' ' + id];
-  return [saved, held].some((v) => v !== undefined && shown(v).toLowerCase().indexOf(q) !== -1);
+  const derived = derivedValue(id);
+  return [saved, held, derived].some((v) => v !== undefined && shown(v).toLowerCase().indexOf(q) !== -1);
 }
 /** A value as one line of text, whatever shape it is. */
 const shown = (v) => (typeof v === 'string' ? v : JSON.stringify(v === undefined ? '' : v));
@@ -540,6 +684,7 @@ function render() {
 
   const content = ready() && S.tab === 'Content';
   document.getElementById('work').className = content ? (S.keysOpen ? 'wrap content' : 'wrap content wide') : 'wrap';
+  paintColumn();
   document.getElementById('gitbar').innerHTML = gitBar();
   paintGitError();
   document.getElementById('main').innerHTML = view();
@@ -606,7 +751,7 @@ function paintDirty() {
   }
   const count = document.getElementById('dc');
   count.hidden = !dirty();
-  count.textContent = dirty() ? plural(Object.keys(S.draft).length, 'unsaved edit') : '';
+  count.textContent = dirty() ? plural(edits(), 'unsaved edit') : '';
 }
 
 const ENV_CLASSES = { default: 'local', prod: 'prod', production: 'prod', staging: 'staging', preview: 'preview' };
@@ -674,7 +819,8 @@ function keyList() {
       ? '<div class="cb muted">No keys.</div>'
       : items.map((id) => {
         const def = keyDef(id) || {};
-        const value = valueOf(id);
+        const value = shownValue(id);
+        const kinds = kindsOf(id);
         const badge = edited(id) ? '<span class="bdg d">edited</span>'
           : def.shape === 'media' ? '<span class="bdg">img</span>'
             : def.shape === 'richtext' ? '<span class="bdg">rich</span>'
@@ -684,7 +830,8 @@ function keyList() {
         const group = S.q ? '<span class="bdg">' + esc((all.find((g) => g.keys.indexOf(id) !== -1) || {}).label || '') + '</span>' : '';
         return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
           '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + healthBadge(id) + group + '</span>' +
-          '<span class="s">' + esc(rowPreview(value)) + '</span></button>';
+          '<span class="s">' + (kinds.length === 0 ? '' : '<span class="kd">' + esc(kinds.join(' · ')) + '</span>') +
+          '<span class="v">' + esc(rowPreview(value)) + '</span></span></button>';
       }).join('')) + '</div></div>';
 }
 
@@ -703,8 +850,9 @@ function healthBadge(id) {
   }
   const orphans = (S.health && S.health.audit && S.health.audit.orphans) || [];
   if (orphans.indexOf(id) !== -1) return '<span class="bdg d">orphan</span>';
-  // The page holds the snapshot, so this one needs no Health run at all.
-  if (defaultValue(id) === undefined) return '<span class="bdg r">no value</span>';
+  // The page holds the snapshot, so this one needs no Health run at all. A
+  // derived key's value is its derivation, which the snapshot never holds.
+  if (defaultValue(id) === undefined && (keyDef(id) || {}).derivesFrom === undefined) return '<span class="bdg r">no value</span>';
   return '';
 }
 
@@ -726,14 +874,22 @@ function chooser(act, values, current, id, cls, labels) {
 
 /** The commits that touched the snapshot (and, on an html host, the pages). Content's History card and Recent show the same table. */
 function commitTable(rows, loaded) {
-  return '<table><thead><tr><th style="width:80px">Commit</th><th style="width:150px">When</th>' +
-    '<th>Subject</th><th style="width:90px">By</th></tr></thead><tbody>' +
+  // Fixed columns, so the table is as wide as its card: the subject wraps, and
+  // the author sits under it rather than in a fourth column the key column has
+  // no room for.
+  return '<div class="tblx"><table class="fixed"><colgroup><col style="width:70px"><col style="width:88px"><col></colgroup>' +
+    '<thead><tr><th>Commit</th><th>When</th><th>Subject</th></tr></thead><tbody>' +
     (rows.length === 0
-      ? '<tr><td colspan="4" class="muted">' + (!loaded ? 'Not loaded.'
+      ? '<tr><td colspan="3" class="muted">' + (!loaded ? 'Not loaded.'
         : htmlHost() ? 'No commits touch the snapshot or the pages yet.' : 'No commits touch the snapshot yet.') + '</td></tr>'
-      : rows.map((r) => '<tr><td class="mono">' + esc(r.short) + '</td><td class="muted">' + esc(r.at) +
-        '</td><td>' + esc(r.subject) + '</td><td class="muted mono" style="font-size:11px">' +
-        esc(r.author) + '</td></tr>').join('')) + '</tbody></table>';
+      : rows.map((r) => '<tr><td class="mono">' + esc(r.short) + '</td><td class="muted" title="' + esc(r.at) + '">' + whenShort(r.at) +
+        '</td><td>' + esc(r.subject) + '<div class="muted mono" style="font-size:11px">' + esc(r.author) + '</div></td></tr>').join('')) +
+    '</tbody></table></div>';
+}
+/** A commit's time as its author's clock read it: the date, and under it the minute. Anything but git's ISO form is shown as it is. */
+function whenShort(at) {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(String(at));
+  return m === null ? esc(at) : esc(m[1]) + '<br>' + esc(m[2]);
 }
 
 function editorColumn() {
@@ -754,7 +910,7 @@ function editorCard() {
     '<span class="bdg">' + esc(def.shape || 'text') + '</span>' +
     (edited(id) ? '<span class="bdg d">edited</span>' : '') +
     (S.locale !== 'default' ? '<span class="bdg b">' + esc(S.locale) + '</span>' : '') +
-    '</span></div>';
+    '</span></div>' + kindLine(id);
 
   const fallback = (S.locale !== 'default' && value === undefined && defaultValue(id) !== undefined)
     ? '<div class="inf">falls back to default — ' + esc(String(shown(defaultValue(id))).slice(0, 90)) + '</div>'
@@ -764,9 +920,46 @@ function editorCard() {
     findingsBlock(id) + '</div>' + bar(id);
 }
 
+/** Under the editor's header: what element the key is and where, what it derives from, and what derives from it. */
+function kindLine(id) {
+  const def = keyDef(id) || {};
+  const lines = [];
+  const kinds = kindsOf(id);
+  const places = placesOf(id);
+  if (kinds.length > 0) {
+    const where = places.slice(0, 3).map((p) => p.file + ':' + p.line).join(', ') +
+      (places.length > 3 ? ', +' + (places.length - 3) + ' more' : '');
+    lines.push(esc(kinds.join(' · ')) + (where === '' ? '' : ' <span class="muted mono">' + esc(where) + '</span>'));
+  }
+  if (def.derivesFrom !== undefined) lines.push('derived from: ' + named(def.derivesFrom));
+  for (const dep of dependents(id)) lines.push('feeds: ' + named(dep));
+  return lines.length === 0 ? '' : '<div class="kline">' + lines.map((line) => '<div>' + line + '</div>').join('') + '</div>';
+}
+
+/** A tagged value as the mirror under its field shows it: each numbered tag muted on a shade, the words inside a pair muted. */
+function taggedHtml(text) {
+  let depth = 0;
+  return text.split(/(<\/?\d+\/?>)/).map((part, i) => {
+    if (i % 2 === 0) return depth > 0 ? '<span class="pin">' + esc(part) + '</span>' : esc(part);
+    if (/^<\d+>$/.test(part)) depth += 1;
+    else if (/^<\/\d+>$/.test(part)) depth = Math.max(0, depth - 1);
+    return '<span class="ptag">' + esc(part) + '</span>';
+  }).join('') + '\n';
+}
+const TAG_NOTE = 'Words between &lt;1&gt; and &lt;/1&gt; keep the page&rsquo;s own styling for that part, shaded here. ' +
+  'Change the words as you like and keep each tag; a save without them is refused.';
+
 /** The editor for one key, by its declared shape. */
 function field(id, def, value, max) {
   const shape = def.shape || 'text';
+  if (def.derivesFrom !== undefined) {
+    const tmpl = own(S.tmpl, id) ? S.tmpl[id] : (def.tmpl || '');
+    return '<div class="muted" style="font-size:11px">Template</div>' +
+      '<input class="in mono" value="' + esc(tmpl) + '" data-act-input="tmpl:' + esc(id) + '"' + (storeBacked() ? ' disabled' : '') + '>' +
+      '<p class="note">{v} stands for the text of ' + esc(def.derivesFrom) + '.' +
+      (storeBacked() ? ' The template lives in the descriptor; edit it in the repository.' : '') + '</p>' +
+      '<div class="muted" style="font-size:11px;margin-top:8px">Reads as</div>' + derivedBlock(id, max);
+  }
   if (shape === 'richtext' || shape === 'media') {
     return '<div class="term">' + esc(String(shown(value === undefined ? '' : value))) + '</div>' +
       '<p class="note">' + (shape === 'media' ? 'A media reference' : 'Rich text') +
@@ -807,11 +1000,34 @@ function field(id, def, value, max) {
     return '<fieldset class="rec"><legend>' + esc(id) + '</legend>' + fields + '</fieldset>';
   }
   const text = value === undefined ? '' : String(value);
+  if (def.tags !== undefined) {
+    // The field is the textarea, as for any text key; the mirror behind it only colours the tags.
+    return '<div class="tagged"><div class="tagmirror" aria-hidden="true">' + taggedHtml(text) + '</div>' +
+      '<textarea class="in" rows="3" data-act-input="text:' + esc(id) + '">' + esc(text) + '</textarea></div>' +
+      '<p class="note">' + TAG_NOTE + '</p>' +
+      '<div style="display:flex;justify-content:space-between;margin-top:5px">' +
+      '<span class="cnt ' + (max !== null && text.length > max ? 'bad' : '') + '">' +
+      text.length + (max === null ? '' : ' / ' + max + (def.limits && def.limits.severity === 'hard' ? ' · hard' : '')) +
+      '</span></div>';
+  }
   return '<textarea class="in" rows="3" data-act-input="text:' + esc(id) + '">' + esc(text) + '</textarea>' +
     '<div style="display:flex;justify-content:space-between;margin-top:5px">' +
     '<span class="cnt ' + (max !== null && text.length > max ? 'bad' : '') + '">' +
     text.length + (max === null ? '' : ' / ' + max + (def.limits && def.limits.severity === 'hard' ? ' · hard' : '')) +
     '</span></div>';
+}
+
+/** A derived key's text and its count, repainted as its template or its source's draft changes. */
+function derivedBlock(id, max) {
+  const value = shownValue(id);
+  const text = shown(value === undefined ? '' : value);
+  return '<div id="derived"><div class="term">' + esc(text) + '</div>' +
+    '<span class="cnt ' + (max !== null && text.length > max ? 'bad' : '') + '">' + text.length + (max === null ? '' : ' / ' + max) + '</span></div>';
+}
+function paintDerived(id) {
+  const box = document.getElementById('derived');
+  const def = keyDef(id) || {};
+  if (box) box.outerHTML = derivedBlock(id, def.limits ? def.limits.max : null);
 }
 
 /** What the last save said about this key, under the field it is about. */
@@ -867,8 +1083,8 @@ const htmlHost = () => ready() && S.site.host === 'html';
 const rowPreview = (value) => String(value === undefined ? '' : shown(value)).replace(/\n/g, ' ').slice(0, 40) || '—';
 /** The selected row's one-line preview, repainted from the input handlers. */
 function paintRow(id) {
-  const line = document.querySelector('.row.on .s');
-  if (line && S.sel === id) line.textContent = rowPreview(valueOf(id));
+  const line = document.querySelector('.row.on .v');
+  if (line && S.sel === id) line.textContent = rowPreview(shownValue(id));
 }
 
 // --- the pane ------------------------------------------------------------------
@@ -924,6 +1140,7 @@ function paintPane() {
   if (!content) return;
   paintPaneHead();
   paintPaneNote();
+  paintPaneCards();
   const state = paneState();
   // A frame is rebuilt only when its sandbox must change; a new route is a navigation of the same frame.
   const shown = state === 'frame' ? 'frame ' + (S.preview.static ? 'static' : 'dev') + ' ' + S.path : state + ' ' + JSON.stringify([S.preview, S.starting, S.devlog]);
@@ -1131,6 +1348,12 @@ function structuredDraft() {
 /** Outline the selected key in the preview, with its draft in place where it maps onto the page's text. */
 function locateKey(scroll) {
   if (!ready() || S.sel === null) { postToPreview({ stet: 'clear' }); return; }
+  const def = keyDef(S.sel) || {};
+  if (def.derivesFrom !== undefined) {
+    // A derived key is shown where its source renders, outlined dashed; the whole message names the key picked.
+    postLocate({ key: S.sel, mark: def.derivesFrom, texts: renderedTexts(def.derivesFrom), draft: null, scroll: scroll, guess: true, dashed: true });
+    return;
+  }
   const held = S.draft[S.locale + ' ' + S.sel];
   if (structuredDraft()) {
     S.located = Object.assign({}, S.located, { key: S.sel, draft: 'after-save' });
@@ -1142,11 +1365,13 @@ function locateKey(scroll) {
     draft: typeof held === 'string' ? held : null,
     scroll: scroll,
     guess: !S.confirmed.has(S.sel),
+    ...(def.tags === undefined ? {} : { tags: def.tags }),
   });
 }
 function draftChanged() {
   clearTimeout(draftTimer);
   draftTimer = setTimeout(() => locateKey(false), DRAFT_MS);
+  paintPaneCards();
 }
 /** A document loaded in the frame: it is asked to announce itself, and one that stays silent cannot be highlighted. */
 function previewLoaded() {
@@ -1227,6 +1452,7 @@ function paintPaneNote() {
   const at = S.located;
   let line = '';
   if (at && at.unavailable) line = 'Highlighting is not available on this page.';
+  else if (S.sel !== null && whereLine(S.sel) !== '') line = whereLine(S.sel);
   else if (at && at.key === S.sel && at.hardcoded) line = "The outlined text does not come from stet — the page's template writes it out itself, so saving " + S.sel + ' does not change it.';
   else if (at && at.key === S.sel && at.found === 0) line = S.sel + ' was not found on ' + shownRoute(at.route) + '.';
   else if (at && at.key === S.sel && at.hidden === true) line = S.sel + ' is on this page but hidden, so the preview cannot show it.';
@@ -1234,6 +1460,106 @@ function paintPaneNote() {
   note.hidden = line === '';
   note.textContent = line;
 }
+const WHERE = {
+  'page title': 'as the page title, in the browser tab and in search results',
+  'meta description': 'as the meta description, under the title in search results',
+  'share title': 'as the share title, when the page is shared as a link',
+  'share description': 'as the share description, under the share title when the page is shared as a link',
+  'share image': 'as the share image, when the page is shared as a link',
+  'share image alt text': 'as the share image’s alt text, read out by screen readers',
+  'canonical address': 'as the address search engines list the page under',
+  'robots rule': 'as the rule that tells search engines whether to list the page',
+  'aria label': 'as an aria label, read out by screen readers',
+  'image alt text': 'as image alt text, read out by screen readers and shown when the image does not load',
+  tooltip: 'as a tooltip, when the pointer rests on the element',
+};
+/**
+ * The line a key the page's visible text does not show takes: where it
+ * appears; and for a derived key, what it follows, which the preview outlines
+ * dashed in its place. Empty for every other key.
+ */
+function whereLine(id) {
+  const def = keyDef(id) || {};
+  const sourceKind = def.derivesFrom === undefined ? undefined : kindsOf(def.derivesFrom)[0];
+  const follows = def.derivesFrom === undefined ? ''
+    : 'It follows ' + def.derivesFrom + (sourceKind === undefined ? '' : ' (' + sourceKind + ')') + ', outlined dashed on the page.';
+  if (!unseen(id)) return follows === '' ? '' : id + ' is derived. ' + follows;
+  const where = kindsOf(id).map((kind) => WHERE[kind]);
+  return id + ' appears ' + where.join(', and ') + '. ' + (follows || 'It is not part of the page’s visible text.');
+}
+
+// --- the search result and the share card --------------------------------------
+/**
+ * The page a key's head texts belong to, as the keys that fill its search
+ * result and share card: the key itself where it is one of those texts, else
+ * the head texts derived from it. Null where the key is neither.
+ *
+ * On a static-HTML host the texts are the marks of one document: the `<title>`,
+ * the meta description, and the share title and description, where a share
+ * field no meta carries falls back the way a link preview does — `og:` first,
+ * then `twitter:`, then the title or the description. On a JavaScript host they
+ * are a page record's `seo.title` and `seo.description`, which serve both.
+ */
+function headOf(id) {
+  const ids = [id].concat(dependents(id));
+  const place = (pick) => {
+    for (const key of ids) for (const p of placesOf(key)) if (pick(p)) return p;
+    return null;
+  };
+  const pageTitle = (p) => p.tag === 'title' && p.attr === undefined && p.svg !== true;
+  const head = place(isHeadPlace);
+  if (head !== null) {
+    const keyAt = (pick) => {
+      for (const key of Object.keys(S.marks.places).sort()) {
+        if (S.marks.places[key].some((p) => p.file === head.file && pick(p))) return key;
+      }
+      return null;
+    };
+    const meta = (name) => keyAt((p) => p.attr === 'content' && p.meta === name);
+    const title = keyAt(pageTitle);
+    const description = meta('description');
+    const doc = S.marks.documents.find((d) => d.file === head.file);
+    return {
+      route: doc ? doc.route : head.file,
+      title: title,
+      description: description,
+      shareTitle: meta('og:title') || meta('twitter:title') || title,
+      shareDescription: meta('og:description') || meta('twitter:description') || description,
+    };
+  }
+  const pages = (ready() && S.site.descriptor.pages) || {};
+  for (const key of ids) {
+    const role = seoRoles(key).find((r) => r.field === 'title' || r.field === 'description');
+    if (!role) continue;
+    const seo = pages[role.page].seo || {};
+    const title = typeof seo.title === 'string' ? seo.title : null;
+    const description = typeof seo.description === 'string' ? seo.description : null;
+    return { route: pages[role.page].route, title: title, description: description, shareTitle: title, shareDescription: description };
+  }
+  return null;
+}
+/** The search result and the share card beside the pane, from each key's shown value — a draft as it is typed. */
+function paintPaneCards() {
+  const box = document.getElementById('panecards');
+  if (!box) return;
+  const head = ready() && S.sel !== null ? headOf(S.sel) : null;
+  const text = (key) => {
+    // A key with no value in this locale shows the default locale's, as the site renders it.
+    let value = key === null ? undefined : shownValue(key);
+    if (value === undefined && key !== null) value = shownValue(key, S.site.config.locales.default);
+    return value === undefined || value === '' ? '<span class="muted">—</span>' : esc(shown(value));
+  };
+  const html = head === null ? '' : '<div class="cards">' +
+    '<div class="serp"><div class="lb">Search result</div><div class="u mono">' + esc(head.route) + '</div>' +
+    '<div class="tt">' + text(head.title) + '</div><div class="ds">' + text(head.description) + '</div></div>' +
+    '<div class="share"><div class="lb">Share card</div><div class="u mono">' + esc(head.route) + '</div>' +
+    '<div class="tt">' + text(head.shareTitle) + '</div><div class="ds">' + text(head.shareDescription) + '</div></div></div>';
+  if (box.innerHTML === html) return;
+  box.hidden = head === null;
+  box.innerHTML = html;
+  fitFrame();
+}
+
 /** The route the agent reported, as the route field spells it. */
 function shownRoute(route) {
   const prefix = '/s/' + S.site.id + '/site';
@@ -1360,8 +1686,8 @@ function vSeo() {
       : Object.keys(pages).sort().map((name) => {
         const record = pages[name];
         const seo = record.seo || {};
-        const title = seo.title ? valueOf(seo.title) : undefined;
-        const desc = seo.description ? valueOf(seo.description) : undefined;
+        const title = seo.title ? shownValue(seo.title) : undefined;
+        const desc = seo.description ? shownValue(seo.description) : undefined;
         return '<tr><td><b>' + esc(name) + '</b></td><td class="mono">' + esc(record.route) + '</td>' +
           '<td>' + (title ? esc(String(title).slice(0, 70)) : '<span class="bdg d">missing</span>') + '</td>' +
           '<td>' + (desc ? esc(String(desc).slice(0, 70)) : '<span class="bdg d">missing</span>') + '</td></tr>';
@@ -1773,7 +2099,8 @@ const ACTIONS_CHANGE = {
 const ACTIONS_INPUT = {
   search: (el) => { S.q = el.value; render(); },
   editor: (el) => { writeEditor(el.value); },
-  text: (el, id) => { clearRefusal(); setDraft(id, el.value); softCount(el, id); paintRow(id); paintDirty(); },
+  text: (el, id) => { clearRefusal(); setDraft(id, el.value); paintMirror(el); softCount(el, id); paintRow(id); paintDirty(); },
+  tmpl: (el, id) => { clearRefusal(); S.tmpl[id] = el.value; paintDerived(id); paintRow(id); paintDirty(); paintPaneCards(); },
   number: (el, id) => { clearRefusal(); setDraft(id, el.value === '' ? '' : Number(el.value)); paintRow(id); paintDirty(); },
   color: (el, id) => { clearRefusal(); setDraft(id, el.value); paintRow(id); paintDirty(); },
   list: (el, arg) => { listEdit(arg, (entries, i) => { entries[i] = el.value; }); },
@@ -1803,11 +2130,19 @@ function listEdit(arg, change) {
   render();
 }
 
+/** A tagged field's mirror, redrawn from what is typed; the field itself is never repainted. */
+function paintMirror(el) {
+  const mirror = el.parentElement && el.parentElement.classList.contains('tagged') ? el.previousElementSibling : null;
+  if (mirror) mirror.innerHTML = taggedHtml(el.value);
+}
+
 /** The character counter, updated without repainting the field the caret is in. */
 function softCount(el, id) {
   const def = keyDef(id) || {};
   const max = def.limits ? def.limits.max : null;
-  const counter = el.parentElement && el.parentElement.querySelector('.cnt');
+  // A tagged field sits in its mirror's box, so the counter is looked up in the card body.
+  const box = el.closest('.cb') || el.parentElement;
+  const counter = box && box.querySelector('.cnt');
   if (counter === null || counter === undefined) return;
   counter.textContent = max === null
     ? String(el.value.length)
@@ -1839,7 +2174,8 @@ async function save() {
     const cut = held.indexOf(' ');
     return { key: held.slice(cut + 1), locale: held.slice(0, cut), value: S.draft[held] };
   });
-  if (values.length === 0) { tst('Nothing to save.'); return; }
+  const templates = Object.keys(S.tmpl).map((key) => ({ key: key, tmpl: S.tmpl[key] }));
+  if (values.length === 0 && templates.length === 0) { tst('Nothing to save.'); return; }
   if (storeBacked()) {
     for (const value of values) {
       const res = await post(mountPath('draft'), {
@@ -1853,7 +2189,7 @@ async function save() {
     render();
     return;
   }
-  const res = await post('/api/site/save' + query(), { values: values });
+  const res = await post('/api/site/save' + query(), Object.assign({ values: values }, templates.length === 0 ? {} : { templates: templates }));
   S.findings = res.body.findings || [];
   if (!res.ok) {
     // A refused save wrote nothing, so whatever was already pending still is.
@@ -1873,6 +2209,8 @@ async function save() {
   }
   S.message = '';
   S.draft = {};
+  for (const template of templates) S.site.descriptor.keys[template.key].tmpl = template.tmpl;
+  S.tmpl = {};
   // The server reads the committable files from the checkout, so a save that
   // wrote nothing still answers the ones an earlier save left uncommitted.
   const wrote = res.body.written || [];
@@ -1989,8 +2327,80 @@ async function updateEntry(patch) {
   render();
 }
 
+// --- the key column's width ---------------------------------------------------
+// The bar between the key column and the pane: dragged, or moved with the arrow
+// keys once it has focus, it sets the column's width, and the pane takes the
+// rest — its presets refit through the frame's ResizeObserver. Each side keeps
+// room: the column COLUMN.min to COLUMN.max pixels, the pane COLUMN.pane.
+const COLUMN = { base: 300, min: 240, max: 720, pane: 360, step: 16, grip: 11 };
+/** The widest the column may be in this window; COLUMN.max before the work area has a width. */
+function columnMax() {
+  const work = document.getElementById('work');
+  if (work.clientWidth === 0) return COLUMN.max;
+  const style = getComputedStyle(work);
+  const inner = work.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+  const room = inner - COLUMN.grip - COLUMN.pane;
+  return Math.max(COLUMN.min, Math.min(COLUMN.max, room));
+}
+/** The column's width: the operator's, else the default, held between the two bounds. */
+function columnWidth() {
+  return Math.min(Math.max(S.column === null ? COLUMN.base : S.column, COLUMN.min), columnMax());
+}
+function paintColumn() {
+  const grip = document.getElementById('grip');
+  const width = columnWidth();
+  document.getElementById('work').style.setProperty('--colw', width + 'px');
+  grip.setAttribute('aria-valuenow', String(width));
+  grip.setAttribute('aria-valuemin', String(COLUMN.min));
+  grip.setAttribute('aria-valuemax', String(columnMax()));
+}
+/** The column set to a width, held between the bounds; `keep` remembers it for this viewer. */
+function setColumn(width, keep) {
+  S.column = Math.round(width);
+  S.column = columnWidth();
+  paintColumn();
+  if (keep) writeStore('stet.column.width', String(S.column));
+}
+const grip = document.getElementById('grip');
+let drag = null;
+grip.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0) return;
+  drag = { x: event.clientX, width: columnWidth() };
+  grip.setPointerCapture(event.pointerId);
+  document.body.classList.add('dragging');
+  event.preventDefault();
+});
+grip.addEventListener('pointermove', (event) => {
+  if (drag !== null) setColumn(drag.width + event.clientX - drag.x, false);
+});
+function endDrag() {
+  if (drag === null) return;
+  drag = null;
+  document.body.classList.remove('dragging');
+  writeStore('stet.column.width', String(columnWidth()));
+}
+grip.addEventListener('pointerup', endDrag);
+grip.addEventListener('pointercancel', endDrag);
+grip.addEventListener('dblclick', () => {
+  S.column = null;
+  writeStore('stet.column.width', '');
+  paintColumn();
+});
+grip.addEventListener('keydown', (event) => {
+  const step = event.shiftKey ? COLUMN.step * 4 : COLUMN.step;
+  const at = columnWidth();
+  const to = event.key === 'ArrowLeft' ? at - step
+    : event.key === 'ArrowRight' ? at + step
+      : event.key === 'Home' ? COLUMN.min
+        : event.key === 'End' ? columnMax() : null;
+  if (to === null) return;
+  event.preventDefault();
+  setColumn(to, true);
+});
+window.addEventListener('resize', paintColumn);
+
 // --- the delegated listeners -------------------------------------------------
-// Three listeners for the whole page: nothing here is an inline attribute, so
+// The listeners for the whole page: nothing here is an inline attribute, so
 // nothing here is refused by the policy the page is served under.
 function dispatch(table, event) {
   const attribute = table === ACTIONS ? 'data-act' : table === ACTIONS_CHANGE ? 'data-act-change' : 'data-act-input';
@@ -2007,6 +2417,11 @@ function dispatch(table, event) {
 
 const shell = document.getElementById('shell');
 shell.addEventListener('click', (event) => dispatch(ACTIONS, event));
+// A scroll does not bubble; captured, it keeps a tagged field's mirror under its text.
+shell.addEventListener('scroll', (event) => {
+  const el = event.target;
+  if (el.matches && el.matches('.tagged textarea')) el.previousElementSibling.scrollTop = el.scrollTop;
+}, true);
 shell.addEventListener('change', (event) => dispatch(ACTIONS_CHANGE, event));
 shell.addEventListener('input', (event) => dispatch(ACTIONS_INPUT, event));
 

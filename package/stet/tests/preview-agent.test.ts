@@ -1,26 +1,29 @@
 /**
  * The preview agent (`templates/preview-agent.js`) inside a framed page, under
- * jsdom: an outer window at the dashboard's origin frames a document, the
- * agent is added to it the way `stet dev` serves it, and messages reach it as
- * the dashboard would send them — from the framing window, at the dashboard's
- * origin. jsdom lays nothing out, so the frame gets a stand-in layout: every
- * element in the body has a box 20 px high, 40 px below the one before it in
- * document order, starting at 1000; an element under `hidden`, an inline
- * `display: none` or a closed <details> (outside its summary) has none. The
- * frame's `scrollTo` is recorded.
+ * jsdom, through the frame harness in `helpers/preview-frame.ts`: its stand-in
+ * layout gives every element in the body a box 20 px high, 40 px below the one
+ * before it in document order, starting at 1000, and none to an element under
+ * `hidden`, an inline `display: none` or a closed <details> (outside its
+ * summary). The frame's `scrollTo` is recorded.
  */
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { packageRoot } from '../cli/installed.js';
+import {
+  AGENT,
+  DASHBOARD,
+  DASHED,
+  SOLID,
+  boxOf,
+  centred,
+  closeFrames,
+  frame,
+  located,
+  tick,
+  type Framed,
+  type Message,
+} from './helpers/preview-frame.js';
 
-const AGENT = readFileSync(join(packageRoot(), 'templates', 'preview-agent.js'), 'utf8');
-const DASHBOARD = 'http://127.0.0.1:4400';
-const SOLID = '2px solid hsl(38 92% 50%)';
-const DASHED = '2px dashed hsl(38 92% 50%)';
+afterEach(closeFrames);
 
 const PAGE =
   '<h1>  Ship the copy  </h1>' +
@@ -28,104 +31,6 @@ const PAGE =
   '<p id="price">Price 12</p>' +
   '<span data-stet="k_mark">Marked text</span>' +
   '<p id="twin">Marked text</p>';
-
-type Message = Record<string, unknown>;
-
-interface Framed {
-  win: Window & typeof globalThis;
-  doc: Document;
-  /** What the agent posted to the dashboard window, in order. */
-  sent: Message[];
-  /** Every `scrollTo` call on the frame's window. */
-  scrolls: Array<{ top: number; behavior: unknown }>;
-  send(data: unknown, origin?: string, source?: unknown): void;
-  locate(request: Message): Promise<Message | undefined>;
-  close(): void;
-}
-
-const open: Framed[] = [];
-afterEach(() => {
-  for (const framed of open.splice(0)) framed.close();
-});
-
-const tick = (ms = 20): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** Whether the stand-in layout gives `el` no box. */
-function unrendered(el: Element): boolean {
-  if (!el.ownerDocument.body.contains(el)) return true;
-  for (let at: Element | null = el; at !== null; at = at.parentElement) {
-    if (at.hasAttribute('hidden') || /display:\s*none/.test(at.getAttribute('style') ?? '')) return true;
-    const details = at.parentElement;
-    if (details?.tagName === 'DETAILS' && !details.hasAttribute('open') && at.tagName !== 'SUMMARY') return true;
-  }
-  return false;
-}
-
-/** The stand-in box: 20 px high, 40 px apart in document order from 1000, none when unrendered. */
-function boxOf(el: Element): DOMRect {
-  if (unrendered(el)) return { top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0, x: 0, y: 0 } as DOMRect;
-  const top = 1000 + 40 * [...el.ownerDocument.body.querySelectorAll('*')].indexOf(el);
-  return { top, bottom: top + 20, left: 0, right: 200, width: 200, height: 20, x: 0, y: top } as DOMRect;
-}
-
-/** Where the agent scrolls the frame's window to centre `el`: jsdom's window is 768 px high. */
-const centred = (el: Element): { top: number; behavior: string } => ({ top: boxOf(el).top - (768 - 20) / 2, behavior: 'instant' });
-
-/** A framed page holding `body`, the agent added with the dashboard's origin and, unless null, channel `c1`. */
-async function frame(body: string, channel: string | null = 'c1', head = ''): Promise<Framed> {
-  const outer = new JSDOM('<!DOCTYPE html><iframe></iframe>', { url: `${DASHBOARD}/`, runScripts: 'dangerously' });
-  const iframe = outer.window.document.querySelector('iframe') as HTMLIFrameElement;
-  const win = iframe.contentWindow as Window & typeof globalThis;
-  const doc = win.document;
-  doc.head.innerHTML = head;
-  doc.body.innerHTML = body;
-  const sent: Message[] = [];
-  outer.window.addEventListener('message', (event) => sent.push(event.data as Message));
-  const scrolls: Array<{ top: number; behavior: unknown }> = [];
-  win.scrollTo = ((options: { top: number; behavior: unknown }) => {
-    scrolls.push({ top: options.top, behavior: options.behavior });
-  }) as typeof win.scrollTo;
-  const proto = win.Element.prototype as unknown as {
-    getBoundingClientRect: () => DOMRect;
-    getClientRects: () => DOMRect[];
-  };
-  proto.getBoundingClientRect = function (this: Element) {
-    return boxOf(this);
-  };
-  proto.getClientRects = function (this: Element) {
-    return unrendered(this) ? [] : [boxOf(this)];
-  };
-  const script = doc.createElement('script');
-  script.setAttribute('data-parent', DASHBOARD);
-  if (channel !== null) script.setAttribute('data-channel', channel);
-  script.textContent = AGENT;
-  doc.head.appendChild(script);
-  doc.dispatchEvent(new win.Event('DOMContentLoaded'));
-  await tick();
-  const send = (data: unknown, origin = DASHBOARD, source: unknown = outer.window): void => {
-    win.dispatchEvent(new win.MessageEvent('message', { data, origin, source: source as Window }));
-  };
-  let seq = 0;
-  const framed: Framed = {
-    win,
-    doc,
-    sent,
-    scrolls,
-    send,
-    async locate(request) {
-      seq += 1;
-      const before = sent.length;
-      send({ stet: 'locate', seq, texts: [], draft: null, scroll: false, ...request });
-      await tick();
-      return sent.slice(before).find((m) => m['stet'] === 'located');
-    },
-    close: () => outer.window.close(),
-  };
-  open.push(framed);
-  return framed;
-}
-
-const located = (framed: Framed): Message[] => framed.sent.filter((m) => m['stet'] === 'located');
 
 describe('the preview agent', () => {
   it('announces itself to the dashboard window', async () => {
@@ -187,11 +92,97 @@ describe('the preview agent', () => {
     expect(reply).toMatchObject({ found: 1 });
   });
 
-  it('shows a draft with numbered placeholder tags after Save, leaving the text as rendered', async () => {
+  it('shows a tagged draft in the page’s own styling, and one out of order after Save', async () => {
+    const framed = await frame(
+      '<h1 data-stet="k_h1">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>' +
+        '<p data-stet="k_p">Hello <b>big <i>world</i></b>!</p>' +
+        '<p data-stet="k_br">  First line<br>second line.  </p>',
+    );
+    const html = (id: string): string => (framed.doc.querySelector(`[data-stet="${id}"]`) as HTMLElement).innerHTML;
+    const h1 = html('k_h1');
+    const p = html('k_p');
+    const br = html('k_br');
+
+    const headline = await framed.locate({ key: 'k_h1', tags: 1, draft: 'You may already have data<1> our AI partners need.</1>' });
+    expect(headline).toMatchObject({ found: 1, by: 'mark', draft: 'shown' });
+    expect(html('k_h1')).toBe('You may already have data<span class="tail"> our AI partners need.</span>');
+
+    const nested = await framed.locate({ key: 'k_p', tags: 2, draft: 'Hi <1>large <2>earth</2></1>?' });
+    expect(html('k_h1')).toBe(h1);
+    expect(nested).toMatchObject({ draft: 'shown' });
+    expect(html('k_p')).toBe('Hi <b>large <i>earth</i></b>?');
+
+    const broken = await framed.locate({ key: 'k_br', tags: 1, draft: 'One<1/>two.' });
+    expect(html('k_p')).toBe(p);
+    expect(broken).toMatchObject({ draft: 'shown' });
+    expect(html('k_br')).toBe('  One<br>two.  ');
+
+    const reordered = await framed.locate({ key: 'k_p', tags: 2, draft: 'Hi <2>x</2><1>y</1>' });
+    expect(html('k_br')).toBe(br);
+    expect(reordered).toMatchObject({ found: 1, draft: 'after-save' });
+    expect(html('k_p')).toBe(p);
+  });
+
+  it('shows a draft whose tags swap two sibling elements after Save, though every run has a place', async () => {
+    const framed = await frame('<p data-stet="k_p">Hello <b>big</b> and <i>world</i>!</p>');
+    const p = framed.doc.querySelector('p') as HTMLElement;
+    const reply = await framed.locate({ key: 'k_p', tags: 2, draft: 'Hi <2>x</2> and <1>y</1>!' });
+    expect(reply).toMatchObject({ found: 1, draft: 'after-save' });
+    expect(p.innerHTML).toBe('Hello <b>big</b> and <i>world</i>!');
+  });
+
+  it('writes a `<1>` draft as text for a key that declares no tags', async () => {
     const framed = await frame(PAGE);
     const reply = await framed.locate({ key: 'k_title', texts: ['Ship the copy'], draft: 'Ship <1>x</1>' });
-    expect((framed.doc.querySelector('h1') as HTMLElement).textContent).toBe('  Ship the copy  ');
-    expect(reply).toMatchObject({ found: 1, draft: 'after-save' });
+    expect((framed.doc.querySelector('h1') as HTMLElement).textContent).toBe('  Ship <1>x</1>  ');
+    expect((framed.doc.querySelector('h1') as HTMLElement).children).toHaveLength(0);
+    expect(reply).toMatchObject({ found: 1, draft: 'shown' });
+  });
+
+  it('waits for Save with a tagged draft for a key found by its text', async () => {
+    const framed = await frame(PAGE);
+    const reply = await framed.locate({ key: 'k_hello', texts: ['Hello big world'], tags: 1, draft: 'Hi <1>large</1> world' });
+    expect(reply).toMatchObject({ found: 1, by: 'text', draft: 'after-save' });
+    expect((framed.doc.getElementById('hello') as HTMLElement).innerHTML).toBe('Hello <b>big</b> world');
+  });
+
+  it('waits for Save with a tagged draft found inside a longer paragraph', async () => {
+    const framed = await frame('<p id="long">Intro: You may already have the data our AI lab partners need. More words after.</p>');
+    const before = (framed.doc.getElementById('long') as HTMLElement).innerHTML;
+    const reply = await framed.locate({
+      key: 'k_h1',
+      texts: ['You may already have the data our AI lab partners need.'],
+      tags: 1,
+      draft: 'You may already have data<1> our AI partners need.</1>',
+    });
+    expect(reply).toMatchObject({ found: 1, by: 'contained', draft: 'after-save' });
+    expect((framed.doc.getElementById('long') as HTMLElement).innerHTML).toBe(before);
+  });
+
+  it('leaves an element’s text alone for a tagged draft of a key marked on its attribute (stage-5 R9)', async () => {
+    const framed = await frame('<a data-stet-title="k" title="Hello big">Hello <b>big</b></a>');
+    const reply = await framed.locate({ key: 'k', tags: 1, draft: 'Hi <1>x</1>' });
+    expect(reply).toMatchObject({ found: 1, by: 'mark' });
+    expect((framed.doc.querySelector('a') as HTMLElement).innerHTML).toBe('Hello <b>big</b>');
+  });
+
+  it('writes a tagged draft’s markup as text', async () => {
+    const framed = await frame('<h1 data-stet="k_h1">Say<span class="tail"> hello.</span></h1>');
+    const reply = await framed.locate({ key: 'k_h1', tags: 1, draft: '<img src=x onerror=alert(1)><1> hello.</1>' });
+    expect(reply).toMatchObject({ draft: 'shown' });
+    const h1 = framed.doc.querySelector('h1') as HTMLElement;
+    expect(h1.querySelector('img')).toBeNull();
+    expect(h1.textContent).toBe('<img src=x onerror=alert(1)> hello.');
+  });
+
+  it('outlines a derived key’s source dashed, writes nothing there, and answers for the key picked', async () => {
+    const framed = await frame('<h1 data-stet="hero">You may already have the data</h1>');
+    const reply = await framed.locate({ key: 'share', mark: 'hero', dashed: true, draft: null, scroll: true, guess: true });
+    const h1 = framed.doc.querySelector('h1') as HTMLElement;
+    expect(reply).toMatchObject({ key: 'share', found: 1, by: 'mark', draft: null });
+    expect(h1.style.outline).toBe(DASHED);
+    expect(h1.textContent).toBe('You may already have the data');
+    expect(framed.scrolls).toEqual([centred(h1)]);
   });
 
   it('scrolls only when asked', async () => {
@@ -465,11 +456,38 @@ describe('the preview agent', () => {
       expect(both).toMatchObject({ found: 2, hidden: false });
       expect(framed.scrolls).toEqual([centred(framed.doc.getElementById('seen') as HTMLElement)]);
       const hidden = await framed.locate({ key: 'k2', texts: ['Only hidden'], scroll: true });
-      expect(hidden).toMatchObject({ found: 1, hidden: true });
+      // Hidden at first sight: answered as shown, and named hidden once the page has had a second to settle.
+      expect(hidden).toMatchObject({ found: 1, hidden: false });
+      await tick(1_100);
+      expect(located(framed).at(-1)).toMatchObject({ key: 'k2', found: 1, hidden: true });
       expect(framed.scrolls).toHaveLength(1);
       const head = await framed.locate({ key: 'k3', texts: ['nowhere'] });
       expect(head).toMatchObject({ found: 0, hidden: false });
-    });
+    }, 5_000);
+
+    it('looks again when an entrance ends, and names a key hidden only if it still is (journey B19)', async () => {
+      const framed = await frame('<div id="in" style="display: none"><h1 id="h">Arriving headline</h1></div><p id="other">Other words</p>');
+      const first = await framed.locate({ key: 'k1', texts: ['Arriving headline'], scroll: true });
+      expect(first).toMatchObject({ found: 1, hidden: false });
+      expect(framed.scrolls).toHaveLength(0);
+      // An end on an element that holds no hit changes nothing.
+      const other = framed.doc.getElementById('other') as HTMLElement;
+      other.dispatchEvent(new framed.win.Event('transitionend', { bubbles: true }));
+      const wrap = framed.doc.getElementById('in') as HTMLElement;
+      wrap.removeAttribute('style');
+      wrap.dispatchEvent(new framed.win.Event('animationend', { bubbles: true }));
+      expect(framed.scrolls).toEqual([centred(framed.doc.getElementById('h') as HTMLElement)]);
+      await tick(1_100);
+      expect(located(framed).filter((m) => m['hidden'] === true)).toEqual([]);
+    }, 5_000);
+
+    it('ends the wait when another key is picked', async () => {
+      const framed = await frame('<nav hidden><p>Only hidden</p></nav><p>Seen words</p>');
+      await framed.locate({ key: 'k2', texts: ['Only hidden'] });
+      await framed.locate({ key: 'k3', texts: ['Seen words'] });
+      await tick(1_100);
+      expect(located(framed).filter((m) => m['hidden'] === true)).toEqual([]);
+    }, 5_000);
 
     it('scrolls a site’s own scrolling box by scrollTop, then the frame’s window', async () => {
       const framed = await frame('<div id="box" style="overflow-y: auto"><p>Filler</p><p id="far">Far down words</p></div>');

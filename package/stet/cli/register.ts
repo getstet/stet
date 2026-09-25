@@ -368,15 +368,26 @@ function registerHtml(d: {
   for (const document of plan.edited) {
     if (document.diff !== '') report.line(document.diff);
   }
-  if (plan.marked === 0) {
+  const derivations = [...plan.derived, ...plan.converted].sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+  for (const derivation of derivations) {
+    report.line(
+      `${derivation.file}:${derivation.line} ${derivation.key} derives from ${derivation.source} ` +
+        `through ${JSON.stringify(derivation.tmpl)}`,
+    );
+  }
+  const converted = plan.converted.length;
+  if (plan.marked === 0 && converted === 0) {
     report.line('register: nothing to adopt');
     return report.emit(io);
   }
   if (!write) {
-    report.line(
-      `register: run with --write to apply ${plural(plan.marked, 'mark')} ` +
-        `across ${plural(plan.edited.length, 'document')}`,
-    );
+    const parts = [
+      ...(plan.marked === 0
+        ? []
+        : [`apply ${plural(plan.marked, 'mark')} across ${plural(plan.edited.length, 'document')}`]),
+      ...(converted === 0 ? [] : [`derive ${plural(converted, 'key')} from the page's visible text`]),
+    ];
+    report.line(`register: run with --write to ${parts.join(' and ')}`);
     return report.emit(io);
   }
   try {
@@ -388,11 +399,19 @@ function registerHtml(d: {
   } catch (error) {
     rethrowBatchFailure('stet register --write', error);
   }
-  report.line(
-    `wrote ${config.descriptorPath}, ${config.snapshotPath} and ` +
-      `${plural(plan.edited.length, 'document')}: ${plural(plan.added, 'key')} added, ` +
-      `${plan.shared} shared`,
-  );
+  if (plan.marked > 0) {
+    report.line(
+      `wrote ${config.descriptorPath}, ${config.snapshotPath} and ` +
+        `${plural(plan.edited.length, 'document')}: ${plural(plan.added, 'key')} added, ` +
+        `${plan.shared} shared`,
+    );
+  }
+  if (converted > 0) {
+    report.line(
+      `wrote ${config.descriptorPath} and ${config.snapshotPath}: ` +
+        `${plural(converted, 'key')} now derived from the page's visible text; their documents are unchanged`,
+    );
+  }
   report.line('register: applied');
   return report.emit(io);
 }

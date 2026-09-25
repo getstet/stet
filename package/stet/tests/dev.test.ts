@@ -28,12 +28,12 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 
-import { JSDOM, VirtualConsole } from 'jsdom';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
 import { cleanupCliHosts, fakeFetch, htmlFixture, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
 import { cleanupEmailHosts, makeEmailHost } from './helpers/email-host.js';
+import { handlerOver, NONCE, paintPage, req, TOKEN, type PaintedPage } from './helpers/dashboard-page.js';
 import { builtBinExists, installStetShim } from './helpers/stet-shim.js';
 import { writeJsonDeterministic } from '../cli/artifacts.js';
 import { check } from '../cli/check.js';
@@ -54,7 +54,9 @@ import { runHookInstall } from '../cli/hook.js';
 import { gone } from '../cli/liveness.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
-import { loadDescriptor, loadSnapshot } from '../src/index.js';
+import { loadDescriptor, loadSnapshot, resolve } from '../src/index.js';
+import { derivedText } from '../src/resolve.js';
+import { PLACEHOLDER } from '../src/validate.js';
 import type { Descriptor } from '../src/types.js';
 import {
   addSite,
@@ -684,49 +686,6 @@ describe('devDefaults', () => {
 });
 
 // --- the handler ------------------------------------------------------------
-
-const TOKEN = 'dev-run-token';
-
-/** A handler over a workspace holding the given checkouts, with a page of known text. */
-function handlerOver(paths: string[], over: Partial<DevContext> = {}): {
-  handler: (req: Request) => Promise<Response>;
-  ctx: DevContext;
-  file: string;
-  origin: string;
-} {
-  const file = workspaceFile();
-  for (const path of paths) addSite(file, path);
-  const origin = 'http://127.0.0.1:4400';
-  const ctx: DevContext = {
-    token: TOKEN,
-    origin,
-    workspaceFile: file,
-    io: { cwd: tempDir(), env: {}, stdout: () => {}, stderr: () => {} },
-    page: '<style nonce="__STET_NONCE__"></style><script nonce="__STET_NONCE__"></script>',
-    fetchImpl: globalThis.fetch,
-    children: new Map(),
-    stores: new Map(),
-    queues: new Map(),
-    ...over,
-  };
-  return { handler: createDevHandler(ctx), ctx, file, origin };
-}
-
-/** A request at the dashboard's own origin, with the run token unless told otherwise. */
-function req(
-  path: string,
-  init: { method?: string; token?: string | null; host?: string | null; headers?: Record<string, string>; body?: unknown } = {},
-): Request {
-  const headers: Record<string, string> = { ...init.headers };
-  if (init.host !== null) headers['host'] = init.host ?? '127.0.0.1:4400';
-  if (init.token !== null) headers['authorization'] = `Bearer ${init.token ?? TOKEN}`;
-  const method = init.method ?? 'GET';
-  return new Request(`http://127.0.0.1:4400${path}`, {
-    method,
-    headers,
-    ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
-  });
-}
 
 describe('the handler — the guards every request passes', () => {
   it('refuses a wrong or missing Host on the page, the API and the static files', async () => {
@@ -1460,6 +1419,234 @@ describe('POST /api/site/save', () => {
     expect(body['error']).toBe('a store-backed site is edited through its mounted API — use Save draft');
   });
 
+  describe('derived keys', () => {
+    const bytes = (host: CliHost): Buffer[] =>
+      ['content/descriptor.json', 'content/defaults.json', 'index.html'].map((rel) => readFileSync(join(host.cwd, rel)));
+
+    it('takes a derived key’s template alone, and refuses everything else first (journey C1)', async () => {
+      const host = await psyonHost();
+      const { handler } = handlerOver([host.cwd]);
+      const before = bytes(host);
+      const refusals = [
+        { values: [{ key: 'share_description', value: 'A value of its own' }] },
+        { templates: [{ key: 'hero_headline', tmpl: '{v}!' }] },
+        { templates: [{ key: 'share_description', tmpl: 'No placeholder.' }] },
+        { templates: [{ key: 'share_description', tmpl: '{v} and {v}' }] },
+      ];
+      const answers = [];
+      for (const body of refusals) answers.push(await post(handler, `/api/site/save${at(host)}`, body));
+      expect(answers).toEqual([
+        { status: 400, body: { error: 'share_description derives from hero_headline — edit its template instead' } },
+        { status: 400, body: { error: 'hero_headline is not a derived key' } },
+        { status: 400, body: { error: 'the template of share_description must hold {v} exactly once' } },
+        { status: 400, body: { error: 'the template of share_description must hold {v} exactly once' } },
+      ]);
+      expect(bytes(host)).toEqual(before);
+
+      const saved = await post(handler, `/api/site/save${at(host)}`, {
+        templates: [{ key: 'share_description', tmpl: '{v} Start with a call.' }],
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body['written']).toEqual(['content/descriptor.json', 'index.html']);
+      expect(JSON.parse(host.file('content/descriptor.json')).keys.share_description.tmpl).toBe('{v} Start with a call.');
+      expect(host.file('index.html')).toContain(
+        'content="You may already have the data our AI lab partners need. Start with a call."',
+      );
+      const made = await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['pending'] });
+      expect(made.body['subject']).toBe('stet: 1 key updated — share_description');
+    });
+
+    it('moves a derived share description with its headline, and refuses one pushed past its limit (journeys C1, B17)', async () => {
+      const host = await psyonHost();
+      const { handler } = handlerOver([host.cwd]);
+      const saved = await post(handler, `/api/site/save${at(host)}`, {
+        values: [{ key: 'hero_headline', value: 'You may already have data<1> our AI lab partners need.</1>' }],
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body['written']).toEqual(['content/defaults.json', 'index.html']);
+      expect(host.file('index.html')).toContain(
+        'content="You may already have data our AI lab partners need. No raw data is needed to start."',
+      );
+      expect(host.file('index.html')).toContain('>You may already have data<span class="tail"> our AI lab partners need.</span></h1>');
+      const made = await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['pending'] });
+      expect(made.body['subject']).toBe('stet: 2 keys updated — hero_headline, share_description');
+
+      const before = bytes(host);
+      const refused = await post(handler, `/api/site/save${at(host)}`, {
+        values: [{ key: 'hero_headline', value: 'You may already have all of the data<1> our AI lab research partners need today.</1>' }],
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body['findings']).toEqual([expect.objectContaining({ kind: 'limit', key: 'share_description' })]);
+      expect(bytes(host)).toEqual(before);
+    });
+
+    it('refuses a value for a derived key on a JavaScript host, and saves its template', async () => {
+      const host = snapshotHost();
+      const { handler } = handlerOver([host.cwd]);
+      const before = forms(host.cwd);
+      expect(
+        await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'seo_home_title', value: 'Home' }] }),
+      ).toEqual({ status: 400, body: { error: 'seo_home_title derives from hero_headline — edit its template instead' } });
+      expect(forms(host.cwd)).toEqual(before);
+      const saved = await post(handler, `/api/site/save${at(host)}`, {
+        templates: [{ key: 'seo_home_title', tmpl: '{v} | Mirra' }],
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body['written']).toContain('content/descriptor.json');
+      expect(JSON.parse(host.file('content/descriptor.json')).keys.seo_home_title.tmpl).toBe('{v} | Mirra');
+    });
+
+    it('refuses an undeclared or `constructor` key in values and in templates', async () => {
+      const host = await psyonHost();
+      const { handler } = handlerOver([host.cwd]);
+      for (const key of ['nope', 'constructor']) {
+        expect(await post(handler, `/api/site/save${at(host)}`, { values: [{ key, value: 'x' }] })).toEqual({
+          status: 400,
+          body: { error: `undeclared key: ${key}` },
+        });
+        expect(await post(handler, `/api/site/save${at(host)}`, { templates: [{ key, tmpl: '{v}' }] })).toEqual({
+          status: 400,
+          body: { error: `undeclared key: ${key}` },
+        });
+      }
+      const empty = await handler(req(`/api/site/save${at(host)}`, { method: 'POST', body: {} }));
+      expect(empty.status).toBe(400);
+      expect(await empty.json()).toEqual({ error: 'values or templates is required' });
+      const malformed = await handler(req(`/api/site/save${at(host)}`, { method: 'POST', body: { templates: ['x'] } }));
+      expect(malformed.status).toBe(400);
+      expect(await malformed.json()).toEqual({ error: 'each template is { key, tmpl }' });
+    });
+
+    for (const chain of ['a_chain', 'z_chain']) {
+      it(`gates a key two links from the edit, named ${chain}`, async () => {
+        const host = await deriveHost((d) => {
+          d.keys[chain] = {
+            shape: 'text',
+            target: 'web',
+            derivesFrom: DERIVE_KEYS.title,
+            tmpl: '{v} and so on',
+            limits: { max: 45, severity: 'hard' },
+          };
+        });
+        const { handler } = handlerOver([host.cwd]);
+        const refused = await post(handler, `/api/site/save${at(host)}`, {
+          values: [{ key: DERIVE_KEYS.h1, value: 'Ship the whole catalogue <1>in a day now!</1>' }],
+        });
+        expect(refused.status).toBe(409);
+        expect((refused.body['findings'] as Array<{ key?: string }>).map((f) => f.key)).toEqual([chain]);
+      });
+    }
+
+    const de = { locales: { default: 'default', enabled: ['default', 'de'] } };
+
+    it('gates a derived key’s resolution in the locale its source’s value moves', async () => {
+      const host = await deriveHost((d) => {
+        (d.keys[DERIVE_KEYS.title] as { limits?: unknown }).limits = { max: 40, severity: 'hard' };
+      }, de);
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/save${at(host)}`, {
+        values: [{ key: DERIVE_KEYS.h1, locale: 'de', value: 'Den ganzen Katalog versenden <1>an einem einzigen Tag</1>' }],
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body['findings']).toEqual([
+        expect.objectContaining({ key: DERIVE_KEYS.title, message: expect.stringContaining('(de)') }),
+      ]);
+    });
+
+    it('saves a default edit that leaves an overrun already in de alone', async () => {
+      const host = await deriveHost((d, snapshot) => {
+        (d.keys[DERIVE_KEYS.title] as { limits?: unknown }).limits = { max: 40, severity: 'hard' };
+        snapshot['de'] = { [DERIVE_KEYS.h1]: 'Den ganzen Katalog versenden <1>an einem einzigen Tag</1>' };
+      }, de);
+      const { handler } = handlerOver([host.cwd]);
+      const saved = await post(handler, `/api/site/save${at(host)}`, {
+        values: [{ key: DERIVE_KEYS.h1, value: 'Ship it <1>today</1>' }],
+      });
+      expect(saved.status).toBe(200);
+    });
+
+    it('reports a derived key’s overrun once where both locales resolve alike', async () => {
+      const host = await deriveHost((d) => {
+        (d.keys[DERIVE_KEYS.title] as { limits?: unknown }).limits = { max: 20, severity: 'hard' };
+      }, de);
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/save${at(host)}`, {
+        values: [{ key: DERIVE_KEYS.h1, value: 'Ship the whole catalogue <1>in a day now</1>' }],
+      });
+      expect(refused.status).toBe(409);
+      expect((refused.body['findings'] as Array<{ key?: string; kind: string }>).filter((f) => f.key === DERIVE_KEYS.title)).toEqual([
+        expect.objectContaining({ kind: 'limit' }),
+      ]);
+    });
+
+    it('refuses a template that pushes its derived key past a hard limit, and changes nothing (stage-5 R1)', async () => {
+      const host = await deriveHost((d) => {
+        (d.keys[DERIVE_KEYS.title] as { limits?: unknown }).limits = { max: 40, severity: 'hard' };
+      });
+      const { handler } = handlerOver([host.cwd]);
+      const before = ['content/descriptor.json', 'index.html'].map((rel) => readFileSync(join(host.cwd, rel)));
+      const refused = await post(handler, `/api/site/save${at(host)}`, {
+        templates: [{ key: DERIVE_KEYS.title, tmpl: 'Every single day, all year: {v}' }],
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body['findings']).toEqual([expect.objectContaining({ kind: 'limit', key: DERIVE_KEYS.title })]);
+      expect(['content/descriptor.json', 'index.html'].map((rel) => readFileSync(join(host.cwd, rel)))).toEqual(before);
+    });
+
+    it('writes the descriptor through the batch for a template alone', async () => {
+      const host = await deriveHost();
+      const { handler } = handlerOver([host.cwd]);
+      const saved = await post(handler, `/api/site/save${at(host)}`, {
+        templates: [{ key: DERIVE_KEYS.title, tmpl: 'Now: {v}' }],
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body['written']).toEqual(['content/descriptor.json', 'index.html']);
+      expect(host.file('index.html')).toContain('>Now: Ship the catalogue in a day</title>');
+    });
+  });
+
+  describe('the commit subject names the derived keys whose text changed', () => {
+    const subjectOf = (host: CliHost): string => git(host.cwd, ['log', '-1', '--format=%s']).out.trim();
+
+    it('titles a descriptor-only commit by the template it carries, not the value left on disk', async () => {
+      const host = await deriveHost();
+      const { handler } = handlerOver([host.cwd]);
+      await post(handler, `/api/site/save${at(host)}`, {
+        values: [{ key: DERIVE_KEYS.p, value: 'Plans from ten up, for every product page.' }],
+      });
+      await post(handler, `/api/site/save${at(host)}`, { templates: [{ key: DERIVE_KEYS.title, tmpl: 'Now: {v}' }] });
+      const made = await post(handler, `/api/site/commit${at(host)}`, { files: ['content/descriptor.json'] });
+      expect(made.status).toBe(200);
+      expect(subjectOf(host)).toBe(`stet: 1 key updated — ${DERIVE_KEYS.title}`);
+    });
+
+    it('titles a snapshot-only commit by the value it carries, not the template left on disk', async () => {
+      const host = await deriveHost();
+      const { handler } = handlerOver([host.cwd]);
+      await post(handler, `/api/site/save${at(host)}`, { templates: [{ key: DERIVE_KEYS.title, tmpl: 'Now: {v}' }] });
+      await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'start_a_trial', value: 'Try it now' }] });
+      const made = await post(handler, `/api/site/commit${at(host)}`, { files: ['content/defaults.json'] });
+      expect(made.status).toBe(200);
+      expect(subjectOf(host)).toBe('stet: 1 key updated — start_a_trial');
+    });
+
+    it('reads a descriptor HEAD holds but cannot load as the one on disk, and the commit lands', async () => {
+      const host = await psyonHost();
+      const valid = host.file('content/descriptor.json');
+      writeFileSync(join(host.cwd, 'content/descriptor.json'), '{ "version": 1, "keys": { "x": { "shape": "nope" } } }\n');
+      git(host.cwd, ['commit', '-qam', 'a descriptor stet refuses']);
+      writeFileSync(join(host.cwd, 'content/descriptor.json'), valid);
+      const { handler } = handlerOver([host.cwd]);
+      const saved = await post(handler, `/api/site/save${at(host)}`, {
+        values: [{ key: 'hero_headline', value: 'You may already have data<1> our AI lab partners need.</1>' }],
+      });
+      expect(saved.body['pending']).toContain('content/descriptor.json');
+      const made = await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['pending'] });
+      expect(made.status).toBe(200);
+      expect(subjectOf(host)).toBe('stet: 2 keys updated — hero_headline, share_description');
+    });
+  });
+
   it('regenerates an html host’s documents, and inherits the batch’s own refusal (journey B17)', async () => {
     const html = await makeHtmlHost({ register: true, git: true });
     gitInit(html.cwd);
@@ -1496,6 +1683,62 @@ describe('POST /api/site/save', () => {
     expect(String(refused.body['error'])).toContain('could not be regenerated');
   });
 });
+
+/** The psyon shape on a static-HTML host: a tagged headline and a share description derived from it, its limit 100, committed. */
+async function psyonHost(): Promise<CliHost> {
+  const host = await makeHtmlHost({
+    files: {
+      'index.html':
+        '<!DOCTYPE html>\n<html><head>\n<meta property="og:description" content="You may already have the data our AI lab ' +
+        'partners need. No raw data is needed to start." data-stet-content="share_description">\n</head><body>\n' +
+        '<h1 data-stet="hero_headline">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>\n' +
+        '</body></html>\n',
+    },
+    keys: {
+      hero_headline: { shape: 'text', target: 'web', tags: 1 },
+      share_description: {
+        shape: 'text',
+        target: 'web',
+        derivesFrom: 'hero_headline',
+        tmpl: '{v} No raw data is needed to start.',
+        limits: { max: 100, severity: 'hard' },
+      },
+    },
+    defaults: { hero_headline: 'You may already have the data<1> our AI lab partners need.</1>' },
+  });
+  // In the forms' own spelling, so a save rewrites only what it changes.
+  for (const rel of ['content/descriptor.json', 'content/defaults.json']) {
+    writeJsonDeterministic(join(host.cwd, rel), JSON.parse(host.file(rel)));
+  }
+  gitInit(host.cwd);
+  return host;
+}
+
+/** `derive.html` registered, edited as a case needs, and committed. */
+async function deriveHost(
+  edit: (descriptor: Descriptor, snapshot: Record<string, Record<string, unknown>>) => void = () => {},
+  config?: Record<string, unknown>,
+): Promise<CliHost> {
+  const host = await makeHtmlHost({
+    files: { 'index.html': htmlFixture('derive.html') },
+    register: true,
+    ...(config === undefined ? {} : { config }),
+  });
+  const descriptor = JSON.parse(host.file('content/descriptor.json')) as Descriptor;
+  const snapshot = JSON.parse(host.file('content/defaults.json')) as Record<string, Record<string, unknown>>;
+  edit(descriptor, snapshot);
+  writeJsonDeterministic(join(host.cwd, 'content/descriptor.json'), descriptor);
+  writeJsonDeterministic(join(host.cwd, 'content/defaults.json'), snapshot);
+  gitInit(host.cwd);
+  return host;
+}
+/** `derive.html`'s keys once registered. */
+const DERIVE_KEYS = {
+  h1: 'ship_the_catalogue_in_a_day',
+  title: 'ship_the_catalogue_in_a_day_2',
+  p: 'plans_from_and_up_for_every_product_page',
+  description: 'plans_from_and_up_for_every_product',
+};
 
 describe('POST /api/site/commit and /push', () => {
   const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
@@ -1570,7 +1813,8 @@ describe('POST /api/site/commit and /push', () => {
     setHeadline(host.cwd, 'Only this one');
     const made = await post(handler0(host), `/api/site/commit${at(host)}`, { files: ['content/defaults.json'] });
     expect(made.status).toBe(200);
-    expect(made.body['subject']).toBe('stet: 1 key updated — hero_headline');
+    // `seo_home_title` derives from the headline, so its text changed too.
+    expect(made.body['subject']).toBe('stet: 2 keys updated — hero_headline, seo_home_title');
   });
 
   it('agrees the count with the noun, and clips a long list at 72', async () => {
@@ -1769,6 +2013,12 @@ function gitInitWithout(top: string, left: string): void {
   git(top, ['commit', '-qm', 'base']);
 }
 
+/** The keys the checkout's descriptor derives from another. */
+function derivedIn(cwd: string): string[] {
+  const keys = (JSON.parse(readFileSync(join(cwd, 'content/descriptor.json'), 'utf8')) as Descriptor).keys;
+  return Object.keys(keys).filter((key) => keys[key]?.derivesFrom !== undefined);
+}
+
 /** A subject as the commit route clips it. */
 const clip72 = (text: string): string => (text.length <= 72 ? text : `${text.slice(0, 71)}…`);
 
@@ -1924,7 +2174,10 @@ describe('the committable files', () => {
         const saved = await save(handler, t);
         const made = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
         expect(made.status).toBe(200);
-        expect(made.body['subject']).toBe(`stet: 1 key updated — ${t.key}`);
+        // The JavaScript twin's `seo_home_title` derives from its headline, so its text changed too.
+        expect(made.body['subject']).toBe(
+          kind === 'js' ? 'stet: 2 keys updated — hero_headline, seo_home_title' : `stet: 1 key updated — ${t.key}`,
+        );
         expect(made.body['pending']).toEqual([]);
         expect(git(t.cwd, ['show', '--name-only', '--format=', 'HEAD']).out.trim().split('\n').sort()).toEqual(t.written);
       });
@@ -1948,8 +2201,9 @@ describe('the committable files', () => {
         const made = await post(handler, `/api/site/commit${at(t)}`, { files: ['content/defaults.json'] });
         expect(made.status).toBe(200);
         const snapshot = JSON.parse(readFileSync(join(t.cwd, 'content/defaults.json'), 'utf8')) as Record<string, object>;
-        const keys = [...new Set(Object.values(snapshot).flatMap((block) => Object.keys(block)))].sort();
-        expect(keys.length).toBeGreaterThan(1);
+        // HEAD holds no snapshot, so every key on disk changed, the derived ones with their sources.
+        const keys = [...new Set([...Object.values(snapshot).flatMap((block) => Object.keys(block)), ...derivedIn(t.cwd)])].sort();
+        expect(keys.length).toBe(kind === 'js' ? 25 : Object.keys((snapshot as Record<string, object>)['default'] ?? {}).length);
         expect(subject(t.cwd)).toBe(clip72(`stet: ${keys.length} keys updated — ${keys.join(', ')}`));
       });
 
@@ -2095,7 +2349,11 @@ describe('the committable files', () => {
         const { handler } = handlerOver([t.cwd]);
         const made = await post(handler, `/api/site/commit${at(t)}`, { files: ['content/defaults.json'] });
         expect(made.status).toBe(200);
-        const keys = [...new Set(Object.values(repaired).flatMap((block) => Object.keys(block as object)))].sort();
+        // HEAD's snapshot is refused, so every key on disk changed, the derived ones with their sources.
+        const keys = [
+          ...new Set([...Object.values(repaired).flatMap((block) => Object.keys(block as object)), ...derivedIn(t.cwd)]),
+        ].sort();
+        if (kind === 'js') expect(keys.length).toBe(25);
         expect(subject(t.cwd)).toBe(clip72(`stet: ${keys.length} keys updated — ${keys.join(', ')}`));
       });
     });
@@ -3005,14 +3263,205 @@ describe('GET /api/site/marks', () => {
     expect(shared.map(([, files]) => [...files].sort())).toEqual([['index.html', 'notes.html']]);
   });
 
-  it('answers nothing on a JavaScript host, and 401 without the Bearer', async () => {
+  it('answers the source reads on a JavaScript host, and 401 without the Bearer', async () => {
     const js = snapshotHost();
-    expect(await marksOf(js)).toEqual({ documents: [], keys: {} });
+    writeFileSync(
+      join(js.cwd, 'stet.config.json'),
+      JSON.stringify({ project: 't', managedSurfaces: ['src/**/*.astro'] }, null, 2),
+    );
+    write(js.cwd, 'src/pages/index.astro', "---\n---\n<main>\n  <h1>{copy.get('hero_headline')}</h1>\n</main>\n");
+    expect(await marksOf(js)).toEqual({
+      documents: [],
+      keys: {},
+      places: { hero_headline: [{ file: 'src/pages/index.astro', line: 4, tag: 'h1' }] },
+    });
     const { handler } = handlerOver([js.cwd]);
     const refused = await handler(
       req(`/api/site/marks?site=${encodeURIComponent(realpathSync(js.cwd))}`, { token: null }),
     );
     expect(refused.status).toBe(401);
+  });
+
+  it('places each mark of an html host: its file, line, tag, and a meta’s attribute and name', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': htmlFixture('derive.html') }, register: true });
+    const { places } = await marksOf(host);
+    expect(places['ship_the_catalogue_in_a_day_2']).toEqual([
+      { file: 'index.html', line: 5, tag: 'title', head: true },
+      { file: 'index.html', line: 7, tag: 'meta', attr: 'content', meta: 'og:title', head: true },
+    ]);
+    expect(places['plans_from_and_up_for_every_product']).toEqual([
+      { file: 'index.html', line: 6, tag: 'meta', attr: 'content', meta: 'description', head: true },
+    ]);
+    expect(places['start_a_trial_today_and_see_the_whole']).toEqual([
+      { file: 'index.html', line: 8, tag: 'meta', attr: 'content', meta: 'og:description', head: true },
+    ]);
+    expect(places['reship_the_whole_catalogue']).toEqual([
+      { file: 'index.html', line: 9, tag: 'meta', attr: 'content', meta: 'twitter:description', head: true },
+    ]);
+    expect(places['ship_the_catalogue_in_a_day']).toEqual([{ file: 'index.html', line: 14, tag: 'h1' }]);
+    expect(places['everything_we_ship']).toEqual([
+      { file: 'index.html', line: 18, tag: 'h3' },
+      { file: 'index.html', line: 12, tag: 'nav', attr: 'aria-label' },
+    ]);
+  });
+
+  it('places a `<title>` inside an `<svg>` as the graphic’s', async () => {
+    const page =
+      '<!DOCTYPE html>\n<html><head><title data-stet="t">Acme</title></head><body>\n' +
+      '<button><svg viewBox="0 0 1 1"><title data-stet="close">Close the menu</title></svg></button>\n</body></html>\n';
+    const host = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: { t: { shape: 'text', target: 'web' }, close: { shape: 'text', target: 'web' } },
+      defaults: { t: 'Acme', close: 'Close the menu' },
+    });
+    const { places } = await marksOf(host);
+    expect(places['close']).toEqual([{ file: 'index.html', line: 3, tag: 'title', svg: true }]);
+    expect(places['t']).toEqual([{ file: 'index.html', line: 2, tag: 'title', head: true }]);
+  });
+
+  describe('on a JavaScript host', () => {
+    /** The mini project with the given managed files, reading `src/**` and one copy module. */
+    function readsHost(files: Record<string, string>): CliHost {
+      const host = snapshotHost();
+      writeFileSync(
+        join(host.cwd, 'stet.config.json'),
+        JSON.stringify(
+          {
+            project: 't',
+            managedSurfaces: ['src/**/*.astro', 'src/**/*.vue', 'src/**/*.tsx'],
+            copyModules: ['content/copy.ts'],
+          },
+          null,
+          2,
+        ),
+      );
+      for (const [rel, text] of Object.entries(files)) write(host.cwd, rel, text);
+      return host;
+    }
+
+    it('places each declared read: the element around it, or the file alone', async () => {
+      const host = readsHost({
+        'src/pages/index.astro':
+          "---\nconst name = copy('brand__name');\n---\n<main>\n  <h1>{copy.get('hero_headline')}</h1>\n" +
+          "  <a href=\"/docs\">{copy.hero_body}</a>\n  <p>{copy.get('not_declared')} {copy.constructor}</p>\n</main>\n",
+        'content/copy.ts': "export const price = copyMap.pricing_price;\n",
+      });
+      expect((await marksOf(host)).places).toEqual({
+        brand__name: [{ file: 'src/pages/index.astro', line: 2 }],
+        hero_headline: [{ file: 'src/pages/index.astro', line: 5, tag: 'h1' }],
+        hero_body: [{ file: 'src/pages/index.astro', line: 6, tag: 'a' }],
+        pricing_price: [{ file: 'content/copy.ts', line: 1 }],
+      });
+    });
+
+    // Root reads through mode 000, and a virtiofs mount can ignore the mode, so
+    // the case proves nothing there.
+    it.skipIf(process.getuid?.() === 0)('answers 200 with a managed file it cannot read', async () => {
+      const host = readsHost({
+        'src/pages/index.astro': "<h1>{copy.get('hero_headline')}</h1>\n",
+        'src/pages/locked.astro': "<p>{copy.get('hero_body')}</p>\n",
+      });
+      chmodSync(join(host.cwd, 'src/pages/locked.astro'), 0o000);
+      try {
+        const { handler } = handlerOver([host.cwd]);
+        const res = await handler(req(`/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`));
+        expect(res.status).toBe(200);
+        expect(((await res.json()) as { places: unknown }).places).toEqual({
+          hero_headline: [{ file: 'src/pages/index.astro', line: 1, tag: 'h1' }],
+        });
+      } finally {
+        chmodSync(join(host.cwd, 'src/pages/locked.astro'), 0o644);
+      }
+    });
+
+    it('gives a read in a comment or a script no tag, and a bare one its element', async () => {
+      const host = readsHost({
+        'src/a.astro':
+          "<p><!-- {copy.get('hero_headline')} --></p>\n<p><script>const s = copy.get('hero_body');</script></p>\n" +
+          "<p>{copy.get('blog_intro')}</p>\n",
+      });
+      const { places } = await marksOf(host);
+      expect(places['hero_headline']).toEqual([{ file: 'src/a.astro', line: 1 }]);
+      expect(places['hero_body']).toEqual([{ file: 'src/a.astro', line: 2 }]);
+      expect(places['blog_intro']).toEqual([{ file: 'src/a.astro', line: 3, tag: 'p' }]);
+    });
+
+    it('reads a .vue file’s template as its markup, and its script as none', async () => {
+      const host = readsHost({
+        'src/Hero.vue':
+          "<template>\n  <section>\n    <h1>{{ copy.get('hero_headline') }}</h1>\n  </section>\n</template>\n" +
+          "<script setup>\nconst x = copy.get('hero_body');\n</script>\n",
+      });
+      const { places } = await marksOf(host);
+      expect(places['hero_headline']).toEqual([{ file: 'src/Hero.vue', line: 3, tag: 'h1' }]);
+      expect(places['hero_body']).toEqual([{ file: 'src/Hero.vue', line: 7 }]);
+    });
+
+    it('reads a head read as its meta, and a `<title>` as the page title', async () => {
+      const host = readsHost({
+        'src/Base.astro':
+          "---\n---\n<head>\n<meta name=\"description\" content={copy.get('hero_headline')}>\n" +
+          "<meta property=\"og:title\" content={copy.hero_body} />\n<title>{copy.get('blog_intro')}</title>\n</head>\n",
+      });
+      const { places } = await marksOf(host);
+      expect(places['hero_headline']).toEqual([
+        { file: 'src/Base.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true },
+      ]);
+      expect(places['hero_body']).toEqual([
+        { file: 'src/Base.astro', line: 5, tag: 'meta', attr: 'content', meta: 'og:title', head: true },
+      ]);
+      expect(places['blog_intro']).toEqual([{ file: 'src/Base.astro', line: 6, tag: 'title', head: true }]);
+    });
+
+    it('counts braces only in markup, so a brace in frontmatter masks nothing (stage-5 R4)', async () => {
+      const host = readsHost({
+        'src/pages/index.astro':
+          "---\nconst open = '{';\n---\n<head><meta name=\"description\" content={copy.get('hero_body')}></head>\n" +
+          "<h1>{copy.get('hero_headline')}</h1>\n",
+      });
+      const { places } = await marksOf(host);
+      expect(places['hero_body']).toEqual([
+        { file: 'src/pages/index.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true },
+      ]);
+      expect(places['hero_headline']).toEqual([{ file: 'src/pages/index.astro', line: 5, tag: 'h1' }]);
+    });
+
+    it('answers 5,000 reads in a 185,000-byte file within 200 ms', async () => {
+      const host = readsHost({ 'src/big.tsx': "const a = copy.get('hero_headline');\n".repeat(5000) });
+      expect(readFileSync(join(host.cwd, 'src/big.tsx')).length).toBe(185_000);
+      const { handler } = handlerOver([host.cwd]);
+      const path = `/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+      await get(handler, `/api/site?site=${encodeURIComponent(realpathSync(host.cwd))}`);
+      const started = performance.now();
+      const { places } = await get(handler, path);
+      const took = performance.now() - started;
+      expect(places['hero_headline']).toHaveLength(5000);
+      expect(places['hero_headline'].at(-1)).toEqual({ file: 'src/big.tsx', line: 5000 });
+      expect(took).toBeLessThan(200);
+    });
+
+    it('answers a read inside markup too deep for the walk with its file and line', async () => {
+      const host = readsHost({
+        'src/deep.astro': '<div>'.repeat(5000) + "{copy.get('hero_headline')}" + '</div>'.repeat(5000) + '\n',
+      });
+      const { handler } = handlerOver([host.cwd]);
+      const res = await handler(req(`/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`));
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { places: Record<string, unknown[]> }).places['hero_headline']).toEqual([
+        { file: 'src/deep.astro', line: 1 },
+      ]);
+    });
+
+    it('answers a 64 KiB run of spaces after `copy` within 200 ms', async () => {
+      const host = readsHost({ 'src/spaces.astro': `<p>{copy${' '.repeat(65_536)}}</p>\n<p>{copy.get('hero_body')}</p>\n` });
+      const { handler } = handlerOver([host.cwd]);
+      const path = `/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+      await get(handler, `/api/site?site=${encodeURIComponent(realpathSync(host.cwd))}`);
+      const started = performance.now();
+      const { places } = await get(handler, path);
+      expect(performance.now() - started).toBeLessThan(200);
+      expect(places['hero_body']).toEqual([{ file: 'src/spaces.astro', line: 2, tag: 'p' }]);
+    });
   });
 });
 
@@ -3524,7 +3973,6 @@ describe('the static-HTML site’s own files', () => {
  * caught by the page's own guard and lands in the toast, which each step reads.
  */
 describe('the page', () => {
-  const NONCE = 'test-nonce';
   const SITE_ID = 'aaaaaaaaaaaa';
 
   const descriptor: Descriptor = {
@@ -3624,7 +4072,7 @@ describe('the page', () => {
         200,
         {
           editor: 'dashboard:test',
-          version: '0.3.1',
+          version: '0.3.2',
           sites: [
             { state: 'ready', name: 'mini', path: '/checkouts/mini', id: SITE_ID, mode: site['mode'], keys: 11, host: 'js', router: 'astro', project: 'default' },
             { state: 'ready', name: 'other', path: '/checkouts/other', id: 'dddddddddddd', mode: 'snapshot', keys: 4, host: 'html', router: 'app', project: 'other-site' },
@@ -3673,7 +4121,7 @@ describe('the page', () => {
       ['/api/site/dev-log', 200, { running: false, state: 'none', lines: [] }],
       ['/api/site/dev-start', 200, { running: true, state: 'running', pid: 1234, command: 'npx astro dev', lines: [] }],
       ['/api/site/dev-stop', 200, { running: false, state: 'stopped', lines: [] }],
-      ['/api/site/marks', 200, { documents: [], keys: {} }],
+      ['/api/site/marks', 200, { documents: [], keys: {}, places: {} }],
       [`/s/${SITE_ID}/api/stet/recent`, 200, { rows: [{ id: 3, key: 'hero_headline', locale: 'default', status: 'published', value: 'Ship the copy', publishedAt: '2026-09-01T10:00:00Z' }], nextBeforeId: null }],
       [`/s/${SITE_ID}/api/stet/keys`, 200, { descriptor, rows: [{ key: 'hero_headline', locale: 'default', status: 'draft', value: 'Later', publishAt: '2026-09-09T09:00:00Z' }] }],
       [`/s/${SITE_ID}/api/stet/changes`, 200, { changes: [{ id: 2, name: 'September prices', note: 'the whole page', status: 'scheduled', authorKind: 'human', publishAt: '2026-09-30T09:00:00Z', createdAt: '2026-09-01T09:00:00Z', revertedAt: null }], nextBeforeId: null }],
@@ -3686,32 +4134,11 @@ describe('the page', () => {
     ];
   }
 
-  interface Painted {
-    dom: JSDOM;
-    errors: string[];
+  interface Painted extends PaintedPage {
     /** The body `GET /api/workspace` answers. Mutable, so a case can change what a reload sees. */
     workspace: { sites: Array<Record<string, unknown>> };
-    /** Every request the page made, in order, with the body it sent. */
-    sent: Array<{ path: string; body: unknown }>;
     /** Change what one route answers from here on: a body, or a function called per request; `delay` holds the reply back. */
     answer(path: string, status: number, body: unknown, delay?: number): void;
-    /** The paths of every request sent so far whose path starts with `prefix`. */
-    requested(prefix: string): string[];
-    /** This page's local storage, as a map a second page can be seeded with. */
-    storage(): Record<string, string>;
-    /** Clicks the one control carrying this `data-act`, then lets the page settle. */
-    act(name: string): Promise<void>;
-    /** Sets a `data-act-change` select and fires the event the page listens for. */
-    change(name: string, value: string): Promise<void>;
-    /** Types into a `data-act-input` field and fires the event the page listens for. */
-    type(name: string, value: string): Promise<void>;
-    /** The same, with the field focused and the caret where a real keystroke would leave it. */
-    typeAt(name: string, value: string, at: number): Promise<void>;
-    /** The keys the list is showing right now. */
-    keys(): string[];
-    settle(): Promise<void>;
-    html(): string;
-    toast(): string;
   }
 
   /**
@@ -3733,6 +4160,8 @@ describe('the page', () => {
       /** Local and session storage as a page before this one left them. */
       storage?: Record<string, string>;
       session?: Record<string, string>;
+      /** Run on the page's window before its script. */
+      prepare?: (window: Painted['dom']['window']) => void;
     } = {},
   ): Promise<Painted> {
     const site = opts.site ?? siteBody();
@@ -3740,124 +4169,30 @@ describe('the page', () => {
     for (const [path, status, body] of routeTable(site)) table.set(path, [status, body]);
     const workspace = (table.get('/api/workspace') as [number, { sites: Array<Record<string, unknown>> }])[1];
     if (opts.sites !== undefined) workspace.sites = opts.sites;
-    const sent: Array<{ path: string; body: unknown }> = [];
     table.set('/api/site', [200, site]);
     table.set('/api/site/preview', [200, opts.preview ?? { url: 'http://localhost:4321/', up: false, start: 'npx astro dev', source: 'astro' }]);
     for (const [path, status, body, delay] of opts.routes ?? []) table.set(path, [status, body, delay]);
 
-    const errors: string[] = [];
-    const virtualConsole = new VirtualConsole();
-    virtualConsole.on('jsdomError', (error: Error) => errors.push(`${error.name}: ${error.message}`));
-    virtualConsole.on('error', (...args: unknown[]) => errors.push(args.map(String).join(' ')));
-
-    const token = opts.token ?? 'fixture-token';
-    const accepted = opts.expects ?? token;
-    const dom = new JSDOM(dashboardPage().split('__STET_NONCE__').join(NONCE), {
-      url: `http://127.0.0.1:4400/${opts.url ?? (token === '' ? '' : `?t=${token}`)}`,
-      runScripts: 'dangerously',
-      virtualConsole,
-      beforeParse(window) {
-        for (const [name, value] of Object.entries(opts.storage ?? {})) window.localStorage.setItem(name, value);
-        for (const [name, value] of Object.entries(opts.session ?? {})) window.sessionStorage.setItem(name, value);
-        (window as unknown as { fetch: unknown }).fetch = async (
-          path: string,
-          init?: { headers?: Record<string, string>; body?: string },
-        ) => {
-          // Every request must carry the run token: a stub that answered
-          // without it would hide a broken header.
-          if (init?.headers?.['authorization'] !== `Bearer ${accepted}`) {
-            return { status: 401, ok: false, json: async () => ({ error: 'unauthorized' }) };
-          }
-          sent.push({
-            path: String(path),
-            body: init?.body === undefined ? undefined : (JSON.parse(init.body) as unknown),
-          });
-          const found = table.get(String(path).split('?')[0] ?? '');
-          if (found === undefined) return { status: 404, ok: false, json: async () => ({ error: 'not found' }) };
-          if (found[2] !== undefined) await new Promise((resolve) => setTimeout(resolve, found[2]));
-          const payload = typeof found[1] === 'function' ? (found[1] as () => unknown)() : found[1];
-          // A fresh copy per answer, as a real reply is: the page must not hold
-          // a reference into the fixture's own tables.
-          return {
-            status: found[0],
-            ok: found[0] < 400,
-            json: async () => JSON.parse(JSON.stringify(payload)) as unknown,
-          };
-        };
+    const page = await paintPage({
+      ...(opts.token === undefined ? {} : { token: opts.token }),
+      ...(opts.expects === undefined ? {} : { expects: opts.expects }),
+      ...(opts.url === undefined ? {} : { url: opts.url }),
+      ...(opts.storage === undefined ? {} : { storage: opts.storage }),
+      ...(opts.session === undefined ? {} : { session: opts.session }),
+      ...(opts.prepare === undefined ? {} : { prepare: opts.prepare }),
+      serve: async (path) => {
+        const found = table.get(path.split('?')[0] ?? '');
+        if (found === undefined) return { status: 404, body: { error: 'not found' } };
+        if (found[2] !== undefined) await new Promise((resolve) => setTimeout(resolve, found[2]));
+        return { status: found[0], body: typeof found[1] === 'function' ? (found[1] as () => unknown)() : found[1] };
       },
     });
-
-    const settle = async (): Promise<void> => {
-      for (let turn = 0; turn < 25; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
-    };
-    await settle();
-
-    const painted: Painted = {
-      dom,
-      errors,
+    return Object.assign(page, {
       workspace,
-      sent,
       answer(path: string, status: number, body: unknown, delay?: number): void {
         table.set(path, [status, body, delay]);
       },
-      requested: (prefix: string) => sent.map((r) => r.path).filter((path) => path.startsWith(prefix)),
-      storage(): Record<string, string> {
-        const held = dom.window.localStorage;
-        const out: Record<string, string> = {};
-        for (let i = 0; i < held.length; i += 1) {
-          const name = held.key(i) as string;
-          out[name] = held.getItem(name) as string;
-        }
-        return out;
-      },
-      settle,
-      html: () => dom.window.document.body.outerHTML,
-      toast: () => dom.window.document.getElementById('tst')?.textContent ?? '',
-      async change(name: string, value: string): Promise<void> {
-        const el = dom.window.document.querySelector(`[data-act-change="${name}"]`) as HTMLSelectElement | null;
-        expect(el, `no control carries data-act-change="${name}"`).not.toBeNull();
-        (el as HTMLSelectElement).value = value;
-        (el as HTMLSelectElement).dispatchEvent(new dom.window.Event('change', { bubbles: true }));
-        await settle();
-        expect(errors, `after ${name}=${value}`).toEqual([]);
-      },
-      async type(name: string, value: string): Promise<void> {
-        const el = dom.window.document.querySelector(`[data-act-input="${name}"]`) as HTMLTextAreaElement | null;
-        expect(el, `no control carries data-act-input="${name}"`).not.toBeNull();
-        (el as HTMLTextAreaElement).value = value;
-        (el as HTMLTextAreaElement).dispatchEvent(new dom.window.Event('input', { bubbles: true }));
-        await settle();
-        expect(errors, `after typing into ${name}`).toEqual([]);
-      },
-      async typeAt(name: string, value: string, at: number): Promise<void> {
-        const el = dom.window.document.querySelector(`[data-act-input="${name}"]`) as HTMLTextAreaElement | null;
-        expect(el, `no control carries data-act-input="${name}"`).not.toBeNull();
-        const field = el as HTMLTextAreaElement;
-        field.focus();
-        field.value = value;
-        field.selectionStart = at;
-        field.selectionEnd = at;
-        field.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
-        await settle();
-        expect(errors, `after typing into ${name}`).toEqual([]);
-      },
-      keys(): string[] {
-        return [...dom.window.document.querySelectorAll('[data-act^="key:"]')].map(
-          (el) => (el.getAttribute('data-act') ?? '').slice('key:'.length),
-        );
-      },
-      async act(name: string): Promise<void> {
-        const el = dom.window.document.querySelector(`[data-act="${name}"]`);
-        expect(el, `no control carries data-act="${name}"`).not.toBeNull();
-        (el as HTMLElement).click();
-        await settle();
-        // A loader's own failure is swallowed by the page's guard and shown as
-        // a toast, so the toast is read as an error channel here.
-        expect(painted.toast(), `after ${name}`).not.toMatch(/is not defined|is not a function/);
-        expect(errors, `after ${name}`).toEqual([]);
-      },
-    };
-    return painted;
+    });
   }
 
   /** Every inline event-handler attribute in a tree — the thing the policy forbids. */
@@ -3880,7 +4215,7 @@ describe('the page', () => {
     const groupIds = [...page.dom.window.document.querySelectorAll('#gsel option')].map(
       (option) => (option as HTMLOptionElement).value,
     );
-    expect(groupIds).toEqual(['page:home', 'prefix:brand', 'prefix:loose', 'prefix:unseeded', 'prefix:welcome']);
+    expect(groupIds).toEqual(['page:home', 'seo', 'prefix:brand', 'prefix:loose', 'prefix:unseeded', 'prefix:welcome']);
     for (const group of groupIds) {
       await page.change('group', group);
       for (const key of page.keys()) {
@@ -4596,6 +4931,434 @@ describe('the page', () => {
     const note = (page: Painted): HTMLElement => docOf(page).getElementById('panenote') as HTMLElement;
     const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+    // --- add-key-context: what each key is and where it appears -----------------
+    describe('what each key is and where it appears', () => {
+      const HEADLINE = 'You may already have the data<1> our AI lab partners need.</1>';
+      /** The psyon shape: a tagged headline, a share description derived from it, and the head's title and description. */
+      const KC: Descriptor = {
+        version: 1,
+        keys: {
+          hero: { shape: 'text', target: 'web', tags: 1 },
+          share: { shape: 'text', target: 'web', derivesFrom: 'hero', tmpl: '{v} More.' },
+          title: { shape: 'text', target: 'web' },
+          desc: { shape: 'text', target: 'web' },
+          foot: { shape: 'text', target: 'web' },
+        },
+        pages: { home: { route: '/', seo: { title: 'title', description: 'desc' } } },
+      };
+      const KC_SNAPSHOT = {
+        default: { hero: HEADLINE, title: 'Psyon — data acquisition', desc: 'Your development history, read.', foot: '© 2026 Psyon' },
+      };
+      const KC_PLACES: Record<string, Array<Record<string, unknown>>> = {
+        title: [{ file: 'index.html', line: 3, tag: 'title', head: true }],
+        share: [{ file: 'index.html', line: 4, tag: 'meta', attr: 'content', meta: 'og:description', head: true }],
+        desc: [{ file: 'index.html', line: 5, tag: 'meta', attr: 'content', meta: 'description', head: true }],
+        hero: [{ file: 'index.html', line: 9, tag: 'h1' }],
+        foot: [{ file: 'index.html', line: 20, tag: 'p' }],
+      };
+      const kcMarks = (places: Record<string, unknown> = KC_PLACES): Record<string, unknown> => ({
+        documents: [{ file: 'index.html', route: '/', page: 'home' }],
+        keys: Object.fromEntries(Object.keys(places).map((id) => [id, ['index.html']])),
+        places,
+      });
+      /** The psyon-shaped site, its marks answered with `places`. */
+      const kcPage = (over: { descriptor?: Descriptor; snapshot?: unknown; places?: Record<string, unknown>; site?: Record<string, unknown>; preview?: unknown } = {}) =>
+        paint({
+          site: siteBody({ host: 'html', descriptor: over.descriptor ?? KC, snapshot: over.snapshot ?? KC_SNAPSHOT, ...over.site }),
+          routes: [['/api/site/marks', 200, over.places === undefined ? kcMarks() : kcMarks(over.places)]],
+          ...(over.preview === undefined ? {} : { preview: over.preview }),
+        });
+      const rowKinds = (page: Painted, id: string): string =>
+        docOf(page).querySelector(`[data-act="key:${id}"] .kd`)?.textContent ?? '';
+      const kline = (page: Painted): string[] =>
+        [...docOf(page).querySelectorAll('.kline > div')].map((line) => line.textContent ?? '');
+      const cards = (page: Painted): HTMLElement => docOf(page).getElementById('panecards') as HTMLElement;
+      const card = (page: Painted, which: 'serp' | 'share'): string[] =>
+        [...cards(page).querySelectorAll(`.${which} > div`)].map((part) => part.textContent ?? '');
+
+      it('names each row’s and the header’s element (journeys B17, B18)', async () => {
+        const page = await kcPage();
+        await page.change('group', 'seo');
+        expect([rowKinds(page, 'title'), rowKinds(page, 'share'), rowKinds(page, 'desc')]).toEqual([
+          'page title',
+          'share description',
+          'meta description',
+        ]);
+        await page.change('group', 'page:home');
+        expect([rowKinds(page, 'hero'), rowKinds(page, 'foot')]).toEqual(['headline', 'paragraph']);
+        await page.act('key:hero');
+        expect(kline(page)).toEqual(['headline index.html:9', 'feeds: share description (share)']);
+        await page.change('group', 'seo');
+        await page.act('key:share');
+        expect(kline(page)).toEqual(['share description index.html:4', 'derived from: headline (hero)']);
+        expect(page.errors).toEqual([]);
+        page.dom.window.close();
+      });
+
+      it('names a JavaScript host’s reads by their element, or by their file', async () => {
+        const page = await paint({
+          routes: [
+            [
+              '/api/site/marks',
+              200,
+              {
+                documents: [],
+                keys: {},
+                places: {
+                  hero_headline: [
+                    { file: 'src/components/Nav.astro', line: 4, tag: 'a' },
+                    { file: 'src/pages/index.astro', line: 12, tag: 'p' },
+                    { file: 'src/pages/index.astro', line: 2 },
+                    { file: 'src/pages/about.astro', line: 7, tag: 'a' },
+                  ],
+                },
+              },
+            ],
+          ],
+        });
+        expect(rowKinds(page, 'hero_headline')).toBe('link text · paragraph · text in src/pages/index.astro');
+        await page.act('key:hero_headline');
+        expect(kline(page)[0]).toBe(
+          'link text · paragraph · text in src/pages/index.astro src/components/Nav.astro:4, src/pages/index.astro:12, src/pages/index.astro:2, +1 more',
+        );
+        page.dom.window.close();
+      });
+
+      it('reads a `constructor` tag, meta or attribute as plain text, never from a prototype', async () => {
+        const page = await kcPage({
+          places: {
+            ...KC_PLACES,
+            hero: [{ file: 'index.html', line: 9, tag: 'constructor' }],
+            foot: [{ file: 'index.html', line: 20, tag: 'meta', attr: 'content', meta: 'constructor' }],
+            desc: [{ file: 'index.html', line: 5, tag: 'img', attr: 'constructor' }],
+          },
+        });
+        await page.type('search', 'o');
+        expect([rowKinds(page, 'hero'), rowKinds(page, 'foot'), rowKinds(page, 'desc')]).toEqual([
+          'text in <constructor>',
+          'content attribute',
+          'constructor attribute · meta description',
+        ]);
+        page.dom.window.close();
+      });
+
+      it('reads an svg’s `<title>` as a tooltip, outside the SEO group and with no cards', async () => {
+        const page = await kcPage({ places: { ...KC_PLACES, foot: [{ file: 'index.html', line: 20, tag: 'title', svg: true }] } });
+        expect(rowKinds(page, 'foot')).toBe('tooltip');
+        await page.act('key:foot');
+        expect(cards(page).hidden).toBe(true);
+        expect(cards(page).innerHTML).toBe('');
+        await page.change('group', 'seo');
+        expect(page.keys()).not.toContain('foot');
+        page.dom.window.close();
+      });
+
+      it('reads a JavaScript host’s meta description read as one, in the SEO group', async () => {
+        const page = await paint({
+          routes: [
+            [
+              '/api/site/marks',
+              200,
+              { documents: [], keys: {}, places: { loose_key: [{ file: 'src/Base.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true }] } },
+            ],
+          ],
+        });
+        await page.change('group', 'seo');
+        expect(page.keys()).toEqual(['loose_key', 'seo_home_title']);
+        expect(rowKinds(page, 'loose_key')).toBe('meta description');
+        page.dom.window.close();
+      });
+
+      it('puts the head keys in the SEO group (journeys B17, C1)', async () => {
+        const page = await kcPage();
+        const labels = [...docOf(page).querySelectorAll('#gsel option')].map((option) => option.textContent);
+        expect(labels).toEqual(['home — page', 'SEO']);
+        expect((docOf(page).getElementById('gsel') as HTMLSelectElement).value).toBe('page:home');
+        expect(page.keys()).toEqual(['foot', 'hero']);
+        await page.change('group', 'seo');
+        expect(page.keys()).toEqual(['desc', 'share', 'title']);
+        page.dom.window.close();
+      });
+
+      it('says where a key the page does not show appears, in place of the not-found line (journeys B19, C1)', async () => {
+        const page = await kcPage({ preview: STATIC_PREVIEW });
+        const agent = agentOf(page);
+        await agent.load();
+        await agent.ready(`/s/${SITE_ID}/site/`);
+        await page.change('group', 'seo');
+        await page.act('key:title');
+        agent.say(LOCATED({ key: 'title', found: 0, seq: agent.locates().at(-1)?.['seq'] }));
+        await page.settle();
+        expect(note(page).textContent).toBe(
+          'title appears as the page title, in the browser tab and in search results. It is not part of the page’s visible text.',
+        );
+        await page.act('key:share');
+        expect(note(page).textContent).toBe(
+          'share appears as the share description, under the share title when the page is shared as a link. ' +
+            'It follows hero (headline), outlined dashed on the page.',
+        );
+        page.dom.window.close();
+      });
+
+      it('says where a key appears with no agent reply at all', async () => {
+        const page = await kcPage();
+        await page.change('group', 'seo');
+        await page.act('key:title');
+        expect(note(page).textContent).toBe(
+          'title appears as the page title, in the browser tab and in search results. It is not part of the page’s visible text.',
+        );
+        page.dom.window.close();
+      });
+
+      it('draws the search result and the share card from the drafts (journeys C1, B17)', async () => {
+        const page = await kcPage();
+        await page.change('group', 'seo');
+        await page.act('key:share');
+        const serp = ['Search result', '/', 'Psyon — data acquisition', 'Your development history, read.'];
+        expect(card(page, 'serp')).toEqual(serp);
+        expect(card(page, 'share')).toEqual([
+          'Share card',
+          '/',
+          'Psyon — data acquisition',
+          'You may already have the data our AI lab partners need. More.',
+        ]);
+        await page.change('group', 'page:home');
+        await page.act('key:hero');
+        expect(card(page, 'serp')).toEqual(serp);
+        await page.type('text:hero', 'You may already have data<1> our AI lab partners need.</1>');
+        expect(card(page, 'share')[3]).toBe('You may already have data our AI lab partners need. More.');
+        await page.act('key:foot');
+        expect(cards(page).hidden).toBe(true);
+        expect(cards(page).innerHTML).toBe('');
+        page.dom.window.close();
+      });
+
+      it('draws a JavaScript page record’s title and description in both cards', async () => {
+        const page = await paint({
+          site: siteBody({
+            descriptor: { ...descriptor, pages: { home: { route: '/', seo: { title: 'seo_home_title', description: 'loose_key' } } } },
+          }),
+        });
+        await page.change('group', 'seo');
+        await page.act('key:seo_home_title');
+        expect(card(page, 'serp')).toEqual(['Search result', '/', 'Home', 'loose']);
+        expect(card(page, 'share')).toEqual(['Share card', '/', 'Home', 'loose']);
+        page.dom.window.close();
+      });
+
+      it('writes a value holding markup into a card as text', async () => {
+        const page = await kcPage({ snapshot: { default: { ...KC_SNAPSHOT.default, desc: '<b>Bold</b> claims' } } });
+        await page.change('group', 'seo');
+        await page.act('key:title');
+        expect(card(page, 'serp')[3]).toBe('<b>Bold</b> claims');
+        expect(cards(page).querySelector('b')).toBeNull();
+        page.dom.window.close();
+      });
+
+      it('shades the numbered tags in a field that keeps them exactly (journeys B17, B18)', async () => {
+        const page = await kcPage();
+        await page.answer('/api/site/save', 200, { written: ['content/defaults.json', 'index.html'], unchanged: [], findings: [], at: {}, pending: [] });
+        await page.act('key:hero');
+        const doc = docOf(page);
+        const field = doc.querySelector('.tagged textarea') as HTMLTextAreaElement;
+        expect(field.value).toBe(HEADLINE);
+        const mirror = doc.querySelector('.tagmirror') as HTMLElement;
+        expect([...mirror.querySelectorAll('.ptag')].map((tag) => tag.textContent)).toEqual(['<1>', '</1>']);
+        expect([...mirror.querySelectorAll('.pin')].map((run) => run.textContent)).toEqual([' our AI lab partners need.']);
+        expect(doc.querySelector('.tagged + .note')?.textContent).toBe(
+          'Words between <1> and </1> keep the page’s own styling for that part, shaded here. ' +
+            'Change the words as you like and keep each tag; a save without them is refused.',
+        );
+        const typed = 'You may already have <1>all the data</1> we need.';
+        await page.type('text:hero', typed);
+        expect([...mirror.querySelectorAll('.pin')].map((run) => run.textContent)).toEqual(['all the data']);
+        expect(doc.querySelector('.cb .cnt')?.textContent).toBe(String(typed.length));
+        await page.act('save');
+        expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+          values: [{ key: 'hero', locale: 'default', value: typed }],
+        });
+        expect(page.dom.window.document.querySelector('style')?.textContent).toContain('.tagged textarea{display:block;');
+        page.dom.window.close();
+
+        const markup = await kcPage({ snapshot: { default: { ...KC_SNAPSHOT.default, hero: '<img src=x onerror=alert(1)><1>x</1>' } } });
+        await markup.act('key:hero');
+        expect(docOf(markup).querySelector('.tagmirror img')).toBeNull();
+        expect(docOf(markup).querySelector('.tagmirror')?.textContent).toBe('<img src=x onerror=alert(1)><1>x</1>\n');
+        markup.dom.window.close();
+      });
+
+      it('edits a derived key’s template, the one free text it has (journey C1)', async () => {
+        const page = await kcPage();
+        page.answer('/api/site/save', 200, { written: ['content/descriptor.json', 'index.html'], unchanged: [], findings: [], at: {}, pending: [] });
+        await page.change('group', 'seo');
+        await page.act('key:share');
+        const doc = docOf(page);
+        const input = doc.querySelector('[data-act-input="tmpl:share"]') as HTMLInputElement;
+        expect(input.value).toBe('{v} More.');
+        expect(input.disabled).toBe(false);
+        expect(doc.querySelector('.cb .note')?.textContent).toBe('{v} stands for the text of hero.');
+        expect(doc.querySelector('#derived .term')?.textContent).toBe('You may already have the data our AI lab partners need. More.');
+        expect(doc.querySelector('[data-act="key:share"]')?.innerHTML).not.toContain('no value');
+
+        await page.type('tmpl:share', '{v} Start with a call.');
+        const reads = 'You may already have the data our AI lab partners need. Start with a call.';
+        expect(doc.querySelector('#derived .term')?.textContent).toBe(reads);
+        expect(doc.querySelector('#derived .cnt')?.textContent).toBe(String(reads.length));
+        expect(doc.querySelector('.row.on .v')?.textContent).toBe(reads.slice(0, 40));
+        expect(card(page, 'share')[3]).toBe(reads);
+        await page.act('save');
+        expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+          values: [],
+          templates: [{ key: 'share', tmpl: '{v} Start with a call.' }],
+        });
+        expect(doc.querySelector('[data-act="key:share"]')?.innerHTML).not.toContain('no value');
+        page.dom.window.close();
+      });
+
+      it('shows a store-backed site’s template read-only', async () => {
+        const page = await kcPage({ site: { mode: 'store' } });
+        await page.change('group', 'seo');
+        await page.act('key:share');
+        const input = docOf(page).querySelector('[data-act-input="tmpl:share"]') as HTMLInputElement;
+        expect(input.disabled).toBe(true);
+        expect(docOf(page).querySelector('.cb .note')?.textContent).toBe(
+          '{v} stands for the text of hero. The template lives in the descriptor; edit it in the repository.',
+        );
+        page.dom.window.close();
+      });
+
+      it('outlines a derived key’s source and sends a tagged key’s count with its locate', async () => {
+        const page = await kcPage({ preview: STATIC_PREVIEW });
+        const agent = agentOf(page);
+        await agent.load();
+        await agent.ready(`/s/${SITE_ID}/site/`);
+        await page.change('group', 'seo');
+        await page.act('key:share');
+        expect(agent.locates().at(-1)).toMatchObject({ key: 'share', mark: 'hero', dashed: true, draft: null });
+        await page.change('group', 'page:home');
+        await page.act('key:hero');
+        expect(agent.locates().at(-1)).toMatchObject({ key: 'hero', tags: 1 });
+        page.dom.window.close();
+      });
+
+      it('shows a derived key through the locale chain where its source has no value of its own', async () => {
+        const page = await kcPage({
+          descriptor: { ...KC, pages: { home: { route: '/', seo: { title: 'title', description: 'share' } } } },
+        });
+        const expected = resolve(KC, KC_SNAPSHOT, null, { key: 'share', locale: 'de' }).value as string;
+        expect(expected).toBe('You may already have the data our AI lab partners need. More.');
+        await page.change('locale', 'de');
+        await page.change('group', 'seo');
+        expect(docOf(page).querySelector('[data-act="key:share"] .v')?.textContent).toBe(expected.slice(0, 40));
+        await page.act('key:share');
+        expect(docOf(page).querySelector('#derived .term')?.textContent).toBe(expected);
+        expect(card(page, 'share')[3]).toBe(expected);
+        await page.act('tab:SEO');
+        expect(painted(page)).toContain(expected.slice(0, 70));
+        page.dom.window.close();
+      });
+
+      it('fills a card from the default locale where a key has no value in the one selected (stage-5 R5)', async () => {
+        const page = await kcPage();
+        await page.change('locale', 'de');
+        await page.change('group', 'seo');
+        await page.act('key:title');
+        expect(card(page, 'serp')).toEqual(['Search result', '/', 'Psyon — data acquisition', 'Your development history, read.']);
+        page.dom.window.close();
+      });
+
+      it('paints two derived keys that derive from each other, each with no value (stage-5 R8)', async () => {
+        const cycle: Descriptor = {
+          version: 1,
+          keys: {
+            loop_a: { shape: 'text', target: 'web', derivesFrom: 'loop_b', tmpl: '{v}' },
+            loop_b: { shape: 'text', target: 'web', derivesFrom: 'loop_a', tmpl: '{v}' },
+          },
+        };
+        const page = await kcPage({ descriptor: cycle, snapshot: { default: {} }, places: {} });
+        await page.act('key:loop_a');
+        await page.act('key:loop_b');
+        expect(page.errors).toEqual([]);
+        expect([...docOf(page).querySelectorAll('.row .k')].map((k) => k.textContent)).toEqual(['loop_a', 'loop_b']);
+        page.dom.window.close();
+      });
+
+      it('holds in SEO the keys the server places in the head, and no visible attribute', async () => {
+        const descriptor = structuredClone(KC);
+        descriptor.keys['logo'] = { shape: 'text', target: 'web' };
+        descriptor.keys['tab'] = { shape: 'text', target: 'web' };
+        const page = await kcPage({
+          descriptor,
+          places: {
+            ...KC_PLACES,
+            logo: [{ file: 'index.html', line: 10, tag: 'img', attr: 'alt' }],
+            tab: [{ file: 'about.html', line: 3, tag: 'title', head: true }],
+          },
+        });
+        await page.change('group', 'seo');
+        const rows = [...docOf(page).querySelectorAll('.row .k')].map((k) => k.textContent);
+        expect(rows).toContain('tab');
+        expect(rows).not.toContain('logo');
+        page.dom.window.close();
+      });
+
+      it('names no icon it would fetch (stage-5 R7)', () => {
+        expect(dashboardPage()).toContain('<link rel="icon" href="data:,">');
+      });
+
+      it('reads the numbered tags the way src does, in the page and in the agent (the placeholder grammar)', () => {
+        const page = dashboardPage();
+        const agent = readFileSync(join(packageRoot(), 'templates', 'preview-agent.js'), 'utf8');
+        const literal = (source: string, pattern: RegExp): RegExp => {
+          const found = pattern.exec(source)?.[1];
+          expect(found, String(pattern)).toBeDefined();
+          return new RegExp(found as string, 'g');
+        };
+        // The page's derivation, its mirror's split, and the agent's split, as written in their sources.
+        const readers: Record<string, RegExp> = {
+          'page deriveText': literal(page, /function deriveText[\s\S]*?text\.replace\(\/(.+?)\/g,/),
+          'page taggedHtml': literal(page, /function taggedHtml[\s\S]*?text\.split\(\/\((.+?)\)\/\)/),
+          'agent draftTagged': literal(agent, /function draftTagged[\s\S]*?draft\.split\(\/\((.+?)\)\/\)/),
+        };
+        const tokens = (pattern: RegExp, text: string): string[] => [...text.matchAll(new RegExp(pattern.source, 'g'))].map((m) => m[0]);
+        const shapes = ['<1>', '</1>', '<1/>', '<01>', '<1 >', '</1/>', 'text with <b>bold</b> and <2>two</2>'];
+        const mismatches: string[] = [];
+        for (const shape of shapes) {
+          const src = tokens(PLACEHOLDER, shape);
+          for (const [name, pattern] of Object.entries(readers)) {
+            const theirs = tokens(pattern, shape);
+            if (JSON.stringify(theirs) !== JSON.stringify(src)) mismatches.push(`${name} on ${shape}: ${JSON.stringify(theirs)} ≠ ${JSON.stringify(src)}`);
+          }
+        }
+        expect(mismatches).toEqual([]);
+      });
+
+      it('derives the text the resolver does (the parity table)', () => {
+        const source = /function deriveText\(tmpl, value, tagged\) \{[\s\S]*?\n\}/.exec(dashboardPage())?.[0];
+        expect(source).toBeDefined();
+        const deriveText = new Function(`${source as string}; return deriveText;`)() as (t: string, v: unknown, tagged: boolean) => string;
+        const rows: Array<[string, string]> = [
+          ['{v} No raw data is needed to start.', HEADLINE],
+          ['$& $$ $1 {v}', 'Costs $$ and $& now'],
+          ['{v}!', 'First line<1/>second line.'],
+          ['{v} and {v}', 'Twice'],
+          ['No placeholder at all.', 'Ignored'],
+          ['[{v}]', ''],
+          ["{v} — Mirra", "x$`y$'z"],
+        ];
+        const mismatches: string[] = [];
+        for (const tags of [undefined, 1]) {
+          const d: Descriptor = { version: 1, keys: { src: { shape: 'text', target: 'web', ...(tags === undefined ? {} : { tags }) } } };
+          for (const [tmpl, value] of rows) {
+            const page = deriveText(tmpl, value, tags !== undefined);
+            const core = derivedText(d, 'src', value, tmpl);
+            if (page !== core) mismatches.push(`${tags ?? 0} ${tmpl} ${value}: ${page} ≠ ${core}`);
+          }
+        }
+        expect(mismatches).toEqual([]);
+      });
+    });
+
     it('posts a locate for the picked key to the proxy’s origin, and to * on the static pane', async () => {
       const dev = await paint({ preview: DEV_PREVIEW });
       const agent = agentOf(dev);
@@ -4926,14 +5689,16 @@ describe('the page', () => {
       routes: [['/api/site/marks', 200, allMarkedIn('index.html', null), 50]],
     });
     expect(await until(() => late.keys().length > 0 || painted(late).includes('No keys.'))).toBe(true);
-    expect((docOf(late).getElementById('gsel') as HTMLSelectElement | null)?.value ?? 'doc:index.html').toBe('doc:index.html');
-    expect(late.keys()).toEqual(Object.keys(descriptor.keys).sort());
+    expect((docOf(late).getElementById('gsel') as HTMLSelectElement).value).toBe('doc:index.html');
+    // The page record names `seo_home_title`, so the SEO group holds it and the document the rest.
+    expect(late.keys()).toEqual(Object.keys(descriptor.keys).filter((id) => id !== 'seo_home_title').sort());
     late.dom.window.close();
 
     const refused = await paint({
       site: siteBody({ host: 'html', descriptor: unpaged }),
       routes: [['/api/site/marks', 409, { error: 'index.html could not be read' }]],
     });
+    // With no marks there is no document group; the site still opens on its visible text, not on SEO.
     expect((docOf(refused).getElementById('gsel') as HTMLSelectElement).value).toBe('prefix:brand');
     refused.dom.window.close();
   });
@@ -5045,38 +5810,42 @@ describe('the page', () => {
   it('groups keys by page, then by prefix, with no Other (journey A19)', async () => {
     const page = await paint();
     const labels = [...docOf(page).querySelectorAll('#gsel option')].map((option) => option.textContent);
-    expect(labels).toEqual(['home — page', 'brand', 'loose', 'unseeded', 'welcome']);
+    expect(labels).toEqual(['home — page', 'SEO', 'brand', 'loose', 'unseeded', 'welcome']);
+    await page.change('group', 'seo');
+    expect(page.keys()).toEqual(['seo_home_title']);
     expect(painted(page)).not.toContain('>Other<');
     page.dom.window.close();
   });
 
   it('groups an html host’s keys by the document they are marked in, then by its page (journeys A19, B17)', async () => {
-    // One group, so no selector: a query that every key name matches puts each
-    // row's group label beside it.
-    const groupOfEveryRow = async (page: Painted): Promise<string[]> => {
-      expect(docOf(page).getElementById('gsel')).toBeNull();
-      expect(page.keys()).toEqual(Object.keys(descriptor.keys).sort());
+    // A query every key name matches lists every key with its group's label beside it.
+    const groupOfEveryRow = async (page: Painted): Promise<Record<string, string>> => {
       await page.type('search', '_');
-      return [
-        ...new Set(
-          [...docOf(page).querySelectorAll('[data-act^="key:"]')].map(
-            (row) => [...row.querySelectorAll('.bdg')].at(-1)?.textContent ?? '',
-          ),
-        ),
-      ];
+      expect(page.keys()).toEqual(Object.keys(descriptor.keys).sort());
+      return Object.fromEntries(
+        [...docOf(page).querySelectorAll('[data-act^="key:"]')].map((row) => [
+          (row.getAttribute('data-act') ?? '').slice('key:'.length),
+          [...row.querySelectorAll('.bdg')].at(-1)?.textContent ?? '',
+        ]),
+      );
     };
+    // Every key in the one group but the page record's SEO title, which the SEO group holds.
+    const expected = (label: string): Record<string, string> =>
+      Object.fromEntries(Object.keys(descriptor.keys).sort().map((id) => [id, id === 'seo_home_title' ? 'SEO' : label]));
     const byDocument = await paint({
       site: siteBody({ host: 'html', descriptor: unpaged }),
       routes: [['/api/site/marks', 200, allMarkedIn('index.html', null)]],
     });
-    expect(await groupOfEveryRow(byDocument)).toEqual(['index.html']);
+    expect((docOf(byDocument).getElementById('gsel') as HTMLSelectElement).value).toBe('doc:index.html');
+    expect(await groupOfEveryRow(byDocument)).toEqual(expected('index.html'));
     byDocument.dom.window.close();
 
     const byPage = await paint({
       site: siteBody({ host: 'html', descriptor: unpaged }),
       routes: [['/api/site/marks', 200, allMarkedIn('index.html', 'home')]],
     });
-    expect(await groupOfEveryRow(byPage)).toEqual(['home — page']);
+    expect((docOf(byPage).getElementById('gsel') as HTMLSelectElement).value).toBe('page:home');
+    expect(await groupOfEveryRow(byPage)).toEqual(expected('home — page'));
     byPage.dom.window.close();
   });
 
@@ -5164,5 +5933,111 @@ describe('the page', () => {
     expect((docOf(js).getElementById('devcmd') as HTMLInputElement).placeholder).toBe('npx astro dev');
     expect((docOf(js).getElementById('devurl') as HTMLInputElement).placeholder).toBe('http://localhost:4321');
     js.dom.window.close();
+  });
+
+  // --- add-key-context: History inside its card, and the key column's width ---
+
+  it('shows a commit’s date with the minute under it, and its author under the subject', async () => {
+    const page = await paint({
+      routes: [
+        [
+          '/api/site/history',
+          200,
+          {
+            commits: [
+              { sha: '0044dd9aa', short: '0044dd9', author: 'nj-io', at: '2026-09-25T09:41:09+07:00', subject: 'stet: 1 key updated — understand_what_exists_how_it_was' },
+              { sha: '1234567aa', short: '1234567', author: 'dev', at: 'yesterday', subject: 'A <b>bold</b> claim' },
+            ],
+          },
+        ],
+      ],
+    });
+    await page.act('history');
+    const rows = [...docOf(page).querySelectorAll('table.fixed tbody tr')];
+    const cells = (row: Element): Element[] => [...row.querySelectorAll('td')];
+    const [first, second] = rows as [Element, Element];
+    expect(cells(first).map((cell) => cell.innerHTML)).toEqual([
+      '0044dd9',
+      '2026-09-25<br>09:41',
+      'stet: 1 key updated — understand_what_exists_how_it_was<div class="muted mono" style="font-size:11px">nj-io</div>',
+    ]);
+    expect(cells(first)[1]?.getAttribute('title')).toBe('2026-09-25T09:41:09+07:00');
+    expect(cells(second)[1]?.textContent).toBe('yesterday');
+    expect(cells(second)[2]?.querySelector('b')).toBeNull();
+    expect(cells(second)[2]?.firstChild?.textContent).toBe('A <b>bold</b> claim');
+    expect([...docOf(page).querySelectorAll('table.fixed th')].map((th) => th.textContent)).toEqual(['Commit', 'When', 'Subject']);
+    page.dom.window.close();
+  });
+
+  describe('the key column’s width', () => {
+    const grip = (page: Painted): HTMLElement => docOf(page).getElementById('grip') as HTMLElement;
+    const width = (page: Painted): string => (docOf(page).getElementById('work') as HTMLElement).style.getPropertyValue('--colw');
+    const press = async (page: Painted, key: string, shiftKey = false): Promise<void> => {
+      grip(page).focus();
+      grip(page).dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key, shiftKey, bubbles: true }));
+      await page.settle();
+    };
+
+    it('paints the remembered width, and moves it with the keys', async () => {
+      const page = await paint({ storage: { 'stet.column.width': '420' } });
+      expect(grip(page).getAttribute('role')).toBe('separator');
+      expect(grip(page).getAttribute('aria-label')).toBe('Resize the key column');
+      expect(grip(page).getAttribute('title')).toBe('Drag to resize the key column. Double-click to restore its width.');
+      expect(width(page)).toBe('420px');
+      expect(grip(page).getAttribute('aria-valuenow')).toBe('420');
+      await press(page, 'ArrowRight');
+      expect([width(page), page.storage()['stet.column.width']]).toEqual(['436px', '436']);
+      await press(page, 'ArrowLeft', true);
+      expect([width(page), page.storage()['stet.column.width']]).toEqual(['372px', '372']);
+      await press(page, 'Home');
+      expect(width(page)).toBe('240px');
+      await press(page, 'End');
+      expect([width(page), grip(page).getAttribute('aria-valuenow')]).toEqual(['720px', '720']);
+      page.dom.window.close();
+    });
+
+    it('clamps a stored width it cannot show, and keeps it', async () => {
+      const wide = await paint({ storage: { 'stet.column.width': '9999' } });
+      expect(width(wide)).toBe('720px');
+      expect(wide.storage()['stet.column.width']).toBe('9999');
+      wide.dom.window.close();
+      for (const held of ['abc', '']) {
+        const page = await paint({ storage: { 'stet.column.width': held } });
+        expect(width(page)).toBe('300px');
+        page.dom.window.close();
+      }
+    });
+
+    it('restores the default on a double-click and forgets the stored width', async () => {
+      const page = await paint({ storage: { 'stet.column.width': '420' } });
+      grip(page).dispatchEvent(new page.dom.window.MouseEvent('dblclick', { bubbles: true }));
+      await page.settle();
+      expect([width(page), page.storage()['stet.column.width']]).toEqual(['300px', '']);
+      page.dom.window.close();
+    });
+
+    it('works with no storage at all', async () => {
+      const page = await paint({
+        prepare(window) {
+          Object.defineProperty(window, 'localStorage', {
+            get() {
+              throw new Error('storage is disabled');
+            },
+          });
+        },
+      });
+      expect(page.errors).toEqual([]);
+      expect(width(page)).toBe('300px');
+      await press(page, 'ArrowRight');
+      expect(width(page)).toBe('316px');
+      page.dom.window.close();
+    });
+
+    it('is hidden with the keys', async () => {
+      const page = await paint();
+      await page.act('keys');
+      expect((docOf(page).getElementById('work') as HTMLElement).className).toContain('wide');
+      page.dom.window.close();
+    });
   });
 });

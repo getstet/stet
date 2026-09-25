@@ -1,7 +1,7 @@
 import * as ajv2020 from 'ajv/dist/2020.js';
 import type { ErrorObject, ValidateFunction } from 'ajv/dist/2020.js';
 
-import type { Descriptor } from './types.js';
+import type { Descriptor, KeyDef } from './types.js';
 
 /**
  * A descriptor that cannot be trusted, with the failing path named. Nothing
@@ -170,6 +170,14 @@ export function deriveLabel(key: string): string {
   const first = words[0];
   if (first === undefined) return key;
   return [first.charAt(0).toUpperCase() + first.slice(1), ...words.slice(1)].join(' ');
+}
+
+/**
+ * A key's declaration, read as an own property: a key name from a command line,
+ * a document or a request never answers from the prototype (`constructor`).
+ */
+export function keyDefOf(d: Descriptor, key: string): KeyDef | undefined {
+  return Object.hasOwn(d.keys, key) ? d.keys[key] : undefined;
 }
 
 function schemaError(err: ErrorObject): DescriptorError {

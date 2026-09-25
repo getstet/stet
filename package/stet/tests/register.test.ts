@@ -10,10 +10,15 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 import { runRegister } from '../cli/register.js';
 import type { CliIo } from '../cli/main.js';
+import { planDocuments, planHtmlRegister } from '../cli/html-host.js';
+import { Report } from '../cli/report.js';
+import type { Snapshot } from '../src/snapshot.js';
+import type { Descriptor, KeyDef } from '../src/types.js';
+import { cleanupCliHosts, makeHtmlHost } from '../conformance/cli-host.js';
 
 interface SetupOpts {
   router?: 'app' | 'pages';
@@ -815,5 +820,318 @@ describe('runRegister — the JavaScript branch writes through the same batch', 
     // atomicity, so a scan landing INSIDE the batch can still read a half-written
     // tree. What the batch does guarantee is that the failure put everything back.
     expect(readFileSync(join(dir, 'content/descriptor.json'))).toEqual(before);
+  });
+});
+
+describe('register derives head texts', () => {
+  afterAll(cleanupCliHosts);
+  const DERIVE = readFileSync(fileURLToPath(new URL('./fixtures/html-host/derive.html', import.meta.url)), 'utf8');
+  /** The key a written document marks `<open tag start>` with, read back from the page. */
+  const markOf = (page: string, open: string, attr = '(?:-content)?'): string => {
+    const found = new RegExp(`${open}[^>]*? data-stet${attr}="([^"]+)"`).exec(page);
+    if (found === null) throw new Error(`no mark on ${open}`);
+    return found[1] as string;
+  };
+  /** The plan over ad-hoc documents, with the descriptor and snapshot it mutated. */
+  function plan(files: Record<string, string>, keys: Record<string, KeyDef> = {}, values: Snapshot = { default: {} }) {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-register-derive-'));
+    for (const [rel, text] of Object.entries(files)) write(dir, rel, text);
+    const d: Descriptor = { version: 1, keys: structuredClone(keys) };
+    const s: Snapshot = structuredClone(values);
+    const result = planHtmlRegister({ cwd: dir, files: Object.keys(files).sort(), descriptor: d, snapshot: s, report: new Report() });
+    const page = (rel: string): string => result.edited.find((e) => e.rel === rel)?.text ?? (files[rel] as string);
+    return { dir, result, descriptor: d, snapshot: s, page };
+  }
+  const doc = (head: string, body: string): string =>
+    `<!DOCTYPE html>\n<html><head>\n${head}\n</head><body>\n${body}\n</body></html>\n`;
+
+  it('derives the title and the meta description from the visible text they repeat (derive.html)', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': DERIVE } });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const keys = JSON.parse(host.file('content/descriptor.json')).keys as Record<string, KeyDef>;
+    const values = JSON.parse(host.file('content/defaults.json')).default as Record<string, unknown>;
+    const page = host.file('index.html');
+    const h1 = markOf(page, '<h1');
+    const title = markOf(page, '<title');
+    const description = markOf(page, '<meta name="description"');
+    const p = markOf(page, '<p');
+    expect(keys[title]).toEqual({ shape: 'text', target: 'web', derivesFrom: h1, tmpl: '{v}' });
+    expect(keys[description]).toEqual({ shape: 'text', target: 'web', derivesFrom: p, tmpl: '{v} Book a call.' });
+    expect(Object.hasOwn(values, title) || Object.hasOwn(values, description)).toBe(false);
+    // Head texts share among themselves; the rest take literal keys.
+    expect(markOf(page, '<meta property="og:title"')).toBe(title);
+    const og = markOf(page, '<meta property="og:description"');
+    const twitter = markOf(page, '<meta name="twitter:description"');
+    expect([keys[og]?.derivesFrom, values[og]]).toEqual([undefined, 'Start a trial today and see the whole catalogue for yourself.']);
+    expect([keys[twitter]?.derivesFrom, values[twitter]]).toEqual([undefined, 'Reship the whole catalogue']);
+    // The aria label shares the heading's key, as identical visible text does.
+    expect(markOf(page, '<nav aria-label="Everything we ship"', '-aria-label')).toBe(markOf(page, '<h3'));
+    expect(host.stdout()).toContain(`index.html:5 ${title} derives from ${h1} through "{v}"`);
+    expect(host.stdout()).toContain(`index.html:6 ${description} derives from ${p} through "{v} Book a call."`);
+    expect(Buffer.from(page.replace(/ data-stet[^ >]*="[^"]*"/g, ''))).toEqual(Buffer.from(DERIVE));
+
+    host.out.length = 0;
+    expect(await host.run('check')).toBe(0);
+    const before = readFileSync(join(host.cwd, 'index.html'));
+    expect(await host.run('pull')).toBe(0);
+    expect(host.stdout()).toContain('pull: documents current');
+    expect(readFileSync(join(host.cwd, 'index.html'))).toEqual(before);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('register: nothing to adopt');
+  });
+
+  it('derives a share description from a tagged headline', () => {
+    const { result, descriptor: d, page } = plan({
+      'index.html': doc(
+        '<meta property="og:description" content="You may already have the data our AI lab partners need. No raw data is needed to start.">',
+        '<h1>You may already have the data<span class="tail"> our AI lab partners need.</span></h1>',
+      ),
+    });
+    const h1 = markOf(page('index.html'), '<h1');
+    const share = markOf(page('index.html'), '<meta property="og:description"');
+    expect(d.keys[h1]?.tags).toBe(1);
+    expect(d.keys[share]).toEqual({ shape: 'text', target: 'web', derivesFrom: h1, tmpl: '{v} No raw data is needed to start.' });
+    expect(result.derived.map((x) => x.key)).toEqual([share]);
+  });
+
+  it('derives a title placed before its headline in the document (the two passes)', () => {
+    const { descriptor: d, page } = plan({
+      'index.html': doc('<title>Widgets for everyone</title>', '<h1>Widgets for everyone</h1>'),
+    });
+    const title = markOf(page('index.html'), '<title');
+    expect(d.keys[title]?.derivesFrom).toBe(markOf(page('index.html'), '<h1'));
+  });
+
+  describe('the conversion of an adopted site', () => {
+    const HEAD = 'You may already have the data our AI lab partners need. No raw data is needed to start.';
+    const HEADLINE = 'You may already have the data<1> our AI lab partners need.</1>';
+    const adoptedPage = (extra = ''): string =>
+      doc(
+        `<title data-stet="site_title">Acme</title>\n<meta property="og:description" content="${HEAD}" data-stet-content="share">`,
+        `<h1 data-stet="hero">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>${extra}`,
+      );
+    const adoptedKeys = (): Record<string, KeyDef> => ({
+      hero: { shape: 'text', target: 'web', tags: 1 },
+      share: { shape: 'text', target: 'web' },
+      site_title: { shape: 'text', target: 'web' },
+    });
+    const adoptedValues = (): Snapshot => ({ default: { hero: HEADLINE, share: HEAD, site_title: 'Acme' } });
+
+    it('turns a literal head key into a derivation, keeping its name, and changes no document', () => {
+      const { dir, result, descriptor: d, snapshot: s } = plan({ 'index.html': adoptedPage() }, adoptedKeys(), adoptedValues());
+      expect(result.converted).toEqual([
+        { key: 'share', source: 'hero', tmpl: '{v} No raw data is needed to start.', file: 'index.html', line: 4 },
+      ]);
+      expect(result.edited).toEqual([]);
+      expect(d.keys['share']).toEqual({ shape: 'text', target: 'web', derivesFrom: 'hero', tmpl: '{v} No raw data is needed to start.' });
+      expect(Object.hasOwn(s['default'] ?? {}, 'share')).toBe(false);
+      expect(d.keys['site_title']?.derivesFrom).toBeUndefined();
+      expect(planDocuments(dir, ['index.html'], d, s, new Report()).writes).toEqual([]);
+    });
+
+    it('leaves literal a head key with a de value, one also visible, one declaring tags, and one another derives from', () => {
+      const de = adoptedValues();
+      de['de'] = { share: 'Vielleicht haben Sie die Daten schon.' };
+      expect(plan({ 'index.html': adoptedPage() }, adoptedKeys(), de).result.converted).toEqual([]);
+
+      const visible = plan({ 'index.html': adoptedPage(`\n<h2 data-stet="share">${HEAD}</h2>`) }, adoptedKeys(), adoptedValues());
+      expect(visible.result.converted).toEqual([]);
+
+      const tagged = adoptedKeys();
+      tagged['share'] = { shape: 'text', target: 'web', tags: 1 };
+      expect(plan({ 'index.html': adoptedPage() }, tagged, adoptedValues()).result.converted).toEqual([]);
+
+      const followed = adoptedKeys();
+      followed['echo'] = { shape: 'text', target: 'web', derivesFrom: 'share', tmpl: '{v}' };
+      expect(plan({ 'index.html': adoptedPage() }, followed, adoptedValues()).result.converted).toEqual([]);
+    });
+
+    it('leaves literal a head key marked in two documents (stage-5 R2)', () => {
+      const { result, descriptor: d } = plan(
+        {
+          'index.html': doc('<title data-stet="t">Widgets for everyone</title>', '<h1 data-stet="h">Widgets for everyone</h1>'),
+          'z.html': doc('<title data-stet="t">Widgets for everyone</title>', '<p data-stet="z">Another page.</p>'),
+        },
+        { h: { shape: 'text', target: 'web' }, t: { shape: 'text', target: 'web' }, z: { shape: 'text', target: 'web' } },
+        { default: { h: 'Widgets for everyone', t: 'Widgets for everyone', z: 'Another page.' } },
+      );
+      expect(result.converted).toEqual([]);
+      expect(d.keys['t']).toEqual({ shape: 'text', target: 'web' });
+    });
+
+    it('gives a new visible text equal to a head-only key’s value a fresh key', () => {
+      const { descriptor: d, page } = plan({ 'index.html': adoptedPage('\n<h2>Acme</h2>') }, adoptedKeys(), adoptedValues());
+      const h2 = markOf(page('index.html'), '<h2');
+      expect(h2).not.toBe('site_title');
+      expect(d.keys[h2]).toEqual({ shape: 'text', target: 'web' });
+    });
+  });
+
+  it('never derives from a key another page also carries', () => {
+    const nav = '<nav><a href="/">Home</a> <a href="/about.html">About</a></nav>';
+    const { result, descriptor: d, page } = plan({
+      'index.html': doc('<title>Acme widgets</title>', `${nav}\n<h1>Widgets for everyone</h1>`),
+      'about.html': doc('<title>About</title>', `${nav}\n<h1>Who we are</h1>`),
+    });
+    expect(result.derived).toEqual([]);
+    expect(d.keys[markOf(page('about.html'), '<title')]?.derivesFrom).toBeUndefined();
+  });
+
+  it('mints a fresh key for a derivation source’s text on a page a later run adopts (stage-5 R3)', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': doc('<title>Widgets for everyone</title>', '<h1>Widgets for everyone</h1>') },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const source = markOf(host.file('index.html'), '<h1');
+    const title = markOf(host.file('index.html'), '<title');
+    expect(JSON.parse(host.file('content/descriptor.json')).keys[title].derivesFrom).toBe(source);
+    writeFileSync(join(host.cwd, 'about.html'), doc('<title>About us</title>', '<h1>Widgets for everyone</h1>'));
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(markOf(host.file('about.html'), '<h1')).not.toBe(source);
+    // One headline edit rewrites index.html alone.
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as { default: Record<string, unknown> };
+    snapshot.default[source] = 'Widgets for all';
+    writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(snapshot, null, 2)}\n`);
+    const about = readFileSync(join(host.cwd, 'about.html'));
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('index.html')).toContain('>Widgets for all</title>');
+    expect(host.file('index.html')).toContain('>Widgets for all</h1>');
+    expect(readFileSync(join(host.cwd, 'about.html'))).toEqual(about);
+  });
+
+  it('never shares one page’s derived title onto another page', () => {
+    const pair = plan({
+      'a.html': doc('<title>Widgets for everyone</title>', '<h1>Widgets for everyone</h1>'),
+      'b.html': doc('<title>Widgets for everyone</title>', '<h1>Other page heading</h1>'),
+    });
+    const a = markOf(pair.page('a.html'), '<title');
+    const b = markOf(pair.page('b.html'), '<title');
+    expect(pair.descriptor.keys[a]?.derivesFrom).toBe(markOf(pair.page('a.html'), '<h1'));
+    expect(b).not.toBe(a);
+    expect(pair.descriptor.keys[b]?.derivesFrom).toBeUndefined();
+    expect(pair.snapshot['default']?.[b]).toBe('Widgets for everyone');
+  });
+
+  it('never shares a head text’s key with an aria label', () => {
+    const fresh = plan({
+      'index.html': doc(
+        '<meta property="og:title" content="Psyon home page">',
+        '<a href="/" aria-label="Psyon home page">P</a><p>Some body text here.</p>',
+      ),
+    });
+    expect(fresh.result.shared).toBe(0);
+    const og = markOf(fresh.page('index.html'), '<meta property="og:title"');
+    expect(og).not.toBe(markOf(fresh.page('index.html'), '<a href="/" aria-label', '-aria-label'));
+
+    const declared = plan(
+      {
+        'index.html': doc(
+          '<meta property="og:title" content="Psyon home page">',
+          '<a href="/" aria-label="Psyon home page" data-stet-aria-label="home">P</a><p>Some body text here.</p>',
+        ),
+      },
+      { home: { shape: 'text', target: 'web' } },
+      { default: { home: 'Psyon home page' } },
+    );
+    expect(declared.result.shared).toBe(0);
+    expect(markOf(declared.page('index.html'), '<meta property="og:title"')).not.toBe('home');
+  });
+});
+
+describe('register derives head texts — the lines', () => {
+  afterAll(cleanupCliHosts);
+  const HEAD = 'You may already have the data our AI lab partners need. No raw data is needed to start.';
+  const HEADLINE = 'You may already have the data<1> our AI lab partners need.</1>';
+  /** An adopted page whose share description, at line 9, is a literal key repeating the headline. */
+  const ADOPTED = (extra = ''): string =>
+    '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n' +
+    '<title data-stet="site_title">Acme</title>\n' +
+    '<link rel="stylesheet" href="/a.css">\n<link rel="stylesheet" href="/b.css">\n<link rel="icon" href="/i.ico">\n' +
+    `<meta property="og:description" content="${HEAD}" data-stet-content="share">\n` +
+    '</head>\n<body>\n' +
+    `<h1 data-stet="hero">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>${extra}\n` +
+    '</body>\n</html>\n';
+  const KEYS = {
+    hero: { shape: 'text', target: 'web', tags: 1 },
+    share: { shape: 'text', target: 'web' },
+    site_title: { shape: 'text', target: 'web' },
+  };
+  const VALUES = { hero: HEADLINE, share: HEAD, site_title: 'Acme' };
+  const DERIVES = 'index.html:9 share derives from hero through "{v} No raw data is needed to start."';
+
+  it('converts an adopted site’s head key, printing the plan, then the write, with the page unchanged', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': ADOPTED() }, keys: KEYS, defaults: VALUES });
+    const page = readFileSync(join(host.cwd, 'index.html'));
+    const forms = () => [host.file('content/descriptor.json'), host.file('content/defaults.json')];
+    const before = forms();
+
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(host.out).toEqual([DERIVES, "register: run with --write to derive 1 key from the page's visible text"]);
+    expect(forms()).toEqual(before);
+    expect(readFileSync(join(host.cwd, 'index.html'))).toEqual(page);
+
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.out).toEqual([
+      DERIVES,
+      "wrote content/descriptor.json and content/defaults.json: 1 key now derived from the page's visible text; their documents are unchanged",
+      'register: applied',
+    ]);
+    expect(JSON.parse(host.file('content/descriptor.json')).keys.share).toEqual({
+      derivesFrom: 'hero',
+      shape: 'text',
+      target: 'web',
+      tmpl: '{v} No raw data is needed to start.',
+    });
+    expect(Object.hasOwn(JSON.parse(host.file('content/defaults.json')).default, 'share')).toBe(false);
+    expect(readFileSync(join(host.cwd, 'index.html'))).toEqual(page);
+
+    host.out.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(await host.run('pull')).toBe(0);
+    expect(host.stdout()).toContain('pull: documents current');
+    expect(readFileSync(join(host.cwd, 'index.html'))).toEqual(page);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(host.out).toEqual(['register: nothing to adopt']);
+  });
+
+  it('prints both parts and both written lines when a run marks and converts', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': ADOPTED('\n<p>A paragraph nobody has marked yet.</p>') },
+      keys: KEYS,
+      defaults: VALUES,
+    });
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(host.out.slice(-2)).toEqual([
+      DERIVES,
+      "register: run with --write to apply 1 mark across 1 document and derive 1 key from the page's visible text",
+    ]);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.out.slice(-4)).toEqual([
+      DERIVES,
+      'wrote content/descriptor.json, content/defaults.json and 1 document: 1 key added, 0 shared',
+      "wrote content/descriptor.json and content/defaults.json: 1 key now derived from the page's visible text; their documents are unchanged",
+      'register: applied',
+    ]);
+  });
+
+  it('prints the derivations in file, then line order', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'about.html': ADOPTED(),
+        'index.html': '<!DOCTYPE html>\n<html><head>\n<title>Widgets for everyone</title>\n</head><body>\n<h1>Widgets for everyone</h1>\n</body></html>\n',
+      },
+      keys: KEYS,
+      defaults: VALUES,
+    });
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    const lines = host.out.filter((line) => line.includes(' derives from '));
+    expect(lines).toEqual([
+      'about.html:9 share derives from hero through "{v} No raw data is needed to start."',
+      'index.html:3 widgets_for_everyone_2 derives from widgets_for_everyone through "{v}"',
+    ]);
   });
 });
