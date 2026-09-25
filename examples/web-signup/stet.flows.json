@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "app": { "id": "web-signup", "title": "Taskboard (web sample)", "kind": "web" },
+  "points": {
+    "signup":               { "screen": "/signup", "stack": ["/signup"], "title": "Sign up" },
+    "signup.invalid":       { "screen": "/signup", "stack": ["/signup"], "title": "Sign up — invalid address",
+                              "fixture": "signup-invalid" },
+    "signup.sending":       { "screen": "/signup", "stack": ["/signup"], "title": "Sign up — sending",
+                              "fixture": "signup-sending" },
+    "signup.joined":        { "screen": "/signup", "stack": ["/signup"], "title": "Sign up — joined",
+                              "fixture": "signup-joined" },
+    "signup.unavailable":   { "screen": "/signup", "stack": ["/signup"], "title": "Sign up — service unavailable",
+                              "fixture": "signup-unavailable" },
+    "welcome":              { "screen": "/welcome", "stack": ["/welcome"], "title": "Welcome", "account": "new" },
+    "dashboard.new":        { "screen": "/dashboard", "stack": ["/dashboard"], "title": "Dashboard — no projects yet",
+                              "account": "new" },
+    "dashboard":            { "screen": "/dashboard", "stack": ["/dashboard"], "title": "Dashboard", "account": "returning" },
+    "settings":             { "screen": "/settings", "stack": ["/dashboard", "/settings"], "title": "Settings",
+                              "account": "returning" },
+    "settings.saved":       { "screen": "/settings", "stack": ["/dashboard", "/settings"], "title": "Settings — saved",
+                              "account": "returning", "fixture": "settings-saved" },
+    "settings.unsaved":     { "screen": "/settings", "stack": ["/dashboard", "/settings"], "title": "Settings — discard unsaved changes?",
+                              "account": "returning", "fixture": "settings-leaving" },
+    "settings.kept":        { "screen": "/settings", "stack": ["/dashboard", "/settings"], "title": "Settings — kept editing",
+                              "account": "returning", "fixture": "settings-edited" },
+    "dashboard.long-name":  { "screen": "/dashboard", "stack": ["/dashboard"], "title": "Dashboard — 40-character name",
+                              "account": "long-name" },
+    "settings.long-name":   { "screen": "/settings", "stack": ["/dashboard", "/settings"], "title": "Settings — 40-character name",
+                              "account": "long-name" }
+  },
+  "flows": [
+    {
+      "id": "sign-up", "title": "Sign up",
+      "steps": [
+        { "point": "signup" },
+        { "point": "signup.sending", "action": "Enter name and email, click Create account" },
+        { "point": "signup.joined", "action": "Account created" },
+        { "point": "welcome", "action": "Click Continue" },
+        { "point": "dashboard.new", "action": "Click Go to your dashboard" }
+      ],
+      "branches": [
+        { "id": "invalid-address", "title": "Invalid address",
+          "from": "signup", "action": "Click Create account with an invalid address",
+          "steps": [ { "point": "signup.invalid" } ],
+          "rejoins": "signup.sending" },
+        { "id": "service-unavailable", "title": "Service unavailable",
+          "from": "signup.sending", "action": "Sign-up service does not answer",
+          "steps": [ { "point": "signup.unavailable" } ],
+          "rejoins": "signup.sending" }
+      ]
+    },
+    {
+      "id": "settings", "title": "Change settings",
+      "steps": [
+        { "point": "dashboard" },
+        { "point": "settings", "action": "Click Settings" },
+        { "point": "settings.saved", "action": "Change display name, click Save changes" }
+      ],
+      "branches": [
+        { "id": "unsaved-changes", "title": "Unsaved changes",
+          "from": "settings", "action": "Change display name, click Back to dashboard",
+          "steps": [ { "point": "settings.unsaved" } ] },
+        { "id": "unsaved-discard", "title": "Discard changes",
+          "from": "settings.unsaved", "action": "Click Discard",
+          "steps": [],
+          "rejoins": "dashboard" },
+        { "id": "unsaved-keep", "title": "Keep editing",
+          "from": "settings.unsaved", "action": "Click Keep editing",
+          "steps": [ { "point": "settings.kept" } ],
+          "rejoins": "settings.saved" }
+      ]
+    }
+  ],
+  "edgeStates": [
+    { "id": "long-name", "title": "40-character name",
+      "points": ["dashboard.long-name", "settings.long-name"], "flows": ["settings"] }
+  ],
+  "devices": [
+    { "id": "desktop", "platform": "web", "name": "Desktop", "viewport": { "width": 1280, "height": 800, "pixelRatio": 2 } },
+    { "id": "mobile", "platform": "web", "name": "Mobile", "viewport": { "width": 390, "height": 844, "pixelRatio": 3 } }
+  ]
+}
