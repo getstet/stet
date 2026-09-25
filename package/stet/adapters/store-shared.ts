@@ -12,11 +12,22 @@
  * canonical. Timestamps cross as ISO UTC, the one form every adapter agrees on.
  */
 
+import { checkDeclaration } from '../src/contacts.js';
 import type { StoreRow } from '../src/resolve.js';
 import type {
   ChangesetRow,
   ChangesetStatus,
+  ContactRecord,
   DraftRefusal,
+  GroupDef,
+  GroupProperty,
+  GroupRow,
+  GroupState,
+  ImportOutcome,
+  JoinResult,
+  MemberRow,
+  MembershipRow,
+  SuppressionRow,
   NotSupported,
   StoreError,
   VersionRow,
@@ -114,6 +125,184 @@ export function mapChangesetRow(r: ChangesetSqlRow): ChangesetRow {
   };
 }
 
+// ── The contacts mapping ────────────────────────────────────────────────────
+//
+// Both SQL adapters call the same migration-3 functions and hand their answers
+// here: a table function arrives as rows (timestamps as `Date` over `pg`, as
+// strings over PostgREST), a jsonb function as one parsed object (timestamps
+// already strings). The memory reference builds the same shapes directly.
+
+/**
+ * A declaration `addGroup` refuses before it writes, or null: `checkDeclaration`
+ * is the one rule, and the CLI's `group add` applies it too. A malformed list
+ * stored would answer every join after it with a check nobody declared.
+ */
+export function invalidDeclaration(properties: unknown): StoreError | null {
+  const fault = checkDeclaration(properties);
+  return fault === null ? null : mapError(`invalid group declaration — ${fault}`);
+}
+
+/** `stet_group_get`'s columns; `stet_group_list` adds `members`. */
+export interface GroupDefSqlRow {
+  key: string;
+  name: string;
+  state: string;
+  properties: unknown;
+  created_at: Date | string;
+}
+
+export interface GroupSqlRow extends GroupDefSqlRow {
+  members: number | string;
+}
+
+export function mapGroupDef(r: GroupDefSqlRow): GroupDef {
+  return {
+    key: r.key,
+    name: r.name,
+    state: r.state as GroupState,
+    properties: Array.isArray(r.properties) ? (r.properties as GroupProperty[]) : [],
+    createdAt: iso(r.created_at),
+  };
+}
+
+export function mapGroupRow(r: GroupSqlRow): GroupRow {
+  // count(*) is a bigint; PostgREST sends it as a number, `pg` as a number
+  // through the pool's int8 parser.
+  return { ...mapGroupDef(r), members: Number(r.members) };
+}
+
+/** A membership's columns, as the members read and the contact record both carry them. */
+interface MembershipSqlRow {
+  id: number;
+  joined_at: Date | string;
+  form: string | null;
+  page: string | null;
+  properties: unknown;
+  updated_at: Date | string;
+}
+
+/** `stet_group_members`' columns. */
+export interface MemberSqlRow extends MembershipSqlRow {
+  contact_id: number;
+  email: string;
+  suppressed: boolean;
+  /** Not a column of the members read: the one group they were read from. */
+  group?: string;
+}
+
+/** One membership, the consent evidence, in the one shape every read answers it in. */
+function mapMembership(m: MembershipSqlRow, group: string): MembershipRow {
+  return {
+    id: Number(m.id),
+    group,
+    joinedAt: iso(m.joined_at),
+    form: m.form,
+    page: m.page,
+    properties: stringsOf(m.properties),
+    updatedAt: iso(m.updated_at),
+  };
+}
+
+export function mapMemberRow(r: MemberSqlRow, group: string): MemberRow {
+  return { ...mapMembership(r, group), contactId: Number(r.contact_id), email: r.email, suppressed: r.suppressed === true };
+}
+
+/** One members page. The cursor for the next is the last id, or null once the page came up short. */
+export function memberPage(rows: MemberSqlRow[], group: string, limit: number): { rows: MemberRow[]; nextAfterId: number | null } {
+  const page = rows.map((r) => mapMemberRow(r, group));
+  return { rows: page, nextAfterId: page.length < limit ? null : (page[page.length - 1]?.id ?? null) };
+}
+
+/** `stet_contact_record`'s object, or null when nothing is held. */
+export function mapContactRecord(body: unknown): { record: ContactRecord | null } | StoreError {
+  if (body === null || body === '') return { record: null };
+  if (typeof body !== 'object' || Array.isArray(body)) return mapError(`unexpected contact record: ${JSON.stringify(body)}`);
+  const b = body as {
+    email: string;
+    contact: { id: number; properties: unknown; created_at: string; updated_at: string } | null;
+    memberships: (MembershipSqlRow & { group: string })[];
+    suppressions: { scope: string; source: string; created_at: string }[];
+  };
+  const memberships = (b.memberships ?? []).map((m) => mapMembership(m, m.group));
+  const suppressions: SuppressionRow[] = (b.suppressions ?? []).map((x) => ({
+    scope: x.scope as SuppressionRow['scope'],
+    source: x.source,
+    createdAt: iso(x.created_at),
+  }));
+  return {
+    record: {
+      email: b.email,
+      contact:
+        b.contact === null
+          ? null
+          : {
+              id: Number(b.contact.id),
+              properties: (b.contact.properties ?? {}) as Record<string, unknown>,
+              createdAt: iso(b.contact.created_at),
+              updatedAt: iso(b.contact.updated_at),
+            },
+      memberships,
+      suppressions,
+    },
+  };
+}
+
+/** `stet_join_group`'s object. */
+export function asJoin(answer: RpcAnswer): JoinResult | StoreError {
+  const checked = expectNoRefusal(answer, 'contacts.join');
+  if (!('body' in checked)) return checked;
+  const b = checked.body as
+    | { contact_id?: unknown; is_new?: unknown; suppressed?: unknown; joined_at?: unknown; form?: unknown; page?: unknown }
+    | null;
+  if (b === null || typeof b !== 'object' || typeof b.is_new !== 'boolean' || typeof b.joined_at !== 'string') {
+    return mapError(`unexpected RPC answer: ${JSON.stringify(checked.body)}`);
+  }
+  return {
+    contactId: Number(b.contact_id),
+    isNew: b.is_new,
+    suppressed: b.suppressed === true,
+    joinedAt: iso(b.joined_at),
+    form: typeof b.form === 'string' ? b.form : null,
+    page: typeof b.page === 'string' ? b.page : null,
+  };
+}
+
+const OUTCOMES: readonly ImportOutcome[] = ['joined', 'present', 'erased', 'suppressed'];
+
+/** `stet_import_member`'s one word. */
+export function asImportOutcome(answer: RpcAnswer): { outcome: ImportOutcome } | StoreError {
+  const checked = expectNoRefusal(answer, 'contacts.importMember');
+  if (!('body' in checked)) return checked;
+  return (OUTCOMES as readonly unknown[]).includes(checked.body)
+    ? { outcome: checked.body as ImportOutcome }
+    : mapError(`unexpected RPC answer: ${JSON.stringify(checked.body)}`);
+}
+
+/** `stet_erase_contact`'s object. */
+export function asErased(answer: RpcAnswer): { existed: boolean; memberships: number } | StoreError {
+  const checked = expectNoRefusal(answer, 'contacts.erase');
+  if (!('body' in checked)) return checked;
+  const b = checked.body as { existed?: unknown; memberships?: unknown } | null;
+  return b !== null && typeof b === 'object' && typeof b.existed === 'boolean'
+    ? { existed: b.existed, memberships: Number(b.memberships) }
+    : mapError(`unexpected RPC answer: ${JSON.stringify(checked.body)}`);
+}
+
+/** A void RPC's answer (`stet_group_add`, `stet_group_state`). */
+export function asVoid(answer: RpcAnswer, method: string): true | StoreError {
+  const checked = expectNoRefusal(answer, method);
+  if (!('body' in checked)) return checked;
+  return checked.body === null || checked.body === '' ? true : mapError(`unexpected RPC answer: ${JSON.stringify(checked.body)}`);
+}
+
+/** A stored answers object, narrowed to its string members — the only kind a join stores. */
+function stringsOf(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return out;
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) if (typeof v === 'string') out[k] = v;
+  return out;
+}
+
 function iso(at: Date | string): string {
   return at instanceof Date ? at.toISOString() : new Date(at).toISOString();
 }
@@ -197,12 +386,23 @@ export function mapPage(
 // ── PostgREST filter quoting ────────────────────────────────────────────────
 
 /**
- * One value inside a PostgREST filter. Backslashes double FIRST and quotes
- * escape second, and the result is wrapped in double quotes: a key or a project
- * carrying a comma, a dot or a quote would otherwise end the filter early, and
- * project scoping is a filter like any other.
+ * An equality filter. PostgREST reads everything after `eq.` as the value,
+ * verbatim — a double quote there is a character of the value, never a
+ * delimiter (PostgREST 12.2.3 and 16.4, executed: a quoted value matched no
+ * row, the bare value matched for a comma, a dot, a colon, parentheses, a
+ * quote, a backslash, a space, `%` and `&`). So the value goes bare, and the
+ * caller's `URLSearchParams` percent-encodes it.
  */
-export function filterValue(value: string): string {
+export function eqFilter(value: string): string {
+  return `eq.${value}`;
+}
+
+/**
+ * One value inside an `in.(…)` list, where commas and parentheses ARE syntax:
+ * backslashes double first, quotes escape second, and the value is wrapped in
+ * double quotes, which PostgREST parses inside a list.
+ */
+export function listValue(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
@@ -226,6 +426,9 @@ const MARKERS = {
   noMembers: 'no_members:',
   staleActive: 'stale_active:',
   groupedSchedule: 'grouped_schedule:',
+  unknownGroup: 'unknown_group:',
+  groupClosed: 'group_closed:',
+  groupExists: 'group_exists:',
 } as const;
 
 /** Publish found nothing to publish. */
@@ -291,6 +494,30 @@ export function staleActive(key: string, expected: number): string {
 /** A grouped draft's schedule is the change's alone — a member never carries its own. */
 export function groupedSchedule(key: string): string {
   return `${MARKERS.groupedSchedule}${key}`;
+}
+
+/** A join or import naming no group of this project. */
+export function unknownGroup(key: string): string {
+  return `${MARKERS.unknownGroup}${key}`;
+}
+
+/** A join to a group that is not open. */
+export function groupClosed(key: string): string {
+  return `${MARKERS.groupClosed}${key}`;
+}
+
+/** `group add` over a key this project already has. */
+export function groupExists(key: string): string {
+  return `${MARKERS.groupExists}${key}`;
+}
+
+/** Which contacts marker a conflict carries, if any — the forms handler's status table reads it. */
+export function contactsMarker(error: StoreError): 'unknown_group' | 'group_closed' | 'group_exists' | null {
+  if (error.code !== 'conflict') return null;
+  if (error.message.startsWith(MARKERS.unknownGroup)) return 'unknown_group';
+  if (error.message.startsWith(MARKERS.groupClosed)) return 'group_closed';
+  if (error.message.startsWith(MARKERS.groupExists)) return 'group_exists';
+  return null;
 }
 
 // Derived from the markers, so a new raise is classified as a `conflict` with

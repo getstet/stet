@@ -124,6 +124,16 @@ publish with revert, grouped changesets that publish and revert as one unit,
 and per-environment connections. A project starts snapshot-only and adds a
 store later with `stet upgrade`.
 
+## Contacts
+
+A site's own sign-up form can post to stet: `createStetFormsHandler` on
+`@getstet/stet/server` records who joined which group, when and from which
+page, in your own Postgres, and serves the one-click unsubscribe your emails
+link to. stet sends nothing; your `onJoin` sends the welcome through your own
+provider. `stet contacts` lists groups and members, exports or erases one
+person, and imports an existing list. Recipes and the SQL reference:
+[docs/operator/contacts.md](https://github.com/getstet/stet/blob/main/package/docs/operator/contacts.md).
+
 ## Frameworks
 
 Next.js (both routers), React and Astro are first-class for scanning and

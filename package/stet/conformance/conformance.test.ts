@@ -42,6 +42,10 @@ import {
 import { createSnapshotStore } from '../adapters/store-snapshot.js';
 import { loadConfig } from '../cli/config.js';
 import { createStetHandler, type PublishEvent } from '../server/mount.js';
+import { createStetFormsHandler, type JoinEvent } from '../server/forms.js';
+import { collision, GRANTS_003 } from '../cli/upgrade.js';
+import { migrations as installedMigrations } from '../cli/installed.js';
+import { mintUnsubscribeToken, verifyUnsubscribeToken } from '../server/unsubscribe-token.js';
 import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { GATE_LINE, HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
@@ -82,7 +86,7 @@ import {
   validateSave,
   webTarget,
 } from '../src/index.js';
-import type { Bundle, Descriptor, SeoFinding, SeoRule, Snapshot, StoreAdapter, StoreRow } from '../src/index.js';
+import type { Bundle, Descriptor, SeoFinding, SeoRule, Snapshot, StoreAdapter, StoreError, StoreRow } from '../src/index.js';
 import {
   bareHtmlHost,
   cleanupCliHosts,
@@ -116,6 +120,8 @@ const MIGRATION_NAME = '001_content_cms.sql';
 const MIGRATION = readFileSync(new URL(`../migrations/${MIGRATION_NAME}`, import.meta.url), 'utf8');
 const MIGRATION_2_NAME = '002_changesets.sql';
 const MIGRATION_2 = readFileSync(new URL(`../migrations/${MIGRATION_2_NAME}`, import.meta.url), 'utf8');
+const MIGRATION_3_NAME = '003_contacts.sql';
+const MIGRATION_3 = readFileSync(new URL(`../migrations/${MIGRATION_3_NAME}`, import.meta.url), 'utf8');
 
 afterAll(cleanupCliHosts);
 afterAll(cleanupEmailHosts);
@@ -1789,6 +1795,14 @@ describe('store', () => {
       method: 'changesets.open',
     });
 
+    // The contacts capability is a second block beside it, as honestly missing
+    // on a snapshot project; the function list above still reads the seven.
+    expect(typeof store.contacts).toBe('object');
+    expect(await snapshot.contacts.join({ group: 'cloud-waitlist', email: 'ana@x.co', properties: {} })).toEqual({
+      notSupported: true,
+      method: 'contacts.join',
+    });
+
     // The change ref is the save's optional membership argument, and its three
     // intents are distinct: absent leaves membership, null detaches, an id
     // attaches.
@@ -2089,6 +2103,11 @@ describe('store', () => {
     // object property, so it can never be mistaken for an eighth method.
     expect(typeof store.changesets).toBe('object');
     expect(typeof (store as never)['changesets']).not.toBe('function');
+    // Both capability blocks, and nothing else, are object properties.
+    expect(Object.keys(store).filter((k) => typeof (store as never)[k] === 'object').sort()).toEqual([
+      'changesets',
+      'contacts',
+    ]);
 
     // And the `canApplyDDL: false` apply path prints a post-apply ACCESS check
     // beside the SQL — the path that promises verification verifies access,
@@ -3160,6 +3179,31 @@ describe('cli', () => {
     // Any other value is a config error naming the two states.
     writeFileSync(join(html.cwd, 'stet.config.json'), JSON.stringify({ host: 'static' }));
     expect(() => loadConfig(html.cwd)).toThrow(/host must be "html", or absent for a JavaScript host/);
+
+    // The forms secret's name and a contacts store of its own round-trip; a
+    // config without them names the default variable and shares the content
+    // store; each refusal names what it refused.
+    const contacts = makeCliHost({
+      config: {
+        formsSecretEnv: 'FORMS_KEY',
+        contacts: {
+          store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' },
+          environments: { prod: { adapter: 'pg', urlEnv: 'PROD_URL' } },
+        },
+      },
+    });
+    const withContacts = loadConfig(contacts.cwd);
+    expect(withContacts.formsSecretEnv).toBe('FORMS_KEY');
+    expect(withContacts.contacts?.store).toMatchObject({ adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' });
+    expect(withContacts.contacts?.environments?.['prod']).toMatchObject({ adapter: 'pg', urlEnv: 'PROD_URL' });
+    expect(loadConfig(bare.cwd).formsSecretEnv).toBeUndefined();
+    expect(loadConfig(bare.cwd).contacts).toBeUndefined();
+    const mysql = makeCliHost({ config: { contacts: { store: { adapter: 'mysql' } } } });
+    expect(() => loadConfig(mysql.cwd)).toThrow(/contacts\.store\.adapter/);
+    const shared = makeCliHost({ config: { formsSecretEnv: 'STET_API_TOKEN' } });
+    expect(() => loadConfig(shared.cwd)).toThrow('formsSecretEnv and apiTokenEnv both name STET_API_TOKEN');
+    const blank = makeCliHost({ config: { formsSecretEnv: ' ' } });
+    expect(() => loadConfig(blank.cwd)).toThrow('formsSecretEnv is blank');
   });
 
   it('Requirement: Every store-touching command accepts --env', async () => {
@@ -4003,6 +4047,33 @@ describe('cli', () => {
     const inGit = await makeHtmlHost({ register: true, git: true });
     expect(await inGit.run('doctor')).toBe(0);
     expect(inGit.stderr()).not.toContain('git: not a repository');
+
+    // Where the contacts live: a declared contacts store at migration 3, a
+    // content store below it, and a project with neither — each exit 0.
+    const metaAt = (version: number): typeof globalThis.fetch =>
+      fakeFetch(JSON.stringify([{ schema_version: version, descriptor_version: '' }]));
+    const declared = makeCliHost({
+      config: { contacts: { store: { adapter: 'postgrest', urlEnv: 'CONTACTS_URL', tokenEnv: 'CONTACTS_TOKEN' } } },
+      env: { CONTACTS_URL: 'http://contacts.test', CONTACTS_TOKEN: 't' },
+      stores: { contacts: createMemoryStore({ project: 'default' }) },
+      fetchImpl: metaAt(3),
+    });
+    expect(await declared.run('doctor')).toBe(0);
+    expect(declared.stdout()).toContain(
+      'contacts: contacts.store (postgrest), schema_version 3 — 0 groups, suppressions: 0 marketing, 0 transactional',
+    );
+    expect(declared.stdout()).toContain('  forms secret: STET_FORMS_SECRET (unset in this shell)');
+    const below = makeCliHost({
+      config: { store: { adapter: 'postgrest' } },
+      env: { STET_POSTGREST_URL: 'http://postgrest.test', STET_POSTGREST_TOKEN: 't' },
+      store: createMemoryStore({ project: 'default' }),
+      fetchImpl: metaAt(2),
+    });
+    expect(await below.run('doctor')).toBe(0);
+    expect(below.stdout()).toContain('contacts: in the content store — not installed (schema_version 2); run stet upgrade');
+    const neither = makeCliHost({ config: {} });
+    expect(await neither.run('doctor')).toBe(0);
+    expect(neither.stdout()).not.toContain('contacts:');
   });
 
   it('Requirement: upgrade knows what it upgrades from', async () => {
@@ -4025,6 +4096,14 @@ describe('cli', () => {
     expect(absent.stdout()).toContain('cannot apply DDL');
     expect(absent.stdout()).toContain("notify pgrst, 'reload schema';");
     expect(absent.stdout()).toContain("select has_table_privilege(");
+    // Migration 3 is pending here, so the print path names what a service role
+    // granted after it needs, and that it must bypass row level security.
+    expect(absent.stdout()).toContain('installed 0, pending 1, 2, 3');
+    expect(absent.stdout()).toContain(
+      'migration 3 grants its tables and functions to every role holding EXECUTE on save_content_draft; a service role granted after it needs:',
+    );
+    expect(absent.stdout()).toContain(`  ${GRANTS_003[0]}`);
+    expect(absent.stdout()).toContain('  alter role <your service role> bypassrls;');
 
     // --verify reads stet_meta through the adapter module and reports the move.
     let patched = '';
@@ -4037,13 +4116,13 @@ describe('cli', () => {
           patched = String(init.body);
           return new Response(JSON.stringify([{ id: 1 }]));
         }
-        // The newest shipped migration: a database still reporting 1 has 002
+        // The newest shipped migration: a database still reporting 2 has 003
         // pending and --verify would refuse it.
-        return new Response(JSON.stringify([{ schema_version: 2, descriptor_version: '' }]));
+        return new Response(JSON.stringify([{ schema_version: 3, descriptor_version: '' }]));
       }) as typeof globalThis.fetch,
     });
     expect(await verified.run('upgrade', '--verify')).toBe(0);
-    expect(verified.stdout()).toContain('schema_version 2');
+    expect(verified.stdout()).toContain('schema_version 3');
     // Migration 1 ships descriptor_version '' — "not yet stamped" — and
     // upgrade is one of its two named stampers.
     expect(patched).toContain('"descriptor_version":"1"');
@@ -4056,6 +4135,25 @@ describe('cli', () => {
     expect(await html.run('upgrade', '--dry-run')).toBe(0);
     expect(html.stdout()).toContain('codegen: none on an html host — the documents are regenerated by stet pull');
     expect(html.exists('content/keys.ts')).toBe(false);
+
+    // A name collision: the lost stamp keeps its repair; a host's relation,
+    // type or function is named, quoted, and never answered with the stamp.
+    const [m1, , m3] = installedMigrations();
+    const source3 = readFileSync(m3!.path, 'utf8');
+    expect(collision(0, m1!, '42P07', 'relation "content_versions" already exists', readFileSync(m1!.path, 'utf8'))).toContain(
+      "Restore the row (insert into stet_meta (id, schema_version, descriptor_version) values (1, 1, ''))",
+    );
+    for (const [code, message, kind] of [
+      ['42P07', 'relation "stet_contacts" already exists', 'the table stet_contacts'],
+      ['42710', 'type "stet_contacts" already exists', 'the table stet_contacts'],
+      ['42723', 'function "stet_group_get" already exists with same argument types', 'the function stet_group_get'],
+    ] as const) {
+      const words = collision(2, m3!, code, message, source3);
+      expect(words).toBe(
+        `migration 3 changed nothing: it creates ${kind}, and this database already has an object of that name ` +
+          `(Postgres: ${message}). Rename or move that object, then run stet upgrade again`,
+      );
+    }
   });
 
   it('Requirement: The Python helper reads the bundle contract', () => {
@@ -5477,6 +5575,20 @@ describe('adoption', () => {
     expect(host.exists('AGENTS.md')).toBe(false);
     expect(host.exists('CLAUDE.md')).toBe(false);
 
+    // Where the contacts have a store, the plan names the tables that stay in
+    // the database and how to write one person out first; eject drops no table.
+    const backed = makeAdoptionHost({ store: createMemoryStore({ project: 'default' }) });
+    expect(await backed.run('init', '--yes')).toBe(0);
+    writeFileSync(
+      join(backed.cwd, 'stet.config.json'),
+      JSON.stringify({ ...JSON.parse(backed.file('stet.config.json')), store: { adapter: 'memory' } }),
+    );
+    expect(await backed.run('eject')).toBe(0);
+    expect(backed.stdout()).toContain(
+      'stays in the database: the contacts tables (stet_groups, stet_contacts, stet_group_memberships, stet_suppressions, ' +
+        'stet_erasures) — eject drops no table; run stet contacts export <email> before --write to write a person to a file',
+    );
+
     // A host file that hand-wired itself onto the scaffold refuses the eject
     // rather than being cut loose. Plan-only prints the FULL manifest — the
     // kept line with its importer and remedy, what stays, and the guidance,
@@ -5874,6 +5986,7 @@ describe('mount', () => {
         // This fake groups nothing, so it answers the capability the way any
         // adapter that cannot honors it — and the routes 501 rather than lie.
         changesets: createSnapshotStore({ project: 'test' }).changesets,
+        contacts: createSnapshotStore({ project: 'test' }).contacts,
       };
       const handler = createStetHandler({
         store,
@@ -6207,6 +6320,12 @@ describe('dashboard', () => {
     expect(await groupOf(page, 'seo')).toEqual(head);
     expect(page.html().match(/\bon[a-z]+="/g)).toBeNull();
     expect(page.errors).toEqual([]);
+    // Contacts stays dark, and its one line says where form sign-ups are read.
+    await page.act('tab:Contacts');
+    expect(page.html()).toContain('Not built yet.');
+    expect(page.html()).toContain(
+      'Form sign-ups are stored in your database. Read them in the terminal with stet contacts list — this tab does not show them yet.',
+    );
     page.dom.window.close();
   });
 
@@ -6375,4 +6494,366 @@ describe('dashboard', () => {
     await tick(1_100);
     expect(located(framed).at(-1)).toMatchObject({ key: 'gone', hidden: true });
   }, 5_000);
+});
+
+describe('contacts', () => {
+  it("Requirement: Migration 3 holds the list in the host's own database", () => {
+    // The file as every store-backed install receives it; the database half —
+    // the collisions, the grants, the join's locking, the normal form — is
+    // settled in store-pg.live.test.ts.
+    expect(MIGRATION_3_NAME).toBe('003_contacts.sql');
+    const code = MIGRATION_3.split('\n')
+      .filter((line) => !line.trimStart().startsWith('--'))
+      .join('\n');
+
+    // One transaction, the stamp its last statement.
+    const statements = code
+      .split(';')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    expect(statements[0]).toBe('begin');
+    expect(statements.at(-1)).toBe('commit');
+    expect(statements.at(-2)).toContain('update stet_meta set schema_version = 3');
+
+    // Every name it creates carries the prefix, and no function replaces a
+    // host's of the same name.
+    const created = [...code.matchAll(/^create (table|index|sequence|function) (\w+)/gm)].map((m) => m[2]);
+    expect(created.length).toBe(5 + 1 + 2 + 13);
+    expect(created.filter((name) => !name?.startsWith('stet_'))).toEqual([]);
+    expect(code).not.toMatch(/create or replace/i);
+
+    // Deny by default on every table, and every function a security invoker.
+    for (const table of ['stet_groups', 'stet_contacts', 'stet_group_memberships', 'stet_suppressions', 'stet_erasures']) {
+      expect(code).toContain(`alter table ${table} enable row level security;`);
+    }
+    const functions = code.split(/^create function /m).slice(1);
+    expect(functions).toHaveLength(13);
+    for (const fn of functions) {
+      const header = fn.slice(0, fn.indexOf('$$'));
+      expect(`${fn.slice(0, fn.indexOf('('))}: ${header.includes('security invoker')}`).toBe(
+        `${fn.slice(0, fn.indexOf('('))}: true`,
+      );
+    }
+
+    // Sequences by name: a serial column picks a free name on a collision.
+    expect(code).not.toMatch(/\b(big)?serial\b/i);
+  });
+
+  it('Requirement: The contacts capability rides the write adapters', async () => {
+    // Every adapter carries the block with the same eleven methods; the
+    // snapshot adapter answers NotSupported from each, naming it. The whole
+    // store suite's contacts block runs over memory in conformance/store.test.ts
+    // and over pg and PostgREST in the live leg.
+    const METHODS = [
+      'addGroup', 'contact', 'erase', 'group', 'groups', 'importMember', 'join', 'members', 'setGroupState',
+      'suppress', 'suppressionCounts',
+    ];
+    for (const store of [
+      createMemoryStore({ project: 'walk' }),
+      createPgStore({ connectionString: 'postgresql://unused/none', project: 'walk' }),
+      createPostgrestStore({ url: 'http://unused.test', token: '', project: 'walk' }),
+      createSnapshotStore({ project: 'walk' }),
+    ]) {
+      expect(Object.keys(store.contacts).sort()).toEqual(METHODS);
+    }
+    const snapshot = createSnapshotStore({ project: 'walk' }).contacts;
+    const refused = [
+      await snapshot.addGroup({ key: 'g', name: 'g', properties: [] }),
+      await snapshot.contact({ email: 'a@b.co' }),
+      await snapshot.erase({ email: 'a@b.co' }),
+      await snapshot.group({ key: 'g' }),
+      await snapshot.groups(),
+      await snapshot.importMember({ group: 'g', email: 'a@b.co', properties: {}, form: 'import:x' }),
+      await snapshot.join({ group: 'g', email: 'a@b.co', properties: {} }),
+      await snapshot.members({ group: 'g' }),
+      await snapshot.setGroupState({ key: 'g', state: 'closed' }),
+      await snapshot.suppress({ email: 'a@b.co', scope: 'marketing', source: 'operator' }),
+      await snapshot.suppressionCounts(),
+    ];
+    expect(refused).toEqual(METHODS.map((m) => ({ notSupported: true, method: `contacts.${m}` })));
+
+    // The reference: a join, a re-join, the three refusals as conflict
+    // markers, and a join that never lifts a suppression.
+    const store = createMemoryStore({ project: 'walk_contacts' }).contacts;
+    ok(await store.addGroup({ key: 'cloud-waitlist', name: 'stet Cloud', properties: [] }));
+    const first = ok(await store.join({ group: 'cloud-waitlist', email: 'ana@lightfield.co', properties: {}, form: 'f', page: null }));
+    const again = ok(await store.join({ group: 'cloud-waitlist', email: 'ana@lightfield.co', properties: {}, form: 'g', page: null }));
+    expect([first.isNew, again.isNew, again.form]).toEqual([true, false, 'f']);
+    expect((await store.addGroup({ key: 'cloud-waitlist', name: 'x', properties: [] }) as StoreError).code).toBe('conflict');
+    expect((await store.join({ group: 'nope', email: 'a@b.co', properties: {} }) as StoreError).message).toBe('unknown_group:nope');
+    ok(await store.setGroupState({ key: 'cloud-waitlist', state: 'closed' }));
+    expect((await store.join({ group: 'cloud-waitlist', email: 'a@b.co', properties: {} }) as StoreError).message).toBe(
+      'group_closed:cloud-waitlist',
+    );
+    ok(await store.setGroupState({ key: 'cloud-waitlist', state: 'open' }));
+    expect(ok(await store.suppress({ email: 'sam@x.co', scope: 'marketing', source: 'one-click' }))).toEqual({ suppressed: true });
+    const suppressed = ok(await store.join({ group: 'cloud-waitlist', email: 'sam@x.co', properties: {} }));
+    expect(suppressed).toMatchObject({ isNew: true, suppressed: true });
+    expect(ok(await store.contact({ email: 'sam@x.co' })).record?.suppressions).toHaveLength(1);
+    expect(ok(await store.importMember({ group: 'cloud-waitlist', email: 'sam@x.co', properties: {}, form: 'import:x' }))).toEqual({
+      outcome: 'suppressed',
+    });
+  });
+
+  /** The website's worked example: `cloud-waitlist` asking a tier, posted from getstet.xyz. */
+  async function websiteForms(): Promise<{
+    store: ReturnType<typeof createMemoryStore>;
+    forms: ReturnType<typeof createStetFormsHandler>;
+    joins: JoinEvent[];
+  }> {
+    const store = createMemoryStore({ project: 'default', db: createMemoryDb() });
+    ok(
+      await store.contacts.addGroup({
+        key: 'cloud-waitlist',
+        name: 'stet Cloud',
+        properties: [{ name: 'tier', type: 'enum', values: ['solo', 'team', 'business'], required: true }],
+      }),
+    );
+    const joins: JoinEvent[] = [];
+    const forms = createStetFormsHandler({
+      store,
+      secret: 'forms-secret',
+      unsubscribeBase: 'https://getstet.xyz/api/stet',
+      allowedOrigins: ['https://www.getstet.xyz'],
+      guard: 'none',
+      onJoin: (e) => {
+        joins.push(e);
+      },
+    });
+    return { store, forms, joins };
+  }
+
+  const websiteJoin = (body: Record<string, unknown>): Request =>
+    new Request('https://getstet.xyz/api/stet/join/cloud-waitlist', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://www.getstet.xyz' },
+      body: JSON.stringify(body),
+    });
+
+  it('Requirement: The join route records a membership and its consent evidence', async () => {
+    const { store, forms, joins } = await websiteForms();
+    const worked = {
+      email: 'Ana@Lightfield.co',
+      properties: { tier: 'team' },
+      form: 'waitlist-page',
+      page: 'https://getstet.xyz/waitlist',
+    };
+    const first = await forms.POST(websiteJoin(worked));
+    expect(first.status).toBe(200);
+    expect(first.headers.get('access-control-allow-origin')).toBe('https://www.getstet.xyz');
+    const firstBody = await first.text();
+    expect(firstBody).toBe('{"ok":true}');
+    const held = ok(await store.contacts.contact({ email: 'ana@lightfield.co' })).record;
+    expect(held?.memberships).toEqual([
+      expect.objectContaining({ group: 'cloud-waitlist', form: 'waitlist-page', page: 'https://getstet.xyz/waitlist', properties: { tier: 'team' } }),
+    ]);
+    expect(joins[0]).toMatchObject({ isNew: true, suppressed: false });
+    expect(joins[0]?.unsubscribeUrl).toMatch(/\/unsubscribe\?token=e\./);
+
+    // Joining again: the answers move, the consent evidence stays the first's.
+    const again = await forms.POST(websiteJoin({ ...worked, properties: { tier: 'business' }, form: 'footer' }));
+    expect(await again.text()).toBe(firstBody);
+    const after = ok(await store.contacts.contact({ email: 'ana@lightfield.co' })).record?.memberships[0];
+    expect(after).toMatchObject({ properties: { tier: 'business' }, joinedAt: held?.memberships[0]?.joinedAt, form: 'waitlist-page' });
+    expect(joins[1]).toMatchObject({ isNew: false, form: 'waitlist-page', page: 'https://getstet.xyz/waitlist' });
+
+    // A suppressed address is answered in the same bytes: the route never
+    // tells a visitor who is on a list.
+    ok(await store.contacts.suppress({ email: 'sam@x.co', scope: 'marketing', source: 'one-click' }));
+    const suppressed = await forms.POST(websiteJoin({ ...worked, email: 'sam@x.co' }));
+    expect([suppressed.status, [...suppressed.headers], await suppressed.text()]).toEqual([
+      again.status,
+      [...again.headers],
+      firstBody,
+    ]);
+  });
+
+  it('Requirement: The unsubscribe route suppresses marketing mail on a signed request', async () => {
+    const { store, forms } = await websiteForms();
+    const link = `https://getstet.xyz/api/stet/unsubscribe?token=${encodeURIComponent(mintUnsubscribeToken('ana@lightfield.co', 'forms-secret'))}`;
+
+    // The footer link's GET changes nothing: mail scanners fetch every link.
+    const shown = await forms.GET(new Request(link));
+    expect(shown.status).toBe(200);
+    expect(await shown.text()).toContain('Unsubscribe ana@lightfield.co from marketing email?');
+    expect(ok(await store.contacts.contact({ email: 'ana@lightfield.co' }))).toEqual({ record: null });
+
+    const oneClick = (): Request =>
+      new Request(link, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'List-Unsubscribe=One-Click',
+      });
+    const done = await forms.POST(oneClick());
+    expect(done.status).toBe(200);
+    expect(done.headers.get('cache-control')).toBe('no-store');
+    expect(done.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(await done.text()).toContain('ana@lightfield.co is unsubscribed from marketing email.');
+    expect(ok(await store.contacts.contact({ email: 'ana@lightfield.co' })).record?.suppressions).toEqual([
+      expect.objectContaining({ scope: 'marketing', source: 'one-click' }),
+    ]);
+    expect((await forms.POST(oneClick())).status).toBe(200);
+
+    const invalid = await forms.GET(new Request(`${link.slice(0, -1)}${link.endsWith('A') ? 'B' : 'A'}`));
+    expect(invalid.status).toBe(400);
+    expect(await invalid.text()).toContain('This unsubscribe link is not valid.');
+  });
+
+  it('Requirement: The unsubscribe token is signed by the forms secret alone', () => {
+    const token = mintUnsubscribeToken('Ana@Lightfield.co', 'one-secret');
+    expect(verifyUnsubscribeToken(token, 'one-secret')).toBe('ana@lightfield.co');
+    expect(verifyUnsubscribeToken(token, 'another-secret')).toBeNull();
+    expect(verifyUnsubscribeToken(`${token.slice(0, -1)}${token.endsWith('A') ? 'B' : 'A'}`, 'one-secret')).toBeNull();
+    // A preview token signed under the same value never stands in for one.
+    expect(verifyUnsubscribeToken(mintPreviewToken({ kind: 'draft', key: 'hero_headline' }, 'one-secret', Date.now()), 'one-secret')).toBeNull();
+
+    expect(() => mintUnsubscribeToken('ana@x.co', '')).toThrowError(/the forms secret is unset/);
+    expect(() => mintUnsubscribeToken('ana@x.co', ' \n')).toThrowError(/the forms secret is unset/);
+    expect(verifyUnsubscribeToken(token, '')).toBeNull();
+    expect(verifyUnsubscribeToken(mintUnsubscribeToken('ana@x.co', 'one-secret\n'), 'one-secret')).toBe('ana@x.co');
+  });
+
+  it('Requirement: Contacts may live in a store of their own', async () => {
+    // The website's shape: content snapshot-only, sign-ups in a database of
+    // their own, with a prod environment of the contacts block's own.
+    const prod = createMemoryStore({ project: 'default' });
+    ok(await prod.contacts.addGroup({ key: 'cloud-waitlist', name: 'stet Cloud', properties: [] }));
+    const site = makeCliHost({
+      config: {
+        contacts: {
+          store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' },
+          environments: { prod: { adapter: 'pg', urlEnv: 'PROD_URL' } },
+        },
+      },
+      stores: { 'contacts.prod': prod },
+    });
+    expect(await site.run('contacts', 'groups', '--env', 'prod')).toBe(0);
+    expect(site.stdout()).toContain('cloud-waitlist   open   0 members');
+
+    expect(await site.run('contacts', 'list', '--group', 'cloud-waitlist', '--env', 'staging')).toBe(2);
+    expect(site.stderr()).toContain(
+      "usage: --env staging: not an environment of the contacts block — declared: prod (and 'default', its store)",
+    );
+    expect(await site.run('contacts', 'groups', '--env', 'constructor')).toBe(2);
+    expect(site.stderr()).toContain('--env constructor: not an environment of the contacts block — declared: prod');
+
+    // A block without environments has only its store.
+    const bare = makeCliHost({ config: { contacts: { store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' } } } });
+    expect(await bare.run('contacts', 'list', '--group', 'cloud-waitlist', '--env', 'prod')).toBe(2);
+    expect(bare.stderr()).toContain(
+      "usage: --env prod: the contacts block in stet.config.json declares no environments — only 'default', its store",
+    );
+  });
+
+  /** A snapshot-only site whose contacts store is the memory reference. */
+  function contactsSite(store = createMemoryStore({ project: 'default', db: createMemoryDb() })): {
+    host: CliHost;
+    store: ReturnType<typeof createMemoryStore>;
+    run: (...argv: string[]) => Promise<{ code: number; out: string; err: string }>;
+  } {
+    const host = makeCliHost({
+      config: { contacts: { store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' } } },
+      stores: { contacts: store },
+    });
+    const run = async (...argv: string[]): Promise<{ code: number; out: string; err: string }> => {
+      const outAt = host.out.length;
+      const errAt = host.err.length;
+      const code = await host.run('contacts', ...argv);
+      return { code, out: host.out.slice(outAt).join('\n'), err: host.err.slice(errAt).join('\n') };
+    };
+    return { host, store, run };
+  }
+
+  it('Requirement: A group is created from the terminal, declares its questions, and is open or closed', async () => {
+    const { run, host } = contactsSite();
+    const added = await run('group', 'add', 'cloud-waitlist', '--name', 'stet Cloud', '--property', 'tier=solo,team,business', '--required', 'tier');
+    expect(added.code).toBe(0);
+    expect(added.out.split('\n')).toEqual([
+      'group cloud-waitlist: created, open — 1 property: tier (solo | team | business, required)',
+      'join endpoint: POST <your forms mount>/join/cloud-waitlist',
+      'body: {"email": "…", "properties": {"tier": "…"}, "form": "…", "page": "…"}',
+    ]);
+    expect(await run('group', 'add', 'cloud-waitlist')).toMatchObject({ code: 1, err: 'error: group cloud-waitlist already exists' });
+    // No file is written into the site.
+    expect(readdirSync(host.cwd).sort()).toEqual(['content', 'stet.config.json']);
+    expect((await run('group', 'close', 'cloud-waitlist')).out).toBe('group cloud-waitlist: closed');
+    expect((await run('group', 'open', 'cloud-waitlist')).out).toBe('group cloud-waitlist: open');
+  });
+
+  it('Requirement: stet contacts reads the list from the terminal', async () => {
+    const { run, store } = contactsSite();
+    ok(
+      await store.contacts.addGroup({
+        key: 'cloud-waitlist',
+        name: 'stet Cloud',
+        properties: [{ name: 'tier', type: 'enum', values: ['solo', 'team', 'business'], required: true }],
+      }),
+    );
+    ok(
+      await store.contacts.join({
+        group: 'cloud-waitlist',
+        email: 'ana@lightfield.co',
+        properties: { tier: 'team' },
+        form: 'waitlist-page',
+        page: 'https://getstet.xyz/waitlist',
+      }),
+    );
+    ok(await store.contacts.join({ group: 'cloud-waitlist', email: 'sam@x.co', properties: { tier: 'solo' } }));
+    ok(await store.contacts.join({ group: 'cloud-waitlist', email: 'lee@x.co', properties: { tier: 'business' } }));
+    ok(await store.contacts.suppress({ email: 'ana@lightfield.co', scope: 'marketing', source: 'one-click' }));
+
+    expect((await run('groups')).out).toBe('cloud-waitlist   open   3 members   tier (solo | team | business)');
+    const list = (await run('list', '--group', 'cloud-waitlist')).out.split('\n');
+    expect(list[0]).toBe('cloud-waitlist: 3 members');
+    expect(list.slice(1).map((line) => line.split('   ')[0])).toEqual(['ana@lightfield.co', 'sam@x.co', 'lee@x.co']);
+    expect(list[1]).toMatch(/unsubscribed \(marketing\)$/);
+    const get = (await run('get', 'ana@lightfield.co')).out;
+    expect(get).toContain('from https://getstet.xyz/waitlist (form waitlist-page)');
+    expect(get).toContain('  suppressed: marketing, ');
+    for (const argv of [['groups'], ['list', '--group', 'cloud-waitlist'], ['get', 'ana@lightfield.co']]) {
+      expect(JSON.parse((await run(...argv, '--json')).out)).toMatchObject({ ok: true });
+    }
+  });
+
+  it('Requirement: Export and erase answer a request about one person', async () => {
+    const { run, store, host } = contactsSite();
+    ok(await store.contacts.addGroup({ key: 'cloud-waitlist', name: 'stet Cloud', properties: [] }));
+    ok(await store.contacts.join({ group: 'cloud-waitlist', email: 'ana@lightfield.co', properties: {} }));
+    execFileSync('git', ['init', '-q'], { cwd: host.cwd });
+    // Not ignored: refused, nothing written.
+    expect((await run('export', 'ana@lightfield.co', '--out', 'ana.json')).code).toBe(1);
+    expect(existsSync(join(host.cwd, 'ana.json'))).toBe(false);
+    // Ignored: written, 0600.
+    writeFileSync(join(host.cwd, '.gitignore'), 'ana.json\n');
+    expect((await run('export', 'ana@lightfield.co', '--out', 'ana.json')).out).toBe('wrote ana.json');
+    expect(statSync(join(host.cwd, 'ana.json')).mode & 0o777).toBe(0o600);
+    // The file exists now: refused. A missing folder: refused, named.
+    expect((await run('export', 'ana@lightfield.co', '--out', 'ana.json')).err).toContain('ana.json already exists');
+    expect((await run('export', 'ana@lightfield.co', '--out', 'nofolder/a.json')).err).toContain('does not exist — create it first');
+  });
+
+  it('Requirement: import brings an existing list into a group', async () => {
+    const { run, store, host } = contactsSite();
+    ok(
+      await store.contacts.addGroup({
+        key: 'cloud-waitlist',
+        name: 'stet Cloud',
+        properties: [{ name: 'tier', type: 'enum', values: ['solo', 'team', 'business'], required: true }],
+      }),
+    );
+    const rows = Array.from({ length: 14 }, (_, i) => ({
+      email: `person${i + 1}@example.com`,
+      tier: 'team',
+      created_at: `2026-09-${String(i + 1).padStart(2, '0')} 10:00:00Z`,
+    }));
+    writeFileSync(join(host.cwd, 'waitlist.json'), JSON.stringify(rows));
+    const args = ['import', '--group', 'cloud-waitlist', '--file', 'waitlist.json', '--joined-at', 'created_at'];
+    expect((await run(...args)).out.split('\n')[0]).toBe(
+      'plan: 14 rows for cloud-waitlist — 14 valid, 0 invalid; addresses already in the group, erased or suppressed are skipped when written',
+    );
+    expect((await run(...args, '--write')).out).toBe('imported 14 into cloud-waitlist — 0 already members, 0 erased, 0 suppressed, 0 invalid');
+    const members = ok(await store.contacts.members({ group: 'cloud-waitlist' })).rows;
+    expect(members[0]?.joinedAt).toBe('2026-09-01T10:00:00.000Z');
+    expect((await run(...args, '--write')).out).toBe('imported 0 into cloud-waitlist — 14 already members, 0 erased, 0 suppressed, 0 invalid');
+  });
 });

@@ -1135,3 +1135,37 @@ describe('eject — the stage-5 fold, prose that quotes stet\'s own syntax', () 
     expect(out.split('</p>')).toHaveLength(4);
   });
 });
+
+describe('eject — the contacts tables stay in the database', () => {
+  afterAll(cleanupCliHosts);
+  const STAYS =
+    'stays in the database: the contacts tables (stet_groups, stet_contacts, stet_group_memberships, stet_suppressions, ' +
+    'stet_erasures) — eject drops no table; run stet contacts export <email> before --write to write a person to a file';
+
+  it('names them on a store-backed plan, right after what stays in the repo', async () => {
+    const dir = host({ store: true });
+    const cap = io(dir, createMemoryStore({ project: 't' }));
+    expect(await runEject([], cap)).toBe(0);
+    const stays = cap.out.findIndex((line) => line.startsWith('stays (no stet imports):'));
+    expect(stays).toBeGreaterThanOrEqual(0);
+    expect(cap.out[stays + 1]).toBe(STAYS);
+  });
+
+  it('says nothing of them on a snapshot-only project with no contacts block', async () => {
+    const cap = io(host());
+    expect(await runEject([], cap)).toBe(0);
+    expect(cap.out.join('\n')).not.toContain('stays in the database');
+  });
+
+  it('names them on an html host whose contacts have a store of their own', async () => {
+    const html = await makeHtmlHost({
+      register: true,
+      config: { contacts: { store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' } } },
+    });
+    expect(await html.run('eject')).toBe(0);
+    const lines = html.stdout().split('\n');
+    const stays = lines.findIndex((line) => line.startsWith('stays (no stet imports):'));
+    expect(lines[stays + 1]).toBe(STAYS);
+  });
+});
+

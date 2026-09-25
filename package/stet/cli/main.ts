@@ -17,6 +17,7 @@ import type { StoreAdapter } from '../src/store.js';
 import { runAgentsInstall } from './agents.js';
 import { runAudit } from './audit.js';
 import { runCheck } from './check.js';
+import { runContacts } from './contacts.js';
 import { runDev } from './dev.js';
 import { runDoctor } from './doctor.js';
 import { runEject } from './eject.js';
@@ -184,6 +185,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return await runUpgrade(rest, io);
       case 'dev':
         return await runDev(rest, io);
+      case 'contacts':
+        return await runContacts(rest, io);
       default:
         io.stderr(`unknown command: ${command}`);
         io.stderr(usage());
@@ -203,7 +206,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 }
 
 /** The commands whose second word is part of the name `--help` asks about. */
-const TWO_TOKEN = new Set(['hook', 'agents', 'pages', 'email', 'seo']);
+const TWO_TOKEN = new Set(['hook', 'agents', 'pages', 'email', 'seo', 'contacts']);
+/** The two-word names whose third word is part of the name too. */
+const THREE_TOKEN = new Set(['contacts group']);
 
 /**
  * `stet <command> --help`: that command's own lines of the usage, then a
@@ -219,7 +224,8 @@ export function commandHelp(argv: string[]): string | null {
   const first = words[0];
   if (first === undefined) return null;
   const second = words[1];
-  const name = TWO_TOKEN.has(first) && second !== undefined ? `${first} ${second}` : first;
+  const two = TWO_TOKEN.has(first) && second !== undefined ? `${first} ${second}` : first;
+  const name = THREE_TOKEN.has(two) && words[2] !== undefined ? `${two} ${words[2]}` : two;
   const lines = usage().split('\n');
   const picked: string[] = [];
   for (let i = 0; i < lines.length; i += 1) {
@@ -275,10 +281,22 @@ export function usage(): string {
     '  doctor [--report] [--url U --key K]      mode, health, and what is serving production',
     '  upgrade [--store A] [--dry-run] [--verify]   migrations, the registry, the version stamp',
     '',
+    'Contacts (the list lives in the store; export writes one person to a file):',
+    '  contacts groups            every group: state, member count, the questions it asks',
+    '  contacts list --group G    the members of a group, in join order',
+    '  contacts get <email>       one person: memberships with when, where and which form, suppressions',
+    '  contacts export <email> [--out F]   one person as JSON; --out refuses a path git would track',
+    '  contacts erase <email> [--write]    delete a person and record a one-way hash; plan first',
+    '  contacts suppress <email> [--scope marketing|transactional]   stop marketing (or all) email to an address',
+    '  contacts import --group G --file F [--joined-at COLUMN] [--write]   bring in an existing list; plan first',
+    '  contacts group add <key> [--name N] [--property P[=a,b]]… [--required P]…   create a group, open',
+    '  contacts group open <key>  accept joins again',
+    '  contacts group close <key> refuse new joins; members stay',
+    '',
     'Dashboard:',
     '  dev [--port N] [--no-open] [--add PATH]   the local dashboard on 127.0.0.1:4400 over your workspace of checkouts',
     '',
-    'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor and both email commands.',
+    'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor, both email commands, and contacts groups, list and get.',
     '  --env <name>             the environments-map connection to run against; check and seo check take none',
     '',
     'Global flags:',

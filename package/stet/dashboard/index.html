@@ -782,7 +782,7 @@ function view() {
   if (S.tab === 'Environments') return vEnvironments();
   if (S.tab === 'Recent') return vRecent();
   if (S.tab === 'Sends') return dark('Sends', 'Sending an announcement to a group through your own email provider is planned.', fxSends());
-  if (S.tab === 'Contacts') return dark('Contacts', 'Capturing form submissions into your store is planned.', fxContacts());
+  if (S.tab === 'Contacts') return dark('Contacts', 'Form sign-ups are stored in your database. Read them in the terminal with stet contacts list — this tab does not show them yet.', fxContacts());
   if (S.tab === 'Media') return dark('Media', 'Uploading images to your own bucket is planned.', fxMedia());
   if (S.tab === 'Packs') return dark('Packs', 'Installing a pack of starter keys and templates is planned.', fxPacks());
   return '';

@@ -12,7 +12,7 @@ import { createMemoryStore } from '../adapters/store-memory.js';
 import { createSnapshotStore } from '../adapters/store-snapshot.js';
 import { createPostgrestStore } from '../adapters/store-postgrest.js';
 import type { StoreAdapter } from '../src/store.js';
-import { selectStoreBlock, type StetConfig as Cfg, type StoreBlock } from './config.js';
+import { environmentBlock, selectStoreBlock, type StetConfig as Cfg, type StoreBlock } from './config.js';
 import { CliError } from './report.js';
 
 /**
@@ -114,4 +114,32 @@ export async function resolveStore(
  */
 export function isStoreBacked(block: StoreBlock | undefined): boolean {
   return block !== undefined && block.adapter !== 'snapshot';
+}
+
+/**
+ * The store contacts live in, for the selected environment. With a declared
+ * `contacts` block: its `store` for the default selection, else the block's
+ * own `environments[name]`. Without one: the content store's block for that
+ * selection. One resolution for `stet contacts`, `doctor` and `upgrade`, so the
+ * three never disagree about which database holds the list. The name is the
+ * `io.stores` key a test injects under: `contacts` or `contacts.<env>` for a
+ * declared block, the content environment's name otherwise.
+ */
+export function contactsBlock(config: Cfg, selection?: string): { name: string; block: StoreBlock | undefined; own: boolean } {
+  const contacts = config.contacts;
+  if (contacts === undefined) return { ...selectStoreBlock(config, selection), own: false };
+  if (selection === undefined || selection === 'default') return { name: 'contacts', block: contacts.store, own: true };
+  return { name: `contacts.${selection}`, block: environmentBlock(contacts.environments, selection, 'contacts'), own: true };
+}
+
+/**
+ * The config a contacts store is reached through: the content config with the
+ * selected contacts block standing as its bare store. Every connection-shaped
+ * helper (`resolveStore`, `cli/meta.ts`, `upgrade`'s apply path) takes a
+ * config, so this is how they reach the contacts database without a second
+ * derivation. Without a contacts block it is the config itself.
+ */
+export function contactsConfig(config: Cfg, selection?: string): Cfg {
+  if (config.contacts === undefined) return config;
+  return { ...config, store: contactsBlock(config, selection).block, environments: undefined };
 }

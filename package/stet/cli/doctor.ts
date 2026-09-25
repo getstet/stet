@@ -18,19 +18,20 @@ import { dirname, join, resolve as resolvePath, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
+import { isNotSupported, isStoreError } from '../adapters/store-shared.js';
 import { resolve } from '../src/resolve.js';
 import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { check } from './check.js';
-import { CONFIG_FILE, isHtmlHost, type StetConfig } from './config.js';
+import { CONFIG_FILE, formsSecretEnvOf, isHtmlHost, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { GATE_LINE, gateSite, hookKind, hooksDir, insideDir, operatorHook, readGate, worktreeTop, type GateEntry } from './hook.js';
 import { packageVersion } from './installed.js';
 import type { CliIo } from './main.js';
 import { readProjectMeta } from './meta.js';
-import { loadProject, type LoadedProject } from './project.js';
+import { loadProject, openContactsStore, type LoadedProject, type OpenedContactsStore } from './project.js';
 import { Report, UsageError, formatFinding, plural, posixRelative, shapeOf } from './report.js';
 import { TS7_REFUSAL, carriesToken, dialectOf, loadTypescript, mentionsToken, scriptKindFor } from './source-scan.js';
-import { isStoreBacked } from './store.js';
+import { contactsConfig, isStoreBacked } from './store.js';
 
 export async function runDoctor(args: string[], io: CliIo): Promise<number> {
   const { values, positionals } = parse(args, {
@@ -78,6 +79,7 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
     environmentsSection(project, report);
     await wrapperChainSection(io, project, report);
     await storeSection(io, project, report);
+    await contactsSection(io, project, report);
     // On any host whose publish IS a commit, a checkout outside git has no way
     // to publish at all. Never on a store-backed host, where publish is a store
     // write and git is beside the point.
@@ -516,6 +518,72 @@ async function storeSection(
     report.data('meta', meta);
   } catch (error) {
     report.warn('store', `stet_meta could not be read: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * Where the contacts live and whether that store holds them: the store's name,
+ * the schema version (3 is migration 3, the contacts tables), the group count
+ * and the suppression count per scope. Silent on a project with no store and no
+ * contacts block — sign-ups are opt-in, and a site without a form is not told
+ * about one. A store that does not answer and a store without the tables are
+ * told apart: the first is a connection to fix, the second an upgrade to run.
+ * The forms secret's variable is named, set or not in this shell. Warns only;
+ * like the rest of doctor it never moves the exit code.
+ */
+async function contactsSection(io: CliIo, project: LoadedProject, report: Report): Promise<void> {
+  const config = project.config;
+  const env = project.environment.name;
+  let opened: OpenedContactsStore | null;
+  try {
+    opened = await openContactsStore(io, config, env);
+  } catch (error) {
+    report.warn('contacts', error instanceof UsageError ? error.message : `the contacts store could not be opened: ${(error as Error).message}`);
+    return;
+  }
+  if (opened === null) return;
+  try {
+    const { name, block, own, store } = opened;
+    if (!isStoreBacked(block)) return;
+    const declared = name === 'contacts' ? 'contacts.store' : `contacts.environments.${env}`;
+    const where = own ? `contacts: ${declared} (${block?.adapter})` : 'contacts: in the content store';
+    let meta: Awaited<ReturnType<typeof readProjectMeta>>;
+    try {
+      meta = own
+        ? await readProjectMeta(contactsConfig(config, env), io.env, undefined, io.fetchImpl)
+        : await readProjectMeta(config, io.env, env, io.fetchImpl);
+    } catch (error) {
+      report.line(`${where}, UNREACHABLE`);
+      // A refused connection arrives from `pg` with an empty message and its code.
+      const reason = (error as Error).message || String((error as { code?: unknown }).code ?? 'no answer');
+      report.warn('contacts', `the contacts store did not answer (${reason}) — check ${block?.urlEnv} and that the database is up`);
+      return;
+    }
+    if (meta === 'unsupported') return;
+    if (meta === null || meta.schemaVersion < 3) {
+      report.line(`${where} — not installed (schema_version ${meta === null ? 'none' : meta.schemaVersion}); run stet upgrade`);
+      if (own) report.warn('contacts', `${declared} is declared and its database has no contacts tables; run stet upgrade`);
+      return;
+    }
+    const groups = await store.contacts.groups();
+    const counts = await store.contacts.suppressionCounts();
+    if (isStoreError(groups) || isNotSupported(groups) || isStoreError(counts) || isNotSupported(counts)) {
+      report.line(`${where}, UNREACHABLE`);
+      report.warn('contacts', 'the contacts store did not answer');
+      return;
+    }
+    const byScope = (scope: string): number => counts.counts.filter((c) => c.scope === scope).reduce((n, c) => n + c.n, 0);
+    report.line(
+      `${where}, schema_version ${meta.schemaVersion} — ${plural(groups.groups.length, 'group')}, ` +
+        `suppressions: ${byScope('marketing')} marketing, ${byScope('transactional')} transactional`,
+    );
+    report.data('contacts', { store: own ? 'contacts' : 'content', groups: groups.groups.length, suppressions: counts.counts });
+    // A line, never a warn: the secret belongs where the forms handler runs,
+    // which is rarely the shell doctor runs in.
+    const secretEnv = formsSecretEnvOf(config);
+    report.line(`  forms secret: ${secretEnv} (${(io.env[secretEnv] ?? '') === '' ? 'unset in this shell' : 'set'})`);
+  } finally {
+    await opened.dispose();
   }
 }
 

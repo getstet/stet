@@ -20,6 +20,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { join } from 'node:path';
 
+import { MAX_BODY_BYTES } from '../server/http.js';
 import type { StoreAdapter } from '../src/store.js';
 import { flag, noPositionals, parse, text } from './args.js';
 import { CONFIG_FILE } from './config.js';
@@ -32,9 +33,6 @@ import { addSite, childEnv, workspacePath } from './workspace.js';
 
 /** The port the dashboard takes when nothing says otherwise. */
 const DEFAULT_PORT = 4400;
-
-/** A request body larger than this is refused before the handler runs. */
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 /** How long the rest of a refused body is read for before the socket is dropped. */
 const DRAIN_MS = 5_000;

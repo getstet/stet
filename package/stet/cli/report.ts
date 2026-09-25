@@ -12,6 +12,7 @@
 
 import { relative, sep } from 'node:path';
 
+import { CONTROL_CHARACTERS } from '../src/contacts.js';
 import type { SeoRule } from '../src/seo.js';
 import type { FindingRule } from '../src/validate.js';
 
@@ -37,7 +38,8 @@ export type CliFindingKind =
   | 'config'
   | 'scan'
   | 'email'
-  | 'pages';
+  | 'pages'
+  | 'contacts';
 
 /** Two levels only: one fails the command, the other reports and does not. */
 export type CliLevel = 'error' | 'warn';
@@ -97,10 +99,11 @@ export class CliError extends Error {
  * Written with escapes rather than the bytes themselves: a literal control
  * character in source is invisible to a reader and to a patch.
  *
- * A `g` regex is safe here because `String.replace` starts at index 0 and
- * resets `lastIndex`; a `.test()` caller would carry it between calls.
+ * The class is `src/contacts.ts`' — the join route refuses it in an address
+ * or an answer — made global here, since `String.replace` starts at index 0
+ * and resets `lastIndex`.
  */
-const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g;
+const CONTROL_EVERYWHERE = new RegExp(CONTROL_CHARACTERS.source, 'g');
 
 /**
  * A finding message, made safe to print. Store-controlled text reaches the
@@ -114,8 +117,8 @@ const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u206
  * a consumer that re-prints decoded JSON content raw crosses this boundary in
  * its own terminal, and owns that.
  */
-function sanitizeLine(text: string): string {
-  return text.replace(CONTROL_CHARACTERS, '\uFFFD');
+export function sanitizeLine(text: string): string {
+  return text.replace(CONTROL_EVERYWHERE, '\uFFFD');
 }
 
 /**

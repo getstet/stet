@@ -249,8 +249,9 @@ export function countingStore(inner: StoreAdapter): StoreAdapter & { calls: stri
       return inner.recent(q);
     },
     // Forwarded whole: this wrapper counts the seven methods, and the
-    // capability is the wrapped store's own.
+    // capabilities are the wrapped store's own.
     changesets: inner.changesets,
+    contacts: inner.contacts,
   };
 }
 

@@ -25,7 +25,7 @@ import { readFileSync } from 'node:fs';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { applySql, readStetMeta } from '../adapters/store-pg.js';
+import { applySql, createPgStore, readStetMeta } from '../adapters/store-pg.js';
 import { cleanupCliHosts, makeCliHost, type CliHost } from '../conformance/cli-host.js';
 import { loadDescriptor, readBundle } from '../src/index.js';
 
@@ -41,6 +41,13 @@ const HALF = 'stet_cli_live_half';
 const ENV_A = 'stet_env_a';
 const ENV_B = 'stet_env_b';
 const ENV_UNMIGRATED = 'stet_env_unmigrated';
+/** Migration 3's legs: a host object colliding by kind, a first install, the grants, a contacts store. */
+const COLLIDE = ['stet_c3_table', 'stet_c3_index', 'stet_c3_sequence', 'stet_c3_domain', 'stet_c3_function'];
+const FIRST = 'stet_c3_first';
+const GRANTS = 'stet_c3_grants';
+const CONTACTS = 'stet_c3_contacts';
+const CONTACTS_PROD = 'stet_c3_contacts_prod';
+const CONTENT_STAGING = 'stet_c3_staging';
 
 /** A connection pinned to a schema. Space and `=` must survive the URL. */
 function scoped(schema: string): string {
@@ -88,7 +95,9 @@ if (BASE) {
       }
     }
     if (client === null) throw new Error('the database never accepted a connection');
-    for (const schema of [SCHEMA, BARE, HALF, ENV_A, ENV_B, ENV_UNMIGRATED]) {
+    for (const schema of [
+      SCHEMA, BARE, HALF, ENV_A, ENV_B, ENV_UNMIGRATED, ...COLLIDE, FIRST, GRANTS, CONTACTS, CONTACTS_PROD, CONTENT_STAGING,
+    ]) {
       await client.query(`drop schema if exists ${schema} cascade`);
       await client.query(`create schema ${schema}`);
     }
@@ -131,7 +140,7 @@ live('the install path, end to end', () => {
     // for exactly this command to fill in.
     const descriptor = loadDescriptor(JSON.parse(host.file('content/descriptor.json')));
     const meta = await readStetMeta(scoped(SCHEMA));
-    expect(meta).toEqual({ schemaVersion: 2, descriptorVersion: String(descriptor.version) });
+    expect(meta).toEqual({ schemaVersion: 3, descriptorVersion: String(descriptor.version) });
     expect(output).toContain('descriptor_version: stamped (1)');
     // Exactly one stamp line: the apply stamps, and the seed it hands off to
     // is told not to say it again.
@@ -236,7 +245,7 @@ live('the install path, end to end', () => {
   it('upgrade is idempotent: a second run has nothing pending', async () => {
     const host = liveHost();
     expect(await host.run('upgrade')).toBe(0);
-    expect(host.stdout()).toContain('migrations: up to date at 2');
+    expect(host.stdout()).toContain('migrations: up to date at 3');
     // The stamp is compared before it is written, so a re-run reports it
     // unchanged rather than churning the row.
     expect(host.stdout()).toContain('descriptor_version: unchanged (1)');
@@ -246,7 +255,7 @@ live('the install path, end to end', () => {
     const host = liveHost();
     expect(await host.run('doctor')).toBe(0);
     expect(host.stdout()).toContain('store: configured (pg), reachable');
-    expect(host.stdout()).toContain('meta: schema_version 2 · descriptor_version 1');
+    expect(host.stdout()).toContain('meta: schema_version 3 · descriptor_version 1');
   });
 
   it('a command ends the pool it opened', async () => {
@@ -446,7 +455,9 @@ live('two environments, two databases', () => {
 
     const selected = splitHost();
     expect(await selected.run('upgrade', '--env', 'b')).toBe(0);
-    expect(selected.stdout()).toContain('migrations: up to date at 2');
+    // b was migrated to 2 by hand; migration 3 is the one it still lacks.
+    expect(selected.stdout()).toContain('migrations: installed 2, pending 3');
+    expect(selected.stdout()).toContain('applied 003_contacts.sql');
     expect(selected.stdout()).toContain('descriptor_version: unchanged (1)');
 
     // The same command without the selector reads the other database and finds
@@ -469,5 +480,210 @@ live('two environments, two databases', () => {
     const clash = splitHost();
     expect(await clash.run('upgrade', '--store', 'postgrest', '--env', 'b')).toBe(2);
     expect(clash.stderr()).toContain('contradicts --env b');
+  }, 60_000);
+});
+
+live('migration 3 through upgrade', () => {
+  const MIGRATION_1 = readFileSync(new URL('../migrations/001_content_cms.sql', import.meta.url), 'utf8');
+  const MIGRATION_2 = readFileSync(new URL('../migrations/002_changesets.sql', import.meta.url), 'utf8');
+
+  function pgHost(schema: string): CliHost {
+    return makeCliHost({ config: { store: { adapter: 'pg' } }, env: { STET_DATABASE_URL: scoped(schema) } });
+  }
+
+  async function sql(schema: string, statement: string): Promise<void> {
+    await applySql(scoped(schema), statement);
+  }
+
+  async function relationExists(schema: string, name: string): Promise<boolean> {
+    const client = await admin();
+    const answer = await client.query<{ n: number }>(
+      'select count(*)::int as n from pg_class where relnamespace = $1::regnamespace and relname = $2',
+      [schema, name],
+    );
+    await client.end();
+    return answer.rows[0]?.n === 1;
+  }
+
+  const words = (what: string, message: string): string =>
+    `migration 3 changed nothing: ${what} (Postgres: ${message}). Rename or move that object, then run stet upgrade again`;
+
+  it('a host object of one of its names is named by kind, and the stamp never suggested', async () => {
+    const cases: [string, string, string, string][] = [
+      ['stet_c3_table', 'create table stet_contacts (id int)', 'the table stet_contacts', 'relation "stet_contacts" already exists'],
+      [
+        'stet_c3_index',
+        'create table stet_group_memberships_group_idx (id int)',
+        'the index stet_group_memberships_group_idx',
+        'relation "stet_group_memberships_group_idx" already exists',
+      ],
+      ['stet_c3_sequence', 'create sequence stet_contacts_id_seq', 'the sequence stet_contacts_id_seq', 'relation "stet_contacts_id_seq" already exists'],
+      ['stet_c3_domain', 'create domain stet_contacts as text', 'the table stet_contacts', 'type "stet_contacts" already exists'],
+      [
+        'stet_c3_function',
+        'create function stet_group_get(a text, b text) returns int language sql as $$ select 1 $$',
+        'the function stet_group_get',
+        'function "stet_group_get" already exists with same argument types',
+      ],
+    ];
+    for (const [schema, host, kind, message] of cases) {
+      await sql(schema, MIGRATION_1);
+      await sql(schema, MIGRATION_2);
+      await sql(schema, host);
+      const run = pgHost(schema);
+      expect(`${schema}: ${await run.run('upgrade')}`).toBe(`${schema}: 1`);
+      expect(run.stderr()).toContain(words(`it creates ${kind}, and this database already has an object of that name`, message));
+      expect(run.stderr()).not.toContain('stet_meta');
+      expect(await readStetMeta(scoped(schema))).toMatchObject({ schemaVersion: 2 });
+    }
+  }, 60_000);
+
+  it('a first install that collides at 3 applies 1 and 2 and is not told to stamp', async () => {
+    await sql(FIRST, 'create table stet_contacts (id int)');
+    const run = pgHost(FIRST);
+    expect(await run.run('upgrade')).toBe(1);
+    expect(run.stdout()).toContain('applied 001_content_cms.sql');
+    expect(run.stdout()).toContain('applied 002_changesets.sql');
+    expect(run.stderr()).toContain(
+      words(
+        'it creates the table stet_contacts, and this database already has an object of that name',
+        'relation "stet_contacts" already exists',
+      ),
+    );
+    expect(await readStetMeta(scoped(FIRST))).toMatchObject({ schemaVersion: 2 });
+    expect(await relationExists(FIRST, 'stet_groups')).toBe(false);
+  }, 60_000);
+
+  it('a lost stamp is repaired by the stamp, word for word', async () => {
+    // HALF was installed to the newest migration and lost its row in the case
+    // above; its tables are all still there.
+    const run = pgHost(HALF);
+    expect(await run.run('upgrade')).toBe(1);
+    expect(run.stderr()).toContain(
+      'migration 1 appears to be already applied — its tables exist but the stet_meta row is missing. ' +
+        "Restore the row (insert into stet_meta (id, schema_version, descriptor_version) values (1, 1, '')) " +
+        'rather than re-applying the file',
+    );
+    expect(await readStetMeta(scoped(HALF))).toBeNull();
+  }, 60_000);
+
+  it('prints the grant lines after a run that applied 3, and none when nothing is pending', async () => {
+    await sql(GRANTS, MIGRATION_1);
+    await sql(GRANTS, MIGRATION_2);
+    const applied = pgHost(GRANTS);
+    expect(await applied.run('upgrade')).toBe(0);
+    const output = applied.stdout();
+    expect(output).toContain('applied 003_contacts.sql');
+    expect(output).toContain(
+      'migration 3 grants its tables and functions to every role holding EXECUTE on save_content_draft; a service role granted after it needs:',
+    );
+    expect(output).toContain(
+      '  grant select, insert, update, delete on stet_groups, stet_contacts, stet_group_memberships, stet_suppressions, stet_erasures to <your service role>;',
+    );
+    expect(output).toContain('  grant usage, select on sequence stet_contacts_id_seq, stet_group_memberships_id_seq to <your service role>;');
+    expect(output).toContain('  grant execute on function stet_normal_email(text), ');
+    expect(output).toContain('and the service role must bypass row level security or own the tables:');
+    expect(output).toContain('  alter role <your service role> bypassrls;');
+
+    const again = pgHost(GRANTS);
+    expect(await again.run('upgrade')).toBe(0);
+    expect(again.stdout()).toContain('migrations: up to date at 3');
+    expect(again.stdout()).not.toContain('grants its tables');
+    expect(again.stdout()).not.toContain('bypassrls');
+  }, 60_000);
+
+  it('a snapshot-only site migrates its contacts store in the same run, and reads it', async () => {
+    const site = (): CliHost =>
+      makeCliHost({
+        config: { contacts: { store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' } } },
+        env: { STET_CONTACTS_DATABASE_URL: scoped(CONTACTS) },
+      });
+
+    const dry = site();
+    expect(await dry.run('upgrade', '--dry-run')).toBe(0);
+    const planned = dry.stdout();
+    expect(planned).toContain('store: snapshot-only — there is no schema to migrate');
+    expect(planned).toContain('contacts store (contacts.store in stet.config.json):');
+    expect(planned).toContain('migrations: installed 0, pending 1, 2, 3');
+    expect(planned).toContain('would apply 003_contacts.sql');
+    expect(planned.indexOf('contacts store (')).toBeLessThan(planned.indexOf('would apply 001_content_cms.sql'));
+    expect(dry.exists('stet/migrations/003_contacts.sql')).toBe(false);
+    expect(await readStetMeta(scoped(CONTACTS))).toBeNull();
+
+    const real = site();
+    expect(await real.run('upgrade')).toBe(0);
+    for (const name of ['001_content_cms.sql', '002_changesets.sql', '003_contacts.sql']) {
+      expect(real.file(`stet/migrations/${name}`)).toBe(readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
+    }
+    expect(real.stdout()).toContain('applied 003_contacts.sql');
+    expect(real.stdout()).toContain('  alter role <your service role> bypassrls;');
+    expect(await readStetMeta(scoped(CONTACTS))).toMatchObject({ schemaVersion: 3 });
+    // The content stays snapshot-only: nothing was seeded into the contacts database.
+    const client = new pg.Client({ connectionString: scoped(CONTACTS) });
+    await client.connect();
+    const content = await client.query<{ n: number }>('select count(*)::int as n from content_versions');
+    await client.end();
+    expect(content.rows[0]?.n).toBe(0);
+
+    const add = site();
+    expect(await add.run('contacts', 'group', 'add', 'cloud-waitlist', '--property', 'tier=solo,team,business', '--required', 'tier')).toBe(0);
+    const read = site();
+    expect(await read.run('contacts', 'groups')).toBe(0);
+    expect(read.stdout()).toContain('cloud-waitlist   open   0 members   tier (solo | team | business)');
+
+    // The operator reference's members query answers what `list` prints,
+    // less the unsubscribed, in the same order.
+    const joiner = createPgStore({ connectionString: scoped(CONTACTS), project: 'default' });
+    for (const [email, tier] of [['ana@lightfield.co', 'team'], ['sam@x.co', 'solo'], ['lee@x.co', 'business']] as const) {
+      expect(await joiner.contacts.join({ group: 'cloud-waitlist', email, properties: { tier } })).toMatchObject({ isNew: true });
+    }
+    expect(await joiner.contacts.suppress({ email: 'sam@x.co', scope: 'marketing', source: 'one-click' })).toEqual({ suppressed: true });
+    await joiner.end();
+    const listed = site();
+    expect(await listed.run('contacts', 'list', '--group', 'cloud-waitlist')).toBe(0);
+    const printed = listed.stdout().split('\n').filter((line) => line.includes('   joined '));
+    expect(printed.map((line) => line.split('   ')[0])).toEqual(['ana@lightfield.co', 'sam@x.co', 'lee@x.co']);
+    const reference = readFileSync(new URL('../../docs/operator/contacts.md', import.meta.url), 'utf8');
+    const query = /### A group's members[\s\S]*?```sql\n([\s\S]*?)```/.exec(reference)?.[1];
+    expect(query).toContain('from stet_group_memberships m');
+    const reader = new pg.Client({ connectionString: scoped(CONTACTS) });
+    await reader.connect();
+    const answered = await reader.query<{ email: string }>(query ?? '');
+    await reader.end();
+    expect(answered.rows.map((r) => r.email)).toEqual(
+      printed.filter((line) => !line.endsWith('unsubscribed (marketing)')).map((line) => line.split('   ')[0]),
+    );
+    expect(answered.rows.map((r) => r.email)).toEqual(['ana@lightfield.co', 'lee@x.co']);
+  }, 60_000);
+
+  it('a contacts environment is its own database, and an --env the block lacks leaves it alone', async () => {
+    const prod = makeCliHost({
+      config: {
+        contacts: {
+          store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' },
+          environments: { prod: { adapter: 'pg', urlEnv: 'PROD_URL' } },
+        },
+      },
+      env: { STET_CONTACTS_DATABASE_URL: scoped(BARE), PROD_URL: scoped(CONTACTS_PROD) },
+    });
+    expect(await prod.run('upgrade', '--env', 'prod')).toBe(0);
+    expect(prod.stdout()).toContain('contacts store (contacts.environments.prod in stet.config.json):');
+    expect(prod.stdout()).not.toContain('store: snapshot-only');
+    expect(await readStetMeta(scoped(CONTACTS_PROD))).toMatchObject({ schemaVersion: 3 });
+    expect(await readStetMeta(scoped(BARE))).toBeNull();
+
+    const staging = makeCliHost({
+      config: {
+        store: { adapter: 'pg' },
+        environments: { staging: { adapter: 'pg', urlEnv: 'STAGING_URL' } },
+        contacts: { store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' } },
+      },
+      env: { STET_DATABASE_URL: scoped(BARE), STAGING_URL: scoped(CONTENT_STAGING), STET_CONTACTS_DATABASE_URL: scoped(BARE) },
+    });
+    expect(await staging.run('upgrade', '--env', 'staging')).toBe(0);
+    expect(staging.stdout()).toContain('applied 003_contacts.sql');
+    expect(staging.stdout()).toContain('contacts store: the contacts block declares no environment staging — not migrated');
+    expect(await readStetMeta(scoped(CONTENT_STAGING))).toMatchObject({ schemaVersion: 3 });
+    expect(await readStetMeta(scoped(BARE))).toBeNull();
   }, 60_000);
 });

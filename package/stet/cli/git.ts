@@ -11,14 +11,15 @@
  * `gitData` is the data-returning variant beside it: stdout alone, because a
  * status list or a file's bytes at HEAD is corrupted by a merged stream. The
  * dashboard's two reads over it — the uncommitted forms and the sequencer
- * check — are its first consumers. The four ad hoc `execFileSync` calls
- * elsewhere (`email verify`'s `show`, `email extract`'s `ls-files -z`,
- * `hooksDir` and the `check-ignore` probe) still wait to move onto it.
+ * check — are its first consumers, and `trackable`, the `check-ignore` probe,
+ * reads through it. The three ad hoc `execFileSync` calls elsewhere (`email
+ * verify`'s `show`, `email extract`'s `ls-files -z` and `hooksDir`) still wait
+ * to move onto it.
  */
 
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { basename, dirname, resolve as resolvePath } from 'node:path';
 
 import { hooksDir } from './hook.js';
 import { childEnv } from './workspace.js';
@@ -107,6 +108,20 @@ export function uncommittedPaths(cwd: string, pathspecs: string[]): string[] {
     if (path.startsWith(base)) paths.add(path.slice(base.length));
   }
   return [...paths].sort();
+}
+
+/**
+ * Whether git tracks, or would track, a file at `path`: true inside a work
+ * tree where the file is in the index or not ignored, false where git ignores
+ * it, null outside any work tree or with git absent. `check-ignore` consults
+ * the index, so a tracked file answers not-ignored even where a pattern
+ * matches it. `contacts export --out` refuses a true; the agent-guidance write
+ * notes a false.
+ */
+export function trackable(path: string): boolean | null {
+  const dir = dirname(path);
+  if (gitData(dir, ['rev-parse', '--is-inside-work-tree']).code !== 0) return null;
+  return gitData(dir, ['check-ignore', '-q', basename(path)]).code !== 0;
 }
 
 /**

@@ -13,7 +13,7 @@
  * passes by answering that way everywhere — the suite probes once and takes the
  * read-only path.
  */
-import { describe, expect, it, type TestContext } from 'vitest';
+import { describe, expect, it, vi, type TestContext } from 'vitest';
 
 import { resolve } from '../src/index.js';
 import { revertChange } from '../adapters/changesets.js';
@@ -1136,6 +1136,322 @@ export function runStoreConformance(name: string, makeAdapter: MakeAdapter): voi
       expect(after.find((r) => r.key === 'hero_headline' && r.locale === 'default')?.value).toBe(
         'the English one',
       );
+    });
+
+    // ── The contacts capability ────────────────────────────────────────────
+    //
+    // Groups, memberships and contacts are per project; suppressions are
+    // store-wide, so every address below carries its case's project name and
+    // no two cases share one.
+    describe('contacts', () => {
+      let contacts: boolean | null = null;
+      async function contactsSupported(): Promise<boolean> {
+        if (contacts === null) {
+          const probe = await makeAdapter(`conf_${name}_contactsprobe`);
+          contacts = !isNotSupported(await probe.contacts.groups());
+        }
+        return contacts;
+      }
+
+      /** The capability, or a VISIBLE skip — never a quiet pass. */
+      async function needsContacts(ctx: TestContext): Promise<StoreAdapter> {
+        ctx.skip(!(await contactsSupported()), 'the contacts capability answers NotSupported');
+        return scope();
+      }
+
+      const WAITLIST = {
+        key: 'cloud-waitlist',
+        name: 'stet Cloud',
+        properties: [
+          { name: 'tier', type: 'enum' as const, values: ['solo', 'team', 'business'], required: true },
+          { name: 'use_case', type: 'text' as const },
+        ],
+      };
+      const address = (store: StoreAdapter, who: string): string => `${who}.${store.project}@x.co`;
+
+      /**
+       * Moves the clock the store stamps with: the memory reference reads
+       * `Date`, so a fake one minute on; a database reads its own `now()`, so
+       * a real 10 ms passes.
+       */
+      async function laterClock(): Promise<void> {
+        if (name === 'memory') {
+          vi.useFakeTimers({ toFake: ['Date'] });
+          vi.setSystemTime(Date.now() + 60_000);
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+
+      it('a group is added, listed with its questions in order, and read by key', async (ctx) => {
+        const store = await needsContacts(ctx);
+        expect(ok(await store.contacts.addGroup(WAITLIST))).toEqual({ created: true });
+        const { groups } = ok(await store.contacts.groups());
+        expect(groups).toHaveLength(1);
+        expect(groups[0]).toMatchObject({ key: 'cloud-waitlist', name: 'stet Cloud', state: 'open', members: 0 });
+        expect(groups[0]?.properties).toEqual(WAITLIST.properties);
+
+        const { group } = ok(await store.contacts.group({ key: 'cloud-waitlist' }));
+        expect(group).toEqual({
+          key: 'cloud-waitlist',
+          name: 'stet Cloud',
+          state: 'open',
+          properties: WAITLIST.properties,
+          createdAt: groups[0]?.createdAt,
+        });
+        expect(group).not.toHaveProperty('members');
+        expect(ok(await store.contacts.group({ key: 'nope' }))).toEqual({ group: null });
+      });
+
+      it('a second add of one key and a state change of a missing one are refused', async (ctx) => {
+        const store = await needsContacts(ctx);
+        ok(await store.contacts.addGroup(WAITLIST));
+        const twice = conflictOf(await store.contacts.addGroup(WAITLIST));
+        expect(twice.code).toBe('conflict');
+        expect(twice.message).toContain('group_exists:cloud-waitlist');
+        const missing = conflictOf(await store.contacts.setGroupState({ key: 'nope', state: 'closed' }));
+        expect(missing.code).toBe('conflict');
+        expect(missing.message).toContain('unknown_group:nope');
+      });
+
+      it('a declaration the rule refuses is refused before anything is written', async (ctx) => {
+        const store = await needsContacts(ctx);
+        // An enum with no values: stored, every join after it would answer a
+        // check nobody declared.
+        const properties = [{ name: 'tier', type: 'enum' }] as unknown as typeof WAITLIST.properties;
+        const refused = conflictOf(await store.contacts.addGroup({ key: 'bad-group', name: 'Bad', properties }));
+        expect(refused.message).toBe('invalid group declaration — tier: the values are a list with no blanks or repeats');
+        expect(ok(await store.contacts.group({ key: 'bad-group' }))).toEqual({ group: null });
+      });
+
+      it('a re-join replaces the answers and keeps the first join’s time, form and page', async (ctx) => {
+        const store = await needsContacts(ctx);
+        ok(await store.contacts.addGroup(WAITLIST));
+        const email = address(store, 'ana');
+        try {
+          const first = ok(
+            await store.contacts.join({
+              group: 'cloud-waitlist',
+              email,
+              properties: { tier: 'team' },
+              form: 'waitlist-page',
+              page: 'https://getstet.xyz/waitlist',
+            }),
+          );
+          expect(first).toMatchObject({ isNew: true, suppressed: false, form: 'waitlist-page', page: 'https://getstet.xyz/waitlist' });
+
+          await laterClock();
+          const again = ok(
+            await store.contacts.join({
+              group: 'cloud-waitlist',
+              email,
+              properties: { tier: 'business' },
+              form: 'footer',
+              page: 'https://getstet.xyz/other',
+            }),
+          );
+          expect(again).toEqual({
+            contactId: first.contactId,
+            isNew: false,
+            suppressed: false,
+            joinedAt: first.joinedAt,
+            form: 'waitlist-page',
+            page: 'https://getstet.xyz/waitlist',
+          });
+
+          const { rows } = ok(await store.contacts.members({ group: 'cloud-waitlist' }));
+          expect(rows).toHaveLength(1);
+          expect(rows[0]).toMatchObject({
+            email,
+            joinedAt: first.joinedAt,
+            form: 'waitlist-page',
+            page: 'https://getstet.xyz/waitlist',
+            properties: { tier: 'business' },
+          });
+          // The clock moved between the two: a re-join that rewrote joinedAt
+          // would read the later stamp here.
+          expect(rows[0]!.updatedAt > rows[0]!.joinedAt).toBe(true);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('a join to a closed group or a missing one is refused', async (ctx) => {
+        const store = await needsContacts(ctx);
+        ok(await store.contacts.addGroup(WAITLIST));
+        expect(ok(await store.contacts.setGroupState({ key: 'cloud-waitlist', state: 'closed' }))).toEqual({
+          state: 'closed',
+        });
+        const email = address(store, 'late');
+        const closed = conflictOf(await store.contacts.join({ group: 'cloud-waitlist', email, properties: {} }));
+        expect(closed.message).toContain('group_closed:cloud-waitlist');
+        const missing = conflictOf(await store.contacts.join({ group: 'nope', email, properties: {} }));
+        expect(missing.message).toContain('unknown_group:nope');
+        expect(ok(await store.contacts.contact({ email }))).toEqual({ record: null });
+      });
+
+      it('an address is stored trimmed and lowercased', async (ctx) => {
+        const store = await needsContacts(ctx);
+        ok(await store.contacts.addGroup(WAITLIST));
+        const email = address(store, 'ana');
+        ok(await store.contacts.join({ group: 'cloud-waitlist', email: ` ${email.toUpperCase()} `, properties: {} }));
+        const { rows } = ok(await store.contacts.members({ group: 'cloud-waitlist' }));
+        expect(rows.map((r) => r.email)).toEqual([email]);
+        expect(ok(await store.contacts.contact({ email: email.toUpperCase() })).record?.email).toBe(email);
+      });
+
+      it('members pages in join order and ends with a null cursor', async (ctx) => {
+        const store = await needsContacts(ctx);
+        ok(await store.contacts.addGroup(WAITLIST));
+        const first = address(store, 'first');
+        const second = address(store, 'second');
+        ok(await store.contacts.join({ group: 'cloud-waitlist', email: first, properties: {} }));
+        ok(await store.contacts.join({ group: 'cloud-waitlist', email: second, properties: {} }));
+
+        const seen: string[] = [];
+        let afterId: number | undefined;
+        let pages = 0;
+        for (;;) {
+          const page = ok(await store.contacts.members({ group: 'cloud-waitlist', afterId, limit: 1 }));
+          pages += 1;
+          seen.push(...page.rows.map((r) => r.email));
+          if (page.nextAfterId === null) break;
+          afterId = page.nextAfterId;
+        }
+        expect(seen).toEqual([first, second]);
+        expect(pages).toBe(3);
+        const missing = conflictOf(await store.contacts.members({ group: 'nope' }));
+        expect(missing.message).toContain('unknown_group:nope');
+      });
+
+      it('a record is null for an unknown address and holds a suppression without a contact', async (ctx) => {
+        const store = await needsContacts(ctx);
+        expect(ok(await store.contacts.contact({ email: address(store, 'nobody') }))).toEqual({ record: null });
+        const email = address(store, 'objector');
+        ok(await store.contacts.suppress({ email, scope: 'marketing', source: 'operator' }));
+        const { record } = ok(await store.contacts.contact({ email }));
+        expect(record).toMatchObject({ email, contact: null, memberships: [] });
+        expect(record?.suppressions).toEqual([
+          { scope: 'marketing', source: 'operator', createdAt: expect.any(String) },
+        ]);
+      });
+
+      it('a suppression is written once per scope, marks the member, and a join never lifts it', async (ctx) => {
+        const store = await needsContacts(ctx);
+        ok(await store.contacts.addGroup(WAITLIST));
+        const email = address(store, 'ana');
+        ok(await store.contacts.join({ group: 'cloud-waitlist', email, properties: { tier: 'team' } }));
+        // Another scope is another row, and marks nothing: only marketing is
+        // the list's unsubscribe.
+        expect(ok(await store.contacts.suppress({ email, scope: 'transactional', source: 'operator' }))).toEqual({
+          suppressed: true,
+        });
+        expect(ok(await store.contacts.members({ group: 'cloud-waitlist' })).rows[0]?.suppressed).toBe(false);
+
+        expect(ok(await store.contacts.suppress({ email, scope: 'marketing', source: 'one-click' }))).toEqual({
+          suppressed: true,
+        });
+        expect(ok(await store.contacts.suppress({ email, scope: 'marketing', source: 'page' }))).toEqual({
+          suppressed: false,
+        });
+        expect(ok(await store.contacts.members({ group: 'cloud-waitlist' })).rows[0]?.suppressed).toBe(true);
+
+        const joined = ok(await store.contacts.join({ group: 'cloud-waitlist', email, properties: { tier: 'solo' } }));
+        expect(joined).toMatchObject({ isNew: false, suppressed: true });
+        const { record } = ok(await store.contacts.contact({ email }));
+        expect(record?.suppressions.map((s) => `${s.scope}/${s.source}`)).toEqual([
+          'marketing/one-click',
+          'transactional/operator',
+        ]);
+      });
+
+      it('erase deletes the person, keeps the suppression, and turns an import away', async (ctx) => {
+        const store = await needsContacts(ctx);
+        ok(await store.contacts.addGroup(WAITLIST));
+        const email = address(store, 'ana');
+        ok(await store.contacts.join({ group: 'cloud-waitlist', email, properties: { tier: 'team' } }));
+        ok(await store.contacts.suppress({ email, scope: 'marketing', source: 'one-click' }));
+
+        expect(ok(await store.contacts.erase({ email }))).toEqual({ existed: true, memberships: 1 });
+        const { record } = ok(await store.contacts.contact({ email }));
+        expect(record).toMatchObject({ email, contact: null, memberships: [] });
+        expect(record?.suppressions.map((s) => s.scope)).toEqual(['marketing']);
+        expect(ok(await store.contacts.members({ group: 'cloud-waitlist' })).rows).toEqual([]);
+        expect(
+          ok(await store.contacts.importMember({ group: 'cloud-waitlist', email, properties: {}, form: 'import:list.csv' })),
+        ).toEqual({ outcome: 'erased' });
+        expect(ok(await store.contacts.erase({ email: address(store, 'stranger') }))).toEqual({
+          existed: false,
+          memberships: 0,
+        });
+      });
+
+      it('an import answers suppressed, present or joined', async (ctx) => {
+        const store = await needsContacts(ctx);
+        ok(await store.contacts.addGroup(WAITLIST));
+        const member = address(store, 'member');
+        const objector = address(store, 'objector');
+        const fresh = address(store, 'fresh');
+        ok(await store.contacts.join({ group: 'cloud-waitlist', email: member, properties: {} }));
+        ok(await store.contacts.join({ group: 'cloud-waitlist', email: objector, properties: {} }));
+        ok(await store.contacts.suppress({ email: objector, scope: 'marketing', source: 'one-click' }));
+        const form = 'import:list.csv';
+
+        // Suppressed before present: the reason it was skipped is the objection.
+        expect(ok(await store.contacts.importMember({ group: 'cloud-waitlist', email: objector, properties: {}, form }))).toEqual({
+          outcome: 'suppressed',
+        });
+        expect(ok(await store.contacts.importMember({ group: 'cloud-waitlist', email: member, properties: {}, form }))).toEqual({
+          outcome: 'present',
+        });
+        expect(
+          ok(
+            await store.contacts.importMember({
+              group: 'cloud-waitlist',
+              email: fresh,
+              properties: { tier: 'solo' },
+              form,
+              joinedAt: '2026-09-01T10:00:00.000Z',
+            }),
+          ),
+        ).toEqual({ outcome: 'joined' });
+        const imported = ok(await store.contacts.members({ group: 'cloud-waitlist' })).rows.find((r) => r.email === fresh);
+        expect(imported).toMatchObject({ joinedAt: '2026-09-01T10:00:00.000Z', form, page: null, properties: { tier: 'solo' } });
+      });
+
+      it('suppression counts are per scope and source', async (ctx) => {
+        const store = await needsContacts(ctx);
+        // Suppressions are store-wide, so this case's rows carry a source of
+        // their own and the counts are read for it alone.
+        const source = `src_${store.project}`;
+        ok(await store.contacts.suppress({ email: address(store, 'a'), scope: 'marketing', source }));
+        ok(await store.contacts.suppress({ email: address(store, 'b'), scope: 'marketing', source }));
+        ok(await store.contacts.suppress({ email: address(store, 'a'), scope: 'transactional', source }));
+        const { counts } = ok(await store.contacts.suppressionCounts());
+        expect(counts.filter((c) => c.source === source)).toEqual([
+          { scope: 'marketing', source, n: 2 },
+          { scope: 'transactional', source, n: 1 },
+        ]);
+      });
+
+      it('groups are per project and suppressions are store-wide', async (ctx) => {
+        const a = await needsContacts(ctx);
+        const b = await scope();
+        ok(await a.contacts.addGroup(WAITLIST));
+        const email = address(a, 'shared');
+        ok(await a.contacts.join({ group: 'cloud-waitlist', email, properties: {} }));
+
+        expect(ok(await b.contacts.groups()).groups).toEqual([]);
+        expect(ok(await b.contacts.group({ key: 'cloud-waitlist' }))).toEqual({ group: null });
+        expect(conflictOf(await b.contacts.join({ group: 'cloud-waitlist', email, properties: {} })).message).toContain(
+          'unknown_group:cloud-waitlist',
+        );
+
+        // An unsubscribe through one app in a shared store covers every app in it.
+        ok(await b.contacts.suppress({ email, scope: 'marketing', source: 'one-click' }));
+        expect(ok(await a.contacts.members({ group: 'cloud-waitlist' })).rows[0]?.suppressed).toBe(true);
+        expect(ok(await a.contacts.contact({ email })).record?.suppressions.map((s) => s.scope)).toEqual(['marketing']);
+      });
     });
   });
 }

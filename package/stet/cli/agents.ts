@@ -18,13 +18,13 @@
  * the span and eject would delete it.
  */
 
-import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 
 import { noPositionals, parse, refuseEnv } from './args.js';
 import { writeText } from './artifacts.js';
 import { CONFIG_FILE, isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { trackable } from './git.js';
 import type { CliIo } from './main.js';
 import { CliError, posixRelative, Report } from './report.js';
 import { dominantEol } from './rewrite.js';
@@ -668,11 +668,7 @@ function writeFailure(label: string, error: unknown): string {
  */
 function noteIfIgnored(cwd: string, path: string, label: string, status: GuidanceStatus, report: Report): void {
   if (status !== 'write' && status !== 'append') return;
-  try {
-    execFileSync('git', ['check-ignore', '-q', path], { cwd, stdio: ['ignore', 'ignore', 'ignore'] });
-  } catch {
-    return; // exit 1 = tracked, 128 = not a repo, ENOENT = no git
-  }
+  if (trackable(resolvePath(cwd, path)) !== false) return; // tracked, not a repo, or no git
   report.line(`${label} is gitignored — the block will not reach other clones`);
 }
 

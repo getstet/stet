@@ -106,6 +106,7 @@ function makeStore(
       'read' | 'saveDraft' | 'publish' | 'revert' | 'rename' | 'history' | 'recent'
     >),
     changesets,
+    contacts: createSnapshotStore({ project: 'test' }).contacts,
   };
   return { store, calls };
 }
@@ -272,6 +273,28 @@ describe('POST writes', () => {
       expect(res.status).toBe(400);
     }
     expect(calls.some((c) => ['saveDraft', 'publish', 'revert'].includes(c.method))).toBe(false);
+  });
+});
+
+describe('the shared HTTP pieces', () => {
+  it('reads an array body as {} and refuses its first missing field', async () => {
+    // `readJson` is server/http.ts' one lenient reader now: an array is not an
+    // object, so a draft posted as one names what it lacks.
+    const { store, calls } = makeStore();
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    const res = await h.POST(post('/api/stet/draft', [{ key: 'hero_headline', value: 'x', editor: 'ada' }]));
+    expect(res.status).toBe(400);
+    expect(await bodyOf(res)).toEqual({ error: 'editor is required' });
+    expect(calls.some((c) => c.method === 'saveDraft')).toBe(false);
+  });
+
+  it('never lets a reply be cached', async () => {
+    const { store } = makeStore();
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    const res = await h.GET(get('/api/stet/recent'));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(res.headers.get('content-type')).toBe('application/json');
   });
 });
 

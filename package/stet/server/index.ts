@@ -13,3 +13,13 @@ export { createStetHandler } from './mount.js';
 export type { PublishEvent, StetHandlerOptions } from './mount.js';
 export { mintPreviewToken, verifyPreviewToken } from '../src/preview-token.js';
 export type { PreviewState } from '../src/preview.js';
+export { createStetFormsHandler } from './forms.js';
+export type {
+  FormsGuard,
+  FormsHandlerOptions,
+  GuardVerdict,
+  JoinEvent,
+  UnsubscribeEvent,
+  UnsubscribePage,
+} from './forms.js';
+export { unsubscribeUrl } from './unsubscribe-token.js';

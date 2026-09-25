@@ -20,12 +20,14 @@
  * the row. One call is one request is one transaction.
  */
 
+import { normalEmail } from '../src/contacts.js';
 import { localeChain, type StoreRow } from '../src/resolve.js';
 import type {
   ChangeMember,
   ChangesetOps,
   ChangesetRow,
   ChangesetStatus,
+  ContactOps,
   DraftRefusal,
   SaveDraftParams,
   StoreAdapter,
@@ -34,11 +36,24 @@ import type {
 } from '../src/store.js';
 import {
   asDraft,
+  asErased,
+  asImportOutcome,
+  asJoin,
   asRenamed,
+  asVoid,
+  invalidDeclaration,
+  mapContactRecord,
+  mapGroupDef,
+  mapGroupRow,
+  memberPage,
+  type GroupDefSqlRow,
+  type GroupSqlRow,
+  type MemberSqlRow,
   asVersion,
   changeClosed,
   expectNoRefusal,
-  filterValue,
+  eqFilter,
+  listValue,
   isError,
   mapChangesetRow,
   mapError,
@@ -161,7 +176,7 @@ export function createPostgrestStore(opts: {
     params.set('select', SELECT);
     // Project scoping is a filter like any other, so it is quoted like any
     // other: an unquoted project carrying a comma would scope to nothing.
-    params.set('project', `eq.${filterValue(opts.project)}`);
+    params.set('project', eqFilter(opts.project));
     return params;
   }
 
@@ -268,9 +283,9 @@ export function createPostgrestStore(opts: {
     }): Promise<{ rows: VersionRow[]; nextBeforeId: number | null } | StoreError> {
       const limit = pageLimit(q.limit);
       const params = scoped();
-      params.set('key', `eq.${filterValue(q.key)}`);
+      params.set('key', eqFilter(q.key));
       params.set('state', 'eq.published');
-      if (q.locale !== undefined) params.set('locale', `eq.${filterValue(q.locale)}`);
+      if (q.locale !== undefined) params.set('locale', eqFilter(q.locale));
       if (q.beforeId !== undefined) params.set('id', `lt.${q.beforeId}`);
       params.set('order', 'id.desc');
       params.set('limit', String(limit));
@@ -290,6 +305,111 @@ export function createPostgrestStore(opts: {
       const rows = await select(params);
       return isError(rows) ? rows : mapPage(rows, limit);
     },
+
+    // The contacts capability: transport only, over the same migration-3
+    // functions store-pg calls. Table functions answer as rows, the jsonb and
+    // scalar ones as one parsed body; the mapping is store-shared's.
+    contacts: {
+      async addGroup(p): Promise<{ created: true } | StoreError> {
+        const invalid = invalidDeclaration(p.properties);
+        if (invalid) return invalid;
+        const done = asVoid(
+          await rpc('stet_group_add', { p_project: opts.project, p_key: p.key, p_name: p.name, p_properties: p.properties }),
+          'contacts.addGroup',
+        );
+        return done === true ? { created: true } : done;
+      },
+
+      async setGroupState(p): Promise<{ state: 'open' | 'closed' } | StoreError> {
+        const done = asVoid(
+          await rpc('stet_group_state', { p_project: opts.project, p_key: p.key, p_state: p.state }),
+          'contacts.setGroupState',
+        );
+        return done === true ? { state: p.state } : done;
+      },
+
+      async groups() {
+        const rows = await table<GroupSqlRow>('/rpc/stet_group_list', {
+          method: 'POST',
+          body: JSON.stringify({ p_project: opts.project }),
+        });
+        return isError(rows) ? rows : { groups: rows.map(mapGroupRow) };
+      },
+
+      async group(p) {
+        const rows = await table<GroupDefSqlRow>('/rpc/stet_group_get', {
+          method: 'POST',
+          body: JSON.stringify({ p_project: opts.project, p_key: p.key }),
+        });
+        return isError(rows) ? rows : { group: rows[0] === undefined ? null : mapGroupDef(rows[0]) };
+      },
+
+      async join(p) {
+        return asJoin(
+          await rpc('stet_join_group', {
+            p_project: opts.project,
+            p_group: p.group,
+            p_email: p.email,
+            p_properties: p.properties,
+            p_form: p.form ?? null,
+            p_page: p.page ?? null,
+          }),
+        );
+      },
+
+      async importMember(p) {
+        return asImportOutcome(
+          await rpc('stet_import_member', {
+            p_project: opts.project,
+            p_group: p.group,
+            p_email: p.email,
+            p_properties: p.properties,
+            p_form: p.form,
+            p_joined_at: p.joinedAt ?? null,
+          }),
+        );
+      },
+
+      async members(q) {
+        const limit = pageLimit(q.limit);
+        const rows = await table<MemberSqlRow>('/rpc/stet_group_members', {
+          method: 'POST',
+          body: JSON.stringify({ p_project: opts.project, p_group: q.group, p_after_id: q.afterId ?? 0, p_limit: limit }),
+        });
+        return isError(rows) ? rows : memberPage(rows, q.group, limit);
+      },
+
+      async contact(p) {
+        const answer = expectNoRefusal(
+          await rpc('stet_contact_record', { p_project: opts.project, p_email: p.email }),
+          'contacts.contact',
+        );
+        return 'body' in answer ? mapContactRecord(answer.body) : answer;
+      },
+
+      // One row, so a direct upsert rather than a function: with
+      // ignore-duplicates PostgREST returns only the rows it inserted.
+      async suppress(p) {
+        const rows = await table<{ email: string }>('/stet_suppressions?on_conflict=email,scope', {
+          method: 'POST',
+          body: JSON.stringify({ email: normalEmail(p.email), scope: p.scope, source: p.source }),
+          prefer: 'resolution=ignore-duplicates,return=representation',
+        });
+        return isError(rows) ? rows : { suppressed: rows.length > 0 };
+      },
+
+      async erase(p) {
+        return asErased(await rpc('stet_erase_contact', { p_project: opts.project, p_email: p.email }));
+      },
+
+      async suppressionCounts() {
+        const rows = await table<{ scope: 'transactional' | 'marketing'; source: string; n: number | string }>(
+          '/rpc/stet_suppression_counts',
+          { method: 'POST', body: '{}' },
+        );
+        return isError(rows) ? rows : { counts: rows.map((r) => ({ scope: r.scope, source: r.source, n: Number(r.n) })) };
+      },
+    } satisfies ContactOps,
 
     changesets: {
       async open(p): Promise<{ changeId: number } | StoreError> {
@@ -311,7 +431,7 @@ export function createPostgrestStore(opts: {
       async list(q = {}): Promise<{ changes: ChangesetRow[]; nextBeforeId: number | null } | StoreError> {
         const limit = pageLimit(q.limit);
         const params = changeScoped();
-        if (q.status !== undefined) params.set('status', `eq.${filterValue(q.status)}`);
+        if (q.status !== undefined) params.set('status', eqFilter(q.status));
         if (q.beforeId !== undefined) params.set('id', `lt.${q.beforeId}`);
         params.set('order', 'id.desc');
         params.set('limit', String(limit));
@@ -331,7 +451,7 @@ export function createPostgrestStore(opts: {
 
         const params = new URLSearchParams();
         params.set('select', 'id,key,locale');
-        params.set('project', `eq.${filterValue(opts.project)}`);
+        params.set('project', eqFilter(opts.project));
         params.set('changeset_id', `eq.${p.changeId}`);
         params.set('state', published ? 'eq.published' : 'eq.draft');
         params.set('order', 'id.asc');
@@ -376,7 +496,7 @@ export function createPostgrestStore(opts: {
         if (p.publishAt !== null) {
           const params = new URLSearchParams();
           params.set('select', 'id');
-          params.set('project', `eq.${filterValue(opts.project)}`);
+          params.set('project', eqFilter(opts.project));
           params.set('changeset_id', `eq.${p.changeId}`);
           params.set('state', 'eq.draft');
           const members = await table<{ id: number }>(`/content_versions?${params.toString()}`);
@@ -518,21 +638,21 @@ export function createPostgrestStore(opts: {
   function changeScoped(): URLSearchParams {
     const params = new URLSearchParams();
     params.set('select', CHANGE_SELECT);
-    params.set('project', `eq.${filterValue(opts.project)}`);
+    params.set('project', eqFilter(opts.project));
     return params;
   }
 
   /**
    * One change's member drafts, scoped to this project. Built through
    * `URLSearchParams` like every other filter here, never string-interpolated:
-   * `filterValue` quotes a value but does not PERCENT-ENCODE it, so a project
+   * `eqFilter` leaves a value bare and does not PERCENT-ENCODE it, so a project
    * carrying a `#` would truncate the query at the fragment and a `&` would
    * inject a parameter — either way dropping the scoping filters off the two
    * destructive writes (the stamp PATCH and the abandon DELETE) that use this.
    */
   function memberDrafts(changeId: number): URLSearchParams {
     const params = new URLSearchParams();
-    params.set('project', `eq.${filterValue(opts.project)}`);
+    params.set('project', eqFilter(opts.project));
     params.set('changeset_id', `eq.${changeId}`);
     params.set('state', 'eq.draft');
     return params;
@@ -542,9 +662,9 @@ export function createPostgrestStore(opts: {
   function beforeParams(m: { id: number; key: string; locale: string }): URLSearchParams {
     const params = new URLSearchParams();
     params.set('select', 'id,value');
-    params.set('project', `eq.${filterValue(opts.project)}`);
-    params.set('key', `eq.${filterValue(m.key)}`);
-    params.set('locale', `eq.${filterValue(m.locale)}`);
+    params.set('project', eqFilter(opts.project));
+    params.set('key', eqFilter(m.key));
+    params.set('locale', eqFilter(m.locale));
     params.set('state', 'eq.published');
     params.set('id', `lt.${m.id}`);
     params.set('order', 'id.desc');
@@ -673,5 +793,5 @@ function raised(text: string): { message: string; sqlstate?: string; detail?: st
 
 /** An `in.(…)` list: every value quoted, so a comma in a key cannot end it. */
 function list(values: string[]): string {
-  return values.map(filterValue).join(',');
+  return values.map(listValue).join(',');
 }

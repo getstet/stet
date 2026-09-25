@@ -117,6 +117,15 @@ describe('the preview token', () => {
     expect(verifyPreviewToken(forged, '', NOW)).toBeNull();
   });
 
+  it('treats a secret of whitespace alone as empty', () => {
+    const state: PreviewState = { kind: 'draft', key: 'hero_headline' };
+    // A secret file's trailing newline is not a key.
+    expect(() => mintPreviewToken(state, ' \n', NOW)).toThrowError(/empty secret/);
+    const real = mintPreviewToken(state, 's3cret', NOW);
+    expect(verifyPreviewToken(real, ' ', NOW)).toBeNull();
+    expect(verifyPreviewToken(real, 's3cret', NOW)).toEqual(state);
+  });
+
   it('expires everything when the clock itself is not a number', () => {
     const token = mintPreviewToken({ kind: 'change-before', changeId: 3 }, SECRET, NOW);
     // NaN >= exp is false, so an unguarded comparison would make every token

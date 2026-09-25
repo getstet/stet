@@ -130,6 +130,105 @@ export interface ChangesetOps {
   markReverted(p: { changeId: number }): Promise<{ revertedAt: string } | NotSupported | StoreError>;
 }
 
+// ── The contacts capability ─────────────────────────────────────────────────
+//
+// The list follows the store (§13.1e): groups, the people who join them and
+// who not to mail, in the host's own Postgres. A second block BESIDE the seven
+// methods, exactly like `changesets`: the snapshot adapter answers
+// `NotSupported` from every method, and the interface's method list is still
+// the seven. Suppressions are store-wide — keyed (email, scope), never by
+// project — so an unsubscribe from one app in a shared store covers every app
+// in it; everything else is scoped to the adapter's project.
+
+export type GroupState = 'open' | 'closed';
+export type SuppressionScope = 'transactional' | 'marketing';
+
+/** One question a group's form asks, in the order the declaration gives. */
+export interface GroupProperty {
+  name: string;
+  type: 'enum' | 'text';
+  /** enum only: the allowed answers, in order. */
+  values?: string[];
+  required?: boolean;
+}
+
+/** A group as the join route reads it: no member count. */
+export interface GroupDef {
+  key: string;
+  name: string;
+  state: GroupState;
+  properties: GroupProperty[];
+  createdAt: string;
+}
+
+/** A group as the list reads it, with its member count. */
+export interface GroupRow extends GroupDef {
+  members: number;
+}
+
+/** One person's membership of one group: the consent evidence. */
+export interface MembershipRow {
+  /** Join order within a group, and the members read's keyset cursor. */
+  id: number;
+  group: string;
+  /** The first join's time, form and page — a re-join never moves them. */
+  joinedAt: string;
+  form: string | null;
+  page: string | null;
+  /** The latest answers; a re-join replaces them. */
+  properties: Record<string, string>;
+  updatedAt: string;
+}
+
+export interface MemberRow extends MembershipRow {
+  contactId: number;
+  email: string;
+  /** A marketing suppression exists for the address — computed at read, never stored. */
+  suppressed: boolean;
+}
+
+export interface SuppressionRow {
+  scope: SuppressionScope;
+  source: string;
+  createdAt: string;
+}
+
+/** Everything held about one address. `contact` is null where only suppressions exist. */
+export interface ContactRecord {
+  email: string;
+  contact: { id: number; properties: Record<string, unknown>; createdAt: string; updatedAt: string } | null;
+  memberships: MembershipRow[];
+  suppressions: SuppressionRow[];
+}
+
+export interface JoinResult {
+  contactId: number;
+  /** false on a re-join: the answers were replaced, nothing else moved. */
+  isNew: boolean;
+  suppressed: boolean;
+  /** The first join's time, form and page, as stored — a re-join's own are never kept. */
+  joinedAt: string;
+  form: string | null;
+  page: string | null;
+}
+
+export type ImportOutcome = 'joined' | 'present' | 'erased' | 'suppressed';
+
+export interface ContactOps {
+  addGroup(p: { key: string; name: string; properties: GroupProperty[] }): Promise<{ created: true } | NotSupported | StoreError>;
+  setGroupState(p: { key: string; state: GroupState }): Promise<{ state: GroupState } | NotSupported | StoreError>;
+  groups(): Promise<{ groups: GroupRow[] } | NotSupported | StoreError>;
+  /** One group by key, or null where the project has none. */
+  group(p: { key: string }): Promise<{ group: GroupDef | null } | NotSupported | StoreError>;
+  join(p: { group: string; email: string; properties: Record<string, string>; form?: string | null; page?: string | null }): Promise<JoinResult | NotSupported | StoreError>;
+  importMember(p: { group: string; email: string; properties: Record<string, string>; form: string; joinedAt?: string | null }): Promise<{ outcome: ImportOutcome } | NotSupported | StoreError>;
+  members(q: { group: string; afterId?: number; limit?: number }): Promise<{ rows: MemberRow[]; nextAfterId: number | null } | NotSupported | StoreError>;
+  contact(p: { email: string }): Promise<{ record: ContactRecord | null } | NotSupported | StoreError>;
+  suppress(p: { email: string; scope: SuppressionScope; source: string }): Promise<{ suppressed: boolean } | NotSupported | StoreError>;
+  erase(p: { email: string }): Promise<{ existed: boolean; memberships: number } | NotSupported | StoreError>;
+  suppressionCounts(): Promise<{ counts: { scope: SuppressionScope; source: string; n: number }[] } | NotSupported | StoreError>;
+}
+
 /**
  * `read` returns the store's rows, never resolved values: resolution is
  * `resolve()`'s one code path across every adapter. Drafts come back only under
@@ -148,6 +247,11 @@ export interface StoreAdapter {
    * snapshot adapter's block returns `NotSupported` from every method.
    */
   readonly changesets: ChangesetOps;
+  /**
+   * The contacts capability — a second object beside the seven methods, like
+   * `changesets`. The snapshot adapter's block answers `NotSupported` everywhere.
+   */
+  readonly contacts: ContactOps;
   read(q?: { keys?: string[]; locale?: string; preview?: boolean }): Promise<StoreRow[] | StoreError>;
   saveDraft(p: SaveDraftParams): Promise<{ draftId: number } | DraftRefusal | NotSupported | StoreError>;
   publish(p: { key: string; editor: string; locale?: string }): Promise<{ versionId: number } | NotSupported | StoreError>;

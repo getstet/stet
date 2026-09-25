@@ -4072,7 +4072,7 @@ describe('the page', () => {
         200,
         {
           editor: 'dashboard:test',
-          version: '0.3.2',
+          version: '0.4.0',
           sites: [
             { state: 'ready', name: 'mini', path: '/checkouts/mini', id: SITE_ID, mode: site['mode'], keys: 11, host: 'js', router: 'astro', project: 'default' },
             { state: 'ready', name: 'other', path: '/checkouts/other', id: 'dddddddddddd', mode: 'snapshot', keys: 4, host: 'html', router: 'app', project: 'other-site' },
@@ -4199,6 +4199,17 @@ describe('the page', () => {
   function inlineHandlers(html: string): string[] {
     return html.match(/\bon[a-z]+="/g) ?? [];
   }
+
+  it('says on the Contacts tab where form sign-ups are read (journey E23)', async () => {
+    const page = await paint();
+    await page.act('tab:Contacts');
+    expect(page.errors).toEqual([]);
+    expect(page.html()).toContain('<h3>Contacts</h3><span class="bdg">Not built yet.</span>');
+    expect(page.html()).toContain(
+      'Form sign-ups are stored in your database. Read them in the terminal with stet contacts list — this tab does not show them yet.',
+    );
+    expect(page.html()).not.toContain('is planned.</');
+  });
 
   it('paints every tab and every key shape with no inline handler and no ReferenceError', async () => {
     const page = await paint();

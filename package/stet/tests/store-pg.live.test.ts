@@ -26,12 +26,14 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createPgStore, type PgStore } from '../adapters/store-pg.js';
+import { GRANTS_003 } from '../cli/upgrade.js';
 import { ok, runStoreConformance } from '../conformance/store.suite.js';
 
 const BASE = process.env['STET_TEST_DATABASE_URL'];
 const SCHEMA = 'stet_live_test';
 const MIGRATION = readFileSync(new URL('../migrations/001_content_cms.sql', import.meta.url), 'utf8');
 const MIGRATION_2 = readFileSync(new URL('../migrations/002_changesets.sql', import.meta.url), 'utf8');
+const MIGRATION_3 = readFileSync(new URL('../migrations/003_contacts.sql', import.meta.url), 'utf8');
 
 /** A connection pinned to this file's schema. Space and `=` must survive the URL. */
 function scoped(base: string): string {
@@ -188,6 +190,7 @@ if (BASE) {
     const c = await client();
     await c.query(MIGRATION);
     await c.query(MIGRATION_2);
+    await c.query(MIGRATION_3);
     await c.end();
   }, 60_000);
 
@@ -206,9 +209,9 @@ live('the migrations, applied in order', () => {
       'select schema_version, descriptor_version from stet_meta',
     );
     expect(meta.rows).toHaveLength(1);
-    // 002's last statement is the stamp, and it is an UPDATE of 001's row: the
-    // counter walks, it is never re-inserted.
-    expect(meta.rows[0]?.schema_version).toBe(2);
+    // Each migration's last statement is the stamp, and it is an UPDATE of
+    // 001's row: the counter walks, it is never re-inserted.
+    expect(meta.rows[0]?.schema_version).toBe(3);
     // '' means not yet stamped: a static file cannot know the project's
     // descriptor version, and `stet upgrade`/`seed` stamp it later.
     expect(meta.rows[0]?.descriptor_version).toBe('');
@@ -261,7 +264,20 @@ live('the migrations, applied in order', () => {
       'rename_content_key',
       'revert_content_version',
       'save_content_draft',
+      'stet_contact_id',
+      'stet_contact_record',
+      'stet_erase_contact',
+      'stet_erasure_hash',
+      'stet_group_add',
+      'stet_group_get',
+      'stet_group_list',
+      'stet_group_members',
+      'stet_group_state',
+      'stet_import_member',
+      'stet_join_group',
+      'stet_normal_email',
       'stet_publish_flip',
+      'stet_suppression_counts',
     ]);
     expect(functions.rows.every((r) => r.prosecdef === false)).toBe(true);
     await c.end();
@@ -582,6 +598,446 @@ live('the migrations, applied in order', () => {
       );
       expect({ name, has: granted.rows[0]?.has }).toEqual({ name, has: false });
     }
+    await c.end();
+  });
+});
+
+live('migration 3', () => {
+  /** A connection whose search path is one scratch schema, dropped and recreated. */
+  async function fresh(schema: string, ...migrations: string[]): Promise<pg.Client> {
+    const c = new pg.Client({ connectionString: BASE ?? '' });
+    await c.connect();
+    await c.query(`drop schema if exists ${schema} cascade`);
+    await c.query(`create schema ${schema}`);
+    await c.query(`set search_path to ${schema}`);
+    for (const sql of migrations) await c.query(sql);
+    return c;
+  }
+
+  /** Apply 003 where it is expected to fail: the refusal's SQLSTATE and message, the transaction rolled back. */
+  async function refusedApply(c: pg.Client): Promise<{ code: string | undefined; message: string }> {
+    const failure = await settled(c.query(MIGRATION_3));
+    await c.query('rollback');
+    return { code: sqlstate(failure), message: failure?.message ?? '' };
+  }
+
+  async function version(c: pg.Client): Promise<number | undefined> {
+    return (await c.query<{ schema_version: number }>('select schema_version from stet_meta')).rows[0]?.schema_version;
+  }
+
+  /** A join through the SQL function, answered as the object it returns. */
+  async function join(
+    c: pg.Client,
+    p: { project: string; group: string; email: string; properties?: object; form?: string | null; page?: string | null },
+  ): Promise<{ contact_id: number; is_new: boolean; suppressed: boolean; joined_at: string; form: string | null; page: string | null }> {
+    const row = await c.query<{ j: never }>('select stet_join_group($1, $2, $3, $4::jsonb, $5, $6) as j', [
+      p.project,
+      p.group,
+      p.email,
+      JSON.stringify(p.properties ?? {}),
+      p.form ?? null,
+      p.page ?? null,
+    ]);
+    return row.rows[0]?.j as never;
+  }
+
+  const TABLES = ['stet_contacts', 'stet_erasures', 'stet_group_memberships', 'stet_groups', 'stet_suppressions'];
+  const FUNCTIONS = [
+    'stet_contact_id(text, text)',
+    'stet_contact_record(text, text)',
+    'stet_erase_contact(text, text)',
+    'stet_erasure_hash(text)',
+    'stet_group_add(text, text, text, jsonb)',
+    'stet_group_get(text, text)',
+    'stet_group_list(text)',
+    'stet_group_members(text, text, bigint, int)',
+    'stet_group_state(text, text, text)',
+    'stet_import_member(text, text, text, jsonb, text, timestamptz)',
+    'stet_join_group(text, text, text, jsonb, text, text)',
+    'stet_normal_email(text)',
+    'stet_suppression_counts()',
+  ];
+  const SEQUENCES = ['stet_contacts_id_seq', 'stet_group_memberships_id_seq'];
+
+  it('stamps 3, creates five tables and thirteen functions, and names every object stet_', async () => {
+    const c = await client();
+    expect(await version(c)).toBe(3);
+    const tables = await c.query<{ table_name: string }>(
+      `select table_name from information_schema.tables where table_schema = $1 and table_name like 'stet\\_%' order by 1`,
+      [SCHEMA],
+    );
+    expect(tables.rows.map((r) => r.table_name)).toEqual([...TABLES, 'stet_meta', 'stet_renames'].sort());
+    for (const signature of FUNCTIONS) {
+      const found = await c.query<{ n: number }>('select count(*)::int as n from pg_proc where oid = $1::regprocedure', [
+        `${SCHEMA}.${signature}`,
+      ]);
+      expect(`${signature}: ${found.rows[0]?.n}`).toBe(`${signature}: 1`);
+    }
+
+    // What 003 created is what this schema holds beyond a 001+002 one: every
+    // table, index, sequence and function of it carries the prefix.
+    const base = await fresh('stet_m3_base', MIGRATION, MIGRATION_2);
+    const objects = async (schema: string): Promise<string[]> => {
+      const rel = await base.query<{ name: string }>(
+        `select relname as name from pg_class where relnamespace = $1::regnamespace and relkind in ('r', 'i', 'S')
+         union all select proname from pg_proc where pronamespace = $1::regnamespace`,
+        [schema],
+      );
+      return rel.rows.map((r) => r.name);
+    };
+    const before = new Set(await objects('stet_m3_base'));
+    const created = (await objects(SCHEMA)).filter((name) => !before.has(name));
+    expect(created.length).toBeGreaterThanOrEqual(5 + 13 + 2);
+    expect(created.filter((name) => !name.startsWith('stet_'))).toEqual([]);
+    await base.query('drop schema stet_m3_base cascade');
+    await base.end();
+
+    const salt = await c.query<{ erasure_salt: string }>('select erasure_salt from stet_meta');
+    expect(salt.rows[0]?.erasure_salt).toMatch(/^[0-9a-f]{32}$/);
+    await c.end();
+  });
+
+  it('a host table named like one of its tables stops the apply whole', async () => {
+    const c = await fresh('stet_m3_collide', MIGRATION, MIGRATION_2);
+    await c.query('create table stet_contacts (id int)');
+    expect((await refusedApply(c)).code).toBe('42P07');
+    expect(await version(c)).toBe(2);
+    const groups = await c.query<{ n: number }>(
+      `select count(*)::int as n from information_schema.tables where table_schema = 'stet_m3_collide' and table_name = 'stet_groups'`,
+    );
+    expect(groups.rows[0]?.n).toBe(0);
+    const salt = await c.query<{ n: number }>(
+      `select count(*)::int as n from information_schema.columns
+        where table_schema = 'stet_m3_collide' and table_name = 'stet_meta' and column_name = 'erasure_salt'`,
+    );
+    expect(salt.rows[0]?.n).toBe(0);
+
+    // The same host's own `contacts` and `email_suppressions` (Mirra's name)
+    // sit beside 003 untouched.
+    await c.query('alter table stet_contacts rename to contacts');
+    await c.query('create table email_suppressions (email text primary key)');
+    await c.query(`insert into contacts values (7); insert into email_suppressions values ('host@x.co')`);
+    await c.query(MIGRATION_3);
+    expect(await version(c)).toBe(3);
+    const columns = await c.query<{ table_name: string; column_name: string }>(
+      `select table_name, column_name from information_schema.columns
+        where table_schema = 'stet_m3_collide' and table_name in ('contacts', 'email_suppressions') order by 1, 2`,
+    );
+    expect(columns.rows).toEqual([
+      { table_name: 'contacts', column_name: 'id' },
+      { table_name: 'email_suppressions', column_name: 'email' },
+    ]);
+    expect((await c.query('select * from contacts')).rows).toEqual([{ id: 7 }]);
+    expect((await c.query('select * from email_suppressions')).rows).toEqual([{ email: 'host@x.co' }]);
+    await c.query('drop schema stet_m3_collide cascade');
+    await c.end();
+  }, 30_000);
+
+  it('a host function of one of its names and argument types stops the apply, never replaced', async () => {
+    const c = await fresh('stet_m3_function', MIGRATION, MIGRATION_2);
+    // 003's own return type, so a `create or replace` would succeed silently.
+    await c.query(
+      `create function stet_group_list(p_project text)
+       returns table (key text, name text, state text, properties jsonb, created_at timestamptz, members bigint)
+       language sql as $$ select 'host', 'host', 'open', '[]'::jsonb, now(), 1::bigint $$`,
+    );
+    expect((await refusedApply(c)).code).toBe('42723');
+    const host = await c.query<{ key: string }>(`select key from stet_group_list('x')`);
+    expect(host.rows[0]?.key).toBe('host');
+    expect(await version(c)).toBe(2);
+    await c.query('drop schema stet_m3_function cascade');
+    await c.end();
+  }, 30_000);
+
+  it('a host sequence of one of its names stops the apply; its own are named and owned', async () => {
+    const c = await fresh('stet_m3_sequence', MIGRATION, MIGRATION_2);
+    await c.query('create sequence stet_contacts_id_seq');
+    const refused = await refusedApply(c);
+    expect(refused.code).toBe('42P07');
+    expect(refused.message).toContain('stet_contacts_id_seq');
+    expect(await version(c)).toBe(2);
+    await c.query('drop schema stet_m3_sequence cascade');
+    await c.end();
+
+    const clean = await client();
+    const owned = await clean.query<{ contacts: string; memberships: string }>(
+      `select pg_get_serial_sequence('stet_contacts', 'id') as contacts,
+              pg_get_serial_sequence('stet_group_memberships', 'id') as memberships`,
+    );
+    expect(owned.rows[0]).toEqual({
+      contacts: `${SCHEMA}.stet_contacts_id_seq`,
+      memberships: `${SCHEMA}.stet_group_memberships_id_seq`,
+    });
+    await clean.end();
+  }, 30_000);
+
+  it('holds no privilege for anon, authenticated or public, and row level security on all five', async () => {
+    const admin = new pg.Client({ connectionString: BASE ?? '' });
+    await admin.connect();
+    await admin.query(`do $$ begin
+      if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon nologin; end if;
+      if not exists (select 1 from pg_roles where rolname = 'authenticated') then create role authenticated nologin; end if;
+    end $$;`);
+    await admin.end();
+    // Supabase's shape: both roles receive every new object by default
+    // privileges, so the revokes are what leave them holding nothing.
+    const schema = 'stet_m3_roles';
+    const c = await fresh(schema);
+    try {
+      for (const kind of ['tables', 'sequences', 'functions']) {
+        await c.query(`alter default privileges in schema ${schema} grant all on ${kind} to anon, authenticated`);
+      }
+      await c.query(MIGRATION);
+      await c.query(MIGRATION_2);
+      await c.query(MIGRATION_3);
+      for (const role of ['anon', 'authenticated', 'public']) {
+        for (const table of TABLES) {
+          const has = await c.query<{ ok: boolean }>(
+            `select has_table_privilege($1, $2, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') as ok`,
+            [role, `${schema}.${table}`],
+          );
+          expect(`${role} ${table}: ${has.rows[0]?.ok}`).toBe(`${role} ${table}: false`);
+        }
+        for (const sequence of SEQUENCES) {
+          const has = await c.query<{ ok: boolean }>(
+            `select has_sequence_privilege($1, $2, 'USAGE, SELECT, UPDATE') as ok`,
+            [role, `${schema}.${sequence}`],
+          );
+          expect(`${role} ${sequence}: ${has.rows[0]?.ok}`).toBe(`${role} ${sequence}: false`);
+        }
+        for (const signature of FUNCTIONS) {
+          const has = await c.query<{ ok: boolean }>(`select has_function_privilege($1, $2, 'EXECUTE') as ok`, [
+            role,
+            `${schema}.${signature}`,
+          ]);
+          expect(`${role} ${signature}: ${has.rows[0]?.ok}`).toBe(`${role} ${signature}: false`);
+        }
+      }
+      const rls = await c.query<{ relname: string; relrowsecurity: boolean }>(
+        `select relname, relrowsecurity from pg_class where relnamespace = $1::regnamespace and relkind = 'r'
+            and relname = any($2) order by relname`,
+        [schema, TABLES],
+      );
+      expect(rls.rows).toEqual(TABLES.map((relname) => ({ relname, relrowsecurity: true })));
+    } finally {
+      await c.query(`drop schema if exists ${schema} cascade`);
+      await c.query('drop owned by anon, authenticated cascade').catch(() => undefined);
+      await c.query('drop role if exists anon').catch(() => undefined);
+      await c.query('drop role if exists authenticated').catch(() => undefined);
+      await c.end();
+    }
+  }, 30_000);
+
+  it('two first joins of one address at once make one contact and one membership', async () => {
+    const project = 'm3_race';
+    const a = await client();
+    const b = await client();
+    await a.query(`select stet_group_add($1, 'waitlist', 'Waitlist', '[]'::jsonb)`, [project]);
+
+    await a.query('begin');
+    await b.query('begin');
+    const first = await join(a, { project, group: 'waitlist', email: 'race@x.co', form: 'first', page: 'https://x.co/a' });
+    // The second parks on the first's uncommitted contact row.
+    const second = join(b, { project, group: 'waitlist', email: 'race@x.co', form: 'second', page: 'https://x.co/b' });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await a.query('commit');
+    const raced = await second;
+    await b.query('commit');
+
+    expect([first.is_new, raced.is_new].filter(Boolean)).toHaveLength(1);
+    expect(raced.contact_id).toBe(first.contact_id);
+    const counts = await a.query<{ contacts: number; memberships: number }>(
+      `select (select count(*)::int from stet_contacts where project = $1 and email = 'race@x.co') as contacts,
+              (select count(*)::int from stet_group_memberships where project = $1) as memberships`,
+      [project],
+    );
+    expect(counts.rows[0]).toEqual({ contacts: 1, memberships: 1 });
+
+    // A re-join with another form and page: the answers move, the consent
+    // evidence stays the first join's, and the answer carries the stored pair.
+    await a.query('select pg_sleep(0.01)');
+    const again = await join(a, {
+      project,
+      group: 'waitlist',
+      email: 'race@x.co',
+      properties: { tier: 'team' },
+      form: 'later',
+      page: 'https://x.co/later',
+    });
+    expect(again).toMatchObject({ is_new: false, form: 'first', page: 'https://x.co/a' });
+    const row = await a.query<{ joined_at: Date; form: string; page: string; properties: unknown; updated_at: Date }>(
+      'select joined_at, form, page, properties, updated_at from stet_group_memberships where project = $1',
+      [project],
+    );
+    expect(row.rows[0]).toMatchObject({ form: 'first', page: 'https://x.co/a', properties: { tier: 'team' } });
+    expect(new Date(again.joined_at).toISOString()).toBe(row.rows[0]?.joined_at.toISOString());
+    expect(row.rows[0]!.updated_at.getTime()).toBeGreaterThan(row.rows[0]!.joined_at.getTime());
+    await a.end();
+    await b.end();
+  }, 30_000);
+
+  it('a close waits for a join holding the group, and a join after the close is refused', async () => {
+    const project = 'm3_close';
+    const joiner = await client();
+    const closer = await client();
+    await joiner.query(`select stet_group_add($1, 'waitlist', 'Waitlist', '[]'::jsonb)`, [project]);
+
+    await joiner.query('begin');
+    await join(joiner, { project, group: 'waitlist', email: 'held@x.co' });
+    await closer.query(`set lock_timeout = '200ms'`);
+    const blocked = await settled(closer.query(`select stet_group_state($1, 'waitlist', 'closed')`, [project]));
+    expect(sqlstate(blocked)).toBe('55P03');
+    await joiner.query('commit');
+
+    await closer.query(`select stet_group_state($1, 'waitlist', 'closed')`, [project]);
+    expect(await raised(() => join(joiner, { project, group: 'waitlist', email: 'late@x.co' }))).toContain(
+      'group_closed:waitlist',
+    );
+    await joiner.end();
+    await closer.end();
+  }, 30_000);
+
+  it('a group with members cannot be deleted', async () => {
+    const project = 'm3_restrict';
+    const c = await client();
+    await c.query(`select stet_group_add($1, 'waitlist', 'Waitlist', '[]'::jsonb)`, [project]);
+    await join(c, { project, group: 'waitlist', email: 'kept@x.co' });
+    const refused = await settled(c.query(`delete from stet_groups where project = $1 and key = 'waitlist'`, [project]));
+    expect(sqlstate(refused)).toBe('23503');
+    await c.end();
+  });
+
+  it('an erasure leaves the address in the suppressions alone, and an import is told erased', async () => {
+    const project = 'm3_erase';
+    const email = 'erased-person@x.co';
+    const c = await client();
+    await c.query(`select stet_group_add($1, 'waitlist', 'Waitlist', '[]'::jsonb)`, [project]);
+    await join(c, { project, group: 'waitlist', email, form: 'f', page: 'https://x.co/p' });
+    await c.query(`insert into stet_suppressions (email, scope, source) values ($1, 'marketing', 'one-click')`, [email]);
+
+    const erased = await c.query<{ e: unknown }>('select stet_erase_contact($1, $2) as e', [project, email]);
+    expect(erased.rows[0]?.e).toEqual({ existed: true, memberships: 1 });
+
+    for (const table of ['stet_contacts', 'stet_group_memberships', 'stet_groups', 'stet_erasures']) {
+      const held = await c.query<{ n: number }>(
+        `select count(*)::int as n from ${table} t where strpos(t::text, $1) > 0`,
+        [email],
+      );
+      expect(`${table}: ${held.rows[0]?.n}`).toBe(`${table}: 0`);
+    }
+    const kept = await c.query<{ n: number }>('select count(*)::int as n from stet_suppressions where email = $1', [email]);
+    expect(kept.rows[0]?.n).toBe(1);
+
+    const imported = await c.query<{ outcome: string }>(
+      `select stet_import_member($1, 'waitlist', $2, '{}'::jsonb, 'import:list.csv') as outcome`,
+      [project, email],
+    );
+    expect(imported.rows[0]?.outcome).toBe('erased');
+    await c.end();
+  });
+
+  it('a missing group raises on the members read and has no row by key', async () => {
+    const c = await client();
+    expect(await raised(() => c.query(`select * from stet_group_members('m3_missing', 'nope', 0, 50)`))).toContain(
+      'unknown_group:nope',
+    );
+    const one = await c.query(`select * from stet_group_get('m3_missing', 'nope')`);
+    expect(one.rows).toEqual([]);
+    await c.end();
+  });
+
+  it('a service role granted by name before 003 joins after it', async () => {
+    const schema = 'stet_m3_replay';
+    const role = 'svc_named';
+    const c = await fresh(schema, MIGRATION, MIGRATION_2);
+    try {
+      await c.query(`drop owned by ${role} cascade`).catch(() => undefined);
+      await c.query(`drop role if exists ${role}`);
+      await c.query(`create role ${role} nologin bypassrls`);
+      await c.query(`grant usage on schema ${schema} to ${role}`);
+      await c.query(`grant select, insert, update, delete on all tables in schema ${schema} to ${role}`);
+      // The content tables alone: stet_meta's salt reaches the role through
+      // 003's replay, or import and erase are denied.
+      await c.query(`revoke all on stet_meta from ${role}`);
+      await c.query(
+        `grant execute on function save_content_draft(text, jsonb, text, text, text, text, text, text, timestamptz, boolean, bigint) to ${role}`,
+      );
+      await c.query(MIGRATION_3);
+      await c.query(`select stet_group_add('default', 'waitlist', 'Waitlist', '[]'::jsonb)`);
+
+      await c.query(`set role ${role}`);
+      const joined = await join(c, { project: 'default', group: 'waitlist', email: 'svc@x.co' });
+      expect(joined.is_new).toBe(true);
+      const imported = await c.query<{ o: string }>(
+        `select stet_import_member('default', 'waitlist', 'new@x.co', '{}'::jsonb, 'import:list.csv') as o`,
+      );
+      expect(imported.rows[0]?.o).toBe('joined');
+      const erased = await c.query<{ e: unknown }>(`select stet_erase_contact('default', 'svc@x.co') as e`);
+      expect(erased.rows[0]?.e).toEqual({ existed: true, memberships: 1 });
+      await c.query('reset role');
+    } finally {
+      await c.query('reset role').catch(() => undefined);
+      await c.query(`drop schema if exists ${schema} cascade`);
+      await c.query(`drop owned by ${role} cascade`).catch(() => undefined);
+      await c.query(`drop role if exists ${role}`);
+      await c.end();
+    }
+  }, 30_000);
+
+  it('a role holding exactly the grants upgrade prints joins, imports and erases', async () => {
+    const schema = 'stet_m3_printed';
+    const role = 'svc_printed';
+    const c = await fresh(schema, MIGRATION, MIGRATION_2, MIGRATION_3);
+    try {
+      await c.query(`drop owned by ${role} cascade`).catch(() => undefined);
+      await c.query(`drop role if exists ${role}`);
+      await c.query(`create role ${role} nologin`);
+      // The scratch schema stands in for `public`, whose USAGE every role holds.
+      await c.query(`grant usage on schema ${schema} to ${role}`);
+      for (const line of GRANTS_003) await c.query(line.replace('<your service role>', role));
+      // The line printed after them.
+      await c.query(`alter role ${role} bypassrls`);
+      await c.query(`select stet_group_add('default', 'waitlist', 'Waitlist', '[]'::jsonb)`);
+
+      await c.query(`set role ${role}`);
+      expect((await join(c, { project: 'default', group: 'waitlist', email: 'svc@x.co' })).is_new).toBe(true);
+      const imported = await c.query<{ o: string }>(
+        `select stet_import_member('default', 'waitlist', 'new@x.co', '{}'::jsonb, 'import:list.csv') as o`,
+      );
+      expect(imported.rows[0]?.o).toBe('joined');
+      const erased = await c.query<{ e: unknown }>(`select stet_erase_contact('default', 'svc@x.co') as e`);
+      expect(erased.rows[0]?.e).toEqual({ existed: true, memberships: 1 });
+      const again = await c.query<{ o: string }>(
+        `select stet_import_member('default', 'waitlist', 'svc@x.co', '{}'::jsonb, 'import:list.csv') as o`,
+      );
+      expect(again.rows[0]?.o).toBe('erased');
+      await c.query('reset role');
+    } finally {
+      await c.query('reset role').catch(() => undefined);
+      await c.query(`drop schema if exists ${schema} cascade`);
+      await c.query(`drop owned by ${role} cascade`).catch(() => undefined);
+      await c.query(`drop role if exists ${role}`);
+      await c.end();
+    }
+  }, 30_000);
+
+  it('stores one normal form of an address however it was typed', async () => {
+    const project = 'm3_normal';
+    const c = await client();
+    const refused = await settled(
+      c.query(`insert into stet_suppressions (email, scope, source) values ('x@y.co' || chr(160), 'marketing', 'operator')`),
+    );
+    expect(sqlstate(refused)).toBe('23514');
+
+    await c.query(`select stet_group_add($1, 'waitlist', 'Waitlist', '[]'::jsonb)`, [project]);
+    await c.query(`select stet_join_group($1, 'waitlist', chr(160) || ' Ana@X.co' || chr(9))`, [project]);
+    const stored = await c.query<{ email: string }>('select email from stet_contacts where project = $1', [project]);
+    expect(stored.rows).toEqual([{ email: 'ana@x.co' }]);
+
+    const hashes = await c.query<{ typed: string; normal: string }>(
+      `select stet_erasure_hash(' Ana@X.co' || chr(12288)) as typed, stet_erasure_hash('ana@x.co') as normal`,
+    );
+    expect(hashes.rows[0]?.typed).toBe(hashes.rows[0]?.normal);
     await c.end();
   });
 });

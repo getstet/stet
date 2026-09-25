@@ -52,6 +52,7 @@ describe('the core is pure by construction', () => {
       'access.ts',
       'bundle.ts',
       'codegen.ts',
+      'contacts.ts',
       'descriptor-schema.generated.ts',
       'descriptor.ts',
       'index.ts',

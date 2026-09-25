@@ -11,13 +11,16 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
 import { PAGE_DEFAULT, isStoreError } from '../adapters/store-shared.js';
 import { ok } from '../conformance/store.suite.js';
-import { CONNECT_TIMEOUT_MS } from '../cli/store.js';
-import { packageRoot } from '../cli/installed.js';
+import { CONNECT_TIMEOUT_MS, contactsBlock, contactsConfig } from '../cli/store.js';
+import { defaultConfig, type StetConfig } from '../cli/config.js';
+import { openContactsStore } from '../cli/project.js';
+import { migrations, packageRoot } from '../cli/installed.js';
+import { collision, GRANTS_003 } from '../cli/upgrade.js';
 import { usage } from '../cli/main.js';
 import {
   bareHtmlHost,
@@ -1122,6 +1125,93 @@ describe('doctor', () => {
     expect(host.stdout()).toContain('reachable');
   });
 
+  describe('the contacts section', () => {
+    const POSTGREST = { STET_POSTGREST_URL: 'http://postgrest.test', STET_POSTGREST_TOKEN: 't' };
+
+    async function withList(): Promise<ReturnType<typeof createMemoryStore>> {
+      const store = createMemoryStore({ project: 'default' });
+      ok(await store.contacts.addGroup({ key: 'cloud-waitlist', name: 'stet Cloud', properties: [] }));
+      ok(await store.contacts.suppress({ email: 'ana@x.co', scope: 'marketing', source: 'one-click' }));
+      return store;
+    }
+
+    function postgrestHost(
+      store: ReturnType<typeof createMemoryStore>,
+      meta: (url: string) => Promise<Response>,
+      env: Record<string, string> = {},
+    ): Host {
+      return makeHost({
+        config: { store: { adapter: 'postgrest' } },
+        env: { ...POSTGREST, ...env },
+        store,
+        fetchImpl: (async (input: string | URL | Request) => meta(String(input))) as typeof globalThis.fetch,
+      });
+    }
+    const at = (version: number) => async (): Promise<Response> =>
+      new Response(JSON.stringify([{ schema_version: version, descriptor_version: '' }]));
+
+    it('says where the contacts live, what that store holds, and whether this shell sets the forms secret', async () => {
+      const unset = postgrestHost(await withList(), at(3));
+      expect(await unset.run('doctor')).toBe(0);
+      expect(unset.stdout()).toContain('contacts: in the content store, schema_version 3 — 1 group, suppressions: 1 marketing, 0 transactional');
+      expect(unset.stdout()).toContain('  forms secret: STET_FORMS_SECRET (unset in this shell)');
+
+      const set = postgrestHost(await withList(), at(3), { STET_FORMS_SECRET: 'x' });
+      expect(await set.run('doctor')).toBe(0);
+      expect(set.stdout()).toContain('  forms secret: STET_FORMS_SECRET (set)');
+
+      const json = postgrestHost(await withList(), at(3));
+      expect(await json.run('doctor', '--json')).toBe(0);
+      expect(json.json<{ contacts: unknown }>().contacts).toEqual({
+        store: 'content',
+        groups: 1,
+        suppressions: [{ scope: 'marketing', source: 'one-click', n: 1 }],
+      });
+    });
+
+    it('tells a store below migration 3 to upgrade', async () => {
+      const host = postgrestHost(await withList(), at(2));
+      expect(await host.run('doctor')).toBe(0);
+      expect(host.stdout()).toContain('contacts: in the content store — not installed (schema_version 2); run stet upgrade');
+      expect(host.stdout()).not.toContain('forms secret');
+    });
+
+    it('says nothing about contacts on a snapshot-only project with no contacts block', async () => {
+      const host = makeHost({ config: {} });
+      expect(await host.run('doctor')).toBe(0);
+      expect(host.stdout()).not.toContain('contacts:');
+      expect(host.stderr()).not.toContain('contacts');
+    });
+
+    it('tells a store that does not answer apart from one without the tables', async () => {
+      const host = postgrestHost(await withList(), async (url) => {
+        if (url.includes('/stet_meta')) throw new TypeError('fetch failed: connect ECONNREFUSED');
+        return new Response('[]');
+      });
+      expect(await host.run('doctor')).toBe(0);
+      expect(host.stdout()).toContain('contacts: in the content store, UNREACHABLE');
+      expect(host.stdout()).not.toContain('not installed');
+      expect(host.stderr()).toContain(
+        'warn: the contacts store did not answer (fetch failed: connect ECONNREFUSED) — check STET_POSTGREST_URL and that the database is up',
+      );
+    });
+
+    it('warns with the usage line where --env names an environment the contacts block lacks', async () => {
+      const host = makeHost({
+        config: {
+          store: { adapter: 'memory' },
+          environments: { staging: { adapter: 'memory' } },
+          contacts: { store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' } },
+        },
+        stores: { default: createMemoryStore({ project: 'default' }), staging: createMemoryStore({ project: 'default' }) },
+      });
+      expect(await host.run('doctor', '--env', 'staging')).toBe(0);
+      expect(host.stderr()).toContain(
+        "warn: --env staging: the contacts block in stet.config.json declares no environments — only 'default', its store",
+      );
+    });
+  });
+
   it('an unreachable store is a warning, never a failure', async () => {
     const store = createMemoryStore({ project: 'default' });
     store.failNext = 'read';
@@ -1249,6 +1339,117 @@ describe('doctor', () => {
   });
 });
 
+describe('upgrade, a name collision', () => {
+  const [m1, , m3] = migrations();
+  const source1 = readFileSync(m1!.path, 'utf8');
+  const source3 = readFileSync(m3!.path, 'utf8');
+  const hostWords = (what: string, message: string): string =>
+    `migration 3 changed nothing: ${what} (Postgres: ${message}). Rename or move that object, then run stet upgrade again`;
+
+  it('keeps the lost-stamp words where migration 1 collides on a database with no row', () => {
+    expect(collision(0, m1!, '42P07', 'relation "content_versions" already exists', source1)).toBe(
+      'migration 1 appears to be already applied — its tables exist but the stet_meta row is missing. ' +
+        "Restore the row (insert into stet_meta (id, schema_version, descriptor_version) values (1, 1, '')) " +
+        'rather than re-applying the file',
+    );
+  });
+
+  it('names the host’s object by what the migration makes of it, and never the stamp', () => {
+    const table = 'relation "stet_contacts" already exists';
+    // A first install stamped by its own run is a stamped database: live 2.
+    for (const live of [0, 2]) {
+      expect(collision(live, m3!, '42P07', table, source3)).toBe(
+        hostWords('it creates the table stet_contacts, and this database already has an object of that name', table),
+      );
+    }
+    const index = 'relation "stet_group_memberships_group_idx" already exists';
+    expect(collision(2, m3!, '42P07', index, source3)).toContain('it creates the index stet_group_memberships_group_idx,');
+    const sequence = 'relation "stet_contacts_id_seq" already exists';
+    expect(collision(2, m3!, '42P07', sequence, source3)).toContain('it creates the sequence stet_contacts_id_seq,');
+    const fn = 'function "stet_group_get" already exists with same argument types';
+    expect(collision(2, m3!, '42723', fn, source3)).toBe(
+      hostWords('it creates the function stet_group_get, and this database already has an object of that name', fn),
+    );
+    const type = 'type "stet_contacts" already exists';
+    expect(collision(2, m3!, '42710', type, source3)).toContain('it creates the table stet_contacts,');
+    const other = 'relation "something_else" already exists';
+    expect(collision(2, m3!, '42P07', other, source3)).toBe(hostWords('this database already has an object named something_else', other));
+    expect(collision(2, m3!, '42P07', 'duplicate', source3)).toBe(
+      hostWords('this database already has an object of the same name', 'duplicate'),
+    );
+    for (const words of [collision(0, m3!, '42P07', table, source3), collision(2, m3!, '42723', fn, source3)]) {
+      expect(words).not.toContain('stet_meta');
+    }
+  });
+
+  it('prints a grant line for every function migration 3 creates, with its argument types', () => {
+    // Each `create function name(p_a text, p_b jsonb default …)` read as `name(text, jsonb)`.
+    const created = [...source3.matchAll(/^create function (\w+)\(([^)]*)\)/gm)].map(([, name, args]) => {
+      const types = (args ?? '')
+        .split(',')
+        .map((a) => a.trim().split(/\s+/)[1])
+        .filter((a): a is string => a !== undefined);
+      return `${name}(${types.join(', ')})`;
+    });
+    expect(created).toHaveLength(13);
+    const granted = GRANTS_003[2]!.replace(/^grant execute on function /, '').replace(/ to <your service role>;$/, '');
+    expect(granted.split(/, (?=stet_)/)).toEqual(created);
+  });
+});
+
+describe('contacts store selection', () => {
+  const PG = { adapter: 'pg' as const, urlEnv: 'STET_CONTACTS_DATABASE_URL', tokenEnv: 'STET_API_TOKEN' };
+  const PROD = { adapter: 'pg' as const, urlEnv: 'PROD_URL', tokenEnv: 'STET_API_TOKEN' };
+  const declared: StetConfig = { ...defaultConfig(), contacts: { store: PG } };
+  const withProd: StetConfig = { ...defaultConfig(), contacts: { store: PG, environments: { prod: PROD } } };
+
+  it('reads a declared block for the default selection and its own environments for --env', () => {
+    expect(contactsBlock(declared)).toEqual({ name: 'contacts', block: PG, own: true });
+    expect(contactsBlock(declared, 'default')).toEqual({ name: 'contacts', block: PG, own: true });
+    expect(() => contactsBlock(declared, 'prod')).toThrow(
+      "--env prod: the contacts block in stet.config.json declares no environments — only 'default', its store",
+    );
+    expect(contactsBlock(withProd, 'prod')).toEqual({ name: 'contacts.prod', block: PROD, own: true });
+    expect(() => contactsBlock(withProd, 'staging')).toThrow(
+      "--env staging: not an environment of the contacts block — declared: prod (and 'default', its store)",
+    );
+  });
+
+  it('falls back to the content store’s selection without a block', () => {
+    const content: StetConfig = { ...defaultConfig(), store: PG, environments: { staging: PROD } };
+    expect(contactsBlock(content, 'staging')).toEqual({ name: 'staging', block: PROD, own: false });
+    expect(contactsBlock(content)).toEqual({ name: 'default', block: PG, own: false });
+  });
+
+  it('stands the selected block in as the bare store of the config it hands on', () => {
+    const plain: StetConfig = { ...defaultConfig(), store: PG };
+    expect(contactsConfig(plain)).toBe(plain);
+    const derived = contactsConfig(withProd, 'prod');
+    expect(derived.store).toEqual(PROD);
+    expect(derived.environments).toBeUndefined();
+    expect(contactsConfig(withProd).store).toEqual(PG);
+  });
+
+  it('opens nothing for a snapshot-only project, the injected store under the contacts name, and closes what it built', async () => {
+    const io = (extra: Record<string, unknown> = {}): Parameters<typeof openContactsStore>[0] =>
+      ({ cwd: '/nowhere', env: { STET_CONTACTS_DATABASE_URL: 'postgresql://nobody@127.0.0.1:1/none' }, stdout: () => {}, stderr: () => {}, ...extra }) as never;
+    expect(await openContactsStore(io(), defaultConfig(), undefined)).toBeNull();
+
+    const injected = Object.assign(createMemoryStore({ project: 'default' }), { end: vi.fn(async () => {}) });
+    const opened = await openContactsStore(io({ store: injected }), declared, undefined);
+    expect(opened).toMatchObject({ name: 'contacts', own: true });
+    expect(opened?.store).toBe(injected);
+    await opened?.dispose();
+    expect(injected.end).not.toHaveBeenCalled();
+
+    const built = await openContactsStore(io(), declared, undefined);
+    expect(built?.store).not.toBe(injected);
+    const end = vi.spyOn(built?.store as unknown as { end: () => Promise<void> }, 'end');
+    await built?.dispose();
+    expect(end).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('upgrade', () => {
   /** A PostgREST that has never seen migration 1: stet_meta is not there. */
   const noMeta = fakeFetch(JSON.stringify({ code: 'PGRST205', message: 'not found' }), 404);
@@ -1300,7 +1501,7 @@ describe('upgrade', () => {
   it('--verify passes and stamps once the schema is there', async () => {
     // The NEWEST shipped migration. A database still reporting 1 has 002
     // pending, which is the --verify refusal below, not this case.
-    const applied = fakeFetch(JSON.stringify([{ schema_version: 2, descriptor_version: '' }]));
+    const applied = fakeFetch(JSON.stringify([{ schema_version: 3, descriptor_version: '' }]));
     let patched: string | null = null;
     const host = makeHost({
       config: { store: { adapter: 'postgrest' } },
@@ -1316,7 +1517,7 @@ describe('upgrade', () => {
     });
 
     expect(await host.run('upgrade', '--verify')).toBe(0);
-    expect(host.stdout()).toContain('verified: stet_meta reports schema_version 2');
+    expect(host.stdout()).toContain('verified: stet_meta reports schema_version 3');
     expect(host.stdout()).toContain('descriptor_version: stamped (1)');
     expect(patched).toContain('"descriptor_version":"1"');
   });
@@ -1413,7 +1614,7 @@ describe('dispatch', () => {
     const host = makeHost();
     expect(await host.run('help')).toBe(0);
     expect(host.stdout()).toContain(
-      'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor and both email commands.',
+      'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor, both email commands, and contacts groups, list and get.',
     );
   });
 
@@ -1521,8 +1722,10 @@ describe('the packed install and the host repo', () => {
     expect(await fresh.run('upgrade', '--store', 'postgrest')).toBe(0);
     expect(fresh.stdout()).toContain('wrote stet/migrations/001_content_cms.sql');
     expect(fresh.stdout()).toContain('wrote stet/migrations/002_changesets.sql');
+    expect(fresh.stdout()).toContain('wrote stet/migrations/003_contacts.sql');
     const shipped = fresh.file('stet/migrations/001_content_cms.sql');
     const shipped2 = fresh.file('stet/migrations/002_changesets.sql');
+    const shipped3 = fresh.file('stet/migrations/003_contacts.sql');
 
     // identical → skip
     const again = makeHost({ config: {}, env, store: createMemoryStore({ project: 'default' }), fetchImpl: noMeta });
@@ -1530,6 +1733,7 @@ describe('the packed install and the host repo', () => {
     mkdirSync(join(again.cwd, 'stet/migrations'), { recursive: true });
     writeFileSync(join(again.cwd, 'stet/migrations/001_content_cms.sql'), shipped);
     writeFileSync(join(again.cwd, 'stet/migrations/002_changesets.sql'), shipped2);
+    writeFileSync(join(again.cwd, 'stet/migrations/003_contacts.sql'), shipped3);
     expect(await again.run('upgrade', '--store', 'postgrest')).toBe(0);
     expect(again.stdout()).toContain('already present, identical');
     expect(again.stdout()).not.toContain('wrote stet/migrations/');
@@ -1544,9 +1748,10 @@ describe('the packed install and the host repo', () => {
     expect(await edited.run('upgrade', '--store', 'postgrest')).toBe(1);
     expect(edited.stderr()).toContain('refusing to overwrite stet/migrations/001_content_cms.sql');
     expect(edited.file('stet/migrations/001_content_cms.sql')).toContain('a grant this host needs');
-    // All-or-nothing across the whole file set: the untouched second migration
-    // is not written either, so a refusal never leaves a half-emitted install.
+    // All-or-nothing across the whole file set: the untouched later migrations
+    // are not written either, so a refusal never leaves a half-emitted install.
     expect(existsSync(join(edited.cwd, 'stet/migrations/002_changesets.sql'))).toBe(false);
+    expect(existsSync(join(edited.cwd, 'stet/migrations/003_contacts.sql'))).toBe(false);
   });
 
   it('names the repo copy and the configured variable, never a node_modules path', async () => {
@@ -1598,12 +1803,12 @@ describe('the packed install and the host repo', () => {
       fetchImpl: (async (_input: string | URL | Request, init?: RequestInit) => {
         if (init?.method === 'PATCH') throw new TypeError('fetch failed: connection reset mid-stamp');
         call += 1;
-        return new Response(JSON.stringify([{ schema_version: 2, descriptor_version: '' }]));
+        return new Response(JSON.stringify([{ schema_version: 3, descriptor_version: '' }]));
       }) as typeof globalThis.fetch,
     });
     expect(await host.run('upgrade', '--verify')).toBe(1);
     expect(call).toBeGreaterThan(0);
-    expect(host.stdout()).toContain('verified: stet_meta reports schema_version 2');
+    expect(host.stdout()).toContain('verified: stet_meta reports schema_version 3');
     expect(host.stderr()).toContain('connection reset mid-stamp');
     expect(host.stderr()).not.toContain('    at ');
   });
@@ -2708,7 +2913,9 @@ describe('per-command help', () => {
     expect(commands).toEqual([
       'init', 'scan', 'register', 'remove', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
       'email extract', 'email verify', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
-      'seed', 'pull', 'audit', 'doctor', 'upgrade', 'dev',
+      'seed', 'pull', 'audit', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
+      'contacts export', 'contacts erase', 'contacts suppress', 'contacts import', 'contacts group add',
+      'contacts group open', 'contacts group close', 'dev',
     ]);
   });
 
@@ -2755,6 +2962,11 @@ describe('per-command help', () => {
     expect(await verify.run('email', 'verify', '--help')).toBe(0);
     expect(verify.stdout().split('\n')).toHaveLength(3);
     expect(verify.stdout().split('\n')[0]).toMatch(/^ {2}email verify /);
+
+    // A third word narrows `contacts group` the same way.
+    const open = makeHost();
+    expect(await open.run('contacts', 'group', 'open', '--help')).toBe(0);
+    expect(open.stdout().split('\n')[0]).toBe('  contacts group open <key>  accept joins again');
 
     const hook = makeHost();
     expect(await hook.run('hook', '-h')).toBe(0);

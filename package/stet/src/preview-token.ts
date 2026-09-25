@@ -29,9 +29,10 @@ interface Payload {
  * JSON, so verification never has to re-serialize — a second serializer would
  * be a second chance to disagree about key order.
  *
- * An empty secret throws. HMAC accepts an empty key perfectly happily, so an
- * unset environment variable arriving as `''` would otherwise mint tokens
- * anyone can forge, and mint them silently. The mint is the caller's own code
+ * An empty secret throws, and so does one of whitespace alone. HMAC accepts an
+ * empty key perfectly happily, so an unset environment variable arriving as
+ * `''` — or as the newline a secret file ends with — would otherwise mint
+ * tokens anyone can forge, and mint them silently. The mint is the caller's own code
  * path, where a throw is a bug report; verification takes the attacker's path
  * and refuses instead.
  */
@@ -41,7 +42,7 @@ export function mintPreviewToken(
   now: number,
   ttlMs = DAY_MS,
 ): string {
-  if (secret === '') {
+  if (secret.trim() === '') {
     throw new Error(
       'a preview token cannot be signed with an empty secret — the signing key is unset, and an ' +
         'empty HMAC key would sign tokens anyone could forge',
@@ -49,7 +50,7 @@ export function mintPreviewToken(
   }
   const payload: Payload = { s: state, exp: now + ttlMs };
   const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  return `${body}.${sign(body, secret)}`;
+  return `${body}.${hmac('', body, secret)}`;
 }
 
 /**
@@ -68,12 +69,12 @@ export function mintPreviewToken(
  * An empty secret verifies nothing, for the reason the mint throws on one.
  */
 export function verifyPreviewToken(token: string, secret: string, now: number): PreviewState | null {
-  if (secret === '') return null;
+  if (secret.trim() === '') return null;
   try {
     const dot = token.indexOf('.');
     if (dot <= 0 || token.indexOf('.', dot + 1) !== -1) return null;
     const body = token.slice(0, dot);
-    if (!sameSignature(token.slice(dot + 1), sign(body, secret))) return null;
+    if (!sameSignature(token.slice(dot + 1), hmac('', body, secret))) return null;
 
     const payload: unknown = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
     if (!isPayload(payload)) return null;
@@ -84,11 +85,26 @@ export function verifyPreviewToken(token: string, secret: string, now: number): 
   }
 }
 
-function sign(body: string, secret: string): string {
-  return createHmac('sha256', secret).update(body, 'utf8').digest('base64url');
+/**
+ * HMAC-SHA256 of `domain` followed by `body`, base64url: the one signer every
+ * token uses. The preview token signs with no domain, so its bytes are what
+ * they always were; the unsubscribe token signs under `stet-unsubscribe:`, so
+ * neither ever verifies as the other, even under one shared secret. It lives
+ * here beside the compare because `src/` may name `node:crypto` in two modules
+ * only; `server/http.ts` re-exports both.
+ */
+export function hmac(domain: string, body: string, secret: string): string {
+  return createHmac('sha256', secret).update(domain + body, 'utf8').digest('base64url');
 }
 
-function sameSignature(provided: string, expected: string): boolean {
+/**
+ * Two strings equal, compared in constant time over their UTF-8 bytes, with a
+ * byte-length guard so a length mismatch is a clean false rather than a throw
+ * out of `timingSafeEqual`. The one compare every credential check uses: the
+ * preview token here, the unsubscribe token and the mount's Bearer on
+ * `@getstet/stet/server`.
+ */
+export function sameSignature(provided: string, expected: string): boolean {
   const a = Buffer.from(provided, 'utf8');
   const b = Buffer.from(expected, 'utf8');
   if (a.byteLength !== b.byteLength) return false;

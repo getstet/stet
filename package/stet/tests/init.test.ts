@@ -156,6 +156,9 @@ describe('runInit — snapshot-only', () => {
     expect(config['managedSurfaces']).toEqual(['app/**/*.tsx']);
     expect(config['mountRoute']).toBeUndefined();
     expect(config['store']).toBeUndefined();
+    // A site with no form is written no forms setting and no contacts store.
+    expect(Object.hasOwn(config, 'formsSecretEnv')).toBe(false);
+    expect(Object.hasOwn(config, 'contacts')).toBe(false);
     // snapshot-only has DEFAULTS already — no pull step
     expect(io.out.join('\n')).toContain('next: stet scan');
     expect(io.out.join('\n')).not.toContain('stet pull');

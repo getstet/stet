@@ -9,14 +9,23 @@
  * must not claim a capability the SQL adapters gate on.
  */
 
+import { normalEmail } from '../src/contacts.js';
 import { localeChain, type StoreRow } from '../src/resolve.js';
 import type {
   ChangeMember,
   ChangesetOps,
   ChangesetRow,
   ChangesetStatus,
+  ContactOps,
+  ContactRecord,
   DraftRefusal,
+  GroupDef,
+  GroupProperty,
+  GroupState,
+  MemberRow,
+  MembershipRow,
   NotSupported,
+  SuppressionScope,
   SaveDraftParams,
   StoreAdapter,
   StoreError,
@@ -25,7 +34,11 @@ import type {
 import type { Target } from '../src/types.js';
 import {
   changeClosed,
+  groupClosed,
+  groupExists,
   groupedSchedule,
+  unknownGroup,
+  invalidDeclaration,
   mapChangesetRow,
   mapError,
   mapPage,
@@ -98,10 +111,67 @@ export interface MemoryDb {
   nextId: number;
   /** `changesets.id` is its own bigserial — change ids never share the version sequence. */
   nextChangeId: number;
+  /** Migration 3's tables, as the reference holds them. */
+  groups: MemoryGroup[];
+  contacts: MemoryContact[];
+  memberships: MemoryMembership[];
+  /** Store-wide, keyed (email, scope) — never by project. */
+  suppressions: { email: string; scope: SuppressionScope; source: string; created_at: string }[];
+  /**
+   * `stet_erasures`, keyed by the normalized address itself: this store lives
+   * in one process and persists nothing, and it imports no Node builtin, so it
+   * keeps no hash. The SQL stores keep the salted hash (migration 003).
+   */
+  erasures: { project: string; email: string; erased_at: string }[];
+  nextContactId: number;
+  nextMembershipId: number;
+}
+
+export interface MemoryGroup {
+  project: string;
+  key: string;
+  name: string;
+  state: GroupState;
+  properties: GroupProperty[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryContact {
+  id: number;
+  project: string;
+  email: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryMembership {
+  id: number;
+  contact_id: number;
+  project: string;
+  group_key: string;
+  joined_at: string;
+  form: string | null;
+  page: string | null;
+  properties: Record<string, string>;
+  updated_at: string;
 }
 
 export function createMemoryDb(): MemoryDb {
-  return { rows: [], renames: [], changesets: [], nextId: 1, nextChangeId: 1 };
+  return {
+    rows: [],
+    renames: [],
+    changesets: [],
+    nextId: 1,
+    nextChangeId: 1,
+    groups: [],
+    contacts: [],
+    memberships: [],
+    suppressions: [],
+    erasures: [],
+    nextContactId: 1,
+    nextMembershipId: 1,
+  };
 }
 
 /** A row as a test declares it; everything unstated takes the column default. */
@@ -208,9 +278,222 @@ export function createMemoryStore(opts: { project: string; db?: MemoryDb }): Mem
     return mapError(new Error(`memory store: simulated ${kind} failure`));
   }
 
+  // ── Contacts: the reference for migration 3's functions ──────────────────
+
+  const groupOf = (key: string): MemoryGroup | undefined =>
+    db.groups.find((g) => g.project === project && g.key === key);
+  const contactOf = (email: string): MemoryContact | undefined =>
+    db.contacts.find((c) => c.project === project && c.email === normalEmail(email));
+  const suppressedFor = (email: string): boolean =>
+    db.suppressions.some((x) => x.email === normalEmail(email) && x.scope === 'marketing');
+  const erased = (email: string): boolean => db.erasures.some((e) => e.project === project && e.email === normalEmail(email));
+
+  /** `stet_contact_id`: the row for an address, created on first sight; a re-sight moves updated_at. */
+  function contactIdFor(email: string): number {
+    const found = contactOf(email);
+    if (found) {
+      found.updated_at = now();
+      return found.id;
+    }
+    const at = now();
+    const row: MemoryContact = { id: db.nextContactId++, project, email: normalEmail(email), created_at: at, updated_at: at };
+    db.contacts.push(row);
+    return row.id;
+  }
+
+  function groupDef(g: MemoryGroup): GroupDef {
+    return { key: g.key, name: g.name, state: g.state, properties: g.properties.map((x) => ({ ...x })), createdAt: g.created_at };
+  }
+
+  function membershipRow(m: MemoryMembership): MembershipRow {
+    return {
+      id: m.id,
+      group: m.group_key,
+      joinedAt: m.joined_at,
+      form: m.form,
+      page: m.page,
+      properties: { ...m.properties },
+      updatedAt: m.updated_at,
+    };
+  }
+
+  const contacts: ContactOps = {
+    async addGroup(p) {
+      const failed = owed('write');
+      if (failed) return failed;
+      const invalid = invalidDeclaration(p.properties);
+      if (invalid) return invalid;
+      if (groupOf(p.key)) return mapError(groupExists(p.key));
+      const at = now();
+      db.groups.push({ project, key: p.key, name: p.name, state: 'open', properties: p.properties.map((x) => ({ ...x })), created_at: at, updated_at: at });
+      return { created: true };
+    },
+
+    async setGroupState(p) {
+      const failed = owed('write');
+      if (failed) return failed;
+      const group = groupOf(p.key);
+      if (!group) return mapError(unknownGroup(p.key));
+      group.state = p.state;
+      group.updated_at = now();
+      return { state: p.state };
+    },
+
+    async groups() {
+      const failed = owed('read');
+      if (failed) return failed;
+      const groups = db.groups
+        .filter((g) => g.project === project)
+        .sort((a, b) => (a.created_at === b.created_at ? (a.key < b.key ? -1 : 1) : a.created_at < b.created_at ? -1 : 1))
+        .map((g) => ({
+          ...groupDef(g),
+          members: db.memberships.filter((m) => m.project === project && m.group_key === g.key).length,
+        }));
+      return { groups };
+    },
+
+    async group(p) {
+      const failed = owed('read');
+      if (failed) return failed;
+      const g = groupOf(p.key);
+      return { group: g === undefined ? null : groupDef(g) };
+    },
+
+    async join(p) {
+      const failed = owed('write');
+      if (failed) return failed;
+      const group = groupOf(p.group);
+      if (!group) return mapError(unknownGroup(p.group));
+      if (group.state !== 'open') return mapError(groupClosed(p.group));
+      const contactId = contactIdFor(p.email);
+      const existing = db.memberships.find((m) => m.contact_id === contactId && m.group_key === p.group);
+      if (existing) {
+        existing.properties = { ...p.properties };
+        existing.updated_at = now();
+        return {
+          contactId,
+          isNew: false,
+          suppressed: suppressedFor(p.email),
+          joinedAt: existing.joined_at,
+          form: existing.form,
+          page: existing.page,
+        };
+      }
+      const at = now();
+      db.memberships.push({
+        id: db.nextMembershipId++,
+        contact_id: contactId,
+        project,
+        group_key: p.group,
+        joined_at: at,
+        form: p.form ?? null,
+        page: p.page ?? null,
+        properties: { ...p.properties },
+        updated_at: at,
+      });
+      return { contactId, isNew: true, suppressed: suppressedFor(p.email), joinedAt: at, form: p.form ?? null, page: p.page ?? null };
+    },
+
+    async importMember(p) {
+      const failed = owed('write');
+      if (failed) return failed;
+      if (!groupOf(p.group)) return mapError(unknownGroup(p.group));
+      if (erased(p.email)) return { outcome: 'erased' };
+      if (suppressedFor(p.email)) return { outcome: 'suppressed' };
+      const contactId = contactIdFor(p.email);
+      if (db.memberships.some((m) => m.contact_id === contactId && m.group_key === p.group)) return { outcome: 'present' };
+      const joined = p.joinedAt ? new Date(p.joinedAt).toISOString() : now();
+      db.memberships.push({
+        id: db.nextMembershipId++,
+        contact_id: contactId,
+        project,
+        group_key: p.group,
+        joined_at: joined,
+        form: p.form,
+        page: null,
+        properties: { ...p.properties },
+        updated_at: now(),
+      });
+      return { outcome: 'joined' };
+    },
+
+    async members(q) {
+      const failed = owed('read');
+      if (failed) return failed;
+      if (!groupOf(q.group)) return mapError(unknownGroup(q.group));
+      const limit = pageLimit(q.limit);
+      const rows: MemberRow[] = db.memberships
+        .filter((m) => m.project === project && m.group_key === q.group && m.id > (q.afterId ?? 0))
+        .sort((a, b) => a.id - b.id)
+        .slice(0, limit)
+        .map((m) => {
+          const c = db.contacts.find((x) => x.id === m.contact_id) as MemoryContact;
+          return { ...membershipRow(m), contactId: c.id, email: c.email, suppressed: suppressedFor(c.email) };
+        });
+      return { rows, nextAfterId: rows.length < limit ? null : (rows[rows.length - 1]?.id ?? null) };
+    },
+
+    async contact(p) {
+      const failed = owed('read');
+      if (failed) return failed;
+      const c = contactOf(p.email);
+      const suppressions = db.suppressions
+        .filter((x) => x.email === normalEmail(p.email))
+        .sort((a, b) => (a.scope < b.scope ? -1 : 1))
+        .map((x) => ({ scope: x.scope, source: x.source, createdAt: x.created_at }));
+      if (!c && suppressions.length === 0) return { record: null };
+      const record: ContactRecord = {
+        email: normalEmail(p.email),
+        contact: c ? { id: c.id, properties: {}, createdAt: c.created_at, updatedAt: c.updated_at } : null,
+        memberships: c
+          ? db.memberships.filter((m) => m.contact_id === c.id).sort((a, b) => a.id - b.id).map(membershipRow)
+          : [],
+        suppressions,
+      };
+      return { record };
+    },
+
+    async suppress(p) {
+      const failed = owed('write');
+      if (failed) return failed;
+      if (db.suppressions.some((x) => x.email === normalEmail(p.email) && x.scope === p.scope)) return { suppressed: false };
+      db.suppressions.push({ email: normalEmail(p.email), scope: p.scope, source: p.source, created_at: now() });
+      return { suppressed: true };
+    },
+
+    async erase(p) {
+      const failed = owed('write');
+      if (failed) return failed;
+      const c = contactOf(p.email);
+      let count = 0;
+      if (c) {
+        count = db.memberships.filter((m) => m.contact_id === c.id).length;
+        db.memberships = db.memberships.filter((m) => m.contact_id !== c.id);
+        db.contacts = db.contacts.filter((x) => x.id !== c.id);
+      }
+      if (!erased(p.email)) db.erasures.push({ project, email: normalEmail(p.email), erased_at: now() });
+      return { existed: c !== undefined, memberships: count };
+    },
+
+    async suppressionCounts() {
+      const failed = owed('read');
+      if (failed) return failed;
+      const tally = new Map<string, { scope: SuppressionScope; source: string; n: number }>();
+      for (const x of db.suppressions) {
+        const k = `${x.scope}\u0000${x.source}`;
+        const t = tally.get(k) ?? { scope: x.scope, source: x.source, n: 0 };
+        t.n += 1;
+        tally.set(k, t);
+      }
+      const counts = [...tally.values()].sort((a, b) => (a.scope === b.scope ? (a.source < b.source ? -1 : 1) : a.scope < b.scope ? -1 : 1));
+      return { counts };
+    },
+  };
+
   const store: MemoryStore = {
     project,
     canApplyDDL: false,
+    contacts,
 
     seed(rows: SeedRow[]): void {
       for (const row of rows) {

@@ -20,6 +20,7 @@ import { randomBytes } from 'node:crypto';
 import { closeSync, openSync, readFileSync, realpathSync, statSync, utimesSync } from 'node:fs';
 import { join, posix, resolve as resolvePath, sep } from 'node:path';
 
+import { json, readJson } from '../server/http.js';
 import { bearerMatches, createStetHandler } from '../server/mount.js';
 import { route as normalizeRoute } from '../src/seo.js';
 import { keyDefOf, loadDescriptor } from '../src/descriptor.js';
@@ -95,14 +96,6 @@ export interface DevContext {
   proxies?: Map<string, PreviewProxy>;
   /** The run's preview channel, minted on first use. */
   previewChannel?: string;
-}
-
-/** A JSON reply. Every route answers one, bar the page, the static files and the mount's own. */
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
-  });
 }
 
 /**
@@ -184,18 +177,6 @@ function summary(site: SiteState): Record<string, unknown> {
   if (site.state !== 'ready') return { ...site };
   const { descriptor: _descriptor, snapshot: _snapshot, config: _config, ...rest } = site;
   return rest;
-}
-
-/** A JSON object body, or `{}` where there is none — the mount's own posture. */
-async function readJson(req: Request): Promise<Record<string, unknown>> {
-  try {
-    const parsed: unknown = await req.json();
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
 }
 
 /** A required string body field, refused by name where it is missing or the wrong shape. */

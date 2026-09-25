@@ -120,6 +120,23 @@ export interface StetConfig {
    * `@getstet/stet/server` importer outside the managed surfaces.
    */
   mountRoute?: string;
+  /**
+   * The NAME of the environment variable holding the forms secret — the key
+   * the unsubscribe links are signed with. The recipes read
+   * `process.env[formsSecretEnv]` into `createStetFormsHandler({ secret })`,
+   * and `doctor` says whether this environment sets it. Optional with no
+   * default in the object, so `init` — which writes the whole config — writes
+   * no forms setting into a site that has no form; `formsSecretEnvOf` reads it.
+   */
+  formsSecretEnv?: string;
+  /**
+   * Where contacts live when that is not the content store. Absent — the
+   * default, and every store-backed host's case — contacts share the content
+   * store; declared, a snapshot-only site keeps publishing by commit and gains
+   * a database for sign-ups alone. Its own `environments` map is what `--env`
+   * selects among for contacts, as the top-level map is for content.
+   */
+  contacts?: { store: StoreBlock; environments?: Record<string, StoreBlock> };
   descriptorPath: string;
   snapshotPath: string;
   bundlePath: string;
@@ -194,21 +211,67 @@ export function selectStoreBlock(
   if (selection === undefined || selection === 'default') {
     return { name: 'default', block: config.store };
   }
-  const declared = config.environments ?? {};
-  const block = declared[selection];
-  if (block === undefined) {
-    const names = Object.keys(declared).sort();
-    throw new UsageError(
-      names.length === 0
-        ? `--env ${selection}: no environments are declared in ${CONFIG_FILE} — only 'default', the bare store block`
-        : `--env ${selection}: not a declared environment — declared: ${names.join(', ')} (and 'default', the bare store block)`,
-    );
+  return { name: selection, block: environmentBlock(config.environments, selection) };
+}
+
+/**
+ * One named block of an environments map — the top-level one, or the contacts
+ * block's where `owner` says so — or the usage error listing what the map
+ * declares. Own keys only: `--env constructor` names no environment.
+ */
+export function environmentBlock(
+  declared: Record<string, StoreBlock> | undefined,
+  selection: string,
+  owner: 'store' | 'contacts' = 'store',
+): StoreBlock {
+  const map = declared ?? {};
+  if (Object.hasOwn(map, selection)) return map[selection] as StoreBlock;
+  const names = Object.keys(map).sort();
+  const bare = owner === 'store' ? 'the bare store block' : 'its store';
+  throw new UsageError(
+    names.length === 0
+      ? owner === 'store'
+        ? `--env ${selection}: no environments are declared in ${CONFIG_FILE} — only 'default', ${bare}`
+        : `--env ${selection}: the contacts block in ${CONFIG_FILE} declares no environments — only 'default', ${bare}`
+      : owner === 'store'
+        ? `--env ${selection}: not a declared environment — declared: ${names.join(', ')} (and 'default', ${bare})`
+        : `--env ${selection}: not an environment of the contacts block — declared: ${names.join(', ')} (and 'default', ${bare})`,
+  );
+}
+
+/**
+ * An environments map, validated: the content store's `environments` and the
+ * contacts block's. The names are operator-supplied map keys, so they are a
+ * validated input in their own right — the block values alone are not the
+ * whole surface.
+ */
+function parseEnvironments(environments: Record<string, unknown>, path: string): Record<string, StoreBlock> {
+  const map: Record<string, StoreBlock> = {};
+  for (const name of Object.keys(environments)) {
+    if (name === 'default') {
+      throw new CliError(
+        `${CONFIG_FILE}: ${path} must not declare "default" — the bare store block IS the default environment, ` +
+          "and 'default' is its reserved selector",
+      );
+    }
+    if (name.trim() === '' || name.startsWith('-')) {
+      throw new CliError(
+        `${CONFIG_FILE}: ${JSON.stringify(name)} is not a usable environment name — it must not be blank, ` +
+          'and a leading dash would read as an option after --env',
+      );
+    }
+    map[name] = parseStoreBlock(environments[name], `${path}.${name}`);
   }
-  return { name: selection, block };
+  return map;
 }
 
 /** Where a Next host's `CopyProvider` mount lives, absent a host saying otherwise. */
 export const DEFAULT_ROOT_LAYOUT = 'app/layout.tsx';
+
+/** The forms secret's variable name: the configured one, else `STET_FORMS_SECRET`. */
+export function formsSecretEnvOf(config: Pick<StetConfig, 'formsSecretEnv'>): string {
+  return config.formsSecretEnv ?? 'STET_FORMS_SECRET';
+}
 
 export function defaultConfig(): StetConfig {
   return {
@@ -288,6 +351,29 @@ export function loadConfig(cwd: string): StetConfig {
   // Optional with no default: absent MEANS no scaffolded route, so a filled-in
   // fallback would send `eject` looking for a file nobody wrote.
   if (mountRoute !== undefined) config.mountRoute = str(source, 'mountRoute', '');
+  const formsSecretEnv = optionalStr(source, 'formsSecretEnv');
+  if (formsSecretEnv !== undefined) {
+    // A blank name reads no variable, and the mount's variable would make the
+    // Bearer credential sign unsubscribe links: credentials never stand in for
+    // each other (§13.5).
+    if (formsSecretEnv.trim() === '') {
+      throw new CliError(`${CONFIG_FILE}: formsSecretEnv is blank — name the variable holding the forms secret, or leave it out`);
+    }
+    if (formsSecretEnv === config.apiTokenEnv) {
+      throw new CliError(
+        `${CONFIG_FILE}: formsSecretEnv and apiTokenEnv both name ${formsSecretEnv} — the forms secret needs a variable of its own`,
+      );
+    }
+    config.formsSecretEnv = formsSecretEnv;
+  }
+  const contacts = obj(source, 'contacts');
+  if (contacts) {
+    // The same validators every store block and environments map use, so an
+    // error names the block it came from (`contacts.store.adapter must be …`).
+    config.contacts = { store: parseStoreBlock(contacts['store'], 'contacts.store') };
+    const named = obj(contacts, 'environments');
+    if (named) config.contacts.environments = parseEnvironments(named, 'contacts.environments');
+  }
 
   config.managedSurfaces = stringArray(source, 'managedSurfaces', config.managedSurfaces);
   config.emailSurfaces = stringArray(source, 'emailSurfaces', config.emailSurfaces);
@@ -344,27 +430,7 @@ export function loadConfig(cwd: string): StetConfig {
   if (store) config.store = parseStoreBlock(store, 'store');
 
   const environments = obj(source, 'environments');
-  if (environments) {
-    const map: Record<string, StoreBlock> = {};
-    // These are operator-supplied map keys, so they are a validated input in
-    // their own right — the block values alone are not the whole surface.
-    for (const name of Object.keys(environments)) {
-      if (name === 'default') {
-        throw new CliError(
-          `${CONFIG_FILE}: environments must not declare "default" — the bare store block IS the default environment, ` +
-            "and 'default' is its reserved selector",
-        );
-      }
-      if (name.trim() === '' || name.startsWith('-')) {
-        throw new CliError(
-          `${CONFIG_FILE}: ${JSON.stringify(name)} is not a usable environment name — it must not be blank, ` +
-            'and a leading dash would read as an option after --env',
-        );
-      }
-      map[name] = parseStoreBlock(environments[name], `environments.${name}`);
-    }
-    config.environments = map;
-  }
+  if (environments) config.environments = parseEnvironments(environments, 'environments');
 
   const seoCheck = obj(source, 'seoCheck');
   if (seoCheck) {

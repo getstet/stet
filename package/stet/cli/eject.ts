@@ -49,6 +49,7 @@ import {
   normalizeNoExt,
   pathAliasMappings,
   resolveSpecifier,
+  selectStoreBlock,
   type StetConfig,
 } from './config.js';
 import { planDocuments, stripMarks } from './html-host.js';
@@ -275,6 +276,7 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
     }
     const stays = staysList(io.cwd, config);
     if (stays.length > 0) report.line(`stays (no stet imports): ${stays.join(', ')}`);
+    reportContactsStay(config, report);
 
     // Under `--write` the refusal fires before a single byte is written. Under
     // plan-only it DEFERS until the full plan has printed — the guidance, hook
@@ -646,6 +648,7 @@ function ejectHtml(d: {
     existsSync(join(io.cwd, rel)),
   );
   if (stays.length > 0) report.line(`stays (no stet imports): ${stays.join(', ')}`);
+  reportContactsStay(config, report);
 
   // The guidance goes first, then the hook, then the dependency — the same
   // order, for the same reason, as on every other host.
@@ -655,6 +658,19 @@ function ejectHtml(d: {
 
   if (refusal !== null) throw refusal;
   return report.emit(io);
+}
+
+/**
+ * The contacts tables, where the project has them: eject drops no table, so
+ * the people a form recorded stay in the database, and the line says how to
+ * write one person to a file before the dependency goes.
+ */
+function reportContactsStay(config: StetConfig, report: Report): void {
+  if (config.contacts === undefined && !isStoreBacked(selectStoreBlock(config, undefined).block)) return;
+  report.line(
+    'stays in the database: the contacts tables (stet_groups, stet_contacts, stet_group_memberships, stet_suppressions, ' +
+      'stet_erasures) — eject drops no table; run stet contacts export <email> before --write to write a person to a file',
+  );
 }
 
 function staysList(

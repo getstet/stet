@@ -10,11 +10,12 @@
  * refusal, the LINE anchor, and the removal loop — are mutation-tested: each is
  * named in the test that fails when it is deleted.
  */
+import { spawnSync } from 'node:child_process';
 import { linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   GUIDANCE_BEGIN,
@@ -29,6 +30,7 @@ import {
   removeGuidance,
 } from '../cli/agents.js';
 import { defaultConfig, defaultStoreBlock } from '../cli/config.js';
+import { cleanupCliHosts, makeCliHost } from '../conformance/cli-host.js';
 
 function project(): string {
   return mkdtempSync(join(tmpdir(), 'stet-agents-'));
@@ -578,3 +580,21 @@ function pathWith(dir: string, name: string, text: string): string {
   writeFileSync(path, text, 'utf8');
   return path;
 }
+
+describe('agents install — a block git will not carry', () => {
+  afterAll(cleanupCliHosts);
+  const NOTE = 'is gitignored — the block will not reach other clones';
+
+  it('notes an ignored file, and says nothing of a tracked one or outside a repository', async () => {
+    const outside = makeCliHost();
+    expect(await outside.run('agents', 'install')).toBe(0);
+    expect(outside.stdout()).not.toContain(NOTE);
+
+    const ignored = makeCliHost();
+    spawnSync('git', ['init', '-q'], { cwd: ignored.cwd });
+    writeFileSync(join(ignored.cwd, '.gitignore'), 'CLAUDE.md\n');
+    expect(await ignored.run('agents', 'install')).toBe(0);
+    expect(ignored.stdout()).toContain(`CLAUDE.md ${NOTE}`);
+    expect(ignored.stdout()).not.toContain(`AGENTS.md ${NOTE}`);
+  });
+});

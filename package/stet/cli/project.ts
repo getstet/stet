@@ -25,7 +25,7 @@ import type { Descriptor } from '../src/types.js';
 import { loadConfig, selectStoreBlock, type StetConfig, type StoreBlock } from './config.js';
 import type { CliIo } from './main.js';
 import { CliError } from './report.js';
-import { resolveStore } from './store.js';
+import { contactsBlock, contactsConfig, isStoreBacked, resolveStore } from './store.js';
 
 export interface RowsAnswer {
   rows: StoreRow[];
@@ -87,11 +87,43 @@ export interface LoadProjectOptions {
 
 /**
  * The adapter a caller injected for this environment, if any. `io.store` is the
- * shorthand for the default one, so the single-store consumers — `stet mcp`,
+ * shorthand for the default one — the content store's `default` or a declared
+ * contacts block's `contacts` — so the single-store consumers — `stet mcp`,
  * every one-environment test — keep working untouched.
  */
-function injectedFor(io: CliIo, name: string): StoreAdapter | undefined {
-  return io.stores?.[name] ?? (name === 'default' ? io.store : undefined);
+export function injectedFor(io: CliIo, name: string): StoreAdapter | undefined {
+  return io.stores?.[name] ?? (name === 'default' || name === 'contacts' ? io.store : undefined);
+}
+
+/** The contacts store `openContactsStore` opened, and what `contactsBlock` resolved it from. */
+export interface OpenedContactsStore extends ReturnType<typeof contactsBlock> {
+  store: StoreAdapter;
+  /** Closes the adapter when it was built here; an injected one is the caller's. */
+  dispose: () => Promise<void>;
+}
+
+/**
+ * The contacts store for a selection, opened: `contactsBlock`'s resolution,
+ * the adapter a caller injected under its name, else one built from the
+ * block. Null where the contacts have no store behind them. `stet contacts`
+ * and `doctor` both open it here, so they read the same database.
+ */
+export async function openContactsStore(
+  io: CliIo,
+  config: StetConfig,
+  selection: string | undefined,
+): Promise<OpenedContactsStore | null> {
+  const selected = contactsBlock(config, selection);
+  const injected = injectedFor(io, selected.name);
+  if (injected === undefined && !isStoreBacked(selected.block)) return null;
+  const store = await resolveStore(contactsConfig(config, selection), io.env, injected, selected.own ? undefined : selection);
+  return {
+    ...selected,
+    store,
+    dispose: async () => {
+      if (injected === undefined) await disposeStore(store);
+    },
+  };
 }
 
 export async function loadProject(

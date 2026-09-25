@@ -39,7 +39,7 @@ import type { CliIo } from './main.js';
 import { applyMigrationSql, readProjectMeta, stampDescriptorVersion } from './meta.js';
 import { loadProject, type LoadedProject } from './project.js';
 import { CliError, Report, UsageError } from './report.js';
-import { isStoreBacked } from './store.js';
+import { contactsConfig, isStoreBacked } from './store.js';
 import { seed } from './write.js';
 
 export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
@@ -55,8 +55,12 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
 
   const report = new Report();
   const config = adapter === undefined ? undefined : storeConfig(io.cwd, adapter);
-  const project = await loadProject(io, { config, env: text(values, 'env') });
-  report.environment(project.environment.name);
+  // An `--env` that only the contacts block declares selects a contacts
+  // database and no content one: the content store is left alone.
+  const env = text(values, 'env');
+  const contactsOnly = adapter === undefined && env !== undefined && contactsOnlyEnv(loadConfig(io.cwd), env);
+  const project = await loadProject(io, { config, env: contactsOnly ? undefined : env });
+  report.environment(contactsOnly ? (env as string) : project.environment.name);
 
   // The one command that mutates a stranger's database never exits silent
   // about DDL it already ran: whatever happened before a failure is reported,
@@ -65,7 +69,19 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
   // same guarantee written where a reader can see it.)
   try {
     if (adapter !== undefined) await install(io, project, report, dryRun, adapter);
-    else await migrate(io, project, report, dryRun, flag(values, 'verify'));
+    else if (!contactsOnly) await migrate(io, project, report, dryRun, flag(values, 'verify'));
+    // A declared contacts store is a second database with the same numbered
+    // migrations: migrated in the same run, reported under its own line. An
+    // `--env` the contacts block does not declare leaves it alone, said so.
+    const contacts = project.config.contacts;
+    const selection = contactsOnly ? (env as string) : project.environment.name;
+    if (adapter === undefined && contacts !== undefined) {
+      if (selection === 'default' || Object.hasOwn(contacts.environments ?? {}, selection)) {
+        await migrateContacts(io, project.config, selection, report, dryRun, flag(values, 'verify'));
+      } else {
+        report.line(`contacts store: the contacts block declares no environment ${selection} — not migrated`);
+      }
+    }
     regenerate(io, project, report, dryRun);
   } catch (error) {
     // A usage mistake keeps its exit code and its silence: it is raised before
@@ -248,36 +264,130 @@ async function applyPending(
   }
 
   if (project.store.canApplyDDL) {
+    // The version the database holds as the loop goes: a first install that
+    // applies 1 and 2 and then collides at 3 is a stamped database by then.
+    let live = installed;
     for (const migration of pending) {
       // Each file is its own transaction — the file's own begin/commit — so a
       // failure leaves nothing behind and never a stamped half-schema.
+      const source = readFileSync(migration.path, 'utf8');
       try {
-        await applyMigrationSql(
-          project.environment.block,
-          io.env,
-          readFileSync(migration.path, 'utf8'),
-        );
+        await applyMigrationSql(project.environment.block, io.env, source);
       } catch (error) {
-        // 42P07 is duplicate_table: the schema is there and `stet_meta` is not,
-        // so this database was migrated by something that lost the stamp.
-        // Re-applying would abort at the first `create table` and change
-        // nothing; the fix is the missing row, not the whole file.
-        if ((error as { code?: string }).code === '42P07') {
-          throw new CliError(
-            `migration ${migration.number} appears to be already applied — its tables exist but the stet_meta row is missing. ` +
-              `Restore the row (insert into stet_meta (id, schema_version, descriptor_version) values (1, ${migration.number}, '')) ` +
-              'rather than re-applying the file',
-          );
+        // 42P07 duplicate_table (any relation), 42723 duplicate_function,
+        // 42710 duplicate_object (a type): the file's own transaction rolled
+        // back, so nothing changed either way.
+        const code = (error as { code?: string }).code;
+        if (code === '42P07' || code === '42723' || code === '42710') {
+          throw new CliError(collision(live, migration, code, (error as Error).message, source));
         }
         throw error;
       }
       report.line(`applied ${migration.name}`);
+      live = migration.number;
     }
+    printGrants(pending, report);
     await stamp(io, project, report);
     return;
   }
 
   printForOutOfBandApply(io, project, pending, report);
+}
+
+/** Whether `env` names an environment of the contacts block and none of the content store. */
+function contactsOnlyEnv(config: StetConfig, env: string): boolean {
+  if (env === 'default' || config.contacts === undefined) return false;
+  return Object.hasOwn(config.contacts.environments ?? {}, env) && !Object.hasOwn(config.environments ?? {}, env);
+}
+
+/**
+ * The contacts store's pass: the migration copies emitted into the repo (the
+ * durable files the print path names), then the same pending-and-apply walk
+ * over a project whose bare store is the contacts block.
+ */
+async function migrateContacts(
+  io: CliIo,
+  config: StetConfig,
+  selection: string,
+  report: Report,
+  dryRun: boolean,
+  verify: boolean,
+): Promise<void> {
+  const where = selection === 'default' ? 'contacts.store' : `contacts.environments.${selection}`;
+  report.line('');
+  report.line(`contacts store (${where} in stet.config.json):`);
+  const contacts = await loadProject(io, { config: contactsConfig(config, selection) });
+  try {
+    emitMigrations(io, report, dryRun);
+    await migrate(io, contacts, report, dryRun, verify);
+  } finally {
+    await contacts.dispose();
+  }
+}
+
+/**
+ * The words for a name collision during an apply. Only where the database
+ * held no `stet_meta` row when migration 1 collided does a duplicate table
+ * mean stet's own schema lost its stamp, and the row is the repair — the
+ * shipped wording, unchanged. Anywhere else the name belongs to the host: the
+ * words say the migration changed nothing, name the object by what the
+ * migration makes of it, quote Postgres's own message, and never suggest the
+ * stamp, which would record the migration as applied with none of its objects
+ * made.
+ */
+export function collision(live: number, migration: Migration, code: string, message: string, source: string): string {
+  if (live === 0 && migration.number === 1 && code === '42P07') {
+    return (
+      `migration ${migration.number} appears to be already applied — its tables exist but the stet_meta row is missing. ` +
+      `Restore the row (insert into stet_meta (id, schema_version, descriptor_version) values (1, ${migration.number}, '')) ` +
+      'rather than re-applying the file'
+    );
+  }
+  const name = /"([^"]+)"/.exec(message)?.[1];
+  // What the migration makes under that name, read from its own statements.
+  const kind = source
+    .split('\n')
+    .map((line) => /^create (table|index|sequence|type|function) (\w+)/.exec(line))
+    .find((m) => m !== null && m[2] === name)?.[1];
+  const what =
+    name === undefined
+      ? 'this database already has an object of the same name'
+      : kind === undefined
+        ? `this database already has an object named ${name}`
+        : `it creates the ${kind} ${name}, and this database already has an object of that name`;
+  return (
+    `migration ${migration.number} changed nothing: ${what} (Postgres: ${message}). ` +
+    'Rename or move that object, then run stet upgrade again'
+  );
+}
+
+/**
+ * What migration 3 grants, and to whom: its replay reaches every role holding
+ * EXECUTE on `save_content_draft`, 001's by-name idiom; a service role granted
+ * after it needs these lines. Printed wherever 3 is pending.
+ */
+export const GRANTS_003 = [
+  'grant select, insert, update, delete on stet_groups, stet_contacts, stet_group_memberships, stet_suppressions, stet_erasures to <your service role>;',
+  'grant usage, select on sequence stet_contacts_id_seq, stet_group_memberships_id_seq to <your service role>;',
+  'grant execute on function stet_normal_email(text), stet_erasure_hash(text), stet_contact_id(text, text), ' +
+    'stet_join_group(text, text, text, jsonb, text, text), stet_import_member(text, text, text, jsonb, text, timestamptz), ' +
+    'stet_erase_contact(text, text), stet_group_add(text, text, text, jsonb), stet_group_state(text, text, text), ' +
+    'stet_group_get(text, text), stet_group_list(text), stet_group_members(text, text, bigint, int), ' +
+    'stet_contact_record(text, text), stet_suppression_counts() to <your service role>;',
+  // The erasure hash reads the per-database salt: import and erase need it.
+  'grant select on stet_meta to <your service role>;',
+];
+
+function printGrants(pending: Migration[], report: Report): void {
+  if (!pending.some((m) => m.number === 3)) return;
+  report.line('');
+  report.line(
+    'migration 3 grants its tables and functions to every role holding EXECUTE on save_content_draft; ' +
+      'a service role granted after it needs:',
+  );
+  for (const line of GRANTS_003) report.line(`  ${line}`);
+  report.line('and the service role must bypass row level security or own the tables:');
+  report.line('  alter role <your service role> bypassrls;');
 }
 
 /**
@@ -323,6 +433,7 @@ function printForOutOfBandApply(
   report.line(
     "  select has_table_privilege('<your anon role>', 'content_versions', 'SELECT');  -- expected: f",
   );
+  printGrants(pending, report);
   report.line('');
   report.line('then, in order:');
   report.line('  stet upgrade --verify');

@@ -10,7 +10,7 @@
  */
 
 import type { StoreRow } from '../src/resolve.js';
-import type { ChangesetOps, NotSupported, StoreAdapter } from '../src/store.js';
+import type { ChangesetOps, ContactOps, NotSupported, StoreAdapter } from '../src/store.js';
 
 export function createSnapshotStore(opts: { project: string }): StoreAdapter {
   return {
@@ -45,6 +45,43 @@ export function createSnapshotStore(opts: { project: string }): StoreAdapter {
         return notSupported('changesets.markReverted');
       },
     } satisfies ChangesetOps,
+    // A project with no database has no list: contacts need a store (§13.1e),
+    // and every method says so rather than pretending a join landed.
+    contacts: {
+      async addGroup(): Promise<NotSupported> {
+        return notSupported('contacts.addGroup');
+      },
+      async setGroupState(): Promise<NotSupported> {
+        return notSupported('contacts.setGroupState');
+      },
+      async groups(): Promise<NotSupported> {
+        return notSupported('contacts.groups');
+      },
+      async group(): Promise<NotSupported> {
+        return notSupported('contacts.group');
+      },
+      async join(): Promise<NotSupported> {
+        return notSupported('contacts.join');
+      },
+      async importMember(): Promise<NotSupported> {
+        return notSupported('contacts.importMember');
+      },
+      async members(): Promise<NotSupported> {
+        return notSupported('contacts.members');
+      },
+      async contact(): Promise<NotSupported> {
+        return notSupported('contacts.contact');
+      },
+      async suppress(): Promise<NotSupported> {
+        return notSupported('contacts.suppress');
+      },
+      async erase(): Promise<NotSupported> {
+        return notSupported('contacts.erase');
+      },
+      async suppressionCounts(): Promise<NotSupported> {
+        return notSupported('contacts.suppressionCounts');
+      },
+    } satisfies ContactOps,
     async read(): Promise<StoreRow[]> {
       return [];
     },

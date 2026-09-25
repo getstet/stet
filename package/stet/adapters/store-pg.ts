@@ -17,12 +17,14 @@
 
 import pg from 'pg';
 
+import { normalEmail } from '../src/contacts.js';
 import { localeChain, type StoreRow } from '../src/resolve.js';
 import type {
   ChangeMember,
   ChangesetOps,
   ChangesetRow,
   ChangesetStatus,
+  ContactOps,
   DraftRefusal,
   SaveDraftParams,
   StoreAdapter,
@@ -31,7 +33,19 @@ import type {
 } from '../src/store.js';
 import {
   asDraft,
+  asErased,
+  asImportOutcome,
+  asJoin,
   asRenamed,
+  asVoid,
+  invalidDeclaration,
+  mapContactRecord,
+  mapGroupDef,
+  mapGroupRow,
+  memberPage,
+  type GroupDefSqlRow,
+  type GroupSqlRow,
+  type MemberSqlRow,
   asVersion,
   changeClosed,
   expectNoRefusal,
@@ -266,6 +280,117 @@ export function createPgStore(opts: {
       );
       return isError(rows) ? rows : mapPage(rows, limit);
     },
+
+    // The contacts capability: transport only. Every write and every read is
+    // one migration-3 function, so this block and store-postgrest's call the
+    // same SQL and hand the answers to the same mapping in store-shared.
+    contacts: {
+      async addGroup(p): Promise<{ created: true } | StoreError> {
+        const invalid = invalidDeclaration(p.properties);
+        if (invalid) return invalid;
+        const done = asVoid(
+          await call('select stet_group_add($1, $2, $3, $4::jsonb) as id', [
+            opts.project,
+            p.key,
+            p.name,
+            JSON.stringify(p.properties),
+          ]),
+          'contacts.addGroup',
+        );
+        return done === true ? { created: true } : done;
+      },
+
+      async setGroupState(p): Promise<{ state: 'open' | 'closed' } | StoreError> {
+        const done = asVoid(
+          await call('select stet_group_state($1, $2, $3) as id', [opts.project, p.key, p.state]),
+          'contacts.setGroupState',
+        );
+        return done === true ? { state: p.state } : done;
+      },
+
+      async groups() {
+        const rows = await query<GroupSqlRow>(
+          'select key, name, state, properties, created_at, members from stet_group_list($1)',
+          [opts.project],
+        );
+        return isError(rows) ? rows : { groups: rows.map(mapGroupRow) };
+      },
+
+      async group(p) {
+        const rows = await query<GroupDefSqlRow>(
+          'select key, name, state, properties, created_at from stet_group_get($1, $2)',
+          [opts.project, p.key],
+        );
+        return isError(rows) ? rows : { group: rows[0] === undefined ? null : mapGroupDef(rows[0]) };
+      },
+
+      async join(p) {
+        return asJoin(
+          await call('select stet_join_group($1, $2, $3, $4::jsonb, $5, $6) as id', [
+            opts.project,
+            p.group,
+            p.email,
+            JSON.stringify(p.properties),
+            p.form ?? null,
+            p.page ?? null,
+          ]),
+        );
+      },
+
+      async importMember(p) {
+        return asImportOutcome(
+          await call('select stet_import_member($1, $2, $3, $4::jsonb, $5, $6) as id', [
+            opts.project,
+            p.group,
+            p.email,
+            JSON.stringify(p.properties),
+            p.form,
+            p.joinedAt ?? null,
+          ]),
+        );
+      },
+
+      async members(q) {
+        const limit = pageLimit(q.limit);
+        const rows = await query<MemberSqlRow>(
+          `select id, contact_id, email, joined_at, form, page, properties, updated_at, suppressed
+             from stet_group_members($1, $2, $3, $4)`,
+          [opts.project, q.group, q.afterId ?? 0, limit],
+        );
+        return isError(rows) ? rows : memberPage(rows, q.group, limit);
+      },
+
+      async contact(p) {
+        const answer = expectNoRefusal(
+          await call('select stet_contact_record($1, $2) as id', [opts.project, p.email]),
+          'contacts.contact',
+        );
+        return 'body' in answer ? mapContactRecord(answer.body) : answer;
+      },
+
+      // One row, so a direct upsert rather than a function: RETURNING yields
+      // the row only when this statement inserted it.
+      async suppress(p) {
+        const rows = await query<{ ok: boolean }>(
+          `insert into stet_suppressions (email, scope, source) values ($1, $2, $3)
+           on conflict (email, scope) do nothing returning true as ok`,
+          [normalEmail(p.email), p.scope, p.source],
+        );
+        return isError(rows) ? rows : { suppressed: rows.length > 0 };
+      },
+
+      async erase(p) {
+        return asErased(await call('select stet_erase_contact($1, $2) as id', [opts.project, p.email]));
+      },
+
+      async suppressionCounts() {
+        const rows = await query<{ scope: 'transactional' | 'marketing'; source: string; n: number | string }>(
+          'select scope, source, n from stet_suppression_counts()',
+          [],
+        );
+        return isError(rows) ? rows : { counts: rows.map((r) => ({ scope: r.scope, source: r.source, n: Number(r.n) })) };
+      },
+    } satisfies ContactOps,
 
     changesets: {
       async open(p): Promise<{ changeId: number } | StoreError> {
@@ -547,6 +672,7 @@ export async function readStetMeta(connectionString: string): Promise<StetMeta |
     await pool.end();
   }
 }
+
 
 /**
  * One migration file, applied as one query. The file carries its own

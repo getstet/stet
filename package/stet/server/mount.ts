@@ -18,11 +18,10 @@
  * drafts included" is the outlier against the published-only store contract.
  */
 
-import { timingSafeEqual } from 'node:crypto';
-
 import { revertChange } from '../adapters/changesets.js';
 import type { DraftRefusal, NotSupported, StoreAdapter, StoreError } from '../src/store.js';
 import type { Descriptor, Target } from '../src/types.js';
+import { json, readJson, sameSignature } from './http.js';
 
 /** Fired fire-and-forget after a publish or revert. `target` is the descriptor's, never widened to a string. */
 export interface PublishEvent {
@@ -377,11 +376,11 @@ export function createStetHandler(opts: StetHandlerOptions): {
  * Whether a request's Bearer equals the expected token, in constant time.
  *
  * An absent or empty expected token authenticates NOTHING (an empty === empty
- * would otherwise pass), and the compare guards on BYTE length so a multibyte
- * length mismatch is a clean false rather than a throw out of
- * `timingSafeEqual`. The expected value is TRIMMED: a `.env`/secret-file token
- * carries a trailing newline the HTTP layer strips from the request header, so
- * an untrimmed compare could never match (P2-5).
+ * would otherwise pass), and the compare is `sameSignature`, the one
+ * constant-time compare every token uses, which guards on BYTE length so a
+ * multibyte length mismatch is a clean false. The expected value is TRIMMED: a
+ * `.env`/secret-file token carries a trailing newline the HTTP layer strips
+ * from the request header, so an untrimmed compare could never match (P2-5).
  *
  * Exported for `cli/dev.ts`'s local server, which authenticates its own routes
  * against a per-run token with exactly this rule — one compare, so the
@@ -393,15 +392,7 @@ export function bearerMatches(req: Request, expected: string | undefined): boole
   if (want === undefined || want === '') return false;
   const provided = bearer(req);
   if (provided === undefined) return false;
-  const a = Buffer.from(want, 'utf8');
-  const b = Buffer.from(provided, 'utf8');
-  if (a.byteLength !== b.byteLength) return false;
-  return timingSafeEqual(a, b);
-}
-
-/** JSON response with the right content type. */
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  return sameSignature(provided, want);
 }
 
 /** The Bearer token, or undefined — an empty `Bearer ` yields undefined (no match). */
@@ -476,16 +467,6 @@ function changeField(
   if (value === null) return { change: null };
   if (isId(value)) return { change: value };
   return INVALID;
-}
-
-/** A JSON object body, or {} when the body is absent, malformed, or not an object. */
-async function readJson(req: Request): Promise<Record<string, unknown>> {
-  try {
-    const parsed = await req.json();
-    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
 }
 
 function isStoreError(value: unknown): value is StoreError {

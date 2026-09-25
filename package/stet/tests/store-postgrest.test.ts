@@ -188,7 +188,7 @@ describe('store-postgrest, offline fault cases', () => {
     await store.read({ keys: ['hero_headline'], locale: 'de', preview: true });
     const read = seen[0]!;
     expect(read.url).toContain(`${URL_BASE}/content_versions?`);
-    expect(decodeURIComponent(read.url)).toContain('project=eq."site"');
+    expect(decodeURIComponent(read.url)).toContain('project=eq.site');
     expect(decodeURIComponent(read.url)).toContain('or=(is_active.is.true,state.eq.draft)');
     expect(decodeURIComponent(read.url)).toContain('key=in.("hero_headline")');
     // The locale chain, not the locale alone: a `default` row must reach the resolver.
@@ -314,13 +314,14 @@ describe('store-postgrest, offline fault cases', () => {
     // Backslashes double first, then quotes escape — the other order would
     // leave an escaped quote's own backslash unescaped.
     expect(seen[0]).toContain(String.raw`key=in.("odd\\key","quoted\"key")`);
-    // Project scoping rests on the same quoting: a comma in a project id would
-    // otherwise scope the read to two projects that do not exist.
-    expect(seen[0]).toContain('project=eq."site,other"');
+    // An equality filter carries the value bare: PostgREST reads everything
+    // after `eq.` as the value, so quotes there would become part of it and
+    // match no row (the pre-existing defect this change fixes).
+    expect(seen[0]).toContain('project=eq.site,other');
 
     await store.history({ key: 'quoted"key', locale: 'de' });
-    expect(seen[1]).toContain(String.raw`key=eq."quoted\"key"`);
-    expect(seen[1]).toContain('locale=eq."de"');
+    expect(seen[1]).toContain('key=eq.quoted"key');
+    expect(seen[1]).toContain('locale=eq.de');
   });
 });
 
@@ -618,7 +619,7 @@ describe('store-postgrest, the wire shapes', () => {
   });
 
   it('keeps both scoping filters on a destructive write when the project name is hostile', async () => {
-    // `filterValue` quotes a value; it does NOT percent-encode it. A `#` in an
+    // `eqFilter` leaves a value bare; it does NOT percent-encode it. A `#` in an
     // interpolated query string starts the URL fragment and truncates
     // everything after it — here that is `changeset_id` and `state`, leaving a
     // PATCH and a DELETE scoped to almost nothing. Both are built through

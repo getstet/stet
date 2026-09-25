@@ -14,8 +14,10 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   CONFIG_FILE,
   defaultConfig,
+  formsSecretEnvOf,
   isHtmlHost,
   loadConfig,
+  selectStoreBlock,
   writeConfig,
   type StetConfig,
 } from '../cli/config.js';
@@ -153,4 +155,79 @@ describe('stet.config.json', () => {
     writeFileSync(join(next, CONFIG_FILE), JSON.stringify({ router: 'app' }));
     expect(loadConfig(next).rootLayout).toBe('app/layout.tsx');
   });
+
+  /** A config file holding `source`, loaded — or the error it raises. */
+  function loaded(source: unknown): StetConfig {
+    const cwd = tempDir();
+    writeFileSync(join(cwd, CONFIG_FILE), JSON.stringify(source));
+    return loadConfig(cwd);
+  }
+
+  it('reads the forms secret’s name and a contacts store, and round-trips them', () => {
+    const PG = { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' };
+    const config = loaded({
+      formsSecretEnv: 'FORMS_KEY',
+      contacts: { store: PG, environments: { prod: { adapter: 'pg', urlEnv: 'PROD_URL' } } },
+    });
+    expect(config.formsSecretEnv).toBe('FORMS_KEY');
+    expect(formsSecretEnvOf(config)).toBe('FORMS_KEY');
+    expect(config.contacts).toMatchObject({ store: PG, environments: { prod: { adapter: 'pg', urlEnv: 'PROD_URL' } } });
+    expect(Object.keys(config.contacts ?? {})).toEqual(['store', 'environments']);
+
+    const cwd = tempDir();
+    writeConfig(join(cwd, CONFIG_FILE), config);
+    expect(loadConfig(cwd)).toEqual(config);
+
+    // Neither field is required: a site with no form gets no forms setting.
+    const bare = loaded({ project: 'x' });
+    expect(bare.formsSecretEnv).toBeUndefined();
+    expect(bare.contacts).toBeUndefined();
+    expect(formsSecretEnvOf(bare)).toBe('STET_FORMS_SECRET');
+    expect(Object.hasOwn(defaultConfig(), 'formsSecretEnv')).toBe(false);
+    expect(Object.hasOwn(defaultConfig(), 'contacts')).toBe(false);
+  });
+
+  it('validates the contacts block as it validates the top-level store and its map', () => {
+    expect(() => loaded({ contacts: { store: { adapter: 'mysql' } } })).toThrow(/contacts\.store\.adapter/);
+    expect(() => loaded({ contacts: {} })).toThrow(/contacts\.store/);
+    const pg = { adapter: 'pg', urlEnv: 'DB' };
+    expect(() => loaded({ contacts: { store: pg, environments: { default: pg } } })).toThrow(
+      'stet.config.json: contacts.environments must not declare "default" — the bare store block IS the default environment, ' +
+        "and 'default' is its reserved selector",
+    );
+    expect(() => loaded({ contacts: { store: pg, environments: { '-x': pg } } })).toThrow(
+      'stet.config.json: "-x" is not a usable environment name — it must not be blank, and a leading dash would read as an option after --env',
+    );
+    // The top-level map keeps its words.
+    expect(() => loaded({ environments: { default: pg } })).toThrow('stet.config.json: environments must not declare "default"');
+  });
+
+  it('refuses a blank forms secret name, and one the mount’s Bearer already names', () => {
+    expect(() => loaded({ formsSecretEnv: ' ' })).toThrow(
+      'stet.config.json: formsSecretEnv is blank — name the variable holding the forms secret, or leave it out',
+    );
+    expect(() => loaded({ formsSecretEnv: 'STET_API_TOKEN' })).toThrow(
+      'stet.config.json: formsSecretEnv and apiTokenEnv both name STET_API_TOKEN — the forms secret needs a variable of its own',
+    );
+    expect(() => loaded({ apiTokenEnv: 'TOK', formsSecretEnv: 'TOK' })).toThrow(
+      'stet.config.json: formsSecretEnv and apiTokenEnv both name TOK — the forms secret needs a variable of its own',
+    );
+  });
+
+  it('selects an environment by own key alone, in the words it always used', () => {
+    const none = loaded({ store: { adapter: 'memory' } });
+    expect(() => selectStoreBlock(none, 'prod')).toThrow(
+      "--env prod: no environments are declared in stet.config.json — only 'default', the bare store block",
+    );
+    const declared = loaded({ store: { adapter: 'memory' }, environments: { b: { adapter: 'memory' } } });
+    expect(selectStoreBlock(declared, 'b')).toMatchObject({ name: 'b', block: { adapter: 'memory' } });
+    expect(() => selectStoreBlock(declared, 'prod')).toThrow(
+      "--env prod: not a declared environment — declared: b (and 'default', the bare store block)",
+    );
+    // `constructor` is on every object's prototype and names no environment.
+    expect(() => selectStoreBlock(declared, 'constructor')).toThrow(
+      "--env constructor: not a declared environment — declared: b (and 'default', the bare store block)",
+    );
+  });
 });
+
