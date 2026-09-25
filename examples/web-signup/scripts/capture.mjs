@@ -156,9 +156,9 @@ function measure(components) {
     for (var i = 0; i < all.length; i += 1) {
       for (var j = 0; j < ATTRS.length; j += 1) {
         var v = all[i].getAttribute(ATTRS[j]);
+        if (v === null || norm(v) === '' || !test(norm(v))) continue;
         // A placeholder shows only while its field is empty.
-        if (ATTRS[j] === 'placeholder' && all[i].value) continue;
-        if (v !== null && norm(v) !== '' && test(norm(v))) found.push({ el: all[i], attr: ATTRS[j] });
+        found.push({ el: all[i], attr: ATTRS[j], hidden: ATTRS[j] === 'placeholder' && Boolean(all[i].value) });
       }
     }
     return found;
@@ -244,12 +244,21 @@ function measure(components) {
     var p = pattern(read.value);
     var entry = { key: read.key, value: read.value };
     if (p === null) return Object.assign(entry, { status: 'not-located' });
-    var hits = byNode(p.test);
-    if (hits.length === 0) hits = byElement(p.test);
-    if (hits.length === 0) hits = byAttribute(p.test);
-    if (hits.length === 0) hits = byContained(read.value);
-    hits = hits.filter(function (hit) { return visible(hit.el); });
     var owners = new Set(read.owners);
+    // An attribute key: its value sits in an attribute of an element a reading
+    // component made. It is matched there alone, never inside other text.
+    var inAttribute = owners.size === 0 ? [] : byAttribute(p.test).filter(function (hit) { return madeBy(hit.el, owners); });
+    var hits;
+    if (inAttribute.length > 0) {
+      hits = inAttribute.filter(function (hit) { return !hit.hidden; });
+      if (hits.length === 0) return Object.assign(entry, { status: 'not-located', reason: inAttribute[0].attr + ' hidden' });
+    } else {
+      hits = byNode(p.test);
+      if (hits.length === 0) hits = byElement(p.test);
+      if (hits.length === 0) hits = byAttribute(p.test).filter(function (hit) { return !hit.hidden; });
+      if (hits.length === 0) hits = byContained(read.value);
+    }
+    hits = hits.filter(function (hit) { return visible(hit.el); });
     // Every match made by a component that read the key, and no other key of
     // the same value read by that component: each match is this key.
     var owned = false;
