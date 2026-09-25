@@ -528,7 +528,8 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
 
   it('(c2) names a local stet that is there but cannot start', async () => {
     const log = logFile();
-    const top = gitRepo();
+    // The gate names the resolved path; on macOS the temp folder is a /var → /private/var link.
+    const top = realpathSync(gitRepo());
     const site = standInCheckout(top, 'site', log);
     commit(top, 'base');
     expect(await runHookInstall([], io(site))).toBe(0);

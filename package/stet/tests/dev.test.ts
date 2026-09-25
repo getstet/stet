@@ -258,7 +258,7 @@ function midOperation(kind: 'merge' | 'cherry-pick' | 'revert' | 'rebase', host:
   if (kind === 'rebase') {
     setHeadline(cwd, 'One');
     git(cwd, ['commit', '-qam', 'one']);
-    const stopped = git(cwd, ['-c', 'sequence.editor=sed -i 1s/^pick/edit/', 'rebase', '-i', 'HEAD~1']);
+    const stopped = git(cwd, ['-c', 'sequence.editor=sed -i.orig 1s/^pick/edit/', 'rebase', '-i', 'HEAD~1']);
     expect(stopped.code, stopped.out).toBe(0);
     return host;
   }
