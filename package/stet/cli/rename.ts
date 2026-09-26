@@ -782,7 +782,6 @@ export function keyMoveWrites(
   ];
 }
 
-/** What a rename does to the host's files, and what it leaves. */
 /** Each read of `key` stet cannot rewrite, then each it cannot parse, named with its line — rename's, merge's and split's words. */
 export function hostRefusals(host: HostRenames, key: string): string[] {
   return [
@@ -795,6 +794,7 @@ export function hostRefusals(host: HostRenames, key: string): string[] {
   ];
 }
 
+/** What a rename does to the host's files, and what it leaves. */
 export interface HostRenames {
   edited: Array<{ rel: string; text: string; diff: string }>;
   rewritten: Occurrence[];

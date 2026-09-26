@@ -17,6 +17,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -3443,6 +3444,25 @@ describe('GET /api/site/removed and POST /api/site/restore (D12)', () => {
       expect(refused.status).toBe(409);
       expect(refused.body['error']).toBe('Restore waits for the uncommitted changes to notes.txt — commit or discard them first');
       expect(host.file('notes.txt')).toBe('launch notes, edited again\n');
+      expect(rev(host.cwd, 'HEAD')).toBe(sha);
+    });
+
+    it('while a file the commit touched was moved to an intent-to-add path, naming the path git reports', async () => {
+      const host = await restoreHost();
+      writeFileSync(join(host.cwd, 'old-notes.txt'), 'launch notes, the first draft\n');
+      git(host.cwd, ['add', 'old-notes.txt']);
+      git(host.cwd, ['commit', '-qm', 'old notes']);
+      // The commit deletes old-notes.txt and rewrites notes.txt: both are paths it touched.
+      rmSync(join(host.cwd, 'old-notes.txt'));
+      const sha = removeOperating(host);
+      renameSync(join(host.cwd, 'notes.txt'), join(host.cwd, 'old-notes.txt'));
+      git(host.cwd, ['add', '-N', 'old-notes.txt']);
+      // A rename in the worktree column: its source path is the next NUL field.
+      expect(gitData(host.cwd, ['status', '--porcelain=v1', '-z', '--', 'notes.txt', 'old-notes.txt']).stdout).toBe(' R old-notes.txt\0notes.txt\0');
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/restore${at(host)}`, { sha });
+      expect(refused.status).toBe(409);
+      expect(refused.body['error']).toBe('Restore waits for the uncommitted changes to old-notes.txt — commit or discard them first');
       expect(rev(host.cwd, 'HEAD')).toBe(sha);
     });
 
