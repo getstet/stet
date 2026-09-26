@@ -6193,3 +6193,54 @@ describe('the page', () => {
     });
   });
 });
+
+describe('stet dev holds its signal listeners through the close (F48)', () => {
+  it('absorbs a second SIGINT and a SIGTERM during the close, ends the trapping child, and exits 0', async () => {
+    const file = workspaceFile();
+    const host = snapshotHost();
+    addSite(file, host.cwd);
+    const path = realpathSync(host.cwd);
+    // The trap fixture, with no output of its own: stet's death cannot end it through a broken pipe.
+    updateSite(file, path, { devCommand: `node -e "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"; true` });
+    const stet = spawn(process.execPath, [join(packageRoot(), 'dist/cli/main.js'), 'dev', '--no-open', '--port', '0'], {
+      cwd: tempDir(),
+      env: { ...process.env, STET_WORKSPACE: file },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const exited = new Promise<number | null>((resolve) => stet.on('exit', (code) => resolve(code)));
+    let printed = '';
+    stet.stdout.setEncoding('utf8');
+    stet.stdout.on('data', (chunk: string) => {
+      printed += chunk;
+    });
+    const dashboard = await new Promise<URL>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no dashboard line: ${printed}`)), 8_000);
+      stet.stdout.on('data', () => {
+        const line = /dashboard: (\S+)/.exec(printed);
+        if (line === null) return;
+        clearTimeout(timer);
+        resolve(new URL(line[1] as string));
+      });
+    });
+    const port = Number(dashboard.port);
+    const token = dashboard.searchParams.get('t') as string;
+    const reply = await raw(
+      port,
+      `POST /api/site/dev-start?site=${encodeURIComponent(path)} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+        `Authorization: Bearer ${token}\r\ncontent-length: 2\r\nConnection: close\r\n\r\n{}`,
+    );
+    expect(reply.split('\r\n')[0]).toContain('200');
+    const pid = Number(/"pid":(\d+)/.exec(reply)?.[1]);
+    expect(pid).toBeGreaterThan(0);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const began = Date.now();
+    stet.kill('SIGINT');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    stet.kill('SIGINT');
+    stet.kill('SIGTERM');
+    expect(await exited).toBe(0);
+    expect(Date.now() - began).toBeLessThan(5_500);
+    expect(await gone(-pid, 0)).toBe(true);
+  }, 20_000);
+});

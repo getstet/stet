@@ -10,17 +10,16 @@
  * rewrite what it cannot do safely: a client leaf with no `CopyProvider` mounted
  * (which would throw at render), a scope that already binds a foreign `copy`, a
  * client literal with no component body, or an ambiguous un-directived
- * App-Router component. The descriptor and default are written either way; the
- * host source edit is gated on `--write` and shown as a diff first.
+ * App-Router component. The run without `--write` shows the diffs and writes
+ * nothing; `--write` lands the descriptor, the default, the codegen and every
+ * leaf edit in one batch.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { basename, join, resolve as resolvePath } from 'node:path';
-
-import type * as TS from 'typescript';
+import { join, resolve as resolvePath } from 'node:path';
 
 import type { Snapshot } from '../src/snapshot.js';
-import { DEFAULT_TARGET, EMAIL_TARGET, type Descriptor, type Target } from '../src/types.js';
+import type { Descriptor } from '../src/types.js';
 import { parse, flag, text as argText, noPositionals } from './args.js';
 import {
   asUpdate,
@@ -43,35 +42,14 @@ import {
 } from './config.js';
 import { filesForGlobs } from './files.js';
 import { planHtmlRegister, type ChosenName, type HtmlRegisterPlan } from './html-host.js';
-import { kindOf, numberNames, type Place } from './key-names.js';
+import { kindOf, type Place } from './key-names.js';
 import { fileHash, planProblems, planText, readPlan, refusePlan, type NamingPlan, type PlanEntry } from './key-plan.js';
-import { pageOfFile } from './pages.js';
+import { htmlPageOf } from './pages.js';
 import type { CliIo } from './main.js';
 import { clip, collapseLines, plural, CliError, HostTextReport, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff, planRewrite, type Edit } from './rewrite.js';
-import {
-  isJsxFile,
-  matchGlob,
-  scanModule,
-  scanSource,
-  type LocatedLiteral,
-  type Span,
-} from './source-scan.js';
-import { classifyAdoption } from './scan.js';
-import { validateUnnamed, validateValue } from './validate.js';
-
-/** App-Router files that are server components by default — every other .tsx is ambiguous without a directive. */
-const ROUTE_FILES = new Set([
-  'page',
-  'layout',
-  'template',
-  'default',
-  'loading',
-  'error',
-  'global-error',
-  'not-found',
-  'route',
-]);
+import { classifyAdoption, planJsxRun, targetFor } from './register-run.js';
+import { validateValue } from './validate.js';
 
 export async function runRegister(args: string[], io: CliIo): Promise<number> {
   const { values, positionals } = parse(args, {
@@ -118,119 +96,32 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     return registerHtml({ io, config, descriptor: htmlDescriptor, snapshot: htmlSnapshot, write, report, naming });
   }
 
-  // Before ANY write, the descriptor and snapshot included: a rewrite that
-  // inserts an import the host cannot resolve breaks every file it touched.
-  if (write) refuseUnresolvableAlias(io.cwd, config);
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);
   if (!snapshot) return report.emit(io);
 
   let added = 0;
-  // Leaf rewrites shown but not applied — the only thing `--write` has left to
-  // do. A module-shaped adoption completes on the plain run, so a run that
-  // adopted only modules has nothing pending and must not say it has.
+  // Literals that read a key the descriptor already held: no entry, no value.
+  let reused = 0;
+  // Files whose leaf rewrites were shown. A run that adopted only module shapes
+  // has no source edit, and its closing line must not say it has.
   let printedDiffs = 0;
+  // Each edited file's text, written in the one batch with the repo forms.
+  const edited: Array<{ abs: string; rel: string; text: string; edits: number }> = [];
 
-  // What the JSX walk parsed and CLAIMED, per file. A file both declarations
-  // match is parsed once and every literal is owned by exactly one
-  // classification; `null` marks a file the parser refused, which the module
-  // loop then leaves alone rather than refusing it a second time.
-  const walked = new Map<string, { sourceFile: TS.SourceFile; claimed: Span[] } | null>();
-
-  // ONE collection across BOTH loops, flushed below the adopted lines: a dialect
-  // host refuses the same files in the surface loop that the module loop would
-  // meet, and the walked map above already yields a single refusal per file.
-  const refusals: string[] = [];
-
-  // Pass one: every surface parsed and classified before any literal is named,
-  // so a role that repeats across the run is numbered across it.
-  const adoptable: Array<{
-    file: string;
-    source: string;
-    literals: LocatedLiteral[];
-    target: Target;
-    kind: 'server' | 'client';
-  }> = [];
-  for (const file of filesForGlobs(io.cwd, config.managedSurfaces)) {
-    const source = readFileSync(join(io.cwd, file), 'utf8');
-    const page = pageOfFile(io.cwd, file, descriptor.pages);
-    const result = await scanSource(file, source, {
-      readPathImport: config.readPath.import,
-      ...(page === undefined ? {} : { page }),
-    });
-    if (result.parseErrors) {
-      refusals.push(`${file}: could not be parsed cleanly — reported, not adopted`);
-      walked.set(file, null);
-      continue;
-    }
-    // Recorded BEFORE the early returns below: this walk classified the file's
-    // JSX positions whether or not it went on to adopt any of them.
-    walked.set(file, { sourceFile: result.sourceFile, claimed: result.claimed });
-    if (result.literals.length === 0) continue;
-
-    const target = targetFor(file, config);
-    const kind = kindFor(file, result.hasUseClient, config, forcedKind);
-    if (kind === null) {
-      report.warn('scan', `${file}: ambiguous — an un-directived App-Router component; re-run with --kind server|client`);
-      continue;
-    }
-    if (kind === 'client' && !providerMounted(io.cwd, config)) {
-      for (const literal of result.literals) {
-        report.warn(
-          'scan',
-          `${file}: ${JSON.stringify(literal.proposedKey)} needs a client rewrite, but no CopyProvider is mounted — ` +
-            'mount CopyProvider in the root layout first (stet init can do it)',
-        );
-      }
-      continue;
-    }
-    // A literal the gate or the rewrite would refuse is reported here and takes
-    // no name, so a run's numbers have no gaps. Neither depends on the key's name.
-    const literals = result.literals.filter((literal) => {
-      const passed = validateUnnamed({
-        descriptor,
-        snapshot,
-        placeholder: '\u0001',
-        def: { shape: 'text', target },
-        stored: literal.text,
-        value: literal.text,
-        report,
-        name: literal.proposedKey,
-        keep: false,
-      });
-      if (!passed) return false;
-      const planned = planRewrite(source, literal, literal.proposedKey, kind, config.readPath.import);
-      if (planned.skipped === undefined) return true;
-      report.warn('scan', `${file}: ${JSON.stringify(literal.proposedKey)} ${skipReason(planned.skipped)} — adopt by hand`);
-      return false;
-    });
-    if (literals.length > 0) adoptable.push({ file, source, literals, target, kind });
-  }
-
-  // The copy modules, walked once here for their own names — which no JSX name
-  // may take — and again below for adoption.
-  const modules = new Map<string, Awaited<ReturnType<typeof scanModule>>>();
-  const propertyNames = new Map<string, string>();
-  for (const file of filesForGlobs(io.cwd, config.copyModules)) {
-    const handoff = walked.get(file);
-    if (handoff === null) continue;
-    const result = await scanModule(file, readFileSync(join(io.cwd, file), 'utf8'), handoff);
-    modules.set(file, result);
-    for (const literal of result.literals) {
-      if (literal.shape === 'property' || literal.shape === 'plain') propertyNames.set(literal.proposedKey, file);
-    }
-  }
-
-  // The names: the rule's, numbered across the run past every key declared
-  // before it and every copy-module name; then, under --plan, the plan's.
-  const run = adoptable.flatMap((f) => f.literals);
-  const before = new Set(Object.keys(descriptor.keys));
-  const numbered = numberNames(
-    run.map((l) => l.proposedKey),
-    (name) => before.has(name) || propertyNames.has(name),
-  );
-  const nameOf = new Map(run.map((literal, i) => [literal, numbered[i] as string]));
+  // Pass one, the copy modules' own names and the run's names: the naming pass
+  // `scan` previews with. Then, under --plan, the plan's names.
+  const { adoptable, nameOf, reused: reusedLiterals, refusals, modules, propertyNames } = await planJsxRun({
+    cwd: io.cwd,
+    config,
+    descriptor,
+    snapshot,
+    report,
+    ...(forcedKind === undefined ? {} : { forcedKind }),
+  });
+  // A naming plan lists only the keys the run adds: a reused literal is never an entry.
+  const run = adoptable.flatMap((f) => f.literals).filter((literal) => !reusedLiterals.has(literal));
   const resolved = resolveNaming({
     io,
     report,
@@ -254,12 +145,21 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   const { chosen } = resolved;
   // A plan run shows what it will do and writes nothing until --write, as on the static-HTML host.
   const planOnly = naming.planIn !== undefined && !write;
+  // Only a run that applies writes anything: without it, every host writes nothing.
+  const applying = write && !planOnly;
 
   // Pass two: each file's literals keyed and rewritten.
   for (const { file, source, literals, target, kind } of adoptable) {
     const edits: Edit[] = [];
     for (const literal of literals) {
       const proposed = nameOf.get(literal) as string;
+      if (reusedLiterals.has(literal)) {
+        // No entry, no value: the key already holds this text.
+        edits.push(...planRewrite(source, literal, proposed, kind, config.readPath.import).edits);
+        reused += 1;
+        report.line(`${file}: reuses ${proposed} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
+        continue;
+      }
       const choice = chosen?.(proposed);
       if (choice?.adopt === false) continue;
       const key = choice?.key ?? proposed;
@@ -280,13 +180,10 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     }
 
     if (edits.length === 0) continue;
-    const edited = applyFileEdits(source, edits);
+    const text = applyFileEdits(source, edits);
     printedDiffs += 1;
-    report.line(formatDiff(file, source, edited));
-    if (write && !planOnly) {
-      writeText(join(io.cwd, file), edited);
-      report.line(`${file}: rewrote ${plural(edits.length, 'edit')}`);
-    }
+    report.line(formatDiff(file, source, text));
+    edited.push({ abs: join(io.cwd, file), rel: file, text, edits: edits.length });
   }
 
   // The SECOND loop: the declared copy modules. `register` re-walks the host
@@ -297,14 +194,13 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   // copy module is adopted as RECORD: it keeps its literals, and byte-equality
   // against the snapshot is what the drift gate then watches.
   for (const [file, result] of modules) {
-    // The walk ran before the surface pass's own `--write` may have rewritten
-    // this file, over the tree the JSX walk handed it. That is safe rather than
-    // merely tolerated: `scanModule` reads the TREE's own text wherever it reads
-    // by position, so its offsets and its bytes always come from the same
-    // document. Re-walking instead would be worse — the rewrite just wrote fresh
-    // `copy('key')` calls whose key arguments would need fresh claims,
-    // re-opening the accessor-key leak on exactly the files most likely to have
-    // one.
+    // The walk ran over the tree the JSX walk handed it, before the batch below
+    // writes this file's leaf edits. That is safe rather than merely tolerated:
+    // `scanModule` reads the TREE's own text wherever it reads by position, so
+    // its offsets and its bytes always come from the same document. Re-walking
+    // instead would be worse — the rewrite plans fresh `copy('key')` calls whose
+    // key arguments would need fresh claims, re-opening the accessor-key leak on
+    // exactly the files most likely to have one.
     if (result.parseErrors) {
       refusals.push(`${file}: could not be parsed cleanly — reported, not adopted`);
       continue;
@@ -345,7 +241,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
         continue;
       }
       // One line per adopted key, never a diff: there is no source edit to show.
-      report.line(`adopted ${key} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
+      report.line(`${applying ? 'adopted' : 'adopts'} ${key} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
       added += 1;
     }
   }
@@ -358,34 +254,46 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report.line(line);
   }
 
-  if (added > 0 && planOnly) {
-    report.line('register: run with --write to apply the plan');
+  if (added + reused === 0) {
+    report.line('register: nothing to adopt');
     return report.emit(io);
   }
-  if (added > 0) {
-    // ONE batch, with rollback: the descriptor, the snapshot and the codegen
-    // modules land together or not at all. The codegen regenerates here so the
-    // `copy('new_key')` leaf register just wrote typechecks immediately — the
-    // Accessor sig is narrow (`ContentKey`), so a stale `.d.ts` would red the
-    // host tsc until a separate `stet upgrade`.
-    try {
-      writePlanned(planRepoForms(io.cwd, config, descriptor, snapshot, report));
-    } catch (error) {
-      rethrowBatchFailure('stet register', error);
-    }
-    report.line(`wrote ${config.descriptorPath}, ${config.snapshotPath} and the codegen modules: ${plural(added, 'key')} added`);
+  // The run without `--write` writes NOTHING, as on the static-HTML host: a
+  // descriptor entry landed without its leaf edit is a key no source reads, and
+  // the next `--write` would number a second one beside it.
+  if (!applying) {
+    report.line(pendingLine({ planOnly, added, printedDiffs }));
+    return report.emit(io);
   }
-  // The closing line turns on whether there were LEAF EDITS, not on `--write`:
-  // a `--write` run that adopted only module shapes applied nothing, and
-  // "applied" is the very confusion the record line exists to remove.
+  // Before ANY write, the descriptor and snapshot included: a rewrite that
+  // inserts an import the host cannot resolve breaks every file it touched. Every
+  // write is in the batch below, and a run that applies no leaf edit writes no import.
+  if (edited.length > 0) refuseUnresolvableAlias(io.cwd, config);
+  // ONE batch, with rollback: the descriptor, the snapshot, the codegen modules
+  // and every leaf edit land together or not at all. The codegen regenerates
+  // here so the `copy('new_key')` leaf register just wrote typechecks
+  // immediately — the Accessor sig is narrow (`ContentKey`), so a stale `.d.ts`
+  // would red the host tsc until a separate `stet upgrade`.
+  try {
+    writePlanned([
+      ...planRepoForms(io.cwd, config, descriptor, snapshot, report),
+      ...edited.map((e) => asUpdate(planWrite(e.abs, e.text, e.rel))),
+    ]);
+  } catch (error) {
+    rethrowBatchFailure('stet register', error);
+  }
+  for (const e of edited) report.line(`${e.rel}: rewrote ${plural(e.edits, 'edit')}`);
+  if (added > 0) {
+    report.line(
+      `wrote ${config.descriptorPath}, ${config.snapshotPath} and the codegen modules: ${plural(added, 'key')} added` +
+        (reused > 0 ? `, ${reused} reused` : ''),
+    );
+  }
+  // The closing line turns on whether there were LEAF EDITS: a `--write` run
+  // that adopted only module shapes applied nothing, and "applied" is the very
+  // confusion the record line exists to remove.
   report.line(
-    added === 0
-      ? 'register: nothing to adopt'
-      : printedDiffs === 0
-        ? 'register: adopted as record — there are no source edits to apply'
-        : write
-          ? 'register: applied'
-          : 'register: run with --write to apply the leaf edits',
+    printedDiffs === 0 ? 'register: adopted as record — there are no source edits to apply' : 'register: applied',
   );
   return report.emit(io);
 }
@@ -416,28 +324,12 @@ function refuseUnresolvableAlias(cwd: string, config: StetConfig): void {
   );
 }
 
-/** The accessor kind, or null when an un-directived App-Router component is ambiguous. */
-function kindFor(
-  file: string,
-  hasUseClient: boolean,
-  config: StetConfig,
-  forced: string | undefined,
-): 'server' | 'client' | null {
-  // A non-JSX file (a `.ts`/`.js` mailer) has no client-component form on ANY
-  // router — checked FIRST, so a Pages host's email mailer is still server (and
-  // reaches EMAIL_TARGET), not client-skipped for want of a provider.
-  if (!isJsxFile(file)) return 'server';
-  // Only `pages` forces the client form: a Pages-Router file is client-rendered
-  // with no directive to detect it by. `app` and `astro` both fall through to
-  // the directive and the route-file test.
-  if (config.router === 'pages' || hasUseClient) return 'client';
-  if (isRouteFile(file)) return 'server';
-  if (forced === 'server' || forced === 'client') return forced;
-  return null;
-}
-
-function isRouteFile(file: string): boolean {
-  return ROUTE_FILES.has(basename(file).replace(/\.(tsx|jsx|ts|js)$/, ''));
+/** The closing line of a JavaScript run that does not apply: what `--write` would do. */
+function pendingLine(run: { planOnly: boolean; added: number; printedDiffs: number }): string {
+  if (run.planOnly) return 'register: run with --write to apply the plan';
+  if (run.added === 0) return 'register: run with --write to apply the leaf edits';
+  const edits = run.printedDiffs > 0 ? ' and apply the leaf edits' : '';
+  return `register: run with --write to add ${plural(run.added, 'key')}${edits}`;
 }
 
 /** Enough of an adopted default to recognize it on the line that reports it. */
@@ -447,10 +339,9 @@ const ADOPTED_EXCERPT = 60;
  * `register` on the static-HTML host: every located proposal becomes a key and
  * a mark, in one batch with the descriptor and the snapshot.
  *
- * The plain run writes NOTHING — a departure from the JavaScript branch, whose
- * descriptor and snapshot land either way. A descriptor entry written without
- * its mark is half a batch, and the next `check` would report every such key as
- * marked in no document.
+ * The plain run writes NOTHING, as on the JavaScript branch. A descriptor entry
+ * written without its mark is half a batch, and the next `check` would report
+ * every such key as marked in no document.
  */
 function registerHtml(d: {
   io: CliIo;
@@ -463,7 +354,7 @@ function registerHtml(d: {
 }): number {
   const { io, config, descriptor, snapshot, write, report, naming } = d;
   const files = filesForGlobs(io.cwd, config.managedSurfaces);
-  const pageOf = (file: string): string => pageOfFile(io.cwd, file, descriptor.pages, { html: true }) ?? 'page';
+  const pageOf = (file: string): string => htmlPageOf(io.cwd, file, descriptor.pages);
   const run = (
     forms: { descriptor: Descriptor; snapshot: Snapshot },
     runReport: Report,
@@ -671,32 +562,4 @@ function madeHashes(cwd: string, config: StetConfig, files: string[]): Record<st
     if (existsSync(join(cwd, rel))) made[rel] = fileHash(cwd, rel);
   }
   return made;
-}
-
-
-/**
- * The target a file's keys take. Derived from the SURFACE the file matched — an
- * email surface gets email rules — never from a send-arg heuristic, which
- * misfires on `res.send`/`socket.send`. A copy module declared into the email
- * surfaces takes the email target and its validation rules by the same rule.
- */
-function targetFor(file: string, config: StetConfig): Target {
-  return config.emailSurfaces.some((g) => matchGlob(g, file)) ? EMAIL_TARGET : DEFAULT_TARGET;
-}
-
-/** The live grep P1-H uses: a `CopyProvider` import from `@getstet/stet/react` in the root layout. */
-function providerMounted(cwd: string, config: StetConfig): boolean {
-  // No recorded root layout is no layout, and no layout is no provider — an
-  // Astro host, whose site layout is a `.astro` template.
-  if (config.rootLayout === undefined) return false;
-  const path = join(cwd, config.rootLayout);
-  if (!existsSync(path)) return false;
-  const source = readFileSync(path, 'utf8');
-  return /import\s*\{[^}]*\bCopyProvider\b[^}]*\}\s*from\s*['"]@getstet\/stet\/react['"]/.test(source);
-}
-
-function skipReason(skip: 'no-component-body' | 'copy-collision'): string {
-  return skip === 'copy-collision'
-    ? 'a foreign `copy` is already bound in scope'
-    : 'a client literal with no enclosing component body';
 }

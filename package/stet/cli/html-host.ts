@@ -1599,6 +1599,21 @@ export function planDocuments(
 
 // --- register's html branch -------------------------------------------------
 
+/**
+ * A key's own default-locale text, where it is a web `text` key with no
+ * derivation — the text a run may share onto an element or a JSX literal that
+ * carries it. Own-property reads on both maps (`keyDefOf`): a name from the
+ * snapshot or a document is read against the descriptor, so `constructor` would
+ * otherwise resolve to a prototype member.
+ */
+export function heldTextOf(descriptor: Descriptor, snapshot: Snapshot, key: string): string | null {
+  const def = keyDefOf(descriptor, key);
+  const defaults = snapshot['default'] ?? {};
+  const value = Object.hasOwn(defaults, key) ? defaults[key] : undefined;
+  if (def === undefined || def.shape !== 'text' || def.target !== DEFAULT_TARGET) return null;
+  return def.derivesFrom === undefined && typeof value === 'string' ? value : null;
+}
+
 export interface HtmlRegisterPlan {
   edited: Array<{ abs: string; text: string; rel: string; diff: string }>;
   added: number;
@@ -1610,6 +1625,8 @@ export interface HtmlRegisterPlan {
   converted: HtmlDerivation[];
   /** The keys this run adds, in the order it minted them: what a naming plan lists. */
   minted: HtmlMint[];
+  /** The key each proposal the run marks receives, after naming — what `scan` prints as its proposed key. */
+  keyAt: Map<HtmlProposal, string>;
 }
 
 /** A key this run adds, as a naming plan shows it. */
@@ -1784,9 +1801,11 @@ export function planHtmlRegister(input: {
   pageOf: (file: string) => string;
   /** A naming plan's choice for a proposed name, where the run applies one. */
   chosen?: (proposed: string) => ChosenName | undefined;
+  /** The proposals, where the caller has already located them (`scan`). */
+  set?: HtmlProposalSet;
 }): HtmlRegisterPlan {
   const { cwd, files, descriptor, snapshot, report, pageOf, chosen } = input;
-  const set = proposeHtml(cwd, files);
+  const set = input.set ?? proposeHtml(cwd, files);
   // The names the descriptor held before the run: a role name never lands on one.
   const before = new Set(Object.keys(descriptor.keys));
   const defaults = (): Record<string, unknown> => snapshot['default'] ?? {};
@@ -1794,13 +1813,6 @@ export function planHtmlRegister(input: {
   // SNAPSHOT or a DOCUMENT is read against the DESCRIPTOR's map, so
   // `constructor` would otherwise resolve to a prototype member.
   const defOf = (key: string): KeyDef | undefined => keyDefOf(descriptor, key);
-  /** A key's own text, where it is a web `text` key with no derivation. */
-  const literalOf = (key: string): string | null => {
-    const def = defOf(key);
-    const value = Object.hasOwn(defaults(), key) ? defaults()[key] : undefined;
-    if (def === undefined || def.shape !== 'text' || def.target !== DEFAULT_TARGET) return null;
-    return def.derivesFrom === undefined && typeof value === 'string' ? value : null;
-  };
 
   // Where the documents already carry each key.
   const marksOf = new Map<string, HtmlMark[]>();
@@ -1820,7 +1832,7 @@ export function planHtmlRegister(input: {
   // Visible keys and their text, the sources a head text may derive from.
   const visible = new Map<string, string>();
   for (const [key, marks] of marksOf) {
-    const text = literalOf(key);
+    const text = heldTextOf(descriptor, snapshot, key);
     if (text !== null && marks.some(isVisibleText)) visible.set(key, text);
   }
 
@@ -1835,7 +1847,7 @@ export function planHtmlRegister(input: {
     byValue.set(slot, [...(byValue.get(slot) ?? []), key]);
   };
   for (const key of Object.keys(defaults()).sort()) {
-    const text = literalOf(key);
+    const text = heldTextOf(descriptor, snapshot, key);
     if (text === null || headOnly.has(key)) continue;
     holdValue(`${defOf(key)?.tags ?? 0}\u0000${text}`, key);
   }
@@ -1853,8 +1865,10 @@ export function planHtmlRegister(input: {
   const placesOf = new Map<string, Place[]>();
   const minting: Array<{ tmp: string; proposal: HtmlProposal; text: string }> = [];
   const derived: HtmlDerivation[] = [];
+  const keyAt = new Map<HtmlProposal, string>();
 
   const markWith = (proposal: HtmlProposal, key: string, shared: boolean): void => {
+    keyAt.set(proposal, key);
     const document = set.documents.find((d) => d.file === proposal.file) as Document;
     // The ONE edit: an attribute at the end of the open tag. The text is
     // never touched.
@@ -1963,7 +1977,7 @@ export function planHtmlRegister(input: {
   const derivedFrom = new Set(Object.values(descriptor.keys).map((def) => def.derivesFrom));
   // `headOnly` holds only keys no visible text carries: visible text never shares one, so none is a source.
   for (const key of [...headOnly].sort()) {
-    const text = literalOf(key);
+    const text = heldTextOf(descriptor, snapshot, key);
     if (text === null || defOf(key)?.tags !== undefined || derivedFrom.has(key)) continue;
     // Only a key whose value lives in the default locale alone: a derivation replaces every locale's literal.
     if (Object.keys(snapshot).some((locale) => locale !== 'default' && Object.hasOwn(snapshot[locale] ?? {}, key))) continue;
@@ -2037,6 +2051,10 @@ export function planHtmlRegister(input: {
     });
   });
   const named = (key: string): string => finalOf.get(key) ?? key;
+  for (const [proposal, key] of keyAt) {
+    if (dropped.has(key)) keyAt.delete(proposal);
+    else keyAt.set(proposal, named(key));
+  }
   for (const def of Object.values(descriptor.keys)) {
     if (def.derivesFrom !== undefined) def.derivesFrom = named(def.derivesFrom);
   }
@@ -2072,7 +2090,7 @@ export function planHtmlRegister(input: {
   const added = minted.length;
   const marked = kept.length;
   const shared = kept.filter((m) => m.shared).length;
-  return { edited, added, shared, marked, derived, converted, minted };
+  return { edited, added, shared, marked, derived, converted, minted, keyAt };
 }
 
 // --- check's documents ------------------------------------------------------

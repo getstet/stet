@@ -282,21 +282,19 @@ export async function runDev(args: string[], io: CliIo, hooks: RunDevHooks = {})
   const opened = adding === undefined ? undefined : addSite(workspaceFile, adding).path;
 
   const handle = await startDevServer({ port, workspaceFile, io });
-  const url = opened === undefined ? handle.url : `${handle.url}&site=${encodeURIComponent(opened)}`;
-  io.stdout(`dashboard: ${url}`);
-  if (!flag(values, 'no-open')) openBrowser(url);
-
-  if (hooks.onListening !== undefined) {
+  const run = untilInterrupted();
+  try {
+    const url = opened === undefined ? handle.url : `${handle.url}&site=${encodeURIComponent(opened)}`;
+    io.stdout(`dashboard: ${url}`);
+    if (!flag(values, 'no-open')) openBrowser(url);
+    await (hooks.onListening === undefined ? run.interrupted : hooks.onListening(handle));
+  } finally {
     try {
-      await hooks.onListening(handle);
-    } finally {
       await handle.close();
+    } finally {
+      run.release();
     }
-    return 0;
   }
-
-  await untilInterrupted();
-  await handle.close();
   return 0;
 }
 
@@ -310,17 +308,16 @@ function parsePort(raw: string | undefined): number {
   return port;
 }
 
-/** The run, held open until the operator ends it. */
-function untilInterrupted(): Promise<void> {
-  return new Promise((resolve) => {
-    const stop = (): void => {
-      process.off('SIGINT', stop);
-      process.off('SIGTERM', stop);
-      resolve();
-    };
-    process.once('SIGINT', stop);
-    process.once('SIGTERM', stop);
+/** The run, held open until the operator ends it. The listeners stay until `release`, so a signal during the close is absorbed (F48). */
+function untilInterrupted(): { interrupted: Promise<void>; release: () => void } {
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+  let resolve: () => void = () => {};
+  const interrupted = new Promise<void>((r) => {
+    resolve = r;
   });
+  const stop = (): void => resolve();
+  for (const signal of signals) process.on(signal, stop);
+  return { interrupted, release: () => signals.forEach((signal) => process.off(signal, stop)) };
 }
 
 /**

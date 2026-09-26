@@ -3601,7 +3601,7 @@ describe('cli', () => {
     const demo = ['brand__ink', 'brand__name', 'brand__primary', 'brand__radius', 'hero_headline'];
     expect(await scaffolded.run('remove', ...demo, '--write')).toBe(0);
     expect(await scaffolded.run('scan')).toBe(0);
-    expect(await scaffolded.run('register', '--from', 'scan')).toBe(0);
+    expect(await scaffolded.run('register', '--from', 'scan', '--write')).toBe(0);
     const adopted = JSON.parse(scaffolded.file('content/defaults.json')) as Record<string, Record<string, unknown>>;
     // Its OWN name, no suffixed variant, and the project closes green — the
     // round trip proves the forms were fully cleaned.
@@ -5412,7 +5412,7 @@ describe('adoption', () => {
     // Adopted through register, the same property is byte-equal to the snapshot
     // default and the scan says nothing about it. The host's stderr ACCUMULATES
     // across runs, so each verdict below is read from the lines that run added.
-    expect(await modules.run('register', '--from', 'scan')).toBe(0);
+    expect(await modules.run('register', '--from', 'scan', '--write')).toBe(0);
     const afterAdopt = modules.err.length;
     expect(await modules.run('scan')).toBe(0);
     expect(modules.err.slice(afterAdopt).join('\n')).not.toContain('site_tag');
@@ -5671,13 +5671,15 @@ describe('adoption', () => {
   });
 
   it('Requirement: register adds a key and rewrites the consuming leaf', async () => {
-    // no --write: the descriptor gains the key, the leaf's source is untouched
+    // no --write: the diff prints and nothing is written — no entry, no source edit
     const planned = makeAdoptionHost();
     expect(await planned.run('init', '--yes')).toBe(0);
     const pageBefore = planned.file('app/page.tsx');
+    const plannedDescriptor = planned.file('content/descriptor.json');
     expect(await planned.run('register', '--from', 'scan')).toBe(0);
+    expect(planned.stdout()).toContain('+++ b/app/page.tsx');
     expect(planned.file('app/page.tsx')).toBe(pageBefore);
-    expect(JSON.parse(planned.file('content/descriptor.json')).keys.home_page_headline).toBeDefined();
+    expect(planned.file('content/descriptor.json')).toBe(plannedDescriptor);
 
     // --write: the leaf becomes an accessor call and the read-path import lands
     const applied = makeAdoptionHost();
@@ -5698,8 +5700,8 @@ describe('adoption', () => {
     expect(await unresolvable.run('register', '--from', 'scan', '--write')).toBe(1);
     expect(unresolvable.stderr()).toContain('no tsconfig/jsconfig path mapping in this project resolves it to');
     expect(unresolvable.stderr()).toContain('Declare the alias in the project file, or edit readPath.import');
-    // Not one file touched — the descriptor write runs in both modes, so it is
-    // the one that proves the guard precedes everything.
+    // Not one file touched — the descriptor lands in the same batch as the
+    // leaf, so it is the one that proves the guard precedes everything.
     expect(unresolvable.file('app/page.tsx')).toBe(before);
     expect(unresolvable.file('content/descriptor.json')).toBe(descriptorBefore);
 
@@ -5742,11 +5744,17 @@ describe('adoption', () => {
     oracle.write('stet.config.json', JSON.stringify({ ...oracleConfig, copyModules: ['src/copy.ts'] }, null, 2));
 
     const moduleBefore = readFileSync(join(oracle.cwd, 'src/copy.ts'));
-    // The PLAIN run completes module adoption whole: the descriptor and
-    // snapshot writes were never `--write`-gated, and there is no source edit
-    // for `--write` to hold back.
+    // The PLAIN run prints one line per key it would adopt and writes nothing.
+    const oracleDescriptor = oracle.file('content/descriptor.json');
     expect(await oracle.run('register', '--from', 'scan')).toBe(0);
-    const adoptedOut = oracle.stdout();
+    expect(oracle.stdout()).toContain('adopts hero_eyebrow = Open source · Apache-2.0');
+    expect(oracle.out.at(-1)).toBe('register: run with --write to add 3 keys');
+    expect(oracle.file('content/descriptor.json')).toBe(oracleDescriptor);
+
+    // `--write` lands the module adoption whole: there is no source edit.
+    const beforeWrite = oracle.out.length;
+    expect(await oracle.run('register', '--from', 'scan', '--write')).toBe(0);
+    const adoptedOut = oracle.out.slice(beforeWrite).join('\n');
     expect(adoptedOut).toContain('adopted hero_eyebrow = Open source · Apache-2.0');
     expect(adoptedOut).toContain('adopted footer_note = stet is a working name.');
     expect(adoptedOut).toContain('register: adopted as record — there are no source edits to apply');
@@ -5774,8 +5782,7 @@ describe('adoption', () => {
     // The module itself is untouched, byte for byte.
     expect(readFileSync(join(oracle.cwd, 'src/copy.ts')).equals(moduleBefore)).toBe(true);
 
-    // `--write` is the SOURCE-EDIT gate, and for a module shape there is no
-    // source edit: it changes nothing further, the module least of all.
+    // A second `--write` changes nothing further, the module least of all.
     const descriptorAfterPlain = oracle.file('content/descriptor.json');
     expect(await oracle.run('register', '--from', 'scan', '--write')).toBe(0);
     expect(readFileSync(join(oracle.cwd, 'src/copy.ts')).equals(moduleBefore)).toBe(true);
@@ -5842,7 +5849,7 @@ describe('adoption', () => {
       ),
     );
     const beforeCollapse = refusing.out.length;
-    expect(await refusing.run('register', '--from', 'scan')).toBe(0);
+    expect(await refusing.run('register', '--from', 'scan', '--write')).toBe(0);
     const collapsed = refusing.out.slice(beforeCollapse);
     expect(collapsed.join('\n')).toContain(
       '4 file(s) could not be parsed cleanly — reported, not adopted; run with --verbose to list them',
@@ -5860,8 +5867,8 @@ describe('adoption', () => {
     expect(listed.join('\n')).not.toContain('run with --verbose to list them');
 
     // On the static-HTML host the ONE edit is the mark, and the plain run writes
-    // nothing at all — a departure from the JavaScript branch above, kept
-    // because a descriptor entry without its mark is half a batch.
+    // nothing at all, as on the JavaScript branch above: a descriptor entry
+    // without its mark is half a batch.
     const html = await makeHtmlHost();
     const original = html.file('index.html');
     const emptyDescriptor = html.file('content/descriptor.json');

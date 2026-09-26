@@ -15,8 +15,10 @@ import { runEmailExtract } from '../cli/email-extract.js';
 import { runScan } from '../cli/scan.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { cleanupEmailHosts, makeEmailHost } from './helpers/email-host.js';
+import { cleanupCliHosts, makeHtmlHost } from '../conformance/cli-host.js';
 
 afterAll(cleanupEmailHosts);
+afterAll(cleanupCliHosts);
 
 function project(config: Record<string, unknown> = {}): string {
   const dir = mkdtempSync(join(tmpdir(), 'stet-scan-'));
@@ -1534,6 +1536,14 @@ describe('runScan — a static route with no page record', () => {
     expect(cap.err.join('\n')).not.toContain('has no page record');
   });
 
+  it('reads a pages array as no pages at all, however its items read', async () => {
+    // An array is no map of records, even where each item carries a route.
+    const dir = withPages([{ route: '/' }], ['index.astro', 'team.astro']);
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    expect(cap.err.join('\n')).not.toContain('has no page record');
+  });
+
   it('reads an entry whose route is not a string as no page at all', async () => {
     // The INNER half of the narrowing: the outer `isRecord` passes here and
     // only the per-entry filter keeps the gate shut. Without it a number
@@ -1789,5 +1799,97 @@ describe('runScan --json — findings carry their location and slot as structure
     const dead = payload.findings.find((f) => f.message.startsWith('glob matched no files'));
     expect(dead).toBeDefined();
     expect(dead !== undefined && 'at' in dead).toBe(false);
+  });
+});
+
+/** Every key a scan run proposes, in the order it printed them. */
+function proposedKeys(lines: string[]): string[] {
+  return lines.flatMap((line) => [...line.matchAll(/propose key (\S+)/g)].map((m) => m[1] as string));
+}
+
+/** A JavaScript host with forms and the `@/*` alias, so `register --write` can land what scan previews. */
+function namedProject(config: Record<string, unknown> = {}, keys: Record<string, unknown> = {}, defaults: Record<string, unknown> = {}): string {
+  const dir = project({ descriptorPath: 'content/descriptor.json', snapshotPath: 'content/defaults.json', ...config });
+  write(dir, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } }));
+  write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys }));
+  write(dir, 'content/defaults.json', JSON.stringify({ default: defaults }));
+  return dir;
+}
+
+describe('scan names the keys register adds (F54)', () => {
+  const HOME =
+    '<!doctype html>\n<html><head><title>Home of the site</title></head><body>\n' +
+    '<p>The first paragraph of copy.</p>\n<p>The second paragraph of copy.</p>\n' +
+    '<footer><p>The footer line on every page.</p></footer>\n</body></html>\n';
+  const ABOUT =
+    '<!doctype html>\n<html><head><title>About the site</title></head><body>\n' +
+    '<footer><p>The footer line on every page.</p></footer>\n</body></html>\n';
+
+  it('on an html host: two paragraphs in no section and a footer in two documents', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': HOME, 'about.html': ABOUT } });
+    expect(await host.run('scan')).toBe(0);
+    const names = proposedKeys(host.err);
+    expect(names).toEqual(expect.arrayContaining(['home_page_paragraph_1', 'home_page_paragraph_2', 'site_footer_paragraph']));
+    expect(names.filter((n) => n === 'site_footer_paragraph')).toHaveLength(2);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const added = Object.keys(JSON.parse(host.file('content/descriptor.json')).keys as Record<string, unknown>);
+    expect([...new Set(names)].sort()).toEqual(added.sort());
+  });
+
+  it('on a JavaScript host: two paragraphs in one section, numbered as register numbers them', async () => {
+    const dir = namedProject();
+    write(dir, 'app/page.tsx', COMPONENT('<section id="intro"><p>One paragraph here.</p><p>Two paragraph here.</p></section>'));
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    const names = proposedKeys(cap.err);
+    expect(names).toEqual(['home_intro_paragraph_1', 'home_intro_paragraph_2']);
+    // `--json` carries the same names as each finding's key.
+    const json = io(dir);
+    expect(await runScan(['--json'], json)).toBe(0);
+    const findings = (JSON.parse(json.out.at(-1) as string) as { findings: Array<{ key?: string }> }).findings;
+    expect(findings.flatMap((f) => (f.key === undefined ? [] : [f.key]))).toEqual(names);
+    expect(await runCli(['register', '--from', 'scan', '--write'], io(dir))).toBe(0);
+    const added = Object.keys((JSON.parse(readFileSync(join(dir, 'content/descriptor.json'), 'utf8')) as { keys: object }).keys);
+    expect(added.sort()).toEqual(names);
+  });
+
+  it('shows the declared key a literal reuses', async () => {
+    const dir = namedProject({}, { about_page_headline: { shape: 'text', target: 'web' } }, { about_page_headline: 'Welcome' });
+    write(dir, 'app/page.tsx', COMPONENT('<h1>Welcome</h1>'));
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    expect(proposedKeys(cap.err)).toEqual(['about_page_headline']);
+  });
+
+  it('keeps the role name for a literal register skips: no provider mounted', async () => {
+    const dir = namedProject({ router: 'pages', managedSurfaces: ['pages/**/*.tsx'], rootLayout: 'pages/_app.tsx' });
+    write(dir, 'pages/index.tsx', COMPONENT('<main><p>One paragraph here.</p><p>Two paragraph here.</p></main>'));
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    expect(proposedKeys(cap.err)).toEqual(['home_page_paragraph', 'home_page_paragraph']);
+  });
+});
+
+describe('scan names only from validated forms (F54)', () => {
+  const MALFORMED = [{ version: 1 }, { keys: null }, { version: 1, keys: { x: null } }];
+
+  it('falls back to the role names on a malformed descriptor on a JavaScript host, exit 0', async () => {
+    for (const raw of MALFORMED) {
+      const dir = namedProject();
+      write(dir, 'content/descriptor.json', JSON.stringify(raw));
+      write(dir, 'app/page.tsx', COMPONENT('<main><p>One paragraph here.</p><p>Two paragraph here.</p></main>'));
+      const cap = io(dir);
+      expect(await runScan([], cap)).toBe(0);
+      expect(proposedKeys(cap.err)).toEqual(['home_page_paragraph', 'home_page_paragraph']);
+    }
+  });
+
+  it('falls back to the role names on a malformed descriptor on an html host, exit 0', async () => {
+    for (const raw of MALFORMED) {
+      const host = await makeHtmlHost({ files: { 'index.html': '<html><body><p>One paragraph here.</p><p>Two paragraph here.</p></body></html>\n' } });
+      writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(raw));
+      expect(await host.run('scan')).toBe(0);
+      expect(proposedKeys(host.err)).toEqual(['home_page_paragraph', 'home_page_paragraph']);
+    }
   });
 });

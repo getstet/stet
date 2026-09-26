@@ -16,16 +16,19 @@ import { join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import type { PageDef } from '../src/types.js';
+import { loadDescriptor } from '../src/descriptor.js';
+import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
+import type { Descriptor, PageDef } from '../src/types.js';
 
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { writeJsonDeterministic } from './artifacts.js';
 import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
-import { isHeadText, proposeHtml } from './html-host.js';
+import { isHeadText, planHtmlRegister, proposeHtml } from './html-host.js';
+import { classifyAdoption, isRecord, planJsxRun, type Adoption } from './register-run.js';
 import { baseName } from './key-names.js';
 import type { CliIo } from './main.js';
-import { detectPagesRoots, pageOfFile, proposePages } from './pages.js';
+import { detectPagesRoots, htmlPageOf, pageOfFile, proposePages } from './pages.js';
 import { CliError, clip, lineCol, plural, posixRelative, Report } from './report.js';
 import {
   dialectOf,
@@ -85,43 +88,11 @@ interface RawSnapshot {
   default?: unknown;
 }
 
-/** Whether a copy module's literal is already adopted, has drifted from what was adopted, or is new. */
-export type Adoption = 'adopted' | 'diverged' | 'unadopted';
-
 /**
- * The ONE adoption verdict, over the whole name space, shared by `scan`'s
- * copy-module loop and `register`'s. Idempotence is TRUE rather than asserted
- * because both ask this: run two classifies everything `adopted` and adds
- * nothing, and scan says nothing about it.
- *
- * `unadopted` — no own descriptor key of that name. `diverged` — a key exists,
- * and the snapshot default is absent or not byte-equal to what the module says;
- * that is exactly the drift the gate exists to name, so it is reported and never
- * adopted over. `adopted` — an own key, an own default, byte-equal.
- *
- * Membership is `Object.hasOwn` on BOTH maps. These are JSON-parsed objects and
- * `constructor` is a perfectly ordinary copy-module property name that passes
- * the key grammar; a bare lookup answers it from the prototype and reads a key
- * that was never declared.
+ * The ONE adoption verdict lives with the JSX run's naming pass, which both
+ * `register` and `scan` call. Re-exported here, where its consumers reach it.
  */
-export function classifyAdoption(
-  descriptor: RawDescriptor | null,
-  snapshot: RawSnapshot | null,
-  key: string,
-  text: string,
-): Adoption {
-  const keys = descriptor?.keys;
-  if (!isRecord(keys) || !Object.hasOwn(keys, key)) return 'unadopted';
-  const defaults = snapshot?.default;
-  if (!isRecord(defaults) || !Object.hasOwn(defaults, key)) return 'diverged';
-  const stored = defaults[key];
-  if (typeof stored !== 'string') return 'diverged';
-  return Buffer.from(stored, 'utf8').equals(Buffer.from(text, 'utf8')) ? 'adopted' : 'diverged';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+export { classifyAdoption, type Adoption };
 
 /**
  * The snapshot's own default for a key, as a string — `undefined` where there
@@ -135,6 +106,23 @@ function ownDefault(snapshot: RawSnapshot | null, key: string): string | undefin
   if (!isRecord(defaults) || !Object.hasOwn(defaults, key)) return undefined;
   const stored = defaults[key];
   return typeof stored === 'string' ? stored : undefined;
+}
+
+/**
+ * The descriptor and snapshot validated for the naming pass, from clones of
+ * scan's raw reads, or null where either is missing or malformed: scan never
+ * refuses on them, and falls back to the role names.
+ */
+function namingForms(
+  rawDescriptor: RawDescriptor | null,
+  rawSnapshot: RawSnapshot | null,
+): { descriptor: Descriptor; snapshot: Snapshot } | null {
+  if (rawDescriptor === null || rawSnapshot === null) return null;
+  try {
+    return { descriptor: loadDescriptor(structuredClone(rawDescriptor)), snapshot: loadSnapshot(structuredClone(rawSnapshot)) };
+  } catch {
+    return null;
+  }
 }
 
 /** Parsed JSON at a path, or null where the file is absent or unreadable — the report-free read. */
@@ -225,6 +213,31 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   // never validates — have nothing to contribute and are not converted here.
   const html = isHtmlHost(config) ? proposeHtml(io.cwd, files) : null;
 
+  // The names `register` would give, from its own naming pass over the same
+  // files, so the key scan proposes is the key register adds. The pass reads
+  // VALIDATED forms, loaded from clones of the raw reads; a missing or
+  // malformed form — `stet check`'s to report — or a JavaScript host with no
+  // usable compiler falls back to the role names, and the exit is unmoved. It
+  // previews the run with no `--kind`: a file register needs one for keeps its
+  // role name.
+  const forms = namingForms(descriptorOnce(), snapshotOnce());
+  const keyAt =
+    html !== null && forms !== null
+      ? planHtmlRegister({
+          cwd: io.cwd,
+          files,
+          descriptor: forms.descriptor,
+          snapshot: forms.snapshot,
+          report: new Report(),
+          pageOf: (file) => htmlPageOf(io.cwd, file, forms.descriptor.pages),
+          set: html,
+        }).keyAt
+      : null;
+  const run =
+    html === null && forms !== null && compilerRefusal === null
+      ? await planJsxRun({ cwd: io.cwd, config, descriptor: forms.descriptor, snapshot: forms.snapshot, report: new Report() })
+      : null;
+
   let refused = 0;
   for (const file of files) {
     const source = readFileSync(join(io.cwd, file), 'utf8');
@@ -247,17 +260,16 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
             : proposal.metaName === undefined
               ? ` (${proposal.attr})`
               : ` (meta ${proposal.metaName})`;
-        // The role name before its number: register numbers a role that repeats
-        // across its run, which one finding cannot know.
+        // The role name before its number, where the naming pass gave none.
         const base = baseName({
-          page: pageOfFile(io.cwd, file, rawPages(descriptorOnce()), { html: true }) ?? 'page',
+          page: htmlPageOf(io.cwd, file, rawPages(descriptorOnce())),
           ...(isHeadText(proposal) ? {} : { section: proposal.sectionWord }),
           role: proposal.role,
         });
         report.warn(
           'scan',
           `${file}:${proposal.line} possible copy ${JSON.stringify(clip(proposal.value, LITERAL_EXCERPT))}${suffix} — ` +
-            `propose key ${base}`,
+            `propose key ${keyAt?.get(proposal) ?? base}`,
           undefined,
           { at: { file, line: proposal.line } },
         );
@@ -309,13 +321,17 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     let handoff: { sourceFile: TS.SourceFile; claimed: Span[] } | undefined;
 
     if (isSurface) {
-      // The role name before its number, as on the html host.
+      // The naming pass parsed this file already; a file it did not reach is parsed here.
       const page = pageOfFile(io.cwd, file, rawPages(descriptorOnce()));
-      const result = await scanSource(file, source, {
-        readPathImport: config.readPath.import,
-        ...(page === undefined ? {} : { page }),
-      });
-      if (result.parseErrors) {
+      const held = run?.parsed.get(file);
+      const result =
+        held === undefined
+          ? await scanSource(file, source, {
+              readPathImport: config.readPath.import,
+              ...(page === undefined ? {} : { page }),
+            })
+          : held;
+      if (result === null || result.parseErrors) {
         report.line(`${file}: could not be parsed cleanly — reported, not scanned`);
         refused += 1;
         continue;
@@ -325,10 +341,13 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
       for (const literal of result.literals) {
         if (baselined({ file, context: literal.context, text: literal.text })) continue;
         const { line, col } = lineCol(source, literal.pos);
+        // The name register gives; the role name before its number where it
+        // would refuse or skip the literal.
+        const name = run?.nameOf.get(literal) ?? literal.proposedKey;
         report.warn(
           'scan',
-          `${file}:${line}:${col} unkeyed copy ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))} — propose key ${literal.proposedKey}`,
-          literal.proposedKey,
+          `${file}:${line}:${col} unkeyed copy ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))} — propose key ${name}`,
+          name,
           { at: { file, line, col } },
         );
         warned += 1;
@@ -339,7 +358,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     // classifications, neither of them twice: the JSX walk above owns every
     // position it classified, and the module walk covers what it leaves.
     if (isModule) {
-      const result = await scanModule(file, source, handoff);
+      const result = run?.modules.get(file) ?? (await scanModule(file, source, handoff));
       if (result.parseErrors) {
         report.line(`${file}: could not be parsed cleanly — reported, not scanned`);
         refused += 1;

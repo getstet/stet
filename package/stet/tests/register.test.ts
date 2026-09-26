@@ -5,7 +5,8 @@
  * never-touch-a-published-value guarantee, idempotence, the server/client
  * choice, and every refusal (ambiguous, no-provider, foreign `copy`).
  */
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -119,16 +120,17 @@ const SERVER_PAGE = (body: string): string => `export default function Page() {\
 const CLIENT_WIDGET = (body: string): string => `'use client';\nexport default function Widget() {\n  return ${body};\n}\n`;
 
 describe('runRegister — descriptor and default', () => {
-  it('without --write writes descriptor+default and prints a diff, edits no source', async () => {
+  it('without --write prints a diff and writes nothing: no entry, no default, no source edit', async () => {
     const dir = project();
     const before = SERVER_PAGE('<h1>Adopt me now</h1>');
     write(dir, 'app/page.tsx', before);
+    const forms = [read(dir, 'content/descriptor.json'), read(dir, 'content/defaults.json')];
     const cap = io(dir);
     const code = await runRegister(['--from', 'scan'], cap);
     expect(code).toBe(0);
-    expect(descriptor(dir).keys['home_page_headline']).toEqual({ shape: 'text', target: 'web' });
-    expect(defaults(dir).default['home_page_headline']).toBe('Adopt me now');
+    expect([read(dir, 'content/descriptor.json'), read(dir, 'content/defaults.json')]).toEqual(forms);
     expect(cap.out.join('\n')).toContain('+++ b/app/page.tsx'); // a diff was shown
+    expect(cap.out.at(-1)).toBe('register: run with --write to add 1 key and apply the leaf edits');
     expect(read(dir, 'app/page.tsx')).toBe(before); // source untouched
   });
 
@@ -463,7 +465,7 @@ describe('runRegister — declared copy modules', () => {
     write(dir, 'src/copy.ts', 'export const copy = {\n  hero_headline: "Change the content",\n};\n');
     const before = read(dir, 'src/copy.ts');
     const cap = io(dir);
-    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
     expect(descriptor(dir).keys['hero_headline']).toEqual({ shape: 'text', target: 'web' });
     expect(defaults(dir).default['hero_headline']).toBe('Change the content');
     // A suffixed module key forks the registry from the module it was read out
@@ -483,7 +485,7 @@ describe('runRegister — declared copy modules', () => {
       emailSurfaces: ['lib/email/**/*.ts'],
     });
     write(dir, 'lib/email/strings.ts', 'export const strings = {\n  welcome_subject: "Welcome aboard",\n};\n');
-    expect(await runRegister(['--from', 'scan'], io(dir))).toBe(0);
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
     expect(descriptor(dir).keys['welcome_subject']).toEqual({ shape: 'text', target: 'html-email' });
   });
 
@@ -498,7 +500,7 @@ describe('runRegister — declared copy modules', () => {
     const dir = project({ copyModules: ['src/copy.ts'] });
     write(dir, 'src/copy.ts', 'export const a = "Sign in!";\nexport const b = "Sign in?";\n');
     const cap = io(dir);
-    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
     // The first wins the key; the second is reported and never adopted over it.
     expect(defaults(dir).default['sign_in']).toBe('Sign in!');
     expect(descriptor(dir).keys['sign_in_2']).toBeUndefined();
@@ -513,26 +515,30 @@ describe('runRegister — declared copy modules', () => {
     const page = SERVER_PAGE('<h1>Adopt this leaf</h1>');
     write(dir, 'app/page.tsx', page);
     write(dir, 'src/copy.ts', 'export const copy = {\n  footer_note: "A working name",\n};\n');
-    const cap = io(dir);
-    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    const forms = read(dir, 'content/descriptor.json');
+    const plain = io(dir);
+    expect(await runRegister(['--from', 'scan'], plain)).toBe(0);
+    // A diff for the leaf, an `adopts` line for the property — each half
+    // reports in its own register — and nothing written without --write.
+    expect(plain.out.join('\n')).toContain('+++ b/app/page.tsx');
+    expect(plain.out.join('\n')).toContain('adopts footer_note = A working name');
+    expect(plain.out.at(-1)).toBe('register: run with --write to add 2 keys and apply the leaf edits');
+    expect(read(dir, 'content/descriptor.json')).toBe(forms);
+    expect(read(dir, 'app/page.tsx')).toBe(page);
 
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
     // Both halves landed: the leaf's derived key and the module's own name.
     expect(descriptor(dir).keys['home_page_headline']).toBeDefined();
     expect(descriptor(dir).keys['footer_note']).toBeDefined();
     const out = cap.out.join('\n');
-    // A diff for the leaf, an `adopted` line for the property — each half
-    // reports in its own register, in one run.
-    expect(out).toContain('+++ b/app/page.tsx');
     expect(out).toContain('adopted footer_note = A working name');
     expect(out).not.toContain('+++ b/src/copy.ts');
     // `added` SUMS both loops and the shared write block runs exactly once, so
     // the codegen is written once rather than per loop.
     expect(out).toContain('and the codegen modules: 2 keys added');
     expect(cap.out.filter((l) => l.includes('and the codegen modules'))).toHaveLength(1);
-    // There IS a leaf edit pending here, so the closing line says so.
-    expect(out).toContain('register: run with --write to apply the leaf edits');
-    // Neither file was touched without --write.
-    expect(read(dir, 'app/page.tsx')).toBe(page);
+    expect(cap.out.at(-1)).toBe('register: applied');
     expect(read(dir, 'src/copy.ts')).toContain('footer_note: "A working name"');
   });
 
@@ -565,14 +571,14 @@ describe('runRegister — declared copy modules', () => {
     const dir = project({ copyModules: ['src/copy.ts'] });
     write(dir, 'src/copy.ts', 'export const copy = {\n  footer_note: "A working name",\n};\n');
     const before = read(dir, 'src/copy.ts');
-    expect(await runRegister(['--from', 'scan'], io(dir))).toBe(0);
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
     const after = read(dir, 'content/descriptor.json');
 
     const second = io(dir);
     expect(await runRegister(['--from', 'scan'], second)).toBe(0);
     expect(second.out.join('\n')).toContain('register: nothing to adopt');
     expect(read(dir, 'content/descriptor.json')).toBe(after);
-    // `--write` is the source-edit gate, and a module shape has no source edit.
+    // A module shape has no source edit, on either run.
     expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
     expect(read(dir, 'src/copy.ts')).toBe(before);
   });
@@ -636,7 +642,7 @@ describe('runRegister — the parse-refusal wall', () => {
     write(dir, 'src/copy.ts', 'export const copy = {\n  footer_note: "A working name",\n};\n');
 
     const cap = io(dir);
-    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
     const adopted = cap.out.findIndex((l) => l.startsWith('adopted footer_note'));
     const count = cap.out.findIndex((l) => l.includes('4 file(s) could not be parsed cleanly'));
     expect(adopted).toBeGreaterThanOrEqual(0);
@@ -1899,5 +1905,258 @@ describe('register — the stage-5 review', () => {
     expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
     expect(cap.out.join('\n')).not.toContain('\u001b');
     expect(cap.out.join('\n')).toContain('�[2J');
+  });
+});
+
+/** Every file under `dir`, hashed: what "byte-identical" is measured by. */
+function tree(dir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (rel: string): void => {
+    for (const name of readdirSync(join(dir, rel))) {
+      const r = rel === '' ? name : `${rel}/${name}`;
+      if (statSync(join(dir, r)).isDirectory()) walk(r);
+      else out[r] = createHash('sha256').update(readFileSync(join(dir, r))).digest('hex');
+    }
+  };
+  walk('');
+  return out;
+}
+
+describe('register — the run without --write writes nothing (F55)', () => {
+  const PAGES_INDEX = SERVER_PAGE('<main><h1>Welcome</h1><p>A paragraph of copy.</p><a href="/about">Read more</a></main>');
+
+  it('a plain run leaves every file byte-identical; --write adds the three keys with no _2; a third run adds nothing', async () => {
+    const dir = project({ router: 'pages', provider: true });
+    write(dir, 'pages/index.tsx', PAGES_INDEX);
+    const before = tree(dir);
+    const plain = io(dir);
+    expect(await runRegister(['--from', 'scan'], plain)).toBe(0);
+    expect(tree(dir)).toEqual(before);
+    expect(plain.out.join('\n')).toContain('+++ b/pages/index.tsx');
+    expect(plain.out.at(-1)).toBe('register: run with --write to add 3 keys and apply the leaf edits');
+
+    const applied = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], applied)).toBe(0);
+    expect(Object.keys(descriptor(dir).keys).sort()).toEqual(['home_page_headline', 'home_page_link_text', 'home_page_paragraph']);
+    expect(applied.out.slice(-3)).toEqual([
+      'pages/index.tsx: rewrote 9 edits',
+      'wrote content/descriptor.json, content/defaults.json and the codegen modules: 3 keys added',
+      'register: applied',
+    ]);
+    expect(read(dir, 'pages/index.tsx')).toContain("copy('home_page_headline')");
+
+    const third = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], third)).toBe(0);
+    expect(third.out).toEqual(['register: nothing to adopt']);
+  });
+
+  it('a copy-module-only run prints adopts and writes nothing; --write lands it', async () => {
+    const dir = project({ copyModules: ['src/copy.ts'] });
+    write(dir, 'src/copy.ts', 'export const copy = {\n  footer_note: "A working name",\n};\n');
+    const before = tree(dir);
+    const plain = io(dir);
+    expect(await runRegister(['--from', 'scan'], plain)).toBe(0);
+    expect(plain.out).toEqual(['adopts footer_note = A working name', 'register: run with --write to add 1 key']);
+    expect(tree(dir)).toEqual(before);
+
+    const applied = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], applied)).toBe(0);
+    expect(applied.out).toEqual([
+      'adopted footer_note = A working name',
+      'wrote content/descriptor.json, content/defaults.json and the codegen modules: 1 key added',
+      'register: adopted as record — there are no source edits to apply',
+    ]);
+    expect(defaults(dir).default['footer_note']).toBe('A working name');
+  });
+
+  it('a batch refused part-way (an unwritable leaf) leaves every file as it was', async () => {
+    const dir = project();
+    write(dir, 'app/a/page.tsx', SERVER_PAGE('<h1>First page copy</h1>'));
+    write(dir, 'app/b/page.tsx', SERVER_PAGE('<h1>Second page copy</h1>'));
+    // The later leaf in file order cannot be written, so the batch has already
+    // written the repo forms and the first leaf when it fails.
+    chmodSync(join(dir, 'app/b/page.tsx'), 0o400);
+    const before = tree(dir);
+    let failed = false;
+    try {
+      await runRegister(['--from', 'scan', '--write'], io(dir));
+    } catch (error) {
+      failed = true;
+      expect((error as Error).message).toContain('the write batch failed');
+    } finally {
+      chmodSync(join(dir, 'app/b/page.tsx'), 0o600);
+    }
+    expect(failed).toBe(true);
+    expect(tree(dir)).toEqual(before);
+  });
+});
+
+describe('register — a literal whose text a declared key holds reuses it (F55)', () => {
+  const WEB = { shape: 'text', target: 'web' } as const;
+
+  it('never reuses a key a page reads for its SEO', async () => {
+    const dir = project({ keys: { seo_about_title: WEB }, defaults: { seo_about_title: 'About' } });
+    const d = descriptor(dir) as { keys: Record<string, unknown>; pages?: unknown };
+    d.pages = { about: { route: '/about', seo: { title: 'seo_about_title' } } };
+    write(dir, 'content/descriptor.json', JSON.stringify(d));
+    write(dir, 'app/page.tsx', SERVER_PAGE('<nav><a href="/about">About</a></nav>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out.join('\n')).not.toContain('reuses');
+    expect(read(dir, 'app/page.tsx')).toContain("copy('home_nav_link_text')");
+  });
+
+  it("never reuses a template's slot key", async () => {
+    const dir = project({ keys: { welcome__headline: WEB }, defaults: { welcome__headline: 'Welcome aboard' } });
+    const d = descriptor(dir) as { keys: Record<string, unknown>; templates?: unknown };
+    d.templates = { welcome: { class: 'transactional', trigger: 'app-event', slots: ['headline'] } };
+    write(dir, 'content/descriptor.json', JSON.stringify(d));
+    write(dir, 'app/page.tsx', SERVER_PAGE('<nav><a href="/start">Welcome aboard</a></nav>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out.join('\n')).not.toContain('reuses');
+    expect(read(dir, 'app/page.tsx')).toContain("copy('home_nav_link_text')");
+  });
+
+  it('never reuses a brand__ key', async () => {
+    const dir = project({ keys: { brand__name: WEB }, defaults: { brand__name: 'Acme' } });
+    write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Acme</h1>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out.join('\n')).not.toContain('reuses');
+    expect(read(dir, 'app/page.tsx')).toContain("copy('home_page_headline')");
+  });
+
+  it('reuses the orphan key a preview run left, adds no entry, mints no _2; a different text takes its own key', async () => {
+    const dir = project({ keys: { home_page_headline: WEB }, defaults: { home_page_headline: 'Welcome' } });
+    write(dir, 'app/page.tsx', SERVER_PAGE('<main><h1>Welcome</h1><h1>Welcome!</h1></main>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out).toContain('app/page.tsx: reuses home_page_headline = Welcome');
+    expect(Object.keys(descriptor(dir).keys).sort()).toEqual(['home_page_headline', 'home_page_headline_2']);
+    expect(defaults(dir).default['home_page_headline_2']).toBe('Welcome!');
+    expect(cap.out).toContain(
+      'wrote content/descriptor.json, content/defaults.json and the codegen modules: 1 key added, 1 reused',
+    );
+    const page = read(dir, 'app/page.tsx');
+    expect(page).toContain("<h1>{copy('home_page_headline')}</h1>");
+    expect(page).toContain("<h1>{copy('home_page_headline_2')}</h1>");
+  });
+
+  it('closes a reuse-only plain run with the leaf-edit line and writes nothing', async () => {
+    const dir = project({ keys: { home_page_headline: WEB }, defaults: { home_page_headline: 'Welcome' } });
+    write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Welcome</h1>'));
+    const before = tree(dir);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(cap.out.at(-1)).toBe('register: run with --write to apply the leaf edits');
+    expect(tree(dir)).toEqual(before);
+  });
+
+  it('never reuses across targets: a web literal beside an email key, an email literal beside a web key', async () => {
+    const web = project({ keys: { welcome_mail: { shape: 'text', target: 'html-email' } }, defaults: { welcome_mail: 'Welcome' } });
+    write(web, 'app/page.tsx', SERVER_PAGE('<h1>Welcome</h1>'));
+    const webCap = io(web);
+    expect(await runRegister(['--from', 'scan', '--write'], webCap)).toBe(0);
+    expect(webCap.out.join('\n')).not.toContain('reuses');
+    expect(read(web, 'app/page.tsx')).toContain("copy('home_page_headline')");
+
+    const mail = project({
+      managedSurfaces: ['lib/email/**/*.ts'],
+      emailSurfaces: ['lib/email/**/*.ts'],
+      keys: { site_greeting: WEB },
+      defaults: { site_greeting: 'Welcome aboard now' },
+    });
+    write(
+      mail,
+      'lib/email/welcome.ts',
+      "import { send } from './mailer';\nexport function welcome() {\n  return send({ subject: 'Welcome aboard now', to: 'a@b.co' });\n}\n",
+    );
+    const mailCap = io(mail);
+    expect(await runRegister(['--from', 'scan', '--write'], mailCap)).toBe(0);
+    expect(mailCap.out.join('\n')).not.toContain('reuses');
+    expect(descriptor(mail).keys['welcome_aboard_now']).toEqual({ shape: 'text', target: 'html-email' });
+  });
+
+  it('never reuses a key that derives or declares tags', async () => {
+    const dir = project({
+      keys: {
+        home_source: WEB,
+        home_title: { shape: 'text', target: 'web', derivesFrom: 'home_source', tmpl: '{v}' },
+        home_tagged: { shape: 'text', target: 'web', tags: 1 },
+      },
+      defaults: { home_source: 'Source text', home_title: 'Welcome', home_tagged: 'Hello there' },
+    });
+    write(dir, 'app/page.tsx', SERVER_PAGE('<main><h1>Welcome</h1><p>Hello there</p></main>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out.join('\n')).not.toContain('reuses');
+    expect(descriptor(dir).keys['home_page_headline']).toBeDefined();
+    expect(descriptor(dir).keys['home_page_paragraph']).toBeDefined();
+  });
+
+  it('takes the first of two declared keys by name', async () => {
+    const dir = project({ keys: { b_welcome: WEB, a_welcome: WEB }, defaults: { b_welcome: 'Welcome', a_welcome: 'Welcome' } });
+    write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Welcome</h1>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out).toContain('app/page.tsx: reuses a_welcome = Welcome');
+    expect(read(dir, 'app/page.tsx')).toContain("copy('a_welcome')");
+  });
+
+  it('leaves a reused literal out of --plan-out', async () => {
+    const dir = project({ keys: { home_page_headline: WEB }, defaults: { home_page_headline: 'Welcome' } });
+    write(dir, 'app/page.tsx', SERVER_PAGE('<main><h1>Welcome</h1><p>Fresh paragraph</p></main>'));
+    expect(await runRegister(['--from', 'scan', '--plan-out', 'naming.json'], io(dir))).toBe(0);
+    const plan = JSON.parse(read(dir, 'naming.json')) as { keys: Array<{ proposed: string }> };
+    expect(plan.keys.map((k) => k.proposed)).toEqual(['home_page_paragraph']);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--plan', 'naming.json', '--write'], cap)).toBe(0);
+    expect(cap.out).toContain('app/page.tsx: reuses home_page_headline = Welcome');
+    expect(read(dir, 'app/page.tsx')).toContain("copy('home_page_paragraph')");
+  });
+
+  it('reads a declared key named constructor as an own key', async () => {
+    const dir = project({ keys: { constructor: WEB }, defaults: { constructor: 'Welcome' } });
+    write(dir, 'app/page.tsx', SERVER_PAGE('<main><h1>Welcome</h1><p>Constructor text</p></main>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out).toContain('app/page.tsx: reuses constructor = Welcome');
+    expect(read(dir, 'app/page.tsx')).toContain("copy('constructor')");
+    expect(Object.keys(descriptor(dir).keys).sort()).toEqual(['constructor', 'home_page_paragraph']);
+  });
+
+  it("reuses a key declared for another page, a copy module's property, and onto a copy attribute", async () => {
+    const dir = project({
+      copyModules: ['src/copy.ts'],
+      keys: { about_page_headline: WEB, hero_title: WEB },
+      defaults: { about_page_headline: 'Welcome', hero_title: 'Our logo' },
+    });
+    write(dir, 'src/copy.ts', 'export const copy = {\n  hero_title: "Our logo",\n};\n');
+    write(dir, 'app/page.tsx', SERVER_PAGE('<main><h1>Welcome</h1><img src="/l.png" alt="Our logo" /></main>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.out).toContain('app/page.tsx: reuses about_page_headline = Welcome');
+    expect(cap.out).toContain('app/page.tsx: reuses hero_title = Our logo');
+    const page = read(dir, 'app/page.tsx');
+    expect(page).toContain("copy('about_page_headline')");
+    expect(page).toContain("alt={copy('hero_title')}");
+  });
+});
+
+describe('register — the alias guard runs only where a leaf edit is applied', () => {
+  it('a module-only --write lands its keys on a host whose alias resolves nowhere; a leaf edit there still refuses', async () => {
+    const dir = project({ tsconfig: null, copyModules: ['src/copy.ts'] });
+    write(dir, 'src/copy.ts', 'export const copy = {\n  footer_note: "A working name",\n};\n');
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(defaults(dir).default['footer_note']).toBe('A working name');
+    expect(cap.out.at(-1)).toBe('register: adopted as record — there are no source edits to apply');
+
+    const page = SERVER_PAGE('<h1>Adopt me now</h1>');
+    write(dir, 'app/page.tsx', page);
+    const before = tree(dir);
+    await expect(runRegister(['--from', 'scan', '--write'], io(dir))).rejects.toThrow(/no tsconfig\/jsconfig path mapping/);
+    expect(tree(dir)).toEqual(before);
   });
 });

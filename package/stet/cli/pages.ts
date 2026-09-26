@@ -737,6 +737,11 @@ export function pageOfFile(
   return route === '/' ? 'home' : (normalize(route) ?? undefined);
 }
 
+/** A static-HTML document's page word, `page` where it serves no page: the name register and scan both read. */
+export function htmlPageOf(cwd: string, file: string, pages: Record<string, PageDef> | undefined): string {
+  return pageOfFile(cwd, file, pages, { html: true }) ?? 'page';
+}
+
 /** The last extension of a path, lowercased — `features.md.ts` yields `.ts`. */
 function extensionOf(path: string): string {
   const base = path.slice(path.lastIndexOf('/') + 1);

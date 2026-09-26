@@ -680,7 +680,7 @@ describe('remove — the scaffolded host adopts its own copy (R3)', () => {
     expect(host.err.slice(scanned).join('\n')).toContain('propose key hero_headline');
 
     const adopted = host.out.length;
-    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
     expect(host.out.slice(adopted).join('\n')).toContain('2 keys added');
     const values = JSON.parse(host.file('content/defaults.json'))['default'] as Record<string, unknown>;
     expect(values['hero_headline']).toBe('Never miss a post again.');

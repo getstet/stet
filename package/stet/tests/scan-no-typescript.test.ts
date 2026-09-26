@@ -120,3 +120,22 @@ describe('runScan — typescript absent', () => {
     expect(cap.err.join('\n')).toContain("stet needs 'typescript' to read your source");
   });
 });
+
+describe('scan names nothing through a compiler that is not there (F54)', () => {
+  it('an Astro-only host with its forms present scans and exits 0 with typescript absent', async () => {
+    const dir = project({
+      router: 'astro',
+      rootLayout: undefined,
+      managedSurfaces: ['src/**/*.astro'],
+      copyModules: [],
+      descriptorPath: 'content/descriptor.json',
+      snapshotPath: 'content/defaults.json',
+    });
+    write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    write(dir, 'content/defaults.json', JSON.stringify({ default: {} }));
+    write(dir, 'src/pages/index.astro', '---\nconst title = "Home";\n---\n<h1>{title}</h1>\n<p>Your week, sorted</p>\n');
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    expect(cap.err.join('\n')).toContain('possible copy "Your week, sorted"');
+  });
+});
