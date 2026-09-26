@@ -792,14 +792,27 @@ function jsxItemReader(ts: typeof import('typescript'), sf: TS.SourceFile, texts
     ts.forEachChild(n, look);
   };
   look(sf);
-  const spans = texts.map((t) => ({ node: t, start: t.getStart(sf), end: t.end }));
+  // Sorted by start, so the texts inside a node are one run found by binary search: five thousand items stay linear.
+  const spans = texts.map((t) => ({ node: t, start: t.getStart(sf), end: t.end })).sort((a, b) => a.start - b.start);
   return itemReader<TS.Node>({
     parentOf: (n) => jsxParent(ts, n),
     childrenOf: (n) => children.get(n) ?? [],
     tagOf: (n) => jsxTagName(ts, sf, n),
     textsIn: (n) => {
       const start = n.getStart(sf);
-      return spans.filter((t) => t.start >= start && t.end <= n.end).map((t) => t.node);
+      let lo = 0;
+      let hi = spans.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if ((spans[mid] as (typeof spans)[number]).start < start) lo = mid + 1;
+        else hi = mid;
+      }
+      const inside: TS.Node[] = [];
+      for (let i = lo; i < spans.length && (spans[i] as (typeof spans)[number]).start < n.end; i += 1) {
+        const span = spans[i] as (typeof spans)[number];
+        if (span.end <= n.end) inside.push(span.node);
+      }
+      return inside;
     },
   });
 }

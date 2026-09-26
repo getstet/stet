@@ -3109,6 +3109,35 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
     expect(outside.stdout()).not.toMatch(/hook|seo check/);
   });
 
+  it('arms a site whose only findings are advisory over-length warns: psyon’s 63-character title', async () => {
+    const html = await makeHtmlHost({ register: true });
+    expect(await html.run('pages', 'scan', '--apply')).toBe(0);
+    const descriptor = JSON.parse(html.file('content/descriptor.json'));
+    const title = descriptor.pages.home.seo.title as string;
+    expect(descriptor.keys[title].limits).toEqual({ max: 60, severity: 'advisory' });
+    const snapshot = JSON.parse(html.file('content/defaults.json'));
+    snapshot.default[title] = 'Psyon — data acquisition and processing for AI labs, from Asia.';
+    expect(snapshot.default[title]).toHaveLength(63);
+    writeFileSync(join(html.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+    html.out.length = 0;
+    expect(await html.run('seo', 'check')).toBe(0);
+    expect(html.stdout()).toContain('0 errors');
+    expect(`${html.stdout()}\n${html.stderr()}`).toContain(`its title resolves through "${title}" to 63 characters, over the 60-character bound`);
+    await gated(html);
+    expect(await html.run('upgrade')).toBe(0);
+    expect(html.out).toContain(ARMED);
+    expect(entries(html)).toEqual([{ checkout: '', worktree: '', seo: true }]);
+  });
+
+  it('arms nothing under --dry-run', async () => {
+    const host = makeHost({ config: {} });
+    await gated(host);
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    expect(host.out).not.toContain(ARMED);
+    expect(entries(host)).toEqual([{ checkout: '', worktree: '' }]);
+    expect(host.file(RUNNER)).toBe('// the 0.5.1 runner\n');
+  });
+
   it('arms an html host and a snapshot-only site alike', async () => {
     const html = await makeHtmlHost({ register: true });
     await gated(html);

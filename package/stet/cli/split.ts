@@ -27,7 +27,7 @@ import { numberNames } from './key-names.js';
 import { planProblems, type NamingPlan } from './key-plan.js';
 import type { CliIo } from './main.js';
 import { htmlPageOf, pageOfFile } from './pages.js';
-import { accessorBaseName, keyMoveWrites, markRenames, readRenames, slotOrBrand, type HostRenames, type OnlyAt } from './rename.js';
+import { accessorBaseName, hostRefusals, keyMoveWrites, markRenames, readRenames, slotOrBrand, type HostRenames, type OnlyAt } from './rename.js';
 import { HostTextReport, UsageError } from './report.js';
 import { scanSource } from './source-scan.js';
 
@@ -117,12 +117,7 @@ export async function planSplit(
   for (const occ of [...all.rewritten, ...all.blocked]) places.set(`${occ.file}:${occ.line}`, { file: occ.file, line: occ.line });
   if (places.size <= 1) refused.push(`${key} is marked in one place — there is nothing to split`);
   else if (here.rewritten.length === 0 && here.blocked.length === 0) refused.push(`${at.file}:${at.line} holds no mark or read of ${key}`);
-  for (const occ of here.blocked) {
-    refused.push(`${occ.file}:${occ.line} reads "${key}" in a form stet cannot rewrite — edit it to the new name by hand, then re-run`);
-  }
-  for (const occ of here.unparsed) {
-    refused.push(`${occ.file}:${occ.line} an expression stet cannot parse — edit "${key}" in this file to the new name by hand, then re-run`);
-  }
+  refused.push(...hostRefusals(here, key));
   if (refused.length > 0) return { refused };
 
   const forms = splitForms(descriptor, snapshot, key, next);

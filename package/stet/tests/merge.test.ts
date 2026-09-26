@@ -115,6 +115,25 @@ describe('stet merge — the static-HTML host', () => {
     expect(brand.err).toEqual(['error: cannot rename brand__name: brand__ keys belong to the brand group']);
   });
 
+  it('refuses a key merged into itself, and a derived key on either side — nothing written', async () => {
+    const self = await psyon();
+    const before = bytes(self);
+    expect(await self.run('merge', 'home_header_link_text', '--into', 'home_header_link_text', '--write')).toBe(1);
+    expect(self.err).toEqual(['error: home_header_link_text: the key is the one it merges into — nothing to merge']);
+    expect(bytes(self)).toEqual(before);
+
+    const derived = await psyon({
+      keys: { home_share_description: { shape: 'text', target: 'web', derivesFrom: 'home_header_link_text', tmpl: '{v}' } },
+    });
+    const kept = bytes(derived);
+    expect(await derived.run('merge', 'home_share_description', '--into', 'home_contact_link_text', '--write')).toBe(1);
+    expect(derived.err).toContain('error: home_share_description derives from home_header_link_text — a derived key follows its source');
+    clear(derived);
+    expect(await derived.run('merge', 'home_contact_link_text', '--into', 'home_share_description', '--write')).toBe(1);
+    expect(derived.err).toContain('error: home_share_description derives from home_header_link_text — a derived key follows its source');
+    expect(bytes(derived)).toEqual(kept);
+  });
+
   it('copies a locale only the leaving key carries, and a derivation and a page reference follow', async () => {
     const page = PAGE.replace(
       '</title></head>',

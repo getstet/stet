@@ -167,6 +167,27 @@ describe('stet split — a JavaScript host', () => {
     expect(await host.run('check')).toBe(0);
   });
 
+  it('refuses a line whose expression stet cannot parse, naming it, and writes nothing', async () => {
+    const host = makeCliHost({ config: { project: 't', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'] } });
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as Descriptor;
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as Snapshot;
+    descriptor.keys['nav_docs'] = { shape: 'text', target: 'web' };
+    (snapshot['default'] as Record<string, unknown>)['nav_docs'] = 'Docs';
+    writeFileSync(join(host.cwd, 'content/descriptor.json'), `${JSON.stringify(descriptor, null, 2)}\n`);
+    writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(snapshot, null, 2)}\n`);
+    mkdirSync(join(host.cwd, 'src/pages'), { recursive: true });
+    writeFileSync(join(host.cwd, 'src/copy.ts'), "import { accessor, copyMap } from '../lib/content';\nexport const copy = copyMap;\nexport const get = accessor.get;\n");
+    const page = '---\nimport { copy } from "../copy";\n---\n<p>{copy.nav_docs}</p>\n<p>{copy.nav_docs}</p>\n<p>{copy.nav_docs +}</p>\n';
+    writeFileSync(join(host.cwd, 'src/pages/g.astro'), page);
+    const files = (): string[] => ['content/descriptor.json', 'content/defaults.json', 'src/pages/g.astro'].map((rel) => host.file(rel));
+    const before = files();
+    expect(await host.run('split', 'nav_docs', 'footer_docs', '--at', 'src/pages/g.astro:6', '--write')).toBe(1);
+    expect(host.err).toContain(
+      'error: src/pages/g.astro:6 an expression stet cannot parse — edit "nav_docs" in this file to the new name by hand, then re-run',
+    );
+    expect(files()).toEqual(before);
+  });
+
   it('refuses a read at the line in a form stet cannot rewrite', async () => {
     const host = next(['export const which = "home_hero_link_text";']);
     const before = readFileSync(join(host.cwd, 'app/page.tsx'), 'utf8');

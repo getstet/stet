@@ -18,7 +18,7 @@ import { rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
-import { keyMoveWrites, markRenames, readRenames, slotOrBrand, type HostRenames } from './rename.js';
+import { hostRefusals, keyMoveWrites, markRenames, readRenames, slotOrBrand, type HostRenames } from './rename.js';
 import { storeRowsLine } from './remove.js';
 import { HostTextReport, UsageError } from './report.js';
 
@@ -123,12 +123,7 @@ export async function planMerge(
 
   const renames = new Map([[leaving, into]]);
   const host = isHtmlHost(config) ? markRenames(cwd, config, renames) : await readRenames(cwd, config, renames);
-  for (const occ of host.blocked) {
-    refused.push(`${occ.file}:${occ.line} reads "${leaving}" in a form stet cannot rewrite — edit it to the new name by hand, then re-run`);
-  }
-  for (const occ of host.unparsed) {
-    refused.push(`${occ.file}:${occ.line} an expression stet cannot parse — edit "${leaving}" in this file to the new name by hand, then re-run`);
-  }
+  refused.push(...hostRefusals(host, leaving));
   if (refused.length > 0) return { refused };
 
   const merged = mergedForms(descriptor, snapshot, leaving, into);

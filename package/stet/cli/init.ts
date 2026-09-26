@@ -351,18 +351,27 @@ function detectHtmlHost(target: string): string | null {
  * which is the common shape of a hand-written site.
  */
 function manifestDeclaresNone(target: string, names: string[]): boolean {
-  let raw: Record<string, unknown>;
+  return names.every((name) => declaredDep(target, name, ['dependencies', 'devDependencies']) === null);
+}
+
+/**
+ * What the manifest at `target` declares for `name`, from the first of `fields`
+ * that holds it; null where none does, or where there is no manifest or it
+ * will not parse.
+ */
+function declaredDep(target: string, name: string, fields: readonly string[]): { range: unknown } | null {
+  let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8')) as Record<string, unknown>;
+    raw = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'));
   } catch {
-    return true;
+    return null;
   }
-  for (const field of ['dependencies', 'devDependencies']) {
-    const deps = raw[field];
-    if (typeof deps !== 'object' || deps === null) continue;
-    if (names.some((name) => Object.hasOwn(deps, name))) return false;
+  if (typeof raw !== 'object' || raw === null) return null;
+  for (const field of fields) {
+    const deps = (raw as Record<string, unknown>)[field];
+    if (typeof deps === 'object' && deps !== null && Object.hasOwn(deps, name)) return { range: (deps as Record<string, unknown>)[name] };
   }
-  return true;
+  return null;
 }
 
 /**
@@ -416,18 +425,10 @@ function probeRootLayout(target: string, base: '' | 'src/', router: 'app' | 'pag
  * matches the host's own reality rather than second-guessing it.
  */
 function detectReact(target: string): boolean {
-  try {
-    const raw = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8')) as Record<string, unknown>;
-    // All THREE maps: a component library declares react as a peer, and
-    // reading two of them called such a host react-less.
-    return ['dependencies', 'devDependencies', 'peerDependencies'].some((field) => {
-      const deps = raw[field];
-      return typeof deps === 'object' && deps !== null && Object.hasOwn(deps, 'react');
-    });
-  } catch {
-    // No manifest, or one that will not parse: nothing declares react.
-    return false;
-  }
+  // All THREE maps: a component library declares react as a peer, and reading
+  // two of them called such a host react-less. No manifest, or one that will
+  // not parse, declares nothing.
+  return declaredDep(target, 'react', ['dependencies', 'devDependencies', 'peerDependencies']) !== null;
 }
 
 /** A store exists when a config already declares one or a DB URL is in the env. */
@@ -492,13 +493,8 @@ function nextVersion(target: string, root: string): [number, number] | null {
     if (installed !== null) return installed;
   }
   for (const dir of dirs) {
-    const manifest = read(join(dir, 'package.json'));
-    for (const field of ['dependencies', 'devDependencies']) {
-      const deps = manifest?.[field];
-      if (typeof deps !== 'object' || deps === null || !Object.hasOwn(deps, 'next')) continue;
-      const declared = parsed((deps as Record<string, unknown>)['next']);
-      if (declared !== null) return declared;
-    }
+    const declared = parsed(declaredDep(dir, 'next', ['dependencies', 'devDependencies'])?.range);
+    if (declared !== null) return declared;
   }
   return null;
 }

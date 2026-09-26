@@ -243,12 +243,7 @@ export async function runRename(args: string[], io: CliIo): Promise<number> {
     }
     const mentioned = new Set((host?.mentions.filter((o) => o.key === old) ?? []).map((o) => `${o.file}:${o.line}`));
     for (const at of mentioned) report.line(`  ${at} mentions "${old}" in text — left as it is`);
-    for (const occ of host?.blocked.filter((o) => o.key === old) ?? []) {
-      report.line(`  ${occ.file}:${occ.line} reads "${old}" in a form stet cannot rewrite — edit it to the new name by hand, then re-run`);
-    }
-    for (const occ of host?.unparsed.filter((o) => o.key === old) ?? []) {
-      report.line(`  ${occ.file}:${occ.line} an expression stet cannot parse — edit "${old}" in this file to the new name by hand, then re-run`);
-    }
+    for (const line of host === null ? [] : hostRefusals(host, old)) report.line(`  ${line}`);
   }
   if (host !== null && !isHtmlHost(config)) {
     report.line(
@@ -788,6 +783,18 @@ export function keyMoveWrites(
 }
 
 /** What a rename does to the host's files, and what it leaves. */
+/** Each read of `key` stet cannot rewrite, then each it cannot parse, named with its line — rename's, merge's and split's words. */
+export function hostRefusals(host: HostRenames, key: string): string[] {
+  return [
+    ...host.blocked
+      .filter((occ) => occ.key === key)
+      .map((occ) => `${occ.file}:${occ.line} reads "${key}" in a form stet cannot rewrite — edit it to the new name by hand, then re-run`),
+    ...host.unparsed
+      .filter((occ) => occ.key === key)
+      .map((occ) => `${occ.file}:${occ.line} an expression stet cannot parse — edit "${key}" in this file to the new name by hand, then re-run`),
+  ];
+}
+
 export interface HostRenames {
   edited: Array<{ rel: string; text: string; diff: string }>;
   rewritten: Occurrence[];

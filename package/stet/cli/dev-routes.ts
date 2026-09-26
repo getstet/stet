@@ -33,7 +33,7 @@ import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js
 import { check } from './check.js';
 import type { StetConfig } from './config.js';
 import { filesForGlobs, staticPrefix } from './files.js';
-import { git, gitData, gitRun, gitState, operationInProgress, pushRemoteOf, runTool, uncommittedPaths } from './git.js';
+import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, type GitState } from './git.js';
 import {
   heldTextOf,
   isHeadText,
@@ -56,7 +56,7 @@ import { runCli, type CliIo } from './main.js';
 import { applyPages, fileRoute, proposeForHost } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
-import { keyMoveWrites } from './rename.js';
+import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { blankNonMarkup, dialectOf, matchGlob, type Dialect } from './source-scan.js';
@@ -518,17 +518,16 @@ function siteReply(site: SiteState, entry: WorkspaceEntry): Response {
     dev: devDefaults(config, entry),
     entry,
     pending: pendingForms(site),
-    git: { ...site.git, live: liveOf(site.path) },
+    git: { ...site.git, live: liveOf(site.path, site.git.branch) },
   });
 }
 
 /**
- * The live branch as this checkout knows it without the network: the push
- * remote's `HEAD` symref (`origin/main` → `main`), else null, which the page
- * reads as `main`.
+ * The live branch as this checkout knows it without the network, for the
+ * branch the site reply read: the push remote's `HEAD` symref (`origin/main`
+ * → `main`), else null, which the page reads as `main`.
  */
-function liveOf(cwd: string): string | null {
-  const branch = gitState(cwd).branch;
+function liveOf(cwd: string, branch: string | null): string | null {
   if (branch === null) return null;
   const chosen = pushRemoteOf(cwd, branch);
   return 'error' in chosen ? null : liveBranchOf(cwd, chosen.remote);
@@ -1037,16 +1036,27 @@ async function publishLive(site: SiteState): Promise<Response> {
   const remote = chosen.remote;
   const live = liveBranchOf(ready.path, remote) ?? (await remoteHeadOf(ready.path, remote)) ?? 'main';
   if (live === at.branch) return json({ error: `${at.branch} is the live branch`, at }, 409);
-  const exists = await gitRun(ready.path, ['ls-remote', '--exit-code', '--heads', remote, live]);
+  // Publish takes the commit the branch's upstream holds: a branch ahead of it,
+  // behind it or with none would publish a commit the preview never built.
+  const upstream = at.upstream ?? `${remote}/${at.branch}`;
+  const head = git(ready.path, ['rev-parse', 'HEAD']).out.trim();
+  if (at.upstream === null || git(ready.path, ['rev-parse', at.upstream]).out.trim() !== head) {
+    return json({ error: `push ${at.branch} first — it is not level with ${upstream}`, at }, 409);
+  }
+  // The full ref: a bare `main` would also match `refs/heads/feature/main`.
+  const exists = await gitRun(ready.path, ['ls-remote', '--exit-code', '--heads', remote, `refs/heads/${live}`]);
   if (exists.code === 2) return json({ error: `${live} does not exist on ${remote}`, at }, 409);
   if (exists.code !== 0) return json({ error: 'git ls-remote failed', output: exists.out, at }, 409);
-  const fetched = await gitRun(ready.path, ['fetch', remote, '--', live]);
+  const tracking = `refs/remotes/${remote}/${live}`;
+  // An explicit refspec: a single-branch clone's configured one would leave
+  // `<remote>/<live>` unwritten.
+  const fetched = await gitRun(ready.path, ['fetch', remote, '--', `+refs/heads/${live}:${tracking}`]);
   if (fetched.code !== 0) return json({ error: 'git fetch failed', output: fetched.out, at }, 409);
-  const tip = git(ready.path, ['rev-parse', `${remote}/${live}`]).out.trim();
-  if (tip === git(ready.path, ['rev-parse', 'HEAD']).out.trim()) {
+  const tip = git(ready.path, ['rev-parse', tracking]).out.trim();
+  if (tip === head) {
     return json({ output: '', live, already: true, at: gitState(ready.path) });
   }
-  const behind = await gitRun(ready.path, ['merge-base', '--is-ancestor', `${remote}/${live}`, 'HEAD']);
+  const behind = await gitRun(ready.path, ['merge-base', '--is-ancestor', tracking, 'HEAD']);
   if (behind.code === 1) return json({ error: `${live} has commits ${at.branch} lacks — bring them into ${at.branch} first`, at }, 409);
   if (behind.code !== 0) return json({ error: 'git merge-base failed', output: behind.out, at }, 409);
   const pushed = await gitRun(ready.path, ['push', remote, `HEAD:refs/heads/${live}`]);
@@ -1149,14 +1159,22 @@ async function mergeKeys(req: Request, site: SiteState): Promise<Response> {
   const body = await readJson(req);
   const plan = await planMerge(ready.path, ready.config, ready.descriptor, ready.snapshot, reqStr(body, 'key'), reqStr(body, 'into'));
   if ('refused' in plan) return json({ error: plan.refused.join('\n'), lines: plan.refused }, 409);
-  const report = new Report();
-  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, report).filter((p) => p.status !== 'unchanged');
+  return json(applyKeyMove(ready, plan, 'dashboard merge'));
+}
+
+/** A merge or split plan written as its command's one batch, answered with what changed and the checkout's state. */
+function applyKeyMove(
+  ready: Ready,
+  plan: { descriptor: Descriptor; snapshot: Snapshot; host: HostRenames },
+  label: string,
+): { written: string[]; touched: string | null; at: GitState; pending: string[] } {
+  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, new Report()).filter((p) => p.status !== 'unchanged');
   try {
     writePlanned(changed);
   } catch (error) {
-    rethrowBatchFailure('dashboard merge', error);
+    rethrowBatchFailure(label, error);
   }
-  return json({ written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) });
+  return { written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) };
 }
 
 /**
@@ -1175,14 +1193,7 @@ async function splitPlace(req: Request, site: SiteState): Promise<Response> {
   if (typeof name !== 'string' || name === '') throw new UsageError('name is required');
   const plan = await planSplit(ready.path, ready.config, ready.descriptor, ready.snapshot, key, name, at);
   if ('refused' in plan) return json({ error: plan.refused.join('\n'), lines: plan.refused }, 409);
-  const report = new Report();
-  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, report).filter((p) => p.status !== 'unchanged');
-  try {
-    writePlanned(changed);
-  } catch (error) {
-    rethrowBatchFailure('dashboard split', error);
-  }
-  return json({ written: changed.map((p) => p.label), key: name, touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) });
+  return json({ ...applyKeyMove(ready, plan, 'dashboard split'), key: name });
 }
 
 /**
@@ -1336,6 +1347,16 @@ function markupOf(site: Ready, sha: string, keys: readonly string[]): Array<{ fi
   const before = documentsAt(site, `${sha}^`);
   const marks = firstMarks(before, keys);
   const removed = new Set(keys);
+  // Each document's parent map and element list, built once however many marks read them.
+  const trees = new Map<Document, { parents: Map<Element, Element>; all: Element[] }>();
+  const treeOf = (document: Document): { parents: Map<Element, Element>; all: Element[] } => {
+    let tree = trees.get(document);
+    if (tree === undefined) {
+      tree = { parents: parentsOf(document), all: document.roots.flatMap((root) => [root, ...root.descendants]) };
+      trees.set(document, tree);
+    }
+    return tree;
+  };
   /** Whether every mark inside `el` (itself included) names a removed key. */
   const onlyRemoved = (file: string, el: Element): boolean =>
     before.claimed.every(
@@ -1343,7 +1364,7 @@ function markupOf(site: Ready, sha: string, keys: readonly string[]): Array<{ fi
     );
   /** From the mark's element up to `section`, the highest ancestor holding only removed keys' marks. */
   const climb = (mark: HtmlMark, section: Element): Element => {
-    const parents = parentsOf(mark.document);
+    const { parents } = treeOf(mark.document);
     let found = mark.element;
     for (let at = parents.get(mark.element); at !== undefined && found !== section; at = parents.get(at)) {
       if (!onlyRemoved(mark.file, at)) break;
@@ -1356,8 +1377,7 @@ function markupOf(site: Ready, sha: string, keys: readonly string[]): Array<{ fi
     const document = head.documents.find((d) => d.file === file);
     if (document === undefined) return false;
     const id = el.attrs.find((a) => a.name === 'id')?.value;
-    const parents = parentsOf(document);
-    const all = document.roots.flatMap((root) => [root, ...root.descendants]);
+    const { parents, all } = treeOf(document);
     return all.some(
       (other) =>
         other.tag === el.tag &&
@@ -1383,16 +1403,7 @@ function markupOf(site: Ready, sha: string, keys: readonly string[]): Array<{ fi
 function changedAmong(cwd: string, files: readonly string[]): string[] {
   if (files.length === 0) return [];
   const status = gitData(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...files.map((f) => `:(top,literal)${f}`)]);
-  const records = status.stdout.split('\0');
-  const names: string[] = [];
-  for (let i = 0; i < records.length; i += 1) {
-    const record = records[i] ?? '';
-    if (record.length < 4) continue;
-    names.push(record.slice(3));
-    // A rename carries its source path as the next record.
-    if (record[0] === 'R' || record[0] === 'C') i += 1;
-  }
-  return names;
+  return porcelainRecords(status.stdout).map((record) => record.path);
 }
 
 /**
@@ -1439,7 +1450,11 @@ async function restore(req: Request, site: SiteState): Promise<Response> {
     // The revert holds the commit undone; a key a later commit moved the same
     // entries around is still missing, and is added back into the same index.
     const abort = async (error: string, output?: string): Promise<Response> => {
-      await gitRun(ready.path, ['revert', '--abort']);
+      const aborted = await gitRun(ready.path, ['revert', '--abort']);
+      // An abort git refuses (an edit made to a reverted file since) leaves the revert in progress: say so.
+      if (aborted.code !== 0) {
+        return refuse('git revert --abort failed — finish it in the terminal', [output, aborted.out].filter(Boolean).join('\n'));
+      }
       return refuse(error, output);
     };
     let now: { descriptor: Descriptor; snapshot: Snapshot };

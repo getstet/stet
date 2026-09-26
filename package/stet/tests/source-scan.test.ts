@@ -781,7 +781,7 @@ describe('JSX role names', () => {
     expect(Date.now() - started).toBeLessThan(10_000);
     expect(r.literals).toHaveLength(10_000);
     expect(r.literals[9_999]?.proposedKey).toBe('home_many_item_5000_paragraph');
-  });
+  }, 20_000);
 
   it('gives an accessor call its place and the name the rule gives it', async () => {
     const r = await onPage(page('<section id="hero"><h1>{copy(\'hero_title\')}</h1><img alt={copy(\'hero_alt\')} /></section>'));

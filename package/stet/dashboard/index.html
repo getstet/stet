@@ -793,7 +793,7 @@ function branchBar() {
       ? '<a href="' + esc(link.url) + '" target="_blank" rel="noopener" style="font-size:11.5px">' + esc('Preview: ' + link.url + ' ↗') + '</a>'
       : '<span class="muted" style="font-size:11.5px">' + esc('No preview reported for ' + git.branch) + '</span>' +
         '<button class="btn sm" data-act="previewCheck">Check again</button>';
-  const publish = S.pending.length === 0 && !dirty() && git.upstream && git.ahead === 0
+  const publish = S.pending.length === 0 && !dirty() && git.upstream && git.ahead === 0 && git.behind === 0
     ? '<button class="btn sm" data-act="publishAsk">Publish to live</button>' : '';
   return '<span class="bdg">' + esc(git.branch + ' · preview') + '</span>' + preview + publish;
 }
@@ -2533,11 +2533,16 @@ async function linkThem() {
   const res = await post('/api/site/merge' + query(), { key: q.leaving, into: q.survivor });
   if (!res.ok) { S.message = res.body.error || 'the keys were not linked'; render(); return; }
   S.same = null;
-  await loadWorkspace();
-  S.sel = q.survivor;
-  S.group = groupOf(q.survivor);
-  render();
+  await reloadAndSelect(q.survivor);
   tst('Linked: ' + q.leaving + ' now reads ' + q.survivor);
+}
+
+/** After a write that moved keys: the page reloaded as `removeKey` reloads it, and `key` selected in its group. */
+async function reloadAndSelect(key) {
+  await loadWorkspace();
+  S.sel = key;
+  S.group = groupOf(key);
+  render();
 }
 
 /** A History row opened: the keys its commit removed; a second click closes it. */
@@ -2590,10 +2595,7 @@ async function split() {
   const res = await post('/api/site/split' + query(), { key: q.key, at: q.at, name: q.name });
   if (!res.ok) { S.message = res.body.error || 'that place cannot be split'; render(); return; }
   S.split = null;
-  await loadWorkspace();
-  S.sel = q.name;
-  S.group = groupOf(q.name);
-  render();
+  await reloadAndSelect(q.name);
 }
 
 

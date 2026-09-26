@@ -227,6 +227,16 @@ describe('git', () => {
     expect(pushRemoteOf(host.cwd, branch)).toEqual({ remote: 'up' });
   });
 
+  it('reads a branch tracking a local branch (branch.<b>.remote is .) as choosing no remote', () => {
+    const host = gitHost();
+    const branch = gitState(host.cwd).branch as string;
+    git(host.cwd, ['checkout', '-qb', 'feature', '--track', branch]);
+    expect(git(host.cwd, ['config', '--get', 'branch.feature.remote']).out.trim()).toBe('.');
+    expect(pushRemoteOf(host.cwd, 'feature')).toEqual({ error: 'this checkout has no remote' });
+    bareRemote(host.cwd, 'origin');
+    expect(pushRemoteOf(host.cwd, 'feature')).toEqual({ remote: 'origin' });
+  });
+
   it('names the remotes a and b when neither is chosen', () => {
     const host = gitHost();
     const branch = gitState(host.cwd).branch as string;
@@ -3046,6 +3056,64 @@ describe('POST /api/site/publish-live (D11)', () => {
     expect(existsSync(join(bare, 'received.log'))).toBe(false);
   });
 
+  it('refuses while a git operation is in progress, pushing nothing', async () => {
+    const { host, bare } = publishHost();
+    const tip = rev(bare, 'main');
+    writeFileSync(join(host.cwd, '.git/MERGE_HEAD'), `${rev(host.cwd, 'HEAD')}\n`);
+    const { handler } = handlerOver([host.cwd]);
+    const refused = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal');
+    expect(rev(bare, 'main')).toBe(tip);
+  });
+
+  it('refuses a live branch the remote holds only as the tail of another name', async () => {
+    const { host, bare } = publishHost();
+    git(bare, ['branch', 'feature/main', 'main']);
+    git(bare, ['symbolic-ref', 'HEAD', 'refs/heads/develop']);
+    git(bare, ['branch', '-D', 'main']);
+    const { handler } = handlerOver([host.cwd]);
+    const refused = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('main does not exist on origin');
+    expect(gitData(bare, ['rev-parse', '--verify', '-q', 'main']).code).not.toBe(0);
+  });
+
+  it('publishes from a single-branch clone, whose fetch refspec names its own branch alone', async () => {
+    const { bare } = publishHost();
+    const clone = tempDir('stet-single-');
+    git(clone, ['clone', '-q', '--single-branch', '--branch', 'develop', bare, '.']);
+    git(clone, ['config', 'user.email', 'c@test']);
+    git(clone, ['config', 'user.name', 'c']);
+    git(clone, ['commit', '-q', '--allow-empty', '-m', 'clone work']);
+    git(clone, ['push', '-q']);
+    expect(git(clone, ['config', '--get', 'remote.origin.fetch']).out.trim()).toBe('+refs/heads/develop:refs/remotes/origin/develop');
+    const { handler } = handlerOver([clone]);
+    const published = await post(handler, `/api/site/publish-live?site=${encodeURIComponent(realpathSync(clone))}`, {});
+    expect(published.status).toBe(200);
+    expect(published.body['live']).toBe('main');
+    expect(rev(bare, 'main')).toBe(rev(clone, 'HEAD'));
+  });
+
+  it('refuses a branch that is not level with its upstream', async () => {
+    const { host, bare } = publishHost();
+    const other = tempDir('stet-clone-');
+    git(other, ['clone', '-q', bare, '.']);
+    git(other, ['config', 'user.email', 'o@test']);
+    git(other, ['config', 'user.name', 'o']);
+    git(other, ['checkout', '-q', 'develop']);
+    git(other, ['commit', '-q', '--allow-empty', '-m', 'develop elsewhere']);
+    git(other, ['push', '-q', 'origin', 'develop']);
+    git(host.cwd, ['fetch', '-q', 'origin']);
+    const tip = rev(bare, 'main');
+    const { handler } = handlerOver([host.cwd]);
+    const refused = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('push develop first — it is not level with origin/develop');
+    expect(refused.body['at']).toMatchObject({ behind: 1, ahead: 0 });
+    expect(rev(bare, 'main')).toBe(tip);
+  });
+
   it('refuses on the live branch and on a detached HEAD', async () => {
     const { host } = publishHost();
     const { handler } = handlerOver([host.cwd]);
@@ -3302,6 +3370,22 @@ describe('GET /api/site/removed and POST /api/site/restore (D12)', () => {
     expect(rev(host.cwd, 'HEAD')).toBe(sha);
     expect(operationInProgress(host.cwd)).toBe(false);
     expect(git(host.cwd, ['status', '--porcelain']).out).toBe('');
+  });
+
+  it('says the revert is left in progress where git refuses the abort after a refused commit', async () => {
+    const host = await restoreHost();
+    const sha = removeOperating(host);
+    // A formatter-style hook: it edits a file the revert staged, then refuses, so the abort cannot reset it.
+    mkdirSync(join(host.cwd, '.git', 'hooks'), { recursive: true });
+    writeFileSync(join(host.cwd, '.git/hooks/pre-commit'), '#!/bin/sh\necho formatted >> notes.txt\necho gate says no\nexit 1\n', { mode: 0o755 });
+    const { handler } = handlerOver([host.cwd]);
+    const refused = await post(handler, `/api/site/restore${at(host)}`, { sha });
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('git revert --abort failed — finish it in the terminal');
+    expect(String(refused.body['output'])).toContain('gate says no');
+    expect(String(refused.body['output'])).toContain('notes.txt');
+    expect(rev(host.cwd, 'HEAD')).toBe(sha);
+    expect(operationInProgress(host.cwd)).toBe(true);
   });
 
   it('answers git’s output and writes nothing where the revert refuses to start', async () => {
@@ -7482,7 +7566,7 @@ describe('the page', () => {
       page.dom.window.close();
     });
 
-    it('shows no Publish and no preview on the live branch, nor Publish while the branch is ahead', async () => {
+    it('shows no Publish and no preview on the live branch, nor Publish while the branch is ahead or behind', async () => {
       const live = await paint({ site: siteBody({ git: { ...BRANCH, branch: 'main', upstream: 'origin/main' } }) });
       expect(branchBar(live).textContent).toBe('main · live');
       expect(live.requested('/api/site/preview-link')).toEqual([]);
@@ -7490,6 +7574,9 @@ describe('the page', () => {
       const ahead = await paint({ site: siteBody({ git: { ...BRANCH, ahead: 1 } }), routes: [['/api/site/preview-link', 200, { url: null }]] });
       expect(branchBar(ahead).querySelector('[data-act="publishAsk"]')).toBeNull();
       ahead.dom.window.close();
+      const behind = await paint({ site: siteBody({ git: { ...BRANCH, behind: 1 } }), routes: [['/api/site/preview-link', 200, { url: null }]] });
+      expect(branchBar(behind).querySelector('[data-act="publishAsk"]')).toBeNull();
+      behind.dom.window.close();
       const detached = await paint({ site: siteBody({ git: { ...BRANCH, branch: null, upstream: null } }) });
       expect(branchBar(detached).textContent).toBe('detached · c7b3961');
       detached.dom.window.close();

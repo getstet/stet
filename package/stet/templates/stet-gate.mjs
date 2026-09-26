@@ -2,8 +2,9 @@
 // `stet hook install` and run by the hook. It reads the checkouts from
 // stet-gate.json beside it and runs `stet check` and `stet scan` — and `stet
 // seo check` where the checkout's entry carries `seo` — in each one of this
-// worktree that the commit touches, with the stet installed in that checkout. It never runs npx and never reaches the registry. Node built-ins
-// only: it runs outside any package.
+// worktree that the commit touches, with the stet installed in that checkout.
+// It never runs npx and never reaches the registry. Node built-ins only: it
+// runs outside any package.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';

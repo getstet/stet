@@ -93,21 +93,33 @@ export function uncommittedPaths(cwd: string, pathspecs: string[]): string[] {
   const base = prefix.stdout.trim();
   const status = gitData(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...pathspecs]);
   if (status.code !== 0) return [];
-  const records = status.stdout.split('\0');
   const paths = new Set<string>();
-  for (let i = 0; i < records.length; i += 1) {
-    const record = records[i] ?? '';
-    if (record.length < 4) continue;
-    const x = record[0];
-    const y = record[1];
-    // A rename or a copy, in either column, carries its source path as the NEXT record.
-    if (x === 'R' || x === 'C' || y === 'R' || y === 'C') i += 1;
+  for (const { x, y, path } of porcelainRecords(status.stdout)) {
     // A deletion is the terminal's to commit, and an unmerged path is a merge's.
     if (x === 'D' || y === 'D' || x === 'U' || y === 'U' || (x === 'A' && y === 'A')) continue;
-    const path = record.slice(3);
     if (path.startsWith(base)) paths.add(path.slice(base.length));
   }
   return [...paths].sort();
+}
+
+/**
+ * `git status --porcelain=v1 -z` read as one record per path: its two status
+ * columns and its path from the repository's top. A rename or a copy, in
+ * either column, carries its source path as the next NUL-separated field, which
+ * is skipped.
+ */
+export function porcelainRecords(stdout: string): Array<{ x: string; y: string; path: string }> {
+  const fields = stdout.split('\0');
+  const records: Array<{ x: string; y: string; path: string }> = [];
+  for (let i = 0; i < fields.length; i += 1) {
+    const field = fields[i] ?? '';
+    if (field.length < 4) continue;
+    const x = field[0] as string;
+    const y = field[1] as string;
+    if (x === 'R' || x === 'C' || y === 'R' || y === 'C') i += 1;
+    records.push({ x, y, path: field.slice(3) });
+  }
+  return records;
 }
 
 /**
