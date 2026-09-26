@@ -25,6 +25,18 @@ import type * as TS from 'typescript';
 import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
 import { escapeRegExp } from '../src/seo.js';
 import type { Descriptor } from '../src/types.js';
+import {
+  baseName,
+  firstWords,
+  isHeadKind,
+  metaCopyNameOf,
+  roleOf,
+  SECTION_MAX,
+  SECTION_WORDS,
+  sectionWord,
+  type Place,
+  type SectionNode,
+} from './key-names.js';
 import { CliError } from './report.js';
 
 // `managedSurfaces` speaks a two-token glob — a single star for one path segment
@@ -160,7 +172,15 @@ export interface LocatedLiteral {
   text: string;
   context: 'jsx-text' | 'jsx-attr' | 'send-arg' | 'module';
   shape: LiteralShape;
+  /**
+   * The name a new key would take before the run numbers it: a JSX literal's
+   * role name (page, section, role), a copy module's own property name.
+   */
   proposedKey: string;
+  /** A JSX literal's place: its line, its element's tag and the attribute it fills. */
+  place?: Place;
+  /** A JSX literal's section word, `null` where none answers. */
+  sectionWord?: string | null;
   /** Insert point for `const copy = useCopy();` — the nearest block-bodied COMPONENT (not any callback); null otherwise. A module literal carries `null`: it is never rewritten. */
   enclosingBodyPos: number | null;
   /** Per-literal LEXICAL scope — what `copy` binds to AT this literal (nearest enclosing scope wins). `'stet'` = the nearest `copy` is the accessor: `const copy = useCopy()`, or a named `{ copy }` import from the read-path module. `'foreign'` = any other `copy` binding (a param, a `let`/`var copy`, a non-`useCopy` `const`, a `function copy`, a default/namespace import, a non-read-path `{ copy }`, or a block `const`/`let` declared AFTER this literal — TDZ) → register skips+reports. `'none'` = no `copy` in scope → register inserts. */
@@ -590,19 +610,6 @@ export function proposeKey(text: string): string {
 }
 
 /**
- * `base`, or the first `base_2`, `base_3` … the descriptor does not already
- * declare. Beside `proposeKey` because the pair is one act: propose a name, then
- * take a free one. `register` mints with it on both hosts.
- */
-export function freeKey(descriptor: Descriptor, base: string): string {
-  if (!(base in descriptor.keys)) return base;
-  for (let n = 2; ; n++) {
-    const candidate = `${base}_${n}`;
-    if (!(candidate in descriptor.keys)) return candidate;
-  }
-}
-
-/**
  * Why a JSX text node is out of stet's reach: it lives inside a message
  * catalog's element, or its author opted it out at the source. `null` where it
  * is ordinary copy.
@@ -665,6 +672,66 @@ function isSendCall(ts: typeof import('typescript'), call: TS.CallExpression): b
   if (ts.isIdentifier(e)) return e.text === 'send';
   if (ts.isPropertyAccessExpression(e)) return e.name.text === 'send';
   return false;
+}
+
+/**
+ * A JSX element's attribute as a literal string: `id="hero"`, or a string or
+ * a no-substitution template in braces, `id={"hero"}`. Undefined for any other
+ * value, which the source does not fix.
+ */
+function jsxStringAttr(ts: typeof import('typescript'), sf: TS.SourceFile, el: TS.Node, name: string): string | undefined {
+  const attrs = ts.isJsxElement(el)
+    ? el.openingElement.attributes
+    : ts.isJsxSelfClosingElement(el)
+      ? el.attributes
+      : undefined;
+  for (const prop of attrs?.properties ?? []) {
+    if (!ts.isJsxAttribute(prop) || prop.name.getText(sf) !== name) continue;
+    let init: TS.Node | undefined = prop.initializer;
+    if (init !== undefined && ts.isJsxExpression(init)) init = init.expression;
+    if (init !== undefined && (ts.isStringLiteral(init) || ts.isNoSubstitutionTemplateLiteral(init))) return init.text;
+  }
+  return undefined;
+}
+
+/**
+ * A JSX element's section word: key-names' `sectionWord` over its JSX
+ * ancestors, the element itself included. A heading's text is every JSX text
+ * inside it in order, a self-closing element read as a space, as the
+ * static-HTML host reads an element's plain text. A component tag never
+ * answers: what it renders is another file's.
+ */
+function jsxSectionWord(ts: typeof import('typescript'), sf: TS.SourceFile, from: TS.Node): string | null {
+  const textOf = (n: TS.Node): string => {
+    if (ts.isJsxText(n)) return n.text;
+    if (ts.isJsxSelfClosingElement(n)) return ' ';
+    return n.getChildren(sf).map(textOf).join('');
+  };
+  function* chain(): Generator<SectionNode> {
+    for (let at: TS.Node | undefined = from; at; at = at.parent) {
+      const tag = jsxTagName(ts, sf, at);
+      if (tag === undefined) continue;
+      const here = at;
+      yield {
+        tag,
+        id: () => jsxStringAttr(ts, sf, here, 'id'),
+        heading: () => {
+          let found: TS.JsxElement | undefined;
+          const look = (n: TS.Node): void => {
+            if (found !== undefined) return;
+            if (ts.isJsxElement(n) && /^h[1-6]$/.test(jsxTagName(ts, sf, n) ?? '')) {
+              found = n;
+              return;
+            }
+            ts.forEachChild(n, look);
+          };
+          if (ts.isJsxElement(here)) here.children.forEach(look);
+          return found === undefined ? undefined : found.children.map(textOf).join('');
+        },
+      };
+    }
+  }
+  return sectionWord(chain());
 }
 
 function jsxTagName(ts: typeof import('typescript'), sf: TS.SourceFile, el: TS.Node): string | undefined {
@@ -746,7 +813,11 @@ export function scriptKindFor(ts: typeof import('typescript'), file: string): TS
 export async function scanSource(
   file: string,
   source: string,
-  opts: { readPathImport: string },
+  opts: {
+    readPathImport: string;
+    /** The file's page word, where it serves a page; a component file has none. */
+    page?: string;
+  },
 ): Promise<ScanResult> {
   const ts = await loadTypescript();
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
@@ -822,6 +893,9 @@ export async function scanSource(
     context: 'jsx-text' | 'jsx-attr' | 'send-arg';
     enclosingBodyPos: number | null;
     copyBinding: 'stet' | 'foreign' | 'none';
+    place: Place;
+    /** The section word the nearest section answers, else the component's name in a file that serves no page. */
+    section: string | null;
   }
   const partials: PartialLiteral[] = [];
   const accessorCalls: LocatedAccessor[] = [];
@@ -996,6 +1070,35 @@ export async function scanSource(
     if (ts.isJsxOpeningElement(owner)) return owner.parent; // JsxElement
     return undefined;
   };
+  // Where a literal renders, for its role name: the line, the element's tag and
+  // the attribute it fills, and the section word — the nearest section's, else,
+  // in a file that serves no page, the component's own name.
+  const placeOf = (node: TS.Node, element: TS.Node | undefined, attr?: string): { place: Place; section: string | null } => {
+    const tag = element === undefined ? undefined : jsxTagName(ts, sf, element);
+    // A `<meta>`'s `content` is read under its name, as the static-HTML host reads it.
+    const meta =
+      element === undefined || tag === undefined || attr !== 'content'
+        ? null
+        : metaCopyNameOf(tag, (name) => jsxStringAttr(ts, sf, element, name));
+    const place: Place = {
+      file,
+      line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
+      ...(tag === undefined ? {} : { tag }),
+      ...(attr === undefined ? {} : { attr }),
+      ...(meta === null ? {} : { meta }),
+    };
+    let section = element === undefined ? null : jsxSectionWord(ts, sf, element);
+    if (section === null && opts.page === undefined) {
+      for (let cur = node.parent; cur; cur = cur.parent) {
+        const name = isFunctionLike(cur) ? functionName(cur) : undefined;
+        if (name !== undefined && /^[A-Z]/.test(name)) {
+          section = firstWords(name, SECTION_WORDS, SECTION_MAX) || null;
+          break;
+        }
+      }
+    }
+    return { place, section };
+  };
   // The send-site escape hatch: a leading `// stet-ignore-next-line` on the
   // statement the send call sits in.
   const enclosingStatement = (node: TS.Node): TS.Node => {
@@ -1029,7 +1132,7 @@ export async function scanSource(
   };
   const pushSendLiteral = (lit: TS.StringLiteral): void => {
     const pos = lit.getStart(sf);
-    partials.push({ pos, end: lit.end, raw: source.slice(pos, lit.end), text: lit.text, context: 'send-arg', enclosingBodyPos: enclosingComponentBodyPos(lit), copyBinding: copyBindingAt(lit) });
+    partials.push({ pos, end: lit.end, raw: source.slice(pos, lit.end), text: lit.text, context: 'send-arg', enclosingBodyPos: enclosingComponentBodyPos(lit), copyBinding: copyBindingAt(lit), ...placeOf(lit, undefined) });
   };
 
   const visit = (node: TS.Node): void => {
@@ -1110,7 +1213,7 @@ export async function scanSource(
       if (text !== '') {
         const suppression = jsxTextSuppression(ts, sf, node);
         if (suppression === 'i18n') i18nSkips.push({ file, pos, text });
-        else if (suppression === null) partials.push({ pos, end, raw: trimmed, text, context: 'jsx-text', enclosingBodyPos: enclosingComponentBodyPos(node), copyBinding: copyBindingAt(node) });
+        else if (suppression === null) partials.push({ pos, end, raw: trimmed, text, context: 'jsx-text', enclosingBodyPos: enclosingComponentBodyPos(node), copyBinding: copyBindingAt(node), ...placeOf(node, node.parent) });
       }
     }
 
@@ -1129,7 +1232,7 @@ export async function scanSource(
           // significant, so it is NOT collapsed (unlike jsx-text). `raw` stays
           // the quoted source slice, so the §2.4 re-confirm guard is untouched.
           const pos = init.getStart(sf);
-          partials.push({ pos, end: init.end, raw: source.slice(pos, init.end), text: decodeEntities(init.text), context: 'jsx-attr', enclosingBodyPos: enclosingComponentBodyPos(node), copyBinding: copyBindingAt(node) });
+          partials.push({ pos, end: init.end, raw: source.slice(pos, init.end), text: decodeEntities(init.text), context: 'jsx-attr', enclosingBodyPos: enclosingComponentBodyPos(node), copyBinding: copyBindingAt(node), ...placeOf(node, element, name) });
         }
       }
     }
@@ -1148,7 +1251,17 @@ export async function scanSource(
     // The JSX walk's own — send arguments included. It is the one shape the
     // rewrite engine accepts, and the one site that ever emits it.
     shape: 'jsx',
-    proposedKey: proposeKey(p.text),
+    // A send argument has no element to take a role from, and keeps the name its text gives.
+    proposedKey:
+      p.context === 'send-arg'
+        ? proposeKey(p.text)
+        : baseName({
+            ...(opts.page === undefined ? {} : { page: opts.page }),
+            ...(isHeadKind(p.place) ? {} : { section: p.section }),
+            role: roleOf(p.place),
+          }),
+    place: p.place,
+    sectionWord: p.section,
     enclosingBodyPos: p.enclosingBodyPos,
     copyBinding: p.copyBinding,
     accessorImported,
@@ -1550,21 +1663,21 @@ export interface DialectFinding {
   text: string;
 }
 
-const FRONTMATTER = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?=\r?\n|$)/;
+export const FRONTMATTER = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?=\r?\n|$)/;
 const SCRIPT_OR_STYLE = /<(script|style)\b[^>]*>[\s\S]*?<\/\1[ \t]*>/gi;
-const CODE_FENCE = /^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[^\n]*$/gm;
-const ESM_LINE = /^[ \t]*(?:import|export)\b[^\n]*$/gm;
+export const CODE_FENCE = /^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[^\n]*$/gm;
+export const ESM_LINE = /^[ \t]*(?:import|export)\b[^\n]*$/gm;
 /** `<![CDATA[ … ]]>` — its body may carry `>`, so it is matched to the real terminator. */
-const CDATA_SECTION = /<!\[CDATA\[[\s\S]*?\]\]>/g;
+export const CDATA_SECTION = /<!\[CDATA\[[\s\S]*?\]\]>/g;
 
 /**
  * The remaining bogus-comment forms — a processing instruction (`<? … ?>`), a
  * markup declaration and the doctype (`<! … >`). HTML terminates each at the
  * first `>`, and so does this.
  */
-const BOGUS_COMMENT = /<[?!][^>]*>/g;
+export const BOGUS_COMMENT = /<[?!][^>]*>/g;
 
-const HTML_COMMENT = /<!--[\s\S]*?-->/g;
+export const HTML_COMMENT = /<!--[\s\S]*?-->/g;
 /**
  * A tag, whose body cannot contain another `<`. The looser `<[^>]*>` treats a
  * bare `<` in prose as a tag opening and swallows everything up to the real

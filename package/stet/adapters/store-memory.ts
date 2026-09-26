@@ -194,6 +194,8 @@ export interface MemoryStore extends StoreAdapter {
   seed(rows: SeedRow[]): void;
   /** This project's rows, as data a test can assert over. */
   dump(): MemoryRow[];
+  /** This project's rename log, as `stet_renames` holds it: what `rename` reads beside the rows. */
+  renameLog(): RenameRecord[];
   /** The next call of this kind answers `unreachable`, once. */
   failNext?: 'read' | 'write';
 }
@@ -535,6 +537,10 @@ export function createMemoryStore(opts: { project: string; db?: MemoryDb }): Mem
 
     dump(): MemoryRow[] {
       return mine().map((r) => ({ ...r }));
+    },
+
+    renameLog(): RenameRecord[] {
+      return db.renames.filter((r) => r.project === project).map((r) => ({ ...r }));
     },
 
     async read(q = {}): Promise<StoreRow[] | StoreError> {

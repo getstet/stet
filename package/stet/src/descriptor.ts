@@ -99,26 +99,20 @@ export function checkDescriptorStructure(d: Descriptor): DescriptorWarning[] {
     });
   }
 
-  for (const [page, def] of Object.entries(d.pages ?? {})) {
-    // Existence only. The shape stays unconstrained on purpose — a robots key
-    // is legitimately `text` or `list` — so a wrong-shaped reference surfaces
-    // through the seo rules, which read the value, rather than here.
-    for (const [field, key] of Object.entries(def.seo ?? {})) {
-      if (key !== undefined && !(key in d.keys)) {
-        throw new DescriptorError(
+  // Existence only. The shape stays unconstrained on purpose — a robots key is
+  // legitimately `text` or `list` — so a wrong-shaped reference surfaces through
+  // the seo rules, which read the value, rather than here.
+  for (const { page, kind, field, key } of pageKeyReferences(d)) {
+    if (key in d.keys) continue;
+    throw kind === 'seo'
+      ? new DescriptorError(
           `pages/${page}/seo/${field}`,
           `page "${page}" references SEO field "${field}" through "${key}", which is not a key in this descriptor`,
-        );
-      }
-    }
-    for (const [field, key] of Object.entries(def.jsonLd?.bindings ?? {})) {
-      if (!(key in d.keys)) {
-        throw new DescriptorError(
+        )
+      : new DescriptorError(
           `pages/${page}/jsonLd/bindings/${field}`,
           `page "${page}" binds JSON-LD field "${field}" to "${key}", which is not a key in this descriptor`,
         );
-      }
-    }
   }
 
   for (const [template, def] of Object.entries(d.templates ?? {})) {
@@ -223,3 +217,21 @@ function schemaError(err: ErrorObject): DescriptorError {
 // run `npm run codegen:schema` after editing the JSON. The core reads no files.
 import { DESCRIPTOR_SCHEMA } from './descriptor-schema.generated.js';
 export { DESCRIPTOR_SCHEMA };
+
+/**
+ * Every page field that names a key — each `seo` field and each JSON-LD
+ * binding — in page order: the one walk the structural check reads, `remove`
+ * drops through and `rename` rewrites through.
+ */
+export function pageKeyReferences(
+  descriptor: Descriptor,
+): Array<{ page: string; kind: 'seo' | 'jsonLd'; field: string; key: string }> {
+  const out: Array<{ page: string; kind: 'seo' | 'jsonLd'; field: string; key: string }> = [];
+  for (const [page, def] of Object.entries(descriptor.pages ?? {})) {
+    for (const [field, key] of Object.entries(def.seo ?? {})) {
+      if (key !== undefined) out.push({ page, kind: 'seo', field, key });
+    }
+    for (const [field, key] of Object.entries(def.jsonLd?.bindings ?? {})) out.push({ page, kind: 'jsonLd', field, key });
+  }
+  return out;
+}

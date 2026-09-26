@@ -695,6 +695,27 @@ export async function applySql(connectionString: string, sql: string): Promise<v
   }
 }
 
+/**
+ * Whether `stet_renames` holds `oldKey` renamed to `newKey` for the project: a
+ * rename this database finished, whoever ran it. `rename` reads it where rows
+ * sit under a new name its own record does not account for.
+ */
+export async function renameRecorded(
+  connectionString: string,
+  p: { project: string; oldKey: string; newKey: string },
+): Promise<boolean> {
+  const pool = makePool(connectionString);
+  try {
+    const result = await pool.query<{ found: boolean } & pg.QueryResultRow>(
+      'select exists (select 1 from stet_renames where project = $1 and old_key = $2 and new_key = $3) as found',
+      [p.project, p.oldKey, p.newKey],
+    );
+    return result.rows[0]?.found === true;
+  } finally {
+    await pool.end();
+  }
+}
+
 /** The descriptor-version stamp migration 1's `''` promises (§4). */
 export async function writeDescriptorVersion(connectionString: string, v: string): Promise<void> {
   const pool = makePool(connectionString);

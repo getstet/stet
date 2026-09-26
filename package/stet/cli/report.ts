@@ -122,6 +122,15 @@ export function sanitizeLine(text: string): string {
 }
 
 /**
+ * Host text made safe to print a line or a diff at a time: every character
+ * `sanitizeLine` replaces but the line break and the tab, which a diff and a
+ * line of source hold as themselves.
+ */
+export function sanitizeText(text: string): string {
+  return text.replace(CONTROL_EVERYWHERE, (c) => (c === '\n' || c === '\t' ? c : '\uFFFD'));
+}
+
+/**
  * A finding rendered for a human channel: its level, and its message with every
  * terminal-active character replaced.
  *
@@ -324,5 +333,15 @@ export class Report {
       ...(extra ?? {}),
       message,
     });
+  }
+}
+
+/**
+ * A report whose lines carry host text — a line of source, a diff, a value — and
+ * print it made safe (`sanitizeText`). `register` and `rename` report through it.
+ */
+export class HostTextReport extends Report {
+  override line(text = ''): void {
+    super.line(sanitizeText(text));
   }
 }

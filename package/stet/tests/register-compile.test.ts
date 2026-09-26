@@ -105,7 +105,7 @@ const LEAF = (key: string): string =>
 describe('register regenerates the codegen so the leaf typechecks (R-CP6-1)', () => {
   it('the registered key is assignable to the narrowed ContentKey', async () => {
     const dir = await adopted();
-    const r = tscProbe(dir, LEAF('regenerated_key'));
+    const r = tscProbe(dir, LEAF('home_page_headline'));
     expect(r.output).toBe('');
     expect(r.ok).toBe(true);
   });

@@ -31,6 +31,7 @@ import { runPull } from './pull.js';
 import { runDiff, runGet, runList } from './read.js';
 import { runRegister } from './register.js';
 import { runRemove } from './remove.js';
+import { runRename } from './rename.js';
 import { CliError, UsageError } from './report.js';
 import { runScan } from './scan.js';
 import { runSeoCheck } from './seo.js';
@@ -94,6 +95,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return await runRegister(rest, io);
       case 'remove':
         return await runRemove(rest, io);
+      case 'rename':
+        return await runRename(rest, io);
       case 'eject':
         return await runEject(rest, io);
       case 'hook': {
@@ -249,8 +252,9 @@ export function usage(): string {
     'Setup (write or edit files in the adopting project):',
     '  init [--app DIR] [--host html] [--yes]   scaffold a project; the shown edits mount the CopyProvider and write the agent guidance',
     '  scan                       report unkeyed copy in the managed surfaces — warn by default',
-    '  register --from scan [--write] [--verbose]   add a key and rewrite the consuming leaf; --verbose lists every parse refusal',
+    '  register --from scan [--plan FILE | --plan-out FILE] [--write] [--verbose]   add keys named by role and rewrite the consuming leaf; --plan-out writes the names to edit, --plan applies them; --verbose lists every parse refusal',
     '  remove <key> [<key>...] [--write]   delete keys from descriptor + snapshot; plan first, --write applies',
+    '  rename <old> <new> | --plan FILE [--write] [--env NAME]   move keys to new names in the descriptor, snapshot, host reads and every store',
     "  pages scan [--apply [names…]]   declare the host's static routes as pages; scaffold their SEO keys empty",
     '  eject --write [--verbose]  un-rewrite the host, write content back, remove the dependency; --verbose lists every parse refusal',
     '  hook install               the opt-in pre-commit gate (stet check + stet scan)',

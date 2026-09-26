@@ -32,15 +32,26 @@ import type { Snapshot } from '../src/snapshot.js';
 import { targetAdapter } from '../src/targets/adapter.js';
 import { DEFAULT_TARGET, type Descriptor, type KeyDef } from '../src/types.js';
 import { plainOf } from '../src/validate.js';
-import { CliError, type Report } from './report.js';
+import { CliError, Report } from './report.js';
+import {
+  baseName,
+  isHeadKind,
+  metaCopyNameOf,
+  META_NAME_COPY,
+  META_PROPERTY_COPY,
+  numberNames,
+  roleOf,
+  sectionWord,
+  SITE_PAGE,
+  type Place,
+  type SectionNode,
+} from './key-names.js';
 import { applyFileEdits, formatDiff, type Edit } from './rewrite.js';
-import { validateValue } from './validate.js';
+import { validateUnnamed } from './validate.js';
 import {
   blankNonMarkup,
   decodeEntities,
   type Dialect,
-  freeKey,
-  proposeKey,
   qualifiesAsCopy,
   undecodedEntity,
 } from './source-scan.js';
@@ -120,10 +131,7 @@ const SECTIONING = new Set(['section', 'main', 'header', 'footer', 'nav', 'artic
 const ATTR_COPY = ['alt', 'aria-label', 'title', 'placeholder'] as const;
 
 /** `<meta name=…>` values whose `content` is copy. */
-const META_NAME_COPY = new Set(['description', 'twitter:title', 'twitter:description']);
 
-/** `<meta property=…>` values whose `content` is copy. A URL-valued meta (`og:url`) is never one. */
-const META_PROPERTY_COPY = new Set(['og:title', 'og:description']);
 
 /** The attributes a `data-stet-<attr>` mark may name. */
 const MARKABLE_ATTRS = new Set<string>([...ATTR_COPY, 'content']);
@@ -252,7 +260,13 @@ export interface HtmlProposal {
   /** The value with its placeholders removed — what the key is named from. */
   plain: string;
   tags: number;
-  proposedKey: string;
+  /**
+   * The section word of the element (`sectionWordOf`), `null` where no section
+   * answers — which the role name spells `page`.
+   */
+  sectionWord: string | null;
+  /** The role part of the element's name: its kind word underscored, else its tag or attribute. */
+  role: string;
   /** The offset of the open tag's `>` (or its `/>`), where a mark is inserted. */
   insertAt: number;
 }
@@ -876,12 +890,7 @@ function locate(document: Document): Located {
 
 /** The `name`/`property` a `<meta>`'s `content` is copy under, or null. */
 export function metaCopyName(el: Element): string | null {
-  if (el.tag !== 'meta') return null;
-  const name = el.attrs.find((a) => a.name === 'name')?.value;
-  if (name !== undefined && META_NAME_COPY.has(name)) return name;
-  const property = el.attrs.find((a) => a.name === 'property')?.value;
-  if (property !== undefined && META_PROPERTY_COPY.has(property)) return property;
-  return null;
+  return metaCopyNameOf(el.tag, (name) => el.attrs.find((a) => a.name === name)?.value);
 }
 
 /** Whether `<attr>` on this element is one stet manages — the refused set is everything else. */
@@ -959,6 +968,44 @@ export function proposeHtml(cwd: string, files: string[]): HtmlProposalSet {
   return { proposals, claimed, skips, documents };
 }
 
+/** Every element's parent in a document — the tree the tokenizer builds carries children alone. */
+export function parentsOf(document: Document): Map<Element, Element> {
+  const parents = new Map<Element, Element>();
+  const visit = (el: Element): void => {
+    for (const child of el.children) {
+      parents.set(child, el);
+      visit(child);
+    }
+  };
+  for (const root of document.roots) visit(root);
+  return parents;
+}
+
+/**
+ * The section word of an element (key-names' `sectionWord`) over its chain of
+ * parents: an `id` attribute, and a headed section's first heading's plain
+ * text, all of it.
+ *
+ * A word of its own beside `Element.section`, which stays the innermost id and
+ * keeps its meaning for scan's `--json` and the dashboard's grouping.
+ */
+export function sectionWordOf(el: Element, parents: Map<Element, Element>): string | null {
+  function* chain(): Generator<SectionNode> {
+    for (let at: Element | undefined = el; at !== undefined; at = parents.get(at)) {
+      const here = at;
+      yield {
+        tag: here.tag,
+        id: () => here.attrs.find((a) => a.name === 'id')?.value,
+        heading: () => {
+          const found = here.descendants.find((d) => /^h[1-6]$/.test(d.tag));
+          return found === undefined ? undefined : valueOf(found).plain;
+        },
+      };
+    }
+  }
+  return sectionWord(chain());
+}
+
 function readOne(
   document: Document,
   proposals: HtmlProposal[],
@@ -985,6 +1032,7 @@ function readOne(
     }
   };
   underSvg(document.roots, false);
+  const parents = parentsOf(document);
 
   // Which attributes a `data-stet-<attr>` already binds, so an attribute is
   // proposed exactly once and a bound one is silent.
@@ -1046,7 +1094,8 @@ function readOne(
       value: read.value,
       plain: read.plain,
       tags: read.tags,
-      proposedKey: proposeKey(read.plain),
+      sectionWord: sectionWordOf(el, parents),
+      role: roleOf({ file: document.file, line: line(el.openStart), tag: el.tag, ...(svg.has(el) ? { svg: true as const } : {}) }),
       insertAt: insertAtOf(document, el),
     });
   }
@@ -1141,7 +1190,14 @@ function readOne(
       value: text,
       plain: text,
       tags: 0,
-      proposedKey: proposeKey(text),
+      sectionWord: sectionWordOf(candidate.el, parents),
+      role: roleOf({
+        file: document.file,
+        line: line(candidate.el.openStart),
+        tag: candidate.el.tag,
+        attr: candidate.attr.name,
+        ...(candidate.metaName === null ? {} : { meta: candidate.metaName }),
+      }),
       insertAt: insertAtOf(document, candidate.el),
     });
   }
@@ -1552,6 +1608,34 @@ export interface HtmlRegisterPlan {
   derived: HtmlDerivation[];
   /** Existing literal head keys this run turns into derived ones; no document changes for them. */
   converted: HtmlDerivation[];
+  /** The keys this run adds, in the order it minted them: what a naming plan lists. */
+  minted: HtmlMint[];
+}
+
+/** A key this run adds, as a naming plan shows it. */
+export interface HtmlMint {
+  /** Its role name (`numberNames` over the run), or the name a plan chose. */
+  key: string;
+  /** The role name the rule gave it, before any plan. */
+  proposed: string;
+  /** Every element and attribute the run marks with it, in document order. */
+  places: Place[];
+  /** The value it is seeded with, or the template of a derived key. */
+  text: string;
+  sectionWord: string | null;
+  /** The name of the key a derived key follows. */
+  derivesFrom?: string;
+}
+
+/** What a naming plan says about one proposed key: its name, and the words that go on its entry. */
+export interface ChosenName {
+  /** `false` leaves the key out: no entry, no value, no mark. */
+  adopt?: false;
+  key: string;
+  label?: string;
+  help?: string;
+  /** The section word the entry writes; `null` writes none. */
+  section?: string | null;
 }
 
 /** One head text's derivation, where register reports it. */
@@ -1576,12 +1660,37 @@ export function isHeadText(at: {
   metaName?: string;
   inSvg?: true;
 }): boolean {
-  return at.kind === 'element' ? at.tag === 'title' && at.inSvg !== true : at.attr === 'content' && at.metaName !== undefined;
+  return isHeadKind(placeOf({ file: '', line: 0, ...at }));
 }
 
 /** Visible text: an element's text anywhere but `<title>`. */
 function isVisibleText(at: { kind: 'element' | 'attribute'; tag: string }): boolean {
   return at.kind === 'element' && at.tag !== 'title';
+}
+
+/**
+ * A proposal or a mark as the place the vocabulary reads: its file and line,
+ * its element, and for an attribute its name — a meta's `name` beside its
+ * `content` — and whether an `<svg>` holds it. The one place object the naming
+ * plan, the head-text rule and the dashboard's marks route share.
+ */
+export function placeOf(at: {
+  file: string;
+  line: number;
+  kind: 'element' | 'attribute';
+  tag: string;
+  attr?: string;
+  metaName?: string;
+  inSvg?: true;
+}): Place {
+  return {
+    file: at.file,
+    line: at.line,
+    tag: at.tag,
+    ...(at.kind === 'attribute' && at.attr !== undefined ? { attr: at.attr } : {}),
+    ...(at.metaName === undefined ? {} : { meta: at.metaName }),
+    ...(at.inSvg === undefined ? {} : { svg: true as const }),
+  };
 }
 
 /** A visible text shorter than this is never read as the heart of a longer head text. */
@@ -1671,9 +1780,15 @@ export function planHtmlRegister(input: {
   descriptor: Descriptor;
   snapshot: Snapshot;
   report: Report;
+  /** The page word of a document (`pageOfFile`); pages.ts owns routes, and importing it here would close a ring. */
+  pageOf: (file: string) => string;
+  /** A naming plan's choice for a proposed name, where the run applies one. */
+  chosen?: (proposed: string) => ChosenName | undefined;
 }): HtmlRegisterPlan {
-  const { cwd, files, descriptor, snapshot, report } = input;
+  const { cwd, files, descriptor, snapshot, report, pageOf, chosen } = input;
   const set = proposeHtml(cwd, files);
+  // The names the descriptor held before the run: a role name never lands on one.
+  const before = new Set(Object.keys(descriptor.keys));
   const defaults = (): Record<string, unknown> => snapshot['default'] ?? {};
   // An own-property read (`keyDefOf`), not a bare index: a name from the
   // SNAPSHOT or a DOCUMENT is read against the DESCRIPTOR's map, so
@@ -1712,12 +1827,17 @@ export function planHtmlRegister(input: {
   // Keyed by value AND declared tag count: sharing a `tags: 1` key onto an
   // element with no descendants writes a value the regenerator must refuse. A
   // key marked only on head texts is left out: visible text never shares one.
-  const byValue = new Map<string, string>();
+  // EVERY key per value, in name order and then as the run mints them (F40): a
+  // key tied to a derivation in another document is passed over for the next,
+  // so a third page carrying the text shares the second page's key.
+  const byValue = new Map<string, string[]>();
+  const holdValue = (slot: string, key: string): void => {
+    byValue.set(slot, [...(byValue.get(slot) ?? []), key]);
+  };
   for (const key of Object.keys(defaults()).sort()) {
     const text = literalOf(key);
     if (text === null || headOnly.has(key)) continue;
-    const slot = `${defOf(key)?.tags ?? 0}\u0000${text}`;
-    if (!byValue.has(slot)) byValue.set(slot, key);
+    holdValue(`${defOf(key)?.tags ?? 0}\u0000${text}`, key);
   }
   // Head texts by the text they render, derived keys by their resolution.
   const byHeadText = new Map<string, string>();
@@ -1726,37 +1846,46 @@ export function planHtmlRegister(input: {
     if (typeof text === 'string' && !byHeadText.has(text)) byHeadText.set(text, key);
   }
 
-  const edits = new Map<Document, Edit[]>();
-  let added = 0;
-  let shared = 0;
-  let marked = 0;
+  // A mark's edit names its key at the end, once the run's keys have their names.
+  // Whether each mark shares a key it did not mint, so the counts are read from
+  // the marks that land, once a plan has left some out.
+  const edits = new Map<Document, Array<{ at: number; key: string; attr?: string; shared: boolean }>>();
+  const placesOf = new Map<string, Place[]>();
+  const minting: Array<{ tmp: string; proposal: HtmlProposal; text: string }> = [];
   const derived: HtmlDerivation[] = [];
 
-  const markWith = (proposal: HtmlProposal, key: string): void => {
+  const markWith = (proposal: HtmlProposal, key: string, shared: boolean): void => {
     const document = set.documents.find((d) => d.file === proposal.file) as Document;
     // The ONE edit: an attribute at the end of the open tag. The text is
     // never touched.
     const list = edits.get(document) ?? [];
-    list.push({
-      pos: proposal.insertAt,
-      end: proposal.insertAt,
-      text: proposal.kind === 'element' ? ` data-stet="${key}"` : ` data-stet-${proposal.attr}="${key}"`,
-    });
+    list.push({ at: proposal.insertAt, key, shared, ...(proposal.kind === 'attribute' ? { attr: proposal.attr as string } : {}) });
     edits.set(document, list);
+    placesOf.set(key, [...(placesOf.get(key) ?? []), placeOf(proposal)]);
     markedIn(key, proposal.file);
-    marked += 1;
   };
   /** A fresh key, tentatively added so the save gate can read its own rules; reverted on a refusal, the JSX loop's idiom. */
+  // A fresh key takes a placeholder no descriptor key can equal (the key grammar
+  // admits no control character); its role name is given once the run knows
+  // every key it adds, so a repeated role is numbered from 1 across the run.
   const mint = (proposal: HtmlProposal, def: KeyDef, value: string | null): string | null => {
-    const key = freeKey(descriptor, proposal.proposedKey);
-    descriptor.keys[key] = def;
-    if (value !== null) (snapshot['default'] ??= {})[key] = value;
-    if (!validateValue(descriptor, snapshot, key, proposal.value, 'default', report)) {
-      delete descriptor.keys[key];
-      delete snapshot['default']?.[key];
-      return null;
-    }
-    added += 1;
+    const key = `\u0001${minting.length}`;
+    // The gate's findings name the key; the placeholder never reaches output, so
+    // they are told by the element's file and line.
+    const passed = validateUnnamed({
+      descriptor,
+      snapshot,
+      placeholder: key,
+      def,
+      stored: value,
+      value: proposal.value,
+      report,
+      name: `${proposal.file}:${proposal.line}`,
+      at: { at: { file: proposal.file, line: proposal.line } },
+      keep: true,
+    });
+    if (!passed) return null;
+    minting.push({ tmp: key, proposal, text: value ?? def.tmpl ?? '' });
     return key;
   };
 
@@ -1776,8 +1905,7 @@ export function planHtmlRegister(input: {
     sources.has(key) && [...(docsOf.get(key) ?? [])].some((doc) => doc !== file);
 
   for (const proposal of order.filter((p) => !isHeadText(p))) {
-    let key = byValue.get(`${proposal.tags}\u0000${proposal.value}`);
-    if (key !== undefined && tiedElsewhere(key, proposal.file)) key = undefined;
+    let key = (byValue.get(`${proposal.tags}\u0000${proposal.value}`) ?? []).find((k) => !tiedElsewhere(k, proposal.file));
     if (key === undefined) {
       const minted = mint(
         proposal,
@@ -1786,12 +1914,13 @@ export function planHtmlRegister(input: {
       );
       if (minted === null) continue;
       key = minted;
-      byValue.set(`${proposal.tags}\u0000${proposal.value}`, key);
-    } else {
-      shared += 1;
+      holdValue(`${proposal.tags}\u0000${proposal.value}`, key);
+      if (isVisibleText(proposal)) visible.set(key, proposal.value);
+      markWith(proposal, key, false);
+      continue;
     }
     if (isVisibleText(proposal)) visible.set(key, proposal.value);
-    markWith(proposal, key);
+    markWith(proposal, key, true);
   }
 
   /** The visible keys a head text in `file` may derive from: those marked in that document alone. */
@@ -1805,12 +1934,11 @@ export function planHtmlRegister(input: {
     let key = byHeadText.get(proposal.value);
     const from = key === undefined ? undefined : defOf(key)?.derivesFrom;
     if (key !== undefined && (from === undefined || onlyIn(from, proposal.file))) {
-      shared += 1;
-      markWith(proposal, key);
+      markWith(proposal, key, true);
       continue;
     }
     const found = derivationOf(descriptor, proposal.value, sourcesIn(proposal.file));
-    const unmarked = byValue.get(`0\u0000${proposal.value}`);
+    const unmarked = (byValue.get(`0\u0000${proposal.value}`) ?? [])[0];
     if (found !== null) {
       const minted = mint(proposal, { shape: 'text', target: DEFAULT_TARGET, derivesFrom: found.source, tmpl: found.tmpl }, null);
       if (minted === null) continue;
@@ -1818,15 +1946,16 @@ export function planHtmlRegister(input: {
       derived.push({ key, ...found, file: proposal.file, line: proposal.line });
     } else if (unmarked !== undefined && !docsOf.has(unmarked)) {
       // A key declared before the run and marked nowhere, before it or in it, is shared, as ever.
-      key = unmarked;
-      shared += 1;
+      byHeadText.set(proposal.value, unmarked);
+      markWith(proposal, unmarked, true);
+      continue;
     } else {
       const minted = mint(proposal, { shape: 'text', target: DEFAULT_TARGET }, proposal.value);
       if (minted === null) continue;
       key = minted;
     }
     byHeadText.set(proposal.value, key);
-    markWith(proposal, key);
+    markWith(proposal, key, false);
   }
 
   // The conversion: literal head keys the documents already carry.
@@ -1858,10 +1987,77 @@ export function planHtmlRegister(input: {
     converted.push({ key, ...found, file: first.file, line: first.line });
   }
 
+  // The names. Each key this run adds is named from its first mark — `site` for
+  // its page where it is marked in more than one document, no section for a
+  // head text — and the run's names are numbered together.
+  const bases = minting.map(({ tmp, proposal }) => {
+    const docs = docsOf.get(tmp) ?? new Set<string>();
+    return baseName({
+      page: docs.size > 1 ? SITE_PAGE : pageOf(proposal.file),
+      ...(isHeadText(proposal) ? {} : { section: proposal.sectionWord }),
+      role: proposal.role,
+    });
+  });
+  const proposedNames = numberNames(bases, (name) => before.has(name));
+  const finalOf = new Map<string, string>();
+  const minted: HtmlMint[] = [];
+  const dropped = new Set<string>();
+  minting.forEach(({ tmp, proposal, text }, i) => {
+    const proposed = proposedNames[i] as string;
+    const choice = chosen?.(proposed);
+    const def = descriptor.keys[tmp] as KeyDef;
+    delete descriptor.keys[tmp];
+    if (choice?.adopt === false) {
+      // Left out by the plan: its entry, its value and every mark it would get.
+      delete snapshot['default']?.[tmp];
+      dropped.add(tmp);
+      return;
+    }
+    const name = choice?.key ?? proposed;
+    finalOf.set(tmp, name);
+    const section = choice?.section === undefined ? proposal.sectionWord : choice.section;
+    descriptor.keys[name] = {
+      ...def,
+      ...(section === null ? {} : { section }),
+      ...(choice?.label === undefined ? {} : { label: choice.label }),
+      ...(choice?.help === undefined ? {} : { help: choice.help }),
+    };
+    const block = snapshot['default'];
+    if (block !== undefined && Object.hasOwn(block, tmp)) {
+      block[name] = block[tmp];
+      delete block[tmp];
+    }
+    minted.push({
+      key: name,
+      proposed,
+      places: placesOf.get(tmp) ?? [],
+      text,
+      sectionWord: proposal.sectionWord,
+      ...(def.derivesFrom === undefined ? {} : { derivesFrom: def.derivesFrom }),
+    });
+  });
+  const named = (key: string): string => finalOf.get(key) ?? key;
+  for (const def of Object.values(descriptor.keys)) {
+    if (def.derivesFrom !== undefined) def.derivesFrom = named(def.derivesFrom);
+  }
+  for (const mint of minted) if (mint.derivesFrom !== undefined) mint.derivesFrom = named(mint.derivesFrom);
+  const keptDerived = derived.filter((d) => !dropped.has(d.key));
+  derived.length = 0;
+  derived.push(...keptDerived);
+  for (const derivation of [...derived, ...converted]) {
+    derivation.key = named(derivation.key);
+    derivation.source = named(derivation.source);
+  }
+
   const edited: HtmlRegisterPlan['edited'] = [];
   for (const document of set.documents) {
-    const list = edits.get(document);
-    if (list === undefined) continue;
+    const marks = (edits.get(document) ?? []).filter((m) => !dropped.has(m.key));
+    if (marks.length === 0) continue;
+    const list: Edit[] = marks.map(({ at, key, attr }) => ({
+      pos: at,
+      end: at,
+      text: attr === undefined ? ` data-stet="${named(key)}"` : ` data-stet-${attr}="${named(key)}"`,
+    }));
     const out = applyFileEdits(document.source, list);
     edited.push({
       abs: join(cwd, document.file),
@@ -1870,7 +2066,13 @@ export function planHtmlRegister(input: {
       diff: formatDiff(document.file, document.source, out),
     });
   }
-  return { edited, added, shared, marked, derived, converted };
+  // The counts, from what lands: every key kept, every mark kept, and the
+  // marks among them that carry a key the mark did not mint.
+  const kept = [...edits.values()].flat().filter((m) => !dropped.has(m.key));
+  const added = minted.length;
+  const marked = kept.length;
+  const shared = kept.filter((m) => m.shared).length;
+  return { edited, added, shared, marked, derived, converted, minted };
 }
 
 // --- check's documents ------------------------------------------------------

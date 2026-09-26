@@ -5,7 +5,8 @@
  * never alters a published value, so a branch run cannot damage what is live.
  *
  * It re-scans (so a leaf already rewritten to an accessor call is a no-op —
- * idempotent), resolves key collisions with a `_2`/`_3` suffix, and refuses to
+ * idempotent), names each new key by its role (page, section, role, and a
+ * number where the role repeats in the run), and refuses to
  * rewrite what it cannot do safely: a client leaf with no `CopyProvider` mounted
  * (which would throw at render), a scope that already binds a foreign `copy`, a
  * client literal with no component body, or an ambiguous un-directived
@@ -14,7 +15,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, join, resolve as resolvePath } from 'node:path';
 
 import type * as TS from 'typescript';
 
@@ -41,20 +42,23 @@ import {
   type StetConfig,
 } from './config.js';
 import { filesForGlobs } from './files.js';
-import { planHtmlRegister } from './html-host.js';
+import { planHtmlRegister, type ChosenName, type HtmlRegisterPlan } from './html-host.js';
+import { kindOf, numberNames, type Place } from './key-names.js';
+import { fileHash, planProblems, planText, readPlan, refusePlan, type NamingPlan, type PlanEntry } from './key-plan.js';
+import { pageOfFile } from './pages.js';
 import type { CliIo } from './main.js';
-import { clip, collapseLines, plural, CliError, Report, UsageError } from './report.js';
+import { clip, collapseLines, plural, CliError, HostTextReport, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff, planRewrite, type Edit } from './rewrite.js';
 import {
-  freeKey,
   isJsxFile,
   matchGlob,
   scanModule,
   scanSource,
+  type LocatedLiteral,
   type Span,
 } from './source-scan.js';
 import { classifyAdoption } from './scan.js';
-import { validateValue } from './validate.js';
+import { validateUnnamed, validateValue } from './validate.js';
 
 /** App-Router files that are server components by default — every other .tsx is ambiguous without a directive. */
 const ROUTE_FILES = new Set([
@@ -70,10 +74,17 @@ const ROUTE_FILES = new Set([
 ]);
 
 export async function runRegister(args: string[], io: CliIo): Promise<number> {
-  const { values, positionals } = parse(args, { from: 'string', write: 'boolean', kind: 'string', verbose: 'boolean' });
+  const { values, positionals } = parse(args, {
+    from: 'string',
+    write: 'boolean',
+    kind: 'string',
+    verbose: 'boolean',
+    plan: 'string',
+    'plan-out': 'string',
+  });
   noPositionals(positionals, 'register');
   if (argText(values, 'from') !== 'scan') {
-    throw new UsageError('stet register --from scan [--write] [--kind server|client] [--verbose]');
+    throw new UsageError('stet register --from scan [--plan FILE | --plan-out FILE] [--write] [--kind server|client] [--verbose]');
   }
   const forcedKind = argText(values, 'kind');
   if (forcedKind !== undefined && forcedKind !== 'server' && forcedKind !== 'client') {
@@ -81,9 +92,19 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   }
   const write = flag(values, 'write');
   const verbose = flag(values, 'verbose');
+  const planIn = argText(values, 'plan');
+  const planOut = argText(values, 'plan-out');
+  if (planIn !== undefined && planOut !== undefined) {
+    throw new UsageError('stet register takes --plan or --plan-out, not both');
+  }
+  if (planOut !== undefined && write) {
+    throw new UsageError('stet register --plan-out writes the plan alone — run --plan with --write to apply it');
+  }
+  const naming: Naming = { ...(planIn === undefined ? {} : { planIn }), ...(planOut === undefined ? {} : { planOut }) };
 
   const config = loadConfig(io.cwd);
-  const report = new Report();
+  const report = new HostTextReport();
+  if (planOut !== undefined) refusePlanOut(io.cwd, planOut);
 
   // The html branch runs FIRST — ahead of the alias guard, which throws on the
   // defaulted `@/lib/content` of a config that writes no read path, and ahead of
@@ -94,7 +115,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     if (!htmlDescriptor) return report.emit(io);
     const htmlSnapshot = snapshotOf(config, io.cwd, report);
     if (!htmlSnapshot) return report.emit(io);
-    return registerHtml({ io, config, descriptor: htmlDescriptor, snapshot: htmlSnapshot, write, report });
+    return registerHtml({ io, config, descriptor: htmlDescriptor, snapshot: htmlSnapshot, write, report, naming });
   }
 
   // Before ANY write, the descriptor and snapshot included: a rewrite that
@@ -122,9 +143,22 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   // meet, and the walked map above already yields a single refusal per file.
   const refusals: string[] = [];
 
+  // Pass one: every surface parsed and classified before any literal is named,
+  // so a role that repeats across the run is numbered across it.
+  const adoptable: Array<{
+    file: string;
+    source: string;
+    literals: LocatedLiteral[];
+    target: Target;
+    kind: 'server' | 'client';
+  }> = [];
   for (const file of filesForGlobs(io.cwd, config.managedSurfaces)) {
     const source = readFileSync(join(io.cwd, file), 'utf8');
-    const result = await scanSource(file, source, { readPathImport: config.readPath.import });
+    const page = pageOfFile(io.cwd, file, descriptor.pages);
+    const result = await scanSource(file, source, {
+      readPathImport: config.readPath.import,
+      ...(page === undefined ? {} : { page }),
+    });
     if (result.parseErrors) {
       refusals.push(`${file}: could not be parsed cleanly — reported, not adopted`);
       walked.set(file, null);
@@ -151,27 +185,96 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       }
       continue;
     }
+    // A literal the gate or the rewrite would refuse is reported here and takes
+    // no name, so a run's numbers have no gaps. Neither depends on the key's name.
+    const literals = result.literals.filter((literal) => {
+      const passed = validateUnnamed({
+        descriptor,
+        snapshot,
+        placeholder: '\u0001',
+        def: { shape: 'text', target },
+        stored: literal.text,
+        value: literal.text,
+        report,
+        name: literal.proposedKey,
+        keep: false,
+      });
+      if (!passed) return false;
+      const planned = planRewrite(source, literal, literal.proposedKey, kind, config.readPath.import);
+      if (planned.skipped === undefined) return true;
+      report.warn('scan', `${file}: ${JSON.stringify(literal.proposedKey)} ${skipReason(planned.skipped)} — adopt by hand`);
+      return false;
+    });
+    if (literals.length > 0) adoptable.push({ file, source, literals, target, kind });
+  }
 
-    const edits: Edit[] = [];
+  // The copy modules, walked once here for their own names — which no JSX name
+  // may take — and again below for adoption.
+  const modules = new Map<string, Awaited<ReturnType<typeof scanModule>>>();
+  const propertyNames = new Map<string, string>();
+  for (const file of filesForGlobs(io.cwd, config.copyModules)) {
+    const handoff = walked.get(file);
+    if (handoff === null) continue;
+    const result = await scanModule(file, readFileSync(join(io.cwd, file), 'utf8'), handoff);
+    modules.set(file, result);
     for (const literal of result.literals) {
-      const key = freeKey(descriptor, literal.proposedKey);
+      if (literal.shape === 'property' || literal.shape === 'plain') propertyNames.set(literal.proposedKey, file);
+    }
+  }
+
+  // The names: the rule's, numbered across the run past every key declared
+  // before it and every copy-module name; then, under --plan, the plan's.
+  const run = adoptable.flatMap((f) => f.literals);
+  const before = new Set(Object.keys(descriptor.keys));
+  const numbered = numberNames(
+    run.map((l) => l.proposedKey),
+    (name) => before.has(name) || propertyNames.has(name),
+  );
+  const nameOf = new Map(run.map((literal, i) => [literal, numbered[i] as string]));
+  const resolved = resolveNaming({
+    io,
+    report,
+    config,
+    descriptor,
+    naming,
+    files: [...new Set([...filesForGlobs(io.cwd, config.managedSurfaces), ...filesForGlobs(io.cwd, config.copyModules)])],
+    mints: run.map((literal) => ({
+      proposed: nameOf.get(literal) as string,
+      sectionWord: literal.sectionWord ?? null,
+      places: literal.place === undefined ? [] : [literal.place],
+      text: literal.text,
+    })),
+    // A copy module's property adopts under its own name, so a plan's name may not take it.
+    also: (plan) =>
+      plan.keys
+        .filter((e) => e.adopt !== false && propertyNames.has(e.key))
+        .map((e) => `${e.proposed as string}: "${e.key}" is a property of ${propertyNames.get(e.key) as string}, which adopts under its own name`),
+  });
+  if ('exit' in resolved) return resolved.exit;
+  const { chosen } = resolved;
+  // A plan run shows what it will do and writes nothing until --write, as on the static-HTML host.
+  const planOnly = naming.planIn !== undefined && !write;
+
+  // Pass two: each file's literals keyed and rewritten.
+  for (const { file, source, literals, target, kind } of adoptable) {
+    const edits: Edit[] = [];
+    for (const literal of literals) {
+      const proposed = nameOf.get(literal) as string;
+      const choice = chosen?.(proposed);
+      if (choice?.adopt === false) continue;
+      const key = choice?.key ?? proposed;
+      const section = (choice?.section === undefined ? literal.sectionWord : choice.section) ?? undefined;
       // Tentatively add so the save gate can read the key's rules; revert on any refusal.
-      descriptor.keys[key] = { shape: 'text', target };
+      descriptor.keys[key] = {
+        shape: 'text',
+        target,
+        ...(section === undefined ? {} : { section }),
+        ...(choice?.label === undefined ? {} : { label: choice.label }),
+        ...(choice?.help === undefined ? {} : { help: choice.help }),
+      };
       (snapshot['default'] ??= {})[key] = literal.text;
-
-      if (!validateValue(descriptor, snapshot, key, literal.text, 'default', report)) {
-        delete descriptor.keys[key];
-        delete snapshot['default']?.[key];
-        continue;
-      }
-
+      // Pass one gated the text and proved the rewrite; neither reads the name.
       const planned = planRewrite(source, literal, key, kind, config.readPath.import);
-      if (planned.skipped !== undefined) {
-        delete descriptor.keys[key];
-        delete snapshot['default']?.[key];
-        report.warn('scan', `${file}: ${JSON.stringify(key)} ${skipReason(planned.skipped)} — adopt by hand`);
-        continue;
-      }
       edits.push(...planned.edits);
       added += 1;
     }
@@ -180,7 +283,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     const edited = applyFileEdits(source, edits);
     printedDiffs += 1;
     report.line(formatDiff(file, source, edited));
-    if (write) {
+    if (write && !planOnly) {
       writeText(join(io.cwd, file), edited);
       report.line(`${file}: rewrote ${plural(edits.length, 'edit')}`);
     }
@@ -193,19 +296,15 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   // kind, no provider check, no import insertion, and above all no rewrite. A
   // copy module is adopted as RECORD: it keeps its literals, and byte-equality
   // against the snapshot is what the drift gate then watches.
-  for (const file of filesForGlobs(io.cwd, config.copyModules)) {
-    const handoff = walked.get(file);
-    if (handoff === null) continue; // already refused in the surface loop; the flush reports it once
-    const source = readFileSync(join(io.cwd, file), 'utf8');
-    // The handoff carries the tree parsed BEFORE the surface loop's own
-    // `--write` may have rewritten this file, so the tree is stale relative to
-    // disk. That is safe rather than merely tolerated: `scanModule` reads the
-    // TREE's own text wherever it reads by position, so its offsets and its
-    // bytes always come from the same document. Re-walking instead would be
-    // worse — the rewrite just wrote fresh `copy('key')` calls whose key
-    // arguments would need fresh claims, re-opening the accessor-key leak on
-    // exactly the files most likely to have one.
-    const result = await scanModule(file, source, handoff);
+  for (const [file, result] of modules) {
+    // The walk ran before the surface pass's own `--write` may have rewritten
+    // this file, over the tree the JSX walk handed it. That is safe rather than
+    // merely tolerated: `scanModule` reads the TREE's own text wherever it reads
+    // by position, so its offsets and its bytes always come from the same
+    // document. Re-walking instead would be worse — the rewrite just wrote fresh
+    // `copy('key')` calls whose key arguments would need fresh claims,
+    // re-opening the accessor-key leak on exactly the files most likely to have
+    // one.
     if (result.parseErrors) {
       refusals.push(`${file}: could not be parsed cleanly — reported, not adopted`);
       continue;
@@ -217,7 +316,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       // reaches the descriptor write.
       if (literal.shape !== 'property' && literal.shape !== 'plain') continue;
 
-      // OWN NAME ONLY — `freeKey` is never called for a module shape. A
+      // OWN NAME ONLY — a module shape is never numbered. A
       // suffixed key forks the registry from the module it was read out of,
       // silently, and every later comparison is against a name the module does
       // not use.
@@ -228,7 +327,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       if (verdict === 'adopted') continue;
       if (verdict === 'diverged') {
         // Reported, never adopted and never written. `register` only ADDS keys,
-        // and with `freeKey` gone the assignment below would otherwise replace
+        // and with no number taken the assignment below would otherwise replace
         // an existing definition outright — these verdicts are the only guard.
         report.warn(
           'scan',
@@ -259,6 +358,10 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report.line(line);
   }
 
+  if (added > 0 && planOnly) {
+    report.line('register: run with --write to apply the plan');
+    return report.emit(io);
+  }
   if (added > 0) {
     // ONE batch, with rollback: the descriptor, the snapshot and the codegen
     // modules land together or not at all. The codegen regenerates here so the
@@ -356,15 +459,52 @@ function registerHtml(d: {
   snapshot: Snapshot;
   write: boolean;
   report: Report;
+  naming: Naming;
 }): number {
-  const { io, config, descriptor, snapshot, write, report } = d;
-  const plan = planHtmlRegister({
-    cwd: io.cwd,
-    files: filesForGlobs(io.cwd, config.managedSurfaces),
-    descriptor,
-    snapshot,
-    report,
-  });
+  const { io, config, descriptor, snapshot, write, report, naming } = d;
+  const files = filesForGlobs(io.cwd, config.managedSurfaces);
+  const pageOf = (file: string): string => pageOfFile(io.cwd, file, descriptor.pages, { html: true }) ?? 'page';
+  const run = (
+    forms: { descriptor: Descriptor; snapshot: Snapshot },
+    runReport: Report,
+    chosen?: (proposed: string) => ChosenName | undefined,
+  ): HtmlRegisterPlan =>
+    planHtmlRegister({
+      cwd: io.cwd,
+      files,
+      descriptor: forms.descriptor,
+      snapshot: forms.snapshot,
+      report: runReport,
+      pageOf,
+      ...(chosen === undefined ? {} : { chosen }),
+    });
+
+  // The naming plan: the run as the rule would make it, on copies of the forms,
+  // so nothing a plan decides depends on anything but the tree it was made from.
+  let chosen: ((proposed: string) => ChosenName | undefined) | undefined;
+  if (naming.planOut !== undefined || naming.planIn !== undefined) {
+    const probe = run({ descriptor: structuredClone(descriptor), snapshot: structuredClone(snapshot) }, new Report());
+    const resolved = resolveNaming({
+      io,
+      report,
+      config,
+      descriptor,
+      naming,
+      files,
+      mints: probe.minted,
+      // A key the plan leaves out may not be what an adopted key derives from.
+      also: (plan) => {
+        const out = new Set(plan.keys.filter((e) => e.adopt === false).map((e) => e.proposed as string));
+        return [...probe.derived, ...probe.converted]
+          .filter((derivation) => out.has(derivation.source) && !out.has(derivation.key))
+          .map((derivation) => `${derivation.source}: ${derivation.key} derives from it — adopt both or neither`);
+      },
+    });
+    if ('exit' in resolved) return resolved.exit;
+    chosen = resolved.chosen;
+  }
+
+  const plan = run({ descriptor, snapshot }, report, chosen);
   for (const document of plan.edited) {
     if (document.diff !== '') report.line(document.diff);
   }
@@ -415,6 +555,124 @@ function registerHtml(d: {
   report.line('register: applied');
   return report.emit(io);
 }
+
+/** A proposed key as a naming plan lists it. */
+interface Mint {
+  proposed: string;
+  sectionWord: string | null;
+  places: Place[];
+  text: string;
+}
+
+/**
+ * The naming plan's half of a register run, shared by both hosts. `--plan-out`
+ * writes the plan and ends the run (`exit`); `--plan` reads it and answers the
+ * choice per proposal, or refuses it and ends the run; neither answers no choice.
+ */
+function resolveNaming(d: {
+  io: CliIo;
+  report: Report;
+  config: StetConfig;
+  descriptor: Descriptor;
+  naming: Naming;
+  files: string[];
+  mints: Mint[];
+  also?: (plan: NamingPlan) => string[];
+}): { exit: number } | { chosen?: (proposed: string) => ChosenName | undefined } {
+  const { io, report, config, descriptor, naming, files, mints } = d;
+  if (naming.planOut === undefined && naming.planIn === undefined) return {};
+  const made = madeHashes(io.cwd, config, files);
+  if (naming.planOut !== undefined) {
+    const plan: NamingPlan = {
+      plan: 'stet register',
+      version: 1,
+      made,
+      keys: mints.map((mint) => ({
+        proposed: mint.proposed,
+        key: mint.proposed,
+        label: null,
+        help: null,
+        section: mint.sectionWord,
+        adopt: true,
+        kind: mint.places[0] === undefined ? 'text' : kindOf(mint.places[0]),
+        places: mint.places.map(placeLine),
+        text: mint.text,
+      })),
+    };
+    try {
+      writeText(resolvePath(io.cwd, naming.planOut), planText(plan));
+    } catch (error) {
+      throw new CliError(`--plan-out ${naming.planOut}: the plan cannot be written there — ${(error as Error).message}`);
+    }
+    report.line(
+      `wrote ${naming.planOut}: the naming plan for ${plural(plan.keys.length, 'key')} — edit key, label and help, ` +
+        `then run stet register --from scan --plan ${naming.planOut}`,
+    );
+    return { exit: report.emit(io) };
+  }
+  const file = naming.planIn as string;
+  const plan = readPlan(io.cwd, file, 'stet register');
+  const problems = planProblems(plan, file, descriptor, mints.map((m) => m.proposed), { hashes: made });
+  problems.push(...(d.also?.(plan) ?? []));
+  if (problems.length > 0) return { exit: refusePlan(io, report, 'stet register', file, problems) };
+  const byProposed = new Map<string, PlanEntry>(plan.keys.map((e) => [e.proposed as string, e]));
+  return {
+    chosen: (proposed) => {
+      const e = byProposed.get(proposed);
+      if (e === undefined) return undefined;
+      if (e.adopt === false) return { adopt: false, key: e.key };
+      return {
+        key: e.key,
+        ...(e.label === null || e.label === undefined ? {} : { label: e.label }),
+        ...(e.help === null || e.help === undefined ? {} : { help: e.help }),
+        ...(e.section === undefined ? {} : { section: e.section }),
+      };
+    },
+  };
+}
+
+/**
+ * `--plan-out` names a new file or an earlier plan. Any other file that exists
+ * is refused — the descriptor, the snapshot, the config, a managed file, a copy
+ * module, a codegen or read-path file, under whatever spelling a
+ * case-insensitive disk or a link gives it — because the check reads the file
+ * itself, never its name.
+ */
+function refusePlanOut(cwd: string, planOut: string): void {
+  const target = resolvePath(cwd, planOut);
+  if (!existsSync(target)) return;
+  let marker: unknown;
+  try {
+    marker = (JSON.parse(readFileSync(target, 'utf8')) as { plan?: unknown } | null)?.plan;
+  } catch {
+    marker = undefined;
+  }
+  if (marker === 'stet register' || marker === 'stet rename') return;
+  throw new CliError(`--plan-out ${planOut}: the file exists and is not a stet plan — name a new file, or an earlier plan to replace`);
+}
+
+/** What `--plan` and `--plan-out` asked of this run. */
+interface Naming {
+  planIn?: string;
+  planOut?: string;
+}
+
+/** A place as a plan lists it: `index.html:467 <h1>`, `index.html:9 <meta> og:description`. */
+function placeLine(place: { file: string; line: number; tag?: string; attr?: string; meta?: string }): string {
+  const what = place.tag === undefined ? '' : ` <${place.tag}>`;
+  const attr = place.attr === undefined ? '' : place.meta === undefined ? ` ${place.attr}` : ` ${place.meta}`;
+  return `${place.file}:${place.line}${what}${attr}`;
+}
+
+/** The `made` map of a register plan: every file the run reads, hashed. */
+function madeHashes(cwd: string, config: StetConfig, files: string[]): Record<string, string> {
+  const made: Record<string, string> = {};
+  for (const rel of [config.descriptorPath, config.snapshotPath, ...files].sort()) {
+    if (existsSync(join(cwd, rel))) made[rel] = fileHash(cwd, rel);
+  }
+  return made;
+}
+
 
 /**
  * The target a file's keys take. Derived from the SURFACE the file matched — an

@@ -63,16 +63,17 @@ describe('runScan', () => {
     expect(code).toBe(0);
     const findings = cap.err.join('\n');
     expect(findings).toContain('app/page.tsx:2');
-    expect(findings).toContain('your_week_sorted');
+    // The role name before its number: the home page, no section, a headline.
+    expect(findings).toContain('"Your week, sorted" — propose key home_page_headline');
   });
 
   it('still reports a literal whose proposed key collides with an existing descriptor key (P2-B)', async () => {
     const dir = project();
-    write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: { your_week_sorted: { shape: 'text', target: 'web' } } }));
+    write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: { home_page_headline: { shape: 'text', target: 'web' } } }));
     write(dir, 'app/page.tsx', COMPONENT('<h1>Your week, sorted</h1>'));
     const cap = io(dir);
     await runScan([], cap);
-    expect(cap.err.join('\n')).toContain('your_week_sorted');
+    expect(cap.err.join('\n')).toContain('"Your week, sorted" — propose key home_page_headline');
   });
 
   it('suppresses a baselined literal even after a line is inserted above it', async () => {
@@ -85,7 +86,7 @@ describe('runScan', () => {
     const cap = io(dir);
     const code = await runScan([], cap);
     expect(code).toBe(0);
-    expect(cap.err.join('\n')).not.toContain('steady_copy_here');
+    expect(cap.err.join('\n')).not.toContain('home_page_headline');
   });
 
   it('reports a <Trans> string as i18n info, never a key', async () => {
@@ -93,8 +94,8 @@ describe('runScan', () => {
     write(dir, 'app/page.tsx', COMPONENT('<Trans>Hello there</Trans>'));
     const cap = io(dir);
     await runScan([], cap);
+    expect(cap.err.join('\n')).not.toContain('home_page_trans');
     expect(cap.out.join('\n')).toContain('i18n copy');
-    expect(cap.err.join('\n')).not.toContain('hello_there');
   });
 
   it('does not scan a file outside the globs', async () => {
@@ -105,8 +106,8 @@ describe('runScan', () => {
     await runScan([], cap);
     const findings = cap.err.join('\n');
     // scan reads only what the globs match, so the outside literal never surfaces.
-    expect(findings).toContain('managed_copy');
-    expect(findings).not.toContain('unmanaged_copy');
+    expect(findings).toContain('"Managed copy" — propose key home_page_headline');
+    expect(findings).not.toContain('Unmanaged copy');
   });
 
   it('P3-17 — never enumerates node_modules/dist even under a **-prefixed glob', async () => {
@@ -119,18 +120,19 @@ describe('runScan', () => {
     const cap = io(dir);
     await runScan([], cap);
     const findings = cap.err.join('\n');
-    expect(findings).toContain('managed_here');
-    expect(findings).not.toContain('vendored_copy');
-    expect(findings).not.toContain('built_copy');
+    expect(findings).toContain('"Managed here" — propose key home_page_headline');
+    expect(findings).not.toContain('Vendored copy');
+    expect(findings).not.toContain('Built copy');
   });
 
   it('reports a parse-error file as info, not scanned', async () => {
     const dir = project();
-    write(dir, 'app/page.tsx', 'export default function Page( {  return <h1>Broken</h1>;\n');
+    // A stray brace after an intact component: the file is unparseable, its <h1> readable.
+    write(dir, 'app/page.tsx', 'export default function Page() {\n  return <h1>Broken</h1>;\n}\n}\n');
     const cap = io(dir);
     await runScan([], cap);
+    expect(cap.err.join('\n')).not.toContain('home_page_headline');
     expect(cap.out.join('\n')).toContain('could not be parsed cleanly');
-    expect(cap.err.join('\n')).not.toContain('broken');
   });
 
   it('does not report an ignore-commented literal', async () => {
@@ -143,7 +145,7 @@ describe('runScan', () => {
     );
     const cap = io(dir);
     await runScan([], cap);
-    expect(cap.err.join('\n')).not.toContain('skip_this_copy');
+    expect(cap.err.join('\n')).not.toContain('home_page_headline');
   });
 
   it('fail severity promotes warnings to exit 1', async () => {
@@ -181,7 +183,7 @@ describe('runScan', () => {
     expect(findings).toContain('glob matched no files: src/pages/**/*.tsx');
     expect(findings).not.toContain('glob matched no files: app/**/*.tsx');
     // The live glob's findings are untouched, and nothing claims the run scanned nothing.
-    expect(findings).toContain('live_glob_copy');
+    expect(findings).toContain('"Live glob copy" — propose key home_page_headline');
     expect(findings).not.toContain('nothing was scanned');
     expect(cap.out.join('\n')).toContain('scan: 1 file, 1 unkeyed literal');
   });
@@ -281,7 +283,7 @@ describe('runScan', () => {
     const mixedCap = io(mixed);
     expect(await runScan([], mixedCap)).toBe(0);
     expect(mixedCap.err.join('\n')).not.toContain('refused by the parser');
-    expect(mixedCap.err.join('\n')).toContain('parsed_fine');
+    expect(mixedCap.err.join('\n')).toContain('"Parsed fine" — propose key home_page_headline');
   });
 });
 
@@ -720,7 +722,7 @@ describe('runScan — declared copy modules', () => {
     const liveCap = io(live);
     expect(await runScan([], liveCap)).toBe(0);
     expect(liveCap.err.join('\n')).toContain('glob matched no files: src/copy.ts');
-    expect(liveCap.err.join('\n')).toContain('live_surface_copy');
+    expect(liveCap.err.join('\n')).toContain('"Live surface copy" — propose key home_page_headline');
     expect(liveCap.err.join('\n')).not.toContain('nothing was scanned');
 
     // Both lists dead: the aggregate line, which names the DECLARED globs
@@ -821,8 +823,8 @@ describe('runScan — a file both declarations match', () => {
     );
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
-    expect(countIn(cap.err, 'propose key learn_more')).toBe(1);
-    expect(countIn(cap.err, 'propose key read_the_docs')).toBe(1);
+    expect(countIn(cap.err, 'propose key home_page_link_text')).toBe(1);
+    expect(countIn(cap.err, 'propose key home_page_tooltip')).toBe(1);
     // A structural attribute is the JSX walk's decision, and it stays made.
     expect(cap.err.join('\n')).not.toContain('propose key btn');
     // The file IS a managed surface, so nothing says its JSX went unread.
@@ -869,8 +871,8 @@ describe('runScan — a file both declarations match', () => {
     // The module-level literal is still found — the file is half-read, not unread.
     expect(findings).toContain('propose key sign_in_here');
     // …and the JSX side really is dark, structural attributes included.
-    expect(findings).not.toContain('learn_more');
-    expect(findings).not.toContain('read_the_docs');
+    expect(findings).not.toContain('btn_link_text');
+    expect(findings).not.toContain('btn_tooltip');
     expect(findings).not.toContain('propose key btn');
 
     // It rides the ordinary severity contract, so a `fail` posture fails on it.
@@ -1611,14 +1613,36 @@ describe('runScan — the static-HTML host', () => {
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
     const found = cap.err.join('\n');
+    // The role name before its number: both of the section's headings read the
+    // same base, since one finding cannot know its role repeats in the run.
+    expect(found).toContain('index.html:33 possible copy "How it works." — propose key home_qualify_headline');
     expect(found).toContain(
-      'index.html:34 possible copy "Software, product and engineering histories" — propose key software_product_and_engineering',
+      'index.html:34 possible copy "Software, product and engineering histories" — propose key home_qualify_headline',
     );
     // A tagged value prints with its tags.
     expect(found).toContain('possible copy "You may already have the data<1> our AI lab partners need...');
     // An attribute names itself; a meta names which meta it is.
-    expect(found).toContain('"A lab bench with sample trays" (alt) — propose key a_lab_bench_with_sample_trays');
-    expect(found).toContain('(meta description) — propose key psyon_connects_hospitals_labs_and');
+    expect(found).toContain('"A lab bench with sample trays" (alt) — propose key home_page_image_alt_text');
+    expect(found).toContain('(meta description) — propose key home_meta_description');
+  });
+
+  it("names the page by a declared page's route, and a malformed pages member names none", async () => {
+    const declared = htmlProject();
+    write(declared, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { landing: { route: '/' } } }));
+    const named = io(declared);
+    expect(await runScan([], named)).toBe(0);
+    expect(named.err.join('\n')).toContain('— propose key landing_page_title');
+
+    const malformed = htmlProject();
+    write(
+      malformed,
+      'content/descriptor.json',
+      JSON.stringify({ version: 1, keys: {}, pages: { landing: 'not a record', other: { route: 42 } } }),
+    );
+    const cap = io(malformed);
+    expect(await runScan([], cap)).toBe(0);
+    expect(cap.err.join('\n')).toContain('"Psyon data partnerships for AI labs" — propose key home_page_title');
+    expect(cap.err.join('\n')).not.toContain('landing_');
   });
 
   it('counts the page as one file and every proposal as an unkeyed literal', async () => {

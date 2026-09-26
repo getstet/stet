@@ -693,18 +693,18 @@ describe('remove — the scaffolded host adopts its own copy (R3)', () => {
 describe('remove — the static-HTML host', () => {
   it('names each mark it will strip, then strips it and keeps the text', async () => {
     const host = await makeHtmlHost({ register: true });
-    // `how_it_works` is the shared key: two identical links carry it.
-    expect(await host.run('remove', 'how_it_works')).toBe(0);
+    // `home_nav_link_text` is the shared key: two identical links carry it.
+    expect(await host.run('remove', 'home_nav_link_text')).toBe(0);
     const plan = host.stdout();
     expect(plan).toContain('  index.html:20 the mark is removed and the text stays');
     expect(plan).toContain('  index.html:21 the mark is removed and the text stays');
     expect(plan).toContain('  every other mark is regenerated in the same write');
-    expect(host.file('index.html')).toContain('data-stet="how_it_works"');
+    expect(host.file('index.html')).toContain('data-stet="home_nav_link_text"');
 
     host.out.length = 0;
-    expect(await host.run('remove', 'how_it_works', '--write')).toBe(0);
+    expect(await host.run('remove', 'home_nav_link_text', '--write')).toBe(0);
     const page = host.file('index.html');
-    expect(page).not.toContain('data-stet="how_it_works"');
+    expect(page).not.toContain('data-stet="home_nav_link_text"');
     // Both texts remain exactly where they were.
     expect(page).toContain('<a href="#how">How it works</a>');
     expect(page).toContain('<a href="#detail">How it works</a>');
@@ -715,8 +715,8 @@ describe('remove — the static-HTML host', () => {
     const snapshot = JSON.parse(host.file('content/defaults.json')) as {
       default: Record<string, unknown>;
     };
-    expect(descriptor.keys['how_it_works']).toBeUndefined();
-    expect(snapshot.default['how_it_works']).toBeUndefined();
+    expect(descriptor.keys['home_nav_link_text']).toBeUndefined();
+    expect(snapshot.default['home_nav_link_text']).toBeUndefined();
 
     host.out.length = 0;
     host.err.length = 0;
@@ -727,19 +727,19 @@ describe('remove — the static-HTML host', () => {
     // The mark IS what the batch strips, so naming it would put "un-wire the
     // read first" on every page the removal already handles.
     const host = await makeHtmlHost({ register: true });
-    expect(host.file('index.html')).toContain('data-stet="how_it_works"');
-    expect(await host.run('remove', 'how_it_works')).toBe(0);
+    expect(host.file('index.html')).toContain('data-stet="home_nav_link_text"');
+    expect(await host.run('remove', 'home_nav_link_text')).toBe(0);
     expect(host.stdout()).not.toContain('mentions');
 
     // A mention in a script is a real read, and it still prints.
     const scripted = await makeHtmlHost({ register: true });
     writeFileSync(
       join(scripted.cwd, 'index.html'),
-      scripted.file('index.html').replace('</body>', '<script>const k = "how_it_works";</script>\n</body>'),
+      scripted.file('index.html').replace('</body>', '<script>const k = "home_nav_link_text";</script>\n</body>'),
     );
-    expect(await scripted.run('remove', 'how_it_works')).toBe(0);
+    expect(await scripted.run('remove', 'home_nav_link_text')).toBe(0);
     expect(scripted.stdout()).toContain(
-      'index.html mentions "how_it_works" — un-wire the read first, or the regenerated types surface it',
+      'index.html mentions "home_nav_link_text" — un-wire the read first, or the regenerated types surface it',
     );
   });
 });

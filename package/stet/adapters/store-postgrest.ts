@@ -728,6 +728,29 @@ export async function readStetMeta(conn: PostgrestConnection): Promise<StetMeta 
 }
 
 /**
+ * Whether `stet_renames` holds `oldKey` renamed to `newKey` for the project, over
+ * REST: a rename this database finished, whoever ran it.
+ */
+export async function renameRecorded(
+  conn: PostgrestConnection,
+  p: { project: string; oldKey: string; newKey: string },
+): Promise<boolean> {
+  const params = new URLSearchParams();
+  params.set('select', 'old_key');
+  params.set('project', eqFilter(p.project));
+  params.set('old_key', eqFilter(p.oldKey));
+  params.set('new_key', eqFilter(p.newKey));
+  params.set('limit', '1');
+  const response = await fetchOf(conn)(`${baseOf(conn.url)}/stet_renames?${params.toString()}`, {
+    headers: authHeaders(conn.token),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`stet_renames read failed: ${response.status} ${response.statusText}: ${text}`);
+  const rows = JSON.parse(text === '' ? '[]' : text) as unknown;
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+/**
  * The descriptor-version stamp, over REST.
  *
  * `Prefer: return=representation` is load-bearing: RLS is enabled on

@@ -16,13 +16,16 @@ import { join } from 'node:path';
 
 import type * as TS from 'typescript';
 
+import type { PageDef } from '../src/types.js';
+
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { writeJsonDeterministic } from './artifacts.js';
 import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
-import { proposeHtml } from './html-host.js';
+import { isHeadText, proposeHtml } from './html-host.js';
+import { baseName } from './key-names.js';
 import type { CliIo } from './main.js';
-import { detectPagesRoots, proposePages } from './pages.js';
+import { detectPagesRoots, pageOfFile, proposePages } from './pages.js';
 import { CliError, clip, lineCol, plural, posixRelative, Report } from './report.js';
 import {
   dialectOf,
@@ -58,6 +61,23 @@ interface RawDescriptor {
   keys?: unknown;
   pages?: unknown;
   templates?: Record<string, { slots?: string[]; render?: { file?: unknown } }>;
+}
+
+/**
+ * The raw descriptor's pages where they are a map of route-carrying records,
+ * else none: a malformed `pages` names no page, as the uncovered-route warn
+ * reads it.
+ */
+function rawPages(descriptor: RawDescriptor | null): Record<string, PageDef> | undefined {
+  const pages = descriptor?.pages;
+  if (pages === null || typeof pages !== 'object' || Array.isArray(pages)) return undefined;
+  const out: Record<string, PageDef> = {};
+  for (const [name, page] of Object.entries(pages as Record<string, unknown>)) {
+    if (page !== null && typeof page === 'object' && typeof (page as { route?: unknown }).route === 'string') {
+      out[name] = page as PageDef;
+    }
+  }
+  return out;
 }
 
 /** The snapshot as raw parsed JSON — only the `default` block, which is what a seeded default lives in. */
@@ -227,10 +247,17 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
             : proposal.metaName === undefined
               ? ` (${proposal.attr})`
               : ` (meta ${proposal.metaName})`;
+        // The role name before its number: register numbers a role that repeats
+        // across its run, which one finding cannot know.
+        const base = baseName({
+          page: pageOfFile(io.cwd, file, rawPages(descriptorOnce()), { html: true }) ?? 'page',
+          ...(isHeadText(proposal) ? {} : { section: proposal.sectionWord }),
+          role: proposal.role,
+        });
         report.warn(
           'scan',
           `${file}:${proposal.line} possible copy ${JSON.stringify(clip(proposal.value, LITERAL_EXCERPT))}${suffix} — ` +
-            `propose key ${proposal.proposedKey}`,
+            `propose key ${base}`,
           undefined,
           { at: { file, line: proposal.line } },
         );
@@ -282,7 +309,12 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     let handoff: { sourceFile: TS.SourceFile; claimed: Span[] } | undefined;
 
     if (isSurface) {
-      const result = await scanSource(file, source, { readPathImport: config.readPath.import });
+      // The role name before its number, as on the html host.
+      const page = pageOfFile(io.cwd, file, rawPages(descriptorOnce()));
+      const result = await scanSource(file, source, {
+        readPathImport: config.readPath.import,
+        ...(page === undefined ? {} : { page }),
+      });
       if (result.parseErrors) {
         report.line(`${file}: could not be parsed cleanly — reported, not scanned`);
         refused += 1;

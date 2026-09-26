@@ -24,6 +24,7 @@ import { json, readJson } from '../server/http.js';
 import { bearerMatches, createStetHandler } from '../server/mount.js';
 import { route as normalizeRoute } from '../src/seo.js';
 import { keyDefOf, loadDescriptor } from '../src/descriptor.js';
+import { canonicalize } from '../src/codegen.js';
 import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
@@ -33,7 +34,9 @@ import { check } from './check.js';
 import type { StetConfig } from './config.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, uncommittedPaths } from './git.js';
-import { isHeadText, lineIndex, metaCopyName, proposeHtml, readDocument, type Document, type Element } from './html-host.js';
+import { isHeadText, lineIndex, metaCopyName, placeOf, proposeHtml, readDocument, type Document, type Element } from './html-host.js';
+import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
+import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
 import { runCli, type CliIo } from './main.js';
 import { applyPages, fileRoute, proposeForHost } from './pages.js';
 import { planRemoval } from './remove.js';
@@ -677,19 +680,23 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
   // The keys the caller names, else — when the snapshot or the descriptor is in
   // the commit — the keys whose value it changes, a derived key's included; a
   // commit carrying neither names its files.
-  const subject =
+  // A commit that only renames says so, in the words `stet rename` prints.
+  const changed =
     Array.isArray(keys) && keys.length > 0
-      ? keys.map((key) => String(key))
+      ? { keys: keys.map((key) => String(key)), renamed: 0 }
       : named.includes(gitSpelling(ready.config.snapshotPath)) || named.includes(gitSpelling(ready.config.descriptorPath))
         ? changedKeys(ready, named)
-        : [];
+        : { keys: [], renamed: 0 };
+  const subject = changed.keys;
   const message =
     typeof body['message'] === 'string' && body['message'] !== ''
       ? body['message']
       : clipTo72(
-          subject.length > 0
-            ? `stet: ${plural(subject.length, 'key')} updated — ${subject.join(', ')}`
-            : `stet: ${plural(named.length, 'file')} updated — ${named.join(', ')}`,
+          subject.length > 0 && changed.renamed === subject.length
+            ? `stet: rename ${plural(subject.length, 'key')} — ${subject.join(', ')}`
+            : subject.length > 0
+              ? `stet: ${plural(subject.length, 'key')} updated — ${subject.join(', ')}`
+              : `stet: ${plural(named.length, 'file')} updated — ${named.join(', ')}`,
         );
 
   // Through the async twin: a pre-commit hook that runs a real check would
@@ -739,7 +746,7 @@ function formAtHead<T>(site: Ready, path: string, load: (raw: unknown) => T): T 
  * repairs it — makes every key on disk a change; a descriptor HEAD does not
  * hold, or one `loadDescriptor` refuses, is read as the one on disk.
  */
-function changedKeys(site: Ready, named: string[]): string[] {
+function changedKeys(site: Ready, named: string[]): { keys: string[]; renamed: number } {
   const committed: Snapshot = formAtHead(site, site.config.snapshotPath, loadSnapshot) ?? {};
   const described: Descriptor = formAtHead(site, site.config.descriptorPath, loadDescriptor) ?? site.descriptor;
   // A form the commit leaves out stays as HEAD has it.
@@ -755,6 +762,10 @@ function changedKeys(site: Ready, named: string[]): string[] {
       if (JSON.stringify(own(a, key)) !== JSON.stringify(own(b, key))) keys.add(key);
     }
   }
+  // A derived key the commit adds or drops moves too, though it has no row.
+  for (const [key, def] of Object.entries(described.keys)) {
+    if (def.derivesFrom !== undefined && !Object.hasOwn(descriptor.keys, key)) keys.add(key);
+  }
   for (const [key, def] of Object.entries(descriptor.keys)) {
     if (def.derivesFrom === undefined) continue;
     for (const locale of site.config.locales.enabled) {
@@ -763,7 +774,38 @@ function changedKeys(site: Ready, named: string[]): string[] {
       if (JSON.stringify(was) !== JSON.stringify(is)) keys.add(key);
     }
   }
-  return [...keys].sort();
+  // A rename: a key HEAD declares that the commit's descriptor does not, and one
+  // it declares that HEAD does not, holding the same value in every locale —
+  // the one such pair for each. Named as `old → new`, once.
+  const renamed = new Map<string, string>();
+  const leaving = [...keys].filter((key) => Object.hasOwn(described.keys, key) && !Object.hasOwn(descriptor.keys, key));
+  const arriving = [...keys].filter((key) => Object.hasOwn(descriptor.keys, key) && !Object.hasOwn(described.keys, key));
+  const valuesOf = (forms: Snapshot, key: string): string =>
+    JSON.stringify(Object.keys(forms).sort().map((locale) => own(forms[locale], key)));
+  const rowless = (forms: Snapshot, key: string): boolean =>
+    Object.values(forms).every((block) => own(block, key) === undefined);
+  // Keys with a row pair on their values; a key with none anywhere — a derived
+  // key — pairs on its descriptor entry, key order, label and help aside, since
+  // a rename rewrites those.
+  const entryOf = (d: Descriptor, key: string): string => {
+    const rest: Record<string, unknown> = { ...d.keys[key] };
+    delete rest['label'];
+    delete rest['help'];
+    return JSON.stringify(canonicalize(rest));
+  };
+  const same = (old: string, next: string): boolean =>
+    rowless(committed, old) && rowless(snapshot, next)
+      ? entryOf(described, old) === entryOf(descriptor, next)
+      : valuesOf(committed, old) === valuesOf(snapshot, next);
+  for (const old of leaving) {
+    const matches = arriving.filter((next) => same(old, next));
+    const next = matches[0];
+    if (matches.length !== 1 || next === undefined || [...renamed.values()].includes(next)) continue;
+    renamed.set(old, next);
+  }
+  const moved = new Set([...renamed.keys(), ...renamed.values()]);
+  const listed = [...[...renamed].map(([old, next]) => `${old} → ${next}`), ...[...keys].filter((key) => !moved.has(key)).sort()];
+  return { keys: listed, renamed: renamed.size };
 }
 
 /**
@@ -1230,41 +1272,27 @@ function marks(site: SiteState): Response {
     keys.set(mark.key, held);
     places.set(mark.key, [
       ...(places.get(mark.key) ?? []),
-      {
-        file: mark.file,
-        line: mark.line,
-        tag: mark.tag,
-        ...(mark.attr === undefined ? {} : { attr: mark.attr }),
-        ...(mark.metaName === undefined ? {} : { meta: mark.metaName }),
-        ...(mark.inSvg === undefined ? {} : { svg: true as const }),
-        ...(isHeadText(mark) ? { head: true as const } : {}),
-      },
+      withKind({ ...placeOf(mark), ...(isHeadText(mark) ? { head: true as const } : {}) }),
     ]);
   }
   return json({ documents, keys: Object.fromEntries(keys), places: Object.fromEntries(places) });
 }
 
-/** Where a key renders: a file and line, and the element's tag and attribute where stet can read them. */
-interface Place {
-  file: string;
-  line: number;
-  tag?: string;
-  attr?: string;
-  meta?: string;
-  /** A `<title>` inside an `<svg>`: the graphic's name, which a browser shows as a tooltip. */
-  svg?: true;
+/**
+ * Where a key renders, as the route answers it: the place, what kind of text it
+ * is in the page's words (`kindOf`, the vocabulary role names are made from),
+ * and whether it is a head text.
+ */
+interface Place extends KeyPlace {
+  kind: string;
   /** A head text (`isHeadText`): the page's `<title>`, or a meta whose `content` is copy. */
   head?: true;
 }
 
-/**
- * A read of a key in a JavaScript host's source: `copy.get('<key>')`,
- * `copy('<key>')` or `get('<key>')`, and `copy.<key>` or `copyMap.<key>` — the
- * accessor `register` writes, the map the scaffolded read path exports, and
- * the forms a host re-exports them under.
- */
-const KEY_READ =
-  /\bcopy(?:Map)?\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1|\b(?:copy|get)\s*\(\s*(['"`])([^'"`\n]+)\3|\bcopy(?:Map)?\s*\.\s*([A-Za-z_$][\w$]*)/g;
+/** A place with its kind. */
+function withKind(place: KeyPlace & { head?: true }): Place {
+  return { ...place, kind: kindOf(place) };
+}
 
 /**
  * Every declared key's reads in the managed surfaces and copy modules of a
@@ -1275,7 +1303,9 @@ const KEY_READ =
  * in a JSX file, in frontmatter, a script or a comment, in markup the tokenizer
  * could not pair, or in a file it cannot read at all carries none, and the page
  * names the file instead. Only reads of declared keys count, so `copy.get` or
- * an unrelated `.data` is never a place.
+ * an unrelated `.data` is never a place; and in a template dialect only reads
+ * in its code count — front matter, scripts, tag interiors, braces — so a
+ * sample in prose, a comment or an `is:raw` block is never one.
  */
 function keyReads(site: Ready): Record<string, Place[]> {
   const out = new Map<string, Place[]>();
@@ -1295,31 +1325,30 @@ function keyReads(site: Ready): Record<string, Place[]> {
     try {
       if (dialect === 'html') document = readDocument(file, source, dialect);
       else if (dialect !== null && dialect !== 'mdx') {
-        document = readDocument(file, maskExpressions(dialect === 'vue' ? vueMarkup(source) : source, dialect), dialect);
+        const markup = selfClosedRaw(dialect === 'vue' ? vueMarkup(source) : source);
+        document = readDocument(file, maskExpressions(markup, dialect), dialect);
       }
     } catch {
       document = null;
     }
+    const code = dialect === null ? null : dialectCode(source, dialect);
+    const spans = code === null ? null : [...code.scripts, ...code.expressions];
     for (const found of source.matchAll(KEY_READ)) {
       const key = found[2] ?? found[4] ?? found[5] ?? '';
       if (!Object.hasOwn(site.descriptor.keys, key)) continue;
       const at = found.index;
-      const place: Place = { file, line: lineAt(at) };
+      if (spans !== null && !within(spans, at)) continue;
+      const place: KeyPlace & { head?: true } = { file, line: lineAt(at) };
       if (document !== null && !document.blanked.slice(at, at + found[0].length).includes('\0')) {
         try {
           const element = elementAt(document.roots, at);
           Object.assign(place, element);
-          if (element.tag !== undefined && isHeadText({
-            kind: element.attr === undefined ? 'element' : 'attribute',
-            tag: element.tag,
-            ...(element.attr === undefined ? {} : { attr: element.attr }),
-            ...(element.meta === undefined ? {} : { metaName: element.meta }),
-          })) place.head = true;
+          if (element.tag !== undefined && isHeadKind(place)) place.head = true;
         } catch {
           document = null;
         }
       }
-      out.set(key, [...(out.get(key) ?? []), place]);
+      out.set(key, [...(out.get(key) ?? []), withKind(place)]);
     }
   }
   return Object.fromEntries(out);
@@ -1327,31 +1356,49 @@ function keyReads(site: Ready): Record<string, Place[]> {
 
 /**
  * A template dialect's markup with the inside of every `{…}` expression masked
- * with `_`, its braces and newlines kept: `content={copy.get('k')}` then reads
- * as one unquoted attribute value, where the quotes inside the expression would
- * otherwise end the attribute and the tag early. Braces count only in the
+ * with `_`, its outer braces and newlines kept: `content={copy.get('k')}` then
+ * reads as one unquoted attribute value, where the quotes inside the expression
+ * would otherwise end the attribute and the tag early. A brace opens only in the
  * markup `blankNonMarkup` leaves, so a `'{'` in frontmatter or a script opens
- * nothing. Every offset stays put.
+ * nothing, and ends where `closing` says, as the rename reads it. Every offset
+ * stays put.
  */
 function maskExpressions(source: string, dialect: Dialect): string {
   const markup = blankNonMarkup(source, dialect);
-  const out: string[] = [];
-  let depth = 0;
+  let out = '';
+  let from = 0;
   for (let i = 0; i < source.length; i++) {
-    const ch = source[i] as string;
-    if (markup[i] === '\0') {
-      out.push(ch);
-      continue;
-    }
-    if (ch === '{') depth += 1;
-    else if (ch === '}' && depth > 0) depth -= 1;
-    else if (depth > 0 && ch !== '\n') {
-      out.push('_');
-      continue;
-    }
-    out.push(ch);
+    if (source[i] !== '{' || markup[i] === '\0') continue;
+    // The brace ends where `closing` says, as the rename's walk reads it.
+    const end = closing(source, i, '}');
+    out += source.slice(from, i + 1) + source.slice(i + 1, Math.max(i + 1, end - 1)).replace(/[^\n]/g, '_');
+    from = Math.max(i + 1, end - 1);
+    i = from - 1;
   }
-  return out.join('');
+  return out + source.slice(from);
+}
+
+/**
+ * A template dialect's source with each self-closing `<script … />` and
+ * `<style … />` blanked as a script body is: in a dialect the element has no
+ * body, so the next close tag of its name must not end it and swallow the
+ * markup between. The tag is read by `openTag`, as `dialectCode` reads it.
+ * Every offset stays put.
+ */
+function selfClosedRaw(source: string): string {
+  const spans: Array<{ start: number; end: number }> = [];
+  for (const m of source.matchAll(/<(?:script|style)\b/gi)) {
+    const tag = openTag(source, m.index);
+    if (tag.selfClosing) spans.push({ start: m.index, end: tag.end });
+  }
+  let out = '';
+  let from = 0;
+  for (const { start, end } of spans) {
+    if (start < from) continue;
+    out += source.slice(from, start) + source.slice(start, end).replace(/[^\n]/g, '\0');
+    from = end;
+  }
+  return out + source.slice(from);
 }
 
 /**
@@ -1378,7 +1425,11 @@ function vueMarkup(source: string): string {
  * does: its tag, the attribute's name, and for a `<meta>`'s `content` the meta's
  * `name` or `property`, so a head read on a JavaScript host reads as its kind.
  */
-function elementAt(roots: Element[], at: number): { tag?: string; attr?: string; meta?: string } {
+function elementAt(
+  roots: Element[],
+  at: number,
+  inSvg = false,
+): { tag?: string; attr?: string; meta?: string; svg?: true } {
   for (const el of roots) {
     if (at < el.openStart || at >= el.closeEnd) continue;
     if (at < el.openEnd) {
@@ -1388,8 +1439,9 @@ function elementAt(roots: Element[], at: number): { tag?: string; attr?: string;
       return { tag: el.tag, attr: attr.name, ...(meta === null ? {} : { meta }) };
     }
     if (el.opaque) return {};
-    const inner = elementAt(el.children, at);
-    return inner.tag === undefined ? { tag: el.tag } : inner;
+    // A `<title>` inside an `<svg>` names the graphic, as on the static-HTML host.
+    const inner = elementAt(el.children, at, inSvg || el.tag === 'svg');
+    return inner.tag === undefined ? { tag: el.tag, ...(inSvg ? { svg: true as const } : {}) } : inner;
   }
   return {};
 }

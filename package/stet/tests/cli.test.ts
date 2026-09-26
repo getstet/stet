@@ -2911,7 +2911,7 @@ describe('per-command help', () => {
 
   it('reads every command word out of the usage', () => {
     expect(commands).toEqual([
-      'init', 'scan', 'register', 'remove', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
+      'init', 'scan', 'register', 'remove', 'rename', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
       'email extract', 'email verify', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
       'seed', 'pull', 'audit', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
       'contacts export', 'contacts erase', 'contacts suppress', 'contacts import', 'contacts group add',

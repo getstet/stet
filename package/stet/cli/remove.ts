@@ -24,12 +24,13 @@ import { join } from 'node:path';
 import {
   checkDescriptorStructure,
   DescriptorError,
+  pageKeyReferences,
   type DescriptorWarning,
 } from '../src/descriptor.js';
 import { resolve } from '../src/resolve.js';
 import { checkCurrency, type Snapshot } from '../src/snapshot.js';
 import { keyDefOf } from '../src/descriptor.js';
-import type { Descriptor, KeyDef } from '../src/types.js';
+import type { Descriptor, KeyDef, PageDef } from '../src/types.js';
 import { flag, parse, refuseEnv } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { checkValues, descriptorOf, snapshotOf } from './check.js';
@@ -336,36 +337,31 @@ function bakeDerivations(
  */
 function dropPageReferences(cleaned: Descriptor, removed: Set<string>): DropNote[] {
   const notes: DropNote[] = [];
-  for (const [page, def] of Object.entries(cleaned.pages ?? {})) {
-    if (def.seo !== undefined) {
+  const touched = new Set<string>();
+  for (const ref of pageKeyReferences(cleaned)) {
+    if (!removed.has(ref.key)) continue;
+    const def = (cleaned.pages ?? {})[ref.page] as PageDef;
+    if (ref.kind === 'seo') {
       // `PageSeo` has no index signature, so the delete goes through a local
       // indexable copy and the narrowed record is reassigned.
       const seo: Record<string, string | undefined> = { ...def.seo };
-      let dropped = false;
-      for (const [field, key] of Object.entries(seo)) {
-        if (key === undefined || !removed.has(key)) continue;
-        delete seo[field];
-        dropped = true;
-        notes.push({ key, page, field, kind: 'seo', emptied: Object.keys(seo).length === 0 });
-      }
-      // Only where THIS run dropped something: a record the removal never
-      // touched stays exactly as the developer wrote it, empty or not.
-      if (dropped) {
-        def.seo = seo;
-        if (Object.keys(seo).length === 0) delete def.seo;
-      }
+      delete seo[ref.field];
+      def.seo = seo;
+      notes.push({ key: ref.key, page: ref.page, field: ref.field, kind: 'seo', emptied: Object.keys(seo).length === 0 });
+    } else {
+      const bindings = def.jsonLd?.bindings as Record<string, string>;
+      delete bindings[ref.field];
+      notes.push({ key: ref.key, page: ref.page, field: ref.field, kind: 'jsonLd', emptied: Object.keys(bindings).length === 0 });
     }
-    const bindings = def.jsonLd?.bindings;
-    if (bindings !== undefined) {
-      let dropped = false;
-      for (const [field, key] of Object.entries(bindings)) {
-        if (!removed.has(key)) continue;
-        delete bindings[field];
-        dropped = true;
-        notes.push({ key, page, field, kind: 'jsonLd', emptied: Object.keys(bindings).length === 0 });
-      }
-      if (dropped && Object.keys(bindings).length === 0) delete def.jsonLd;
-    }
+    touched.add(`${ref.kind}\u0000${ref.page}`);
+  }
+  // Only where THIS run dropped something: a record the removal never touched
+  // stays exactly as the developer wrote it, empty or not.
+  for (const at of touched) {
+    const [kind, page] = at.split('\u0000') as ['seo' | 'jsonLd', string];
+    const def = (cleaned.pages ?? {})[page] as PageDef;
+    if (kind === 'seo' && def.seo !== undefined && Object.keys(def.seo).length === 0) delete def.seo;
+    if (kind === 'jsonLd' && def.jsonLd !== undefined && Object.keys(def.jsonLd.bindings ?? {}).length === 0) delete def.jsonLd;
   }
   return notes;
 }

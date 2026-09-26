@@ -47,6 +47,12 @@ npx stet register --from scan --write    # adopt those strings as keys, byte-ide
 npx stet check                           # descriptor, snapshot and types — offline
 ```
 
+Keys are named by where they sit and what they are — home_hero_headline,
+home_faq_headline_1. register --from scan --plan-out naming.json writes the
+names it would give, for you or an agent to edit with a label and help; --plan
+naming.json applies them. stet rename \<old> \<new> moves a key in the
+descriptor, the snapshot, the reads stet can prove and every store.
+
 For a plain HTML site with no build, the same three steps run against the pages
 themselves:
 

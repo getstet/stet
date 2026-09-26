@@ -39,6 +39,7 @@ import { writeJsonDeterministic } from '../cli/artifacts.js';
 import { check } from '../cli/check.js';
 import { loadConfig } from '../cli/config.js';
 import { planDocuments } from '../cli/html-host.js';
+import { HEAD_KINDS } from '../cli/key-names.js';
 import { Report } from '../cli/report.js';
 import {
   captured,
@@ -1624,10 +1625,10 @@ describe('POST /api/site/save', () => {
       const host = await deriveHost();
       const { handler } = handlerOver([host.cwd]);
       await post(handler, `/api/site/save${at(host)}`, { templates: [{ key: DERIVE_KEYS.title, tmpl: 'Now: {v}' }] });
-      await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'start_a_trial', value: 'Try it now' }] });
+      await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'home_page_button_text', value: 'Try it now' }] });
       const made = await post(handler, `/api/site/commit${at(host)}`, { files: ['content/defaults.json'] });
       expect(made.status).toBe(200);
-      expect(subjectOf(host)).toBe('stet: 1 key updated — start_a_trial');
+      expect(subjectOf(host)).toBe('stet: 1 key updated — home_page_button_text');
     });
 
     it('reads a descriptor HEAD holds but cannot load as the one on disk, and the commit lands', async () => {
@@ -1644,6 +1645,85 @@ describe('POST /api/site/save', () => {
       const made = await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['pending'] });
       expect(made.status).toBe(200);
       expect(subjectOf(host)).toBe('stet: 2 keys updated — hero_headline, share_description');
+    });
+  });
+
+  describe('the commit subject', () => {
+    /** An html host holding a 0.3.2 name, a plain key and two keys sharing one value, committed. */
+    const renameHost = async (): Promise<CliHost> => {
+      const text = { shape: 'text', target: 'web' } as const;
+      const host = await makeHtmlHost({
+        files: {
+          'index.html':
+            '<!DOCTYPE html>\n<html><head>\n<title>Process</title>\n</head><body>\n' +
+            '<h3 data-stet="01_assess">Assess what you hold</h3>\n<p data-stet="hero_body">Plans from ten up.</p>\n' +
+            '<p data-stet="a_key">Same words</p>\n<p data-stet="b_key">Same words</p>\n</body></html>\n',
+        },
+        keys: { '01_assess': text, hero_body: text, a_key: text, b_key: text },
+        defaults: { '01_assess': 'Assess what you hold', hero_body: 'Plans from ten up.', a_key: 'Same words', b_key: 'Same words' },
+      });
+      for (const rel of ['content/descriptor.json', 'content/defaults.json']) {
+        writeJsonDeterministic(join(host.cwd, rel), JSON.parse(host.file(rel)));
+      }
+      gitInit(host.cwd);
+      return host;
+    };
+    const renamePlan = (host: CliHost, keys: Array<{ old: string; key: string; label?: string; help?: string }>): void => {
+      const plan = { plan: 'stet rename', version: 1, keys: keys.map((k) => ({ label: null, help: null, ...k })) };
+      writeFileSync(join(host.cwd, 'rename.json'), `${JSON.stringify(plan, null, 2)}\n`);
+    };
+    /** Commit what the site reports pending, and answer the subject. */
+    const commitPending = async (host: CliHost, expected: string[]): Promise<string> => {
+      const { handler } = handlerOver([host.cwd]);
+      const pending = (await get(handler, `/api/site${at(host)}`))['pending'] as string[];
+      expect(pending).toEqual(expected);
+      const made = await post(handler, `/api/site/commit${at(host)}`, { files: pending });
+      expect(made.status).toBe(200);
+      return String(made.body['subject']);
+    };
+    const FORMS = ['content/defaults.json', 'content/descriptor.json', 'index.html'];
+
+    it('titles a commit that only renames in the words stet rename prints (journey G2)', async () => {
+      const host = await renameHost();
+      expect(await host.run('rename', '01_assess', 'home_process_step_1', '--write')).toBe(0);
+      expect(await commitPending(host, FORMS)).toBe('stet: rename 1 key — 01_assess → home_process_step_1');
+    });
+
+    it('names a rename beside a value edit as one entry of the updated list', async () => {
+      const host = await renameHost();
+      expect(await host.run('rename', '01_assess', 'home_process_step_1', '--write')).toBe(0);
+      const { handler } = handlerOver([host.cwd]);
+      expect((await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'hero_body', value: 'Plans from five up.' }] })).status).toBe(200);
+      expect(await commitPending(host, FORMS)).toBe('stet: 2 keys updated — 01_assess → home_process_step_1, hero_body');
+    });
+
+    it('pairs none where two leaving keys and two arriving keys share one value', async () => {
+      const host = await renameHost();
+      renamePlan(host, [
+        { old: 'a_key', key: 'a_new' },
+        { old: 'b_key', key: 'b_new' },
+      ]);
+      expect(await host.run('rename', '--plan', 'rename.json', '--write')).toBe(0);
+      expect(await commitPending(host, FORMS)).toBe('stet: 4 keys updated — a_key, a_new, b_key, b_new');
+    });
+
+    it('pairs a derived key, which holds no value, on its descriptor entry', async () => {
+      const host = await psyonHost();
+      expect(await host.run('rename', 'share_description', 'home_share_description', '--write')).toBe(0);
+      expect(await commitPending(host, ['content/descriptor.json', 'index.html'])).toBe(
+        'stet: rename 1 key — share_description → home_share_description',
+      );
+    });
+
+    it('pairs a derived key renamed with a new label and help, which the entry compare sets aside', async () => {
+      const host = await psyonHost();
+      renamePlan(host, [
+        { old: 'share_description', key: 'home_share_description', label: 'Share text', help: 'What a shared link shows.' },
+      ]);
+      expect(await host.run('rename', '--plan', 'rename.json', '--write')).toBe(0);
+      expect(await commitPending(host, ['content/descriptor.json', 'index.html'])).toBe(
+        'stet: rename 1 key — share_description → home_share_description',
+      );
     });
   });
 
@@ -1734,10 +1814,10 @@ async function deriveHost(
 }
 /** `derive.html`'s keys once registered. */
 const DERIVE_KEYS = {
-  h1: 'ship_the_catalogue_in_a_day',
-  title: 'ship_the_catalogue_in_a_day_2',
-  p: 'plans_from_and_up_for_every_product_page',
-  description: 'plans_from_and_up_for_every_product',
+  h1: 'home_page_headline_1',
+  title: 'home_page_title',
+  p: 'home_page_paragraph',
+  description: 'home_meta_description',
 };
 
 describe('POST /api/site/commit and /push', () => {
@@ -3273,7 +3353,7 @@ describe('GET /api/site/marks', () => {
     expect(await marksOf(js)).toEqual({
       documents: [],
       keys: {},
-      places: { hero_headline: [{ file: 'src/pages/index.astro', line: 4, tag: 'h1' }] },
+      places: { hero_headline: [{ file: 'src/pages/index.astro', line: 4, tag: 'h1', kind: 'headline' }] },
     });
     const { handler } = handlerOver([js.cwd]);
     const refused = await handler(
@@ -3285,24 +3365,32 @@ describe('GET /api/site/marks', () => {
   it('places each mark of an html host: its file, line, tag, and a meta’s attribute and name', async () => {
     const host = await makeHtmlHost({ files: { 'index.html': htmlFixture('derive.html') }, register: true });
     const { places } = await marksOf(host);
-    expect(places['ship_the_catalogue_in_a_day_2']).toEqual([
-      { file: 'index.html', line: 5, tag: 'title', head: true },
-      { file: 'index.html', line: 7, tag: 'meta', attr: 'content', meta: 'og:title', head: true },
+    expect(places['home_page_title']).toEqual([
+      { file: 'index.html', line: 5, tag: 'title', head: true, kind: 'page title' },
+      { file: 'index.html', line: 7, tag: 'meta', attr: 'content', meta: 'og:title', head: true, kind: 'share title' },
     ]);
-    expect(places['plans_from_and_up_for_every_product']).toEqual([
-      { file: 'index.html', line: 6, tag: 'meta', attr: 'content', meta: 'description', head: true },
+    expect(places['home_meta_description']).toEqual([
+      { file: 'index.html', line: 6, tag: 'meta', attr: 'content', meta: 'description', head: true, kind: 'meta description' },
     ]);
-    expect(places['start_a_trial_today_and_see_the_whole']).toEqual([
-      { file: 'index.html', line: 8, tag: 'meta', attr: 'content', meta: 'og:description', head: true },
+    expect(places['home_share_description_1']).toEqual([
+      { file: 'index.html', line: 8, tag: 'meta', attr: 'content', meta: 'og:description', head: true, kind: 'share description' },
     ]);
-    expect(places['reship_the_whole_catalogue']).toEqual([
-      { file: 'index.html', line: 9, tag: 'meta', attr: 'content', meta: 'twitter:description', head: true },
+    expect(places['home_share_description_2']).toEqual([
+      { file: 'index.html', line: 9, tag: 'meta', attr: 'content', meta: 'twitter:description', head: true, kind: 'share description' },
     ]);
-    expect(places['ship_the_catalogue_in_a_day']).toEqual([{ file: 'index.html', line: 14, tag: 'h1' }]);
-    expect(places['everything_we_ship']).toEqual([
-      { file: 'index.html', line: 18, tag: 'h3' },
-      { file: 'index.html', line: 12, tag: 'nav', attr: 'aria-label' },
+    expect(places['home_page_headline_1']).toEqual([{ file: 'index.html', line: 14, tag: 'h1', kind: 'headline' }]);
+    expect(places['home_nav_aria_label']).toEqual([
+      { file: 'index.html', line: 18, tag: 'h3', kind: 'headline' },
+      { file: 'index.html', line: 12, tag: 'nav', attr: 'aria-label', kind: 'aria label' },
     ]);
+  });
+
+  it("reads the page's head kinds as a superset of the CLI vocabulary's", () => {
+    const page = readFileSync(join(packageRoot(), 'dashboard/index.html'), 'utf8');
+    const declared = /const HEAD_KINDS = (\[[^\]]*\]);/.exec(page)?.[1];
+    expect(declared).toBeDefined();
+    const pageKinds = JSON.parse((declared as string).replace(/'/g, '"')) as string[];
+    for (const kind of HEAD_KINDS) expect(pageKinds, kind).toContain(kind);
   });
 
   it('places a `<title>` inside an `<svg>` as the graphic’s', async () => {
@@ -3315,8 +3403,8 @@ describe('GET /api/site/marks', () => {
       defaults: { t: 'Acme', close: 'Close the menu' },
     });
     const { places } = await marksOf(host);
-    expect(places['close']).toEqual([{ file: 'index.html', line: 3, tag: 'title', svg: true }]);
-    expect(places['t']).toEqual([{ file: 'index.html', line: 2, tag: 'title', head: true }]);
+    expect(places['close']).toEqual([{ file: 'index.html', line: 3, tag: 'title', svg: true, kind: 'tooltip' }]);
+    expect(places['t']).toEqual([{ file: 'index.html', line: 2, tag: 'title', head: true, kind: 'page title' }]);
   });
 
   describe('on a JavaScript host', () => {
@@ -3347,10 +3435,10 @@ describe('GET /api/site/marks', () => {
         'content/copy.ts': "export const price = copyMap.pricing_price;\n",
       });
       expect((await marksOf(host)).places).toEqual({
-        brand__name: [{ file: 'src/pages/index.astro', line: 2 }],
-        hero_headline: [{ file: 'src/pages/index.astro', line: 5, tag: 'h1' }],
-        hero_body: [{ file: 'src/pages/index.astro', line: 6, tag: 'a' }],
-        pricing_price: [{ file: 'content/copy.ts', line: 1 }],
+        brand__name: [{ file: 'src/pages/index.astro', line: 2, kind: 'text in src/pages/index.astro' }],
+        hero_headline: [{ file: 'src/pages/index.astro', line: 5, tag: 'h1', kind: 'headline' }],
+        hero_body: [{ file: 'src/pages/index.astro', line: 6, tag: 'a', kind: 'link text' }],
+        pricing_price: [{ file: 'content/copy.ts', line: 1, kind: 'text in content/copy.ts' }],
       });
     });
 
@@ -3367,7 +3455,7 @@ describe('GET /api/site/marks', () => {
         const res = await handler(req(`/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`));
         expect(res.status).toBe(200);
         expect(((await res.json()) as { places: unknown }).places).toEqual({
-          hero_headline: [{ file: 'src/pages/index.astro', line: 1, tag: 'h1' }],
+          hero_headline: [{ file: 'src/pages/index.astro', line: 1, tag: 'h1', kind: 'headline' }],
         });
       } finally {
         chmodSync(join(host.cwd, 'src/pages/locked.astro'), 0o644);
@@ -3381,9 +3469,10 @@ describe('GET /api/site/marks', () => {
           "<p>{copy.get('blog_intro')}</p>\n",
       });
       const { places } = await marksOf(host);
-      expect(places['hero_headline']).toEqual([{ file: 'src/a.astro', line: 1 }]);
-      expect(places['hero_body']).toEqual([{ file: 'src/a.astro', line: 2 }]);
-      expect(places['blog_intro']).toEqual([{ file: 'src/a.astro', line: 3, tag: 'p' }]);
+      // A read in a comment is no read: the dialect never evaluates it.
+      expect(places['hero_headline']).toBeUndefined();
+      expect(places['hero_body']).toEqual([{ file: 'src/a.astro', line: 2, kind: 'text in src/a.astro' }]);
+      expect(places['blog_intro']).toEqual([{ file: 'src/a.astro', line: 3, tag: 'p', kind: 'paragraph' }]);
     });
 
     it('reads a .vue file’s template as its markup, and its script as none', async () => {
@@ -3393,8 +3482,33 @@ describe('GET /api/site/marks', () => {
           "<script setup>\nconst x = copy.get('hero_body');\n</script>\n",
       });
       const { places } = await marksOf(host);
-      expect(places['hero_headline']).toEqual([{ file: 'src/Hero.vue', line: 3, tag: 'h1' }]);
-      expect(places['hero_body']).toEqual([{ file: 'src/Hero.vue', line: 7 }]);
+      expect(places['hero_headline']).toEqual([{ file: 'src/Hero.vue', line: 3, tag: 'h1', kind: 'headline' }]);
+      expect(places['hero_body']).toEqual([{ file: 'src/Hero.vue', line: 7, kind: 'text in src/Hero.vue' }]);
+    });
+
+    it('reads a Vue-bound attribute by the attribute it binds', async () => {
+      const host = readsHost({
+        'src/Hero.vue':
+          "<template>\n  <a :title=\"copy.hero_headline\" href=\"#\">x</a>\n" +
+          "  <img v-bind:alt=\"copy.hero_body\" src=\"/a.png\">\n  <input :placeholder=\"copy.blog_intro\">\n</template>\n",
+      });
+      const { places } = await marksOf(host);
+      expect(places['hero_headline']).toEqual([{ file: 'src/Hero.vue', line: 2, tag: 'a', attr: ':title', kind: 'tooltip' }]);
+      expect(places['hero_body']).toEqual([{ file: 'src/Hero.vue', line: 3, tag: 'img', attr: 'v-bind:alt', kind: 'image alt text' }]);
+      expect(places['blog_intro']).toEqual([{ file: 'src/Hero.vue', line: 4, tag: 'input', attr: ':placeholder', kind: 'placeholder' }]);
+    });
+
+    it('reads the markup after a self-closing `<script />` or `<style />` as markup', async () => {
+      const host = readsHost({
+        'src/pages/probe.astro':
+          '<script type="application/ld+json" set:html={JSON.stringify({ name: copy.hero_body })} />\n' +
+          "<a href=\"#\">{copy.hero_headline}</a>\n<style is:inline set:html={css} />\n<p>{copy.blog_intro}</p>\n" +
+          '<pre is:raw><script>copy.hero_headline</script><style></style></pre>\n',
+      });
+      const { places } = await marksOf(host);
+      expect(places['hero_headline']).toEqual([{ file: 'src/pages/probe.astro', line: 2, tag: 'a', kind: 'link text' }]);
+      expect(places['blog_intro']).toEqual([{ file: 'src/pages/probe.astro', line: 4, tag: 'p', kind: 'paragraph' }]);
+      expect(places['hero_body']).toEqual([{ file: 'src/pages/probe.astro', line: 1, kind: 'text in src/pages/probe.astro' }]);
     });
 
     it('reads a head read as its meta, and a `<title>` as the page title', async () => {
@@ -3405,12 +3519,12 @@ describe('GET /api/site/marks', () => {
       });
       const { places } = await marksOf(host);
       expect(places['hero_headline']).toEqual([
-        { file: 'src/Base.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true },
+        { file: 'src/Base.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true, kind: 'meta description' },
       ]);
       expect(places['hero_body']).toEqual([
-        { file: 'src/Base.astro', line: 5, tag: 'meta', attr: 'content', meta: 'og:title', head: true },
+        { file: 'src/Base.astro', line: 5, tag: 'meta', attr: 'content', meta: 'og:title', head: true, kind: 'share title' },
       ]);
-      expect(places['blog_intro']).toEqual([{ file: 'src/Base.astro', line: 6, tag: 'title', head: true }]);
+      expect(places['blog_intro']).toEqual([{ file: 'src/Base.astro', line: 6, tag: 'title', head: true, kind: 'page title' }]);
     });
 
     it('counts braces only in markup, so a brace in frontmatter masks nothing (stage-5 R4)', async () => {
@@ -3421,9 +3535,36 @@ describe('GET /api/site/marks', () => {
       });
       const { places } = await marksOf(host);
       expect(places['hero_body']).toEqual([
-        { file: 'src/pages/index.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true },
+        { file: 'src/pages/index.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true, kind: 'meta description' },
       ]);
-      expect(places['hero_headline']).toEqual([{ file: 'src/pages/index.astro', line: 5, tag: 'h1' }]);
+      expect(places['hero_headline']).toEqual([{ file: 'src/pages/index.astro', line: 5, tag: 'h1', kind: 'headline' }]);
+    });
+
+    it('answers no place for a read the dialect prints as text', async () => {
+      const host = readsHost({
+        'src/pages/docs.astro':
+          "<pre is:raw>{copy('hero_headline')}</pre>\n<p>{copy.hero_body}</p>\n<p>The hero_headline key, in prose: copy.get('hero_headline').</p>\n",
+      });
+      const { places } = await marksOf(host);
+      expect(places['hero_headline']).toBeUndefined();
+      expect(places['hero_body']).toEqual([{ file: 'src/pages/docs.astro', line: 2, tag: 'p', kind: 'paragraph' }]);
+    });
+
+    it('places a read in an svg’s `<title>` as a tooltip, never a head text (F41)', async () => {
+      const host = readsHost({
+        'src/pages/index.astro':
+          "<button><svg viewBox=\"0 0 1 1\"><title>{copy.get('close_label')}</title></svg></button>\n",
+      });
+      const descriptor = JSON.parse(readFileSync(join(host.cwd, 'content/descriptor.json'), 'utf8')) as Descriptor;
+      descriptor.keys['close_label'] = { shape: 'text', target: 'web' };
+      writeJsonDeterministic(join(host.cwd, 'content/descriptor.json'), descriptor);
+      const snapshot = JSON.parse(readFileSync(join(host.cwd, 'content/defaults.json'), 'utf8'));
+      snapshot.default.close_label = 'Close the menu';
+      writeJsonDeterministic(join(host.cwd, 'content/defaults.json'), snapshot);
+      const { places } = await marksOf(host);
+      expect(places['close_label']).toEqual([
+        { file: 'src/pages/index.astro', line: 1, tag: 'title', svg: true, kind: 'tooltip' },
+      ]);
     });
 
     it('answers 5,000 reads in a 185,000-byte file within 200 ms', async () => {
@@ -3436,7 +3577,7 @@ describe('GET /api/site/marks', () => {
       const { places } = await get(handler, path);
       const took = performance.now() - started;
       expect(places['hero_headline']).toHaveLength(5000);
-      expect(places['hero_headline'].at(-1)).toEqual({ file: 'src/big.tsx', line: 5000 });
+      expect(places['hero_headline'].at(-1)).toEqual({ file: 'src/big.tsx', line: 5000, kind: 'text in src/big.tsx' });
       expect(took).toBeLessThan(200);
     });
 
@@ -3448,7 +3589,7 @@ describe('GET /api/site/marks', () => {
       const res = await handler(req(`/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`));
       expect(res.status).toBe(200);
       expect(((await res.json()) as { places: Record<string, unknown[]> }).places['hero_headline']).toEqual([
-        { file: 'src/deep.astro', line: 1 },
+        { file: 'src/deep.astro', line: 1, kind: 'text in src/deep.astro' },
       ]);
     });
 
@@ -3460,7 +3601,7 @@ describe('GET /api/site/marks', () => {
       const started = performance.now();
       const { places } = await get(handler, path);
       expect(performance.now() - started).toBeLessThan(200);
-      expect(places['hero_body']).toEqual([{ file: 'src/spaces.astro', line: 2, tag: 'p' }]);
+      expect(places['hero_body']).toEqual([{ file: 'src/spaces.astro', line: 2, tag: 'p', kind: 'paragraph' }]);
     });
   });
 });
@@ -4072,7 +4213,7 @@ describe('the page', () => {
         200,
         {
           editor: 'dashboard:test',
-          version: '0.4.0',
+          version: '0.5.0',
           sites: [
             { state: 'ready', name: 'mini', path: '/checkouts/mini', id: SITE_ID, mode: site['mode'], keys: 11, host: 'js', router: 'astro', project: 'default' },
             { state: 'ready', name: 'other', path: '/checkouts/other', id: 'dddddddddddd', mode: 'snapshot', keys: 4, host: 'html', router: 'app', project: 'other-site' },
@@ -4961,11 +5102,11 @@ describe('the page', () => {
         default: { hero: HEADLINE, title: 'Psyon — data acquisition', desc: 'Your development history, read.', foot: '© 2026 Psyon' },
       };
       const KC_PLACES: Record<string, Array<Record<string, unknown>>> = {
-        title: [{ file: 'index.html', line: 3, tag: 'title', head: true }],
-        share: [{ file: 'index.html', line: 4, tag: 'meta', attr: 'content', meta: 'og:description', head: true }],
-        desc: [{ file: 'index.html', line: 5, tag: 'meta', attr: 'content', meta: 'description', head: true }],
-        hero: [{ file: 'index.html', line: 9, tag: 'h1' }],
-        foot: [{ file: 'index.html', line: 20, tag: 'p' }],
+        title: [{ file: 'index.html', line: 3, kind: 'page title', tag: 'title', head: true }],
+        share: [{ file: 'index.html', line: 4, kind: 'share description', tag: 'meta', attr: 'content', meta: 'og:description', head: true }],
+        desc: [{ file: 'index.html', line: 5, kind: 'meta description', tag: 'meta', attr: 'content', meta: 'description', head: true }],
+        hero: [{ file: 'index.html', line: 9, kind: 'headline', tag: 'h1' }],
+        foot: [{ file: 'index.html', line: 20, kind: 'paragraph', tag: 'p' }],
       };
       const kcMarks = (places: Record<string, unknown> = KC_PLACES): Record<string, unknown> => ({
         documents: [{ file: 'index.html', route: '/', page: 'home' }],
@@ -5017,10 +5158,10 @@ describe('the page', () => {
                 keys: {},
                 places: {
                   hero_headline: [
-                    { file: 'src/components/Nav.astro', line: 4, tag: 'a' },
-                    { file: 'src/pages/index.astro', line: 12, tag: 'p' },
-                    { file: 'src/pages/index.astro', line: 2 },
-                    { file: 'src/pages/about.astro', line: 7, tag: 'a' },
+                    { file: 'src/components/Nav.astro', line: 4, kind: 'link text', tag: 'a' },
+                    { file: 'src/pages/index.astro', line: 12, kind: 'paragraph', tag: 'p' },
+                    { file: 'src/pages/index.astro', line: 2, kind: 'text in src/pages/index.astro' },
+                    { file: 'src/pages/about.astro', line: 7, kind: 'link text', tag: 'a' },
                   ],
                 },
               },
@@ -5039,9 +5180,9 @@ describe('the page', () => {
         const page = await kcPage({
           places: {
             ...KC_PLACES,
-            hero: [{ file: 'index.html', line: 9, tag: 'constructor' }],
-            foot: [{ file: 'index.html', line: 20, tag: 'meta', attr: 'content', meta: 'constructor' }],
-            desc: [{ file: 'index.html', line: 5, tag: 'img', attr: 'constructor' }],
+            hero: [{ file: 'index.html', line: 9, kind: 'text in <constructor>', tag: 'constructor' }],
+            foot: [{ file: 'index.html', line: 20, kind: 'content attribute', tag: 'meta', attr: 'content', meta: 'constructor' }],
+            desc: [{ file: 'index.html', line: 5, kind: 'constructor attribute', tag: 'img', attr: 'constructor' }],
           },
         });
         await page.type('search', 'o');
@@ -5054,7 +5195,7 @@ describe('the page', () => {
       });
 
       it('reads an svg’s `<title>` as a tooltip, outside the SEO group and with no cards', async () => {
-        const page = await kcPage({ places: { ...KC_PLACES, foot: [{ file: 'index.html', line: 20, tag: 'title', svg: true }] } });
+        const page = await kcPage({ places: { ...KC_PLACES, foot: [{ file: 'index.html', line: 20, kind: 'tooltip', tag: 'title', svg: true }] } });
         expect(rowKinds(page, 'foot')).toBe('tooltip');
         await page.act('key:foot');
         expect(cards(page).hidden).toBe(true);
@@ -5070,7 +5211,7 @@ describe('the page', () => {
             [
               '/api/site/marks',
               200,
-              { documents: [], keys: {}, places: { loose_key: [{ file: 'src/Base.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true }] } },
+              { documents: [], keys: {}, places: { loose_key: [{ file: 'src/Base.astro', line: 4, kind: 'meta description', tag: 'meta', attr: 'content', meta: 'description', head: true }] } },
             ],
           ],
         });

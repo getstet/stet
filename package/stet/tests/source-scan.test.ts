@@ -19,6 +19,7 @@ import {
   scanSource,
   undecodedEntity,
 } from '../cli/source-scan.js';
+import { SECTION_WORD_ROWS } from './fixtures/section-words.js';
 
 /** descriptor.schema.json:44 — every proposed key must satisfy it. */
 const KEY_REGEX = /^[a-z0-9]+(?:_{1,2}[a-z0-9]+)*$/;
@@ -286,7 +287,8 @@ describe('scanSource', () => {
     expect(r.literals).toHaveLength(1);
     expect(r.literals[0]?.context).toBe('jsx-text');
     expect(r.literals[0]?.raw).toBe('Your week');
-    expect(r.literals[0]?.proposedKey).toBe('your_week');
+    // The role name: no page given, no section, so the component's name stands in.
+    expect(r.literals[0]?.proposedKey).toBe('c_headline');
   });
 
   it('a multi-line JSX text is entity-decoded and whitespace-collapsed, raw is the trimmed source', async () => {
@@ -711,4 +713,96 @@ describe('the stage-5 fold — bogus-comment forms blank like a comment', () => 
     expect(blanked.startsWith('\0'.repeat(15))).toBe(true);
     expect(blanked).toContain('Ordinary page copy.');
   });
+});
+
+describe('JSX role names', () => {
+  const onPage = (source: string, page = 'home') =>
+    scanSource('app/page.tsx', source, { readPathImport: '@/lib/content', page });
+  const page = (jsx: string): string => `export default function Page() {\n  return (<>${jsx}</>);\n}\n`;
+  const keyOf = async (source: string, text: string, pageWord?: string): Promise<string | undefined> => {
+    const r = pageWord === undefined ? await scan('components/x.tsx', source) : await onPage(source, pageWord);
+    return r.literals.find((l) => l.text === text)?.proposedKey;
+  };
+
+  it('names a literal by its page, its section and its role, and carries its place', async () => {
+    const r = await onPage('<section id="hero"><h1>Your week, sorted</h1></section>');
+    expect(r.literals).toHaveLength(1);
+    expect(r.literals[0]?.proposedKey).toBe('home_hero_headline');
+    expect(r.literals[0]?.place).toEqual({ file: 'app/page.tsx', line: 1, tag: 'h1' });
+    expect(r.literals[0]?.sectionWord).toBe('hero');
+  });
+
+  it('spells no section as page, and main never names one', async () => {
+    expect(await keyOf(page('<main><img alt="A diagram of the flow" /></main>'), 'A diagram of the flow', 'home')).toBe(
+      'home_page_image_alt_text',
+    );
+  });
+
+  it("names a section with no id by its heading's first words", async () => {
+    const source = page('<section><h2>Frequently asked</h2><h3>Does it buy the data?</h3></section>');
+    expect(await keyOf(source, 'Does it buy the data?', 'home')).toBe('home_frequently_asked_headline');
+  });
+
+  it("names a component file's literal by the component, with no page part", async () => {
+    expect(await keyOf('export function PricingCard() { return <div><h2>Premium</h2></div> }', 'Premium')).toBe(
+      'pricing_card_headline',
+    );
+    expect(await keyOf('const Hero = () => <p>Hi there</p>;', 'Hi there')).toBe('hero_paragraph');
+    expect(await keyOf('export function Toolbar() { return <Button>Save now</Button> }', 'Save now')).toBe('toolbar_button');
+  });
+
+  it('names a symbol-only literal by its role, never the fallback key (F8)', async () => {
+    expect(await keyOf(page('<span>%</span>'), '%', 'home')).toBe('home_page_span');
+  });
+
+  it('keeps the text-derived name for a send argument, which has no element', async () => {
+    const r = await scan('lib/email/welcome.ts', "export function f(x: unknown) { send({ subject: 'Welcome to Mirra', to: x }); }");
+    expect(r.literals[0]?.context).toBe('send-arg');
+    expect(r.literals[0]?.proposedKey).toBe('welcome_to_mirra');
+  });
+
+  it('reads an id given as a braced string', async () => {
+    expect(await keyOf(page('<section id={"hero"}><h1>Your week, sorted</h1></section>'), 'Your week, sorted', 'home')).toBe(
+      'home_hero_headline',
+    );
+  });
+
+  it("reads a heading as all the text inside it, an inline element's included", async () => {
+    const source = page('<section><h2>Frequently <b>asked</b> things</h2><p>The answers follow.</p></section>');
+    const r = await onPage(source);
+    expect(r.literals.find((l) => l.text === 'The answers follow.')?.sectionWord).toBe('frequently_asked_things');
+  });
+
+  it("reads a meta's content under its name, as a head text with no section", async () => {
+    const source = page('<meta property="og:description" content="A share line for the page." />');
+    expect(await keyOf(source, 'A share line for the page.', 'home')).toBe('home_share_description');
+  });
+
+  it("names a component's prop by the component and the prop", async () => {
+    expect(await keyOf(page('<main><Image alt="A friendly face" /></main>'), 'A friendly face', 'home')).toBe('home_page_image_alt');
+    const source = page('<title>My page title here</title><Card title="A card heading here" />');
+    expect(await keyOf(source, 'My page title here', 'home')).toBe('home_page_title');
+    expect(await keyOf(source, 'A card heading here', 'home')).toBe('home_page_card_title');
+  });
+
+  it("cuts a long component's name to its first three words", async () => {
+    const source = 'export function VeryLongComponentNameForTheMarketingHeroSection() { return <p>Some words here</p>; }';
+    expect(await keyOf(source, 'Some words here')).toBe('very_long_component_paragraph');
+  });
+
+  for (const row of SECTION_WORD_ROWS) {
+    it(`answers the fixture row: ${row.name}`, async () => {
+      const source = page(row.markup);
+      // The marked element's open tag, and the text directly after it: the
+      // literal on it is an attribute inside the tag or the text after it.
+      const open = source.indexOf(' data-mark');
+      const start = source.lastIndexOf('<', open);
+      const end = source.indexOf('>', open);
+      const after = source.indexOf('<', end);
+      const r = await onPage(source);
+      const found = r.literals.filter((l) => (l.pos > start && l.pos < end) || (l.pos > end && l.pos < after));
+      expect(found).toHaveLength(1);
+      expect(found[0]?.sectionWord).toBe(row.word);
+    });
+  }
 });

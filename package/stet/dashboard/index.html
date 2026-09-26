@@ -494,13 +494,7 @@ function writeEditor(value) {
 
 // --- where a key renders ------------------------------------------------------
 // The server's places (`GET /api/site/marks`) and the page records' SEO fields,
-// said in plain words. A place is { file, line, tag?, attr?, meta? }.
-const HEAD_META = {
-  description: 'meta description', 'og:title': 'share title', 'twitter:title': 'share title',
-  'og:description': 'share description', 'twitter:description': 'share description',
-};
-const ATTR_KINDS = { alt: 'image alt text', 'aria-label': 'aria label', title: 'tooltip', placeholder: 'placeholder' };
-const TAG_KINDS = { p: 'paragraph', a: 'link text', button: 'button text', li: 'list item', title: 'page title' };
+// said in plain words. A place is { file, line, kind, tag?, attr?, meta?, svg?, head? }.
 const SEO_KINDS = {
   title: 'page title', description: 'meta description', ogImage: 'share image', ogImageAlt: 'share image alt text',
   canonical: 'canonical address', robots: 'robots rule',
@@ -510,16 +504,8 @@ const HEAD_KINDS = ['page title', 'meta description', 'share title', 'share desc
   'share image alt text', 'canonical address', 'robots rule'];
 /** And the attributes no one sees on the page as it sits. */
 const UNSEEN_KINDS = HEAD_KINDS.concat(['aria label', 'image alt text', 'tooltip']);
-/** What element a place is, in plain words. */
-function kindOf(place) {
-  // A <title> inside an <svg> names the graphic; a browser shows it as a tooltip.
-  if (place.svg === true && place.tag === 'title') return 'tooltip';
-  if (place.attr === 'content' && own(HEAD_META, place.meta)) return HEAD_META[place.meta];
-  if (place.attr !== undefined) return own(ATTR_KINDS, place.attr) ? ATTR_KINDS[place.attr] : place.attr + ' attribute';
-  if (place.tag === undefined) return 'text in ' + place.file;
-  if (/^h[1-6]$/.test(place.tag)) return 'headline';
-  return own(TAG_KINDS, place.tag) ? TAG_KINDS[place.tag] : 'text in <' + place.tag + '>';
-}
+/** What element a place is, in plain words: the server's `kindOf`, the vocabulary role names are made from. */
+const kindOf = (place) => place.kind;
 const placesOf = (id) => (own(S.marks.places, id) ? S.marks.places[id] : []);
 /** A place in the page's head — its `<title>` or a meta whose content is copy — as the server marks it. */
 const isHeadPlace = (place) => place.head === true;

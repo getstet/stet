@@ -8,17 +8,20 @@
  * pointed at — and `seed`, `upgrade` and `doctor` never import an adapter
  * module themselves.
  *
- * Every function here answers `'unsupported'`/null for a project whose store
+ * Every `stet_meta` function here answers `'unsupported'`/null for a project whose store
  * has no `stet_meta` to speak of: memory, snapshot, and an injected test store
  * with no config store block. That is a reported outcome, never an error — a
  * project without a database is a mode.
  */
 
+import type { MemoryStore } from '../adapters/store-memory.js';
 import {
   readStetMeta as readPostgrestMeta,
+  renameRecorded as postgrestRenameRecorded,
   writeDescriptorVersion as writePostgrestVersion,
 } from '../adapters/store-postgrest.js';
 import type { StetMeta } from '../adapters/store-shared.js';
+import type { StoreAdapter } from '../src/store.js';
 import { selectStoreBlock, type StetConfig, type StoreBlock } from './config.js';
 import { CliError } from './report.js';
 import { loadPgAdapter, requireEnv } from './store.js';
@@ -86,6 +89,35 @@ export async function readProjectMeta(
     }
     case 'postgrest':
       return readPostgrestMeta({ url: conn.url, token: conn.token, fetchImpl });
+  }
+}
+
+/**
+ * Whether the selected store's rename log (`stet_renames`) holds `oldKey`
+ * renamed to `newKey`: a rename that store finished, whoever ran it. The memory
+ * reference answers from its own log; a store with no log answers false.
+ */
+export async function renameRecorded(
+  config: StetConfig,
+  env: NodeJS.ProcessEnv,
+  selection: string,
+  store: StoreAdapter,
+  pair: { oldKey: string; newKey: string },
+  fetchImpl?: Fetch,
+): Promise<boolean> {
+  const conn = connectionOf(config, env, selection);
+  const p = { project: config.project, ...pair };
+  switch (conn.kind) {
+    case 'pg': {
+      const { renameRecorded: pgRenameRecorded } = await loadPgAdapter();
+      return pgRenameRecorded(conn.connectionString, p);
+    }
+    case 'postgrest':
+      return postgrestRenameRecorded({ url: conn.url, token: conn.token, fetchImpl }, p);
+    case 'none': {
+      const log = (store as Partial<MemoryStore>).renameLog;
+      return typeof log === 'function' && log.call(store).some((r) => r.old_key === p.oldKey && r.new_key === p.newKey);
+    }
   }
 }
 

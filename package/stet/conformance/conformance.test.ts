@@ -330,19 +330,19 @@ describe('descriptor', () => {
     };
     const values = (JSON.parse(host.file('content/defaults.json')) as { default: Record<string, string> })
       .default;
-    expect(written.keys['you_may_already_have_the_data_our_ai']).toEqual({
+    expect(written.keys['home_page_headline']).toEqual({
       shape: 'text',
       target: 'web',
       tags: 1,
     });
-    expect(values['you_may_already_have_the_data_our_ai']).toBe(
+    expect(values['home_page_headline']).toBe(
       'You may already have the data<1> our AI lab partners need.</1>',
     );
     // A nested pair declares two; an element with no descendants declares none.
     const nested = Object.entries(values).find(([, v]) => v === 'Hello <1>big <2>world</2></1>!')![0];
     expect(written.keys[nested]?.tags).toBe(2);
     const plain = Object.entries(values).find(([, v]) => v === 'Imaging archives')![0];
-    expect(written.keys[plain]).toEqual({ shape: 'text', target: 'web' });
+    expect(written.keys[plain]).toEqual({ shape: 'text', target: 'web', section: 'qualify' });
 
     // The schema rejects a count below one, naming the path.
     const document = mutable(readFixture('descriptor.json') as Record<string, never>);
@@ -1715,8 +1715,8 @@ describe('seo', () => {
       },
     });
     expect(await html.run('pages', 'scan')).toBe(0);
-    expect(html.stdout()).toContain('  title: bound to psyon_data_partnerships_for_ai_labs');
-    expect(html.stdout()).toContain('  description: bound to psyon_connects_hospitals_labs_and');
+    expect(html.stdout()).toContain('  title: bound to home_page_title');
+    expect(html.stdout()).toContain('  description: bound to home_meta_description');
     expect(html.stdout()).toContain('  title: no marked <title> — run stet register first, or declare it by hand');
     expect(html.stdout()).not.toContain('shot');
 
@@ -1727,15 +1727,15 @@ describe('seo', () => {
       keys: Record<string, { pages?: string[] }>;
     };
     expect(bound.pages['home']?.seo).toEqual({
-      title: 'psyon_data_partnerships_for_ai_labs',
-      description: 'psyon_connects_hospitals_labs_and',
+      title: 'home_page_title',
+      description: 'home_meta_description',
     });
     // No `seo_home_*` was minted, and the page with no marks scaffolds nothing.
     expect(bound.keys['seo_home_title']).toBeUndefined();
     expect(bound.keys['seo_about_title']).toBeUndefined();
     expect(bound.pages['about']?.seo).toBeUndefined();
     // The bound key carries the page in its reverse index.
-    expect(bound.keys['psyon_data_partnerships_for_ai_labs']?.pages).toEqual(['home']);
+    expect(bound.keys['home_page_title']?.pages).toEqual(['home']);
     // The gap is `seo check`'s to report, honestly.
     html.out.length = 0;
     html.err.length = 0;
@@ -1754,6 +1754,7 @@ describe('store', () => {
       'read',
       'recent',
       'rename',
+      'renameLog',
       'revert',
       'saveDraft',
       'seed',
@@ -2095,6 +2096,7 @@ describe('store', () => {
       'read',
       'recent',
       'rename',
+      'renameLog',
       'revert',
       'saveDraft',
       'seed',
@@ -3273,6 +3275,27 @@ describe('cli', () => {
     // environment, warning and naming the source — deliberate, since it IS
     // §13.1c's release step. Its proof is the per-case suite's, not this walk's
     // (tests/cli.test.ts, "pull from a non-default environment warns").
+
+    // `rename` runs every store-backed environment unless --env narrows it, and
+    // names each one it leaves (journey G2).
+    const renamed: string[] = [];
+    const narrowStores = {
+      default: createMemoryStore({ project: 'default' }),
+      staging: createMemoryStore({ project: 'default' }),
+    };
+    for (const [env, store] of Object.entries(narrowStores)) {
+      const real = store.rename.bind(store);
+      store.rename = async (p) => {
+        renamed.push(env);
+        return real(p);
+      };
+    }
+    const narrowed = makeCliHost({ config, stores: narrowStores });
+    expect(await narrowed.run('rename', 'blog_intro', 'blog_opening', '--write', '--env', 'staging')).toBe(0);
+    expect(renamed).toEqual(['staging']);
+    expect(narrowed.stdout()).toContain(
+      'store (default): not renamed in this run — run the same command with --env default to finish',
+    );
   });
 
   it('Requirement: Mode is detected, never asked', async () => {
@@ -3736,14 +3759,342 @@ describe('cli', () => {
     // On the static-HTML host the forms include the MARKS: the plan names each
     // one, and the batch strips it with the text kept.
     const html = await makeHtmlHost({ register: true });
-    expect(await html.run('remove', 'how_it_works')).toBe(0);
+    expect(await html.run('remove', 'home_nav_link_text')).toBe(0);
     expect(html.stdout()).toContain('the mark is removed and the text stays');
     expect(html.stdout()).toContain('every other mark is regenerated in the same write');
     html.out.length = 0;
-    expect(await html.run('remove', 'how_it_works', '--write')).toBe(0);
-    expect(html.file('index.html')).not.toContain('data-stet="how_it_works"');
+    expect(await html.run('remove', 'home_nav_link_text', '--write')).toBe(0);
+    expect(html.file('index.html')).not.toContain('data-stet="home_nav_link_text"');
     expect(html.file('index.html')).toContain('<a href="#how">How it works</a>');
     expect(await html.run('check')).toBe(0);
+  });
+
+  it('Requirement: rename moves a key in every repo form, every read stet can prove, and every store', async () => {
+    /** The mini project with extra keys, its codegen trio regenerated so check starts green. */
+    const withKeys = (host: CliHost, keys: Record<string, string>): CliHost => {
+      const d = JSON.parse(host.file('content/descriptor.json')) as Descriptor;
+      const snap = JSON.parse(host.file('content/defaults.json')) as Record<string, Record<string, unknown>>;
+      for (const [key, value] of Object.entries(keys)) {
+        d.keys[key] = { shape: 'text', target: 'web' };
+        (snap['default'] as Record<string, unknown>)[key] = value;
+      }
+      writeFileSync(join(host.cwd, 'content/descriptor.json'), `${JSON.stringify(d, null, 2)}\n`);
+      writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(snap, null, 2)}\n`);
+      const registry = generateRegistry(d);
+      writeFileSync(join(host.cwd, 'content/keys.ts'), registry.keysTs);
+      writeFileSync(join(host.cwd, 'content/stet-env.d.ts'), registry.dts);
+      writeFileSync(join(host.cwd, 'content/defaults.ts'), generateDefaultsModule(snap as never));
+      return host;
+    };
+    const put = (host: { cwd: string }, rel: string, text: string): void => {
+      mkdirSync(join(host.cwd, rel, '..'), { recursive: true });
+      writeFileSync(join(host.cwd, rel), text, 'utf8');
+    };
+    const REPO = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts'];
+    const bytes = (host: { cwd: string }, rels: string[]) => rels.map((rel) => readFileSync(join(host.cwd, rel)));
+
+    // A static-HTML site renames three keys (journey G2).
+    const marked =
+      '<!DOCTYPE html>\n<html><head><title data-stet="psyon_title">Psyon data acquisition</title>\n' +
+      '<meta property="og:description" content="You may already have the data. Start today." data-stet-content="share_description">\n' +
+      '</head><body>\n<h1 data-stet="hero_line">You may already have the data.</h1>\n' +
+      '<h3 data-stet="01_assess">01 Assess</h3>\n<p data-stet="agreed_case_by_case_where_none_of_the">Agreed case by case.</p>\n' +
+      '<footer><p data-stet="2026_psyon_all_rights_reserved">© 2026 Psyon. All rights reserved.</p></footer>\n</body></html>\n';
+    const html = await makeHtmlHost({
+      files: { 'index.html': marked },
+      keys: {
+        psyon_title: { shape: 'text', target: 'web' },
+        share_description: { shape: 'text', target: 'web', derivesFrom: 'hero_line', tmpl: '{v} Start today.' },
+        hero_line: { shape: 'text', target: 'web' },
+        '01_assess': { shape: 'text', target: 'web' },
+        agreed_case_by_case_where_none_of_the: { shape: 'text', target: 'web' },
+        '2026_psyon_all_rights_reserved': { shape: 'text', target: 'web' },
+      },
+      defaults: {
+        psyon_title: 'Psyon data acquisition',
+        hero_line: 'You may already have the data.',
+        '01_assess': '01 Assess',
+        agreed_case_by_case_where_none_of_the: 'Agreed case by case.',
+        '2026_psyon_all_rights_reserved': '© 2026 Psyon. All rights reserved.',
+      },
+    });
+    writeFileSync(
+      join(html.cwd, 'rename.json'),
+      JSON.stringify({
+        plan: 'stet rename',
+        version: 1,
+        keys: [
+          { old: '01_assess', key: 'home_process_step_1', label: 'Process step 1', help: "The first step's title in How it works." },
+          { old: 'agreed_case_by_case_where_none_of_the', key: 'home_another_structure_body', label: null, help: null },
+          { old: '2026_psyon_all_rights_reserved', key: 'home_footer_copyright', label: null, help: null },
+        ],
+      }),
+    );
+    const htmlBefore = bytes(html, ['content/descriptor.json', 'content/defaults.json', 'index.html']);
+    expect(await html.run('rename', '--plan', 'rename.json')).toBe(0);
+    expect(html.stdout()).toContain('rename 01_assess → home_process_step_1\n  index.html:6 the mark is renamed');
+    expect(bytes(html, ['content/descriptor.json', 'content/defaults.json', 'index.html'])).toEqual(htmlBefore);
+    html.out.length = 0;
+    expect(await html.run('rename', '--plan', 'rename.json', '--write')).toBe(0);
+    expect(html.stdout()).toContain('wrote content/descriptor.json, content/defaults.json, index.html: 3 keys renamed');
+    expect(html.stdout()).toContain(
+      'commit them together: git commit -m "stet: rename 3 keys" -- content/descriptor.json content/defaults.json index.html',
+    );
+    expect(
+      html
+        .file('index.html')
+        .replace('"home_process_step_1"', '"01_assess"')
+        .replace('"home_another_structure_body"', '"agreed_case_by_case_where_none_of_the"')
+        .replace('"home_footer_copyright"', '"2026_psyon_all_rights_reserved"'),
+    ).toBe(marked);
+    expect(await html.run('check')).toBe(0);
+
+    // A derived key and a page follow a renamed key (journey G2).
+    expect(await html.run('pages', 'scan', '--apply')).toBe(0);
+    html.out.length = 0;
+    writeFileSync(
+      join(html.cwd, 'follow.json'),
+      JSON.stringify({
+        plan: 'stet rename',
+        version: 1,
+        keys: [
+          { old: 'hero_line', key: 'home_hero_title', label: null, help: null },
+          { old: 'psyon_title', key: 'home_title', label: null, help: null },
+        ],
+      }),
+    );
+    expect(await html.run('rename', '--plan', 'follow.json', '--write')).toBe(0);
+    expect(html.stdout()).toContain('rename hero_line → home_hero_title\n  share_description derives from it and follows');
+    expect(html.stdout()).toContain('rename psyon_title → home_title\n  pages/home/seo/title follows');
+    const followed = JSON.parse(html.file('content/descriptor.json'));
+    expect(followed.keys.share_description.derivesFrom).toBe('home_hero_title');
+    expect(followed.pages.home.seo.title).toBe('home_title');
+    expect(await html.run('check')).toBe(0);
+
+    // A JavaScript host's reads are rewritten through a copy module (journey G2),
+    // and a documentation sample is a mention.
+    const site = withKeys(
+      makeCliHost({ config: { project: 't', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'] } }),
+      { nav_docs: 'Docs' },
+    );
+    put(site, 'src/copy.ts', "import { accessor, copyMap } from '../lib/content';\nexport const copy = copyMap;\nexport const get = accessor.get;\n");
+    put(site, 'src/layouts/Base.astro', '---\nimport { copy } from "../copy";\n---\n<a href="/docs">{copy.nav_docs}</a>\n');
+    put(site, 'src/components/ui/SiteNav.astro', '---\nimport { copy } from "../../copy";\n---\n<a>{copy.nav_docs}</a>\n<a>{copy.nav_docs}</a>\n');
+    put(site, 'src/pages/docs.astro', "<pre is:raw>{copy('hero_headline')}</pre>\n<p>The hero_headline key names the headline.</p>\n");
+    expect(await site.run('rename', 'hero_headline', 'hero_title')).toBe(0);
+    expect(site.stdout()).toContain('  src/pages/docs.astro:1 mentions "hero_headline" in text — left as it is');
+    expect(site.stdout()).toContain('  src/pages/docs.astro:2 mentions "hero_headline" in text — left as it is');
+    expect(site.stdout()).not.toContain('src/pages/docs.astro:1 {copy');
+    site.out.length = 0;
+    expect(await site.run('rename', 'nav_docs', 'nav_documentation', '--write')).toBe(0);
+    expect(site.stdout()).toContain('  src/layouts/Base.astro:4 <a href="/docs">{copy.nav_docs}</a>');
+    expect(site.stdout()).toContain('stet cannot see reads outside the declared surfaces');
+    expect(site.file('src/components/ui/SiteNav.astro').match(/copy\.nav_documentation/g)).toHaveLength(2);
+    expect(site.file('content/keys.ts')).toContain('nav_documentation');
+    expect(await site.run('check')).toBe(0);
+
+    // Vue and Svelte attribute code is rewritten (journey G2).
+    const frameworks = withKeys(
+      makeCliHost({ config: { project: 't', managedSurfaces: ['src/**/*.vue', 'src/**/*.svelte'], copyModules: ['src/copy.ts'] } }),
+      { nav_docs: 'Docs' },
+    );
+    put(frameworks, 'src/copy.ts', "import { copyMap } from '../lib/content';\nexport const copy = copyMap;\n");
+    put(
+      frameworks,
+      'src/components/Nav.vue',
+      '<script setup>\nimport { copy } from "../copy";\n</script>\n<template>\n' +
+        '<a :title="copy.nav_docs" v-text="copy.nav_docs" v-if="copy.nav_docs" class="nav_docs"></a>\n</template>\n',
+    );
+    put(frameworks, 'src/components/Nav.svelte', '<script>\nimport { copy } from "../copy";\n</script>\n<a title="{copy.nav_docs}" class="nav_docs">x</a>\n');
+    expect(await frameworks.run('rename', 'nav_docs', 'nav_documentation', '--write')).toBe(0);
+    expect(frameworks.file('src/components/Nav.vue')).toContain(
+      '<a :title="copy.nav_documentation" v-text="copy.nav_documentation" v-if="copy.nav_documentation" class="nav_docs"></a>',
+    );
+    expect(frameworks.file('src/components/Nav.svelte')).toContain('<a title="{copy.nav_documentation}" class="nav_docs">x</a>');
+
+    // A read stet cannot rewrite refuses the write (journey G2).
+    const blocked = withKeys(
+      makeCliHost({ config: { project: 't', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'] } }),
+      { nav_docs: 'Docs' },
+    );
+    put(blocked, 'src/copy.ts', "import { copyMap } from '../lib/content';\nexport const copy = copyMap;\n");
+    put(blocked, 'src/pages/probe.astro', '---\nimport { copy } from "../copy";\nconst name = "nav_docs";\n---\n<p>{copy["nav_docs"]}</p>\n');
+    const blockedBefore = bytes(blocked, [...REPO, 'src/pages/probe.astro']);
+    expect(await blocked.run('rename', 'nav_docs', 'nav_documentation', '--write')).toBe(1);
+    expect(blocked.stdout()).toContain('  src/pages/probe.astro:5 <p>{copy["nav_docs"]}</p>');
+    expect(blocked.stdout()).toContain(
+      '  src/pages/probe.astro:3 reads "nav_docs" in a form stet cannot rewrite — edit it to the new name by hand, then re-run',
+    );
+    expect(blocked.stderr()).toContain('cannot rename: 1 read stet cannot rewrite — nothing written');
+    expect(bytes(blocked, [...REPO, 'src/pages/probe.astro'])).toEqual(blockedBefore);
+
+    // The store half: every store-backed environment, resumable from the record.
+    const TWO = { project: 'default', store: { adapter: 'memory' }, environments: { staging: { adapter: 'memory' } } };
+    const publishedIn = async (store: ReturnType<typeof createMemoryStore>, key: string): Promise<void> => {
+      await store.saveDraft({ key, value: 'A value', target: 'web', editor: 't' });
+      await store.publish({ key, editor: 't' });
+    };
+    const rowsUnder = async (store: ReturnType<typeof createMemoryStore>, key: string): Promise<boolean> => {
+      const rows = await store.read({ keys: [key], preview: true });
+      return Array.isArray(rows) && rows.length > 0;
+    };
+    const pair = (host: { cwd: string }, file: string, pairs: Array<[string, string]>): void =>
+      writeFileSync(
+        join(host.cwd, file),
+        JSON.stringify({ plan: 'stet rename', version: 1, keys: pairs.map(([old, key]) => ({ old, key, label: null, help: null })) }),
+      );
+
+    // A store half that stops part-way is finished by the same command (journey G2).
+    const partDefault = createMemoryStore({ project: 'default' });
+    const partStaging = createMemoryStore({ project: 'default' });
+    for (const store of [partDefault, partStaging]) {
+      await publishedIn(store, 'a_key');
+      await publishedIn(store, 'b_key');
+    }
+    const realRename = partStaging.rename.bind(partStaging);
+    let failedOnce = false;
+    partStaging.rename = async (p) => {
+      if (p.oldKey === 'b_key' && !failedOnce) {
+        failedOnce = true;
+        return { storeError: true, code: 'unreachable', message: 'connection reset' };
+      }
+      return realRename(p);
+    };
+    const part = withKeys(makeCliHost({ config: TWO, stores: { default: partDefault, staging: partStaging } }), {
+      a_key: 'A value',
+      b_key: 'A value',
+    });
+    pair(part, 'rename.json', [
+      ['a_key', 'a_new'],
+      ['b_key', 'b_new'],
+    ]);
+    const partBefore = bytes(part, REPO);
+    expect(await part.run('rename', '--plan', 'rename.json', '--write')).toBe(1);
+    expect(part.stderr()).toContain(
+      'store (staging): 1 of 2 keys re-keyed before connection reset — this run wrote no code; run the same command again to finish',
+    );
+    expect(bytes(part, REPO)).toEqual(partBefore);
+    expect(JSON.parse(part.file('.stet/rename-pending.json')).pairs).toEqual([
+      ['a_key', 'a_new'],
+      ['b_key', 'b_new'],
+    ]);
+    part.out.length = 0;
+    expect(await part.run('rename', '--plan', 'rename.json', '--write')).toBe(0);
+    expect(part.stdout()).toContain('store (staging): 1 key re-keyed, 1 already renamed; their history stays linked under the new names');
+    expect(part.stdout()).toContain('commit them together: git commit -m "stet: rename 2 keys" --');
+    expect(part.exists('.stet/rename-pending.json')).toBe(false);
+    const linked = await partDefault.history({ key: 'a_new' });
+    expect('rows' in linked && linked.rows.length).toBe(1);
+
+    // A finished rename is refused with one line per cause (journey G2).
+    part.err.length = 0;
+    expect(await part.run('rename', '--plan', 'rename.json', '--write')).toBe(1);
+    expect(part.err).toEqual([
+      'error: stet rename: rename.json is refused — nothing written',
+      'error: a_key, b_key: not keys in the descriptor',
+      'error: a_new, b_new: already keys in the descriptor — the rename has landed',
+    ]);
+
+    // A narrowed run leaves the other environments named, and a clone finishes them (journey G2).
+    const narrowDefault = createMemoryStore({ project: 'default' });
+    const narrowStaging = createMemoryStore({ project: 'default' });
+    for (const store of [narrowDefault, narrowStaging]) await publishedIn(store, 'a_key');
+    const narrow = withKeys(makeCliHost({ config: TWO, stores: { default: narrowDefault, staging: narrowStaging } }), { a_key: 'A value' });
+    const gitIn = (cwd: string, ...args: string[]) =>
+      execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, stdio: 'pipe' });
+    gitIn(narrow.cwd, 'init', '-q');
+    gitIn(narrow.cwd, 'add', '-A');
+    gitIn(narrow.cwd, 'commit', '-qm', 'base');
+    expect(await narrow.run('rename', 'a_key', 'a_new', '--env', 'staging', '--write')).toBe(0);
+    expect(narrow.stdout()).toContain('store (default): not renamed in this run — run the same command with --env default to finish');
+    expect(narrow.stdout()).toContain(`wrote ${[...REPO, '.stet/rename-pending.json'].join(', ')}: 1 key renamed`);
+    gitIn(narrow.cwd, 'add', '--', ...REPO, '.stet/rename-pending.json');
+    gitIn(narrow.cwd, 'commit', '-qm', 'stet: rename 1 key');
+    const clone = mkdtempSync(join(tmpdir(), 'stet-rename-clone-'));
+    gitIn(tmpdir(), 'clone', '-q', narrow.cwd, clone);
+    const cloneOut: string[] = [];
+    expect(
+      await runCli(['rename', 'a_key', 'a_new', '--env', 'default', '--write'], {
+        cwd: clone,
+        env: {},
+        stdout: (line) => cloneOut.push(line),
+        stderr: (line) => cloneOut.push(line),
+        stores: { default: narrowDefault, staging: narrowStaging },
+      }),
+    ).toBe(0);
+    expect(cloneOut.join('\n')).not.toContain('not renamed in this run');
+    expect(cloneOut).toContain('commit the rename record: git commit -m "stet: rename 1 key" -- .stet/rename-pending.json');
+    expect(existsSync(join(clone, '.stet/rename-pending.json'))).toBe(false);
+    expect(await rowsUnder(narrowDefault, 'a_new')).toBe(true);
+
+    // An occupied new name refuses before any write (journey G2).
+    const occupiedStore = createMemoryStore({ project: 'default' });
+    await publishedIn(occupiedStore, 'a_key');
+    await occupiedStore.saveDraft({ key: 'a_new', value: 'Taken', target: 'web', editor: 'x', publishAt: '2099-01-01T00:00:00Z' });
+    const occupied = withKeys(makeCliHost({ config: { project: 'default', store: { adapter: 'memory' } }, stores: { default: occupiedStore } }), {
+      a_key: 'A value',
+    });
+    const occupiedBefore = bytes(occupied, REPO);
+    expect(await occupied.run('rename', 'a_key', 'a_new', '--write')).toBe(1);
+    expect(occupied.stderr()).toContain('cannot rename a_key: "a_new" already has rows in store (default)');
+    expect(bytes(occupied, REPO)).toEqual(occupiedBefore);
+    expect(await rowsUnder(occupiedStore, 'a_key')).toBe(true);
+
+    // Rows under the new name that no pending rename explains are refused (journey G2),
+    // in an environment the run writes and in one it does not.
+    const orphanDefault = createMemoryStore({ project: 'default' });
+    const orphanStaging = createMemoryStore({ project: 'default' });
+    await publishedIn(orphanStaging, 'a_key');
+    await orphanDefault.saveDraft({ key: 'a_new', value: 'Someone else', target: 'web', editor: 'x' });
+    const orphan = withKeys(makeCliHost({ config: TWO, stores: { default: orphanDefault, staging: orphanStaging } }), { a_key: 'A value' });
+    expect(await orphan.run('rename', 'a_key', 'a_new', '--env', 'staging', '--write')).toBe(1);
+    expect(orphan.stderr()).toContain(
+      'cannot rename a_key: "a_new" already has rows in store (default) that no pending rename of a_key explains',
+    );
+    expect(orphan.stderr()).toContain('stet audit lists them');
+
+    // A chain is refused where a store exists, and applies on a snapshot-only project (journey G2).
+    const chained = withKeys(makeCliHost({ config: { project: 'default', store: { adapter: 'memory' } } }), { a_key: 'A', b_key: 'B' });
+    pair(chained, 'chain.json', [
+      ['a_key', 'b_key'],
+      ['b_key', 'c_key'],
+    ]);
+    expect(await chained.run('rename', '--plan', 'chain.json', '--write')).toBe(1);
+    expect(chained.stderr()).toContain(
+      'a_key: "b_key" is another entry\'s old name — a store renames one key at a time, so rename through a temporary name in two plans',
+    );
+    const bare = withKeys(makeCliHost({ config: { project: 'default' } }), { a_key: 'A', b_key: 'B' });
+    pair(bare, 'chain.json', [
+      ['a_key', 'b_key'],
+      ['b_key', 'c_key'],
+    ]);
+    expect(await bare.run('rename', '--plan', 'chain.json', '--write')).toBe(0);
+    expect(JSON.parse(bare.file('content/defaults.json')).default.c_key).toBe('B');
+
+    // A pair naming its own key, a slot key and a brand key are refused (journey G2).
+    const refusing = makeCliHost({ config: { project: 'default' } });
+    expect(await refusing.run('rename', 'hero_headline', 'hero_headline')).toBe(1);
+    expect(refusing.stderr()).toContain('hero_headline: the new name is the old name — nothing to rename');
+    refusing.err.length = 0;
+    expect(await refusing.run('rename', 'welcome__subject', 'welcome_title')).toBe(1);
+    expect(refusing.err).toEqual([
+      'error: stet rename is refused — nothing written',
+      'error: cannot rename welcome__subject: welcome__subject is the subject slot of the welcome template — a slot key follows its template',
+    ]);
+    refusing.err.length = 0;
+    expect(await refusing.run('rename', 'brand__name', 'site_name')).toBe(1);
+    expect(refusing.err).toEqual([
+      'error: stet rename is refused — nothing written',
+      'error: cannot rename brand__name: brand__ keys belong to the brand group',
+    ]);
+
+    // A snapshot-only project renames the code alone (journey G2).
+    const snapshotOnly = makeCliHost({ config: { project: 'default' } });
+    expect(await snapshotOnly.run('rename', 'blog_intro', 'blog_opening', '--write')).toBe(0);
+    expect(snapshotOnly.exists('.stet/rename-pending.json')).toBe(false);
+    expect(snapshotOnly.stdout()).not.toContain('store (');
+    expect(JSON.parse(snapshotOnly.file('content/defaults.json')).default.blog_opening).toBeDefined();
+    expect(await snapshotOnly.run('check')).toBe(0);
   });
 
   it('Requirement: publish is one path — click, agent and clock', async () => {
@@ -4364,6 +4715,42 @@ describe('cli', () => {
   });
 });
 
+/** A plain HTML page shaped as psyon.ai's: a skip link, a header, a hero, four questions, a card of chips, a footer. */
+const PSYON_SHAPED = [
+  '<!DOCTYPE html>',
+  '<html lang="en">',
+  '<head>',
+  '  <meta charset="utf-8">',
+  '  <title>Acme — data for labs</title>',
+  '  <meta property="og:description" content="Ship the catalogue in a day. Start today.">',
+  '</head>',
+  '<body>',
+  '  <a href="#main">Skip to content</a>',
+  '  <header>',
+  '    <span>Acme wordmark</span>',
+  '    <nav><a href="#top">Why it matters</a> <a href="#faq">Questions asked</a></nav>',
+  '  </header>',
+  '  <main id="main">',
+  '    <section id="top">',
+  '      <h1>Ship the catalogue in a day.</h1>',
+  '      <p>Data acquisition for labs.</p>',
+  '    </section>',
+  '    <section id="faq">',
+  ...[1, 2, 3, 4].map((n) => `      <details><h3>Question number ${n} here?</h3><p>Answer number ${n} here.</p></details>`),
+  '    </section>',
+  '    <section id="does">',
+  '      <article>',
+  '        <h3>Prepare</h3>',
+  ...['Select', 'Structure', 'Annotate', 'Review and validate', 'Deliver'].map((chip) => `        <span>${chip}</span>`),
+  '      </article>',
+  '    </section>',
+  '  </main>',
+  '  <footer><p>Copyright the company, all rights.</p></footer>',
+  '</body>',
+  '</html>',
+  '',
+].join('\n');
+
 describe('adoption', () => {
   it("Requirement: A static-HTML host's documents are generated forms of the snapshot", async () => {
     // ONE walk over a real static-HTML host: adopt it, prove the page is a
@@ -4389,7 +4776,7 @@ describe('adoption', () => {
     host.err.length = 0;
     expect(await host.run('scan')).toBe(0);
     expect(host.stdout()).toContain('scan: 2 files, 29 unkeyed literals');
-    expect(host.stderr()).toContain('propose key software_product_and_engineering');
+    expect(host.stderr()).toContain('propose key home_qualify_headline');
 
     // register — the plain run writes nothing, `--write` lands one batch.
     host.out.length = 0;
@@ -4409,8 +4796,8 @@ describe('adoption', () => {
     // The mark is the ONLY edit: the document is byte-identical without it.
     expect(host.file('index.html').replace(/ data-stet[^ >]*="[^"]*"/g, '')).toBe(original);
     // A mixed element declares its placeholder count; identical text shares one key.
-    expect(descriptor().keys['you_may_already_have_the_data_our_ai']?.tags).toBe(1);
-    expect(host.file('index.html').match(/data-stet="how_it_works"/g)).toHaveLength(2);
+    expect(descriptor().keys['home_page_headline']?.tags).toBe(1);
+    expect(host.file('index.html').match(/data-stet="home_nav_link_text"/g)).toHaveLength(2);
 
     // check — every mark walked, the documents current.
     host.out.length = 0;
@@ -4454,7 +4841,7 @@ describe('adoption', () => {
 
     // A value that lost its placeholder is refused, and nothing is written.
     const broken = snapshot();
-    const mixed = 'you_may_already_have_the_data_our_ai';
+    const mixed = 'home_page_headline';
     broken.default[mixed] = 'You may already have the data our AI lab partners need.';
     writeFileSync(join(host.cwd, 'content/defaults.json'), `${JSON.stringify(broken, null, 2)}\n`);
     const beforeRefusal = host.file('index.html');
@@ -4474,8 +4861,8 @@ describe('adoption', () => {
     host.err.length = 0;
     expect(await host.run('pages', 'scan', '--apply')).toBe(0);
     expect(descriptor().pages?.['home']?.seo).toEqual({
-      title: 'psyon_data_partnerships_for_ai_labs',
-      description: 'psyon_connects_hospitals_labs_and',
+      title: 'home_page_title',
+      description: 'home_meta_description',
     });
     expect(descriptor().pages?.['about']?.seo).toBeUndefined();
     expect(descriptor().keys['seo_about_title']).toBeUndefined();
@@ -4494,8 +4881,8 @@ describe('adoption', () => {
     // remove — the mark is stripped and its text stays.
     host.out.length = 0;
     host.err.length = 0;
-    expect(await host.run('remove', 'how_it_works', '--write')).toBe(0);
-    expect(host.file('index.html')).not.toContain('data-stet="how_it_works"');
+    expect(await host.run('remove', 'home_nav_link_text', '--write')).toBe(0);
+    expect(host.file('index.html')).not.toContain('data-stet="home_nav_link_text"');
     expect(host.file('index.html')).toContain('<a href="#how">How it works</a>');
     host.out.length = 0;
     host.err.length = 0;
@@ -4933,7 +5320,14 @@ describe('adoption', () => {
     // exit stays 0 under the default warn severity
     expect(await host.run('scan')).toBe(0);
     expect(host.stderr()).toContain('Your week, sorted');
-    expect(host.stderr()).toContain('propose key your_week_sorted');
+    // The proposed key is the literal's role name: its page, its section, its role.
+    expect(host.stderr()).toContain('propose key home_page_headline');
+    const sectioned = makeAdoptionHost({
+      page: 'export default function Page() {\n  return <section id="hero"><h1>Your week, sorted</h1></section>;\n}\n',
+    });
+    expect(await sectioned.run('init', '--yes')).toBe(0);
+    expect(await sectioned.run('scan')).toBe(0);
+    expect(sectioned.stderr()).toContain('"Your week, sorted" — propose key home_hero_headline');
     // It says how many files it read, so a green light always states its scope
     // (the layout and the page both match the scaffolded glob).
     expect(host.stdout()).toContain('scan: 2 files, 1 unkeyed literal');
@@ -4951,7 +5345,7 @@ describe('adoption', () => {
     expect(await dead.run('scan')).toBe(0);
     expect(dead.stderr()).toContain('glob matched no files: src/pages/**/*.tsx');
     expect(dead.stderr()).not.toContain('glob matched no files: app/**/*.tsx');
-    expect(dead.stderr()).toContain('your_week_sorted'); // the live glob's findings stand
+    expect(dead.stderr()).toContain('propose key home_page_headline'); // the live glob's findings stand
     expect(dead.stderr()).not.toContain('nothing was scanned');
 
     // Every glob dead: the extra warn, and under a `fail` posture the run
@@ -5252,6 +5646,16 @@ describe('adoption', () => {
       value: 'You may already have the data<1> our AI lab partners need.</1>',
     });
     expect(located.proposals.find((p) => p.value === 'Hello <1>big <2>world</2></1>!')?.tags).toBe(2);
+    // Each run proposes its role name before its number: the heading in
+    // `<section id="qualify">`, and the mixed heading in no section.
+    html.out.length = 0;
+    expect(await html.run('scan')).toBe(0);
+    expect(html.stderr()).toContain(
+      'index.html:34 possible copy "Software, product and engineering histories" — propose key home_qualify_headline',
+    );
+    expect(html.stderr()).toContain(
+      'index.html:25 possible copy "You may already have the data<1> our AI lab partners need..." — propose key home_page_headline',
+    );
 
     // A claimed mark is silent; a refused one is a named skip.
     const marked = await makeHtmlHost({ register: true });
@@ -5273,14 +5677,14 @@ describe('adoption', () => {
     const pageBefore = planned.file('app/page.tsx');
     expect(await planned.run('register', '--from', 'scan')).toBe(0);
     expect(planned.file('app/page.tsx')).toBe(pageBefore);
-    expect(JSON.parse(planned.file('content/descriptor.json')).keys.your_week_sorted).toBeDefined();
+    expect(JSON.parse(planned.file('content/descriptor.json')).keys.home_page_headline).toBeDefined();
 
     // --write: the leaf becomes an accessor call and the read-path import lands
     const applied = makeAdoptionHost();
     expect(await applied.run('init', '--yes')).toBe(0);
     expect(await applied.run('register', '--from', 'scan', '--write')).toBe(0);
     const page = applied.file('app/page.tsx');
-    expect(page).toContain("copy('your_week_sorted')");
+    expect(page).toContain("copy('home_page_headline')");
     expect(page).toContain('@/lib/content');
     expect(page).not.toContain('Your week, sorted');
 
@@ -5476,20 +5880,34 @@ describe('adoption', () => {
     const values = (JSON.parse(html.file('content/defaults.json')) as {
       default: Record<string, string>;
     }).default;
-    expect(keys['you_may_already_have_the_data_our_ai']?.tags).toBe(1);
+    expect(keys['home_page_headline']?.tags).toBe(1);
     // `&amp;` read back as the character it denotes.
-    expect(values['research_development_notes']).toBe('Research & development notes.');
-    // Identical text shares ONE key; the near-misses take the suffixes in order.
-    expect(Object.keys(keys).filter((k) => k.startsWith('how_it_works')).sort()).toEqual([
-      'how_it_works',
-      'how_it_works_2',
-      'how_it_works_3',
-    ]);
-    expect(html.file('index.html').match(/data-stet="how_it_works"/g)).toHaveLength(2);
-    // A link carrying both a copy title and text takes both marks on one tag.
+    expect(values['home_page_paragraph_1']).toBe('Research & development notes.');
+    // Identical text shares ONE key; the near-misses take keys named by their roles.
+    expect(values['home_nav_link_text']).toBe('How it works');
+    expect(values['home_qualify_headline_1']).toBe('How it works.');
+    expect(values['home_contact_button_text']).toBe('How it works →');
+    expect(html.file('index.html').match(/data-stet="home_nav_link_text"/g)).toHaveLength(2);
+    // A link carrying both a copy title and text takes both marks on one tag,
+    // one key named for its first mark, the title.
     expect(html.file('index.html')).toContain(
-      '<a href="/book" title="Book now" data-stet="book_now" data-stet-title="book_now">',
+      '<a href="/book" title="Book now" data-stet="home_contact_tooltip" data-stet-title="home_contact_tooltip">',
     );
+    // Where no section holds them, the near-misses read the page's word.
+    const shared = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><body>\n<a href="#a">How it works</a>\n<a href="#b">How it works</a>\n' +
+          '<h2>How it works.</h2>\n<button>How it works →</button>\n</body></html>\n',
+      },
+    });
+    expect(await shared.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(Object.keys(JSON.parse(shared.file('content/descriptor.json')).keys).sort()).toEqual([
+      'home_page_button_text',
+      'home_page_headline',
+      'home_page_link_text',
+    ]);
+    expect(shared.file('index.html').match(/data-stet="home_page_link_text"/g)).toHaveLength(2);
     // A second run adopts nothing.
     html.out.length = 0;
     expect(await html.run('register', '--from', 'scan')).toBe(0);
@@ -5503,22 +5921,20 @@ describe('adoption', () => {
       keys: Record<string, { derivesFrom?: string; tmpl?: string }>;
     }).keys;
     const derivedValues = (JSON.parse(derive.file('content/defaults.json')) as { default: Record<string, string> }).default;
-    expect(derivedKeys['ship_the_catalogue_in_a_day_2']).toMatchObject({ derivesFrom: 'ship_the_catalogue_in_a_day', tmpl: '{v}' });
-    expect(derivedKeys['plans_from_and_up_for_every_product']).toMatchObject({
-      derivesFrom: 'plans_from_and_up_for_every_product_page',
+    expect(derivedKeys['home_page_title']).toMatchObject({ derivesFrom: 'home_page_headline_1', tmpl: '{v}' });
+    expect(derivedKeys['home_meta_description']).toMatchObject({
+      derivesFrom: 'home_page_paragraph',
       tmpl: '{v} Book a call.',
     });
-    expect(Object.hasOwn(derivedValues, 'ship_the_catalogue_in_a_day_2')).toBe(false);
+    expect(Object.hasOwn(derivedValues, 'home_page_title')).toBe(false);
     expect(derive.file('index.html')).toContain(
-      '<meta property="og:title" content="Ship the catalogue in a day" data-stet-content="ship_the_catalogue_in_a_day_2">',
+      '<meta property="og:title" content="Ship the catalogue in a day" data-stet-content="home_page_title">',
     );
-    expect(derivedKeys['start_a_trial_today_and_see_the_whole']?.derivesFrom).toBeUndefined();
-    expect(derivedKeys['reship_the_whole_catalogue']?.derivesFrom).toBeUndefined();
-    expect(derive.file('index.html')).toContain('<nav aria-label="Everything we ship" data-stet-aria-label="everything_we_ship">');
-    expect(derive.file('index.html')).toContain('<h3 data-stet="everything_we_ship">');
-    expect(derive.stdout()).toContain(
-      'index.html:5 ship_the_catalogue_in_a_day_2 derives from ship_the_catalogue_in_a_day through "{v}"',
-    );
+    expect(derivedKeys['home_share_description_1']?.derivesFrom).toBeUndefined();
+    expect(derivedKeys['home_share_description_2']?.derivesFrom).toBeUndefined();
+    expect(derive.file('index.html')).toContain('<nav aria-label="Everything we ship" data-stet-aria-label="home_nav_aria_label">');
+    expect(derive.file('index.html')).toContain('<h3 data-stet="home_nav_aria_label">');
+    expect(derive.stdout()).toContain('index.html:5 home_page_title derives from home_page_headline_1 through "{v}"');
     expect(derive.file('index.html').replace(/ data-stet[^ >]*="[^"]*"/g, '')).toBe(htmlFixture('derive.html'));
     expect(await derive.run('check')).toBe(0);
 
@@ -5552,6 +5968,271 @@ describe('adoption', () => {
     expect(await adopted.run('pull')).toBe(0);
     expect(adopted.stdout()).toContain('pull: documents current');
     expect(readFileSync(join(adopted.cwd, 'index.html'))).toEqual(adoptedPage);
+
+    // A JSX run numbers a repeated role across the run, past a declared name,
+    // and each entry carries its section word.
+    const jsx = makeAdoptionHost({
+      page:
+        'export default function Page() {\n  return (\n    <main>\n' +
+        '      <section id="hero"><h1>Your week, sorted</h1></section>\n' +
+        '      <section><h2>Frequently asked</h2><h3>Does it read my mail?</h3><h3>Can I stop it anytime?</h3></section>\n' +
+        '    </main>\n  );\n}\n',
+    });
+    expect(await jsx.run('init', '--yes')).toBe(0);
+    const jsxDescriptor = JSON.parse(jsx.file('content/descriptor.json'));
+    jsxDescriptor.keys.home_hero_headline = { shape: 'text', target: 'web' };
+    jsx.write('content/descriptor.json', JSON.stringify(jsxDescriptor, null, 2));
+    const jsxDefaults = JSON.parse(jsx.file('content/defaults.json'));
+    jsxDefaults.default.home_hero_headline = 'An older headline';
+    jsx.write('content/defaults.json', JSON.stringify(jsxDefaults, null, 2));
+    expect(await jsx.run('register', '--from', 'scan', '--write')).toBe(0);
+    const jsxKeys = JSON.parse(jsx.file('content/descriptor.json')).keys as Record<string, { section?: string }>;
+    for (const n of [1, 2, 3]) expect(jsxKeys[`home_frequently_asked_headline_${n}`]?.section).toBe('frequently_asked');
+    expect(jsxKeys['home_hero_headline_2']?.section).toBe('hero');
+    const jsxPage = jsx.file('app/page.tsx');
+    for (const name of ['home_hero_headline_2', 'home_frequently_asked_headline_1', 'home_frequently_asked_headline_2', 'home_frequently_asked_headline_3']) {
+      expect(jsxPage).toContain(`copy('${name}')`);
+    }
+
+    // A third page carrying a derivation source's text shares the second
+    // page's key (F40): a key tied to another document is passed over for the next.
+    const para = (title: string, mark = ''): string =>
+      `<!doctype html><html><head><title>${title}</title></head><body><p${mark}>Ship the catalogue in a day.</p></body></html>\n`;
+    const third = await makeHtmlHost({
+      files: {
+        'index.html': '<!doctype html><html><body></body></html>\n',
+        'a.html':
+          '<!doctype html><html><head><title>A</title><meta property="og:description" content="Ship the catalogue in a day. Start today." ' +
+          'data-stet-content="a_share_description"></head><body><p data-stet="a_page_paragraph">Ship the catalogue in a day.</p></body></html>\n',
+        'b.html': para('b'),
+        'c.html': para('c'),
+      },
+      keys: {
+        a_page_paragraph: { shape: 'text', target: 'web' },
+        a_share_description: { shape: 'text', target: 'web', derivesFrom: 'a_page_paragraph', tmpl: '{v} Start today.' },
+      },
+      defaults: { a_page_paragraph: 'Ship the catalogue in a day.' },
+    });
+    expect(await third.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(third.stdout()).toContain('1 key added, 1 shared');
+    expect(third.file('b.html')).toContain('<p data-stet="site_page_paragraph">');
+    expect(third.file('c.html')).toContain('<p data-stet="site_page_paragraph">');
+    expect(third.file('a.html')).toContain('<p data-stet="a_page_paragraph">');
+    third.out.length = 0;
+    expect(await third.run('check')).toBe(0);
+  });
+
+  it("Requirement: A new key's name says where it sits and what it is", async () => {
+    // A plain HTML page shaped as psyon.ai's: the names a plan lists are the rule's.
+    const shaped = await makeHtmlHost({ files: { 'index.html': PSYON_SHAPED } });
+    expect(await shaped.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const names = (JSON.parse(shaped.file('naming.json')) as { keys: Array<{ proposed: string }> }).keys.map((e) => e.proposed);
+    expect(names).toEqual([
+      'home_page_link_text',
+      'home_header_span',
+      'home_nav_link_text_1',
+      'home_nav_link_text_2',
+      'home_top_headline',
+      'home_top_paragraph',
+      'home_faq_headline_1',
+      'home_faq_paragraph_1',
+      'home_faq_headline_2',
+      'home_faq_paragraph_2',
+      'home_faq_headline_3',
+      'home_faq_paragraph_3',
+      'home_faq_headline_4',
+      'home_faq_paragraph_4',
+      'home_prepare_headline',
+      'home_prepare_span_1',
+      'home_prepare_span_2',
+      'home_prepare_span_3',
+      'home_prepare_span_4',
+      'home_prepare_span_5',
+      'home_footer_paragraph',
+      'home_page_title',
+      'home_share_description',
+    ]);
+    expect(names.filter((n) => /^[0-9]/.test(n))).toEqual([]);
+
+    // A component's keys carry no page.
+    const component = makeAdoptionHost({ page: 'export default function Page() {\n  return null;\n}\n' });
+    expect(await component.run('init', '--yes')).toBe(0);
+    const componentConfig = JSON.parse(component.file('stet.config.json'));
+    component.write(
+      'stet.config.json',
+      JSON.stringify({ ...componentConfig, managedSurfaces: [...componentConfig.managedSurfaces, 'components/**/*.tsx'] }, null, 2),
+    );
+    component.write(
+      'components/PricingCard.tsx',
+      'export function PricingCard() {\n  return <div><h2>Premium</h2><button>Choose plan</button></div>;\n}\n',
+    );
+    expect(await component.run('register', '--from', 'scan', '--kind', 'server', '--write')).toBe(0);
+    const card = component.file('components/PricingCard.tsx');
+    expect(card).toContain("{copy('pricing_card_headline')}");
+    expect(card).toContain("{copy('pricing_card_button_text')}");
+
+    // A taken name is never given: the bare name or its _1 declared, the new key is _2.
+    for (const taken of ['home_hero_headline', 'home_hero_headline_1']) {
+      const host = await makeHtmlHost({
+        files: { 'index.html': '<!DOCTYPE html>\n<html><body>\n<section id="hero"><h1>Your week, sorted</h1></section>\n</body></html>\n' },
+        keys: { [taken]: { shape: 'text', target: 'web' } },
+        defaults: { [taken]: 'An older headline' },
+      });
+      expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+      expect(host.file('index.html')).toContain('<h1 data-stet="home_hero_headline_2">');
+      expect(JSON.parse(host.file('content/defaults.json')).default[taken]).toBe('An older headline');
+    }
+
+    // A component's attribute is named by its prop; a page's title and a card's in no section.
+    const props = makeAdoptionHost({
+      page:
+        'export default function Page() {\n  return <><title>My page title here</title><Card title="A card heading here" /></>;\n}\n',
+    });
+    expect(await props.run('init', '--yes')).toBe(0);
+    const propsConfig = JSON.parse(props.file('stet.config.json'));
+    props.write(
+      'stet.config.json',
+      JSON.stringify({ ...propsConfig, managedSurfaces: [...propsConfig.managedSurfaces, 'components/**/*.tsx'] }, null, 2),
+    );
+    props.write(
+      'components/Long.tsx',
+      'export function VeryLongComponentNameForTheMarketingHeroSection() {\n  return <Image alt="A friendly face" />;\n}\n',
+    );
+    expect(await props.run('register', '--from', 'scan', '--kind', 'server', '--write')).toBe(0);
+    const propKeys = JSON.parse(props.file('content/descriptor.json')).keys as Record<string, { section?: string }>;
+    expect(propKeys['very_long_component_image_alt']?.section).toBe('very_long_component');
+    expect(props.file('app/page.tsx')).toContain("copy('home_page_title')");
+    expect(props.file('app/page.tsx')).toContain("copy('home_page_card_title')");
+
+    // An existing site keeps its names: 0.3.2's text slugs, adopting nothing.
+    const existing = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head><title data-stet="psyon_data_acquisition">Psyon data acquisition</title></head><body>\n' +
+          '<h3 data-stet="01_assess">01 Assess</h3>\n<p data-stet="2026_psyon_all_rights_reserved">© 2026 Psyon. All rights reserved.</p>\n</body></html>\n',
+      },
+      keys: {
+        psyon_data_acquisition: { shape: 'text', target: 'web' },
+        '01_assess': { shape: 'text', target: 'web' },
+        '2026_psyon_all_rights_reserved': { shape: 'text', target: 'web' },
+      },
+      defaults: {
+        psyon_data_acquisition: 'Psyon data acquisition',
+        '01_assess': '01 Assess',
+        '2026_psyon_all_rights_reserved': '© 2026 Psyon. All rights reserved.',
+      },
+    });
+    const existingForms = ['index.html', 'content/descriptor.json', 'content/defaults.json'].map((rel) => existing.file(rel));
+    expect(await existing.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(existing.stdout()).toContain('register: nothing to adopt');
+    expect(['index.html', 'content/descriptor.json', 'content/defaults.json'].map((rel) => existing.file(rel))).toEqual(existingForms);
+  });
+
+  it('Requirement: register applies an edited naming plan', async () => {
+    type Plan = { made: Record<string, string>; keys: Array<Record<string, unknown> & { proposed: string }> };
+    const planOf = (host: { file(rel: string): string }): Plan => JSON.parse(host.file('naming.json')) as Plan;
+    const entry = (plan: Plan, proposed: string) => plan.keys.find((e) => e.proposed === proposed) as Record<string, unknown>;
+    const formsOf = (host: { file(rel: string): string }) =>
+      ['index.html', 'content/descriptor.json', 'content/defaults.json'].map((rel) => host.file(rel));
+
+    // An agent names and describes the keys it adopts (journey A20).
+    const agent = await makeHtmlHost({ files: { 'index.html': PSYON_SHAPED } });
+    expect(await agent.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const edited = planOf(agent);
+    Object.assign(entry(edited, 'home_top_headline'), {
+      key: 'home_hero_headline',
+      label: 'Hero headline',
+      help: 'The headline at the top of the home page. The share description repeats its words.',
+      section: 'hero',
+    });
+    Object.assign(entry(edited, 'home_top_paragraph'), { key: 'home_hero_intro', label: 'Hero introduction', section: 'hero' });
+    entry(edited, 'home_prepare_span_1')['adopt'] = false;
+    writeFileSync(join(agent.cwd, 'naming.json'), JSON.stringify(edited, null, 2));
+    agent.out.length = 0;
+    expect(await agent.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+    const agentKeys = JSON.parse(agent.file('content/descriptor.json')).keys as Record<string, Record<string, unknown>>;
+    expect(Object.keys(agentKeys)).toHaveLength(22);
+    expect(agentKeys['home_hero_headline']).toEqual({
+      shape: 'text',
+      target: 'web',
+      section: 'hero',
+      label: 'Hero headline',
+      help: 'The headline at the top of the home page. The share description repeats its words.',
+    });
+    expect(agentKeys['home_hero_intro']).toMatchObject({ section: 'hero', label: 'Hero introduction' });
+    expect(agentKeys['home_prepare_span_1']).toBeUndefined();
+    expect(agent.file('index.html')).toContain('<span>Select</span>');
+    expect(agent.stdout()).toMatch(/index\.html:\d+ home_share_description derives from home_hero_headline through "\{v\} Start today\."/);
+    agent.out.length = 0;
+    expect(await agent.run('check')).toBe(0);
+
+    // A plan's problems are listed together, and no file changes.
+    const refused = await makeHtmlHost({ files: { 'index.html': PSYON_SHAPED } });
+    expect(await refused.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const bad = planOf(refused);
+    entry(bad, 'home_top_paragraph')['key'] = 'home_hero__eyebrow';
+    entry(bad, 'home_faq_headline_2')['key'] = 'home_faq_question';
+    entry(bad, 'home_faq_headline_3')['key'] = 'home_faq_question';
+    entry(bad, 'home_top_headline')['label'] = 'x'.repeat(61);
+    writeFileSync(join(refused.cwd, 'naming.json'), JSON.stringify(bad, null, 2));
+    const refusedForms = formsOf(refused);
+    expect(await refused.run('register', '--from', 'scan', '--plan', 'naming.json')).toBe(1);
+    expect(refused.err).toEqual([
+      'error: stet register: naming.json is refused — nothing written',
+      'error: home_top_headline: its label is longer than 60 characters',
+      'error: home_top_paragraph: "home_hero__eyebrow" uses "__", which names a template slot or the brand group',
+      'error: home_faq_headline_2 and home_faq_headline_3: both are named "home_faq_question"',
+    ]);
+    expect(formsOf(refused)).toEqual(refusedForms);
+
+    // An unedited plan passes on either host.
+    const digits = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><body>\n<section id="2col"><p>Two columns of text.</p></section>\n' +
+          '<section><h2>2026 annual report</h2><p>The year in review.</p></section>\n</body></html>\n',
+      },
+    });
+    expect(await digits.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    expect(await digits.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+    const digitKeys = JSON.parse(digits.file('content/descriptor.json')).keys as Record<string, { section?: string }>;
+    expect(digitKeys['home_2col_paragraph']?.section).toBe('2col');
+    expect(digitKeys['home_2026_annual_report_paragraph']?.section).toBe('2026_annual_report');
+    const jsx = makeAdoptionHost({
+      page: 'export default function Page() {\n  return <section id="hero"><h1>Your week, sorted</h1></section>;\n}\n',
+    });
+    expect(await jsx.run('init', '--yes')).toBe(0);
+    expect(await jsx.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const jsxBefore = ['app/page.tsx', 'content/descriptor.json', 'content/defaults.json'].map((rel) => jsx.file(rel));
+    const jsxOut = jsx.out.length;
+    expect(await jsx.run('register', '--from', 'scan', '--plan', 'naming.json')).toBe(0);
+    expect(jsx.out.slice(jsxOut).join('\n')).toContain('register: run with --write to apply the plan');
+    expect(['app/page.tsx', 'content/descriptor.json', 'content/defaults.json'].map((rel) => jsx.file(rel))).toEqual(jsxBefore);
+    expect(await jsx.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+    expect(jsx.file('app/page.tsx')).toContain("copy('home_hero_headline')");
+
+    // A stale plan is refused with its one line.
+    const stale = await makeHtmlHost({ files: { 'index.html': PSYON_SHAPED } });
+    expect(await stale.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    writeFileSync(join(stale.cwd, 'index.html'), PSYON_SHAPED.replace('Why it matters', 'Why it counts'));
+    const staleForms = formsOf(stale);
+    expect(await stale.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(1);
+    expect(stale.err).toEqual([
+      'error: stet register: naming.json is refused — nothing written',
+      'error: naming.json: the files it was made from have changed — run the command with --plan-out again',
+    ]);
+    expect(formsOf(stale)).toEqual(staleForms);
+
+    // A derivation's source is kept with its key.
+    const source = await makeHtmlHost({ files: { 'index.html': PSYON_SHAPED } });
+    expect(await source.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const dropped = planOf(source);
+    entry(dropped, 'home_top_headline')['adopt'] = false;
+    writeFileSync(join(source.cwd, 'naming.json'), JSON.stringify(dropped, null, 2));
+    const sourceForms = formsOf(source);
+    expect(await source.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(1);
+    expect(source.stderr()).toContain('home_top_headline: home_share_description derives from it — adopt both or neither');
+    expect(formsOf(source)).toEqual(sourceForms);
   });
 
   it('Requirement: eject un-rewrites the host, writes content back, and removes the dependency', async () => {
@@ -6335,25 +7016,25 @@ describe('dashboard', () => {
     const page = await served(host.cwd);
     const doc = page.dom.window.document;
     expect(await groupOf(page, 'seo')).toEqual([
-      'plans_from_and_up_for_every_product',
-      'reship_the_whole_catalogue',
-      'ship_the_catalogue_in_a_day_2',
-      'start_a_trial_today_and_see_the_whole',
+      'home_meta_description',
+      'home_page_title',
+      'home_share_description_1',
+      'home_share_description_2',
     ]);
     // The derived title: its kinds and places, what it follows, and where it appears.
-    await page.act('key:ship_the_catalogue_in_a_day_2');
+    await page.act('key:home_page_title');
     expect([...doc.querySelectorAll('.kline > div')].map((line) => line.textContent)).toEqual([
       'page title · share title index.html:5, index.html:7',
-      'derived from: headline (ship_the_catalogue_in_a_day)',
+      'derived from: headline (home_page_headline_1)',
     ]);
     expect(doc.getElementById('panenote')?.textContent).toBe(
-      'ship_the_catalogue_in_a_day_2 appears as the page title, in the browser tab and in search results, and as the share ' +
-        'title, when the page is shared as a link. It follows ship_the_catalogue_in_a_day (headline), outlined dashed on the page.',
+      'home_page_title appears as the page title, in the browser tab and in search results, and as the share ' +
+        'title, when the page is shared as a link. It follows home_page_headline_1 (headline), outlined dashed on the page.',
     );
     // The headline's draft moves the share card's title as it is typed.
     await page.change('group', 'page:home');
-    await page.act('key:ship_the_catalogue_in_a_day');
-    await page.type('text:ship_the_catalogue_in_a_day', 'Ship everything <1>this week</1>');
+    await page.act('key:home_page_headline_1');
+    await page.type('text:home_page_headline_1', 'Ship everything <1>this week</1>');
     const share = [...doc.querySelectorAll('#panecards .share > div')].map((part) => part.textContent);
     expect(share).toEqual([
       'Share card',
@@ -6363,17 +7044,53 @@ describe('dashboard', () => {
     ]);
     expect(page.errors).toEqual([]);
     page.dom.window.close();
+
+    // On a JavaScript host a documentation sample is no place, and every place carries its kind.
+    const js = makeCliHost({ config: { project: 't', managedSurfaces: ['src/**/*.astro'] } });
+    mkdirSync(join(js.cwd, 'src/pages/docs'), { recursive: true });
+    for (const name of ['quickstart', 'reference']) {
+      writeFileSync(
+        join(js.cwd, `src/pages/docs/${name}.astro`),
+        "<pre is:raw>{copy('hero_headline')}</pre>\n<p>{copy.hero_body}</p>\n",
+      );
+    }
+    // An svg's title read is a tooltip, never a head text.
+    const descriptor = JSON.parse(readFileSync(join(js.cwd, 'content/descriptor.json'), 'utf8')) as Descriptor;
+    descriptor.keys['close_label'] = { shape: 'text', target: 'web' };
+    writeFileSync(join(js.cwd, 'content/descriptor.json'), JSON.stringify(descriptor, null, 2));
+    const snapshot = JSON.parse(readFileSync(join(js.cwd, 'content/defaults.json'), 'utf8')) as Snapshot;
+    (snapshot.default as Record<string, unknown>)['close_label'] = 'Close the menu';
+    writeFileSync(join(js.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+    writeFileSync(
+      join(js.cwd, 'src/pages/index.astro'),
+      "<button><svg viewBox=\"0 0 1 1\"><title>{copy.get('close_label')}</title></svg></button>\n",
+    );
+    const reads = (await call(handlerOver([js.cwd]).handler, `/api/site/marks${siteOf(js.cwd)}`)).body;
+    expect(reads.places['hero_headline']).toBeUndefined();
+    expect(reads.places['hero_body']).toEqual([
+      { file: 'src/pages/docs/quickstart.astro', line: 2, kind: 'paragraph', tag: 'p' },
+      { file: 'src/pages/docs/reference.astro', line: 2, kind: 'paragraph', tag: 'p' },
+    ]);
+    expect(reads.places['close_label']).toEqual([
+      { file: 'src/pages/index.astro', line: 1, kind: 'tooltip', tag: 'title', svg: true },
+    ]);
+    const all = Object.values(reads.places as Record<string, Array<{ kind?: string }>>).flat();
+    expect(all.every((place) => typeof place.kind === 'string')).toBe(true);
+    const jsPage = await served(js.cwd);
+    expect(await groupOf(jsPage, 'seo')).not.toContain('close_label');
+    expect(jsPage.errors).toEqual([]);
+    jsPage.dom.window.close();
   });
 
   it("Requirement: The preview is the site's own dev server, started only on request", async () => {
     // On a static-HTML host each mark is a place: file, line, tag, and a meta's attribute and name.
     const html = await makeHtmlHost({ files: { 'index.html': htmlFixture('derive.html') }, register: true });
     const marks = (await call(handlerOver([html.cwd]).handler, `/api/site/marks${siteOf(html.cwd)}`)).body;
-    expect(marks.places['ship_the_catalogue_in_a_day_2']).toEqual([
-      { file: 'index.html', line: 5, tag: 'title', head: true },
-      { file: 'index.html', line: 7, tag: 'meta', attr: 'content', meta: 'og:title', head: true },
+    expect(marks.places['home_page_title']).toEqual([
+      { file: 'index.html', line: 5, kind: 'page title', tag: 'title', head: true },
+      { file: 'index.html', line: 7, kind: 'share title', tag: 'meta', attr: 'content', meta: 'og:title', head: true },
     ]);
-    expect(marks.places['ship_the_catalogue_in_a_day']).toEqual([{ file: 'index.html', line: 14, tag: 'h1' }]);
+    expect(marks.places['home_page_headline_1']).toEqual([{ file: 'index.html', line: 14, kind: 'headline', tag: 'h1' }]);
     expect(marks.documents).toEqual([{ file: 'index.html', route: '/', page: null }]);
 
     // On a JavaScript host the places are the source reads: the element a
@@ -6391,10 +7108,12 @@ describe('dashboard', () => {
       documents: [],
       keys: {},
       places: {
-        brand__name: [{ file: 'src/pages/index.astro', line: 2 }],
-        hero_body: [{ file: 'src/pages/index.astro', line: 4, tag: 'meta', attr: 'content', meta: 'description', head: true }],
-        hero_headline: [{ file: 'src/pages/index.astro', line: 5, tag: 'h1' }],
-        pricing_price: [{ file: 'src/pages/index.astro', line: 6, tag: 'a' }],
+        brand__name: [{ file: 'src/pages/index.astro', line: 2, kind: 'text in src/pages/index.astro' }],
+        hero_body: [
+          { file: 'src/pages/index.astro', line: 4, kind: 'meta description', tag: 'meta', attr: 'content', meta: 'description', head: true },
+        ],
+        hero_headline: [{ file: 'src/pages/index.astro', line: 5, kind: 'headline', tag: 'h1' }],
+        pricing_price: [{ file: 'src/pages/index.astro', line: 6, kind: 'link text', tag: 'a' }],
       },
     });
   });
@@ -6460,6 +7179,27 @@ describe('dashboard', () => {
     expect(retemplated.body['written']).toEqual(['content/descriptor.json', 'index.html']);
     const again = await call(handler, `/api/site/commit${siteOf(host.cwd)}`, { files: retemplated.body['pending'] });
     expect(again.body['subject']).toBe('stet: 1 key updated — share_description');
+
+    // A rename commits under its own subject: a key holding a value, then a derived key, which holds none.
+    const renamed = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head><title>Process</title></head><body>\n' +
+          '<h3 data-stet="01_assess">Assess what you hold</h3>\n</body></html>\n',
+      },
+      keys: { '01_assess': { shape: 'text', target: 'web' } },
+      defaults: { '01_assess': 'Assess what you hold' },
+    });
+    expect(await renamed.run('pull')).toBe(0);
+    committed(renamed.cwd);
+    expect(await renamed.run('rename', '01_assess', 'home_process_step_1', '--write')).toBe(0);
+    const moved = await call(handlerOver([renamed.cwd]).handler, `/api/site/commit${siteOf(renamed.cwd)}`, {
+      files: ['content/defaults.json', 'content/descriptor.json', 'index.html'],
+    });
+    expect(moved.body['subject']).toBe('stet: rename 1 key — 01_assess → home_process_step_1');
+    expect(await host.run('rename', 'share_description', 'home_share_description', '--write')).toBe(0);
+    const derived = await call(handler, `/api/site/commit${siteOf(host.cwd)}`, { files: ['content/descriptor.json', 'index.html'] });
+    expect(derived.body['subject']).toBe('stet: rename 1 key — share_description → home_share_description');
   });
 
   it('Requirement: The preview finds the selected key and shows its draft in place', async () => {

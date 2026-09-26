@@ -5,16 +5,38 @@
  * never-touch-a-published-value guarantee, idempotence, the server/client
  * choice, and every refusal (ambiguous, no-provider, foreign `copy`).
  */
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
+
+/**
+ * A write outside the temp directory is refused as the disk would refuse a
+ * write under `/`, whoever runs the suite: the absolute `--plan-out` case
+ * aims at `/index.html`, and a run as root must not leave one there.
+ */
+vi.mock('../cli/artifacts.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../cli/artifacts.js')>();
+  const { realpathSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const roots = [tmpdir(), realpathSync(tmpdir())];
+  return {
+    ...real,
+    writeText: (path: string, text: string) => {
+      if (!roots.some((root) => path.startsWith(root))) {
+        throw Object.assign(new Error(`EACCES: permission denied, open '${path}'`), { code: 'EACCES' });
+      }
+      return real.writeText(path, text);
+    },
+  };
+});
 
 import { runRegister } from '../cli/register.js';
-import type { CliIo } from '../cli/main.js';
+import { runCli, type CliIo } from '../cli/main.js';
 import { planDocuments, planHtmlRegister } from '../cli/html-host.js';
+import { fileHash } from '../cli/key-plan.js';
 import { Report } from '../cli/report.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
@@ -104,8 +126,8 @@ describe('runRegister — descriptor and default', () => {
     const cap = io(dir);
     const code = await runRegister(['--from', 'scan'], cap);
     expect(code).toBe(0);
-    expect(descriptor(dir).keys['adopt_me_now']).toEqual({ shape: 'text', target: 'web' });
-    expect(defaults(dir).default['adopt_me_now']).toBe('Adopt me now');
+    expect(descriptor(dir).keys['home_page_headline']).toEqual({ shape: 'text', target: 'web' });
+    expect(defaults(dir).default['home_page_headline']).toBe('Adopt me now');
     expect(cap.out.join('\n')).toContain('+++ b/app/page.tsx'); // a diff was shown
     expect(read(dir, 'app/page.tsx')).toBe(before); // source untouched
   });
@@ -116,7 +138,7 @@ describe('runRegister — descriptor and default', () => {
     await runRegister(['--from', 'scan', '--write'], io(dir));
     const edited = read(dir, 'app/page.tsx');
     expect(edited).toContain("import { copy } from '@/lib/content'");
-    expect(edited).toContain("{copy('server_copy')}");
+    expect(edited).toContain("{copy('home_page_headline')}");
   });
 });
 
@@ -128,16 +150,19 @@ describe('runRegister — batching and collisions', () => {
     const edited = read(dir, 'app/widget.tsx');
     expect(edited.match(/import \{ useCopy \} from '@getstet\/stet\/react'/g)?.length).toBe(1);
     expect(edited.match(/const copy = useCopy\(\)/g)?.length).toBe(1);
-    expect(edited).toContain("{copy('first_copy')}");
-    expect(edited).toContain("{copy('second_copy')}");
+    expect(edited).toContain("{copy('widget_headline')}");
+    expect(edited).toContain("{copy('widget_paragraph')}");
   });
 
-  it('a colliding proposed key gets a _2 suffix', async () => {
-    const dir = project({ keys: { your_week: { shape: 'text', target: 'web' } }, defaults: { your_week: 'existing' } });
+  it('a taken role name continues at _2', async () => {
+    const dir = project({
+      keys: { home_page_headline: { shape: 'text', target: 'web' } },
+      defaults: { home_page_headline: 'existing' },
+    });
     write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Your week</h1>'));
     await runRegister(['--from', 'scan', '--write'], io(dir));
-    expect(descriptor(dir).keys['your_week_2']).toBeDefined();
-    expect(read(dir, 'app/page.tsx')).toContain("{copy('your_week_2')}");
+    expect(descriptor(dir).keys['home_page_headline_2']).toBeDefined();
+    expect(read(dir, 'app/page.tsx')).toContain("{copy('home_page_headline_2')}");
   });
 
   it('never alters an existing published value', async () => {
@@ -146,7 +171,7 @@ describe('runRegister — batching and collisions', () => {
     await runRegister(['--from', 'scan', '--write'], io(dir));
     expect(descriptor(dir).keys['hero_headline']).toEqual({ shape: 'text', target: 'web' });
     expect(defaults(dir).default['hero_headline']).toBe('Live headline');
-    expect(descriptor(dir).keys['brand_new_copy']).toBeDefined();
+    expect(descriptor(dir).keys['home_page_headline']).toBeDefined();
   });
 
   it('is idempotent — a re-scan after --write finds zero literals', async () => {
@@ -157,7 +182,7 @@ describe('runRegister — batching and collisions', () => {
     await runRegister(['--from', 'scan', '--write'], cap);
     expect(cap.out.join('\n')).toContain('nothing to adopt');
     // only one key exists — the second run added none
-    expect(Object.keys(descriptor(dir).keys)).toEqual(['once_only']);
+    expect(Object.keys(descriptor(dir).keys)).toEqual(['home_page_headline']);
   });
 });
 
@@ -175,12 +200,12 @@ describe('runRegister — the server/client choice and refusals', () => {
     const skip = io(dir);
     await runRegister(['--from', 'scan'], skip);
     expect(skip.err.join('\n')).toContain('ambiguous');
-    expect(descriptor(dir).keys['ambiguous_copy']).toBeUndefined();
+    expect(descriptor(dir).keys['page_headline']).toBeUndefined();
 
     const dir2 = project();
     write(dir2, 'app/widget.tsx', SERVER_PAGE('<h1>Ambiguous copy</h1>'));
     await runRegister(['--from', 'scan', '--write', '--kind', 'server'], io(dir2));
-    expect(read(dir2, 'app/widget.tsx')).toContain("{copy('ambiguous_copy')}");
+    expect(read(dir2, 'app/widget.tsx')).toContain("{copy('page_headline')}");
   });
 
   it('a client rewrite with no CopyProvider mounted is skipped with a mount-first message', async () => {
@@ -188,8 +213,8 @@ describe('runRegister — the server/client choice and refusals', () => {
     write(dir, 'app/widget.tsx', CLIENT_WIDGET('<h1>Needs provider</h1>'));
     const cap = io(dir);
     await runRegister(['--from', 'scan', '--write'], cap);
+    expect(descriptor(dir).keys['widget_headline']).toBeUndefined();
     expect(cap.err.join('\n')).toContain('CopyProvider');
-    expect(descriptor(dir).keys['needs_provider']).toBeUndefined();
     expect(read(dir, 'app/widget.tsx')).not.toContain('useCopy');
   });
 
@@ -202,8 +227,8 @@ describe('runRegister — the server/client choice and refusals', () => {
     );
     const cap = io(dir);
     await runRegister(['--from', 'scan', '--write'], cap);
+    expect(descriptor(dir).keys['widget_headline']).toBeUndefined();
     expect(cap.err.join('\n')).toContain('foreign');
-    expect(descriptor(dir).keys['press_me']).toBeUndefined();
   });
 });
 
@@ -246,9 +271,9 @@ describe('runRegister — the CP6 fold', () => {
     const dir = project();
     write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Fresh key here</h1>'));
     await runRegister(['--from', 'scan', '--write'], io(dir));
-    expect(read(dir, 'content/stet-env.d.ts')).toContain('fresh_key_here');
-    expect(read(dir, 'content/keys.ts')).toContain('fresh_key_here');
-    expect(read(dir, 'content/defaults.ts')).toContain('fresh_key_here');
+    expect(read(dir, 'content/stet-env.d.ts')).toContain('home_page_headline');
+    expect(read(dir, 'content/keys.ts')).toContain('home_page_headline');
+    expect(read(dir, 'content/defaults.ts')).toContain('home_page_headline');
   });
 });
 
@@ -329,7 +354,7 @@ describe('runRegister — the read-path import must resolve before --write', () 
     });
     write(matched, 'app/page.tsx', SERVER_PAGE('<h1>Resolved onto it</h1>'));
     expect(await runRegister(['--from', 'scan', '--write'], io(matched))).toBe(0);
-    expect(read(matched, 'app/page.tsx')).toContain("{copy('resolved_onto_it')}");
+    expect(read(matched, 'app/page.tsx')).toContain("{copy('home_page_headline')}");
   });
 
   it('resolves a `~*` pattern, whose `*` carries no slash of its own', async () => {
@@ -344,7 +369,7 @@ describe('runRegister — the read-path import must resolve before --write', () 
     });
     write(covered, 'app/page.tsx', SERVER_PAGE('<h1>Tilde covered</h1>'));
     expect(await runRegister(['--from', 'scan', '--write'], io(covered))).toBe(0);
-    expect(read(covered, 'app/page.tsx')).toContain("{copy('tilde_covered')}");
+    expect(read(covered, 'app/page.tsx')).toContain("{copy('home_page_headline')}");
 
     // The same mapping with the read path left under `lib/` lands in `src/lib/`
     // instead: declared, matching, and still not covering.
@@ -382,7 +407,7 @@ describe('runRegister — the read-path import must resolve before --write', () 
     });
     write(matched, 'app/page.tsx', SERVER_PAGE('<h1>Carved out</h1>'));
     expect(await runRegister(['--from', 'scan', '--write'], io(matched))).toBe(0);
-    expect(read(matched, 'app/page.tsx')).toContain("{copy('carved_out')}");
+    expect(read(matched, 'app/page.tsx')).toContain("{copy('home_page_headline')}");
   });
 
   it('refuses an extends-only host, which is the Astro shape', async () => {
@@ -395,14 +420,14 @@ describe('runRegister — the read-path import must resolve before --write', () 
     const prefixed = project({ tsconfig: { compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } } });
     write(prefixed, 'app/page.tsx', SERVER_PAGE('<h1>Prefix covered</h1>'));
     expect(await runRegister(['--from', 'scan', '--write'], io(prefixed))).toBe(0);
-    expect(read(prefixed, 'app/page.tsx')).toContain("{copy('prefix_covered')}");
+    expect(read(prefixed, 'app/page.tsx')).toContain("{copy('home_page_headline')}");
 
     // An exact-key mapping is legal tsconfig that the `/*`-only grammar of
     // init's own probe never emits, and it covers by equality.
     const exact = project({ tsconfig: { compilerOptions: { paths: { '@/lib/content': ['./lib/content.ts'] } } } });
     write(exact, 'app/page.tsx', SERVER_PAGE('<h1>Exactly covered</h1>'));
     expect(await runRegister(['--from', 'scan', '--write'], io(exact))).toBe(0);
-    expect(read(exact, 'app/page.tsx')).toContain("{copy('exactly_covered')}");
+    expect(read(exact, 'app/page.tsx')).toContain("{copy('home_page_headline')}");
   });
 
   it('leaves relative and bare specifiers alone — there is no alias to declare', async () => {
@@ -442,7 +467,7 @@ describe('runRegister — declared copy modules', () => {
     expect(descriptor(dir).keys['hero_headline']).toEqual({ shape: 'text', target: 'web' });
     expect(defaults(dir).default['hero_headline']).toBe('Change the content');
     // A suffixed module key forks the registry from the module it was read out
-    // of, so `freeKey` is never reached for a module shape.
+    // of, so a module shape is never numbered.
     expect(descriptor(dir).keys['hero_headline_2']).toBeUndefined();
     // Record only: one line, no diff, and the module untouched.
     expect(cap.out.join('\n')).toContain('adopted hero_headline = Change the content');
@@ -492,7 +517,7 @@ describe('runRegister — declared copy modules', () => {
     expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
 
     // Both halves landed: the leaf's derived key and the module's own name.
-    expect(descriptor(dir).keys['adopt_this_leaf']).toBeDefined();
+    expect(descriptor(dir).keys['home_page_headline']).toBeDefined();
     expect(descriptor(dir).keys['footer_note']).toBeDefined();
     const out = cap.out.join('\n');
     // A diff for the leaf, an `adopted` line for the property — each half
@@ -529,7 +554,7 @@ describe('runRegister — declared copy modules', () => {
     );
     expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
     // The leaf WAS rewritten, so the offsets really did move…
-    expect(read(dir, 'app/page.tsx')).toContain("copy('adopt_this_leaf')");
+    expect(read(dir, 'app/page.tsx')).toContain("copy('home_page_headline')");
     // …and the opted-out literal is still opted out.
     expect(descriptor(dir).keys['secret_key']).toBeUndefined();
     expect(descriptor(dir).keys['do_not_adopt_this']).toBeUndefined();
@@ -687,7 +712,7 @@ describe('runRegister — the static-HTML host', () => {
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
     const out = cap.out.join('\n');
-    expect(out).toContain('+      <h3 data-stet="software_product_and_engineering">');
+    expect(out).toContain('+      <h3 data-stet="home_qualify_headline_2">');
     expect(out).toContain('register: run with --write to apply 28 marks across 1 document');
     // The divergence from the JavaScript branch: a descriptor entry without its
     // mark is half a batch, so the plain run commits none of it.
@@ -706,16 +731,17 @@ describe('runRegister — the static-HTML host', () => {
     expect(cap.out.join('\n')).toContain('register: applied');
 
     const keys = descriptor(dir).keys;
-    expect(keys['you_may_already_have_the_data_our_ai']).toEqual({
+    // The headline sits directly in `<main>`, which names no section.
+    expect(keys['home_page_headline']).toEqual({
       shape: 'text',
       target: 'web',
       tags: 1,
     });
-    expect(defaults(dir).default['you_may_already_have_the_data_our_ai']).toBe(
+    expect(defaults(dir).default['home_page_headline']).toBe(
       'You may already have the data<1> our AI lab partners need.</1>',
     );
     // `&amp;` read back as the character it denotes.
-    expect(defaults(dir).default['research_development_notes']).toBe('Research & development notes.');
+    expect(defaults(dir).default['home_page_paragraph_1']).toBe('Research & development notes.');
 
     // The document is byte-identical outside the inserted attributes.
     const written = readFileSync(join(dir, 'index.html'), 'utf8');
@@ -725,25 +751,26 @@ describe('runRegister — the static-HTML host', () => {
     expect(written.match(/data-stet/g)).toHaveLength(28);
   });
 
-  it('shares one key for identical text and suffixes the rest in document order', async () => {
+  it('shares one key for identical text and names the rest by their roles', async () => {
     const dir = htmlProject();
     await runRegister(['--from', 'scan', '--write'], io(dir));
-    const keys = Object.keys(descriptor(dir).keys).filter((k) => k.startsWith('how_it_works'));
-    expect(keys.sort()).toEqual(['how_it_works', 'how_it_works_2', 'how_it_works_3']);
     const values = defaults(dir).default;
-    expect(values['how_it_works']).toBe('How it works');
-    expect(values['how_it_works_2']).toBe('How it works.');
-    expect(values['how_it_works_3']).toBe('How it works →');
+    const holding = Object.keys(values).filter((k) => String(values[k]).startsWith('How it works')).sort();
+    expect(holding).toEqual(['home_contact_button_text', 'home_nav_link_text', 'home_qualify_headline_1']);
+    expect(values['home_nav_link_text']).toBe('How it works');
+    expect(values['home_qualify_headline_1']).toBe('How it works.');
+    expect(values['home_contact_button_text']).toBe('How it works →');
     // One key, marked on BOTH links.
     const page = readFileSync(join(dir, 'index.html'), 'utf8');
-    expect(page.match(/data-stet="how_it_works"/g)).toHaveLength(2);
+    expect(page.match(/data-stet="home_nav_link_text"/g)).toHaveLength(2);
   });
 
   it('marks a link carrying both text and a copy title with both, in the stated order', async () => {
     const dir = htmlProject();
     await runRegister(['--from', 'scan', '--write'], io(dir));
     expect(readFileSync(join(dir, 'index.html'), 'utf8')).toContain(
-      '<a href="/book" title="Book now" data-stet="book_now" data-stet-title="book_now">',
+      // One key for the equal text and title, named for its first mark: the title.
+      '<a href="/book" title="Book now" data-stet="home_contact_tooltip" data-stet-title="home_contact_tooltip">',
     );
   });
 
@@ -753,7 +780,9 @@ describe('runRegister — the static-HTML host', () => {
       defaults: { existing_heading: 'Software, product and engineering histories' },
     });
     await runRegister(['--from', 'scan', '--write'], io(shared));
-    expect(descriptor(shared).keys['software_product_and_engineering']).toBeUndefined();
+    // The heading shares the key, so the section's one other headline goes unnumbered.
+    expect(descriptor(shared).keys['home_qualify_headline_2']).toBeUndefined();
+    expect(descriptor(shared).keys['home_qualify_headline']).toBeDefined();
     expect(readFileSync(join(shared, 'index.html'), 'utf8')).toContain(
       '<h3 data-stet="existing_heading">',
     );
@@ -763,9 +792,10 @@ describe('runRegister — the static-HTML host', () => {
       defaults: { existing_heading: 'Software, product and engineering histories' },
     });
     await runRegister(['--from', 'scan', '--write'], io(email));
-    expect(descriptor(email).keys['software_product_and_engineering']).toEqual({
+    expect(descriptor(email).keys['home_qualify_headline_2']).toEqual({
       shape: 'text',
       target: 'web',
+      section: 'qualify',
     });
   });
 
@@ -838,7 +868,14 @@ describe('register derives head texts', () => {
     for (const [rel, text] of Object.entries(files)) write(dir, rel, text);
     const d: Descriptor = { version: 1, keys: structuredClone(keys) };
     const s: Snapshot = structuredClone(values);
-    const result = planHtmlRegister({ cwd: dir, files: Object.keys(files).sort(), descriptor: d, snapshot: s, report: new Report() });
+    const result = planHtmlRegister({
+      cwd: dir,
+      files: Object.keys(files).sort(),
+      descriptor: d,
+      snapshot: s,
+      report: new Report(),
+      pageOf: () => 'home',
+    });
     const page = (rel: string): string => result.edited.find((e) => e.rel === rel)?.text ?? (files[rel] as string);
     return { dir, result, descriptor: d, snapshot: s, page };
   }
@@ -1131,7 +1168,736 @@ describe('register derives head texts — the lines', () => {
     const lines = host.out.filter((line) => line.includes(' derives from '));
     expect(lines).toEqual([
       'about.html:9 share derives from hero through "{v} No raw data is needed to start."',
-      'index.html:3 widgets_for_everyone_2 derives from widgets_for_everyone through "{v}"',
+      'index.html:3 home_page_title derives from home_page_headline through "{v}"',
     ]);
+  });
+});
+
+describe('register names by role', () => {
+  afterAll(cleanupCliHosts);
+  const ROLES = readFileSync(fileURLToPath(new URL('./fixtures/html-host/roles.html', import.meta.url)), 'utf8');
+  const NAMES = [
+    'home_page_link_text',
+    'home_header_span',
+    'home_nav_link_text_1',
+    'home_nav_link_text_2',
+    'home_top_headline',
+    'home_top_paragraph_1',
+    'home_top_paragraph_2',
+    'home_faq_headline_1',
+    'home_faq_paragraph_1',
+    'home_faq_headline_2',
+    'home_faq_paragraph_2',
+    'home_footer_paragraph',
+    'home_page_title',
+    'home_share_description',
+  ];
+  /** Every mark a written page carries, in document order. */
+  const marksIn = (page: string): string[] => [...page.matchAll(/ data-stet(?:-[a-z-]+)?="([^"]*)"/g)].map((m) => m[1] as string);
+  type Forms = { keys: Record<string, KeyDef & { section?: string; label?: string; help?: string }> };
+
+  it('names every key by its page, section and role, numbered across the run', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const keys = (JSON.parse(host.file('content/descriptor.json')) as Forms).keys;
+    expect(Object.keys(keys).sort()).toEqual([...NAMES].sort());
+    // The body's marks in document order, the head texts ahead of them.
+    expect(marksIn(host.file('index.html'))).toEqual([
+      'home_page_title',
+      'home_share_description',
+      ...NAMES.slice(0, 12),
+    ]);
+    // The section word lands on each entry where one answered; the skip link
+    // and the head texts carry none.
+    expect(keys['home_top_headline']?.section).toBe('top');
+    expect(keys['home_faq_paragraph_2']?.section).toBe('faq');
+    expect(keys['home_header_span']?.section).toBe('header');
+    expect(keys['home_nav_link_text_1']?.section).toBe('nav');
+    expect(keys['home_footer_paragraph']?.section).toBe('footer');
+    for (const name of ['home_page_link_text', 'home_page_title', 'home_share_description']) {
+      expect(keys[name]).not.toHaveProperty('section');
+    }
+    expect(keys['home_share_description']?.derivesFrom).toBe('home_top_headline');
+    expect(host.stdout()).toContain(
+      'index.html:6 home_share_description derives from home_top_headline through "{v} Start today."',
+    );
+    // The placeholder a fresh key is minted under reaches no file and no line.
+    for (const rel of ['content/descriptor.json', 'content/defaults.json', 'index.html']) {
+      expect(readFileSync(join(host.cwd, rel)).includes(0x01)).toBe(false);
+    }
+    expect(`${host.stdout()}${host.stderr()}`).not.toMatch(/[\u0001�]/);
+  });
+
+  it("tells a gate refusal by the element's file and line, never by the placeholder", async () => {
+    const page = ROLES.replace('<p>Sometimes, depending on the case.</p>', '<p>Unsubscribe here: {{unsubscribe_url}}</p>');
+    const host = await makeHtmlHost({ files: { 'index.html': page } });
+    expect(await host.run('register', '--from', 'scan')).toBe(1);
+    expect(host.stderr()).toContain(
+      'index.html:26: undeclared variable {{unsubscribe_url}} — declare them on the key or fix the placeholder (default)',
+    );
+    expect(`${host.stdout()}${host.stderr()}`).not.toMatch(/[\u0001�]/);
+  });
+
+  it('never gives a declared name: the heading continues at _2', async () => {
+    const bare = await makeHtmlHost({
+      files: { 'index.html': ROLES },
+      keys: { home_top_headline: { shape: 'text', target: 'web' } },
+      defaults: { home_top_headline: 'An older headline' },
+    });
+    expect(await bare.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(bare.file('index.html')).toContain('<h1 data-stet="home_top_headline_2">');
+
+    const first = await makeHtmlHost({
+      files: { 'index.html': ROLES },
+      keys: { home_top_headline_1: { shape: 'text', target: 'web' } },
+      defaults: { home_top_headline_1: 'An older headline' },
+    });
+    expect(await first.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(first.file('index.html')).toContain('<h1 data-stet="home_top_headline_2">');
+  });
+
+  it("shares the second page's key with a third page, past a derivation's source (F40)", async () => {
+    const A =
+      '<!doctype html><html><head><title>A</title><meta property="og:description" content="Ship the catalogue in a day. Start today."></head>' +
+      '<body><p>Ship the catalogue in a day.</p></body></html>\n';
+    const other = (title: string): string =>
+      `<!doctype html><html><head><title>${title}</title></head><body><p>Ship the catalogue in a day.</p></body></html>\n`;
+    // `a.html` is adopted first, alone: its share description derives from its paragraph.
+    const host = await makeHtmlHost({ files: { 'index.html': '<!doctype html><html><body></body></html>\n', 'a.html': A } });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.file('a.html')).toContain('<p data-stet="a_page_paragraph">');
+    expect(host.file('a.html')).toContain('data-stet-content="a_share_description"');
+
+    write(host.cwd, 'b.html', other('b'));
+    write(host.cwd, 'c.html', other('c'));
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.stdout()).toContain('1 key added, 1 shared');
+    expect(host.file('b.html')).toContain('<p data-stet="site_page_paragraph">');
+    expect(host.file('c.html')).toContain('<p data-stet="site_page_paragraph">');
+    expect(host.file('a.html')).toContain('<p data-stet="a_page_paragraph">');
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+  });
+
+  describe("a plan's choices", () => {
+    function planWith(chosen: Parameters<typeof planHtmlRegister>[0]['chosen'], page = ROLES) {
+      const dir = mkdtempSync(join(tmpdir(), 'stet-register-chosen-'));
+      write(dir, 'index.html', page);
+      const d: Descriptor = { version: 1, keys: {} };
+      const s: Snapshot = { default: {} };
+      const result = planHtmlRegister({
+        cwd: dir,
+        files: ['index.html'],
+        descriptor: d,
+        snapshot: s,
+        report: new Report(),
+        pageOf: () => 'home',
+        ...(chosen === undefined ? {} : { chosen }),
+      });
+      return { result, descriptor: d, snapshot: s, page: result.edited[0]?.text ?? page };
+    }
+
+    it('renames the entry, its value, what derives from it, its derivation and its mark', () => {
+      const { result, descriptor: d, snapshot: s, page } = planWith((proposed) =>
+        proposed === 'home_top_headline'
+          ? { key: 'home_hero_headline', label: 'Hero headline', help: 'The line at the top.', section: 'hero' }
+          : undefined,
+      );
+      expect(d.keys['home_top_headline']).toBeUndefined();
+      expect(d.keys['home_hero_headline']).toEqual({
+        shape: 'text',
+        target: 'web',
+        section: 'hero',
+        label: 'Hero headline',
+        help: 'The line at the top.',
+      });
+      expect(s['default']?.['home_hero_headline']).toBe('Ship the catalogue in a day.');
+      expect(s['default']).not.toHaveProperty('home_top_headline');
+      expect(d.keys['home_share_description']?.derivesFrom).toBe('home_hero_headline');
+      expect(result.derived.map((x) => `${x.key} ${x.source}`)).toEqual(['home_share_description home_hero_headline']);
+      expect(page).toContain('<h1 data-stet="home_hero_headline">');
+    });
+
+    it('leaves a proposal the plan drops out: no entry, no value, no mark', () => {
+      const { result, descriptor: d, snapshot: s, page } = planWith((proposed) =>
+        proposed === 'home_header_span' ? { adopt: false, key: 'home_header_span' } : undefined,
+      );
+      expect(d.keys['home_header_span']).toBeUndefined();
+      expect(s['default']).not.toHaveProperty('home_header_span');
+      expect(page).toContain('<span>Acme wordmark</span>');
+      expect(marksIn(page)).not.toContain('home_header_span');
+      expect(page.includes('\u0001')).toBe(false);
+      expect(result.added).toBe(NAMES.length - 1);
+    });
+
+    it('counts what lands: a shared key left out adds and shares nothing', async () => {
+      const page =
+        '<!DOCTYPE html>\n<html><body>\n<footer>\n<p>Same words, twice over.</p>\n<p>Same words, twice over.</p>\n' +
+        '<p>Other words in here.</p>\n</footer>\n</body></html>\n';
+      const host = await makeHtmlHost({ files: { 'index.html': page } });
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'p.json')).toBe(0);
+      const plan = JSON.parse(host.file('p.json')) as { keys: Array<{ proposed: string; adopt: boolean }> };
+      expect(plan.keys.map((e) => e.proposed)).toEqual(['home_footer_paragraph_1', 'home_footer_paragraph_2']);
+      (plan.keys[0] as { adopt: boolean }).adopt = false;
+      write(host.cwd, 'p.json', JSON.stringify(plan));
+      host.out.length = 0;
+      expect(await host.run('register', '--from', 'scan', '--plan', 'p.json', '--write')).toBe(0);
+      expect(host.stdout()).toContain('1 key added, 0 shared');
+      expect(marksIn(host.file('index.html'))).toEqual(['home_footer_paragraph_2']);
+    });
+  });
+});
+
+/** The App Router fixture: a home page with a hero and a headed section, a pricing page, a component. */
+const HOME =
+  'export default function Page() {\n' +
+  '  return (\n' +
+  '    <main>\n' +
+  '      <section id="hero">\n' +
+  '        <h1>Your week, sorted</h1>\n' +
+  '        <p>One brief a week, from the feeds you follow.</p>\n' +
+  '      </section>\n' +
+  '      <section>\n' +
+  '        <h2>Frequently asked</h2>\n' +
+  '        <h3>Does it read my mail?</h3>\n' +
+  '        <h3>Can I stop it anytime?</h3>\n' +
+  '      </section>\n' +
+  '    </main>\n' +
+  '  );\n' +
+  '}\n';
+const PRICING =
+  'export default function Pricing() {\n' +
+  '  return (\n' +
+  '    <>\n' +
+  '      <main><h1>Plans for every team</h1></main>\n' +
+  '      <footer><p>Prices exclude tax.</p></footer>\n' +
+  '    </>\n' +
+  '  );\n' +
+  '}\n';
+const CARD = 'export function PricingCard() {\n  return <div><h2>Premium plan</h2></div>;\n}\n';
+const footer = (name: string, text: string, head = ''): string =>
+  `${head}export function ${name}() {\n  return <footer><p>${text}</p></footer>;\n}\n`;
+
+describe('register names JSX by role', () => {
+  type Entry = { section?: string };
+
+  function appHost(): string {
+    const dir = project({
+      managedSurfaces: ['app/**/*.tsx', 'components/**/*.tsx'],
+      keys: { home_hero_headline: { shape: 'text', target: 'web' } },
+      defaults: { home_hero_headline: 'An older headline' },
+    });
+    write(dir, 'app/page.tsx', HOME);
+    write(dir, 'app/pricing/page.tsx', PRICING);
+    write(dir, 'components/PricingCard.tsx', CARD);
+    return dir;
+  }
+
+  it('names each leaf by page, section and role, numbered across the run past a declared name', async () => {
+    const dir = appHost();
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const keys = descriptor(dir).keys as Record<string, Entry>;
+    const added = Object.keys(keys).filter((k) => k !== 'home_hero_headline');
+    expect(added.sort()).toEqual(
+      [
+        'home_hero_headline_2',
+        'home_hero_paragraph',
+        'home_frequently_asked_headline_1',
+        'home_frequently_asked_headline_2',
+        'home_frequently_asked_headline_3',
+        'pricing_page_headline',
+        'pricing_footer_paragraph',
+      ].sort(),
+    );
+    expect(keys['home_hero_headline_2']?.section).toBe('hero');
+    expect(keys['home_hero_paragraph']?.section).toBe('hero');
+    expect(keys['home_frequently_asked_headline_3']?.section).toBe('frequently_asked');
+    expect(keys['pricing_footer_paragraph']?.section).toBe('footer');
+    expect(keys['pricing_page_headline']).not.toHaveProperty('section');
+    const home = read(dir, 'app/page.tsx');
+    for (const name of ['home_hero_headline_2', 'home_hero_paragraph', 'home_frequently_asked_headline_1', 'home_frequently_asked_headline_3']) {
+      expect(home).toContain(`{copy('${name}')}`);
+    }
+    expect(read(dir, 'app/pricing/page.tsx')).toContain("{copy('pricing_footer_paragraph')}");
+    // The component is ambiguous without --kind, so it takes no name here.
+    expect(read(dir, 'components/PricingCard.tsx')).toBe(CARD);
+  });
+
+  it('names a component by its own name under --kind server, with no page part', async () => {
+    const dir = appHost();
+    expect(await runRegister(['--from', 'scan', '--write', '--kind', 'server'], io(dir))).toBe(0);
+    expect(read(dir, 'components/PricingCard.tsx')).toContain("{copy('pricing_card_headline')}");
+    expect((descriptor(dir).keys as Record<string, Entry>)['pricing_card_headline']?.section).toBe('pricing_card');
+  });
+
+  it('numbers a role that repeats across files', async () => {
+    const dir = project({ managedSurfaces: ['components/**/*.tsx'] });
+    write(dir, 'components/A.tsx', footer('SiteFooter', 'The first footer line.'));
+    write(dir, 'components/B.tsx', footer('PageFooter', 'The second footer line.'));
+    expect(await runRegister(['--from', 'scan', '--write', '--kind', 'server'], io(dir))).toBe(0);
+    expect(read(dir, 'components/A.tsx')).toContain("{copy('footer_paragraph_1')}");
+    expect(read(dir, 'components/B.tsx')).toContain("{copy('footer_paragraph_2')}");
+  });
+
+  it('gives a literal the gate refuses no name, so the numbers have no gap', async () => {
+    const dir = project();
+    write(
+      dir,
+      'app/page.tsx',
+      SERVER_PAGE('<section id="a"><img alt="Use {{x}} here now" /><img alt="A picture of a cat" /></section>'),
+    );
+    const cap = io(dir);
+    await runRegister(['--from', 'scan', '--write'], cap);
+    expect(cap.err.join('\n')).toContain('undeclared variable {{x}}');
+    expect(Object.keys(descriptor(dir).keys)).toEqual(['home_a_image_alt_text']);
+    expect(read(dir, 'app/page.tsx')).toContain('alt="Use {{x}} here now"');
+  });
+
+  it('gives a literal the rewrite skips no name, and reports it to adopt by hand', async () => {
+    const dir = project({ managedSurfaces: ['components/**/*.tsx'] });
+    write(dir, 'components/A.tsx', footer('SiteFooter', 'The first footer line.', "import copy from 'copy-to-clipboard';\n"));
+    write(dir, 'components/B.tsx', footer('PageFooter', 'The second footer line.'));
+    const cap = io(dir);
+    await runRegister(['--from', 'scan', '--write', '--kind', 'server'], cap);
+    expect(cap.err.join('\n')).toContain(
+      'components/A.tsx: "footer_paragraph" a foreign `copy` is already bound in scope — adopt by hand',
+    );
+    expect(Object.keys(descriptor(dir).keys)).toEqual(['footer_paragraph']);
+    expect(read(dir, 'components/B.tsx')).toContain("{copy('footer_paragraph')}");
+  });
+
+  it("never gives a declared copy module's property name to a leaf", async () => {
+    const dir = project({ managedSurfaces: ['components/**/*.tsx'], copyModules: ['lib/copy.ts'] });
+    write(dir, 'lib/copy.ts', 'export const copy = {\n  hero_title: "The hero title",\n};\n');
+    write(dir, 'components/Hero.tsx', 'export function Hero() {\n  return <Title>Welcome to the site</Title>;\n}\n');
+    expect(await runRegister(['--from', 'scan', '--write', '--kind', 'server'], io(dir))).toBe(0);
+    expect(read(dir, 'components/Hero.tsx')).toContain("{copy('hero_title_2')}");
+    expect(defaults(dir).default['hero_title']).toBe('The hero title');
+  });
+});
+
+describe('register --plan', () => {
+  afterAll(cleanupCliHosts);
+  const ROLES = readFileSync(fileURLToPath(new URL('./fixtures/html-host/roles.html', import.meta.url)), 'utf8');
+  interface PlanFile {
+    plan: string;
+    version: number;
+    made: Record<string, string>;
+    keys: Array<{
+      proposed: string;
+      key: string;
+      label: string | null;
+      help: string | null;
+      section: string | null;
+      adopt: boolean;
+      kind: string;
+      places: string[];
+      text: string;
+    }>;
+  }
+  /** Every file of a checkout, so "nothing else was written" is a byte compare. */
+  function filesOf(dir: string): Map<string, Buffer> {
+    const files = new Map<string, Buffer>();
+    const walk = (sub: string): void => {
+      for (const entry of readdirSync(join(dir, sub), { withFileTypes: true })) {
+        const rel = sub === '' ? entry.name : `${sub}/${entry.name}`;
+        if (entry.isDirectory()) walk(rel);
+        else files.set(rel, readFileSync(join(dir, rel)));
+      }
+    };
+    walk('');
+    return files;
+  }
+  function sameFiles(dir: string, before: Map<string, Buffer>, except: string[] = []): void {
+    const after = filesOf(dir);
+    for (const rel of except) after.delete(rel);
+    expect([...after.keys()].sort()).toEqual([...before.keys()].filter((k) => !except.includes(k)).sort());
+    for (const [rel, bytes] of after) expect(bytes.equals(before.get(rel) as Buffer), rel).toBe(true);
+  }
+  const edit = (dir: string, rel: string, change: (plan: PlanFile) => void): void => {
+    const plan = JSON.parse(readFileSync(join(dir, rel), 'utf8')) as PlanFile;
+    change(plan);
+    write(dir, rel, JSON.stringify(plan, null, 2));
+  };
+  const entryOf = (plan: PlanFile, proposed: string) => plan.keys.find((e) => e.proposed === proposed) as PlanFile['keys'][number];
+  /** A JavaScript host run through the dispatcher, so usage errors exit 2 as a person sees them. */
+  function cli(dir: string) {
+    const cap = io(dir);
+    return { cap, run: (...argv: string[]) => runCli(argv, cap) };
+  }
+  function appHost(extra: { copyModules?: string[] } = {}): string {
+    const dir = project({ managedSurfaces: ['app/**/*.tsx'], ...extra });
+    write(dir, 'app/page.tsx', HOME);
+    write(dir, 'app/pricing/page.tsx', PRICING);
+    return dir;
+  }
+
+  describe('on the static-HTML host', () => {
+    it('--plan-out writes the plan and nothing else, its entries in run order', async () => {
+      const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+      const before = filesOf(host.cwd);
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      expect(host.stdout()).toContain(
+        'wrote naming.json: the naming plan for 14 keys — edit key, label and help, then run stet register --from scan --plan naming.json',
+      );
+      sameFiles(host.cwd, before, ['naming.json']);
+      const plan = JSON.parse(host.file('naming.json')) as PlanFile;
+      expect(plan.plan).toBe('stet register');
+      expect(plan.version).toBe(1);
+      expect(plan.made).toEqual({
+        'content/defaults.json': fileHash(host.cwd, 'content/defaults.json'),
+        'content/descriptor.json': fileHash(host.cwd, 'content/descriptor.json'),
+        'index.html': fileHash(host.cwd, 'index.html'),
+      });
+      expect(plan.keys.map((e) => e.proposed)).toEqual([
+        'home_page_link_text',
+        'home_header_span',
+        'home_nav_link_text_1',
+        'home_nav_link_text_2',
+        'home_top_headline',
+        'home_top_paragraph_1',
+        'home_top_paragraph_2',
+        'home_faq_headline_1',
+        'home_faq_paragraph_1',
+        'home_faq_headline_2',
+        'home_faq_paragraph_2',
+        'home_footer_paragraph',
+        'home_page_title',
+        'home_share_description',
+      ]);
+      expect(plan.keys[0]).toEqual({
+        proposed: 'home_page_link_text',
+        key: 'home_page_link_text',
+        label: null,
+        help: null,
+        section: null,
+        adopt: true,
+        kind: 'link text',
+        places: ['index.html:9 <a>'],
+        text: 'Skip to content',
+      });
+      expect(entryOf(plan, 'home_top_headline')).toMatchObject({ section: 'top', kind: 'headline', places: ['index.html:19 <h1>'] });
+      expect(entryOf(plan, 'home_share_description')).toMatchObject({
+        section: null,
+        kind: 'share description',
+        places: ['index.html:6 <meta> og:description'],
+        text: '{v} Start today.',
+      });
+    });
+
+    it('applies the edited names, labels, help and sections, and leaves a dropped proposal out', async () => {
+      const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      edit(host.cwd, 'naming.json', (plan) => {
+        Object.assign(entryOf(plan, 'home_top_headline'), {
+          key: 'home_hero_headline',
+          label: 'Hero headline',
+          help: 'The headline at the top of the home page.',
+          section: 'hero',
+        });
+        entryOf(plan, 'home_header_span').adopt = false;
+      });
+      host.out.length = 0;
+      expect(await host.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+      const keys = (JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, unknown> }).keys;
+      expect(keys['home_hero_headline']).toEqual({
+        shape: 'text',
+        target: 'web',
+        section: 'hero',
+        label: 'Hero headline',
+        help: 'The headline at the top of the home page.',
+      });
+      expect(keys['home_top_headline']).toBeUndefined();
+      expect(keys['home_header_span']).toBeUndefined();
+      expect(JSON.parse(host.file('content/defaults.json')).default).not.toHaveProperty('home_header_span');
+      expect(host.file('index.html')).toContain('<span>Acme wordmark</span>');
+      expect(host.stdout()).toContain(
+        'index.html:6 home_share_description derives from home_hero_headline through "{v} Start today."',
+      );
+      host.out.length = 0;
+      expect(await host.run('check')).toBe(0);
+    });
+
+    it('refuses a plan with every problem listed, and changes nothing', async () => {
+      const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      edit(host.cwd, 'naming.json', (plan) => {
+        entryOf(plan, 'home_top_paragraph_1').key = 'home_hero__eyebrow';
+        entryOf(plan, 'home_faq_headline_1').key = 'home_faq_question';
+        entryOf(plan, 'home_faq_headline_2').key = 'home_faq_question';
+        entryOf(plan, 'home_top_headline').label = 'x'.repeat(61);
+      });
+      const before = filesOf(host.cwd);
+      expect(await host.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(1);
+      expect(host.err).toEqual([
+        'error: stet register: naming.json is refused — nothing written',
+        'error: home_top_headline: its label is longer than 60 characters',
+        'error: home_top_paragraph_1: "home_hero__eyebrow" uses "__", which names a template slot or the brand group',
+        'error: home_faq_headline_1 and home_faq_headline_2: both are named "home_faq_question"',
+      ]);
+      sameFiles(host.cwd, before);
+    });
+
+    it('refuses a plan whose files have changed since it was written', async () => {
+      const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      write(host.cwd, 'index.html', ROLES.replace('Questions asked', 'Questions we get'));
+      const before = filesOf(host.cwd);
+      expect(await host.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(1);
+      expect(host.err).toEqual([
+        'error: stet register: naming.json is refused — nothing written',
+        'error: naming.json: the files it was made from have changed — run the command with --plan-out again',
+      ]);
+      sameFiles(host.cwd, before);
+    });
+
+    it("refuses a plan that drops a derivation's source and keeps the derived key", async () => {
+      const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      edit(host.cwd, 'naming.json', (plan) => {
+        entryOf(plan, 'home_top_headline').adopt = false;
+      });
+      const before = filesOf(host.cwd);
+      expect(await host.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(1);
+      expect(host.stderr()).toContain('home_top_headline: home_share_description derives from it — adopt both or neither');
+      sameFiles(host.cwd, before);
+    });
+
+    it('takes --plan or --plan-out, and --plan-out never with --write', async () => {
+      const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+      expect(await host.run('register', '--from', 'scan', '--plan', 'a.json', '--plan-out', 'b.json')).toBe(2);
+      expect(host.stderr()).toContain('usage: stet register takes --plan or --plan-out, not both');
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'b.json', '--write')).toBe(2);
+      expect(host.stderr()).toContain(
+        'usage: stet register --plan-out writes the plan alone — run --plan with --write to apply it',
+      );
+      expect(host.exists('b.json')).toBe(false);
+    });
+
+    it('--plan-out refuses a file that exists and is not a plan, and replaces an earlier plan', async () => {
+      const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+      // A case-insensitive disk (macOS's default) reads `INDEX.html` as the page itself.
+      const folds = existsSync(join(host.cwd, 'INDEX.html'));
+      for (const rel of ['index.html', ...(folds ? ['INDEX.html'] : []), 'stet.config.json', 'content/descriptor.json']) {
+        const bytes = readFileSync(join(host.cwd, rel));
+        host.err.length = 0;
+        expect(await host.run('register', '--from', 'scan', '--plan-out', rel)).toBe(1);
+        expect(host.stderr()).toBe(
+          `error: --plan-out ${rel}: the file exists and is not a stet plan — name a new file, or an earlier plan to replace`,
+        );
+        expect(readFileSync(join(host.cwd, rel)).equals(bytes), rel).toBe(true);
+      }
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'p.json')).toBe(0);
+      const first = host.file('p.json');
+      write(host.cwd, 'index.html', ROLES.replace('Questions asked', 'Questions we get'));
+      expect(await host.run('register', '--from', 'scan', '--plan-out', 'p.json')).toBe(0);
+      expect(host.file('p.json')).not.toBe(first);
+      expect((JSON.parse(host.file('p.json')) as PlanFile).made['index.html']).toBe(fileHash(host.cwd, 'index.html'));
+    });
+
+    it('passes an unedited plan, digit-first section words included', async () => {
+      for (const page of [
+        ROLES,
+        '<!DOCTYPE html>\n<html><body>\n<section id="2col"><p>Two columns of text.</p></section>\n' +
+          '<section><h2>2026 annual report</h2><p>The year in review.</p></section>\n</body></html>\n',
+      ]) {
+        const host = await makeHtmlHost({ files: { 'index.html': page } });
+        expect(await host.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+        expect(await host.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+        expect(host.stderr()).toBe('');
+        if (page !== ROLES) {
+          const keys = (JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, { section?: string }> }).keys;
+          expect(keys['home_2col_paragraph']?.section).toBe('2col');
+          expect(keys['home_2026_annual_report_paragraph']?.section).toBe('2026_annual_report');
+        }
+      }
+    });
+  });
+
+  describe('on a JavaScript host', () => {
+    it('--plan-out writes the plan and nothing else', async () => {
+      const dir = appHost();
+      const before = filesOf(dir);
+      const { cap, run } = cli(dir);
+      expect(await run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      expect(cap.out.join('\n')).toContain('wrote naming.json: the naming plan for 7 keys');
+      sameFiles(dir, before, ['naming.json']);
+      const plan = JSON.parse(read(dir, 'naming.json')) as PlanFile;
+      expect(Object.keys(plan.made)).toEqual([
+        'app/layout.tsx',
+        'app/page.tsx',
+        'app/pricing/page.tsx',
+        'content/defaults.json',
+        'content/descriptor.json',
+      ]);
+      expect(plan.keys.map((e) => e.proposed)).toEqual([
+        'home_hero_headline',
+        'home_hero_paragraph',
+        'home_frequently_asked_headline_1',
+        'home_frequently_asked_headline_2',
+        'home_frequently_asked_headline_3',
+        'pricing_page_headline',
+        'pricing_footer_paragraph',
+      ]);
+      expect(plan.keys[0]).toMatchObject({ section: 'hero', kind: 'headline', places: ['app/page.tsx:5 <h1>'], text: 'Your week, sorted' });
+    });
+
+    it('--plan without --write shows the run and writes nothing; --write applies it', async () => {
+      const dir = appHost();
+      const { cap, run } = cli(dir);
+      expect(await run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      edit(dir, 'naming.json', (plan) => {
+        Object.assign(entryOf(plan, 'home_hero_headline'), { key: 'home_hero_title', label: 'Hero title' });
+      });
+      const before = filesOf(dir);
+      cap.out.length = 0;
+      expect(await run('register', '--from', 'scan', '--plan', 'naming.json')).toBe(0);
+      expect(cap.out.join('\n')).toContain('register: run with --write to apply the plan');
+      sameFiles(dir, before);
+      expect(await run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+      expect(read(dir, 'app/page.tsx')).toContain("{copy('home_hero_title')}");
+      expect(descriptor(dir).keys['home_hero_title']).toEqual({ shape: 'text', target: 'web', section: 'hero', label: 'Hero title' });
+    });
+
+    it("refuses a name a declared copy module's property holds", async () => {
+      const dir = appHost({ copyModules: ['lib/copy.ts'] });
+      write(dir, 'lib/copy.ts', 'export const copy = {\n  hero_title: "The hero title",\n};\n');
+      const { cap, run } = cli(dir);
+      expect(await run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      edit(dir, 'naming.json', (plan) => {
+        entryOf(plan, 'home_hero_paragraph').key = 'hero_title';
+      });
+      const before = filesOf(dir);
+      expect(await run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(1);
+      expect(cap.err.join('\n')).toContain(
+        'home_hero_paragraph: "hero_title" is a property of lib/copy.ts, which adopts under its own name',
+      );
+      sameFiles(dir, before);
+    });
+
+    it('--plan-out refuses a copy module', async () => {
+      const dir = appHost({ copyModules: ['src/copy.ts'] });
+      write(dir, 'src/copy.ts', 'export const copy = {\n  footer_note: "A working name",\n};\n');
+      const bytes = readFileSync(join(dir, 'src/copy.ts'));
+      const { run } = cli(dir);
+      expect(await run('register', '--from', 'scan', '--plan-out', 'src/copy.ts')).toBe(1);
+      expect(readFileSync(join(dir, 'src/copy.ts')).equals(bytes)).toBe(true);
+    });
+
+    it('passes an unedited plan, a long component name included', async () => {
+      const app = appHost();
+      const { run } = cli(app);
+      expect(await run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+      expect(await run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+      expect(read(app, 'app/page.tsx')).toContain("{copy('home_frequently_asked_headline_3')}");
+
+      const long = project({ managedSurfaces: ['components/**/*.tsx'] });
+      write(
+        long,
+        'components/Long.tsx',
+        'export function VeryLongComponentNameForTheMarketingHeroSection() {\n  return <section><p>Some words here</p><Image alt="A friendly face" /></section>;\n}\n',
+      );
+      const second = cli(long);
+      expect(await second.run('register', '--from', 'scan', '--kind', 'server', '--plan-out', 'naming.json')).toBe(0);
+      expect((JSON.parse(read(long, 'naming.json')) as PlanFile).keys.map((e) => e.proposed)).toEqual([
+        'very_long_component_paragraph',
+        'very_long_component_image_alt',
+      ]);
+      expect(await second.run('register', '--from', 'scan', '--kind', 'server', '--plan', 'naming.json', '--write')).toBe(0);
+      expect(second.cap.err.join('\n')).toBe('');
+    });
+  });
+});
+
+// --- Stage-5 review ------------------------------------------------------------------
+
+describe('register — the stage-5 review', () => {
+  afterAll(cleanupCliHosts);
+  const ROLES = readFileSync(fileURLToPath(new URL('./fixtures/html-host/roles.html', import.meta.url)), 'utf8');
+
+  it("writes a --plan-out spelled /index.html where it names, never over the repo's own page (F2)", async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+    const page = readFileSync(join(host.cwd, 'index.html'));
+    expect(await host.run('register', '--from', 'scan', '--plan-out', '/index.html')).toBe(1);
+    expect(host.err).toHaveLength(1);
+    expect(host.err[0]).toMatch(/^error: --plan-out \/index\.html: the plan cannot be written there — EACCES\b/);
+    expect(readFileSync(join(host.cwd, 'index.html')).equals(page)).toBe(true);
+  });
+
+  it('reads and writes a plan through an absolute path (F2)', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+    const abs = join(host.cwd, 'naming.json');
+    expect(await host.run('register', '--from', 'scan', '--plan-out', abs)).toBe(0);
+    expect(existsSync(abs)).toBe(true);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--plan', abs)).toBe(0);
+    expect(host.stderr()).toBe('');
+  });
+
+  it('refuses a --plan-out it cannot write in one line (F2)', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+    expect(await host.run('register', '--from', 'scan', '--plan-out', 'index.html/naming.json')).toBe(1);
+    expect(host.err).toHaveLength(1);
+    expect(host.err[0]).toMatch(/^error: --plan-out index\.html\/naming\.json: the plan cannot be written there — E[A-Z]+\b/);
+  });
+
+  it('writes no section where the plan sets it to null, on both hosts (F9)', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': ROLES } });
+    expect(await host.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const plan = JSON.parse(host.file('naming.json')) as { keys: Array<{ proposed: string; section: string | null }> };
+    const entry = plan.keys.find((e) => e.proposed === 'home_top_headline') as { section: string | null };
+    expect(entry.section).toBe('top');
+    entry.section = null;
+    writeFileSync(join(host.cwd, 'naming.json'), JSON.stringify(plan, null, 2));
+    expect(await host.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+    expect(JSON.parse(host.file('content/descriptor.json')).keys['home_top_headline']).not.toHaveProperty('section');
+
+    const dir = project({ managedSurfaces: ['app/**/*.tsx'] });
+    write(dir, 'app/page.tsx', HOME);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--plan-out', 'naming.json'], cap)).toBe(0);
+    const jsx = JSON.parse(read(dir, 'naming.json')) as { keys: Array<{ proposed: string; section: string | null }> };
+    const hero = jsx.keys.find((e) => e.proposed === 'home_hero_headline') as { section: string | null };
+    expect(hero.section).toBe('hero');
+    hero.section = null;
+    write(dir, 'naming.json', JSON.stringify(jsx, null, 2));
+    expect(await runRegister(['--from', 'scan', '--plan', 'naming.json', '--write'], io(dir))).toBe(0);
+    expect(descriptor(dir).keys['home_hero_headline']).not.toHaveProperty('section');
+  });
+
+  it("names a component prop that spells a kind as a prop, apart from the page's own <title> (F6)", async () => {
+    const dir = project({ managedSurfaces: ['app/**/*.tsx'] });
+    write(
+      dir,
+      'app/hk/page.tsx',
+      'export default function Page() {\n  return (\n    <html>\n      <head><title>The page title</title></head>\n' +
+        '      <body><section id="intro"><Page title="A prop that names a title" /></section></body>\n    </html>\n  );\n}\n',
+    );
+    expect(await runRegister(['--from', 'scan', '--kind', 'server', '--plan-out', 'naming.json'], io(dir))).toBe(0);
+    const plan = JSON.parse(read(dir, 'naming.json')) as { keys: Array<{ proposed: string; kind: string }> };
+    expect(plan.keys.map((e) => [e.proposed, e.kind])).toEqual(
+      expect.arrayContaining([
+        ['hk_page_title', 'page title'],
+        ['hk_intro_page_title_prop', 'page title prop'],
+      ]),
+    );
+  });
+
+  it('prints its diffs and lines with control characters replaced (F5)', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': ROLES.replace('<h1>', '<!-- \u001b[2J\u001b]0;PWNED\u0007 -->\n      <h1>') },
+    });
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(host.stdout()).not.toMatch(/[\u001b\u0007]/);
+    expect(host.stdout()).toContain('�[2J');
+
+    const dir = project({ managedSurfaces: ['app/**/*.tsx'] });
+    write(dir, 'app/page.tsx', 'export default function Page() {\n  return (\n    <main>\n      {/* \u001b[2J */}\n      <h1>Your week, sorted</h1>\n    </main>\n  );\n}\n');
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(cap.out.join('\n')).not.toContain('\u001b');
+    expect(cap.out.join('\n')).toContain('�[2J');
   });
 });

@@ -30,7 +30,7 @@ import {
   valueOf,
 } from '../cli/html-host.js';
 import { Report } from '../cli/report.js';
-import { proposeKey } from '../cli/source-scan.js';
+import { SECTION_WORD_ROWS } from './fixtures/section-words.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 
@@ -112,14 +112,41 @@ describe('the fixture document — the pinned proposal list', () => {
     expect(set.claimed).toEqual([]);
   });
 
-  it('proposes each key from the plain text the function itself yields', () => {
-    for (const p of set.proposals) expect(p.proposedKey).toBe(proposeKey(p.plain));
+  it('gives each proposal the section word and the role its name is made from', () => {
+    // `role | section word` per proposal, in document order: a head text sits in
+    // no section, `<main>` never names one, and a tag with no kind word is its role.
+    expect(set.proposals.map((p) => `${p.role} | ${p.sectionWord ?? '-'}`)).toEqual([
+      'page_title | -',
+      'meta_description | -',
+      'share_title | -',
+      'share_description | -',
+      'aria_label | nav',
+      'link_text | nav',
+      'link_text | nav',
+      'headline | -',
+      'paragraph | -',
+      'paragraph | -',
+      'paragraph | -',
+      'paragraph | -',
+      'paragraph | -',
+      'image_alt_text | -',
+      'headline | qualify',
+      'headline | qualify',
+      'list_item | qualify',
+      'list_item | qualify',
+      'list_item | qualify',
+      'button_text | qualify',
+      'paragraph | contact',
+      'paragraph | contact',
+      'link_text | contact',
+      'link_text | contact',
+      'tooltip | contact',
+      'button_text | contact',
+      'textarea | contact',
+      'paragraph | contact',
+    ]);
     const h1 = set.proposals.find((p) => p.tag === 'h1');
     expect(h1?.plain).toBe('You may already have the data our AI lab partners need.');
-    expect(h1?.proposedKey).toBe('you_may_already_have_the_data_our_ai');
-    expect(set.proposals.find((p) => p.tag === 'h3')?.proposedKey).toBe(
-      'software_product_and_engineering',
-    );
   });
 
   it('reads the `<br>` paragraph as a self-closing tag whose plain text joins the lines', () => {
@@ -141,15 +168,14 @@ describe('the fixture document — the pinned proposal list', () => {
   });
 
   it('says nothing about a repeated value — sharing is register’s to decide', () => {
-    expect(set.proposals.filter((p) => p.value === 'How it works')).toHaveLength(2);
-    // Three distinct values, one slug: the heading, the button and the links.
-    const slugged = set.proposals.filter((p) => p.proposedKey === 'how_it_works');
-    expect(slugged.map((p) => p.value)).toEqual([
-      'How it works',
-      'How it works',
-      'How it works.',
-      'How it works →',
-    ]);
+    const links = set.proposals.filter((p) => p.value === 'How it works');
+    expect(links).toHaveLength(2);
+    // Both links carry the same parts; whether they share one key or take two
+    // numbered names is register's call, over the whole run.
+    expect(links.map((p) => `${p.sectionWord} ${p.role}`)).toEqual(['nav link_text', 'nav link_text']);
+    // The heading and the button holding near-identical text take roles of their own.
+    expect(set.proposals.find((p) => p.value === 'How it works.')?.role).toBe('headline');
+    expect(set.proposals.find((p) => p.value === 'How it works →')?.role).toBe('button_text');
   });
 
   it('reads a structural container’s children on their own and never the container', () => {
@@ -183,6 +209,46 @@ describe('the fixture document — the pinned proposal list', () => {
     expect(all).not.toContain('color');
     expect(all).not.toContain('an editor might mistake');
   });
+});
+
+describe('section words', () => {
+  const set = fixture('sections.html');
+  const wordOf = (value: string): string | null | undefined =>
+    set.proposals.find((p) => p.value === value)?.sectionWord;
+
+  it('names a section by its id, cut to three words', () => {
+    expect(wordOf('The hero headline here')).toBe('hero_banner_main');
+  });
+
+  it('names a landmark with no id by its tag', () => {
+    expect(wordOf('Home of the site')).toBe('nav');
+  });
+
+  it('names an article by its heading, and one with none by the section around it', () => {
+    expect(wordOf('Psyon acquires the data from you.')).toBe('outright_acquisition');
+    expect(wordOf('An answer with no heading of its own.')).toBe('faq');
+  });
+
+  it('answers no section directly in <main>', () => {
+    expect(wordOf('A paragraph straight in the page.')).toBeNull();
+  });
+
+  it("names a section's own attribute by that section", () => {
+    expect(wordOf('Our pricing plans')).toBe('pricing');
+    expect(wordOf('Plans for every team size.')).toBe('pricing');
+  });
+
+  for (const row of SECTION_WORD_ROWS) {
+    it(`answers the fixture row: ${row.name}`, () => {
+      const source = `<!DOCTYPE html>\n<html><body>\n${row.markup}\n</body></html>\n`;
+      // The marked element's open tag: the proposal on it is the one its `>` inserts at.
+      const open = source.indexOf(' data-mark');
+      const insertAt = source.indexOf('>', open);
+      const found = readSource(source).proposals.filter((p) => p.insertAt === insertAt);
+      expect(found).toHaveLength(1);
+      expect(found[0]?.sectionWord).toBe(row.word);
+    });
+  }
 });
 
 describe('the edge document', () => {
@@ -372,6 +438,7 @@ describe('the documents as generated forms', () => {
       descriptor,
       snapshot,
       report: new Report(),
+      pageOf: () => 'home',
     });
     for (const document of plan.edited) writeFileSync(document.abs, document.text, 'utf8');
     return { dir, descriptor, snapshot, page: readFileSync(join(dir, 'index.html'), 'utf8') };
@@ -972,7 +1039,7 @@ describe('head texts', () => {
     writeFileSync(join(dir, 'index.html'), source, 'utf8');
     const descriptor: Descriptor = { version: 1, keys: {} };
     const snapshot: Snapshot = { default: {} };
-    const plan = planHtmlRegister({ cwd: dir, files: ['index.html'], descriptor, snapshot, report: new Report() });
+    const plan = planHtmlRegister({ cwd: dir, files: ['index.html'], descriptor, snapshot, report: new Report(), pageOf: () => 'home' });
     for (const document of plan.edited) writeFileSync(document.abs, document.text, 'utf8');
     return proposeHtml(dir, ['index.html']);
   }

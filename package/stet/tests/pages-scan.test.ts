@@ -23,7 +23,7 @@ import { loadSnapshot } from '../src/snapshot.js';
 import { makeHtmlHost } from '../conformance/cli-host.js';
 import { loadConfig } from '../cli/config.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { proposeForHost } from '../cli/pages.js';
+import { normalize, pageOfFile, proposeForHost } from '../cli/pages.js';
 
 interface Host extends CliIo {
   cwd: string;
@@ -900,8 +900,8 @@ describe('pages scan — the html arm', () => {
     const host = await site();
     await host.run('pages', 'scan');
     const out = host.stdout();
-    expect(out).toContain('  title: bound to psyon_data_partnerships_for_ai_labs');
-    expect(out).toContain('  description: bound to psyon_connects_hospitals_labs_and');
+    expect(out).toContain('  title: bound to home_page_title');
+    expect(out).toContain('  description: bound to home_meta_description');
     expect(out).toContain('  title: no marked <title> — run stet register first, or declare it by hand');
     expect(out).toContain(
       '  description: no marked meta description — run stet register first, or declare it by hand',
@@ -920,8 +920,8 @@ describe('pages scan — the html arm', () => {
       keys: Record<string, { pages?: string[] }>;
     };
     expect(descriptor.pages['home']?.seo).toEqual({
-      title: 'psyon_data_partnerships_for_ai_labs',
-      description: 'psyon_connects_hospitals_labs_and',
+      title: 'home_page_title',
+      description: 'home_meta_description',
     });
     // A page with neither mark gets a record and NO seo block at all.
     expect(descriptor.pages['about']).toMatchObject({ route: '/about' });
@@ -930,7 +930,7 @@ describe('pages scan — the html arm', () => {
     expect(descriptor.keys['seo_about_title']).toBeUndefined();
     expect(descriptor.keys['seo_home_title']).toBeUndefined();
     // The bound key carries the page in its reverse index.
-    expect(descriptor.keys['psyon_data_partnerships_for_ai_labs']?.pages).toEqual(['home']);
+    expect(descriptor.keys['home_page_title']?.pages).toEqual(['home']);
   });
 
   it('leaves check green — no key was scaffolded for anything to warn about', async () => {
@@ -1070,5 +1070,42 @@ describe('proposeForHost — the propose half, split out', () => {
     // its undefined members dropped, so the compare is over the same shape.
     expect(JSON.parse(JSON.stringify(set?.proposals))).toEqual(payload.pages);
     expect(JSON.parse(JSON.stringify(set?.skips))).toEqual(payload.skips);
+  });
+});
+
+describe('pageOfFile', () => {
+  it('names an html document by its route, home for /', () => {
+    const host = project();
+    expect(pageOfFile(host.cwd, 'index.html', undefined, { html: true })).toBe('home');
+    expect(pageOfFile(host.cwd, 'about/index.html', undefined, { html: true })).toBe('about');
+    expect(pageOfFile(host.cwd, 'docs/start.html', undefined, { html: true })).toBe('docs_start');
+  });
+
+  it("names a document by the declared page whose route it serves, compared in seo's form", () => {
+    const host = project();
+    expect(pageOfFile(host.cwd, 'index.html', { landing: { route: '/' } }, { html: true })).toBe('landing');
+  });
+
+  it('names an Astro route file by its route, and a component or a dynamic route not at all', () => {
+    const host = project();
+    tree(host, 'src/pages', ['pricing.astro', '[slug].astro']);
+    host.put('src/components/Hero.astro', '<h1>x</h1>\n');
+    expect(pageOfFile(host.cwd, 'src/pages/pricing.astro', undefined)).toBe('pricing');
+    expect(pageOfFile(host.cwd, 'src/components/Hero.astro', undefined)).toBeUndefined();
+    expect(pageOfFile(host.cwd, 'src/pages/[slug].astro', undefined)).toBeUndefined();
+  });
+
+  it('names a Next App page by its route, and a layout not at all', () => {
+    const host = project();
+    host.put('app/page.tsx', PAGE);
+    host.put('app/pricing/page.tsx', PAGE);
+    host.put('app/layout.tsx', PAGE);
+    expect(pageOfFile(host.cwd, 'app/page.tsx', undefined)).toBe('home');
+    expect(pageOfFile(host.cwd, 'app/pricing/page.tsx', undefined)).toBe('pricing');
+    expect(pageOfFile(host.cwd, 'app/layout.tsx', undefined)).toBeUndefined();
+  });
+
+  it('normalizes a name through the one spelling of descriptor words', () => {
+    expect(normalize('Pricing Page')).toBe('pricing_page');
   });
 });

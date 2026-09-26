@@ -49,6 +49,7 @@ import { descriptorOf, snapshotOf } from './check.js';
 import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
 import { filesForGlobs, walk } from './files.js';
 import { proposeHtml } from './html-host.js';
+import { NAME_PART, wordsOf } from './key-names.js';
 import type { CliIo } from './main.js';
 import { clip, plural, posixRelative, CliError, Report, UsageError } from './report.js';
 
@@ -62,8 +63,8 @@ export { walk };
 
 // --- The name grammar -------------------------------------------------------
 
-/** A descriptor key, and therefore a template, slot or page name. */
-const NAME_PART = /^[a-z0-9]+(?:_[a-z0-9]+)*$/;
+// A descriptor key, and therefore a template, slot or page name, is
+// `NAME_PART` (cli/key-names.ts), spelled by `wordsOf`.
 
 /**
  * A descriptor name from arbitrary text, or `null` where the text makes none.
@@ -73,11 +74,7 @@ const NAME_PART = /^[a-z0-9]+(?:_[a-z0-9]+)*$/;
  * and a page name goes on to carry `seo_<name>_title`.
  */
 export function normalize(raw: string): string | null {
-  const name = raw
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '');
+  const name = wordsOf(raw);
   return NAME_PART.test(name) ? name : null;
 }
 
@@ -694,6 +691,50 @@ function readNextPages(rel: string): RouteRead {
   }
   const route = fileRoute(rel);
   return isDynamic(route) ? dynamicSkip(route) : { route };
+}
+
+/**
+ * The page word a file's keys are named under (key-names.ts): the declared page
+ * whose route the file serves, else the route's own name — `home` for `/`, the
+ * normalized route otherwise, as `proposePages` names a page. A file the host's
+ * routing convention serves at no static route — a component, a layout, a
+ * dynamic route, an endpoint — answers `undefined`, and its keys carry no page
+ * part. On the static-HTML host every managed `.html` file is a page at its
+ * `fileRoute`. The arms are the detector's own, so a name here and a page
+ * `pages scan` proposes for the same file always agree.
+ */
+export function pageOfFile(
+  cwd: string,
+  file: string,
+  pages: Record<string, PageDef> | undefined,
+  options: { html?: boolean } = {},
+): string | undefined {
+  let route: string | undefined;
+  for (const root of detectPagesRoots(cwd, options)) {
+    const prefix = root.root === '' ? '' : `${root.root}/`;
+    if (!file.startsWith(prefix)) continue;
+    const rel = file.slice(prefix.length);
+    const read: RouteRead =
+      root.arm === 'html'
+        ? { route: fileRoute(rel) }
+        : root.arm === 'astro'
+          ? readAstro(rel)
+          : root.arm === 'next-app'
+            ? readNextApp(rel)
+            : readNextPages(rel);
+    if (read !== null && 'route' in read) {
+      route = read.route;
+      break;
+    }
+  }
+  if (route === undefined) return undefined;
+  // Compared in `seo`'s normalized form, where `/` is the empty string.
+  const at = normalizeRoute(route);
+  for (const name of Object.keys(pages ?? {}).sort()) {
+    const page = (pages ?? {})[name];
+    if (page !== undefined && typeof page.route === 'string' && normalizeRoute(page.route) === at) return name;
+  }
+  return route === '/' ? 'home' : (normalize(route) ?? undefined);
 }
 
 /** The last extension of a path, lowercased — `features.md.ts` yields `.ts`. */
