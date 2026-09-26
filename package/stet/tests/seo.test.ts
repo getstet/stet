@@ -1,8 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { afterAll, describe, expect, it } from 'vitest';
+
+import { cleanupCliHosts, makeCliHost } from '../conformance/cli-host.js';
 
 import { miniDescriptor, miniSnapshot, mutable } from '../conformance/fixture.js';
 import { SEO_SEVERITY, seoCheck } from '../src/index.js';
-import type { Descriptor, SeoFinding, SeoRule, Snapshot } from '../src/index.js';
+import type { Descriptor, KeyDef, SeoFinding, SeoRule, Snapshot } from '../src/index.js';
+import { headLimitsFor } from '../src/seo.js';
+
+afterAll(cleanupCliHosts);
 
 const descriptor = miniDescriptor();
 const snapshot = miniSnapshot();
@@ -256,5 +264,78 @@ describe('seoCheck', () => {
     ).toBe('warning');
     // The table itself is untouched — overrides apply per call, never globally.
     expect(SEO_SEVERITY['visible-content']).toBe('error');
+  });
+});
+
+describe('over-length takes the severity of a key that carries limits', () => {
+  /** The home page's title resolving to 63 characters through `seo_home_title`, whose limit each case sets. */
+  function over(limits: KeyDef['limits'] | null): { d: Descriptor; s: Snapshot } {
+    const { d, s } = copies();
+    s['default']!['hero_headline'] = 'x'.repeat(55);
+    const def = d.keys['seo_home_title'] as KeyDef;
+    if (limits === null) delete def.limits;
+    else def.limits = limits;
+    return { d, s };
+  }
+
+  it('warns on an advisory limit, errors on a hard one, and takes the table with none', () => {
+    const advisory = over({ max: 60, severity: 'advisory' });
+    expect(only(seoCheck(advisory.d, advisory.s), 'over-length').map((f) => f.severity)).toEqual(['warning']);
+    const hard = over({ max: 60, severity: 'hard' });
+    expect(only(seoCheck(hard.d, hard.s), 'over-length').map((f) => f.severity)).toEqual(['error']);
+    const none = over(null);
+    expect(only(seoCheck(none.d, none.s), 'over-length').map((f) => f.severity)).toEqual(['error']);
+    expect(only(seoCheck(none.d, none.s, { 'over-length': 'warning' }), 'over-length').map((f) => f.severity)).toEqual(['warning']);
+  });
+
+  it("keeps a hard key's error under a config that makes over-length a warn", () => {
+    const hard = over({ max: 60, severity: 'hard' });
+    expect(only(seoCheck(hard.d, hard.s, { 'over-length': 'warning' }), 'over-length').map((f) => f.severity)).toEqual(['error']);
+    const advisory = over({ max: 60, severity: 'advisory' });
+    expect(only(seoCheck(advisory.d, advisory.s, { 'over-length': 'error' }), 'over-length').map((f) => f.severity)).toEqual(['warning']);
+  });
+
+  it('measures the SEO bound, never the key\'s own max', () => {
+    const wide = over({ max: 70, severity: 'hard' });
+    const findings = only(seoCheck(wide.d, wide.s), 'over-length');
+    expect(findings[0]?.message).toContain('over the 60-character bound');
+  });
+
+  it('carries the effective severity in --json and exits by it', async () => {
+    const host = makeCliHost({ config: {} });
+    const put = (limits: KeyDef['limits']): void => {
+      const d = JSON.parse(host.file('content/descriptor.json')) as Descriptor;
+      (d.keys['seo_home_title'] as KeyDef).limits = limits;
+      writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(d, null, 2));
+      const s = JSON.parse(host.file('content/defaults.json')) as Snapshot;
+      s['default']!['hero_headline'] = 'x'.repeat(55);
+      writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(s, null, 2));
+    };
+    put({ max: 60, severity: 'advisory' });
+    expect(await host.run('seo', 'check', '--json')).toBe(0);
+    expect(host.json<{ seo: Array<{ rule: string; severity: string }> }>().seo).toEqual([
+      expect.objectContaining({ rule: 'over-length', severity: 'warning', key: 'seo_home_title' }),
+    ]);
+    put({ max: 60, severity: 'hard' });
+    host.out.length = 0;
+    expect(await host.run('seo', 'check', '--json')).toBe(1);
+    expect(host.json<{ seo: Array<{ rule: string; severity: string }> }>().seo).toEqual([
+      expect.objectContaining({ rule: 'over-length', severity: 'error', key: 'seo_home_title' }),
+    ]);
+  });
+});
+
+describe('headLimitsFor', () => {
+  it('gives a head key the advisory bound of the tightest field its roles fill', () => {
+    expect(headLimitsFor(['page_title'])).toEqual({ max: 60, severity: 'advisory' });
+    expect(headLimitsFor(['meta_description'])).toEqual({ max: 160, severity: 'advisory' });
+    expect(headLimitsFor(['page_title', 'share_description'])).toEqual({ max: 60, severity: 'advisory' });
+    expect(headLimitsFor(['share_description', 'page_title'])).toEqual({ max: 60, severity: 'advisory' });
+  });
+
+  it('gives no limit where no role is a head role, reading the table by own property', () => {
+    expect(headLimitsFor(['headline'])).toBeUndefined();
+    expect(headLimitsFor([])).toBeUndefined();
+    expect(headLimitsFor(['constructor'])).toBeUndefined();
   });
 });

@@ -2911,7 +2911,7 @@ describe('per-command help', () => {
 
   it('reads every command word out of the usage', () => {
     expect(commands).toEqual([
-      'init', 'scan', 'register', 'remove', 'rename', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
+      'init', 'scan', 'register', 'remove', 'rename', 'merge', 'split', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
       'email extract', 'email verify', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
       'seed', 'pull', 'audit', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
       'contacts export', 'contacts erase', 'contacts suppress', 'contacts import', 'contacts group add',
@@ -3034,5 +3034,91 @@ describe('doctor — the compiler, where it is installed', () => {
     writeFileSync(join(host.cwd, 'src/copy.ts'), "export const copy = { hero: 'Hello' };\n");
     expect(await host.run('doctor')).toBe(0);
     expect(`${host.stdout()}\n${host.stderr()}`).not.toContain('typescript:');
+  });
+});
+
+describe('upgrade arms the commit gate’s SEO run only where seo check passes', () => {
+  const GATE = '.git/stet-gate.json';
+  const RUNNER = '.git/stet-gate.mjs';
+  const shippedRunner = (): string => readFileSync(join(packageRoot(), 'templates', 'stet-gate.mjs'), 'utf8');
+  /** The checkout made a repository, its gate installed, and its entry taken back to 0.5.1's: no `seo`, an older runner. */
+  async function gated(host: Host): Promise<void> {
+    spawnSync('git', ['init', '-q'], { cwd: host.cwd });
+    expect(await host.run('hook', 'install')).toBe(0);
+    writeFileSync(join(host.cwd, GATE), `${JSON.stringify({ entries: [{ checkout: '', worktree: '' }] }, null, 2)}\n`);
+    writeFileSync(join(host.cwd, RUNNER), '// the 0.5.1 runner\n');
+    host.out.length = 0;
+    host.err.length = 0;
+  }
+  const entries = (host: Host): unknown => JSON.parse(host.file(GATE)).entries;
+  /** Two over-length descriptions, both errors by the table. */
+  function overLong(host: Host): void {
+    const snapshot = JSON.parse(host.file('content/defaults.json'));
+    snapshot.default.seo_home_desc = 'y'.repeat(161);
+    snapshot.default.seo_pricing_desc = 'z'.repeat(161);
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+  }
+  const ARMED = "hook: the pre-commit gate's runner is updated — it runs stet seo check too";
+
+  it('arms a listed checkout whose seo check passes, rewriting its runner, and is silent the second time', async () => {
+    const host = makeHost({ config: {} });
+    await gated(host);
+    expect(await host.run('upgrade')).toBe(0);
+    expect(host.out).toContain(ARMED);
+    expect(entries(host)).toEqual([{ checkout: '', worktree: '', seo: true }]);
+    expect(host.file(RUNNER)).toBe(shippedRunner());
+    host.out.length = 0;
+    expect(await host.run('upgrade')).toBe(0);
+    expect(host.stdout()).not.toContain('hook:');
+    expect(host.stdout()).not.toContain('seo check');
+  });
+
+  it('leaves a checkout whose seo check fails as it was, naming the errors, then arms it once they are fixed', async () => {
+    const host = makeHost({ config: {} });
+    await gated(host);
+    overLong(host);
+    expect(await host.run('upgrade')).toBe(0);
+    expect(host.out).toContain(
+      'seo check reports 2 errors; the commit gate will run stet seo check once these pass — fix them, or set seoCheck severities, then run stet hook install',
+    );
+    expect(entries(host)).toEqual([{ checkout: '', worktree: '' }]);
+    expect(host.file(RUNNER)).toBe('// the 0.5.1 runner\n');
+    const snapshot = JSON.parse(host.file('content/defaults.json'));
+    snapshot.default.seo_home_desc = 'A short description.';
+    snapshot.default.seo_pricing_desc = 'Another short description.';
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+    host.out.length = 0;
+    expect(await host.run('upgrade')).toBe(0);
+    expect(host.out).toContain(ARMED);
+    expect(entries(host)).toEqual([{ checkout: '', worktree: '', seo: true }]);
+  });
+
+  it("names hook install where stet's pre-commit runs and this checkout is not listed, and says nothing with no gate", async () => {
+    const listedElsewhere = makeHost({ config: {} });
+    await gated(listedElsewhere);
+    writeFileSync(join(listedElsewhere.cwd, GATE), `${JSON.stringify({ entries: [] }, null, 2)}\n`);
+    expect(await listedElsewhere.run('upgrade')).toBe(0);
+    expect(listedElsewhere.out).toContain('run stet hook install to add the SEO check to the commit gate');
+
+    const bare = makeHost({ config: {} });
+    spawnSync('git', ['init', '-q'], { cwd: bare.cwd });
+    expect(await bare.run('upgrade')).toBe(0);
+    expect(bare.stdout()).not.toMatch(/hook|seo check/);
+    const outside = makeHost({ config: {} });
+    expect(await outside.run('upgrade')).toBe(0);
+    expect(outside.stdout()).not.toMatch(/hook|seo check/);
+  });
+
+  it('arms an html host and a snapshot-only site alike', async () => {
+    const html = await makeHtmlHost({ register: true });
+    await gated(html);
+    expect(await html.run('upgrade')).toBe(0);
+    expect(html.out).toContain(ARMED);
+    expect(entries(html)).toEqual([{ checkout: '', worktree: '', seo: true }]);
+    const snapshotOnly = makeHost({ config: {} });
+    await gated(snapshotOnly);
+    expect(await snapshotOnly.run('upgrade')).toBe(0);
+    expect(snapshotOnly.stdout()).toContain('store: snapshot-only');
+    expect(snapshotOnly.out).toContain(ARMED);
   });
 });

@@ -1,10 +1,11 @@
 /**
  * `stet init` — the 90-second adopt. It DETECTS framework, router, source root
- * and store (never asks), asks only the two §13.1 questions (what the site is,
- * whether it sends email), and WRITES a project's worth of new files: the
- * descriptor and its snapshot (from the shipped starter assets), the three
- * codegen modules, the server read path, the migration, the config, and — where
- * a store exists — the `createStetHandler` API-mount route.
+ * and store (never asks), asks only the three questions (what the site is,
+ * whether it sends email, whether it collects sign-ups), and WRITES a project's
+ * worth of new files: the descriptor and its snapshot (from the shipped starter
+ * assets), the three codegen modules, the server read path, the migration, the
+ * config, where a store exists the `createStetHandler` API-mount route, and on a
+ * Next 15.1+ App Router host that collects sign-ups the forms routes.
  *
  * Its ONE edit to pre-existing CODE is mounting the root-layout `CopyProvider`:
  * shown as a diff, applied only on confirm or `--yes`, skipped (with the manual
@@ -19,6 +20,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join, sep } from 'node:path';
 
 import type * as TS from 'typescript';
@@ -28,13 +30,14 @@ import { loadDescriptorWithWarnings } from '../src/descriptor.js';
 import { loadSnapshot } from '../src/snapshot.js';
 import { writeInitGuidance } from './agents.js';
 import { flag, noPositionals, parse, text } from './args.js';
-import { planJson, planWrite, writePlanned, writeText, type WritePlan } from './artifacts.js';
+import { asUpdate, planJson, planWrite, writePlanned, writeText, type WritePlan } from './artifacts.js';
 import { check } from './check.js';
 import {
   CONFIG_FILE,
   HOST_MIGRATIONS,
   defaultConfig,
   defaultStoreBlock,
+  formsSecretEnvOf,
   pathAliasMappings,
   type StetConfig,
 } from './config.js';
@@ -46,6 +49,7 @@ import type { CliIo } from './main.js';
 import { plural, posixRelative, Report, UsageError } from './report.js';
 import { applyFileEdits, dominantEol, formatDiff, type Edit } from './rewrite.js';
 import { loadTypescript, scriptKindFor } from './source-scan.js';
+import { contactsBlock } from './store.js';
 
 export async function runInit(args: string[], io: CliIo): Promise<number> {
   const { values, positionals } = parse(args, { app: 'string', host: 'string', yes: 'boolean' });
@@ -79,12 +83,17 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   // its layout sits there waiting to be wrapped.
   const hasReact = isHtml ? false : detectReact(target) || (target !== io.cwd && detectReact(io.cwd));
 
-  // The two §13.1 questions. Both default in a non-interactive context (no
+  // The three questions. Each defaults in a non-interactive context (no
   // `ask`/`confirm` on the io), with a printed note — never a blocked run.
   const pack = await askPack(io, report);
   const sendsEmail = await askEmail(io, target, base, report);
+  const signups = await askSignups(io, report);
+  // Only a Next App Router host that exports `after` (15.1) takes the forms
+  // scaffold: the recipe's `import { after }` breaks a 15.0 host's build.
+  const version = isHtml || router !== 'app' ? null : nextVersion(target, io.cwd);
+  const scaffoldForms = signups && version !== null && (version[0] > 15 || (version[0] === 15 && version[1] >= 1));
 
-  const config = buildConfig({ base, router, host, rootLayout, storeBacked, sendsEmail, target, report });
+  const config = buildConfig({ base, router, host, rootLayout, storeBacked, sendsEmail, scaffoldForms, target, report });
 
   const label = (diskPath: string): string => posixRelative(io.cwd, diskPath);
   const plan = (relPath: string, text: string): WritePlan =>
@@ -130,6 +139,11 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
     }
     if (config.mountRoute !== undefined) {
       plans.push(plan(config.mountRoute, routeModule(config, join(target, config.mountRoute), target)));
+    }
+    if (scaffoldForms) {
+      for (const [rel, text] of formsModules(config, base, target)) plans.push(plan(rel, text));
+      // Computed from the file as it stands, so an existing `.env.example` is extended and never refused.
+      plans.push(asUpdate(plan('.env.example', envExample(target, formsEnvNames(config, storeBacked)))));
     }
     plans.push(planJsonAt(CONFIG_FILE, config));
   }
@@ -183,6 +197,16 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   // no server surface named.
   if (!isHtml && storeBacked && config.mountRoute === undefined) {
     report.line('mount route: not scaffolded on an Astro host — mount createStetHandler in an Astro endpoint by hand');
+  }
+  if (scaffoldForms) {
+    if (!resolves(target, 'pg')) {
+      report.line('sign-ups: the contacts store needs the optional peer dependency pg — run npm install pg, then next build again');
+    }
+    report.line('sign-ups: run stet upgrade to add the contacts tables, then stet contacts group add <key> --name "<name>"');
+  } else if (signups) {
+    // The Next.js recipe on a Next host of either router and any version; the Worker recipe on a host with no server of its own.
+    const anchor = isHtml || router === 'astro' ? 'the-worker-recipe' : 'the-nextjs-recipe';
+    report.line(`sign-ups: this host has no scaffold yet — the recipe is at ${CONTACTS_DOC}#${anchor}`);
   }
 
   report.line('');
@@ -437,6 +461,58 @@ async function askPack(io: CliIo, report: Report): Promise<string> {
   return answer;
 }
 
+/** Whether the site collects sign-ups — gates the forms scaffold on a host that takes one. */
+async function askSignups(io: CliIo, report: Report): Promise<boolean> {
+  const answer = io.confirm ? await io.confirm('Does this site collect sign-ups?') : false;
+  report.line(io.confirm ? `collects sign-ups: ${answer}` : `collects sign-ups: ${answer} (not asked)`);
+  return answer;
+}
+
+/**
+ * The host's Next `[major, minor]`: the installed `next`'s version, read from
+ * the target and then the invocation root (an `--app` run's hoisted install),
+ * else the first two integers of the range either declares; null where neither
+ * answers.
+ */
+function nextVersion(target: string, root: string): [number, number] | null {
+  const dirs = target === root ? [target] : [target, root];
+  const read = (path: string): Record<string, unknown> | null => {
+    try {
+      return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  };
+  const parsed = (raw: unknown): [number, number] | null => {
+    const m = typeof raw === 'string' ? /(\d+)(?:\.(\d+))?/.exec(raw) : null;
+    return m === null ? null : [Number(m[1]), Number(m[2] ?? 0)];
+  };
+  for (const dir of dirs) {
+    const installed = parsed(read(join(dir, 'node_modules', 'next', 'package.json'))?.['version']);
+    if (installed !== null) return installed;
+  }
+  for (const dir of dirs) {
+    const manifest = read(join(dir, 'package.json'));
+    for (const field of ['dependencies', 'devDependencies']) {
+      const deps = manifest?.[field];
+      if (typeof deps !== 'object' || deps === null || !Object.hasOwn(deps, 'next')) continue;
+      const declared = parsed((deps as Record<string, unknown>)['next']);
+      if (declared !== null) return declared;
+    }
+  }
+  return null;
+}
+
+/** Whether `name` resolves from the host at `target`. */
+function resolves(target: string, name: string): boolean {
+  try {
+    createRequire(join(target, 'package.json')).resolve(name);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Whether the site sends email — gates the `lib/email` managed-surface glob. */
 async function askEmail(io: CliIo, target: string, base: '' | 'src/', report: Report): Promise<boolean> {
   const detected = existsSync(join(target, base, 'lib', 'email'));
@@ -454,6 +530,7 @@ function buildConfig(d: {
   rootLayout: string | undefined;
   storeBacked: boolean;
   sendsEmail: boolean;
+  scaffoldForms: boolean;
   target: string;
   report: Report;
 }): StetConfig {
@@ -512,8 +589,16 @@ function buildConfig(d: {
     // names, so no `mountRoute` is recorded and `eject` looks for no file.
     if (d.router !== 'astro') config.mountRoute = `${d.base}app/api/stet/[...stet]/route.ts`;
   }
+  // A snapshot-only site's sign-ups need a database of their own.
+  if (d.scaffoldForms && !d.storeBacked) config.contacts = { store: { ...defaultStoreBlock('pg'), urlEnv: CONTACTS_URL_ENV } };
   return config;
 }
+
+/** The contacts database's variable on a snapshot-only site that collects sign-ups. */
+const CONTACTS_URL_ENV = 'STET_CONTACTS_DATABASE_URL';
+
+/** The contacts doc, where the recipes a host without a scaffold follows live. */
+const CONTACTS_DOC = 'https://github.com/getstet/stet/blob/main/package/docs/operator/contacts.md';
 
 /**
  * The module specifier `register` inserts for the server read path. It must be
@@ -555,6 +640,53 @@ function probePathAlias(target: string, readPathFile: string): string | undefine
 }
 
 // --- the scaffolded modules (pinned to compile in a Next host) --------------
+
+/**
+ * The forms routes and their handler module, from `templates/forms/`: the
+ * recipe with its store built for the adapter the contacts store names, its
+ * secret and base read from the environment, and the routes importing the
+ * handler by a relative path, never an alias the host may not declare.
+ */
+function formsModules(config: StetConfig, base: '' | 'src/', target: string): Array<[string, string]> {
+  const template = (name: string): string => readFileSync(join(packageRoot(), 'templates', 'forms', name), 'utf8');
+  const formsFile = `${base}lib/stet-forms.ts`;
+  const limitFile = `${base}lib/limit.ts`;
+  const store = contactsBlock(config).block ?? defaultStoreBlock('pg');
+  const project = `'${config.project.replace(/[\\']/g, '\\$&')}'`;
+  const handler = template('stet-forms.ts')
+    .replace('__STORE_IMPORT__', "import { createPgStore } from '@getstet/stet/store-pg';")
+    .replace('__STORE__', `createPgStore({ connectionString: process.env.${store.urlEnv} ?? '', project: ${project} })`)
+    .replace('__STORE_END__', 'after(() => store.end());')
+    .replace('__SECRET_ENV__', formsSecretEnvOf(config))
+    .replace('__LIMIT_MODULE__', relImport(join(target, formsFile), join(target, limitFile), { stripExt: true }));
+  const route = (rel: string, name: string): [string, string] => [
+    rel,
+    template(name).replace('__FORMS_MODULE__', relImport(join(target, rel), join(target, formsFile), { stripExt: true })),
+  ];
+  return [
+    [formsFile, handler],
+    [limitFile, template('limit.ts')],
+    route(`${base}app/api/stet/join/[group]/route.ts`, 'join-route.ts'),
+    route(`${base}app/api/stet/unsubscribe/route.ts`, 'unsubscribe-route.ts'),
+  ];
+}
+
+/** The names the forms scaffold reads from the environment: the secret, the base, and a snapshot-only site's contacts database. */
+function formsEnvNames(config: StetConfig, storeBacked: boolean): string[] {
+  return [formsSecretEnvOf(config), 'STET_FORMS_BASE', ...(storeBacked ? [] : [CONTACTS_URL_ENV])];
+}
+
+/** `.env.example` with each of `names` it lacks appended as `NAME=`, its other lines kept; created where absent. */
+function envExample(target: string, names: string[]): string {
+  const path = join(target, '.env.example');
+  const current = existsSync(path) ? readFileSync(path, 'utf8') : '';
+  const present = new Set(current.split(/\r?\n/).map((line) => line.split('=')[0]?.trim()));
+  const missing = names.filter((name) => !present.has(name));
+  if (missing.length === 0) return current;
+  const eol = dominantEol(current);
+  const joint = current === '' || current.endsWith('\n') ? '' : eol;
+  return `${current}${joint}${missing.map((name) => `${name}=`).join(eol)}${eol}`;
+}
 
 /** A `/`-normalized, `./`-prefixed specifier from one file to a target path. */
 function relImport(fromFile: string, toDiskPath: string, opts: { stripExt?: boolean } = {}): string {

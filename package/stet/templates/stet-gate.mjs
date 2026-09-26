@@ -1,8 +1,8 @@
 // The stet pre-commit gate's runner, copied into git's common directory by
 // `stet hook install` and run by the hook. It reads the checkouts from
-// stet-gate.json beside it and runs `stet check` and `stet scan` in each one
-// of this worktree that the commit touches, with the stet installed in that
-// checkout. It never runs npx and never reaches the registry. Node built-ins
+// stet-gate.json beside it and runs `stet check` and `stet scan` — and `stet
+// seo check` where the checkout's entry carries `seo` — in each one of this
+// worktree that the commit touches, with the stet installed in that checkout. It never runs npx and never reaches the registry. Node built-ins
 // only: it runs outside any package.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs';
@@ -41,8 +41,8 @@ function localStet(dir) {
 }
 
 /** One stet command in `dir`; a stet that is there but cannot start (a folder, a missing interpreter) is named. */
-function run(stet, command, dir) {
-  const result = spawnSync(stet, [command], { cwd: dir, stdio: 'inherit' });
+function run(stet, args, dir) {
+  const result = spawnSync(stet, args, { cwd: dir, stdio: 'inherit' });
   if (result.error !== undefined) {
     say(`${stet} could not run: ${result.error.message}`);
     return false;
@@ -70,10 +70,15 @@ for (const entry of entries) {
     code = 1;
     continue;
   }
-  if (!run(stet, 'check', dir)) {
+  if (!run(stet, ['check'], dir)) {
     code = 1;
     continue;
   }
-  if (!run(stet, 'scan', dir)) code = 1;
+  if (!run(stet, ['scan'], dir)) {
+    code = 1;
+    continue;
+  }
+  // Only a checkout whose entry opted in: hook install and a passing upgrade set `seo`.
+  if (entry.seo === true && !run(stet, ['seo', 'check'], dir)) code = 1;
 }
 process.exit(code);

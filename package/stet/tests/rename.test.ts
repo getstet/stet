@@ -849,3 +849,252 @@ describe('rename — the stage-5 review', () => {
     sameBytes(host, [...REPO, 'src/pages/g.astro'], before);
   });
 });
+
+describe('rename --propose', () => {
+  type Proposed = { plan: string; made: Record<string, string>; keys: Array<Record<string, unknown>> };
+  const planOf = (host: CliHost, rel = 'naming.json'): Proposed => JSON.parse(host.file(rel)) as Proposed;
+  const moves = (plan: Proposed): Record<string, unknown> => Object.fromEntries(plan.keys.map((e) => [e['old'], e['key']]));
+
+  it('proposes role names for an html site adopted with text names, and writes nothing else', async () => {
+    const host = await marked();
+    const before = bytesOf(host, FORMS);
+    expect(await host.run('rename', '--propose', 'naming.json')).toBe(0);
+    sameBytes(host, FORMS, before);
+    expect(host.stdout()).toContain(
+      'wrote naming.json: 6 of 6 keys would take new names — edit key, label and help, then run stet rename --plan naming.json',
+    );
+    const plan = planOf(host);
+    expect(plan.plan).toBe('stet rename');
+    expect(moves(plan)).toEqual({
+      you_may_already_have_the_data_2: 'home_page_headline_1',
+      '01_assess': 'home_page_headline_2',
+      agreed_case_by_case_where_none_of_the: 'home_page_paragraph',
+      '2026_psyon_all_rights_reserved': 'home_footer_paragraph',
+      psyon_data_acquisition: 'home_page_title',
+      you_may_already_have_the_data: 'home_share_description',
+    });
+    expect(plan.keys.find((e) => e['old'] === '2026_psyon_all_rights_reserved')).toEqual({
+      old: '2026_psyon_all_rights_reserved',
+      key: 'home_footer_paragraph',
+      label: null,
+      help: null,
+      section: 'footer',
+      kind: 'paragraph',
+      places: ['index.html:11 <p>'],
+      text: '© 2026 Psyon. All rights reserved.',
+    });
+    expect(plan.keys.find((e) => e['old'] === 'you_may_already_have_the_data')).toMatchObject({
+      section: null,
+      kind: 'share description',
+      places: ['index.html:5 <meta> og:description'],
+    });
+    expect(Object.keys(plan.made)).toEqual(['content/defaults.json', 'content/descriptor.json', 'index.html']);
+  });
+
+  it('leaves out a key the rule already names, and proposes nothing once every key follows it', async () => {
+    const host = await marked();
+    expect(await host.run('rename', '--propose', 'naming.json')).toBe(0);
+    expect(await host.run('rename', '--plan', 'naming.json', '--write')).toBe(0);
+    clear(host);
+    expect(await host.run('check')).toBe(0);
+    expect(await host.run('rename', '--propose', 'again.json')).toBe(0);
+    expect(planOf(host, 'again.json').keys).toEqual([]);
+    expect(host.stdout()).toContain('wrote again.json: 0 of 6 keys would take new names');
+
+    // One key off the rule among keys that follow it: only that one moves, and no sibling is renumbered.
+    const one = await marked(
+      MARKED.replace('data-stet="01_assess"', 'data-stet="home_page_headline_2"'),
+      { ...MARKED_KEYS, home_page_headline_2: MARKED_KEYS['01_assess'] },
+      { ...MARKED_VALUES, home_page_headline_2: '01 Assess' },
+    );
+    expect(await one.run('rename', '--propose', 'naming.json')).toBe(0);
+    expect(moves(planOf(one))).not.toHaveProperty('home_page_headline_2');
+    expect(moves(planOf(one))['you_may_already_have_the_data_2']).toBe('home_page_headline_1');
+
+    // A key already named by the rule is numbered with its siblings, so none takes its name.
+    const shared = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><body><section id="hero">\n<h1 data-stet="home_hero_headline">The first words</h1>\n' +
+          '<h1 data-stet="old_title">The second words</h1>\n</section></body></html>\n',
+      },
+      keys: { home_hero_headline: { shape: 'text', target: 'web' }, old_title: { shape: 'text', target: 'web' } },
+      defaults: { home_hero_headline: 'The first words', old_title: 'The second words' },
+    });
+    expect(await shared.run('rename', '--propose', 'naming.json')).toBe(0);
+    expect(moves(planOf(shared))).toEqual({ home_hero_headline: 'home_hero_headline_1', old_title: 'home_hero_headline_2' });
+    expect(await shared.run('rename', '--plan', 'naming.json', '--write')).toBe(0);
+    clear(shared);
+    expect(await shared.run('check')).toBe(0);
+  });
+
+  it('names a key marked in two documents for the site, and leaves out slot and brand keys', async () => {
+    const page = (title: string): string =>
+      `<!DOCTYPE html>\n<html><head><title data-stet="${title}">${title}</title></head><body>\n` +
+      '<nav><a href="/" data-stet="home_link">Home page</a></nav>\n<p data-stet="brand__name">Acme</p>\n<p data-stet="hero__headline">Big words</p>\n</body></html>\n';
+    const host = await makeHtmlHost({
+      files: { 'index.html': page('index_title'), 'about.html': page('about_title') },
+      keys: {
+        index_title: { shape: 'text', target: 'web' },
+        about_title: { shape: 'text', target: 'web' },
+        home_link: { shape: 'text', target: 'web' },
+        brand__name: { shape: 'text', target: 'web' },
+        hero__headline: { shape: 'text', target: 'web' },
+      },
+      defaults: { index_title: 'index_title', about_title: 'about_title', home_link: 'Home page', brand__name: 'Acme', hero__headline: 'Big words' },
+    });
+    const descriptor = JSON.parse(host.file('content/descriptor.json'));
+    descriptor.templates = { hero: { class: 'transactional', trigger: 'form', slots: ['headline'] } };
+    writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(descriptor, null, 2));
+    expect(await host.run('rename', '--propose', 'naming.json')).toBe(0);
+    const proposed = moves(planOf(host));
+    expect(proposed['home_link']).toBe('site_nav_link_text');
+    expect(proposed).not.toHaveProperty('brand__name');
+    expect(proposed).not.toHaveProperty('hero__headline');
+    expect(proposed['about_title']).toBe('about_page_title');
+    expect(proposed['index_title']).toBe('home_page_title');
+  });
+
+  it('names a key by its first visible mark before any head text', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head><title data-stet="same_words">Same words here</title></head>\n' +
+          '<body><h1 data-stet="same_words">Same words here</h1></body></html>\n',
+      },
+      keys: { same_words: { shape: 'text', target: 'web' } },
+      defaults: { same_words: 'Same words here' },
+    });
+    expect(await host.run('rename', '--propose', 'naming.json')).toBe(0);
+    expect(planOf(host).keys[0]).toMatchObject({
+      key: 'home_page_headline',
+      kind: 'headline',
+      places: ['index.html:3 <h1>', 'index.html:2 <title>'],
+    });
+  });
+
+  it('proposes from copy() calls on a JavaScript host, and counts a property read as no place', async () => {
+    const host = withKeys(
+      makeCliHost({ config: { project: 't', managedSurfaces: ['app/**/*.tsx'] } }),
+      { hero_title: 'The hero title', footer_note: 'A footer note' },
+    );
+    put(
+      host,
+      'app/page.tsx',
+      "import { copy } from '@/lib/content';\nexport default function Page() {\n  return (\n" +
+        "    <section id=\"hero\"><h1>{copy('hero_title')}</h1><p>{copy.footer_note}</p></section>\n  );\n}\n",
+    );
+    expect(await host.run('rename', '--propose', 'naming.json')).toBe(0);
+    const plan = planOf(host);
+    expect(plan.keys.find((e) => e['old'] === 'hero_title')).toMatchObject({
+      key: 'home_hero_headline',
+      section: 'hero',
+      kind: 'headline',
+      places: ['app/page.tsx:4 <h1>'],
+    });
+    expect(moves(plan)).not.toHaveProperty('footer_note');
+    const placeless = (): number => Number(/(\d+) keys? ha(?:ve|s) no place stet can read — left out of the plan/.exec(host.stdout())?.[1]);
+    const counted = placeless();
+    // The property read is counted: read through copy() instead, the key leaves the count.
+    put(host, 'app/page.tsx', host.file('app/page.tsx').replace('{copy.footer_note}', "{copy('footer_note')}"));
+    clear(host);
+    expect(await host.run('rename', '--propose', 'again.json')).toBe(0);
+    expect(placeless()).toBe(counted - 1);
+    expect(Object.keys(plan.made)).toContain('app/page.tsx');
+    expect(Object.keys(plan.made)).toContain('content/descriptor.json');
+  });
+
+  it('writes a swap as it is, and a store-backed --plan refuses it with the two-step line', async () => {
+    const host = await marked(
+      MARKED.replace('data-stet="01_assess"', 'data-stet="home_page_headline_1"').replace(
+        'data-stet="you_may_already_have_the_data_2"',
+        'data-stet="home_page_headline_2"',
+      ).replace('derivesFrom', 'derivesFrom'),
+      {
+        ...MARKED_KEYS,
+        home_page_headline_1: MARKED_KEYS['01_assess'],
+        home_page_headline_2: MARKED_KEYS['you_may_already_have_the_data_2'],
+        you_may_already_have_the_data: { ...MARKED_KEYS.you_may_already_have_the_data, derivesFrom: 'home_page_headline_2' },
+      },
+      { ...MARKED_VALUES, home_page_headline_1: '01 Assess', home_page_headline_2: 'You may already have the data.' },
+    );
+    const descriptor = JSON.parse(host.file('content/descriptor.json'));
+    delete descriptor.keys['01_assess'];
+    delete descriptor.keys['you_may_already_have_the_data_2'];
+    writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(descriptor, null, 2));
+    const snapshot = JSON.parse(host.file('content/defaults.json'));
+    delete snapshot.default['01_assess'];
+    delete snapshot.default['you_may_already_have_the_data_2'];
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+    expect(await host.run('rename', '--propose', 'naming.json')).toBe(0);
+    expect(moves(planOf(host))).toMatchObject({ home_page_headline_2: 'home_page_headline_1', home_page_headline_1: 'home_page_headline_2' });
+    const config = JSON.parse(host.file('stet.config.json'));
+    writeFileSync(join(host.cwd, 'stet.config.json'), JSON.stringify({ ...config, store: { adapter: 'memory' } }, null, 2));
+    clear(host);
+    expect(await host.run('rename', '--plan', 'naming.json')).toBe(1);
+    expect(host.stderr()).toContain('is another entry\'s old name — a store renames one key at a time, so rename through a temporary name in two plans');
+  });
+
+  it('is a usage error beside --plan, --write or a pair, and refuses a file that is not a plan', async () => {
+    const host = await marked();
+    for (const argv of [
+      ['--propose', 'n.json', '--plan', 'p.json'],
+      ['--propose', 'n.json', '--write'],
+      ['a_key', 'b_key', '--propose', 'n.json'],
+    ]) {
+      expect(await host.run('rename', ...argv)).toBe(2);
+    }
+    const before = bytesOf(host, FORMS);
+    expect(await host.run('rename', '--propose', 'index.html')).toBe(1);
+    sameBytes(host, FORMS, before);
+    expect(host.stderr()).toContain('--propose index.html: the file exists and is not a stet plan');
+  });
+});
+
+describe('rename --plan — the section and the proposal it was made from', () => {
+  const keysOf = (host: CliHost): Record<string, { section?: string }> => JSON.parse(host.file('content/descriptor.json')).keys;
+  const planWith = (entry: Record<string, unknown>): string =>
+    JSON.stringify({ plan: 'stet rename', version: 1, keys: [{ label: null, help: null, ...entry }] }, null, 2);
+
+  it('sets an entry’s section, and a null section removes it', async () => {
+    const host = await marked(MARKED, {
+      ...MARKED_KEYS,
+      agreed_case_by_case_where_none_of_the: { shape: 'text', target: 'web', section: 'old_words' },
+    });
+    writeFileSync(join(host.cwd, 'set.json'), planWith({ old: '01_assess', key: 'home_services_headline', section: 'services' }));
+    expect(await host.run('rename', '--plan', 'set.json', '--write')).toBe(0);
+    expect(keysOf(host)['home_services_headline']?.section).toBe('services');
+    writeFileSync(
+      join(host.cwd, 'drop.json'),
+      planWith({ old: 'agreed_case_by_case_where_none_of_the', key: 'home_another_structure_body', section: null }),
+    );
+    expect(await host.run('rename', '--plan', 'drop.json', '--write')).toBe(0);
+    expect(keysOf(host)['home_another_structure_body']).not.toHaveProperty('section');
+  });
+
+  it('applies an unedited proposal with its sections, and check is green', async () => {
+    const host = await marked();
+    expect(await host.run('rename', '--propose', 'naming.json')).toBe(0);
+    expect(await host.run('rename', '--plan', 'naming.json', '--write')).toBe(0);
+    expect(keysOf(host)['home_footer_paragraph']?.section).toBe('footer');
+    expect(keysOf(host)['home_page_title']).not.toHaveProperty('section');
+    clear(host);
+    expect(await host.run('check')).toBe(0);
+  });
+
+  it('refuses a proposal once a page changes, and never checks a plan carrying no made', async () => {
+    const host = await marked();
+    expect(await host.run('rename', '--propose', 'naming.json')).toBe(0);
+    writeFileSync(join(host.cwd, 'index.html'), host.file('index.html').replace('01 Assess', '01 Assess now'));
+    const before = bytesOf(host, FORMS);
+    clear(host);
+    expect(await host.run('rename', '--plan', 'naming.json', '--write')).toBe(1);
+    expect(host.err).toEqual([
+      'error: stet rename: naming.json is refused — nothing written',
+      'error: naming.json: the files it was made from have changed — run stet rename --propose again',
+    ]);
+    sameBytes(host, FORMS, before);
+    writeFileSync(join(host.cwd, 'hand.json'), planWith({ old: '01_assess', key: 'home_process_step_1' }));
+    expect(await host.run('rename', '--plan', 'hand.json')).toBe(0);
+  });
+});

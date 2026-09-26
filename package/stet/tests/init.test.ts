@@ -96,7 +96,7 @@ interface Captured extends CliIo {
 }
 function makeIo(
   cwd: string,
-  opts: { env?: NodeJS.ProcessEnv; email?: boolean; mount?: boolean; guidance?: boolean; ask?: string } = {},
+  opts: { env?: NodeJS.ProcessEnv; email?: boolean; mount?: boolean; guidance?: boolean; signups?: boolean; ask?: string } = {},
 ): Captured {
   const out: string[] = [];
   const err: string[] = [];
@@ -108,13 +108,14 @@ function makeIo(
     out,
     err,
   };
-  // One confirm channel serves three questions; route by the question text, the
+  // One confirm channel serves four questions; route by the question text, the
   // way a person answering each prompt would.
-  if (opts.email !== undefined || opts.mount !== undefined || opts.guidance !== undefined) {
+  if (opts.email !== undefined || opts.mount !== undefined || opts.guidance !== undefined || opts.signups !== undefined) {
     io.confirm = async (q: string) => {
       const asked = q.toLowerCase();
       if (asked.includes('send email')) return opts.email ?? false;
       if (asked.includes('agent-guidance')) return opts.guidance ?? false;
+      if (asked.includes('sign-ups')) return opts.signups ?? false;
       return opts.mount ?? false;
     };
   }
@@ -161,7 +162,7 @@ describe('runInit — snapshot-only', () => {
     expect(Object.hasOwn(config, 'contacts')).toBe(false);
     // snapshot-only has DEFAULTS already — no pull step
     expect(io.out.join('\n')).toContain('next: stet scan');
-    expect(io.out.join('\n')).not.toContain('stet pull');
+    expect(io.out.filter((line) => line.startsWith('next:')).join('\n')).not.toContain('stet pull');
   });
 
   it('skips the provider mount non-interactively and prints the snippet', async () => {
@@ -1232,5 +1233,112 @@ describe('runInit — the static-HTML host', () => {
       expect(io.out).toContain(`${name}: already present, identical`);
     }
     expect(readFileSync(join(dir, 'index.html'))).toEqual(before);
+  });
+});
+
+describe('runInit — the sign-up question and the forms scaffold', () => {
+  const FORMS = ['lib/stet-forms.ts', 'lib/limit.ts', 'app/api/stet/join/[group]/route.ts', 'app/api/stet/unsubscribe/route.ts'];
+  const UPGRADE = 'sign-ups: run stet upgrade to add the contacts tables, then stet contacts group add <key> --name "<name>"';
+  const PG = 'sign-ups: the contacts store needs the optional peer dependency pg — run npm install pg, then next build again';
+  const DOC = 'https://github.com/getstet/stet/blob/main/package/docs/operator/contacts.md';
+  /** A Next App Router host declaring `next` at `range`, under `base`. */
+  function nextHost(range: string, base: '' | 'src/' = ''): string {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-init-forms-'));
+    write(dir, 'package.json', `${JSON.stringify({ name: 'host', private: true, dependencies: { next: range, react: '^19' } }, null, 2)}\n`);
+    write(dir, `${base}app/layout.tsx`, APP_LAYOUT);
+    write(dir, `${base}app/page.tsx`, 'export default function Page() { return <main />; }\n');
+    return dir;
+  }
+  const yes = (dir: string): Captured => makeIo(dir, { signups: true });
+
+  for (const base of ['', 'src/'] as const) {
+    it(`writes the four forms files${base === '' ? ' at the root' : ' under src/'}, the .env.example names and the contacts block`, async () => {
+      const dir = nextHost('^15.5.0', base);
+      const io = yes(dir);
+      expect(await runInit([], io)).toBe(0);
+      for (const rel of FORMS) expect(existsSync(join(dir, base, rel)), rel).toBe(true);
+      expect(readFileSync(join(dir, '.env.example'), 'utf8')).toBe('STET_FORMS_SECRET=\nSTET_FORMS_BASE=\nSTET_CONTACTS_DATABASE_URL=\n');
+      expect(readConfig(dir)['contacts']).toMatchObject({ store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' } });
+      expect(io.out).toContain('collects sign-ups: true');
+      const at = io.out.indexOf(UPGRADE);
+      expect(at).toBeGreaterThan(0);
+      expect(io.out[at - 1]).toBe(PG);
+      const handler = readFileSync(join(dir, base, 'lib/stet-forms.ts'), 'utf8');
+      expect(handler).toContain("createPgStore({ connectionString: process.env.STET_CONTACTS_DATABASE_URL ?? '', project: 'default' })");
+      expect(handler).toContain("import { limitByAddress } from './limit';");
+      expect(readFileSync(join(dir, base, 'app/api/stet/join/[group]/route.ts'), 'utf8')).toContain("from '../../../../../lib/stet-forms';");
+      expect(readFileSync(join(dir, base, 'app/api/stet/unsubscribe/route.ts'), 'utf8')).toContain("from '../../../../lib/stet-forms';");
+      // No literal address reaches a delivered link: every forms file reads its base from the environment.
+      for (const rel of FORMS) expect(readFileSync(join(dir, base, rel), 'utf8'), rel).not.toContain('https://');
+
+      const again = yes(dir);
+      expect(await runInit([], again)).toBe(0);
+      expect(again.out.filter((line) => line.startsWith('wrote '))).toEqual([]);
+    });
+  }
+
+  it('points every other host at its recipe and writes nothing for sign-ups', async () => {
+    const pagesHost = mkdtempSync(join(tmpdir(), 'stet-init-forms-'));
+    write(pagesHost, 'package.json', `${JSON.stringify({ name: 'h', dependencies: { next: '^15.5.0', react: '^19' } })}\n`);
+    write(pagesHost, 'pages/_app.tsx', PAGES_APP);
+    write(pagesHost, 'pages/index.tsx', 'export default function Home() { return null; }\n');
+    const next14 = nextHost('^14.2.0');
+    const next150 = nextHost('^15.0.0');
+    // The installed version decides over the declared range.
+    write(next150, 'node_modules/next/package.json', '{"name":"next","version":"15.0.4"}\n');
+    const astro = mkdtempSync(join(tmpdir(), 'stet-init-forms-'));
+    write(astro, 'package.json', '{"name":"h","dependencies":{"astro":"^5"}}\n');
+    write(astro, 'src/pages/index.astro', '<h1>x</h1>\n');
+    const html = mkdtempSync(join(tmpdir(), 'stet-init-forms-'));
+    write(html, 'index.html', '<html><body><p>Hello there.</p></body></html>\n');
+    for (const [dir, anchor] of [
+      [pagesHost, 'the-nextjs-recipe'],
+      [next14, 'the-nextjs-recipe'],
+      [next150, 'the-nextjs-recipe'],
+      [astro, 'the-worker-recipe'],
+      [html, 'the-worker-recipe'],
+    ] as const) {
+      const io = yes(dir);
+      expect(await runInit([], io), dir).toBe(0);
+      expect(io.out).toContain(`sign-ups: this host has no scaffold yet — the recipe is at ${DOC}#${anchor}`);
+      expect(existsSync(join(dir, '.env.example')), dir).toBe(false);
+      for (const rel of FORMS) expect(existsSync(join(dir, rel)), `${dir} ${rel}`).toBe(false);
+      expect(readConfig(dir)['contacts']).toBeUndefined();
+    }
+  });
+
+  it('collects no sign-ups on a non-interactive run', async () => {
+    const dir = nextHost('^15.5.0');
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(io.out).toContain('collects sign-ups: false (not asked)');
+    for (const rel of FORMS) expect(existsSync(join(dir, rel)), rel).toBe(false);
+  });
+
+  it('refuses a re-run over an edited lib/limit.ts, naming it', async () => {
+    const dir = nextHost('^15.5.0');
+    expect(await runInit([], yes(dir))).toBe(0);
+    write(dir, 'lib/limit.ts', '// my own limiter\n');
+    await expect(runInit([], yes(dir))).rejects.toThrow(/refusing to overwrite lib\/limit\.ts/);
+  });
+
+  it('extends an existing .env.example, keeping its lines and a name already present', async () => {
+    const dir = nextHost('^15.5.0');
+    write(dir, '.env.example', 'FOO=bar\nSTET_FORMS_SECRET=x\n');
+    expect(await runInit([], yes(dir))).toBe(0);
+    expect(readFileSync(join(dir, '.env.example'), 'utf8')).toBe('FOO=bar\nSTET_FORMS_SECRET=x\nSTET_FORMS_BASE=\nSTET_CONTACTS_DATABASE_URL=\n');
+  });
+
+  it('prints no pg line where pg resolves, and a store-backed host reads the content database', async () => {
+    const dir = nextHost('^16.0.0');
+    write(dir, 'node_modules/pg/package.json', '{"name":"pg","version":"8.0.0","main":"index.js"}\n');
+    write(dir, 'node_modules/pg/index.js', 'module.exports = {};\n');
+    const io = makeIo(dir, { signups: true, env: { STET_DATABASE_URL: 'postgres://localhost/x' } });
+    expect(await runInit([], io)).toBe(0);
+    expect(io.out).not.toContain(PG);
+    expect(io.out).toContain(UPGRADE);
+    expect(readConfig(dir)['contacts']).toBeUndefined();
+    expect(readFileSync(join(dir, 'lib/stet-forms.ts'), 'utf8')).toContain('process.env.STET_DATABASE_URL');
+    expect(readFileSync(join(dir, '.env.example'), 'utf8')).toBe('STET_FORMS_SECRET=\nSTET_FORMS_BASE=\n');
   });
 });

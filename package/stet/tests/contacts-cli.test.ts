@@ -156,7 +156,7 @@ describe('stet contacts groups, list and get', () => {
       code: 0,
       out: [
         'cloud-waitlist: 3 members',
-        'ana@lightfield.co   joined 2 Oct 2026 14:02   tier=team   unsubscribed (marketing)',
+        'ana@lightfield.co   joined 2 Oct 2026 14:02   tier=team   from https://getstet.xyz/waitlist (form waitlist-page)   unsubscribed (marketing)',
         'sam@x.co   joined 2 Oct 2026 14:03   tier=solo',
         'lee@x.co   joined 2 Oct 2026 14:04   tier=business',
       ].join('\n'),
@@ -166,11 +166,39 @@ describe('stet contacts groups, list and get', () => {
       code: 0,
       out: [
         'ana@lightfield.co in project default — first seen 2 Oct 2026 14:02',
-        '  cloud-waitlist   joined 2 Oct 2026 14:02 from https://getstet.xyz/waitlist (form waitlist-page)   tier=team',
+        '  cloud-waitlist   joined 2 Oct 2026 14:02   tier=team   from https://getstet.xyz/waitlist (form waitlist-page)',
         '  suppressed: marketing, 3 Oct 2026 09:30 (one-click)',
       ].join('\n'),
       err: '',
     });
+  });
+
+  it("names each member's page and form after the answers, and leaves out what a membership lacks", async () => {
+    const { run, store } = project();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-03T10:00:00.000Z'));
+    ok(await store.contacts.addGroup({ key: 'cloud-waitlist', name: 'stet Cloud', properties: TIERS }));
+    ok(await store.contacts.join({ group: 'cloud-waitlist', email: 'ana@example.com', properties: { tier: 'team' }, form: 'waitlist-page', page: 'https://getstet.xyz/cloud' }));
+    ok(await store.contacts.join({ group: 'cloud-waitlist', email: 'kim@example.com', properties: { tier: 'solo' }, form: 'footer', page: null }));
+    vi.useRealTimers();
+    expect((await run('list', '--group', 'cloud-waitlist')).out.split('\n')).toEqual([
+      'cloud-waitlist: 2 members',
+      'ana@example.com   joined 3 Oct 2026 10:00   tier=team   from https://getstet.xyz/cloud (form waitlist-page)',
+      'kim@example.com   joined 3 Oct 2026 10:00   tier=solo   (form footer)',
+    ]);
+    expect((await run('get', 'ana@example.com')).out.split('\n')[1]).toBe(
+      '  cloud-waitlist   joined 3 Oct 2026 10:00   tier=team   from https://getstet.xyz/cloud (form waitlist-page)',
+    );
+  });
+
+  it('prints no answers gap for a membership with no answers, and no from without a page', async () => {
+    const { run, store } = project();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-03T10:00:00.000Z'));
+    ok(await store.contacts.addGroup({ key: 'news', name: 'News', properties: [] }));
+    ok(await store.contacts.join({ group: 'news', email: 'lee@example.com', properties: {}, form: null, page: null }));
+    vi.useRealTimers();
+    expect((await run('list', '--group', 'news')).out.split('\n')[1]).toBe('lee@example.com   joined 3 Oct 2026 10:00');
   });
 
   it('answers --json with the same rows', async () => {

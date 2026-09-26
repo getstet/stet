@@ -51,7 +51,11 @@ Keys are named by where they sit and what they are — home_hero_headline,
 home_faq_headline_1. register --from scan --plan-out naming.json writes the
 names it would give, for you or an agent to edit with a label and help; --plan
 naming.json applies them. stet rename \<old> \<new> moves a key in the
-descriptor, the snapshot, the reads stet can prove and every store.
+descriptor, the snapshot, the reads stet can prove and every store; stet rename
+--propose \<file> writes the names the naming rule gives the keys already
+declared, to edit and apply with --plan \<file>. stet merge \<key> --into
+\<other> folds one key into another that holds the same words, and stet split
+\<key> \<new> --at \<file>:\<line> gives one place of a key its own key.
 
 For a plain HTML site with no build, the same three steps run against the pages
 themselves:
@@ -76,7 +80,9 @@ npx stet hook install                    # the pre-commit gate
 - **Offline checks.** `stet check` validates descriptor, snapshot and generated
   files. `stet seo check` runs its SEO rules over your declared pages and
   committed copy — no network, no database, so it runs on a fork PR before
-  anything deploys.
+  anything deploys. The pre-commit gate `stet hook install` writes runs `stet
+  check`, `stet scan` and `stet seo check` on each commit that touches the
+  checkout.
 - **Page declaration from your routes.** `stet pages scan` reads your
   file-based routing convention, proposes page records with scaffolded SEO
   keys, and writes nothing without `--apply`.

@@ -29,11 +29,15 @@ import {
   baseName,
   firstWords,
   isHeadKind,
+  itemReader,
+  itemWord,
+  looseHeadingRole,
   metaCopyNameOf,
   roleOf,
   SECTION_MAX,
   SECTION_WORDS,
   sectionWord,
+  type ItemNode,
   type Place,
   type SectionNode,
 } from './key-names.js';
@@ -181,6 +185,8 @@ export interface LocatedLiteral {
   place?: Place;
   /** A JSX literal's section word, `null` where none answers. */
   sectionWord?: string | null;
+  /** The repeated item a JSX literal sits in (`card_2`), where it sits in one. */
+  item?: string;
   /** Insert point for `const copy = useCopy();` — the nearest block-bodied COMPONENT (not any callback); null otherwise. A module literal carries `null`: it is never rewritten. */
   enclosingBodyPos: number | null;
   /** Per-literal LEXICAL scope — what `copy` binds to AT this literal (nearest enclosing scope wins). `'stet'` = the nearest `copy` is the accessor: `const copy = useCopy()`, or a named `{ copy }` import from the read-path module. `'foreign'` = any other `copy` binding (a param, a `let`/`var copy`, a non-`useCopy` `const`, a `function copy`, a default/namespace import, a non-read-path `{ copy }`, or a block `const`/`let` declared AFTER this literal — TDZ) → register skips+reports. `'none'` = no `copy` in scope → register inserts. */
@@ -220,6 +226,15 @@ export interface LocatedAccessor {
    * call with a value nor aborting on a non-key argument.
    */
   copyBinding: 'stet' | 'foreign' | 'none';
+  /** Where the call renders — its line, and its element's tag and attribute — as a literal's place reads. */
+  place: Place;
+  /** The call, and the JSX element it renders in, where it renders in one. */
+  node: TS.Node;
+  element?: TS.Node;
+  /** The section word, repeated item and role the naming rule gives its place: what `rename --propose` names its key by. */
+  section: string | null;
+  item?: string;
+  role: string;
 }
 
 /** One managed-surface file, walked once. */
@@ -702,36 +717,120 @@ function jsxStringAttr(ts: typeof import('typescript'), sf: TS.SourceFile, el: T
  * answers: what it renders is another file's.
  */
 function jsxSectionWord(ts: typeof import('typescript'), sf: TS.SourceFile, from: TS.Node): string | null {
+  return sectionWord(jsxSectionChain(ts, sf, from));
+}
+
+/** One JSX element of the chain the section rule reads, carrying the node it stands for. */
+interface JsxSectionNode extends SectionNode {
+  node: TS.Node;
+}
+
+/** The chain the section rule reads over JSX ancestors, from `from` up: each element's `id`, first heading's text and tag. */
+function* jsxSectionChain(ts: typeof import('typescript'), sf: TS.SourceFile, from: TS.Node | undefined): Generator<JsxSectionNode> {
   const textOf = (n: TS.Node): string => {
     if (ts.isJsxText(n)) return n.text;
     if (ts.isJsxSelfClosingElement(n)) return ' ';
     return n.getChildren(sf).map(textOf).join('');
   };
-  function* chain(): Generator<SectionNode> {
-    for (let at: TS.Node | undefined = from; at; at = at.parent) {
-      const tag = jsxTagName(ts, sf, at);
-      if (tag === undefined) continue;
-      const here = at;
-      yield {
-        tag,
-        id: () => jsxStringAttr(ts, sf, here, 'id'),
-        heading: () => {
-          let found: TS.JsxElement | undefined;
-          const look = (n: TS.Node): void => {
-            if (found !== undefined) return;
-            if (ts.isJsxElement(n) && /^h[1-6]$/.test(jsxTagName(ts, sf, n) ?? '')) {
-              found = n;
-              return;
-            }
-            ts.forEachChild(n, look);
-          };
-          if (ts.isJsxElement(here)) here.children.forEach(look);
-          return found === undefined ? undefined : found.children.map(textOf).join('');
-        },
+  for (let at: TS.Node | undefined = from; at; at = at.parent) {
+    const tag = jsxTagName(ts, sf, at);
+    if (tag === undefined) continue;
+    const here = at;
+    const first = (): TS.JsxElement | undefined => {
+      let found: TS.JsxElement | undefined;
+      const look = (n: TS.Node): void => {
+        if (found !== undefined) return;
+        if (ts.isJsxElement(n) && /^h[1-6]$/.test(jsxTagName(ts, sf, n) ?? '')) {
+          found = n;
+          return;
+        }
+        ts.forEachChild(n, look);
       };
-    }
+      if (ts.isJsxElement(here)) here.children.forEach(look);
+      return found;
+    };
+    yield {
+      tag,
+      node: here,
+      id: () => jsxStringAttr(ts, sf, here, 'id'),
+      heading: () => {
+        const found = first();
+        return found === undefined ? undefined : found.children.map(textOf).join('');
+      },
+      headingTag: () => {
+        const found = first();
+        return found === undefined ? undefined : jsxTagName(ts, sf, found);
+      },
+    };
   }
-  return sectionWord(chain());
+}
+
+/** Whether a node is a JSX element: an element with children, or a self-closing one. */
+function isJsxElementNode(ts: typeof import('typescript'), n: TS.Node): boolean {
+  return ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n);
+}
+
+/** The nearest JSX element above a node — through fragments, expressions and a `.map` callback alike — or undefined. */
+function jsxParent(ts: typeof import('typescript'), n: TS.Node): TS.Node | undefined {
+  for (let at = n.parent; at; at = at.parent) if (isJsxElementNode(ts, at)) return at;
+  return undefined;
+}
+
+/**
+ * The item rule's reads over one file's JSX, over key-names' `itemReader`: an
+ * element's parent is its nearest JSX element above, its children the JSX
+ * elements whose parent it is, and its texts the elements carrying a text —
+ * a literal, or an accessor call — inside its span.
+ */
+function jsxItemReader(ts: typeof import('typescript'), sf: TS.SourceFile, texts: readonly TS.Node[]): (at: TS.Node) => ItemNode {
+  const children = new Map<TS.Node, TS.Node[]>();
+  const look = (n: TS.Node): void => {
+    if (isJsxElementNode(ts, n)) {
+      const parent = jsxParent(ts, n);
+      if (parent !== undefined) children.set(parent, [...(children.get(parent) ?? []), n]);
+    }
+    ts.forEachChild(n, look);
+  };
+  look(sf);
+  const spans = texts.map((t) => ({ node: t, start: t.getStart(sf), end: t.end }));
+  return itemReader<TS.Node>({
+    parentOf: (n) => jsxParent(ts, n),
+    childrenOf: (n) => children.get(n) ?? [],
+    tagOf: (n) => jsxTagName(ts, sf, n),
+    textsIn: (n) => {
+      const start = n.getStart(sf);
+      return spans.filter((t) => t.start >= start && t.end <= n.end).map((t) => t.node);
+    },
+  });
+}
+
+/**
+ * The section word, item and loose-heading role a JSX element is named by —
+ * the static-HTML host's `namingOf` over the JSX tree: inside a repeated item
+ * the section is the one above the outermost item; outside one, a heading
+ * takes P4's role.
+ */
+function jsxNaming(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+  element: TS.Node,
+  items: (at: TS.Node) => ItemNode,
+): { section: string | null; item?: string; loose: 'headline' | 'subheadline' } {
+  const up: TS.Node[] = [];
+  for (let at: TS.Node | undefined = isJsxElementNode(ts, element) ? element : jsxParent(ts, element); at !== undefined; at = jsxParent(ts, at)) {
+    up.push(at);
+  }
+  const found = itemWord(up.map(items));
+  if (found !== null) {
+    const above = jsxParent(ts, up[found.outermost] as TS.Node);
+    return { section: above === undefined ? null : jsxSectionWord(ts, sf, above), item: found.item, loose: 'headline' };
+  }
+  const tag = jsxTagName(ts, sf, element) ?? '';
+  const parent = jsxParent(ts, element);
+  return {
+    section: jsxSectionWord(ts, sf, element),
+    loose: parent === undefined ? 'headline' : looseHeadingRole(tag, jsxSectionChain(ts, sf, parent)),
+  };
 }
 
 function jsxTagName(ts: typeof import('typescript'), sf: TS.SourceFile, el: TS.Node): string | undefined {
@@ -894,8 +993,14 @@ export async function scanSource(
     enclosingBodyPos: number | null;
     copyBinding: 'stet' | 'foreign' | 'none';
     place: Place;
-    /** The section word the nearest section answers, else the component's name in a file that serves no page. */
+    /** The literal's node, and the JSX element it renders in, where it renders in one. */
+    node: TS.Node;
+    element?: TS.Node;
+    /** The section word the nearest section answers, else the component's name in a file that serves no page — set once the walk is done. */
     section: string | null;
+    /** The repeated item it sits in, and a loose heading's P4 role — set once the walk is done. */
+    item?: string;
+    role?: string;
   }
   const partials: PartialLiteral[] = [];
   const accessorCalls: LocatedAccessor[] = [];
@@ -1071,9 +1176,9 @@ export async function scanSource(
     return undefined;
   };
   // Where a literal renders, for its role name: the line, the element's tag and
-  // the attribute it fills, and the section word — the nearest section's, else,
-  // in a file that serves no page, the component's own name.
-  const placeOf = (node: TS.Node, element: TS.Node | undefined, attr?: string): { place: Place; section: string | null } => {
+  // the attribute it fills. Its section, item and loose-heading role are read
+  // once the walk is done, when every text the item rule counts is known.
+  const placeOf = (node: TS.Node, element: TS.Node | undefined, attr?: string): { place: Place; node: TS.Node; element?: TS.Node; section: null } => {
     const tag = element === undefined ? undefined : jsxTagName(ts, sf, element);
     // A `<meta>`'s `content` is read under its name, as the static-HTML host reads it.
     const meta =
@@ -1087,17 +1192,16 @@ export async function scanSource(
       ...(attr === undefined ? {} : { attr }),
       ...(meta === null ? {} : { meta }),
     };
-    let section = element === undefined ? null : jsxSectionWord(ts, sf, element);
-    if (section === null && opts.page === undefined) {
-      for (let cur = node.parent; cur; cur = cur.parent) {
-        const name = isFunctionLike(cur) ? functionName(cur) : undefined;
-        if (name !== undefined && /^[A-Z]/.test(name)) {
-          section = firstWords(name, SECTION_WORDS, SECTION_MAX) || null;
-          break;
-        }
-      }
+    return { place, node, ...(element === undefined ? {} : { element }), section: null };
+  };
+  // In a file that serves no page, a literal in no section takes its component's name.
+  const componentWord = (node: TS.Node): string | null => {
+    if (opts.page !== undefined) return null;
+    for (let cur = node.parent; cur; cur = cur.parent) {
+      const name = isFunctionLike(cur) ? functionName(cur) : undefined;
+      if (name !== undefined && /^[A-Z]/.test(name)) return firstWords(name, SECTION_WORDS, SECTION_MAX) || null;
     }
-    return { place, section };
+    return null;
   };
   // The send-site escape hatch: a leading `// stet-ignore-next-line` on the
   // statement the send call sits in.
@@ -1162,7 +1266,12 @@ export async function scanSource(
         // resolves through the same scope-walk the literals use, so eject can
         // tell the accessor from a foreign `copy` (copy-to-clipboard) and skip it.
         const copyBinding = ts.isIdentifier(node.expression) ? copyBindingAt(node) : 'stet';
-        accessorCalls.push({ file, pos, end, key: keyArg.text, context, copyBinding });
+        const holder = node.parent !== undefined && ts.isJsxExpression(node.parent) ? node.parent.parent : undefined;
+        const at =
+          holder !== undefined && ts.isJsxAttribute(holder)
+            ? placeOf(node, elementOfAttr(holder), holder.name.getText(sf))
+            : placeOf(node, holder);
+        accessorCalls.push({ file, pos, end, key: keyArg.text, context, copyBinding, ...at, role: roleOf(at.place) });
         claimArguments(node);
       } else if (isI18nCall(ts, node)) {
         // The WHOLE call, not just its arguments: a catalog call is an i18n
@@ -1241,6 +1350,32 @@ export async function scanSource(
   };
   ts.forEachChild(sf, visit);
 
+  // The names' structure, now that every text is known: the repeated item, the section above it,
+  // and P4's role for a loose heading.
+  const items = jsxItemReader(ts, sf, [
+    ...new Set([...partials, ...accessorCalls].flatMap((p) => (p.element === undefined ? [] : [p.element]))),
+  ]);
+  for (const call of accessorCalls) {
+    if (call.element === undefined) {
+      call.section = componentWord(call.node);
+      continue;
+    }
+    const naming = jsxNaming(ts, sf, call.element, items);
+    call.section = naming.section ?? componentWord(call.node);
+    if (naming.item !== undefined) call.item = naming.item;
+    if (naming.loose === 'subheadline' && call.place.attr === undefined && call.role === 'headline') call.role = 'subheadline';
+  }
+  for (const p of partials) {
+    if (p.element === undefined) {
+      p.section = componentWord(p.node);
+      continue;
+    }
+    const naming = jsxNaming(ts, sf, p.element, items);
+    p.section = naming.section ?? componentWord(p.node);
+    if (naming.item !== undefined) p.item = naming.item;
+    if (naming.loose === 'subheadline' && p.place.attr === undefined && roleOf(p.place) === 'headline') p.role = 'subheadline';
+  }
+
   const literals: LocatedLiteral[] = partials.map((p) => ({
     file,
     pos: p.pos,
@@ -1258,10 +1393,12 @@ export async function scanSource(
         : baseName({
             ...(opts.page === undefined ? {} : { page: opts.page }),
             ...(isHeadKind(p.place) ? {} : { section: p.section }),
-            role: roleOf(p.place),
+            ...(p.item === undefined ? {} : { item: p.item }),
+            role: p.role ?? roleOf(p.place),
           }),
     place: p.place,
     sectionWord: p.section,
+    ...(p.item === undefined ? {} : { item: p.item }),
     enclosingBodyPos: p.enclosingBodyPos,
     copyBinding: p.copyBinding,
     accessorImported,

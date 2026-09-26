@@ -738,9 +738,67 @@ describe('JSX role names', () => {
     );
   });
 
+  it('names cards and steps by their place, the adoption spec’s JSX page', async () => {
+    const source = page(
+      '<section id="services">' +
+        ['Data sourcing work', 'Labelling at scale', 'Evaluation of models']
+          .map((t, i) => `<article><h3>${t}</h3><p>What card ${i + 1} covers.</p></article>`)
+          .join('') +
+        '</section>' +
+        '<section id="process"><h2>How we work</h2><h3>Four steps in all</h3><ol>' +
+        ['Talk it over', 'Scope the set']
+          .map((t, i) => `<li><h3>${t}</h3><p>What step ${i + 1} holds.</p></li>`)
+          .join('') +
+        '</ol></section>',
+    );
+    const r = await onPage(source);
+    expect(r.literals.map((l) => l.proposedKey)).toEqual([
+      'home_services_card_1_headline',
+      'home_services_card_1_paragraph',
+      'home_services_card_2_headline',
+      'home_services_card_2_paragraph',
+      'home_services_card_3_headline',
+      'home_services_card_3_paragraph',
+      'home_process_headline',
+      'home_process_subheadline',
+      'home_process_step_1_headline',
+      'home_process_step_1_paragraph',
+      'home_process_step_2_headline',
+      'home_process_step_2_paragraph',
+    ]);
+    expect(r.literals[0]).toMatchObject({ sectionWord: 'services', item: 'card_1' });
+  });
+
+  it('reads an item holding one text as no item, whatever else the file holds', async () => {
+    const source = page('<section id="list"><h2>Our short list</h2><ul><li>First item text</li><li>Second item text</li></ul></section>');
+    expect(await keyOf(source, 'First item text', 'home')).toBe('home_list_list_item');
+  });
+
+  it('names five thousand list items inside its budget', async () => {
+    const items = Array.from({ length: 5_000 }, (_, i) => `<li><h3>Heading ${i}</h3><p>Text number ${i}.</p></li>`).join('');
+    const started = Date.now();
+    const r = await onPage(page(`<section id="many"><ul>${items}</ul></section>`));
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(r.literals).toHaveLength(10_000);
+    expect(r.literals[9_999]?.proposedKey).toBe('home_many_item_5000_paragraph');
+  });
+
+  it('gives an accessor call its place and the name the rule gives it', async () => {
+    const r = await onPage(page('<section id="hero"><h1>{copy(\'hero_title\')}</h1><img alt={copy(\'hero_alt\')} /></section>'));
+    const title = r.accessorCalls.find((c) => c.key === 'hero_title');
+    expect(title?.place).toMatchObject({ tag: 'h1' });
+    expect(title).toMatchObject({ section: 'hero', role: 'headline' });
+    expect(title?.item).toBeUndefined();
+    const alt = r.accessorCalls.find((c) => c.key === 'hero_alt');
+    expect(alt?.place).toMatchObject({ tag: 'img', attr: 'alt' });
+    expect(alt).toMatchObject({ section: 'hero', role: 'image_alt_text' });
+  });
+
   it("names a section with no id by its heading's first words", async () => {
     const source = page('<section><h2>Frequently asked</h2><h3>Does it buy the data?</h3></section>');
-    expect(await keyOf(source, 'Does it buy the data?', 'home')).toBe('home_frequently_asked_headline');
+    // An <h3> under a section first headed by an <h2> is a subheadline (P4).
+    expect(await keyOf(source, 'Does it buy the data?', 'home')).toBe('home_frequently_asked_subheadline');
+    expect(await keyOf(source, 'Frequently asked', 'home')).toBe('home_frequently_asked_headline');
   });
 
   it("names a component file's literal by the component, with no page part", async () => {
@@ -803,6 +861,7 @@ describe('JSX role names', () => {
       const found = r.literals.filter((l) => (l.pos > start && l.pos < end) || (l.pos > end && l.pos < after));
       expect(found).toHaveLength(1);
       expect(found[0]?.sectionWord).toBe(row.word);
+      expect(found[0]?.item).toBe(row.item);
     });
   }
 });

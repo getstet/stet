@@ -23,7 +23,7 @@ import { loadSnapshot } from '../src/snapshot.js';
 import { makeHtmlHost } from '../conformance/cli-host.js';
 import { loadConfig } from '../cli/config.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { normalize, pageOfFile, proposeForHost } from '../cli/pages.js';
+import { normalize, pageOfFile, proposeForHost, proposePages } from '../cli/pages.js';
 
 interface Host extends CliIo {
   cwd: string;
@@ -538,6 +538,7 @@ describe('pages scan --apply', () => {
       shape: 'text',
       target: 'web',
       pages: ['docs_adopt'],
+      limits: { max: 60, severity: 'advisory' },
     });
     const snapshot = loadSnapshot(JSON.parse(host.file('content/defaults.json')));
     expect(snapshot['default']?.['seo_home_desc']).toBe('');
@@ -950,7 +951,8 @@ describe('pages scan — the html arm', () => {
     expect(await host.run('seo', 'check', '--json')).toBe(1);
     const findings = host.json<{ findings: Array<{ kind: string; message: string; level: string }> }>().findings;
     const overLength = findings.find((f) => f.kind === 'over-length');
-    expect(overLength?.level).toBe('error');
+    // The description's key carries register's advisory 160, so its over-length warns.
+    expect(overLength?.level).toBe('warn');
     expect(overLength?.message).toContain('165 characters');
     expect(findings.filter((f) => f.kind === 'missing-title')).toHaveLength(2);
     expect(findings.filter((f) => f.kind === 'missing-description')).toHaveLength(2);
@@ -1013,6 +1015,105 @@ describe('pages scan — the html arm', () => {
     expect(warns).toContain('route /about (about.html) has no page record — run stet pages scan');
     expect(warns).toContain('route /docs (docs/index.html) has no page record — run stet pages scan');
     expect(warns).not.toContain('shot.png');
+  });
+});
+
+describe('pages scan --apply gives the scaffolded head keys their SEO bound', () => {
+  it('scaffolds seo_home_title with 60 and seo_home_desc with 160 on the Next arm and on the Astro arm', async () => {
+    const next = project();
+    next.put('app/page.tsx', PAGE);
+    const astro = project();
+    tree(astro, 'src/pages', ['index.astro']);
+    for (const host of [next, astro]) {
+      expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+      const keys = (JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, { limits?: unknown }> }).keys;
+      expect(keys['seo_home_title']?.limits).toEqual({ max: 60, severity: 'advisory' });
+      expect(keys['seo_home_desc']?.limits).toEqual({ max: 160, severity: 'advisory' });
+    }
+  });
+});
+
+describe('pages scan — the html arm fills an empty slot of a declared page', () => {
+  /** A page whose `<title>` carries a mark and whose meta description does not, yet. */
+  const TITLED = [
+    '<html>',
+    '<head><title>About the partnership team</title></head>',
+    '<body><p>A short page about the team.</p></body>',
+    '</html>',
+    '',
+  ].join('\n');
+  const DESCRIBED = TITLED.replace(
+    '</title></head>',
+    '</title><meta name="description" content="Who runs the data partnerships, and how to reach them."></head>',
+  );
+  type Forms = { pages: Record<string, { route: string; seo?: Record<string, string> }>; keys: Record<string, { pages?: string[] }> };
+  const forms = (host: Awaited<ReturnType<typeof makeHtmlHost>>): Forms => JSON.parse(host.file('content/descriptor.json')) as Forms;
+  const clear = (host: Awaited<ReturnType<typeof makeHtmlHost>>): void => {
+    host.out.length = 0;
+    host.err.length = 0;
+  };
+  /** `about.html` declared with its title alone, then its description marked by register. */
+  async function declaredThenMarked() {
+    const host = await makeHtmlHost({ register: true, files: { 'about.html': TITLED } });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(forms(host).pages['about']?.seo?.['description']).toBeUndefined();
+    writeFileSync(join(host.cwd, 'about.html'), DESCRIBED, 'utf8');
+    clear(host);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    clear(host);
+    return host;
+  }
+
+  it('fills the description a later mark carries, appends the page to the key, and fills nothing twice', async () => {
+    const host = await declaredThenMarked();
+    const key = Object.keys(forms(host).keys).find((k) => k.startsWith('about_') && k.includes('description')) as string;
+    expect(key).toBeDefined();
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.out).toContain(`about.html: fills the description with ${key}`);
+    expect(host.out).toContain('pages scan: run with --apply to declare these pages');
+    clear(host);
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.out).toContain(`about.html: fills the description with ${key}`);
+    expect(host.stdout()).not.toMatch(/\block?s? a marked title/);
+    expect(forms(host).pages['about']?.seo?.['description']).toBe(key);
+    expect(forms(host).keys[key]?.pages).toEqual(['about']);
+    clear(host);
+    await host.run('seo', 'check', '--json');
+    const findings = host.json<{ findings: Array<{ kind: string; message: string }> }>().findings;
+    expect(findings.filter((f) => f.kind === 'missing-description' && f.message.includes('about'))).toEqual([]);
+    clear(host);
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).not.toContain('fills the');
+    expect(host.stdout()).toContain('pages scan: nothing to propose');
+  });
+
+  it('never replaces a slot that already names a key', async () => {
+    const host = await declaredThenMarked();
+    const descriptor = forms(host);
+    (descriptor.pages['about'] as { seo: Record<string, string> }).seo['description'] = 'home_meta_description';
+    descriptor.keys['home_meta_description'] = { ...descriptor.keys['home_meta_description'], pages: ['home', 'about'] };
+    writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(descriptor, null, 2));
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).not.toContain('fills the');
+    expect(forms(host).pages['about']?.seo?.['description']).toBe('home_meta_description');
+  });
+
+  it('reads a raw declared page whose seo is a number or null without a throw', async () => {
+    const host = await declaredThenMarked();
+    const config = loadConfig(host.cwd);
+    const set = proposePages(
+      host.cwd,
+      [{ arm: 'html', root: '' }],
+      { pages: { about: { route: '/about', seo: 3 }, home: { route: '/', seo: null } }, keys: {}, values: {} },
+      { bind: true, config },
+    );
+    expect(set.fills.map((fill) => `${fill.page} ${fill.field}`)).toEqual(['about title', 'about description', 'home title', 'home description']);
+  });
+
+  it('agrees the close line with one lacking page', async () => {
+    const host = await makeHtmlHost({ register: true, files: { 'about.html': '<html><head></head><body><p>A short page about the team.</p></body></html>\n' } });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain('declared 2 pages, bound 2 fields; 1 page lacks a marked title or description — stet seo check names them');
   });
 });
 

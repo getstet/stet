@@ -27,21 +27,28 @@ under any prefix; every recipe here mounts it at `/api/stet`.
 { "email": "ana@lightfield.co", "properties": { "tier": "team" }, "form": "waitlist-page", "page": "https://example.com/waitlist" }
 ```
 
-It accepts JSON alone, from the site's own origin (the origin of
-`unsubscribeBase`) or from an origin in `allowedOrigins`, up to 16 KiB. It
+It accepts JSON alone, up to 16 KiB, from any origin unless `allowedOrigins`
+narrows it to the site's own origin (the origin of `unsubscribeBase`) and the
+origins listed. It
 checks the address, the group and each answer against the questions the group
 declares, records the membership, and answers `{"ok":true}`. The answer is the
 same bytes for a new member, a returning one and a suppressed address, so the
 route never tells a visitor who is on a list. A returning member's answers are
 replaced; the first join's time, `form` and `page` are kept as the consent
 evidence. `page` (or the `Referer` header when the body has none) is stored as
-its origin and path alone, and only when it is an `http` or `https` URL whose
-origin is the site's own or listed. Every refusal is `{"ok":false,"error":"<code>"}`, and your page turns
-each code into its own sentence:
+its origin and path alone. With an `Origin` header, which the browser sets and a
+page's script cannot, the claimed page is stored where its origin is that
+`Origin` and it fits 2,000 characters; otherwise the `Origin` alone is stored,
+as `<origin>/`, so the stored page's origin is always the one the browser
+asserted. An `Origin` that is no `http` or `https` origin (the `null` a
+sandboxed or `file:` page sends) stores no page. With no `Origin`, a server-side
+post, the page is stored only when its origin is the site's own or listed.
+Every refusal is `{"ok":false,"error":"<code>"}`, and your page turns each code
+into its own sentence:
 
 | Code | Status | When |
 |---|---|---|
-| `origin_refused` | 403 | the `Origin` is neither the site's own nor listed |
+| `origin_refused` | 403 | `allowedOrigins` is given and the `Origin` is neither the site's own nor listed |
 | `unsupported_media_type` | 415 | the body is not `application/json` |
 | `body_too_large` | 413 | the body is over 16 KiB |
 | `invalid_body` | 400 | the body is not one JSON object, or `properties` is not one |
@@ -122,6 +129,19 @@ Both route folders sit beside a store-backed site's `app/api/stet/[...stet]/rout
 Next matches a static segment before a catch-all, so `/api/stet/join/draft` is a
 join to a group named `draft` and never reaches the Bearer mount.
 
+`stet init` writes this recipe into a Next 15.1 or later App Router host whose
+operator answers yes to `Does this site collect sign-ups?`: `lib/stet-forms.ts`,
+`lib/limit.ts` (the guard's limiter below) and the two route files, each under
+`src/` where the app lives there. The handler reads the forms secret and
+`STET_FORMS_BASE`, the forms mount's public URL, from the environment, so it
+answers 500 until both are set, and `init` adds their names to `.env.example`.
+On a snapshot-only site the contacts live in a database of their own, named by
+`STET_CONTACTS_DATABASE_URL` in the config's `contacts` block. The pg store
+needs the optional peer dependency `pg`: a host that installs `pg` after
+`next build` builds again. Next 15.0 exports `after` only as `unstable_after`,
+so an older Next host, a Pages Router host, an Astro host and a static-HTML host
+take the recipe by hand.
+
 ## The Worker recipe
 
 A static site with no server of its own runs the endpoint on a serverless
@@ -174,6 +194,14 @@ needs `nodejs_compat`. `store-pg` has been run under `wrangler dev` against a
 local database; TLS from a deployed Worker to a remote database has not been
 run.
 
+## Where it runs
+
+The handler takes a web `Request` and answers a web `Response`. It is tested on
+Next.js and on Cloudflare Workers. Astro in server mode, SvelteKit, Remix, Nuxt,
+Hono, Bun and Deno each hand a route a web `Request`, and are untested. Express
+hands a route a Node request, and needs an adapter that builds a `Request` from
+it and writes the `Response` back.
+
 ## Why the store is made inside the request
 
 A `pg` pool made at module scope outlives the request that made it. On a Worker
@@ -215,6 +243,12 @@ or the failed page.
 - The join route stores no control character in an address or an answer: a
   stranger types both, and `stet contacts` prints them. A text answer may hold a
   line feed.
+- Any web page can post a join to an open group, from its visitors' browsers,
+  unless allowedOrigins narrows the route to your own origin and the ones you
+  list. Each membership records the origin of the page that posted it, which
+  the browser asserts and a page cannot forge. An onJoin that sends mail turns
+  every such join into a message to the address it names: pair it with
+  allowedOrigins or a confirmation step.
 - The unsubscribe pages are never cached, never indexed, send no referrer (the
   token is in their URL), and cannot be framed.
 - An erased address is kept as a salted SHA-256 hash in `stet_erasures`, and the

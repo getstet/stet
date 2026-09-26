@@ -80,7 +80,8 @@ export function buildGuidanceBlock(config: StetConfig): string {
     : `Copy in this project is managed by stet — \`${config.descriptorPath}\` names the keys. ` +
       'Never hardcode user-facing copy; route copy work through the stet CLI ' +
       '(run `stet` for the commands), not source edits.';
-  return [GUIDANCE_BEGIN, body, GUIDANCE_END, ''].join('\n');
+  const derived = `A derived key's fixed sentence is its tmpl in \`${config.descriptorPath}\`; edit it there and run \`stet pull\`.`;
+  return [GUIDANCE_BEGIN, `${body} ${derived}`, GUIDANCE_END, ''].join('\n');
 }
 
 /**

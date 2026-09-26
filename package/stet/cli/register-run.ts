@@ -16,11 +16,12 @@ import { DEFAULT_TARGET, EMAIL_TARGET, type Descriptor, type Target } from '../s
 import type { StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { heldTextOf } from './html-host.js';
-import { numberNames } from './key-names.js';
+import { isHeadKind, numberNames } from './key-names.js';
 import { pageOfFile } from './pages.js';
 import type { Report } from './report.js';
 import { planRewrite } from './rewrite.js';
 import {
+  dialectOf,
   isJsxFile,
   matchGlob,
   scanModule,
@@ -95,6 +96,27 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * The keys each text is held by, sorted by name: every web `text` key with a literal default-locale
+ * value, no `tags`, no template slot, no `brand__` prefix, and no page SEO or JSON-LD reference —
+ * the keys a literal or a save may share with.
+ */
+export function sharedTextIndex(descriptor: Descriptor, snapshot: Snapshot): Map<string, string[]> {
+  const notShared = new Set(pageKeyReferences(descriptor).map((ref) => ref.key));
+  for (const [template, def] of Object.entries(descriptor.templates ?? {})) {
+    for (const slot of def.slots) notShared.add(`${template}__${slot}`);
+  }
+  const index = new Map<string, string[]>();
+  for (const key of Object.keys(descriptor.keys).sort()) {
+    const text = heldTextOf(descriptor, snapshot, key);
+    const def = keyDefOf(descriptor, key);
+    if (text === null || def === undefined || def.tags !== undefined) continue;
+    if (notShared.has(key) || key.startsWith('brand__')) continue;
+    index.set(text, [...(index.get(text) ?? []), key]);
+  }
+  return index;
+}
+
 export interface JsxRun {
   /** The files pass one parsed, by path — scan's loop reads these instead of parsing again. */
   parsed: Map<string, ScanResult | null>;
@@ -104,7 +126,17 @@ export interface JsxRun {
   nameOf: Map<LocatedLiteral, string>;
   /** Literals that reuse a declared key (D2); their name is in `nameOf`. */
   reused: Set<LocatedLiteral>;
+  /**
+   * Each literal whose text an earlier literal of the run carries — the same
+   * target, both visible text or both head texts — and that earlier literal:
+   * one key, the leader's. A leader may be one the run refused, which leaves
+   * its followers unadopted with it; a follower's name, where its leader has
+   * one, is the leader's in `nameOf`.
+   */
+  sharedWith: Map<LocatedLiteral, LocatedLiteral>;
   refusals: string[];
+  /** Template-dialect files in the managed surfaces: read by scan's dialect walk, never parsed or rewritten here. */
+  dialectFiles: string[];
   /** The copy-module walk's results and property names, which the naming reserves. */
   modules: Map<string, ModuleScanResult>;
   propertyNames: Map<string, string>;
@@ -130,33 +162,28 @@ export async function planJsxRun(input: {
   // host refuses the same files in the surface loop that the module loop would
   // meet, and the parsed map above already yields a single refusal per file.
   const refusals: string[] = [];
+  const dialectFiles: string[] = [];
 
   // The text each declared web `text` key holds, as the descriptor stood before
-  // the run, by target: a literal whose text a key already holds reads that key
-  // rather than taking a numbered name beside it — the html host's first-pass
-  // rule, the first key by name winning. A key with `tags` holds placeholder
-  // markup no JSX literal carries. A key a page's SEO or JSON-LD reads is the
-  // head text the html host never shares onto visible text; a template's slot
-  // key belongs to its template, and a `brand__` key to the brand group.
-  const heldBy = new Map<string, string>();
-  const notShared = new Set(pageKeyReferences(descriptor).map((ref) => ref.key));
-  for (const [template, def] of Object.entries(descriptor.templates ?? {})) {
-    for (const slot of def.slots) notShared.add(`${template}__${slot}`);
-  }
-  for (const key of Object.keys(descriptor.keys).sort()) {
-    const text = heldTextOf(descriptor, snapshot, key);
-    const def = keyDefOf(descriptor, key);
-    if (text === null || def === undefined || def.tags !== undefined) continue;
-    if (notShared.has(key) || key.startsWith('brand__')) continue;
-    const slot = `${def.target}\u0000${text}`;
-    if (!heldBy.has(slot)) heldBy.set(slot, key);
-  }
+  // the run: a literal whose text a key already holds reads that key rather
+  // than taking a numbered name beside it — the html host's first-pass rule,
+  // the first key by name winning. `heldTextOf` answers web keys alone, so an
+  // email literal never reads one.
+  const index = sharedTextIndex(descriptor, snapshot);
   const reuseOf = new Map<LocatedLiteral, string>();
 
   // Pass one: every surface parsed and classified before any literal is named,
-  // so a role that repeats across the run is numbered across it.
+  // so a role that repeats across the run is numbered across it. Every literal
+  // located is kept in run order, adopted or not, for the share rule below.
   const adoptable: JsxRun['adoptable'] = [];
+  const located: Array<{ literal: LocatedLiteral; target: Target }> = [];
   for (const file of filesForGlobs(cwd, config.managedSurfaces)) {
+    if (dialectOf(file) !== null) {
+      // A template dialect is read by scan's dialect walk and never rewritten: its copy is placed by hand.
+      dialectFiles.push(file);
+      parsed.set(file, null);
+      continue;
+    }
     const source = readFileSync(join(cwd, file), 'utf8');
     const page = pageOfFile(cwd, file, descriptor.pages);
     const result = await scanSource(file, source, {
@@ -174,6 +201,7 @@ export async function planJsxRun(input: {
     if (result.literals.length === 0) continue;
 
     const target = targetFor(file, config);
+    for (const literal of result.literals) located.push({ literal, target });
     const kind = kindFor(file, result.hasUseClient, config, forcedKind);
     if (kind === null) {
       report.warn('scan', `${file}: ambiguous — an un-directived App-Router component; re-run with --kind server|client`);
@@ -194,7 +222,7 @@ export async function planJsxRun(input: {
     // A literal a declared key already holds skips the gate — its value is
     // declared — and only its rewrite is proven.
     const literals = result.literals.filter((literal) => {
-      const reuse = heldBy.get(`${target}\u0000${literal.text}`);
+      const reuse = target === DEFAULT_TARGET ? index.get(literal.text)?.[0] : undefined;
       if (reuse === undefined) {
         const passed = validateUnnamed({
           descriptor,
@@ -234,17 +262,36 @@ export async function planJsxRun(input: {
     }
   }
 
+  // Identical text within the run is one key (stage-0 finding 14): the first
+  // literal carrying it, in run order, is named, and each later one reads that
+  // key. A head text never shares with visible text, and a literal a declared
+  // key already holds reads that key instead.
+  const sharedWith = new Map<LocatedLiteral, LocatedLiteral>();
+  const first = new Map<string, LocatedLiteral>();
+  for (const { literal, target } of located) {
+    if (reuseOf.has(literal) || (target === DEFAULT_TARGET && index.has(literal.text))) continue;
+    const head = literal.place !== undefined && isHeadKind(literal.place);
+    const slot = `${target}\u0000${head ? 'head' : 'body'}\u0000${literal.text}`;
+    const leader = first.get(slot);
+    if (leader === undefined) first.set(slot, literal);
+    else sharedWith.set(literal, leader);
+  }
+
   // The names: the rule's, numbered across the run past every key declared
   // before it and every copy-module name; a reused literal takes its key and
-  // no number.
-  const fresh = adoptable.flatMap((f) => f.literals).filter((literal) => !reuseOf.has(literal));
+  // no number, and a follower its leader's.
+  const fresh = adoptable.flatMap((f) => f.literals).filter((literal) => !reuseOf.has(literal) && !sharedWith.has(literal));
   const before = new Set(Object.keys(descriptor.keys));
   const numbered = numberNames(
     fresh.map((l) => l.proposedKey),
     (name) => before.has(name) || propertyNames.has(name),
   );
   const nameOf = new Map<LocatedLiteral, string>([...reuseOf, ...fresh.map((literal, i) => [literal, numbered[i] as string] as const)]);
-  return { parsed, adoptable, nameOf, reused: new Set(reuseOf.keys()), refusals, modules, propertyNames };
+  for (const [literal, leader] of sharedWith) {
+    const name = nameOf.get(leader);
+    if (name !== undefined) nameOf.set(literal, name);
+  }
+  return { parsed, adoptable, nameOf, reused: new Set(reuseOf.keys()), sharedWith, refusals, dialectFiles, modules, propertyNames };
 }
 
 /** The accessor kind, or null when an un-directived App-Router component is ambiguous. */

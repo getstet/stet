@@ -72,7 +72,10 @@ export interface FormsHandlerOptions {
   guard: FormsGuard | 'none';
   /** A body field a person never fills — a text input left empty; `true`, a non-zero number or non-blank text in it is answered `ok` and dropped. */
   honeypot?: string;
-  /** Origins a browser may post from across origins; the preflight answers these alone. */
+  /**
+   * Absent, a browser on any origin may post a join; present, the handler's own
+   * origin and these alone, and the preflight answers these alone.
+   */
   allowedOrigins?: string[];
   onJoin?: (e: JoinEvent) => void | Promise<void>;
   onUnsubscribe?: (e: UnsubscribeEvent) => void | Promise<void>;
@@ -112,6 +115,7 @@ export function createStetFormsHandler(opts: FormsHandlerOptions): {
     throw new Error("createStetFormsHandler: `guard` is required — a function, or 'none' written knowingly");
   }
   const self = unsubscribeBase(opts.unsubscribeBase, 'createStetFormsHandler').origin;
+  const narrowed = opts.allowedOrigins !== undefined;
   const allowed = new Set(opts.allowedOrigins ?? []);
   const report = opts.onError ?? ((error, where) => console.error(`stet forms: ${where} failed`, error));
 
@@ -132,38 +136,63 @@ export function createStetFormsHandler(opts: FormsHandlerOptions): {
     else await run();
   }
 
-  /** Whether an origin may post here: the handler's own, or a listed one. */
-  function trusted(origin: string): boolean {
+  /** The handler's own origin or a listed one. */
+  function listed(origin: string): boolean {
     return origin === self || allowed.has(origin);
   }
 
-  /** The request's Origin verdict and the headers a cross-origin answer carries. */
-  function originOf(req: Request): { ok: boolean; headers: Record<string, string> } {
-    const origin = req.headers.get('origin');
-    if (origin === null) return { ok: true, headers: {} };
-    if (!trusted(origin)) return { ok: false, headers: {} };
-    return { ok: true, headers: origin === self ? {} : { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' } };
+  /** Whether an origin may post here: any, where no allowedOrigins narrows it; else a listed one. */
+  function trusted(origin: string): boolean {
+    return !narrowed || listed(origin);
   }
 
   /**
-   * The page a join came from, as its origin and path alone — no credentials,
-   * query or fragment, which carry a visitor's tokens and campaign tags — and
-   * only where that origin is one this route trusts: a URL from anywhere else
-   * is a claim the form's host never made. Only an `http:` or `https:` URL is
-   * a page: a `blob:` URL's origin is the page that made it, while its path is
-   * a whole second URL.
+   * The request's Origin verdict, the headers a cross-origin answer carries, and the Origin as the
+   * canonical http(s) origin it asserts — parsed once here; null where the header is absent or no such
+   * origin (`https://a.example/x`, the literal `null` a sandboxed or `file:` page sends).
    */
-  function pageOf(raw: unknown, req: Request): string | null {
-    const candidate = typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : req.headers.get('referer');
-    if (candidate === null) return null;
+  function originOf(req: Request): { ok: boolean; asserted: string | null; headers: Record<string, string> } {
+    const origin = req.headers.get('origin');
+    if (origin === null) return { ok: true, asserted: null, headers: {} };
+    if (!trusted(origin)) return { ok: false, asserted: null, headers: {} };
+    const parsed = pathOf(origin);
+    return {
+      ok: true,
+      asserted: parsed !== null && parsed.origin === origin ? origin : null,
+      headers: origin === self ? {} : { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' },
+    };
+  }
+
+  /**
+   * An `http:` or `https:` URL's origin and path alone — no credentials, query or fragment, which carry a
+   * visitor's tokens and campaign tags — or null. A `blob:` URL's origin is the page that made it, while
+   * its path is a whole second URL, so it is none.
+   */
+  function pathOf(raw: string): { origin: string; page: string } | null {
     try {
-      const url = new URL(candidate);
+      const url = new URL(raw);
       if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
-      const page = url.origin + url.pathname;
-      return trusted(url.origin) && page.length <= PAGE_MAX ? page : null;
+      return { origin: url.origin, page: url.origin + url.pathname };
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The page a join came from. With an Origin header — which the browser sets and a page's script cannot —
+   * the claimed page (the body's `page`, else the Referer) where its origin is the asserted one and it fits
+   * `PAGE_MAX`, and otherwise the asserted origin alone as `<origin>/`: the stored page's origin is always
+   * the one the browser asserted. An Origin that asserts no http(s) origin stores none. With no Origin (a
+   * server-side post), the claimed page only from the handler's own or a listed origin.
+   */
+  function pageOf(raw: unknown, req: Request, asserted: string | null): string | null {
+    const claimed = typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : req.headers.get('referer');
+    const found = claimed === null ? null : pathOf(claimed);
+    if (req.headers.get('origin') === null) {
+      return found !== null && listed(found.origin) && found.page.length <= PAGE_MAX ? found.page : null;
+    }
+    if (asserted === null) return null;
+    return found !== null && found.origin === asserted && found.page.length <= PAGE_MAX ? found.page : `${asserted}/`;
   }
 
   async function join(req: Request, group: string): Promise<Response> {
@@ -209,7 +238,7 @@ export function createStetFormsHandler(opts: FormsHandlerOptions): {
       return fail(400, 'invalid_field', { field: 'form' });
     }
     const form = typeof rawForm === 'string' ? rawForm : null;
-    const page = pageOf(Object.hasOwn(body, 'page') ? body['page'] : undefined, req);
+    const page = pageOf(Object.hasOwn(body, 'page') ? body['page'] : undefined, req, origin.asserted);
 
     const found = await opts.store.contacts.group({ key: group });
     if (isNotSupported(found)) return fail(501, 'not_supported');
@@ -332,7 +361,7 @@ export function createStetFormsHandler(opts: FormsHandlerOptions): {
       const route = routeOf(req.url);
       if (route?.kind !== 'join') return new Response(null, { status: 404 });
       const origin = req.headers.get('origin');
-      if (origin === null || !allowed.has(origin)) return new Response(null, { status: 403 });
+      if (origin === null || !trusted(origin)) return new Response(null, { status: 403 });
       return new Response(null, {
         status: 204,
         headers: {

@@ -40,7 +40,7 @@
 import { readFileSync } from 'node:fs';
 import { join, sep } from 'node:path';
 
-import { route as normalizeRoute } from '../src/seo.js';
+import { headLimitsFor, route as normalizeRoute } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, type Descriptor, type PageDef } from '../src/types.js';
 import { flag, parse, positionalsAround, refuseEnv } from './args.js';
@@ -202,6 +202,17 @@ export interface PageProposal {
 export interface PageProposalSet {
   proposals: PageProposal[];
   skips: PageSkip[];
+  /** Declared html pages whose empty title or description takes the key their file now marks for it. */
+  fills: PageFill[];
+}
+
+/** One empty SEO slot of a declared page, and the key its marked element carries. */
+export interface PageFill {
+  page: string;
+  route: string;
+  file: string;
+  field: 'title' | 'description';
+  key: string;
 }
 
 /** The remedy behind most skips: the descriptor is the registry, and a hand-written page is first-class. */
@@ -296,6 +307,7 @@ export function proposePages(
 
   const proposals: PageProposal[] = [];
   const skips: PageSkip[] = [];
+  const fills: PageFill[] = [];
   const proposedByRoute = new Map<string, PageProposal>();
   const proposedByName = new Map<string, PageProposal>();
 
@@ -342,6 +354,16 @@ export function proposePages(
     const trimmed = normalizeRoute(route);
     const declaredAt = declaredRoutes.get(trimmed);
     if (declaredAt !== undefined) {
+      // An already-declared page's empty SEO slot takes a newly marked tag's key; a filled slot is never replaced.
+      // The pages are read raw, so the record's `seo` may be anything.
+      const seo = declared.pages[declaredAt]?.seo;
+      const held = typeof seo === 'object' && seo !== null ? (seo as Record<string, unknown>) : {};
+      for (const field of ['title', 'description'] as const) {
+        const key = bound.get(file)?.[field];
+        const now = held[field];
+        if (key === undefined || (typeof now === 'string' && now !== '')) continue;
+        fills.push({ page: declaredAt, route, file, field, key });
+      }
       // The seed rides the same read on the page that OWNS this route: a file
       // and the key it seeded diverging is the one thing a seed can hide, so
       // the skip names the difference rather than passing over it.
@@ -419,7 +441,7 @@ export function proposePages(
     if (parent !== undefined) proposal.parent = parent;
   }
 
-  return { proposals, skips };
+  return { proposals, skips, fills };
 }
 
 /**
@@ -788,11 +810,11 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
     report.line('pages scan: no routing convention detected — expected src/pages, app/ or pages/');
     return report.emit(io, { json });
   }
-  printPages(report, set);
+  printPages(report, set, !apply);
 
   if (!apply) {
     report.line(
-      set.proposals.length === 0
+      set.proposals.length === 0 && set.fills.length === 0
         ? 'pages scan: nothing to propose'
         : 'pages scan: run with --apply to declare these pages',
     );
@@ -867,8 +889,16 @@ function seoKeys(name: string): { title: string; description: string } {
   return { title: `seo_${name}_title`, description: `seo_${name}_desc` };
 }
 
-/** The proposal set as a human report and as the `--json` payload. */
-function printPages(report: Report, set: PageProposalSet): void {
+/** One fill in the plan's words. */
+function fillLine(fill: PageFill): string {
+  return `${fill.file}: fills the ${fill.field} with ${fill.key}`;
+}
+
+/**
+ * The proposal set as a human report and as the `--json` payload. The fills
+ * print here on a plain run; `--apply` prints each one it writes after the batch.
+ */
+function printPages(report: Report, set: PageProposalSet, fills: boolean): void {
   for (const proposal of set.proposals) {
     const keys = seoKeys(proposal.name);
     report.line(`${proposal.name} (${proposal.route})`);
@@ -895,11 +925,13 @@ function printPages(report: Report, set: PageProposalSet): void {
       if (value !== undefined) report.line(`  ${field}: "${clip(value, SEED_EXCERPT)}"`);
     }
   }
+  if (fills) for (const fill of set.fills) report.line(fillLine(fill));
   for (const skip of set.skips) {
     report.warn('pages', `${skip.file}: skipped (${skip.reason}) — ${skip.detail}; ${skip.remedy}`);
   }
   report.data('pages', set.proposals);
   report.data('skips', set.skips);
+  report.data('fills', set.fills);
 }
 
 /**
@@ -922,6 +954,8 @@ function selectPages(set: PageProposalSet, names: string[]): PageProposal[] {
       chosen.push(proposal);
       continue;
     }
+    // A declared page named for its fill is selected through the fill.
+    if (set.fills.some((fill) => fill.page === name)) continue;
     const skip = set.skips.find((s) => s.name === name);
     const proposed = [...byName.keys()];
     throw new UsageError(
@@ -963,6 +997,18 @@ export function applyPages(
   const values = (snapshot[config.locales.default] ??= {});
   const pages = (descriptor.pages ??= {});
 
+  // The fills: a declared page's empty slot names the key its file marks, and
+  // the key gains the page, as a bound key does below.
+  const filled: PageFill[] = [];
+  for (const fill of set.fills) {
+    const record = pages[fill.page];
+    if (record === undefined || (names.length > 0 && !names.includes(fill.page))) continue;
+    record.seo = { ...record.seo, [fill.field]: fill.key };
+    const def = descriptor.keys[fill.key];
+    if (def !== undefined && !(def.pages ?? []).includes(fill.page)) def.pages = [...(def.pages ?? []), fill.page];
+    filled.push(fill);
+  }
+
   // The records that actually LANDED. The plans are built from this list, so a
   // batch that declared nothing writes nothing at all rather than restaling the
   // codegen over an empty change.
@@ -1002,10 +1048,15 @@ export function applyPages(
     };
     pages[proposal.name] = record;
     records.set(proposal.name, record);
-    for (const key of [keys.title, keys.description]) {
+    for (const [key, role] of [
+      [keys.title, 'page_title'],
+      [keys.description, 'meta_description'],
+    ] as const) {
       // `pages: [name]` costs nothing and is not decorative: without it the
-      // key's page span in the changeset preview is silently empty.
-      descriptor.keys[key] = { shape: 'text', target: DEFAULT_TARGET, pages: [proposal.name] };
+      // key's page span in the changeset preview is silently empty. The limit
+      // is the SEO bound a head key carries on every host.
+      const limits = headLimitsFor([role]);
+      descriptor.keys[key] = { shape: 'text', target: DEFAULT_TARGET, pages: [proposal.name], ...(limits === undefined ? {} : { limits }) };
     }
     // Empty, never invented copy — a markdown page's frontmatter seed is the
     // host's own copy rather than a guess. Derivation would be the other honest
@@ -1045,7 +1096,7 @@ export function applyPages(
     }
   }
 
-  if (landed.length === 0 && backfilled === 0) {
+  if (landed.length === 0 && backfilled === 0 && filled.length === 0) {
     report.line('pages scan: nothing to propose');
     return;
   }
@@ -1061,6 +1112,7 @@ export function applyPages(
   for (const label of unchanged) report.line(`${label}: already current`);
   for (const label of written) report.line(`wrote ${label}`);
   if (backfilled > 0) report.line(`backfilled parent on ${backfilled} page(s)`);
+  for (const fill of filled) report.line(fillLine(fill));
   if (landed.length === 0) return;
   // The html arm's own close: this run scaffolded nothing and seeded nothing,
   // so today's two lines would both be zero. What matters instead is how many
@@ -1076,7 +1128,7 @@ export function applyPages(
     report.line(
       `declared ${plural(landed.length, 'page')}, ` +
         `bound ${plural(fields, 'field')}; ` +
-        `${plural(short, 'page')} lack a marked title or description — stet seo check names them`,
+        `${plural(short, 'page')} ${short === 1 ? 'lacks' : 'lack'} a marked title or description — stet seo check names them`,
     );
     return;
   }

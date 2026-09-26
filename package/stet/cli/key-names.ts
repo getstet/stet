@@ -7,8 +7,9 @@
  * same word written with underscores — `share description` on the page is
  * `share_description` in `home_share_description`.
  *
- * A role name is up to four parts: the page, the nearest section, the role and
- * a number where the same page, section and role repeat within one run. It
+ * A role name is up to five parts: the page, the nearest section, the repeated
+ * item the element sits in (a card, a step), the role, and a number where the
+ * same page, section, item and role repeat within one run. It
  * records where adoption found the element. Nothing moves the key when the page
  * changes; `stet rename` is how a name that stops describing its place changes.
  */
@@ -47,6 +48,8 @@ const TAG_KINDS: Record<string, string> = {
   button: 'button text',
   li: 'list item',
   title: 'page title',
+  // A `<details>`'s question: its answer beside it is the paragraph (P15).
+  summary: 'headline',
 };
 
 /** Every kind word the tables and rules give, which a component's prop must not spell. */
@@ -173,10 +176,14 @@ export const NO_SECTION = 'page';
 /** The page word for a key marked in more than one document. */
 export const SITE_PAGE = 'site';
 
-/** The elements that name a section by their `id`, or by their own tag name where they carry none. */
-export const SECTION_LANDMARKS: ReadonlySet<string> = new Set(['header', 'footer', 'nav']);
+/**
+ * The elements that name a section by their `id`, or by their own tag name where they carry none. An
+ * `<article>` is one: a lone article names its section `article`, and an article with a sibling of its
+ * own is a repeated item, which the section walk starts above (`itemWord`).
+ */
+export const SECTION_LANDMARKS: ReadonlySet<string> = new Set(['header', 'footer', 'nav', 'article']);
 /** The elements that name a section by their `id`, or by their first heading's first words. */
-export const SECTION_HEADED: ReadonlySet<string> = new Set(['section', 'article', 'aside']);
+export const SECTION_HEADED: ReadonlySet<string> = new Set(['section', 'aside']);
 
 /** One element on the way up from a marked element, as the section rule reads it. */
 export interface SectionNode {
@@ -185,29 +192,135 @@ export interface SectionNode {
   id(): string | undefined;
   /** Its first heading's text, all of it, in order. */
   heading(): string | undefined;
+  /** Its first heading's tag (`h2`), where it holds one. */
+  headingTag(): string | undefined;
 }
 
 /**
  * The section word a key is named under (operator, 2026-09-25), over the chain
- * from the marked element up: the nearest `header`, `footer`, `nav`, `section`,
- * `article` or `aside`, the element itself included, by its `id`; else a
- * landmark by its own name; else a `section`, `article` or `aside` by its first
- * heading's first three words. One with none of them passes the question to its
- * parent, and `main` never answers: it is the page itself. `null` where nothing
+ * from the marked element up: the nearest `header`, `footer`, `nav`, `article`,
+ * `section` or `aside`, the element itself included, by its `id`; else a
+ * landmark by its own name; else a `section` or `aside` by its first heading's
+ * first three words. One with none of them passes the question to its parent,
+ * and `main` never answers: it is the page itself. `null` where nothing
  * answers. The static-HTML host and the JSX walk each hand their own chain.
  */
 export function sectionWord(chain: Iterable<SectionNode>): string | null {
+  return sectionOf(chain)?.word ?? null;
+}
+
+/** The section rule over a chain: the word and the node that answered it, or null. */
+export function sectionOf<N extends SectionNode>(chain: Iterable<N>): { word: string; node: N } | null {
   for (const at of chain) {
     if (!SECTION_LANDMARKS.has(at.tag) && !SECTION_HEADED.has(at.tag)) continue;
     const id = at.id();
     const fromId = id === undefined ? '' : firstWords(id, SECTION_WORDS, SECTION_MAX);
-    if (fromId !== '') return fromId;
-    if (SECTION_LANDMARKS.has(at.tag)) return at.tag;
+    if (fromId !== '') return { word: fromId, node: at };
+    if (SECTION_LANDMARKS.has(at.tag)) return { word: at.tag, node: at };
     const heading = at.heading();
     const words = heading === undefined ? '' : firstWords(heading, SECTION_WORDS, SECTION_MAX);
-    if (words !== '') return words;
+    if (words !== '') return { word: words, node: at };
   }
   return null;
+}
+
+/** The elements a repeated item can be. */
+export const ITEM_TAGS: ReadonlySet<string> = new Set(['article', 'li', 'details']);
+
+/** One element on the way up from a marked element, as the item rule reads it. */
+export interface ItemNode {
+  tag: string;
+  /** Its parent element's tag; `undefined` at the top. */
+  parentTag: string | undefined;
+  /** Its 1-based place among its parent's child elements of its own tag, and how many there are. */
+  position(): { n: number; of: number };
+  /** Whether the texts inside it, itself included, hold a heading (`h2`–`h6`, or a `<summary>`) and at least one other text. */
+  headed(): boolean;
+}
+
+/**
+ * The item part of a name (operator, 2026-09-26), over the chain from the marked element up: every
+ * repeated item on the way — an `<article>`, `<li>` or `<details>` with a sibling of its own tag whose
+ * texts hold a heading and another text — as its word and place, outermost first
+ * (`step_1_item_2`), and the index in the chain of the outermost, above which the section walk
+ * resumes. `null` where the element sits in no repeated item. The word is `card` for an article,
+ * `step` for an `<li>` of an `<ol>`, and `item` for any other `<li>` and a `<details>`.
+ */
+export function itemWord(chain: readonly ItemNode[]): { item: string; outermost: number } | null {
+  const parts: string[] = [];
+  let outermost = -1;
+  chain.forEach((node, i) => {
+    if (!ITEM_TAGS.has(node.tag)) return;
+    const { n, of } = node.position();
+    if (of < 2 || !node.headed()) return;
+    const word = node.tag === 'article' ? 'card' : node.tag === 'li' && node.parentTag === 'ol' ? 'step' : 'item';
+    parts.unshift(`${word}_${n}`);
+    outermost = i;
+  });
+  return outermost === -1 ? null : { item: parts.join('_'), outermost };
+}
+
+/**
+ * The role of a heading in no repeated item (P4): `subheadline` for an `<h3>`–`<h6>` whose nearest
+ * section's first heading is of a higher level, so it never numbers with the section's title; else
+ * `headline`. `chain` runs from the heading's parent up.
+ */
+export function looseHeadingRole(tag: string, chain: Iterable<SectionNode>): 'headline' | 'subheadline' {
+  if (!/^h[3-6]$/.test(tag)) return 'headline';
+  for (const at of chain) {
+    if (!SECTION_LANDMARKS.has(at.tag) && !SECTION_HEADED.has(at.tag)) continue;
+    const first = at.headingTag();
+    return first !== undefined && Number(first.slice(1)) < Number(tag.slice(1)) ? 'subheadline' : 'headline';
+  }
+  return 'headline';
+}
+
+/** A document's tree as the item rule reads it: each host hands its own. */
+export interface ItemTree<N> {
+  parentOf(n: N): N | undefined;
+  childrenOf(n: N): readonly N[];
+  tagOf(n: N): string | undefined;
+  /** The elements carrying a text inside `n`, `n` included. */
+  textsIn(n: N): readonly N[];
+}
+
+/**
+ * The item rule's reads over one tree, each answered once per element: an element's place among
+ * its parent's children of its tag (a list of sixty thousand `<li>`s is walked once, not once per
+ * item), and whether an item holds a heading and another text.
+ */
+export function itemReader<N>(tree: ItemTree<N>): (at: N) => ItemNode {
+  const places = new Map<N, { n: number; of: number }>();
+  const headed = new Map<N, boolean>();
+  return (at) => {
+    const parent = tree.parentOf(at);
+    const tag = tree.tagOf(at) ?? '';
+    return {
+      tag,
+      parentTag: parent === undefined ? undefined : tree.tagOf(parent),
+      position: () => {
+        if (!places.has(at)) {
+          const same = (parent === undefined ? [at] : tree.childrenOf(parent)).filter((c) => tree.tagOf(c) === tag);
+          same.forEach((c, i) => places.set(c, { n: i + 1, of: same.length }));
+        }
+        return places.get(at) as { n: number; of: number };
+      },
+      headed: () => {
+        if (!headed.has(at)) {
+          const inside = tree.textsIn(at);
+          headed.set(
+            at,
+            inside.length >= 2 &&
+              inside.some((d) => {
+                const t = tree.tagOf(d) ?? '';
+                return /^h[2-6]$/.test(t) || t === 'summary';
+              }),
+          );
+        }
+        return headed.get(at) as boolean;
+      },
+    };
+  };
 }
 
 /** The parts of a role name before it is joined and numbered. */
@@ -216,14 +329,18 @@ export interface NameParts {
   page?: string;
   /** Absent for a head text; `null` where no section answers, which takes {@link NO_SECTION}. */
   section?: string | null;
+  /** The repeated item the element sits in (`card_4`, `step_1_item_2`); never cut. */
+  item?: string;
   role: string;
 }
 
 /**
  * A role name before its number: the parts joined by `_`, at most
  * {@link BASE_MAX} characters. Past it the section loses words from its end,
- * then the page from its start, then whatever is left is cut on a word
- * boundary; the role is never cut here, being capped by `roleOf`. A name that
+ * then the page from its start, then the section goes, then the page; the item
+ * and the role are never cut here — the role being capped by `roleOf` — so
+ * where they alone pass the cap the name is longer, and the naming plan's
+ * 64-character rule refuses what passes that. A name that
  * would open with a digit takes {@link NO_SECTION} in front, since
  * `copy.2026_x` is no JavaScript a host could write.
  */
@@ -231,13 +348,15 @@ export function baseName(parts: NameParts): string {
   let page = parts.page === undefined ? [] : parts.page.split('_').filter((w) => w !== '');
   let section =
     parts.section === undefined ? [] : (parts.section ?? NO_SECTION).split('_').filter((w) => w !== '');
-  const join = (): string => [...page, ...section, parts.role].join('_');
+  const join = (): string => [...page, ...section, ...(parts.item === undefined ? [] : [parts.item]), parts.role].join('_');
   while (join().length > BASE_MAX && section.length > 1) section = section.slice(0, -1);
   while (join().length > BASE_MAX && page.length > 1) page = page.slice(1);
   if (join().length > BASE_MAX) section = [];
   if (join().length > BASE_MAX) page = [];
   const joined = join();
-  return /^[0-9]/.test(joined) ? firstWords(`${NO_SECTION}_${joined}`, Infinity, BASE_MAX) : joined;
+  if (!/^[0-9]/.test(joined)) return joined;
+  // The item is never cut, so a name carrying one takes its prefix whole.
+  return parts.item === undefined ? firstWords(`${NO_SECTION}_${joined}`, Infinity, BASE_MAX) : `${NO_SECTION}_${joined}`;
 }
 
 /**

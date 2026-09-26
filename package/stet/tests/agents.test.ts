@@ -64,7 +64,17 @@ describe('buildGuidanceBlock', () => {
     b.emailSurfaces = ['lib/email/**/*.ts'];
     const [textA, textB] = [buildGuidanceBlock(a), buildGuidanceBlock(b)];
     expect(textA).not.toBe(textB);
-    expect(textA.replace('content/descriptor.json', 'copy/keys.json')).toBe(textB);
+    expect(textA.replaceAll('content/descriptor.json', 'copy/keys.json')).toBe(textB);
+  });
+
+  it('names where a derived key’s fixed sentence is edited, in both wordings', () => {
+    const sentence = "A derived key's fixed sentence is its tmpl in `content/descriptor.json`; edit it there and run `stet pull`.";
+    const js = defaultConfig();
+    const html = { ...defaultConfig(), host: 'html' as const };
+    for (const config of [js, html]) {
+      config.descriptorPath = 'content/descriptor.json';
+      expect(buildGuidanceBlock(config).split('\n')[1]?.endsWith(` ${sentence}`)).toBe(true);
+    }
   });
 
   it('is deterministic — the same config builds byte-identical text', () => {
@@ -163,6 +173,18 @@ describe('planGuidance', () => {
     const plan = planGuidance(path, BLOCK);
     expect(plan.status).toBe('differs');
     expect(plan.note).toContain('differs from what stet would write');
+    expect(plan.note).toContain('delete the block and re-run, or keep your edit');
+  });
+
+  it('differs — the 0.5.1 block, which lacks the derived-key sentence, is reported with its remedies', () => {
+    const dir = project();
+    const path = join(dir, 'AGENTS.md');
+    const config = defaultConfig();
+    const before = BLOCK.replace(` A derived key's fixed sentence is its tmpl in \`${config.descriptorPath}\`; edit it there and run \`stet pull\`.`, '');
+    expect(before).not.toBe(BLOCK);
+    writeFileSync(path, `# House rules\n\n${before}`, 'utf8');
+    const plan = planGuidance(path, BLOCK);
+    expect(plan.status).toBe('differs');
     expect(plan.note).toContain('delete the block and re-run, or keep your edit');
   });
 

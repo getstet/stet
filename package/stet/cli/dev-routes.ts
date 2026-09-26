@@ -23,7 +23,7 @@ import { join, posix, resolve as resolvePath, sep } from 'node:path';
 import { json, readJson } from '../server/http.js';
 import { bearerMatches, createStetHandler } from '../server/mount.js';
 import { route as normalizeRoute } from '../src/seo.js';
-import { keyDefOf, loadDescriptor } from '../src/descriptor.js';
+import { DescriptorError, keyDefOf, loadDescriptor, loadDescriptorWithWarnings } from '../src/descriptor.js';
 import { canonicalize } from '../src/codegen.js';
 import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
@@ -33,13 +33,32 @@ import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js
 import { check } from './check.js';
 import type { StetConfig } from './config.js';
 import { filesForGlobs, staticPrefix } from './files.js';
-import { git, gitData, gitRun, gitState, operationInProgress, uncommittedPaths } from './git.js';
-import { isHeadText, lineIndex, metaCopyName, placeOf, proposeHtml, readDocument, type Document, type Element } from './html-host.js';
+import { git, gitData, gitRun, gitState, operationInProgress, pushRemoteOf, runTool, uncommittedPaths } from './git.js';
+import {
+  heldTextOf,
+  isHeadText,
+  lineIndex,
+  metaCopyName,
+  parentsOf,
+  placeOf,
+  proposeHtml,
+  proposeHtmlSources,
+  readDocument,
+  sectionWordOf,
+  type Document,
+  type Element,
+  type HtmlMark,
+  type HtmlProposalSet,
+} from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
 import { runCli, type CliIo } from './main.js';
 import { applyPages, fileRoute, proposeForHost } from './pages.js';
+import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
+import { keyMoveWrites } from './rename.js';
+import { sharedTextIndex } from './register-run.js';
+import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { blankNonMarkup, dialectOf, matchGlob, type Dialect } from './source-scan.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -397,8 +416,20 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await commit(ctx, req, site);
       case 'POST site/push':
         return await push(site);
+      case 'POST site/publish-live':
+        return await publishLive(site);
+      case 'GET site/preview-link':
+        return await previewLink(site);
+      case 'POST site/merge':
+        return await mergeKeys(req, site);
+      case 'POST site/split':
+        return await splitPlace(req, site);
       case 'GET site/history':
         return history(site);
+      case 'GET site/removed':
+        return removed(url, site);
+      case 'POST site/restore':
+        return await restore(req, site);
       case 'GET site/health':
         return await health(ctx, url, site);
       case 'GET site/seo':
@@ -487,7 +518,27 @@ function siteReply(site: SiteState, entry: WorkspaceEntry): Response {
     dev: devDefaults(config, entry),
     entry,
     pending: pendingForms(site),
+    git: { ...site.git, live: liveOf(site.path) },
   });
+}
+
+/**
+ * The live branch as this checkout knows it without the network: the push
+ * remote's `HEAD` symref (`origin/main` → `main`), else null, which the page
+ * reads as `main`.
+ */
+function liveOf(cwd: string): string | null {
+  const branch = gitState(cwd).branch;
+  if (branch === null) return null;
+  const chosen = pushRemoteOf(cwd, branch);
+  return 'error' in chosen ? null : liveBranchOf(cwd, chosen.remote);
+}
+
+/** `<remote>`'s default branch from its local `HEAD` symref, or null where the symref is missing. */
+function liveBranchOf(cwd: string, remote: string): string | null {
+  const read = gitData(cwd, ['symbolic-ref', '--short', `refs/remotes/${remote}/HEAD`]);
+  const ref = read.stdout.trim();
+  return read.code === 0 && ref.startsWith(`${remote}/`) ? ref.slice(remote.length + 1) : null;
 }
 
 /**
@@ -581,6 +632,20 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
   }
   if (!ok) return json({ error: 'refused by the save gate', findings: gate.findings }, 409);
 
+  // For each key given a new default-locale value, the keys that now hold the
+  // same words and did not before: only the save that MADE them equal asks.
+  const before = sharedTextIndex(ready.descriptor, ready.snapshot);
+  const after = sharedTextIndex(descriptor, next);
+  const same: Array<{ key: string; others: string[] }> = [];
+  for (const edit of edits) {
+    if (edit.locale !== config.locales.default || typeof edit.value !== 'string') continue;
+    const holders = after.get(edit.value) ?? [];
+    const others = holders.filter((k) => k !== edit.key);
+    const was = heldTextOf(ready.descriptor, ready.snapshot, edit.key);
+    const fresh = others.filter((k) => !(before.get(was ?? '\u0000') ?? []).includes(k));
+    if (fresh.length > 0 && holders.includes(edit.key)) same.push({ key: edit.key, others: fresh });
+  }
+
   const report = new Report();
   const { written, unchanged } = applyForms(ready.path, config, descriptor, next, report, 'dashboard save');
   const touched = body['touch'] === false ? null : touchReadPath(ready);
@@ -588,6 +653,7 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
     written,
     unchanged,
     touched,
+    same,
     findings: [...gate.findings, ...report.findings],
     at: gitState(ready.path),
     pending: pendingForms(ready),
@@ -725,9 +791,9 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
   });
 }
 
-/** A form as HEAD holds it, through its loader; null where HEAD does not hold it or the loader refuses it. */
-function formAtHead<T>(site: Ready, path: string, load: (raw: unknown) => T): T | null {
-  const found = gitData(site.path, ['show', `HEAD:./${gitSpelling(path)}`]);
+/** A form as a revision holds it, through its loader; null where it does not hold it or the loader refuses it. */
+function formAt<T>(site: Ready, rev: string, path: string, load: (raw: unknown) => T): T | null {
+  const found = gitData(site.path, ['show', `${rev}:./${gitSpelling(path)}`]);
   if (found.code !== 0) return null;
   try {
     return load(JSON.parse(found.stdout));
@@ -747,8 +813,8 @@ function formAtHead<T>(site: Ready, path: string, load: (raw: unknown) => T): T 
  * hold, or one `loadDescriptor` refuses, is read as the one on disk.
  */
 function changedKeys(site: Ready, named: string[]): { keys: string[]; renamed: number } {
-  const committed: Snapshot = formAtHead(site, site.config.snapshotPath, loadSnapshot) ?? {};
-  const described: Descriptor = formAtHead(site, site.config.descriptorPath, loadDescriptor) ?? site.descriptor;
+  const committed: Snapshot = formAt(site, 'HEAD', site.config.snapshotPath, loadSnapshot) ?? {};
+  const described: Descriptor = formAt(site, 'HEAD', site.config.descriptorPath, loadDescriptor) ?? site.descriptor;
   // A form the commit leaves out stays as HEAD has it.
   const snapshot = named.includes(gitSpelling(site.config.snapshotPath)) ? site.snapshot : committed;
   const descriptor = named.includes(gitSpelling(site.config.descriptorPath)) ? site.descriptor : described;
@@ -774,12 +840,29 @@ function changedKeys(site: Ready, named: string[]): { keys: string[]; renamed: n
       if (JSON.stringify(was) !== JSON.stringify(is)) keys.add(key);
     }
   }
-  // A rename: a key HEAD declares that the commit's descriptor does not, and one
-  // it declares that HEAD does not, holding the same value in every locale —
-  // the one such pair for each. Named as `old → new`, once.
+  const { renamed } = keyMoves({ descriptor: described, snapshot: committed }, { descriptor, snapshot }, keys);
+  const moved = new Set([...renamed.keys(), ...renamed.values()]);
+  const listed = [...[...renamed].map(([old, next]) => `${old} → ${next}`), ...[...keys].filter((key) => !moved.has(key)).sort()];
+  return { keys: listed, renamed: renamed.size };
+}
+
+/**
+ * Keys declared before and not after, and keys declared after and not before,
+ * paired where one moved to the other (a rename): a key `before` declares and
+ * `after` does not, and one `after` declares and `before` does not, holding the
+ * same value in every locale — the one such pair for each. `keys` narrows the
+ * keys considered (the commit's changed keys; every key for a removal).
+ */
+function keyMoves(
+  before: { descriptor: Descriptor; snapshot: Snapshot },
+  after: { descriptor: Descriptor; snapshot: Snapshot },
+  keys: ReadonlySet<string>,
+): { renamed: Map<string, string>; removed: string[]; added: string[] } {
+  const own = (block: Record<string, unknown> | undefined, key: string): unknown =>
+    block !== undefined && Object.hasOwn(block, key) ? block[key] : undefined;
   const renamed = new Map<string, string>();
-  const leaving = [...keys].filter((key) => Object.hasOwn(described.keys, key) && !Object.hasOwn(descriptor.keys, key));
-  const arriving = [...keys].filter((key) => Object.hasOwn(descriptor.keys, key) && !Object.hasOwn(described.keys, key));
+  const leaving = [...keys].filter((key) => Object.hasOwn(before.descriptor.keys, key) && !Object.hasOwn(after.descriptor.keys, key));
+  const arriving = [...keys].filter((key) => Object.hasOwn(after.descriptor.keys, key) && !Object.hasOwn(before.descriptor.keys, key));
   const valuesOf = (forms: Snapshot, key: string): string =>
     JSON.stringify(Object.keys(forms).sort().map((locale) => own(forms[locale], key)));
   const rowless = (forms: Snapshot, key: string): boolean =>
@@ -794,18 +877,21 @@ function changedKeys(site: Ready, named: string[]): { keys: string[]; renamed: n
     return JSON.stringify(canonicalize(rest));
   };
   const same = (old: string, next: string): boolean =>
-    rowless(committed, old) && rowless(snapshot, next)
-      ? entryOf(described, old) === entryOf(descriptor, next)
-      : valuesOf(committed, old) === valuesOf(snapshot, next);
+    rowless(before.snapshot, old) && rowless(after.snapshot, next)
+      ? entryOf(before.descriptor, old) === entryOf(after.descriptor, next)
+      : valuesOf(before.snapshot, old) === valuesOf(after.snapshot, next);
   for (const old of leaving) {
     const matches = arriving.filter((next) => same(old, next));
     const next = matches[0];
     if (matches.length !== 1 || next === undefined || [...renamed.values()].includes(next)) continue;
     renamed.set(old, next);
   }
-  const moved = new Set([...renamed.keys(), ...renamed.values()]);
-  const listed = [...[...renamed].map(([old, next]) => `${old} → ${next}`), ...[...keys].filter((key) => !moved.has(key)).sort()];
-  return { keys: listed, renamed: renamed.size };
+  const arrived = new Set(renamed.values());
+  return {
+    renamed,
+    removed: leaving.filter((key) => !renamed.has(key)),
+    added: arriving.filter((key) => !arrived.has(key)),
+  };
 }
 
 /**
@@ -910,12 +996,193 @@ function clipTo72(text: string): string {
   return text.length <= 72 ? text : `${text.slice(0, 71)}…`;
 }
 
-/** `git push`, and git's own answer either way. */
+/**
+ * `git push`, and git's own answer either way. A branch with no upstream (or
+ * one whose ref is gone) is pushed with `-u` to the remote git's own order
+ * chooses; a detached HEAD pushes nothing.
+ */
 async function push(site: SiteState): Promise<Response> {
   const ready = requireReady(site);
-  const pushed = await gitRun(ready.path, ['push']);
-  if (pushed.code !== 0) return json({ error: 'git push failed', output: pushed.out }, 409);
-  return json({ output: pushed.out, at: gitState(ready.path) });
+  const at = gitState(ready.path);
+  if (at.branch === null) return json({ error: 'HEAD is detached — check out a branch to push', at }, 409);
+  let args = ['push'];
+  let upstream: string | null = null;
+  if (at.upstream === null) {
+    const chosen = pushRemoteOf(ready.path, at.branch);
+    if ('error' in chosen) return json({ error: `cannot push ${at.branch}: ${chosen.error}`, at }, 409);
+    // `--` ends the options: a branch named `-f` is a name. `-u` records the upstream.
+    args = ['push', '-u', chosen.remote, '--', at.branch];
+    upstream = chosen.remote;
+  }
+  const pushed = await gitRun(ready.path, args);
+  if (pushed.code !== 0) return json({ error: 'git push failed', output: pushed.out, at: gitState(ready.path) }, 409);
+  return json({ output: pushed.out, at: gitState(ready.path), ...(upstream === null ? {} : { upstream, branch: at.branch }) });
+}
+
+/**
+ * Publish to live: the branch's commit pushed to the live branch, fast-forward
+ * only, never switching the local branch. The remote is read as it is now: the
+ * live branch's existence, its tip, and — where the local symref is missing —
+ * its default branch.
+ */
+async function publishLive(site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const at = gitState(ready.path);
+  if (at.branch === null) return json({ error: 'HEAD is detached — check out a branch to publish', at }, 409);
+  if (operationInProgress(ready.path)) {
+    return json({ error: 'a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal', at }, 409);
+  }
+  const chosen = pushRemoteOf(ready.path, at.branch);
+  if ('error' in chosen) return json({ error: `cannot publish ${at.branch}: ${chosen.error}`, at }, 409);
+  const remote = chosen.remote;
+  const live = liveBranchOf(ready.path, remote) ?? (await remoteHeadOf(ready.path, remote)) ?? 'main';
+  if (live === at.branch) return json({ error: `${at.branch} is the live branch`, at }, 409);
+  const exists = await gitRun(ready.path, ['ls-remote', '--exit-code', '--heads', remote, live]);
+  if (exists.code === 2) return json({ error: `${live} does not exist on ${remote}`, at }, 409);
+  if (exists.code !== 0) return json({ error: 'git ls-remote failed', output: exists.out, at }, 409);
+  const fetched = await gitRun(ready.path, ['fetch', remote, '--', live]);
+  if (fetched.code !== 0) return json({ error: 'git fetch failed', output: fetched.out, at }, 409);
+  const tip = git(ready.path, ['rev-parse', `${remote}/${live}`]).out.trim();
+  if (tip === git(ready.path, ['rev-parse', 'HEAD']).out.trim()) {
+    return json({ output: '', live, already: true, at: gitState(ready.path) });
+  }
+  const behind = await gitRun(ready.path, ['merge-base', '--is-ancestor', `${remote}/${live}`, 'HEAD']);
+  if (behind.code === 1) return json({ error: `${live} has commits ${at.branch} lacks — bring them into ${at.branch} first`, at }, 409);
+  if (behind.code !== 0) return json({ error: 'git merge-base failed', output: behind.out, at }, 409);
+  const pushed = await gitRun(ready.path, ['push', remote, `HEAD:refs/heads/${live}`]);
+  if (pushed.code !== 0) return json({ error: 'git push failed', output: pushed.out, at: gitState(ready.path) }, 409);
+  return json({ output: pushed.out, live, at: gitState(ready.path) });
+}
+
+/** The remote's default branch as the remote answers it now (`ref: refs/heads/main\tHEAD`), or null. */
+async function remoteHeadOf(cwd: string, remote: string): Promise<string | null> {
+  const read = await gitRun(cwd, ['ls-remote', '--symref', remote, 'HEAD']);
+  const m = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(read.out);
+  return read.code === 0 && m !== null ? (m[1] as string) : null;
+}
+
+/** `<owner>/<repo>` of a GitHub remote URL — scp-like, https or ssh — or null for any other host. */
+export function githubRepoOf(url: string): string | null {
+  const m = /^(?:git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(url.trim());
+  return m === null ? null : `${m[1]}/${m[2]}`;
+}
+
+/**
+ * The preview address a Cloudflare Pages check run's summary names. The summary is an HTML table whose
+ * rows read `<strong>Preview URL:</strong></td><td>\n<a href='https://…'>`: the Branch Preview URL row's
+ * link (the branch's standing address), else the Preview URL row's (this one deploy). A run still in
+ * progress carries neither.
+ */
+export function previewOfSummary(summary: string): { url: string; branch: boolean } | null {
+  const row = (label: string): string | null => {
+    const m = new RegExp(`<strong>${label}:</strong>\\s*</td>\\s*<td>\\s*<a\\b[^>]*?href=(['"])(https://[^'"\\s]+)\\1`).exec(summary);
+    return m === null ? null : (m[2] as string);
+  };
+  const branch = row('Branch Preview URL');
+  if (branch !== null) return { url: branch, branch: true };
+  const one = row('Preview URL');
+  return one === null ? null : { url: one, branch: false };
+}
+
+/**
+ * The preview address the operator's own `gh` login reports for the branch's
+ * pushed commit: a successful deployment status's non-empty `environment_url`
+ * (Vercel, Netlify), else a Cloudflare Pages check run's summary — a Branch
+ * Preview URL from any run, else the newest run's Preview URL. Commit statuses
+ * are not read: a CI's status names its build page. stet holds no token.
+ */
+async function previewLink(site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const at = gitState(ready.path);
+  if (at.branch === null) return json({ url: null });
+  const chosen = pushRemoteOf(ready.path, at.branch);
+  if ('error' in chosen) return json({ url: null });
+  if ((liveBranchOf(ready.path, chosen.remote) ?? 'main') === at.branch) return json({ url: null });
+  const repo = githubRepoOf(gitData(ready.path, ['remote', 'get-url', chosen.remote]).stdout);
+  if (repo === null) return json({ url: null, reason: 'not-github' });
+  const sha = git(ready.path, ['rev-parse', at.upstream ?? 'HEAD']).out.trim();
+  const api = async (path: string): Promise<unknown> => {
+    const read = await runTool('gh', ready.path, ['api', path], GH_TIMEOUT_MS);
+    if (read.code !== 0) return null;
+    try {
+      return JSON.parse(read.out);
+    } catch {
+      return null;
+    }
+  };
+  const deployments = await api(`repos/${repo}/deployments?sha=${sha}`);
+  const newest = Array.isArray(deployments) ? (deployments[0] as { id?: unknown } | undefined) : undefined;
+  if (typeof newest?.id === 'number') {
+    const statuses = await api(`repos/${repo}/deployments/${newest.id}/statuses`);
+    if (Array.isArray(statuses)) {
+      for (const status of statuses as Array<{ state?: unknown; environment_url?: unknown }>) {
+        // An empty `environment_url` is absent: some deployers carry `""` beside a log link.
+        if (status.state === 'success' && typeof status.environment_url === 'string' && status.environment_url !== '') {
+          return json({ url: status.environment_url });
+        }
+      }
+    }
+  }
+  const runs = await api(`repos/${repo}/commits/${sha}/check-runs?filter=all`);
+  const list = (runs as { check_runs?: unknown } | null)?.check_runs;
+  if (Array.isArray(list)) {
+    const found = (list as Array<{ started_at?: unknown; output?: { summary?: unknown } }>)
+      .map((run) => ({ at: typeof run.started_at === 'string' ? run.started_at : '', preview: typeof run.output?.summary === 'string' ? previewOfSummary(run.output.summary) : null }))
+      .filter((run) => run.preview !== null)
+      .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+    const chosenRun = found.find((run) => run.preview?.branch === true) ?? found[0];
+    if (chosenRun?.preview) return json({ url: chosenRun.preview.url });
+  }
+  return json({ url: null });
+}
+
+/** How long one `gh api` read may take before the preview line says nothing was reported. */
+const GH_TIMEOUT_MS = 10_000;
+
+/**
+ * Link them: `stet merge`'s planner and its one batch, on a snapshot-only site.
+ * A refusal answers the planner's lines and writes nothing.
+ */
+async function mergeKeys(req: Request, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  if (ready.mode !== 'snapshot') return json({ error: 'merge works on a snapshot-only site — use stet merge' }, 409);
+  const body = await readJson(req);
+  const plan = await planMerge(ready.path, ready.config, ready.descriptor, ready.snapshot, reqStr(body, 'key'), reqStr(body, 'into'));
+  if ('refused' in plan) return json({ error: plan.refused.join('\n'), lines: plan.refused }, 409);
+  const report = new Report();
+  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, report).filter((p) => p.status !== 'unchanged');
+  try {
+    writePlanned(changed);
+  } catch (error) {
+    rethrowBatchFailure('dashboard merge', error);
+  }
+  return json({ written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) });
+}
+
+/**
+ * Give this place its own key: without `name`, the name the naming rule gives
+ * the place; with it, `stet split`'s planner and its one batch.
+ */
+async function splitPlace(req: Request, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  if (ready.mode !== 'snapshot') return json({ error: 'split works on a snapshot-only site — use stet split' }, 409);
+  const body = await readJson(req);
+  const key = reqStr(body, 'key');
+  const at = parseAt(reqStr(body, 'at'));
+  if (at === null) throw new UsageError('at is <file>:<line>');
+  const name = body['name'];
+  if (name === undefined) return json({ proposed: await proposedSplitName(ready.path, ready.config, ready.descriptor, key, at) });
+  if (typeof name !== 'string' || name === '') throw new UsageError('name is required');
+  const plan = await planSplit(ready.path, ready.config, ready.descriptor, ready.snapshot, key, name, at);
+  if ('refused' in plan) return json({ error: plan.refused.join('\n'), lines: plan.refused }, 409);
+  const report = new Report();
+  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, report).filter((p) => p.status !== 'unchanged');
+  try {
+    writePlanned(changed);
+  } catch (error) {
+    rethrowBatchFailure('dashboard split', error);
+  }
+  return json({ written: changed.map((p) => p.label), key: name, touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) });
 }
 
 /**
@@ -949,6 +1216,277 @@ function history(site: SiteState): Response {
       return { sha, short, author, at, subject };
     });
   return json({ commits });
+}
+
+/** The forms a revision holds, or null where it holds no descriptor. */
+function formsAt(site: Ready, rev: string): { descriptor: Descriptor; snapshot: Snapshot } | null {
+  const descriptor = formAt(site, rev, site.config.descriptorPath, loadDescriptor);
+  if (descriptor === null) return null;
+  return { descriptor, snapshot: formAt(site, rev, site.config.snapshotPath, loadSnapshot) ?? {} };
+}
+
+/** `sha` as a full commit hash, or a usage error: never read as an option. */
+function commitOf(site: Ready, sha: string): string {
+  const found = sha.startsWith('-') ? null : gitData(site.path, ['rev-parse', '--verify', '-q', `${sha}^{commit}`]);
+  if (found === null || found.code !== 0) throw new UsageError(`${sha} is not a commit of this checkout`);
+  return found.stdout.trim();
+}
+
+/**
+ * The keys a commit removed — declared at `<sha>^` and not at `<sha>`, a rename
+ * paired out — with the forms at `<sha>^` they are restored from.
+ */
+function removedKeysOf(site: Ready, sha: string): { keys: string[]; before: { descriptor: Descriptor; snapshot: Snapshot } | null } {
+  const before = formsAt(site, `${sha}^`);
+  const after = formsAt(site, sha);
+  if (before === null || after === null) return { keys: [], before };
+  const all = new Set([...Object.keys(before.descriptor.keys), ...Object.keys(after.descriptor.keys)]);
+  return { keys: keyMoves(before, after, all).removed.sort(), before };
+}
+
+/** The managed documents a revision holds, read from git through the claim pass: no temporary directory is written. */
+function documentsAt(site: Ready, rev: string): HtmlProposalSet {
+  const listed = gitData(site.path, ['ls-tree', '-r', '--name-only', rev, '--', '.']);
+  const files = listed.stdout
+    .split('\n')
+    .filter((file) => file.endsWith('.html') && site.config.managedSurfaces.some((glob) => matchGlob(glob, file)))
+    .sort();
+  const sources: Array<{ file: string; source: string }> = [];
+  for (const file of files) {
+    const shown = gitData(site.path, ['show', `${rev}:./${file}`]);
+    if (shown.code === 0) sources.push({ file, source: shown.stdout });
+  }
+  return proposeHtmlSources(sources);
+}
+
+/** Each key's first mark in a claim pass, in file then document order. */
+function firstMarks(set: HtmlProposalSet, keys: readonly string[]): Map<string, HtmlMark> {
+  const wanted = new Set(keys);
+  const first = new Map<string, HtmlMark>();
+  for (const mark of set.claimed) {
+    if (wanted.has(mark.key) && !first.has(mark.key)) first.set(mark.key, mark);
+  }
+  return first;
+}
+
+/**
+ * `GET site/removed?sha=` — the keys a commit removed, each with the section
+ * the naming rule gives its first mark in the document at `<sha>^` (the item
+ * rule's word, read above a repeated item), else the entry's `section`, and its
+ * default-locale text at `<sha>^`.
+ */
+function removed(url: URL, site: SiteState): Response {
+  const ready = requireReady(site);
+  if (ready.mode !== 'snapshot') return json({ keys: [] });
+  const sha = commitOf(ready, url.searchParams.get('sha') ?? '');
+  const { keys, before } = removedKeysOf(ready, sha);
+  if (before === null || keys.length === 0) return json({ keys: [] });
+  const marks = ready.host === 'html' ? firstMarks(documentsAt(ready, `${sha}^`), keys) : new Map<string, HtmlMark>();
+  const locale = ready.config.locales.default;
+  return json({
+    keys: keys.map((key) => {
+      const value = resolve(before.descriptor, before.snapshot, null, { key, locale }).value;
+      return {
+        key,
+        section: marks.get(key)?.sectionWord ?? before.descriptor.keys[key]?.section ?? null,
+        text: typeof value === 'string' ? value : Array.isArray(value) ? value.join(', ') : '',
+      };
+    }),
+  });
+}
+
+/**
+ * The current forms with each removed key's `<sha>^` entry added back, and its
+ * value in every locale the `<sha>^` snapshot holds; a key declared again since
+ * is skipped and listed.
+ */
+function withRemovedKeys(
+  now: { descriptor: Descriptor; snapshot: Snapshot },
+  before: { descriptor: Descriptor; snapshot: Snapshot },
+  keys: readonly string[],
+): { descriptor: Descriptor; snapshot: Snapshot; skipped: string[] } {
+  const descriptor = structuredClone(now.descriptor);
+  const snapshot = structuredClone(now.snapshot);
+  const skipped: string[] = [];
+  for (const key of keys) {
+    const def = before.descriptor.keys[key];
+    if (Object.hasOwn(descriptor.keys, key) || def === undefined) {
+      skipped.push(key);
+      continue;
+    }
+    descriptor.keys[key] = structuredClone(def);
+    for (const [locale, block] of Object.entries(before.snapshot)) {
+      if (!Object.hasOwn(block, key)) continue;
+      snapshot[locale] = { ...(Object.hasOwn(snapshot, locale) ? snapshot[locale] : {}), [key]: block[key] };
+    }
+  }
+  return { descriptor, snapshot, skipped };
+}
+
+/**
+ * The markup a restore that could not revert the page hands back: for each
+ * removed key's first mark at `<sha>^`, the highest element from the mark's own
+ * up to the element its section word was read from whose marks all name keys
+ * the commit removed — or the mark's own element where that section element
+ * still exists in HEAD's document — sliced from the source, marks included; a
+ * slice inside another of the same file is dropped. A slice never carries a mark
+ * of a key the commit left declared.
+ */
+function markupOf(site: Ready, sha: string, keys: readonly string[]): Array<{ file: string; section: string | null; text: string }> {
+  const before = documentsAt(site, `${sha}^`);
+  const marks = firstMarks(before, keys);
+  const removed = new Set(keys);
+  /** Whether every mark inside `el` (itself included) names a removed key. */
+  const onlyRemoved = (file: string, el: Element): boolean =>
+    before.claimed.every(
+      (m) => m.file !== file || m.element.openStart < el.openStart || m.element.closeEnd > el.closeEnd || removed.has(m.key),
+    );
+  /** From the mark's element up to `section`, the highest ancestor holding only removed keys' marks. */
+  const climb = (mark: HtmlMark, section: Element): Element => {
+    const parents = parentsOf(mark.document);
+    let found = mark.element;
+    for (let at = parents.get(mark.element); at !== undefined && found !== section; at = parents.get(at)) {
+      if (!onlyRemoved(mark.file, at)) break;
+      found = at;
+    }
+    return found;
+  };
+  const head = documentsAt(site, 'HEAD');
+  const stillThere = (file: string, el: Element, word: string | null): boolean => {
+    const document = head.documents.find((d) => d.file === file);
+    if (document === undefined) return false;
+    const id = el.attrs.find((a) => a.name === 'id')?.value;
+    const parents = parentsOf(document);
+    const all = document.roots.flatMap((root) => [root, ...root.descendants]);
+    return all.some(
+      (other) =>
+        other.tag === el.tag &&
+        (id !== undefined ? other.attrs.find((a) => a.name === 'id')?.value === id : sectionWordOf(other, parents) === word),
+    );
+  };
+  const slices: Array<{ file: string; section: string | null; el: Element; source: string }> = [];
+  for (const mark of marks.values()) {
+    const section = mark.sectionElement;
+    const el = section === undefined || stillThere(mark.file, section, mark.sectionWord) ? mark.element : climb(mark, section);
+    if (slices.some((s) => s.file === mark.file && s.el === el)) continue;
+    slices.push({ file: mark.file, section: mark.sectionWord, el, source: mark.document.source });
+  }
+  const inside = (a: (typeof slices)[number], b: (typeof slices)[number]): boolean =>
+    a !== b && a.file === b.file && b.el.openStart <= a.el.openStart && a.el.closeEnd <= b.el.closeEnd;
+  return slices
+    .filter((slice) => !slices.some((other) => inside(slice, other)))
+    .sort((a, b) => a.file.localeCompare(b.file) || a.el.openStart - b.el.openStart)
+    .map((slice) => ({ file: slice.file, section: slice.section, text: slice.source.slice(slice.el.openStart, slice.el.closeEnd) }));
+}
+
+/** The files a revision holds changes to, among `files` (paths from the repository's top), as `git status` names them. */
+function changedAmong(cwd: string, files: readonly string[]): string[] {
+  if (files.length === 0) return [];
+  const status = gitData(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...files.map((f) => `:(top,literal)${f}`)]);
+  const records = status.stdout.split('\0');
+  const names: string[] = [];
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i] ?? '';
+    if (record.length < 4) continue;
+    names.push(record.slice(3));
+    // A rename carries its source path as the next record.
+    if (record[0] === 'R' || record[0] === 'C') i += 1;
+  }
+  return names;
+}
+
+/**
+ * `POST site/restore {sha}` — the keys a commit removed, back. The commit is
+ * reverted where git can; where later commits changed the same lines the revert
+ * is aborted and the keys alone come back, with the removed markup for the
+ * operator to paste. Nothing runs over uncommitted stet files, staged changes,
+ * uncommitted changes to a file the commit touched, or a git operation.
+ */
+async function restore(req: Request, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  if (ready.mode !== 'snapshot') return json({ error: "restore works on a snapshot-only site's commits" }, 409);
+  const body = await readJson(req);
+  const sha = commitOf(ready, reqStr(body, 'sha'));
+  const refuse = (error: string, output?: string): Response =>
+    json({ error, ...(output === undefined ? {} : { output }), at: gitState(ready.path), pending: pendingForms(ready) }, 409);
+  const { keys, before } = removedKeysOf(ready, sha);
+  if (before === null || keys.length === 0) throw new UsageError(`${sha.slice(0, 7)} removed no key`);
+  if (operationInProgress(ready.path)) return refuse('a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal');
+  if (pendingForms(ready).length > 0) return refuse('Restore waits for the uncommitted stet files — commit them first');
+  // The revert's commit takes the whole index, so a staged change would ride along.
+  if (gitData(ready.path, ['diff', '--cached', '--quiet']).code !== 0) return refuse('Restore waits for the staged changes — commit or unstage them first');
+  const touched = gitData(ready.path, ['diff', '--name-only', `${sha}^`, sha]).stdout.split('\n').filter((f) => f !== '');
+  const dirty = changedAmong(ready.path, touched);
+  if (dirty.length > 0) return refuse(`Restore waits for the uncommitted changes to ${dirty.join(', ')} — commit or discard them first`);
+
+  const short = git(ready.path, ['rev-parse', '--short', sha]).out.trim();
+  const message = `stet: restore ${plural(keys.length, 'key')} removed by ${short}`;
+  const done = (restored: { skipped: string[]; markup: unknown }): Response =>
+    json({
+      restored: keys.filter((key) => !restored.skipped.includes(key)),
+      skipped: restored.skipped,
+      markup: restored.markup,
+      sha: git(ready.path, ['rev-parse', 'HEAD']).out.trim(),
+      short: git(ready.path, ['rev-parse', '--short', 'HEAD']).out.trim(),
+      subject: git(ready.path, ['log', '-1', '--format=%s']).out.trim(),
+      at: gitState(ready.path),
+      pending: pendingForms(ready),
+    });
+  const report = new Report();
+
+  const reverted = await gitRun(ready.path, ['revert', '--no-commit', '--', sha]);
+  if (reverted.code === 0) {
+    // The revert holds the commit undone; a key a later commit moved the same
+    // entries around is still missing, and is added back into the same index.
+    const abort = async (error: string, output?: string): Promise<Response> => {
+      await gitRun(ready.path, ['revert', '--abort']);
+      return refuse(error, output);
+    };
+    let now: { descriptor: Descriptor; snapshot: Snapshot };
+    try {
+      now = {
+        descriptor: loadDescriptor(JSON.parse(readFileSync(join(ready.path, ready.config.descriptorPath), 'utf8'))),
+        snapshot: loadSnapshot(JSON.parse(readFileSync(join(ready.path, ready.config.snapshotPath), 'utf8'))),
+      };
+    } catch (error) {
+      return abort(`the reverted forms cannot be read: ${(error as Error).message}`);
+    }
+    if (keys.some((key) => !Object.hasOwn(now.descriptor.keys, key))) {
+      const next = withRemovedKeys(now, before, keys);
+      const { written } = applyForms(ready.path, ready.config, next.descriptor, next.snapshot, report, 'dashboard restore');
+      const staged = await gitRun(ready.path, ['add', '--', ...written.map((file) => `:(literal)${file}`)]);
+      if (staged.code !== 0) return abort('git add failed', staged.out);
+    }
+    const made = await gitRun(ready.path, ['commit', '-m', message]);
+    if (made.code !== 0) return abort('git commit failed', made.out);
+    return done({ skipped: [], markup: null });
+  }
+  // A revert that refused to start (an unstaged edit it would overwrite) wrote
+  // nothing; only a conflict leaves REVERT_HEAD, and only a conflict takes the
+  // keys-alone path.
+  if (gitData(ready.path, ['rev-parse', '-q', '--verify', 'REVERT_HEAD']).code !== 0) return refuse('git revert failed', reverted.out);
+  const aborted = await gitRun(ready.path, ['revert', '--abort']);
+  if (aborted.code !== 0) return refuse('git revert --abort failed — finish it in the terminal', aborted.out);
+
+  const next = withRemovedKeys({ descriptor: ready.descriptor, snapshot: ready.snapshot }, before, keys);
+  try {
+    loadDescriptorWithWarnings(structuredClone(next.descriptor));
+  } catch (error) {
+    if (!(error instanceof DescriptorError)) throw error;
+    return refuse(`cannot restore: ${error.path} — ${error.message}; nothing written`);
+  }
+  const markup =
+    ready.host === 'html'
+      ? markupOf(ready, sha, keys)
+      : touched.map((file) => ({ file, section: null, text: git(ready.path, ['show', short, '--', `:(top,literal)${file}`]).out }));
+  const { written } = applyForms(ready.path, ready.config, next.descriptor, next.snapshot, report, 'dashboard restore');
+  // The commit route's own pair: intent to add, then a commit limited to the forms.
+  const literal = written.map((file) => `:(literal)${file}`);
+  const intent = await gitRun(ready.path, ['add', '-N', '--', ...literal]);
+  if (intent.code !== 0) return refuse('git commit failed', intent.out);
+  const made = await gitRun(ready.path, ['commit', '-m', message, '--', ...literal]);
+  if (made.code !== 0) return json({ error: 'git commit failed', output: made.out, markup, at: gitState(ready.path), pending: pendingForms(ready) }, 409);
+  return done({ skipped: next.skipped, markup });
 }
 
 /**

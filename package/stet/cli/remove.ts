@@ -212,15 +212,7 @@ export function planRemoval(
     }
   }
 
-  // A config-level test over the default block and every declared environment:
-  // a host with a snapshot default and a pg prod block still has live rows to
-  // care about. The command never dials — structurally it cannot.
-  if ([config.store, ...Object.values(config.environments ?? {})].some(isStoreBacked)) {
-    report.line(
-      'store rows for removed keys are kept — audit names them as orphans; ' +
-        'an open draft for a removed key still publishes with its change — discard it first',
-    );
-  }
+  storeRowsLine(config, report);
 
   // NEW warnings only. A slot warn the descriptor already carried has printed
   // once, bare, through `descriptorOf`'s fold, and re-printing it with a remedy
@@ -233,6 +225,22 @@ export function planRemoval(
   }
 
   return { cleaned, cleanedSnapshot };
+}
+
+/**
+ * Where a store is declared, its rows under a key the forms drop stay: the line
+ * saying so, which `merge` prints too. A config-level test over the default
+ * block and every declared environment: a host with a snapshot default and a pg
+ * prod block still has live rows to care about. The command never dials —
+ * structurally it cannot.
+ */
+export function storeRowsLine(config: StetConfig, report: Report): void {
+  if ([config.store, ...Object.values(config.environments ?? {})].some(isStoreBacked)) {
+    report.line(
+      'store rows for removed keys are kept — audit names them as orphans; ' +
+        'an open draft for a removed key still publishes with its change — discard it first',
+    );
+  }
 }
 
 /**

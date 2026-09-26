@@ -10,17 +10,20 @@
  * A register plan belongs to the tree that produced it: `made` holds the hash of
  * the descriptor, the snapshot and every managed file the run read, and a plan
  * whose files have changed is refused, because its proposals, their numbers and
- * their places are that tree's. A rename plan is written by hand or by an agent
- * and carries no `made`; its entries are checked against the descriptor as it
- * stands.
+ * their places are that tree's. A rename plan `rename --propose` wrote carries
+ * `made` over `renameInputs` and is held to it the same way; one written by hand
+ * or by an agent carries none, and its entries are checked against the
+ * descriptor as it stands.
  */
 
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import { CONTROL_CHARACTERS } from '../src/contacts.js';
 import type { Descriptor } from '../src/types.js';
+import type { StetConfig } from './config.js';
+import { filesForGlobs } from './files.js';
 import { NAME_PART } from './key-names.js';
 import type { CliIo } from './main.js';
 import { CliError, type Report } from './report.js';
@@ -43,7 +46,7 @@ export interface PlanEntry {
   key: string;
   label: string | null;
   help: string | null;
-  /** register: the section word written to the entry, `null` for none. */
+  /** The section word written to the entry, `null` for none (rename: `null` removes it, absent leaves it). */
   section?: string | null;
   /** register: `false` leaves the proposal out of the run. */
   adopt?: boolean;
@@ -56,7 +59,7 @@ export interface PlanEntry {
 export interface NamingPlan {
   plan: PlanCommand;
   version: 1;
-  /** register: repo-relative path → `sha256:<hex>` of every file the run read. */
+  /** repo-relative path → `sha256:<hex>` of every file the run read (register, and `rename --propose`). */
   made?: Record<string, string>;
   keys: PlanEntry[];
 }
@@ -72,6 +75,58 @@ export const SECTION_WORD_MAX = 24;
 /** The hash `made` records for one file. */
 export function fileHash(cwd: string, rel: string): string {
   return `sha256:${createHash('sha256').update(readFileSync(join(cwd, rel))).digest('hex')}`;
+}
+
+/** The `made` map of a plan: every file the run reads, hashed. */
+export function madeHashes(cwd: string, config: StetConfig, files: string[]): Record<string, string> {
+  const made: Record<string, string> = {};
+  for (const rel of [...new Set([config.descriptorPath, config.snapshotPath, ...files])].sort()) {
+    if (existsSync(join(cwd, rel))) made[rel] = fileHash(cwd, rel);
+  }
+  return made;
+}
+
+/**
+ * The one pinned list a rename plan's `made` covers, which `rename --propose`
+ * hashes and `rename --plan` recomputes: the descriptor, the snapshot, every
+ * file the managed surfaces match and every copy module.
+ */
+export function renameInputs(cwd: string, config: StetConfig): string[] {
+  return [
+    ...new Set([
+      config.descriptorPath,
+      config.snapshotPath,
+      ...filesForGlobs(cwd, config.managedSurfaces),
+      ...filesForGlobs(cwd, config.copyModules),
+    ]),
+  ].sort();
+}
+
+/** A place as a plan lists it: `index.html:467 <h1>`, `index.html:9 <meta> og:description`. */
+export function placeLine(place: { file: string; line: number; tag?: string; attr?: string; meta?: string }): string {
+  const what = place.tag === undefined ? '' : ` <${place.tag}>`;
+  const attr = place.attr === undefined ? '' : place.meta === undefined ? ` ${place.attr}` : ` ${place.meta}`;
+  return `${place.file}:${place.line}${what}${attr}`;
+}
+
+/**
+ * A plan's output file names a new file or an earlier plan. Any other file that
+ * exists is refused — the descriptor, the snapshot, the config, a managed file,
+ * a copy module, a codegen or read-path file, under whatever spelling a
+ * case-insensitive disk or a link gives it — because the check reads the file
+ * itself, never its name. `flag` is the option the caller names it by.
+ */
+export function refusePlanOut(cwd: string, planOut: string, flag = '--plan-out'): void {
+  const target = resolve(cwd, planOut);
+  if (!existsSync(target)) return;
+  let marker: unknown;
+  try {
+    marker = (JSON.parse(readFileSync(target, 'utf8')) as { plan?: unknown } | null)?.plan;
+  } catch {
+    marker = undefined;
+  }
+  if (marker === 'stet register' || marker === 'stet rename') return;
+  throw new CliError(`${flag} ${planOut}: the file exists and is not a stet plan — name a new file, or an earlier plan to replace`);
 }
 
 /** The plan as JSON text, two-space indented with a closing newline — a file an agent reads and edits. */
@@ -113,8 +168,9 @@ export function readPlan(cwd: string, rel: string, command: PlanCommand): Naming
  *
  * `ids` is what the entries must cover: register's proposed names (every one
  * listed, none foreign), or for rename the descriptor's keys (every entry's old
- * name declared). `hashes` is register's current `made` map; rename passes
- * none. `refusal` is the caller's own line for an entry — rename's slot and
+ * name declared). `hashes` is the current `made` map over the plan's inputs:
+ * register's always, rename's where the plan carries `made` (a hand-written or
+ * pair plan carries none and is not checked). `refusal` is the caller's own line for an entry — rename's slot and
  * brand keys — which, where it answers, is that entry's one problem.
  */
 export function planProblems(
@@ -128,13 +184,18 @@ export function planProblems(
   const register = plan.plan === 'stet register';
   const idOf = (e: PlanEntry): string => (register ? e.proposed : e.old) as string;
 
-  // Rule 6: the tree the plan was made from.
-  if (register) {
+  // Rule 6: the tree the plan was made from — a register plan always, a rename
+  // plan where `--propose` recorded it.
+  if (register || plan.made !== undefined) {
     const made = plan.made ?? {};
     const now = options.hashes ?? {};
     const paths = new Set([...Object.keys(made), ...Object.keys(now)]);
     if ([...paths].some((path) => made[path] !== now[path])) {
-      problems.push(`${rel}: the files it was made from have changed — run the command with --plan-out again`);
+      problems.push(
+        register
+          ? `${rel}: the files it was made from have changed — run the command with --plan-out again`
+          : `${rel}: the files it was made from have changed — run stet rename --propose again`,
+      );
       return problems;
     }
   }
@@ -182,7 +243,7 @@ export function planProblems(
     if (sharing.length > 1 && sharing[0] === id) {
       problems.push(`${sharing.join(' and ')}: both are named "${e.key}"`);
     }
-    // Rule 4: the words, and a register entry's section word.
+    // Rule 4: the words, and the entry's section word.
     for (const [field, value, max] of [
       ['label', e.label, LABEL_MAX],
       ['help', e.help, HELP_MAX],
@@ -193,7 +254,7 @@ export function planProblems(
       else if (PLAN_CONTROL.test(value)) problems.push(`${id}: its ${field} holds a control character`);
       else if (value.length > max) problems.push(`${id}: its ${field} is longer than ${max} characters`);
     }
-    if (register && e.section !== null && e.section !== undefined) {
+    if (e.section !== null && e.section !== undefined) {
       if (typeof e.section !== 'string' || !NAME_PART.test(e.section) || e.section.length > SECTION_WORD_MAX) {
         problems.push(
           `${id}: its section "${String(e.section)}" is not a section word — lowercase letters and digits in words joined by single underscores, at most ${SECTION_WORD_MAX} characters`,

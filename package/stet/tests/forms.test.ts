@@ -327,36 +327,99 @@ describe('the join route', () => {
     });
   });
 
-  it('stores a page as its origin and path, and only from a trusted origin', async () => {
+  it('stores a page as its origin and path, and its origin is always the one the Origin header asserts', async () => {
     const h = await harness();
     const stored = async (email: string, body: object, referer?: string): Promise<string | null | undefined> => {
       const res = await h.forms.POST(joinRequest('managed-sending', { email, ...body }, { referer }));
       expect(res.status).toBe(200);
       return (await membership(h, email))?.page;
     };
-    expect(await stored('a@x.co', { page: 'https://evil.example/x' })).toBeNull();
+    // A page claimed for another site stores the asserted origin alone.
+    expect(await stored('a@x.co', { page: 'https://evil.example/x' })).toBe(`${SITE}/`);
     expect(await stored('b@x.co', {}, `${SITE}/waitlist?ref=1`)).toBe(`${SITE}/waitlist`);
     expect(await stored('c@x.co', { page: 'https://user:pw@getstet.xyz/waitlist?utm=x&t=secret#top' })).toBe(
       `${SITE}/waitlist`,
     );
-    expect(await stored('d@x.co', {}, 'https://evil.example/waitlist')).toBeNull();
+    expect(await stored('d@x.co', {}, 'https://evil.example/waitlist')).toBe(`${SITE}/`);
     // A blob URL's origin is the trusted page that made it; its path is a whole URL.
-    expect(await stored('e@x.co', { page: `blob:${SITE}/5b1c-4e2a` })).toBeNull();
-    expect(await stored('f@x.co', {}, `blob:${SITE}/5b1c-4e2a`)).toBeNull();
+    expect(await stored('e@x.co', { page: `blob:${SITE}/5b1c-4e2a` })).toBe(`${SITE}/`);
+    expect(await stored('f@x.co', {}, `blob:${SITE}/5b1c-4e2a`)).toBe(`${SITE}/`);
+    // With no Origin — a server-side post — a page from an origin the route does not list is none.
+    const serverSide = async (email: string, body: object, referer?: string): Promise<string | null | undefined> => {
+      const res = await h.forms.POST(joinRequest('managed-sending', { email, ...body }, { referer, origin: null }));
+      expect(res.status).toBe(200);
+      return (await membership(h, email))?.page;
+    };
+    expect(await serverSide('g@x.co', { page: 'https://evil.example/x' })).toBeNull();
+    expect(await serverSide('h@x.co', {}, `${SITE}/waitlist?ref=1`)).toBe(`${SITE}/waitlist`);
+    expect(await serverSide('i@x.co', { page: 'https://user:pw@getstet.xyz/waitlist?utm=x#top' })).toBe(`${SITE}/waitlist`);
   });
 
-  it('keeps a trusted page of 2000 characters and stores one of 2001 as null', async () => {
+  it('keeps a page of 2000 characters, stores the origin for one of 2001, and none for it with no Origin', async () => {
     const h = await harness();
     const long = (n: number): string => `${SITE}/${'p'.repeat(n - SITE.length - 1)}`;
     for (const [email, page, stored] of [
       ['a@x.co', long(2000), long(2000)],
-      ['b@x.co', long(2001), null],
+      ['b@x.co', long(2001), `${SITE}/`],
     ] as const) {
       const res = await h.forms.POST(joinRequest('managed-sending', { email, page }));
       expect(res.status).toBe(200);
       expect((await membership(h, email))?.page).toBe(stored);
     }
+    const serverSide = await h.forms.POST(joinRequest('managed-sending', { email: 'c@x.co', page: long(2001) }, { origin: null }));
+    expect(serverSide.status).toBe(200);
+    expect((await membership(h, 'c@x.co'))?.page).toBeNull();
     expect(long(2001)).toHaveLength(2001);
+  });
+
+  describe('with no allowedOrigins, any site joins, and the stored page is the one its Origin asserts', () => {
+    const APP = 'https://app.example.com';
+    const open = () => harness({ allowedOrigins: undefined, unsubscribeBase: `${APP}/api/stet` });
+    const joinFrom = (h: Harness, email: string, origin: string | null, page?: string) =>
+      h.forms.POST(joinRequest('managed-sending', { email, ...(page === undefined ? {} : { page }) }, { origin, url: `${APP}/api/stet/join/managed-sending` }));
+
+    it('answers a preflight and a join from another site, storing its page without the query', async () => {
+      const h = await open();
+      const preflight = await h.forms.OPTIONS(
+        new Request(`${APP}/api/stet/join/managed-sending`, { method: 'OPTIONS', headers: { origin: 'https://example.com' } }),
+      );
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get('access-control-allow-origin')).toBe('https://example.com');
+      const res = await joinFrom(h, 'ana@x.co', 'https://example.com', 'https://example.com/pricing?utm=x');
+      expect(res.status).toBe(200);
+      expect(res.headers.get('access-control-allow-origin')).toBe('https://example.com');
+      expect((await membership(h, 'ana@x.co'))?.page).toBe('https://example.com/pricing');
+      expect(h.joins.map((e) => e.page)).toEqual(['https://example.com/pricing']);
+    });
+
+    it('stores a page claimed for another site as the asserting origin, and none for Origin: null', async () => {
+      const h = await open();
+      const page = async (email: string, origin: string | null, claimed: string): Promise<string | null | undefined> => {
+        expect((await joinFrom(h, email, origin, claimed)).status).toBe(200);
+        return (await membership(h, email))?.page;
+      };
+      expect(await page('a@x.co', 'https://evil.example', 'https://example.com/pricing')).toBe('https://evil.example/');
+      expect(await page('b@x.co', 'null', 'https://example.com/pricing')).toBeNull();
+      expect(await page('c@x.co', null, `${APP}/signup`)).toBe(`${APP}/signup`);
+      expect(await page('d@x.co', null, 'https://evil.example/x')).toBeNull();
+      // The handler's own page claimed under a foreign Origin is that Origin's.
+      expect(await page('e@x.co', 'https://evil.example', `${APP}/signup`)).toBe('https://evil.example/');
+      // An Origin header that is no canonical origin asserts none.
+      expect(await page('f@x.co', 'https://a.example/x', 'https://a.example/x/pricing')).toBeNull();
+      const long = `https://example.com/${'p'.repeat(2100)}`;
+      expect(await page('g@x.co', 'https://example.com', long)).toBe('https://example.com/');
+    });
+
+    it('still refuses what allowedOrigins narrows, preflight and join alike, and Origin: null with it', async () => {
+      const h = await harness({ allowedOrigins: ['https://example.com'], unsubscribeBase: `${APP}/api/stet` });
+      const preflight = await h.forms.OPTIONS(
+        new Request(`${APP}/api/stet/join/managed-sending`, { method: 'OPTIONS', headers: { origin: 'https://evil.example' } }),
+      );
+      expect(preflight.status).toBe(403);
+      expect(await answered(await joinFrom(h, 'a@x.co', 'https://evil.example'))).toEqual({ status: 403, body: { ok: false, error: 'origin_refused' } });
+      expect(await answered(await joinFrom(h, 'b@x.co', 'null'))).toEqual({ status: 403, body: { ok: false, error: 'origin_refused' } });
+      expect((await joinFrom(h, 'c@x.co', 'https://example.com', 'https://example.com/a')).status).toBe(200);
+    });
   });
 
   it('takes its own origin from unsubscribeBase, never from the request’s URL', async () => {

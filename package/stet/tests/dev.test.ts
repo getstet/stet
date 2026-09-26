@@ -44,13 +44,15 @@ import { Report } from '../cli/report.js';
 import {
   captured,
   createDevHandler,
+  githubRepoOf,
+  previewOfSummary,
   stopEveryChild,
   withEnvFilesHint,
   type DevContext,
 } from '../cli/dev-routes.js';
 import { packageRoot } from '../cli/installed.js';
 import { dashboardPage, runDev, startDevServer, type DevServerHandle } from '../cli/dev.js';
-import { git, gitData, gitRun, gitState, operationInProgress, uncommittedPaths } from '../cli/git.js';
+import { git, gitData, gitRun, gitState, operationInProgress, pushRemoteOf, uncommittedPaths } from '../cli/git.js';
 import { runHookInstall } from '../cli/hook.js';
 import { gone } from '../cli/liveness.js';
 import { runCli, type CliIo } from '../cli/main.js';
@@ -98,6 +100,14 @@ function gitInit(cwd: string): void {
   git(cwd, ['config', 'commit.gpgsign', 'false']);
   git(cwd, ['add', '-A']);
   git(cwd, ['commit', '-qm', 'base']);
+}
+
+/** A bare repository added to `cwd` as the remote `name`; answers its path. */
+function bareRemote(cwd: string, name: string): string {
+  const bare = tempDir('stet-bare-');
+  git(bare, ['init', '-q', '--bare']);
+  git(cwd, ['remote', 'add', name, bare]);
+  return bare;
 }
 
 /** The mini project as a committed git checkout. */
@@ -155,7 +165,74 @@ describe('git', () => {
     writeFileSync(join(host.cwd, 'notes.txt'), 'stray\n', 'utf8');
     expect(gitState(host.cwd).dirty).toBe(true);
 
-    expect(gitState(tempDir())).toEqual({ head: null, branch: null, dirty: false });
+    expect(gitState(tempDir())).toEqual({
+      head: null,
+      branch: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      dirty: false,
+      detached: false,
+    });
+  });
+
+  it('reads the head as seven hex digits, an unborn branch as null', () => {
+    const host = gitHost();
+    expect(gitState(host.cwd).head).toMatch(/^[0-9a-f]{7}$/);
+    const unborn = tempDir();
+    git(unborn, ['init', '-q']);
+    expect(gitState(unborn)).toMatchObject({ head: null, upstream: null, ahead: 0 });
+  });
+
+  it('reads the upstream and the ahead count, and a pruned or absent upstream as none', () => {
+    const host = gitHost();
+    const bare = bareRemote(host.cwd, 'origin');
+    const branch = gitState(host.cwd).branch as string;
+    // A branch with no upstream.
+    expect(gitState(host.cwd)).toMatchObject({ upstream: null, ahead: 0, behind: 0 });
+    expect(git(host.cwd, ['push', '-q', '-u', 'origin', branch]).code).toBe(0);
+    expect(gitState(host.cwd)).toMatchObject({ upstream: `origin/${branch}`, ahead: 0, behind: 0 });
+    // One commit ahead.
+    writeFileSync(join(host.cwd, 'notes.txt'), 'ahead\n', 'utf8');
+    git(host.cwd, ['add', '--', 'notes.txt']);
+    git(host.cwd, ['commit', '-qm', 'ahead']);
+    expect(gitState(host.cwd)).toMatchObject({ upstream: `origin/${branch}`, ahead: 1, behind: 0 });
+    // The upstream deleted on the remote and pruned: git still names it, with no count.
+    git(bare, ['branch', '-D', branch]);
+    git(host.cwd, ['fetch', '-q', '--prune', 'origin']);
+    expect(gitState(host.cwd)).toMatchObject({ upstream: null, ahead: 0 });
+  });
+
+  it('reads a detached HEAD as no branch', () => {
+    const host = gitHost();
+    git(host.cwd, ['checkout', '-q', '--detach']);
+    expect(gitState(host.cwd)).toMatchObject({ branch: null, detached: true });
+    expect(gitState(host.cwd).head).toMatch(/^[0-9a-f]{7}$/);
+  });
+
+  it('chooses the push remote in git’s own order', () => {
+    const host = gitHost();
+    const branch = gitState(host.cwd).branch as string;
+    expect(pushRemoteOf(host.cwd, branch)).toEqual({ error: 'this checkout has no remote' });
+    bareRemote(host.cwd, 'up');
+    expect(pushRemoteOf(host.cwd, branch)).toEqual({ remote: 'up' });
+    bareRemote(host.cwd, 'other');
+    expect(pushRemoteOf(host.cwd, branch)).toEqual({ error: `several remotes and none chosen for ${branch}: other, up` });
+    bareRemote(host.cwd, 'origin');
+    expect(pushRemoteOf(host.cwd, branch)).toEqual({ remote: 'origin' });
+    git(host.cwd, ['config', `branch.${branch}.remote`, 'origin']);
+    git(host.cwd, ['config', 'remote.pushDefault', 'other']);
+    expect(pushRemoteOf(host.cwd, branch)).toEqual({ remote: 'other' });
+    git(host.cwd, ['config', `branch.${branch}.pushRemote`, 'up']);
+    expect(pushRemoteOf(host.cwd, branch)).toEqual({ remote: 'up' });
+  });
+
+  it('names the remotes a and b when neither is chosen', () => {
+    const host = gitHost();
+    const branch = gitState(host.cwd).branch as string;
+    bareRemote(host.cwd, 'a');
+    bareRemote(host.cwd, 'b');
+    expect(pushRemoteOf(host.cwd, branch)).toEqual({ error: `several remotes and none chosen for ${branch}: a, b` });
   });
 
   it('ends a timed-out git and the hook it spawned, and leaves no lock behind', async () => {
@@ -2032,36 +2109,108 @@ describe('POST /api/site/commit and /push', () => {
     expect((await committing).status).toBe(200);
   });
 
-  it('answers git’s own text with no upstream, and lands the commit with one', async () => {
+  /** Save and commit one headline through the routes, so the branch holds a commit to push. */
+  async function commitHeadline(handler: (r: Request) => Promise<Response>, host: CliHost, value: string): Promise<void> {
+    const saved = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'hero_headline', value }] });
+    await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['written'] as string[], keys: ['hero_headline'] });
+  }
+
+  it('pushes a branch with no upstream with -u to origin, then lands the next commit on it (journey B18)', async () => {
     const host = snapshotHost();
+    git(host.cwd, ['checkout', '-qb', 'develop']);
     const { handler } = handlerOver([host.cwd]);
-    const saved = await post(handler, `/api/site/save${at(host)}`, {
-      values: [{ key: 'hero_headline', value: 'Pushed' }],
-    });
-    await post(handler, `/api/site/commit${at(host)}`, {
-      files: saved.body['written'] as string[],
-      keys: ['hero_headline'],
-    });
+    await commitHeadline(handler, host, 'Pushed');
+    const bare = bareRemote(host.cwd, 'origin');
 
-    const bare = join(tempDir(), 'origin.git');
-    git(tempDir(), ['init', '--bare', '-q', bare]);
-    git(host.cwd, ['remote', 'add', 'origin', bare]);
-    const noUpstream = await post(handler, `/api/site/push${at(host)}`, {});
-    expect(noUpstream.status).toBe(409);
-    expect(String(noUpstream.body['output'])).toContain('no upstream branch');
+    const first = await post(handler, `/api/site/push${at(host)}`, {});
+    expect(first.status).toBe(200);
+    expect(first.body['upstream']).toBe('origin');
+    expect(first.body['branch']).toBe('develop');
+    expect(String(first.body['output'])).toContain('develop');
+    expect(first.body['at']).toMatchObject({ branch: 'develop', upstream: 'origin/develop', ahead: 0 });
+    expect(git(host.cwd, ['config', '--get', 'branch.develop.remote']).out.trim()).toBe('origin');
 
-    const branch = gitState(host.cwd).branch as string;
-    git(host.cwd, ['push', '-u', 'origin', branch]);
-    const second = await post(handler, `/api/site/save${at(host)}`, {
-      values: [{ key: 'hero_headline', value: 'Pushed again' }],
-    });
-    await post(handler, `/api/site/commit${at(host)}`, {
-      files: second.body['written'] as string[],
-      keys: ['hero_headline'],
-    });
+    await commitHeadline(handler, host, 'Pushed again');
+    const second = await post(handler, `/api/site/push${at(host)}`, {});
+    expect(second.status).toBe(200);
+    expect(second.body['upstream']).toBeUndefined();
+    expect(second.body['at']).toMatchObject({ upstream: 'origin/develop', ahead: 0 });
+    expect(git(bare, ['rev-parse', 'develop']).out.trim()).toBe(git(host.cwd, ['rev-parse', 'HEAD']).out.trim());
+  });
+
+  it('pushes to remote.pushDefault over branch.<b>.remote, git’s own order', async () => {
+    const host = snapshotHost();
+    git(host.cwd, ['checkout', '-qb', 'develop']);
+    const { handler } = handlerOver([host.cwd]);
+    bareRemote(host.cwd, 'origin');
+    const other = bareRemote(host.cwd, 'other');
+    git(host.cwd, ['config', 'remote.pushDefault', 'other']);
+    git(host.cwd, ['config', 'branch.develop.remote', 'origin']);
+    git(host.cwd, ['config', 'branch.develop.merge', 'refs/heads/develop']);
     const pushed = await post(handler, `/api/site/push${at(host)}`, {});
     expect(pushed.status).toBe(200);
-    expect(git(bare, ['rev-parse', 'HEAD']).out.trim()).toBe(git(host.cwd, ['rev-parse', 'HEAD']).out.trim());
+    expect(pushed.body['upstream']).toBe('other');
+    expect(git(other, ['rev-parse', 'develop']).out.trim()).toBe(git(host.cwd, ['rev-parse', 'HEAD']).out.trim());
+  });
+
+  it('refuses several remotes none of which is chosen, naming them, and pushes nothing', async () => {
+    const host = snapshotHost();
+    git(host.cwd, ['checkout', '-qb', 'develop']);
+    const { handler } = handlerOver([host.cwd]);
+    const a = bareRemote(host.cwd, 'a');
+    const b = bareRemote(host.cwd, 'b');
+    const refused = await post(handler, `/api/site/push${at(host)}`, {});
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('cannot push develop: several remotes and none chosen for develop: a, b');
+    expect(refused.body['at']).toMatchObject({ branch: 'develop', upstream: null });
+    for (const bare of [a, b]) expect(gitData(bare, ['rev-parse', '--verify', '-q', 'develop']).code).not.toBe(0);
+  });
+
+  it('refuses a checkout with no remote', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const branch = gitState(host.cwd).branch as string;
+    const refused = await post(handler, `/api/site/push${at(host)}`, {});
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe(`cannot push ${branch}: this checkout has no remote`);
+  });
+
+  it('refuses a detached HEAD and pushes nothing', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const bare = bareRemote(host.cwd, 'origin');
+    git(host.cwd, ['checkout', '-q', '--detach']);
+    const refused = await post(handler, `/api/site/push${at(host)}`, {});
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('HEAD is detached — check out a branch to push');
+    expect(git(bare, ['for-each-ref']).out.trim()).toBe('');
+  });
+
+  it('answers git’s own text when the push fails', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    git(host.cwd, ['remote', 'add', 'origin', join(tempDir(), 'missing.git')]);
+    const failed = await post(handler, `/api/site/push${at(host)}`, {});
+    expect(failed.status).toBe(409);
+    expect(failed.body['error']).toBe('git push failed');
+    expect(String(failed.body['output'])).toMatch(/does not appear to be a git repository|not found/);
+    expect(failed.body['at']).toMatchObject({ upstream: null });
+  });
+
+  it('carries the live branch in the site reply: the remote’s HEAD symref, else null', async () => {
+    const host = snapshotHost();
+    const branch = gitState(host.cwd).branch as string;
+    const { handler } = handlerOver([host.cwd]);
+    const site = async (): Promise<Record<string, any>> =>
+      (await (await handler(req(`/api/site${at(host)}`))).json()) as Record<string, any>;
+    expect((await site()).git.live).toBeNull();
+    bareRemote(host.cwd, 'origin');
+    git(host.cwd, ['push', '-q', '-u', 'origin', branch]);
+    expect((await site()).git.live).toBeNull();
+    git(host.cwd, ['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${branch}`]);
+    const read = await site();
+    expect(read.git.live).toBe(branch);
+    expect(read.git).toMatchObject({ branch, upstream: `origin/${branch}` });
   });
 });
 
@@ -2523,6 +2672,718 @@ describe('the committable files', () => {
   }
 });
 
+const START = 'Start a conversation ↗';
+const BOOK = 'Book an introductory call ↗';
+/**
+ * psyon.ai's forms at 3ca2faf: the header's button key in three places, the
+ * contact button's own words in one, the nav's third link marked again in the
+ * footer beside two footer links; a brand key and a derived key holding the
+ * header's words, neither of which a save may link.
+ */
+const PSYON_FORMS_PAGE = [
+  '<!DOCTYPE html>',
+  '<html><head><title data-stet="home_page_title">Psyon data partnerships</title></head><body>',
+  `<header><a href="#c" data-stet="home_header_link_text">${START}</a></header>`,
+  `<section id="about"><h2>About</h2><a href="#c" data-stet="home_header_link_text">${START}</a></section>`,
+  `<section id="contact"><h2>Contact</h2><a href="#c" data-stet="home_contact_link_text">${BOOK}</a></section>`,
+  '<nav><a href="#s" data-stet="home_nav_link_text_3">Data sourcing</a></nav>',
+  '<footer>',
+  `<a href="#c" data-stet="home_header_link_text">${START}</a>`,
+  '<a href="#p" data-stet="home_footer_link_text">Privacy</a>',
+  '<a href="#t" data-stet="home_footer_link_text_2">Terms</a>',
+  '<a href="#s" data-stet="home_nav_link_text_3">Data sourcing</a>',
+  '</footer>',
+  '</body></html>',
+  '',
+].join('\n');
+
+async function psyonFormsHost(): Promise<CliHost> {
+  const host = await makeHtmlHost({
+    files: { 'index.html': PSYON_FORMS_PAGE },
+    keys: {
+      home_page_title: { shape: 'text', target: 'web' },
+      home_header_link_text: { shape: 'text', target: 'web' },
+      home_contact_link_text: { shape: 'text', target: 'web' },
+      home_nav_link_text_3: { shape: 'text', target: 'web' },
+      home_footer_link_text: { shape: 'text', target: 'web' },
+      home_footer_link_text_2: { shape: 'text', target: 'web' },
+      brand__cta: { shape: 'text', target: 'web' },
+      home_cta_echo: { shape: 'text', target: 'web', derivesFrom: 'home_contact_link_text', tmpl: '{v}' },
+    },
+    defaults: {
+      home_page_title: 'Psyon data partnerships',
+      home_header_link_text: START,
+      home_contact_link_text: BOOK,
+      home_nav_link_text_3: 'Data sourcing',
+      home_footer_link_text: 'Privacy',
+      home_footer_link_text_2: 'Terms',
+      brand__cta: START,
+    },
+  });
+  for (const rel of ['content/descriptor.json', 'content/defaults.json']) {
+    writeJsonDeterministic(join(host.cwd, rel), JSON.parse(host.file(rel)));
+  }
+  gitInit(host.cwd);
+  return host;
+}
+
+describe('the same words, Link them and Give this place its own key (D9, D13)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+
+  it('answers same when a save gives a key the words another key holds — never a brand or derived key', async () => {
+    const host = await psyonFormsHost();
+    const { handler } = handlerOver([host.cwd]);
+    const saved = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'home_contact_link_text', value: START }] });
+    expect(saved.status).toBe(200);
+    expect(saved.body['same']).toEqual([{ key: 'home_contact_link_text', others: ['home_header_link_text'] }]);
+  });
+
+  it('answers no same where the pair already held the same words before the save', async () => {
+    const host = await psyonFormsHost();
+    const { handler } = handlerOver([host.cwd]);
+    await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'home_contact_link_text', value: START }] });
+    // The contact key saved again with the words it and the header already share.
+    const again = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'home_contact_link_text', value: START }] });
+    expect(again.status).toBe(200);
+    expect(again.body['same']).toEqual([]);
+    // A save elsewhere leaves the equal pair alone and asks nothing.
+    const other = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'home_footer_link_text', value: 'Privacy policy' }] });
+    expect(other.body['same']).toEqual([]);
+  });
+
+  it('answers no same for words no other key holds, and in a locale other than the default', async () => {
+    const host = await psyonFormsHost();
+    const { handler } = handlerOver([host.cwd]);
+    const fresh = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'home_contact_link_text', value: 'Talk to us ↗' }] });
+    expect(fresh.body['same']).toEqual([]);
+  });
+
+  it('links two keys through site/merge: the contact mark moves, the key goes, one batch', async () => {
+    const host = await psyonFormsHost();
+    const { handler } = handlerOver([host.cwd]);
+    await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'home_contact_link_text', value: START }] });
+    const linked = await post(handler, `/api/site/merge${at(host)}`, { key: 'home_contact_link_text', into: 'home_header_link_text' });
+    expect(linked.status).toBe(200);
+    expect(linked.body['written']).toEqual(['content/descriptor.json', 'content/defaults.json', 'index.html']);
+    expect(host.file('index.html').match(/data-stet="home_header_link_text"/g)).toHaveLength(4);
+    expect(host.file('index.html')).not.toContain('home_contact_link_text');
+    expect(JSON.parse(host.file('content/descriptor.json')).keys).not.toHaveProperty('home_contact_link_text');
+    expect(JSON.parse(host.file('content/defaults.json')).default).not.toHaveProperty('home_contact_link_text');
+    // The derived key follows the survivor.
+    expect(JSON.parse(host.file('content/descriptor.json')).keys['home_cta_echo'].derivesFrom).toBe('home_header_link_text');
+    expect((linked.body['pending'] as string[]).sort()).toEqual(['content/defaults.json', 'content/descriptor.json', 'index.html']);
+  });
+
+  it('answers merge’s refusal lines with 409 and writes nothing', async () => {
+    const host = await psyonFormsHost();
+    const { handler } = handlerOver([host.cwd]);
+    const before = ['content/descriptor.json', 'content/defaults.json', 'index.html'].map((rel) => host.file(rel));
+    const refused = await post(handler, `/api/site/merge${at(host)}`, { key: 'home_contact_link_text', into: 'home_header_link_text' });
+    expect(refused.status).toBe(409);
+    expect(refused.body['lines']).toEqual([`cannot merge: home_contact_link_text and home_header_link_text differ in default — "${BOOK}" and "${START}"`]);
+    expect(refused.body['error']).toBe((refused.body['lines'] as string[]).join('\n'));
+    expect(['content/descriptor.json', 'content/defaults.json', 'index.html'].map((rel) => host.file(rel))).toEqual(before);
+  });
+
+  it('refuses merge and split on a store-backed site', async () => {
+    const host = makeCliHost({ config: { project: 't', store: { adapter: 'memory' } } });
+    const { handler } = handlerOver([host.cwd]);
+    const merged = await post(handler, `/api/site/merge${at(host)}`, { key: 'hero_headline', into: 'hero_subheadline' });
+    expect(merged.status).toBe(409);
+    expect(merged.body['error']).toBe('merge works on a snapshot-only site — use stet merge');
+    const split = await post(handler, `/api/site/split${at(host)}`, { key: 'hero_headline', at: 'app/page.tsx:3' });
+    expect(split.status).toBe(409);
+    expect(split.body['error']).toBe('split works on a snapshot-only site — use stet split');
+  });
+
+  it('proposes the footer place’s own name, then splits it as the CLI does', async () => {
+    const host = await psyonFormsHost();
+    const cli = await psyonFormsHost();
+    const { handler } = handlerOver([host.cwd]);
+    const asked = await post(handler, `/api/site/split${at(host)}`, { key: 'home_nav_link_text_3', at: 'index.html:11' });
+    expect(asked.status).toBe(200);
+    expect(asked.body).toEqual({ proposed: 'home_footer_link_text_3' });
+    expect(git(host.cwd, ['status', '--porcelain']).out).toBe('');
+
+    const split = await post(handler, `/api/site/split${at(host)}`, { key: 'home_nav_link_text_3', at: 'index.html:11', name: 'home_footer_link_text_3' });
+    expect(split.status).toBe(200);
+    expect(split.body['key']).toBe('home_footer_link_text_3');
+    expect(await cli.run('split', 'home_nav_link_text_3', 'home_footer_link_text_3', '--at', 'index.html:11', '--write')).toBe(0);
+    for (const rel of ['content/descriptor.json', 'content/defaults.json', 'index.html']) expect(host.file(rel)).toBe(cli.file(rel));
+  });
+
+  it('answers split’s refusal lines with 409 and writes nothing', async () => {
+    const host = await psyonFormsHost();
+    const { handler } = handlerOver([host.cwd]);
+    const refused = await post(handler, `/api/site/split${at(host)}`, { key: 'home_header_link_text', at: 'index.html:11', name: 'home_footer_link_text_3' });
+    expect(refused.status).toBe(409);
+    expect(refused.body['lines']).toEqual(['index.html:11 holds no mark or read of home_header_link_text']);
+    expect(git(host.cwd, ['status', '--porcelain']).out).toBe('');
+  });
+});
+
+/** A saved check-run payload from psyon-site, the Cloudflare account ids trimmed. */
+const checkRuns = (sha: string): string => readFileSync(join(import.meta.dirname, 'fixtures', `check-runs-${sha}.json`), 'utf8');
+const summariesOf = (sha: string): string[] =>
+  (JSON.parse(checkRuns(sha)) as { check_runs: Array<{ output: { summary: string } }> }).check_runs.map((run) => run.output.summary);
+/** The one answer a sequence of check runs gives: the Branch Preview URL of any run, else the first run's lone Preview URL. */
+const previewOfRuns = (sha: string): string | null => {
+  const found = summariesOf(sha).map(previewOfSummary).filter((p) => p !== null);
+  return (found.find((p) => p.branch) ?? found[0])?.url ?? null;
+};
+
+describe('previewOfSummary and githubRepoOf (D11)', () => {
+  it('reads the develop branch’s standing address from psyon-site’s check runs', () => {
+    expect(previewOfRuns('c94b498')).toBe('https://develop.psyon-site.pages.dev');
+    // The main push's run names only its own deploy; the develop run's Branch Preview URL wins.
+    expect(previewOfSummary(summariesOf('c7b3961')[0] as string)).toEqual({ url: 'https://b34f4a0a.psyon-site.pages.dev', branch: false });
+    expect(previewOfRuns('c7b3961')).toBe('https://develop.psyon-site.pages.dev');
+  });
+
+  it('answers null for a run still in progress', () => {
+    expect(previewOfSummary(summariesOf('c94b498')[1] as string)).toBeNull();
+  });
+
+  it('reads an anchor whose href follows another attribute', () => {
+    const summary = (summariesOf('c94b498')[0] as string).replaceAll("<a href='", '<a target="_blank" href=\'');
+    expect(previewOfSummary(summary)).toEqual({ url: 'https://develop.psyon-site.pages.dev', branch: true });
+  });
+
+  it('parses the three GitHub remote forms, and nothing else', () => {
+    expect(githubRepoOf('git@github.com:psyon/psyon-site.git')).toBe('psyon/psyon-site');
+    expect(githubRepoOf('https://github.com/psyon/psyon-site.git')).toBe('psyon/psyon-site');
+    expect(githubRepoOf('https://github.com/psyon/psyon-site')).toBe('psyon/psyon-site');
+    expect(githubRepoOf('ssh://git@github.com/psyon/psyon-site.git\n')).toBe('psyon/psyon-site');
+    expect(githubRepoOf('git@gitlab.com:psyon/psyon-site.git')).toBeNull();
+    expect(githubRepoOf('/tmp/origin.git')).toBeNull();
+  });
+});
+
+describe('GET /api/site/preview-link (D11)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  const savedPath = process.env['PATH'];
+  afterAll(() => {
+    process.env['PATH'] = savedPath;
+  });
+
+  /** A `gh` on PATH printing a fixture per API path, logging each call; a path with no fixture exits 1. */
+  function stubGh(answers: { deployments?: unknown; statuses?: unknown; checkRuns?: string }): string {
+    const dir = tempDir('stet-gh-');
+    if (answers.deployments !== undefined) writeFileSync(join(dir, 'deployments.json'), JSON.stringify(answers.deployments));
+    if (answers.statuses !== undefined) writeFileSync(join(dir, 'statuses.json'), JSON.stringify(answers.statuses));
+    if (answers.checkRuns !== undefined) writeFileSync(join(dir, 'check-runs.json'), answers.checkRuns);
+    writeFileSync(
+      join(dir, 'gh'),
+      [
+        '#!/bin/sh',
+        `echo "$*" >> "${dir}/calls.log"`,
+        'case "$2" in',
+        `  */deployments/*/statuses) cat "${dir}/statuses.json" ;;`,
+        `  */deployments\\?sha=*) cat "${dir}/deployments.json" ;;`,
+        `  */check-runs\\?filter=all) cat "${dir}/check-runs.json" ;;`,
+        '  *) exit 1 ;;',
+        'esac',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    process.env['PATH'] = `${dir}:${savedPath}`;
+    return dir;
+  }
+
+  /** A checkout on `develop` whose origin is psyon-site on GitHub. */
+  function githubHost(): CliHost {
+    const host = snapshotHost();
+    git(host.cwd, ['checkout', '-qb', 'develop']);
+    git(host.cwd, ['remote', 'add', 'origin', 'git@github.com:psyon/psyon-site.git']);
+    return host;
+  }
+
+  it('answers the Branch Preview URL from the commit’s check runs through the operator’s gh', async () => {
+    const host = githubHost();
+    const gh = stubGh({ deployments: [], checkRuns: checkRuns('c7b3961') });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/preview-link${at(host)}`)).toEqual({ url: 'https://develop.psyon-site.pages.dev' });
+    const head = git(host.cwd, ['rev-parse', 'HEAD']).out.trim();
+    expect(readFileSync(join(gh, 'calls.log'), 'utf8').split('\n').filter(Boolean)).toEqual([
+      `api repos/psyon/psyon-site/deployments?sha=${head}`,
+      `api repos/psyon/psyon-site/commits/${head}/check-runs?filter=all`,
+    ]);
+  });
+
+  it('takes a later successful deployment status, skipping an empty environment_url and a failure', async () => {
+    const host = githubHost();
+    stubGh({
+      deployments: [{ id: 7 }, { id: 6 }],
+      statuses: [
+        { state: 'success', environment_url: '', target_url: 'https://github.com/psyon/psyon-site/actions/runs/1' },
+        { state: 'failure', environment_url: 'https://failed.example.app' },
+        { state: 'success', environment_url: 'https://psyon-site-git-develop.vercel.app' },
+      ],
+      checkRuns: checkRuns('c7b3961'),
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/preview-link${at(host)}`)).toEqual({ url: 'https://psyon-site-git-develop.vercel.app' });
+  });
+
+  it('answers null with no gh on PATH, and names a remote not on GitHub', async () => {
+    const host = githubHost();
+    const bin = tempDir('stet-nogh-');
+    for (const tool of ['git', 'sh']) {
+      const found = execFileSync('/usr/bin/which', [tool], { encoding: 'utf8' }).trim();
+      symlinkSync(found, join(bin, tool));
+    }
+    process.env['PATH'] = bin;
+    const { handler } = handlerOver([host.cwd]);
+    try {
+      expect(await get(handler, `/api/site/preview-link${at(host)}`)).toEqual({ url: null });
+    } finally {
+      process.env['PATH'] = savedPath;
+    }
+    git(host.cwd, ['remote', 'set-url', 'origin', 'git@gitlab.com:psyon/psyon-site.git']);
+    expect(await get(handler, `/api/site/preview-link${at(host)}`)).toEqual({ url: null, reason: 'not-github' });
+  });
+
+  it('answers null on the live branch without asking gh', async () => {
+    const host = githubHost();
+    git(host.cwd, ['checkout', '-qB', 'main']);
+    const gh = stubGh({ deployments: [], checkRuns: checkRuns('c7b3961') });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/preview-link${at(host)}`)).toEqual({ url: null });
+    expect(existsSync(join(gh, 'calls.log'))).toBe(false);
+  });
+});
+
+describe('POST /api/site/publish-live (D11)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  const rev = (cwd: string, ref: string): string => git(cwd, ['rev-parse', ref]).out.trim();
+
+  /**
+   * A checkout on `develop` one commit ahead of `main`, both pushed to a bare
+   * origin whose HEAD is `main`; `origin/HEAD` set locally unless `symref` is false.
+   */
+  function publishHost(opts: { symref?: boolean; ahead?: boolean } = {}): { host: CliHost; bare: string } {
+    const host = snapshotHost();
+    git(host.cwd, ['branch', '-M', 'main']);
+    const bare = bareRemote(host.cwd, 'origin');
+    git(bare, ['symbolic-ref', 'HEAD', 'refs/heads/main']);
+    git(host.cwd, ['push', '-q', 'origin', 'main']);
+    git(host.cwd, ['checkout', '-qb', 'develop']);
+    if (opts.ahead !== false) {
+      writeFileSync(join(host.cwd, 'notes.txt'), 'develop\n', 'utf8');
+      git(host.cwd, ['add', 'notes.txt']);
+      git(host.cwd, ['commit', '-qm', 'develop work']);
+    }
+    git(host.cwd, ['push', '-q', '-u', 'origin', 'develop']);
+    if (opts.symref !== false) git(host.cwd, ['remote', 'set-head', 'origin', 'main']);
+    return { host, bare };
+  }
+
+  it('fast-forwards the live branch to the branch’s commit, never switching the local branch', async () => {
+    const { host, bare } = publishHost();
+    const { handler } = handlerOver([host.cwd]);
+    const published = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(published.status).toBe(200);
+    expect(published.body['live']).toBe('main');
+    expect(published.body['already']).toBeUndefined();
+    expect(rev(bare, 'main')).toBe(rev(host.cwd, 'HEAD'));
+    expect(gitState(host.cwd).branch).toBe('develop');
+  });
+
+  it('refuses where another clone advanced the live branch, pushing nothing', async () => {
+    const { host, bare } = publishHost();
+    const other = tempDir('stet-clone-');
+    git(other, ['clone', '-q', bare, '.']);
+    git(other, ['config', 'user.email', 'o@test']);
+    git(other, ['config', 'user.name', 'o']);
+    git(other, ['commit', '-q', '--allow-empty', '-m', 'hotfix on main']);
+    git(other, ['push', '-q', 'origin', 'main']);
+    const tip = rev(bare, 'main');
+    const { handler } = handlerOver([host.cwd]);
+    const refused = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('main has commits develop lacks — bring them into develop first');
+    expect(rev(bare, 'main')).toBe(tip);
+    expect(gitState(host.cwd).branch).toBe('develop');
+  });
+
+  it('refuses a live branch the remote no longer has', async () => {
+    const { host, bare } = publishHost();
+    git(bare, ['symbolic-ref', 'HEAD', 'refs/heads/develop']);
+    git(bare, ['branch', '-D', 'main']);
+    const { handler } = handlerOver([host.cwd]);
+    const refused = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('main does not exist on origin');
+    expect(gitData(bare, ['rev-parse', '--verify', '-q', 'main']).code).not.toBe(0);
+  });
+
+  it('asks the remote for its HEAD where the local origin/HEAD is missing', async () => {
+    const { host, bare } = publishHost({ symref: false });
+    // The remote serves develop; this checkout publishes feature onto it.
+    git(bare, ['symbolic-ref', 'HEAD', 'refs/heads/develop']);
+    git(host.cwd, ['checkout', '-qb', 'feature']);
+    git(host.cwd, ['commit', '-q', '--allow-empty', '-m', 'feature work']);
+    git(host.cwd, ['push', '-q', '-u', 'origin', 'feature']);
+    expect(gitData(host.cwd, ['symbolic-ref', '-q', 'refs/remotes/origin/HEAD']).code).not.toBe(0);
+    const { handler } = handlerOver([host.cwd]);
+    const published = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(published.status).toBe(200);
+    expect(published.body['live']).toBe('develop');
+    expect(rev(bare, 'develop')).toBe(rev(host.cwd, 'HEAD'));
+    expect(rev(bare, 'main')).not.toBe(rev(host.cwd, 'HEAD'));
+    expect(gitState(host.cwd).branch).toBe('feature');
+  });
+
+  it('pushes nothing where the live branch is already at HEAD', async () => {
+    const { host, bare } = publishHost({ ahead: false });
+    const hook = join(bare, 'hooks', 'pre-receive');
+    writeFileSync(hook, `#!/bin/sh\necho pushed >> "${bare}/received.log"\n`, { mode: 0o755 });
+    const { handler } = handlerOver([host.cwd]);
+    const same = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(same.status).toBe(200);
+    expect(same.body).toMatchObject({ live: 'main', already: true, output: '' });
+    expect(existsSync(join(bare, 'received.log'))).toBe(false);
+  });
+
+  it('refuses on the live branch and on a detached HEAD', async () => {
+    const { host } = publishHost();
+    const { handler } = handlerOver([host.cwd]);
+    git(host.cwd, ['checkout', '-q', 'main']);
+    const live = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(live.status).toBe(409);
+    expect(live.body['error']).toBe('main is the live branch');
+    git(host.cwd, ['checkout', '-q', '--detach']);
+    const detached = await post(handler, `/api/site/publish-live${at(host)}`, {});
+    expect(detached.status).toBe(409);
+    expect(detached.body['error']).toBe('HEAD is detached — check out a branch to publish');
+  });
+});
+
+const RESTORE_NAV = ['<nav class="site-nav">', '<a href="#value" data-stet="home_nav_link_text">Why it may have value</a>', '<a href="#process" data-stet="home_nav_link_text_2">How it works</a>'];
+const FAQ_LINK = '<a href="#faq" data-stet="home_nav_link_text_3">FAQ</a>';
+const OPERATING = [
+  '<section id="operating">',
+  '<h2 data-stet="home_operating_headline">Operating model</h2>',
+  '<div class="row">',
+  '<article class="card"><h3 data-stet="home_operating_card_1_headline">Scoped</h3><p data-stet="home_operating_card_1_text">Every project is scoped.</p></article>',
+  '<article class="card"><h3 data-stet="home_operating_card_2_headline">Piloted</h3><p data-stet="home_operating_card_2_text">A pilot comes first.</p></article>',
+  '</div>',
+  '<aside id="terms"><p data-stet="home_terms_text">Terms apply.</p></aside>',
+  '</section>',
+].join('\n');
+/** psyon.ai's shape before 67694e8: a nav whose last link is FAQ, and section#operating holding a headline, two cards and a terms note. */
+const RESTORE_PAGE = [
+  '<!DOCTYPE html>',
+  '<html><head><title data-stet="home_page_title">Psyon</title></head><body>',
+  '<header>',
+  ...RESTORE_NAV,
+  FAQ_LINK,
+  '</nav>',
+  '</header>',
+  '<section id="hero"><h1 data-stet="home_hero_headline">You may already have the data.</h1></section>',
+  OPERATING,
+  '<footer><p data-stet="home_footer_text">Psyon Ltd</p></footer>',
+  '</body></html>',
+  '',
+].join('\n');
+const RESTORE_VALUES: Record<string, string> = {
+  home_page_title: 'Psyon',
+  home_nav_link_text: 'Why it may have value',
+  home_nav_link_text_2: 'How it works',
+  home_nav_link_text_3: 'FAQ',
+  home_hero_headline: 'You may already have the data.',
+  home_operating_headline: 'Operating model',
+  home_operating_card_1_headline: 'Scoped',
+  home_operating_card_1_text: 'Every project is scoped.',
+  home_operating_card_2_headline: 'Piloted',
+  home_operating_card_2_text: 'A pilot comes first.',
+  home_terms_text: 'Terms apply.',
+  home_footer_text: 'Psyon Ltd',
+};
+/** The keys 67694e8's shape removes: the FAQ link and everything section#operating marks. */
+const REMOVED = [
+  'home_nav_link_text_3',
+  'home_operating_card_1_headline',
+  'home_operating_card_1_text',
+  'home_operating_card_2_headline',
+  'home_operating_card_2_text',
+  'home_operating_headline',
+  'home_terms_text',
+].sort();
+
+describe('GET /api/site/removed and POST /api/site/restore (D12)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  const rev = (cwd: string, ref: string): string => git(cwd, ['rev-parse', ref]).out.trim();
+
+  /** The page and its keys, committed with a notes file beside them. */
+  async function restoreHost(): Promise<CliHost> {
+    const host = await makeHtmlHost({
+      files: { 'index.html': RESTORE_PAGE, 'notes.txt': 'launch notes\n' },
+      keys: Object.fromEntries(Object.keys(RESTORE_VALUES).map((key) => [key, { shape: 'text', target: 'web' }])),
+      defaults: RESTORE_VALUES,
+    });
+    for (const rel of ['content/descriptor.json', 'content/defaults.json']) {
+      writeJsonDeterministic(join(host.cwd, rel), JSON.parse(host.file(rel)));
+    }
+    gitInit(host.cwd);
+    return host;
+  }
+
+  /** One commit editing the forms and the page as `edit` says; answers its hash. */
+  function commitForms(
+    host: CliHost,
+    message: string,
+    edit: { keys?: (keys: Record<string, unknown>, values: Record<string, unknown>) => void; page?: (html: string) => string; notes?: string },
+  ): string {
+    const descriptor = JSON.parse(host.file('content/descriptor.json'));
+    const snapshot = JSON.parse(host.file('content/defaults.json'));
+    edit.keys?.(descriptor.keys, snapshot.default);
+    writeJsonDeterministic(join(host.cwd, 'content/descriptor.json'), descriptor);
+    writeJsonDeterministic(join(host.cwd, 'content/defaults.json'), snapshot);
+    if (edit.page) writeFileSync(join(host.cwd, 'index.html'), edit.page(host.file('index.html')));
+    if (edit.notes !== undefined) writeFileSync(join(host.cwd, 'notes.txt'), edit.notes);
+    git(host.cwd, ['add', '-A']);
+    git(host.cwd, ['commit', '-qm', message]);
+    return rev(host.cwd, 'HEAD');
+  }
+
+  /** 67694e8's shape: the FAQ link and section#operating removed with their seven keys, and the notes edited. */
+  function removeOperating(host: CliHost): string {
+    return commitForms(host, 'layout: the client’s rewrite', {
+      keys: (keys, values) => {
+        for (const key of REMOVED) {
+          delete keys[key];
+          delete values[key];
+        }
+      },
+      page: (html) => html.replace(`${FAQ_LINK}\n`, '').replace(`${OPERATING}\n`, ''),
+      notes: 'launch notes, rewritten\n',
+    });
+  }
+
+  /** a7f8af6's shape: a later commit rewriting the nav lines around the removed link, and the value beside the removed keys. */
+  function rewriteNav(host: CliHost): string {
+    return commitForms(host, 'stet: rename the nav anchors', {
+      keys: (_keys, values) => {
+        values['home_nav_link_text_2'] = 'How we work';
+      },
+      page: (html) =>
+        html
+          .replace('<a href="#process" data-stet="home_nav_link_text_2">How it works</a>', '<a href="#services" data-stet="home_nav_link_text_2">How we work</a>')
+          .replace('<a href="#value" data-stet="home_nav_link_text">', '<a href="#top" data-stet="home_nav_link_text">'),
+    });
+  }
+
+  it('lists the keys a commit removed, each with the item-aware section word and its text at <sha>^', async () => {
+    const host = await restoreHost();
+    const sha = removeOperating(host);
+    const { handler } = handlerOver([host.cwd]);
+    const listed = await get(handler, `/api/site/removed${at(host)}&sha=${sha}`);
+    const byKey = Object.fromEntries((listed.keys as Array<{ key: string; section: string | null; text: string }>).map((k) => [k.key, k]));
+    expect(Object.keys(byKey)).toEqual(REMOVED);
+    // The cards read the section above the repeated item, never `article`.
+    expect(byKey['home_operating_card_1_headline']).toEqual({ key: 'home_operating_card_1_headline', section: 'operating', text: 'Scoped' });
+    expect(byKey['home_operating_card_2_text']?.section).toBe('operating');
+    expect(byKey['home_operating_headline']?.section).toBe('operating');
+    expect(byKey['home_terms_text']).toEqual({ key: 'home_terms_text', section: 'terms', text: 'Terms apply.' });
+    expect(byKey['home_nav_link_text_3']?.text).toBe('FAQ');
+  });
+
+  it('lists nothing for a rename commit', async () => {
+    const host = await restoreHost();
+    const sha = commitForms(host, 'stet: rename 1 key — home_footer_text → home_footer_note', {
+      keys: (keys, values) => {
+        keys['home_footer_note'] = keys['home_footer_text'];
+        delete keys['home_footer_text'];
+        values['home_footer_note'] = values['home_footer_text'];
+        delete values['home_footer_text'];
+      },
+      page: (html) => html.replace('data-stet="home_footer_text"', 'data-stet="home_footer_note"'),
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/removed${at(host)}&sha=${sha}`)).toEqual({ keys: [] });
+  });
+
+  it('restores on the clean path: one revert commit, the document back, no markup', async () => {
+    const host = await restoreHost();
+    const base = rev(host.cwd, 'HEAD');
+    const sha = removeOperating(host);
+    const { handler } = handlerOver([host.cwd]);
+    const restored = await post(handler, `/api/site/restore${at(host)}`, { sha });
+    expect(restored.status).toBe(200);
+    expect(restored.body['restored']).toEqual(REMOVED);
+    expect(restored.body['markup']).toBeNull();
+    expect(restored.body['subject']).toBe(`stet: restore 7 keys removed by ${sha.slice(0, 7)}`);
+    expect(rev(host.cwd, 'HEAD~1')).toBe(sha);
+    for (const rel of ['index.html', 'content/descriptor.json', 'content/defaults.json', 'notes.txt']) {
+      expect(host.file(rel)).toBe(git(host.cwd, ['show', `${base}:./${rel}`]).out);
+    }
+    expect(git(host.cwd, ['status', '--porcelain']).out).toBe('');
+    expect(operationInProgress(host.cwd)).toBe(false);
+  });
+
+  it('restores the keys alone where a later commit changed the same lines, and hands back the markup', async () => {
+    const host = await restoreHost();
+    const sha = removeOperating(host);
+    const later = rewriteNav(host);
+    const page = host.file('index.html');
+    const { handler } = handlerOver([host.cwd]);
+    const restored = await post(handler, `/api/site/restore${at(host)}`, { sha });
+    expect(restored.status).toBe(200);
+    expect(operationInProgress(host.cwd)).toBe(false);
+    expect(rev(host.cwd, 'HEAD~1')).toBe(later);
+    expect(restored.body['subject']).toBe(`stet: restore 7 keys removed by ${sha.slice(0, 7)}`);
+    expect(git(host.cwd, ['show', '--name-only', '--format=', 'HEAD']).out.trim().split('\n')).toEqual(['content/defaults.json', 'content/descriptor.json']);
+    const keys = JSON.parse(host.file('content/descriptor.json')).keys;
+    const values = JSON.parse(host.file('content/defaults.json')).default;
+    for (const key of REMOVED) {
+      expect(keys).toHaveProperty(key);
+      expect(values[key]).toBe(RESTORE_VALUES[key]);
+    }
+    // The later commit's words stay; the page is left as HEAD had it.
+    expect(values['home_nav_link_text_2']).toBe('How we work');
+    expect(host.file('index.html')).toBe(page);
+    expect(git(host.cwd, ['status', '--porcelain']).out).toBe('');
+    // The FAQ link alone, since its <nav> is still in HEAD's page; section#operating whole, its cards and terms note inside it.
+    expect(restored.body['markup']).toEqual([
+      { file: 'index.html', section: expect.any(String), text: FAQ_LINK },
+      { file: 'index.html', section: 'operating', text: OPERATING },
+    ]);
+  });
+
+  it('never hands back a mark of a key the commit left declared: a renamed section’s removed chips come back alone', async () => {
+    const CHAIN = '<div class="chain">\n<span data-stet="chip_select">Select</span>\n<span data-stet="chip_deliver">Deliver</span>\n</div>';
+    const DOES = `<section id="does">\n<h2 data-stet="does_headline">What we do</h2>\n${CHAIN}\n<p data-stet="does_note">Every batch is reviewed.</p>\n</section>`;
+    const page = `<!DOCTYPE html>\n<html><head><title data-stet="home_page_title">Psyon</title></head><body>\n${DOES}\n</body></html>\n`;
+    const values: Record<string, string> = { home_page_title: 'Psyon', does_headline: 'What we do', chip_select: 'Select', chip_deliver: 'Deliver', does_note: 'Every batch is reviewed.' };
+    const host = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: Object.fromEntries(Object.keys(values).map((key) => [key, { shape: 'text', target: 'web' }])),
+      defaults: values,
+    });
+    for (const rel of ['content/descriptor.json', 'content/defaults.json']) writeJsonDeterministic(join(host.cwd, rel), JSON.parse(host.file(rel)));
+    gitInit(host.cwd);
+    // 67694e8's shape: the section takes a new id and loses its chips; its headline and note stay declared.
+    const sha = commitForms(host, 'layout: the chips removed', {
+      keys: (keys, vals) => {
+        for (const key of ['chip_select', 'chip_deliver']) {
+          delete keys[key];
+          delete vals[key];
+        }
+      },
+      page: (html) => html.replace('<section id="does">', '<section id="services">').replace(`${CHAIN}\n`, ''),
+    });
+    commitForms(host, 'the note rewritten', {
+      keys: (_keys, vals) => {
+        vals['does_note'] = 'Every batch is reviewed twice.';
+      },
+      page: (html) => html.replace('Every batch is reviewed.', 'Every batch is reviewed twice.'),
+    });
+    const { handler } = handlerOver([host.cwd]);
+    const restored = await post(handler, `/api/site/restore${at(host)}`, { sha });
+    expect(restored.status).toBe(200);
+    expect(restored.body['markup']).toEqual([{ file: 'index.html', section: 'does', text: CHAIN }]);
+    for (const slice of restored.body['markup'] as Array<{ text: string }>) {
+      expect([...slice.text.matchAll(/data-stet="([^"]+)"/g)].map((m) => m[1])).toEqual(['chip_select', 'chip_deliver']);
+    }
+  });
+
+  it('leaves no REVERT_HEAD where the pre-commit gate refuses the restore commit', async () => {
+    const host = await restoreHost();
+    const sha = removeOperating(host);
+    mkdirSync(join(host.cwd, '.git', 'hooks'), { recursive: true });
+    writeFileSync(join(host.cwd, '.git/hooks/pre-commit'), '#!/bin/sh\necho gate says no\nexit 1\n', { mode: 0o755 });
+    const { handler } = handlerOver([host.cwd]);
+    const refused = await post(handler, `/api/site/restore${at(host)}`, { sha });
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('git commit failed');
+    expect(String(refused.body['output'])).toContain('gate says no');
+    expect(rev(host.cwd, 'HEAD')).toBe(sha);
+    expect(operationInProgress(host.cwd)).toBe(false);
+    expect(git(host.cwd, ['status', '--porcelain']).out).toBe('');
+  });
+
+  it('answers git’s output and writes nothing where the revert refuses to start', async () => {
+    const host = await restoreHost();
+    const main = gitState(host.cwd).branch as string;
+    git(host.cwd, ['checkout', '-qb', 'rewrite']);
+    removeOperating(host);
+    git(host.cwd, ['checkout', '-q', main]);
+    writeFileSync(join(host.cwd, 'footer.txt'), 'a footer\n');
+    git(host.cwd, ['add', 'footer.txt']);
+    git(host.cwd, ['commit', '-qm', 'footer']);
+    git(host.cwd, ['merge', '-q', '--no-edit', '--no-ff', 'rewrite']);
+    const merge = rev(host.cwd, 'HEAD');
+    const { handler } = handlerOver([host.cwd]);
+    expect((await get(handler, `/api/site/removed${at(host)}&sha=${merge}`)).keys).toHaveLength(7);
+    const refused = await post(handler, `/api/site/restore${at(host)}`, { sha: merge });
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('git revert failed');
+    expect(String(refused.body['output'])).toContain('is a merge');
+    expect(rev(host.cwd, 'HEAD')).toBe(merge);
+    expect(git(host.cwd, ['status', '--porcelain']).out).toBe('');
+  });
+
+  describe('refuses, writing nothing', () => {
+    it('while a stet file is uncommitted', async () => {
+      const host = await restoreHost();
+      const sha = removeOperating(host);
+      const { handler } = handlerOver([host.cwd]);
+      await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'home_footer_text', value: 'Psyon Limited' }] });
+      const refused = await post(handler, `/api/site/restore${at(host)}`, { sha });
+      expect(refused.status).toBe(409);
+      expect(refused.body['error']).toBe('Restore waits for the uncommitted stet files — commit them first');
+      expect(rev(host.cwd, 'HEAD')).toBe(sha);
+    });
+
+    it('while anything is staged, which the revert’s commit would carry', async () => {
+      const host = await restoreHost();
+      const sha = removeOperating(host);
+      writeFileSync(join(host.cwd, 'draft.txt'), 'staged, unrelated\n');
+      git(host.cwd, ['add', 'draft.txt']);
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/restore${at(host)}`, { sha });
+      expect(refused.status).toBe(409);
+      expect(refused.body['error']).toBe('Restore waits for the staged changes — commit or unstage them first');
+      expect(rev(host.cwd, 'HEAD')).toBe(sha);
+      expect(git(host.cwd, ['show', '--name-only', '--format=', 'HEAD']).out).not.toContain('draft.txt');
+    });
+
+    it('while a file the commit touched holds uncommitted changes, naming it', async () => {
+      const host = await restoreHost();
+      const sha = removeOperating(host);
+      writeFileSync(join(host.cwd, 'notes.txt'), 'launch notes, edited again\n');
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/restore${at(host)}`, { sha });
+      expect(refused.status).toBe(409);
+      expect(refused.body['error']).toBe('Restore waits for the uncommitted changes to notes.txt — commit or discard them first');
+      expect(host.file('notes.txt')).toBe('launch notes, edited again\n');
+      expect(rev(host.cwd, 'HEAD')).toBe(sha);
+    });
+
+    it('while a git operation is in progress', async () => {
+      const host = await restoreHost();
+      const sha = removeOperating(host);
+      writeFileSync(join(host.cwd, '.git/MERGE_HEAD'), `${sha}\n`);
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/restore${at(host)}`, { sha });
+      expect(refused.status).toBe(409);
+      expect(refused.body['error']).toBe('a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal');
+      expect(rev(host.cwd, 'HEAD')).toBe(sha);
+    });
+
+    it('on a store-backed site', async () => {
+      const host = makeCliHost({ config: { project: 't', store: { adapter: 'memory' } } });
+      gitInit(host.cwd);
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/restore${at(host)}`, { sha: rev(host.cwd, 'HEAD') });
+      expect(refused.status).toBe(409);
+      expect(refused.body['error']).toBe("restore works on a snapshot-only site's commits");
+    });
+  });
+});
+
 describe('GET /api/site/history', () => {
   it('lists the commits that touched the snapshot, newest first', async () => {
     const host = snapshotHost();
@@ -2760,6 +3621,25 @@ describe('POST /api/site/pages/declare', () => {
     // `index.astro` maps to `/`, which the mini descriptor already declares as
     // `home`, so the only route left to propose is `about`.
     expect(Object.keys(pages).sort()).toEqual(['about', 'home', 'pricing']);
+  });
+
+  it("fills a declared html page's empty description through the same pair (F44)", async () => {
+    const titled = '<html>\n<head><title>About the partnership team</title></head>\n<body><p>A short page about the team.</p></body>\n</html>\n';
+    const host = await makeHtmlHost({ register: true, files: { 'about.html': titled } });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    writeFileSync(
+      join(host.cwd, 'about.html'),
+      titled.replace('</title></head>', '</title><meta name="description" content="Who runs the data partnerships, and how to reach them."></head>'),
+      'utf8',
+    );
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const { handler } = handlerOver([host.cwd]);
+    const declared = await post(handler, `/api/site/pages/declare${site(host)}`, { names: [] });
+    expect(declared.status).toBe(200);
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as { pages: Record<string, { seo?: Record<string, string> }> };
+    const key = descriptor.pages['about']?.seo?.['description'];
+    expect(key).toMatch(/^about_/);
+    expect((declared.body['lines'] as string[]).join('\n')).toContain(`about.html: fills the description with ${key}`);
   });
 
   it('refuses a name that was never proposed, and a host with no routing convention', async () => {
@@ -4394,6 +5274,9 @@ describe('the page', () => {
     expect(page.html()).toContain('1 unsaved edit');
     await page.act('save');
     collect();
+    expect(page.html()).toContain('Over the 60-character limit for a text');
+    await page.act('saveAnyway');
+    collect();
     expect(page.html()).toContain('71 characters over a 60 limit');
 
     for (const tab of ['Templates', 'Sends', 'Contacts', 'Media', 'Brand', 'SEO', 'Packs', 'Environments', 'Recent', 'Health', 'Setup', 'Content']) {
@@ -4560,32 +5443,71 @@ describe('the page', () => {
     page.dom.window.close();
   });
 
-  it('offers Push once a commit has landed, and Commit only while stet files are uncommitted (journey B18)', async () => {
-    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json'] }) });
-    const shows = (act: string): boolean =>
-      page.dom.window.document.querySelector(`#gitbar [data-act="${act}"]`) !== null;
-    // Files a save left uncommitted, read from the checkout: Commit, no Push.
-    expect(shows('commit')).toBe(true);
-    expect(shows('push')).toBe(false);
+  /** The header's Commit and Push as the page draws them: label, blue or grey, and the title where one is set. */
+  function gitButtons(page: Painted): Array<{ label: string; blue: boolean; grey: boolean; title: string | null }> {
+    return [...page.dom.window.document.querySelectorAll('#gitbar button')].map((b) => ({
+      label: b.textContent ?? '',
+      blue: b.classList.contains('pri'),
+      grey: (b as HTMLButtonElement).disabled,
+      title: b.getAttribute('title'),
+    }));
+  }
+  const GIT = { head: 'abc1234', branch: 'main', upstream: 'origin/main', ahead: 0, behind: 0, dirty: false, live: 'main' };
 
+  it('Push waits for the commit, then reads its commits, then Pushed (journey B18)', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json'], git: GIT }) });
+    // Files a save left uncommitted: a blue Commit, a grey Push.
+    expect(gitButtons(page)).toEqual([
+      { label: 'Commit', blue: true, grey: false, title: null },
+      { label: 'Push', blue: false, grey: true, title: null },
+    ]);
     page.answer('/api/site/commit', 200, {
       sha: 'def5678abc',
       short: 'def5678',
       subject: 'stet: 1 key updated — hero_headline',
-      at: { head: 'def5678', branch: 'main', dirty: false },
+      at: { ...GIT, head: 'def5678', ahead: 1 },
       pending: [],
     });
     await page.act('commit');
-    // The commit landed and the reply lists nothing: Commit goes, Push stays.
-    expect(shows('commit')).toBe(false);
-    expect(shows('push')).toBe(true);
-
-    // Unsaved work: Push goes until it is saved.
+    expect(gitButtons(page)).toEqual([
+      { label: 'Commit', blue: false, grey: true, title: null },
+      { label: 'Push · 1 commit', blue: true, grey: false, title: null },
+    ]);
+    // Unsaved work greys Push until it is saved.
     await page.act('key:hero_headline');
     await page.type('text:hero_headline', 'A headline that fits');
-    expect(shows('push')).toBe(false);
+    expect(gitButtons(page)[1]).toEqual({ label: 'Push', blue: false, grey: true, title: null });
+    await page.type('text:hero_headline', 'Ship the copy');
+    page.answer('/api/site/push', 200, { output: 'To origin\n   abc1234..def5678  main -> main', at: { ...GIT, head: 'def5678' } });
+    await page.act('push');
+    expect(page.toast()).toBe('Pushed.');
+    expect(gitButtons(page)[1]).toEqual({ label: 'Pushed', blue: false, grey: true, title: null });
     expect(page.errors).toEqual([]);
     page.dom.window.close();
+  });
+
+  it('reads Push · new branch, Push · 2 commits, and a grey Push on a detached HEAD', async () => {
+    const fresh = await paint({ site: siteBody({ git: { ...GIT, branch: 'develop', upstream: null } }) });
+    expect(gitButtons(fresh)[1]).toEqual({ label: 'Push · new branch', blue: true, grey: false, title: null });
+    fresh.answer('/api/site/push', 200, {
+      output: "branch 'develop' set up to track 'origin/develop'.",
+      at: { ...GIT, branch: 'develop', upstream: 'origin/develop' },
+      upstream: 'origin',
+      branch: 'develop',
+    });
+    await fresh.act('push');
+    expect(fresh.toast()).toBe('Pushed develop to origin and set it as the upstream.');
+    expect(gitButtons(fresh)[1]?.label).toBe('Pushed');
+    fresh.dom.window.close();
+
+    const ahead = await paint({ site: siteBody({ git: { ...GIT, ahead: 2 } }) });
+    expect(gitButtons(ahead)[1]).toEqual({ label: 'Push · 2 commits', blue: true, grey: false, title: null });
+    ahead.dom.window.close();
+
+    const detached = await paint({ site: siteBody({ git: { ...GIT, branch: null, upstream: null } }) });
+    expect(gitButtons(detached)[1]).toEqual({ label: 'Push', blue: false, grey: true, title: 'HEAD is detached — check out a branch to push' });
+    expect(detached.errors).toEqual([]);
+    detached.dom.window.close();
   });
 
   it('commits the files the last reply listed, and names no keys (journey B18)', async () => {
@@ -4605,7 +5527,7 @@ describe('the page', () => {
     // first save left uncommitted — so Commit stays.
     page.answer('/api/site/save', 200, { written: [], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
     await page.act('key:hero_tone');
-    await page.change('enum:hero_tone', 'calm');
+    await page.change('enum:hero_tone', 'loud');
     await page.act('save');
     expect(page.dom.window.document.querySelector('#gitbar [data-act="commit"]')).not.toBeNull();
 
@@ -4700,8 +5622,8 @@ describe('the page', () => {
     const line = doc.querySelector('#gitbar span') as HTMLElement;
     expect(line.textContent).toBe('2 stet files not yet committed');
     expect(line.getAttribute('title')).toBe('stet/defaults.json\nsrc/stet.ts');
-    expect(doc.querySelector('#gitbar [data-act="commit"]')).not.toBeNull();
-    expect(doc.querySelector('[data-act="push"]')).toBeNull();
+    expect(doc.querySelector('#gitbar [data-act="commit"]')?.className).toBe('btn sm pri');
+    expect((doc.querySelector('#gitbar [data-act="push"]') as HTMLButtonElement).disabled).toBe(true);
     expect(doc.querySelector('.row.on')).toBeNull();
     // The unsaved-edit badge is hidden until there is an edit.
     expect((doc.getElementById('dc') as HTMLElement).hidden).toBe(true);
@@ -4734,7 +5656,7 @@ describe('the page', () => {
       sha: 'def5678abc',
       short: 'def5678',
       subject: 'stet: 1 file updated — stet/defaults.json',
-      at: { head: 'def5678', branch: 'main', dirty: false },
+      at: { head: 'def5678', branch: 'main', upstream: 'origin/main', ahead: 1, behind: 0, dirty: false },
       pending: [],
     });
     await page.act('commit');
@@ -4991,15 +5913,16 @@ describe('the page', () => {
     route.dispatchEvent(new page.dom.window.Event('change', { bubbles: true }));
     await page.settle();
     expect(page.requested('/api/site/preview').at(-1)).toContain('route=%2Fdocs%2F');
-    route.value = 'docs/quickstart/';
+    // A route the home page serves, with its query, is the one the next open keeps.
+    route.value = '/?x=1';
     route.dispatchEvent(new page.dom.window.Event('change', { bubbles: true }));
     await page.settle();
     const storage = page.storage();
     page.dom.window.close();
 
     const next = await paint({ storage });
-    expect(next.requested('/api/site/preview')[0]).toContain('route=%2Fdocs%2Fquickstart%2F');
-    expect((docOf(next).getElementById('route') as HTMLInputElement).value).toBe('/docs/quickstart/');
+    expect(next.requested('/api/site/preview')[0]).toContain('route=%2F%3Fx%3D1');
+    expect((docOf(next).getElementById('route') as HTMLInputElement).value).toBe('/?x=1');
     next.dom.window.close();
   });
 
@@ -5339,20 +6262,33 @@ describe('the page', () => {
         markup.dom.window.close();
       });
 
-      it('edits a derived key’s template, the one free text it has (journey C1)', async () => {
+      /** The derived editor's two fields and the source's grey text between them. */
+      const editor = (page: Painted, id: string): { before: HTMLInputElement; after: HTMLInputElement; source: string } => ({
+        before: docOf(page).querySelector(`[data-act-input="tmplBefore:${id}"]`) as HTMLInputElement,
+        after: docOf(page).querySelector(`[data-act-input="tmplAfter:${id}"]`) as HTMLInputElement,
+        source: docOf(page).getElementById('derivedsrc')?.textContent ?? '',
+      });
+
+      it('edits a derived key’s template in the two fields around its source’s text (journey C1)', async () => {
         const page = await kcPage();
         page.answer('/api/site/save', 200, { written: ['content/descriptor.json', 'index.html'], unchanged: [], findings: [], at: {}, pending: [] });
         await page.change('group', 'seo');
         await page.act('key:share');
         const doc = docOf(page);
-        const input = doc.querySelector('[data-act-input="tmpl:share"]') as HTMLInputElement;
-        expect(input.value).toBe('{v} More.');
-        expect(input.disabled).toBe(false);
-        expect(doc.querySelector('.cb .note')?.textContent).toBe('{v} stands for the text of hero.');
+        const fields = editor(page, 'share');
+        expect(fields.before.value).toBe('');
+        expect(fields.after.value).toBe(' More.');
+        expect(fields.before.getAttribute('aria-label')).toBe('Text before hero');
+        expect(fields.after.getAttribute('aria-label')).toBe('Text after hero');
+        expect(fields.before.disabled).toBe(false);
+        // The headline's text, its tags dropped, grey between the fields; no {v} line.
+        expect(fields.source).toBe('You may already have the data our AI lab partners need.');
+        expect(doc.getElementById('derivedsrc')?.className).toBe('muted');
+        expect(doc.querySelector('.cb .note')).toBeNull();
         expect(doc.querySelector('#derived .term')?.textContent).toBe('You may already have the data our AI lab partners need. More.');
         expect(doc.querySelector('[data-act="key:share"]')?.innerHTML).not.toContain('no value');
 
-        await page.type('tmpl:share', '{v} Start with a call.');
+        await page.type('tmplAfter:share', ' Start with a call.');
         const reads = 'You may already have the data our AI lab partners need. Start with a call.';
         expect(doc.querySelector('#derived .term')?.textContent).toBe(reads);
         expect(doc.querySelector('#derived .cnt')?.textContent).toBe(String(reads.length));
@@ -5367,15 +6303,47 @@ describe('the page', () => {
         page.dom.window.close();
       });
 
+      it('drops a template typed back to the saved one, and follows the source’s draft in the grey text', async () => {
+        const page = await kcPage();
+        await page.act('key:hero');
+        await page.type('text:hero', 'You may already have <1>all the data</1> we need.');
+        await page.change('group', 'seo');
+        await page.act('key:share');
+        expect(editor(page, 'share').source).toBe('You may already have all the data we need.');
+        await page.type('tmplBefore:share', 'Read: ');
+        expect(docOf(page).getElementById('dc')?.textContent).toBe('2 unsaved edits');
+        await page.type('tmplBefore:share', '');
+        expect(docOf(page).getElementById('dc')?.textContent).toBe('1 unsaved edit');
+        page.dom.window.close();
+      });
+
+      it('shows a source holding only a default value grey in another locale, as Reads as does', async () => {
+        const page = await kcPage();
+        await page.change('locale', 'de');
+        await page.change('group', 'seo');
+        await page.act('key:share');
+        expect(editor(page, 'share').source).toBe('You may already have the data our AI lab partners need.');
+        expect(docOf(page).querySelector('#derived .term')?.textContent).toBe('You may already have the data our AI lab partners need. More.');
+        page.dom.window.close();
+      });
+
+      it('draws markup in the source’s text as text', async () => {
+        const page = await kcPage({ snapshot: { default: { ...KC_SNAPSHOT.default, hero: '<b>bold</b> <img src=x onerror=alert(1)><1>x</1>' } } });
+        await page.change('group', 'seo');
+        await page.act('key:share');
+        expect(docOf(page).querySelector('#derivedsrc b, #derivedsrc img')).toBeNull();
+        expect(editor(page, 'share').source).toBe('<b>bold</b> <img src=x onerror=alert(1)>x');
+        page.dom.window.close();
+      });
+
       it('shows a store-backed site’s template read-only', async () => {
         const page = await kcPage({ site: { mode: 'store' } });
         await page.change('group', 'seo');
         await page.act('key:share');
-        const input = docOf(page).querySelector('[data-act-input="tmpl:share"]') as HTMLInputElement;
-        expect(input.disabled).toBe(true);
-        expect(docOf(page).querySelector('.cb .note')?.textContent).toBe(
-          '{v} stands for the text of hero. The template lives in the descriptor; edit it in the repository.',
-        );
+        const fields = editor(page, 'share');
+        expect(fields.before.disabled).toBe(true);
+        expect(fields.after.disabled).toBe(true);
+        expect(docOf(page).querySelector('.cb .note')?.textContent).toBe('The template lives in the descriptor; edit it in the repository.');
         page.dom.window.close();
       });
 
@@ -6034,11 +7002,13 @@ describe('the page', () => {
     await page.act('key:hero_headline');
     await page.type('text:hero_headline', 'x'.repeat(71));
     await page.act('save');
+    await page.act('saveAnyway');
     expect(painted(page)).toContain('71 characters over a 60 limit');
     await page.type('text:hero_headline', 'x'.repeat(72));
     expect(painted(page)).not.toContain('71 characters over a 60 limit');
     expect(docOf(page).getElementById('refusal')).toBeNull();
     await page.act('save');
+    await page.act('saveAnyway');
     expect(painted(page)).toContain('71 characters over a 60 limit');
     page.dom.window.close();
   });
@@ -6189,6 +7159,459 @@ describe('the page', () => {
       const page = await paint();
       await page.act('keys');
       expect((docOf(page).getElementById('work') as HTMLElement).className).toContain('wide');
+      page.dom.window.close();
+    });
+  });
+
+  // --- add-psyon-followups: Save, the first page, same words, limits, branch, restore, split ---
+  describe('the psyon follow-ups', () => {
+    const saveButton = (page: Painted): HTMLButtonElement => docOf(page).querySelector('[data-act="save"]') as HTMLButtonElement;
+    const saveState = (page: Painted): { label: string; blue: boolean; grey: boolean } => ({
+      label: saveButton(page).textContent ?? '',
+      blue: saveButton(page).classList.contains('pri'),
+      grey: saveButton(page).disabled,
+    });
+    const SAVED = { label: 'Saved', blue: false, grey: true };
+    const SAVE = { label: 'Save', blue: true, grey: false };
+
+    it('Save greys when nothing differs (journey B18)', async () => {
+      const page = await paint({ site: siteBody({ git: { head: 'abc1234', branch: 'main', upstream: 'origin/main', ahead: 0, behind: 0, dirty: false } }) });
+      await page.act('key:hero_headline');
+      expect(saveState(page)).toEqual(SAVED);
+      expect(saveButton(page).getAttribute('title')).toBe('Saves to stet/defaults.json on this machine. Commit from the header when the change is ready.');
+      await page.type('text:hero_headline', 'Ship the copies');
+      expect(saveState(page)).toEqual(SAVE);
+      await page.type('text:hero_headline', 'Ship the copy');
+      expect(saveState(page)).toEqual(SAVED);
+      expect((docOf(page).getElementById('dc') as HTMLElement).hidden).toBe(true);
+      await page.type('text:hero_headline', 'Ship the words');
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json', 'stet/defaults.ts'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+      await page.act('save');
+      expect(saveState(page)).toEqual(SAVED);
+      expect(docOf(page).querySelector('#gitbar span')?.textContent).toBe('1 stet file not yet committed');
+      expect(docOf(page).querySelector('#gitbar [data-act="commit"]')?.classList.contains('pri')).toBe(true);
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('leaves no draft when a field whose locale holds no value is typed and cleared', async () => {
+      const page = await paint();
+      await page.change('locale', 'de');
+      await page.change('group', 'prefix:loose');
+      await page.act('key:loose_key');
+      expect(saveState(page)).toEqual(SAVED);
+      await page.type('text:loose_key', 'lose');
+      expect(saveState(page)).toEqual(SAVE);
+      await page.type('text:loose_key', '');
+      expect(saveState(page)).toEqual(SAVED);
+      await page.act('key:loose_key');
+      expect(docOf(page).querySelector('[data-act="key:loose_key"] .bdg.d')).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('keeps Save draft, always blue and untitled, on a store-backed site', async () => {
+      const page = await paint({ site: siteBody({ mode: 'memory' }) });
+      await page.act('key:hero_headline');
+      expect(saveState(page)).toEqual({ label: 'Save draft', blue: true, grey: false });
+      expect(saveButton(page).getAttribute('title')).toBeNull();
+      page.dom.window.close();
+    });
+
+    /** An html site with two pages, each a document with one marked key. */
+    const TWO_PAGES: Descriptor = {
+      version: 1,
+      keys: { about_text: { shape: 'text', target: 'web' }, home_text: { shape: 'text', target: 'web' } },
+      pages: { about: { route: '/about.html' }, home: { route: '/' } },
+    };
+    const twoPages = (route: string): Promise<Painted> =>
+      paint({
+        site: siteBody({ host: 'html', descriptor: TWO_PAGES, snapshot: { default: { about_text: 'About', home_text: 'Home' } } }),
+        routes: [
+          [
+            '/api/site/marks',
+            200,
+            {
+              documents: [
+                { file: 'about.html', route: '/about.html', page: 'about' },
+                { file: 'index.html', route: '/', page: 'home' },
+              ],
+              keys: { about_text: ['about.html'], home_text: ['index.html'] },
+              places: {},
+            },
+          ],
+        ],
+        storage: { [`stet.route.${SITE_ID}`]: route },
+      });
+    const opened = (page: Painted): { group: string; route: string; loads: string[] } => ({
+      group: (docOf(page).getElementById('gsel') as HTMLSelectElement).value,
+      route: (docOf(page).getElementById('route') as HTMLInputElement).value,
+      loads: page.requested('/api/site/preview?'),
+    });
+
+    it('opens on the page the preview shows (journey B18, B19)', async () => {
+      const about = await twoPages('/about.html?x=1');
+      expect(opened(about)).toEqual({ group: 'page:about', route: '/about.html?x=1', loads: [`/api/site/preview?site=%2Fcheckouts%2Fmini&route=${encodeURIComponent('/about.html?x=1')}`] });
+      about.dom.window.close();
+      const home = await twoPages('/');
+      expect(opened(home)).toMatchObject({ group: 'page:home', route: '/' });
+      expect(home.requested('/api/site/preview?')).toHaveLength(1);
+      home.dom.window.close();
+      const gone = await twoPages('/retired.html');
+      expect(opened(gone)).toMatchObject({ group: 'page:about', route: '/about.html' });
+      expect(gone.requested('/api/site/preview?')).toHaveLength(1);
+      gone.dom.window.close();
+    });
+
+    /** psyon.ai's forms at 3ca2faf: the header's button in three places, the contact button in one. */
+    const BUTTONS: Descriptor = {
+      version: 1,
+      keys: {
+        home_header_link_text: { shape: 'text', target: 'web' },
+        home_contact_link_text: { shape: 'text', target: 'web' },
+        home_about_text: { shape: 'text', target: 'web' },
+      },
+      pages: { home: { route: '/' } },
+    };
+    const BUTTON_VALUES = { default: { home_header_link_text: 'Start a conversation ↗', home_contact_link_text: 'Book an introductory call ↗', home_about_text: 'About us' } };
+    const place = (line: number): Record<string, unknown> => ({ file: 'index.html', line, kind: 'link text', tag: 'a' });
+    const buttonMarks = (places: Record<string, unknown[]>): Record<string, unknown> => ({
+      documents: [{ file: 'index.html', route: '/', page: 'home' }],
+      keys: Object.fromEntries(Object.keys(places).map((id) => [id, ['index.html']])),
+      places,
+    });
+    const BUTTON_PLACES = {
+      home_header_link_text: [place(3), place(40), place(90)],
+      home_contact_link_text: [place(60)],
+      home_about_text: [{ file: 'index.html', line: 20, kind: 'paragraph', tag: 'p' }],
+    };
+    const buttons = (places: Record<string, unknown[]> = BUTTON_PLACES): Promise<Painted> =>
+      paint({
+        site: siteBody({ host: 'html', descriptor: BUTTONS, snapshot: BUTTON_VALUES }),
+        routes: [['/api/site/marks', 200, buttonMarks(places)]],
+      });
+    const panel = (page: Painted): string => [...docOf(page).querySelectorAll('.bar ~ .cb .term')].map((t) => t.textContent ?? '').join('\n');
+
+    it('asks to link the contact button to the header’s three, and links them (journey G8, merge)', async () => {
+      const page = await buttons();
+      await page.act('key:home_contact_link_text');
+      await page.type('text:home_contact_link_text', 'Start a conversation ↗');
+      page.answer('/api/site/save', 200, {
+        written: ['content/defaults.json', 'index.html'],
+        findings: [],
+        pending: ['content/defaults.json', 'index.html'],
+        same: [{ key: 'home_contact_link_text', others: ['home_header_link_text'] }],
+      });
+      await page.act('save');
+      expect(panel(page)).toBe('Same words as home_header_link_text, shown in 3 other places');
+      expect(docOf(page).querySelector('[data-act="sameLink"]')?.textContent).toBe('Link them');
+      expect(docOf(page).querySelector('[data-act="sameKeep"]')?.textContent).toBe('Keep separate');
+
+      // What the checkout reads after the merge.
+      const merged = { ...BUTTONS, keys: { home_header_link_text: BUTTONS.keys['home_header_link_text'], home_about_text: BUTTONS.keys['home_about_text'] } } as Descriptor;
+      page.answer('/api/site/merge', 200, { written: ['content/descriptor.json', 'content/defaults.json', 'index.html'], pending: ['content/descriptor.json', 'content/defaults.json', 'index.html'] });
+      page.answer('/api/site', 200, siteBody({
+        host: 'html',
+        descriptor: merged,
+        snapshot: { default: { home_header_link_text: 'Start a conversation ↗', home_about_text: 'About us' } },
+        pending: ['content/descriptor.json', 'content/defaults.json', 'index.html'],
+      }));
+      page.answer('/api/site/marks', 200, buttonMarks({ home_header_link_text: [place(3), place(40), place(60), place(90)], home_about_text: BUTTON_PLACES.home_about_text }));
+      await page.act('sameLink');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/merge')).at(-1)?.body).toEqual({ key: 'home_contact_link_text', into: 'home_header_link_text' });
+      expect(page.toast()).toBe('Linked: home_contact_link_text now reads home_header_link_text');
+      expect(page.keys()).not.toContain('home_contact_link_text');
+      expect(docOf(page).querySelector('.row.on')?.getAttribute('data-act')).toBe('key:home_header_link_text');
+      expect(docOf(page).querySelector('.kline')?.textContent).toContain('index.html:60');
+      expect(docOf(page).querySelector('#gitbar [data-act="commit"]')?.classList.contains('pri')).toBe(true);
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('keeps the edited key when it has more places, and counts the other key’s places', async () => {
+      const page = await buttons();
+      await page.act('key:home_header_link_text');
+      await page.type('text:home_header_link_text', 'Book an introductory call ↗');
+      page.answer('/api/site/save', 200, { written: ['content/defaults.json'], findings: [], pending: ['content/defaults.json'], same: [{ key: 'home_header_link_text', others: ['home_contact_link_text'] }] });
+      await page.act('save');
+      expect(panel(page)).toBe('Same words as home_contact_link_text, shown in 1 other place');
+      await page.act('sameLink');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/merge')).at(-1)?.body).toEqual({ key: 'home_contact_link_text', into: 'home_header_link_text' });
+      page.dom.window.close();
+    });
+
+    it('keeps the key not edited on a tie', async () => {
+      const page = await buttons({ ...BUTTON_PLACES, home_header_link_text: [place(3)] });
+      await page.act('key:home_contact_link_text');
+      await page.type('text:home_contact_link_text', 'Start a conversation ↗');
+      page.answer('/api/site/save', 200, { written: ['content/defaults.json'], findings: [], pending: ['content/defaults.json'], same: [{ key: 'home_contact_link_text', others: ['home_header_link_text'] }] });
+      await page.act('save');
+      expect(panel(page)).toBe('Same words as home_header_link_text, shown in 1 other place');
+      await page.act('sameLink');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/merge')).at(-1)?.body).toEqual({ key: 'home_contact_link_text', into: 'home_header_link_text' });
+      page.dom.window.close();
+    });
+
+    it('asks once: Keep separate closes the question, and a later save asks nothing (journey G8, merge)', async () => {
+      const page = await buttons();
+      await page.act('key:home_contact_link_text');
+      await page.type('text:home_contact_link_text', 'Start a conversation ↗');
+      page.answer('/api/site/save', 200, { written: ['content/defaults.json'], findings: [], pending: ['content/defaults.json'], same: [{ key: 'home_contact_link_text', others: ['home_header_link_text'] }] });
+      await page.act('save');
+      await page.act('sameKeep');
+      expect(panel(page)).toBe('');
+      page.answer('/api/site/save', 200, { written: ['content/defaults.json'], findings: [], pending: ['content/defaults.json'], same: [] });
+      await page.act('key:home_about_text');
+      await page.type('text:home_about_text', 'About the team');
+      await page.act('save');
+      expect(panel(page)).toBe('');
+      expect(page.requested('/api/site/merge')).toEqual([]);
+      page.dom.window.close();
+    });
+
+    /** A title with an advisory 60, a share description derived from the headline with an advisory 70, a hard-limited tagline. */
+    const LIMITED: Descriptor = {
+      version: 1,
+      keys: {
+        home_page_title: { shape: 'text', target: 'web', limits: { max: 60, severity: 'advisory' } },
+        home_headline: { shape: 'text', target: 'web' },
+        home_share_description: { shape: 'text', target: 'web', derivesFrom: 'home_headline', tmpl: '{v} Read on.', limits: { max: 70, severity: 'advisory' } },
+        home_tagline: { shape: 'text', target: 'web', limits: { max: 20, severity: 'hard' } },
+      },
+      pages: { home: { route: '/', seo: { title: 'home_page_title', description: 'home_share_description' } } },
+    };
+    const limited = (): Promise<Painted> =>
+      paint({
+        site: siteBody({ host: 'html', descriptor: LIMITED, snapshot: { default: { home_page_title: 'Psyon', home_headline: 'Data for AI teams.', home_tagline: 'Short' } } }),
+        routes: [
+          [
+            '/api/site/marks',
+            200,
+            buttonMarks({
+              home_page_title: [{ file: 'index.html', line: 3, kind: 'page title', tag: 'title', head: true }],
+              home_headline: [{ file: 'index.html', line: 9, kind: 'headline', tag: 'h1' }],
+              home_share_description: [{ file: 'index.html', line: 4, kind: 'share description', tag: 'meta', attr: 'content', meta: 'og:description', head: true }],
+              home_tagline: [{ file: 'index.html', line: 10, kind: 'paragraph', tag: 'p' }],
+            }),
+          ],
+          ['/api/site/save', 200, { written: ['content/defaults.json', 'index.html'], findings: [], pending: ['content/defaults.json', 'index.html'] }],
+        ],
+      });
+
+    it('asks before saving a 63-character title past its advisory 60 (journey C1)', async () => {
+      const page = await limited();
+      await page.change('group', 'seo');
+      await page.act('key:home_page_title');
+      const title = 'P'.repeat(63);
+      await page.type('text:home_page_title', title);
+      const count = docOf(page).querySelector('.cb .cnt') as HTMLElement;
+      expect(count.textContent).toBe('63 / 60');
+      expect(count.classList.contains('bad')).toBe(true);
+      await page.act('save');
+      expect(panel(page)).toBe('Over the 60-character limit for a page title');
+      expect(page.requested('/api/site/save')).toEqual([]);
+      await page.act('saveCancel');
+      expect(panel(page)).toBe('');
+      expect(page.requested('/api/site/save')).toEqual([]);
+      await page.act('save');
+      await page.act('saveAnyway');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({ values: [{ key: 'home_page_title', locale: 'default', value: title }] });
+      expect(saveState(page)).toEqual(SAVED);
+      page.dom.window.close();
+    });
+
+    it('asks where a source’s draft pushes its derived key past an advisory limit, and never for a hard one', async () => {
+      const page = await limited();
+      await page.act('key:home_headline');
+      await page.type('text:home_headline', 'Data labelling, annotation, human evaluation and dataset sourcing for AI teams.');
+      await page.act('save');
+      expect(panel(page)).toBe('Over the 70-character limit for a share description');
+      await page.act('saveCancel');
+      await page.type('text:home_headline', 'Data for AI teams.');
+      await page.act('key:home_tagline');
+      await page.type('text:home_tagline', 'A tagline far past its hard limit');
+      await page.act('save');
+      expect(panel(page)).toBe('');
+      expect(page.requested('/api/site/save')).toHaveLength(1);
+      page.dom.window.close();
+    });
+
+    const BRANCH = { head: 'c7b3961', branch: 'develop', upstream: 'origin/develop', ahead: 0, behind: 0, dirty: false, live: 'main' };
+    const branchBar = (page: Painted): HTMLElement => docOf(page).getElementById('branchbar') as HTMLElement;
+
+    it('shows develop · preview, its preview link, and publishes to live (journey B18, B19)', async () => {
+      const page = await paint({
+        site: siteBody({ git: BRANCH }),
+        routes: [['/api/site/preview-link', 200, { url: 'https://develop.psyon-site.pages.dev' }]],
+      });
+      expect(branchBar(page).querySelector('.bdg')?.textContent).toBe('develop · preview');
+      const link = branchBar(page).querySelector('a') as HTMLAnchorElement;
+      expect(link.textContent).toBe('Preview: https://develop.psyon-site.pages.dev ↗');
+      expect([link.getAttribute('href'), link.getAttribute('target'), link.getAttribute('rel')]).toEqual(['https://develop.psyon-site.pages.dev', '_blank', 'noopener']);
+      await page.act('publishAsk');
+      const ask = docOf(page).getElementById('ask') as HTMLElement;
+      expect(ask.hidden).toBe(false);
+      expect(ask.querySelector('.term')?.textContent).toBe('Publish develop to main? main is what mini serves.');
+      await page.act('publishCancel');
+      expect(ask.hidden).toBe(true);
+      expect(page.requested('/api/site/publish-live')).toEqual([]);
+
+      page.answer('/api/site/publish-live', 200, { output: 'To origin\n   1111111..c7b3961  HEAD -> main', live: 'main', at: { ...BRANCH, live: undefined } });
+      await page.act('publishAsk');
+      await page.act('publishLive');
+      expect(page.toast()).toBe('Published develop to main.');
+      expect(branchBar(page).querySelector('.bdg')?.textContent).toBe('develop · preview');
+      page.answer('/api/site/publish-live', 200, { output: '', live: 'main', already: true, at: BRANCH });
+      await page.act('publishAsk');
+      await page.act('publishLive');
+      expect(page.toast()).toBe('Already published');
+      page.answer('/api/site/publish-live', 409, { error: 'main has commits develop lacks — bring them into develop first', at: BRANCH });
+      await page.act('publishAsk');
+      await page.act('publishLive');
+      expect(docOf(page).querySelector('#giterr .term')?.textContent).toBe('main has commits develop lacks — bring them into develop first');
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('says no preview was reported, and asks again on Check again', async () => {
+      const page = await paint({ site: siteBody({ git: BRANCH }), routes: [['/api/site/preview-link', 200, { url: null }]] });
+      expect(branchBar(page).textContent).toContain('No preview reported for develop');
+      page.answer('/api/site/preview-link', 200, { url: 'https://develop.psyon-site.pages.dev' });
+      await page.act('previewCheck');
+      expect(page.requested('/api/site/preview-link')).toHaveLength(2);
+      expect(branchBar(page).querySelector('a')?.textContent).toBe('Preview: https://develop.psyon-site.pages.dev ↗');
+      page.dom.window.close();
+    });
+
+    it('shows no Publish and no preview on the live branch, nor Publish while the branch is ahead', async () => {
+      const live = await paint({ site: siteBody({ git: { ...BRANCH, branch: 'main', upstream: 'origin/main' } }) });
+      expect(branchBar(live).textContent).toBe('main · live');
+      expect(live.requested('/api/site/preview-link')).toEqual([]);
+      live.dom.window.close();
+      const ahead = await paint({ site: siteBody({ git: { ...BRANCH, ahead: 1 } }), routes: [['/api/site/preview-link', 200, { url: null }]] });
+      expect(branchBar(ahead).querySelector('[data-act="publishAsk"]')).toBeNull();
+      ahead.dom.window.close();
+      const detached = await paint({ site: siteBody({ git: { ...BRANCH, branch: null, upstream: null } }) });
+      expect(branchBar(detached).textContent).toBe('detached · c7b3961');
+      detached.dom.window.close();
+    });
+
+    const REMOVED_KEYS = [
+      { key: 'does_psyon_buy_the_data', section: 'faq', text: 'Does Psyon buy the data?' },
+      { key: 'home_operating_card_1_headline', section: 'operating', text: 'Scoped' },
+      { key: 'loose_note', section: null, text: 'A note <b>with markup</b>' },
+    ];
+    const SLICE = '<section id="faq"><h2 data-stet="faq">FAQ</h2><img src=x onerror=alert(1)></section>';
+    const historyPage = (copied: string[] = []): Promise<Painted> =>
+      paint({
+        routes: [
+          ['/api/site/history', 200, { commits: [{ sha: '67694e8abc', short: '67694e8', author: 'nj-io', at: '2026-09-26T18:33:29+07:00', subject: 'layout: FAQ removed' }] }],
+          ['/api/site/removed', 200, { keys: REMOVED_KEYS }],
+        ],
+        prepare: (window) => {
+          Object.defineProperty(window.navigator, 'clipboard', {
+            value: {
+              writeText: async (text: string): Promise<void> => {
+                copied.push(text);
+              },
+            },
+          });
+        },
+      });
+
+    it('lists what a commit removed and restores it, handing back the markup (journey B22, restore)', async () => {
+      const copied: string[] = [];
+      const page = await historyPage(copied);
+      await page.act('history');
+      await page.act('commitOpen:67694e8abc');
+      expect(page.requested('/api/site/removed')).toEqual(['/api/site/removed?site=%2Fcheckouts%2Fmini&sha=67694e8abc']);
+      const listed = docOf(page).querySelector('tr td[colspan="3"] .mono') as HTMLElement;
+      expect(listed.innerHTML.split('<br>').map((line) => new page.dom.window.DOMParser().parseFromString(line, 'text/html').body.textContent)).toEqual([
+        'does_psyon_buy_the_data — faq — "Does Psyon buy the data?"',
+        'home_operating_card_1_headline — operating — "Scoped"',
+        'loose_note — "A note <b>with markup</b>"',
+      ]);
+      expect(listed.querySelector('b')).toBeNull();
+      await page.act('restoreAsk');
+      expect(docOf(page).querySelector('tr td[colspan="3"] .term')?.textContent).toBe('Restore the 3 keys 67694e8 removed?');
+      page.answer('/api/site/restore', 200, {
+        restored: REMOVED_KEYS.map((k) => k.key),
+        skipped: [],
+        markup: [{ file: 'index.html', section: 'faq', text: SLICE }],
+        sha: 'f00dfeed',
+        short: 'f00dfee',
+        subject: 'stet: restore 3 keys removed by 67694e8',
+        pending: [],
+      });
+      await page.act('restoreApply');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/restore')).at(-1)?.body).toEqual({ sha: '67694e8abc' });
+      expect(page.requested('/api/workspace').length).toBeGreaterThanOrEqual(2);
+      const pre = docOf(page).querySelector('pre.term') as HTMLElement;
+      expect(pre.textContent).toBe(SLICE);
+      expect(pre.querySelector('section, img')).toBeNull();
+      expect(painted(page)).toContain('The page could not be restored automatically — later commits changed the same lines. The keys are back; paste each section where it belongs, then save.');
+      await page.act('copyMarkup:0');
+      expect(copied).toEqual([SLICE]);
+      expect(page.toast()).toBe('Copied');
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('shows Restore’s refusal in the row, and greys Restore while anything is unsaved', async () => {
+      const page = await historyPage();
+      await page.act('history');
+      await page.act('commitOpen:67694e8abc');
+      page.answer('/api/site/restore', 409, { error: 'Restore waits for the staged changes — commit or unstage them first', pending: [] });
+      await page.act('restoreAsk');
+      await page.act('restoreApply');
+      expect(docOf(page).querySelector('tr td[colspan="3"] .err')?.textContent).toBe('Restore waits for the staged changes — commit or unstage them first');
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'Unsaved');
+      expect((docOf(page).querySelector('[data-act="restoreAsk"]') as HTMLButtonElement).disabled).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('shows nothing new for a commit that removed no key', async () => {
+      const page = await paint({
+        routes: [
+          ['/api/site/history', 200, { commits: [{ sha: 'abc1234def', short: 'abc1234', author: 'dev', at: '2026-09-01T10:00:00Z', subject: 'stet: 1 key updated' }] }],
+          ['/api/site/removed', 200, { keys: [] }],
+        ],
+      });
+      await page.act('history');
+      await page.act('commitOpen:abc1234def');
+      expect(docOf(page).querySelector('tr td[colspan="3"]')).toBeNull();
+      expect(docOf(page).querySelector('[data-act="restoreAsk"]')).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('gives the footer link its own key from the page (journey G9, split)', async () => {
+      const NAV: Descriptor = { version: 1, keys: { home_nav_link_text_3: { shape: 'text', target: 'web' } }, pages: { home: { route: '/' } } };
+      const navPlaces = { home_nav_link_text_3: [place(453), place(607)] };
+      const page = await paint({
+        site: siteBody({ host: 'html', descriptor: NAV, snapshot: { default: { home_nav_link_text_3: 'Data sourcing' } } }),
+        routes: [['/api/site/marks', 200, buttonMarks(navPlaces)]],
+      });
+      await page.act('key:home_nav_link_text_3');
+      expect(docOf(page).querySelector('[data-act="splitAsk:index.html:453"]')?.textContent).toBe('Give this place its own key');
+      page.answer('/api/site/split', 200, { proposed: 'home_footer_link_text_3' });
+      await page.act('splitAsk:index.html:607');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/split')).at(-1)?.body).toEqual({ key: 'home_nav_link_text_3', at: 'index.html:607' });
+      expect((docOf(page).querySelector('[data-act-input="splitName"]') as HTMLInputElement).value).toBe('home_footer_link_text_3');
+      expect(docOf(page).querySelector('[data-act="splitApply"]')?.textContent).toBe('Split');
+
+      page.answer('/api/site/split', 200, { written: ['content/descriptor.json', 'content/defaults.json', 'index.html'], key: 'home_footer_link_text_3', pending: ['content/descriptor.json', 'content/defaults.json', 'index.html'] });
+      page.answer('/api/site', 200, siteBody({
+        host: 'html',
+        descriptor: { ...NAV, keys: { ...NAV.keys, home_footer_link_text_3: { shape: 'text', target: 'web' } } },
+        snapshot: { default: { home_nav_link_text_3: 'Data sourcing', home_footer_link_text_3: 'Data sourcing' } },
+        pending: ['content/descriptor.json', 'content/defaults.json', 'index.html'],
+      }));
+      page.answer('/api/site/marks', 200, buttonMarks({ home_nav_link_text_3: [place(453)], home_footer_link_text_3: [place(607)] }));
+      await page.act('splitApply');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/split')).at(-1)?.body).toEqual({ key: 'home_nav_link_text_3', at: 'index.html:607', name: 'home_footer_link_text_3' });
+      expect(docOf(page).querySelector('.row.on')?.getAttribute('data-act')).toBe('key:home_footer_link_text_3');
+      expect(docOf(page).querySelector('#gitbar [data-act="commit"]')?.classList.contains('pri')).toBe(true);
+      expect(page.errors).toEqual([]);
       page.dom.window.close();
     });
   });

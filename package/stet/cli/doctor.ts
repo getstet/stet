@@ -24,7 +24,7 @@ import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { check } from './check.js';
 import { CONFIG_FILE, formsSecretEnvOf, isHtmlHost, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
-import { GATE_LINE, gateSite, hookKind, hooksDir, insideDir, operatorHook, readGate, worktreeTop, type GateEntry } from './hook.js';
+import { GATE_LINE, gateSite, hookKind, hooksDir, insideDir, isSite, operatorHook, readGate, worktreeTop, type GateEntry } from './hook.js';
 import { packageVersion } from './installed.js';
 import type { CliIo } from './main.js';
 import { readProjectMeta } from './meta.js';
@@ -255,7 +255,7 @@ function hookSection(cwd: string, report: Report): void {
   } catch {
     /* a list that does not parse is named by the gate itself, on the next commit */
   }
-  if (kind === 'this' && listed.some((entry) => entry.worktree === where.worktree && entry.checkout === where.checkout)) {
+  if (kind === 'this' && listed.some(isSite(where))) {
     report.line('hook: the stet pre-commit gate runs here — stet hook remove takes this checkout out of it');
   }
   if (kind !== 'older') return;

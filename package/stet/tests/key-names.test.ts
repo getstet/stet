@@ -8,10 +8,14 @@ import { describe, expect, it } from 'vitest';
 import {
   baseName,
   firstWords,
+  itemReader,
+  itemWord,
   kindOf,
+  looseHeadingRole,
   metaCopyNameOf,
   numberNames,
   roleOf,
+  sectionOf,
   sectionWord,
   wordsOf,
   type Place,
@@ -185,6 +189,27 @@ describe('baseName', () => {
     expect(baseName({ page: '2026', section: 'footer', role: 'paragraph' })).toBe('page_2026_footer_paragraph');
   });
 
+  it('joins the item between the section and the role', () => {
+    expect(baseName({ page: 'home', section: 'services', item: 'card_4', role: 'headline' })).toBe(
+      'home_services_card_4_headline',
+    );
+  });
+
+  it('keeps the item whole while a 60-character section is cut', () => {
+    const section = 'alpha_bravo_charlie_delta_echo_foxtrot_golf_hotel_india_juli';
+    const name = baseName({ page: 'home', section, item: 'step_1_item_2', role: 'paragraph' });
+    expect(name).toBe('home_alpha_bravo_charlie_step_1_item_2_paragraph');
+    expect(name.length).toBeLessThanOrEqual(48);
+  });
+
+  it('keeps every item part and the role past 48, the item winning over the cap', () => {
+    const item = 'step_1_item_2_item_3_item_4_item_5_item_6_item_7';
+    const name = baseName({ page: 'home', section: 'process', item, role: 'paragraph' });
+    expect(name).toBe(`${item}_paragraph`);
+    expect(name.length).toBeGreaterThan(48);
+    expect(name).toContain('step_1');
+  });
+
   it('cuts the section from its end, then the page from its start, to 48, the role whole', () => {
     const section = 'alpha_bravo_charlie_delta_echo_foxtrot_golf_hotel_india_juli';
     expect(section.length).toBe(60);
@@ -213,8 +238,8 @@ describe('numberNames', () => {
 });
 
 /**
- * The marked element's chain up a fixture row's markup, parsed with a tag
- * stack: the rows are well-formed by construction, so no tokenizer is needed.
+ * A fixture row's markup as a plain object tree, parsed with a tag stack: the
+ * rows are well-formed by construction, so no tokenizer is needed.
  */
 interface Node {
   tag: string;
@@ -223,7 +248,7 @@ interface Node {
   children: Array<Node | string>;
 }
 
-function chainOf(markup: string): SectionNode[] {
+function treeOf(markup: string): { root: Node; marked: Node } {
   const root: Node = { tag: '#root', attrs: '', parent: null, children: [] };
   let at = root;
   let marked: Node | null = null;
@@ -240,33 +265,124 @@ function chainOf(markup: string): SectionNode[] {
       if (m[4] !== '/') at = node;
     }
   }
-  const textOf = (node: Node): string =>
-    node.children.map((c) => (typeof c === 'string' ? c : textOf(c))).join('');
-  const headingOf = (node: Node): string | undefined => {
-    for (const child of node.children) {
-      if (typeof child === 'string') continue;
-      if (/^h[1-6]$/.test(child.tag)) return textOf(child);
-      const inner = headingOf(child);
-      if (inner !== undefined) return inner;
-    }
-    return undefined;
-  };
+  return { root, marked: marked as Node };
+}
+
+const elements = (node: Node): Node[] => node.children.filter((c): c is Node => typeof c !== 'string');
+const textOf = (node: Node): string => node.children.map((c) => (typeof c === 'string' ? c : textOf(c))).join('');
+const firstHeading = (node: Node): Node | undefined => {
+  for (const child of elements(node)) {
+    if (/^h[1-6]$/.test(child.tag)) return child;
+    const inner = firstHeading(child);
+    if (inner !== undefined) return inner;
+  }
+  return undefined;
+};
+
+/** The marked element's chain up the tree, as the section rule reads it. */
+function chainOf(marked: Node | null, root: Node): SectionNode[] {
   const chain: SectionNode[] = [];
   for (let node = marked; node !== null && node !== root; node = node.parent) {
     const here: Node = node;
     chain.push({
       tag: here.tag,
       id: () => /\sid="([^"]*)"/.exec(here.attrs)?.[1],
-      heading: () => headingOf(here),
+      heading: () => {
+        const found = firstHeading(here);
+        return found === undefined ? undefined : textOf(found);
+      },
+      headingTag: () => firstHeading(here)?.tag,
     });
   }
   return chain;
 }
 
+/**
+ * The item rule over the plain tree: an element carries a text where it holds
+ * a text run of its own outside any text-carrying ancestor, or a copy
+ * attribute — the static-HTML walk's key elements and copy attributes.
+ */
+function itemsOf(marked: Node, root: Node): ReturnType<ReturnType<typeof itemReader<Node>>>[] {
+  const carries = (n: Node): boolean =>
+    /\s(aria-label|alt|title|placeholder)="/.test(n.attrs) ||
+    (n.children.some((c) => typeof c === 'string' && c.trim() !== '') &&
+      !(function inside(p: Node | null): boolean {
+        return p !== null && p !== root && (p.children.some((c) => typeof c === 'string' && c.trim() !== '') || inside(p.parent));
+      })(n.parent));
+  const all = (n: Node): Node[] => [n, ...elements(n).flatMap(all)];
+  const read = itemReader<Node>({
+    parentOf: (n) => (n.parent === null || n.parent === root ? undefined : n.parent),
+    childrenOf: (n) => elements(n),
+    tagOf: (n) => n.tag,
+    textsIn: (n) => all(n).filter(carries),
+  });
+  const up: Node[] = [];
+  for (let node: Node | null = marked; node !== null && node !== root; node = node.parent) up.push(node);
+  return up.map(read);
+}
+
 describe('sectionWord', () => {
   for (const row of SECTION_WORD_ROWS) {
     it(`answers the fixture row: ${row.name}`, () => {
-      expect(sectionWord(chainOf(row.markup))).toBe(row.word);
+      const { root, marked } = treeOf(row.markup);
+      const items = itemsOf(marked, root);
+      const found = itemWord(items);
+      expect(found?.item).toBe(row.item);
+      // Inside a repeated item, the section is read above the outermost one.
+      const up: Node[] = [];
+      for (let node: Node | null = marked; node !== null && node !== root; node = node.parent) up.push(node);
+      const from = found === null ? marked : (up[found.outermost]?.parent ?? null);
+      expect(sectionWord(chainOf(from === root ? null : from, root))).toBe(row.word);
     });
   }
+
+  it('answers the node its word came from', () => {
+    const { root, marked } = treeOf('<section id="outer"><div><p data-mark>Words in a div.</p></div></section>');
+    const chain = chainOf(marked, root);
+    const found = sectionOf(chain);
+    expect(found?.word).toBe('outer');
+    expect(found?.node).toBe(chain[2]);
+    expect(sectionOf(chainOf(treeOf('<main><p data-mark>No section here.</p></main>').marked, root))).toBeNull();
+  });
+});
+
+describe('itemWord', () => {
+  it('reads positions and headings over a plain object tree as the html walk does', () => {
+    const { root, marked } = treeOf(
+      '<ul><li><h3>One heading</h3><p>One text</p></li><li><h3>Two heading</h3><p data-mark>Two text</p></li><li><p>Three</p></li></ul>',
+    );
+    const items = itemsOf(marked, root);
+    const li = items[1];
+    expect(li?.tag).toBe('li');
+    expect(li?.parentTag).toBe('ul');
+    expect(li?.position()).toEqual({ n: 2, of: 3 });
+    expect(li?.headed()).toBe(true);
+    expect(itemWord(items)).toEqual({ item: 'item_2', outermost: 1 });
+  });
+});
+
+describe('looseHeadingRole', () => {
+  const sectionHeadedBy = (tag: string): SectionNode[] => {
+    const { root, marked } = treeOf(`<section id="process"><${tag}>The title</${tag}><div data-mark>x</div></section>`);
+    return chainOf(marked, root);
+  };
+
+  it('reads an h3 under a section first headed h2 as a subheadline', () => {
+    expect(looseHeadingRole('h3', sectionHeadedBy('h2'))).toBe('subheadline');
+  });
+
+  it('reads an h3 under a section first headed h3 as a headline', () => {
+    expect(looseHeadingRole('h3', sectionHeadedBy('h3'))).toBe('headline');
+  });
+
+  it('reads an h2 as a headline always', () => {
+    expect(looseHeadingRole('h2', sectionHeadedBy('h1'))).toBe('headline');
+  });
+});
+
+describe('summary', () => {
+  it('reads a <summary> as a headline', () => {
+    expect(roleOf(at({ tag: 'summary' }))).toBe('headline');
+    expect(kindOf(at({ tag: 'summary' }))).toBe('headline');
+  });
 });

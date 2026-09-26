@@ -44,7 +44,7 @@ import { loadConfig } from '../cli/config.js';
 import { createStetHandler, type PublishEvent } from '../server/mount.js';
 import { createStetFormsHandler, type JoinEvent } from '../server/forms.js';
 import { collision, GRANTS_003 } from '../cli/upgrade.js';
-import { migrations as installedMigrations } from '../cli/installed.js';
+import { migrations as installedMigrations, packageRoot } from '../cli/installed.js';
 import { mintUnsubscribeToken, verifyUnsubscribeToken } from '../server/unsubscribe-token.js';
 import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
@@ -1396,6 +1396,26 @@ describe('seo', () => {
     const third = makeCliHost({ config: { seoCheck: { 'anchor-text': 'off' } } });
     expect(await third.run('seo', 'check')).toBe(1);
     expect(third.stderr()).toContain('"error" or "warn"');
+
+    // An advisory limit warns and a hard one errors (journey C1): the title resolves to 63 characters.
+    const overBy = async (limits: Descriptor['keys'][string]['limits'] | null, config: Record<string, unknown> = {}): Promise<[number, string[]]> => {
+      const host = makeCliHost({ config });
+      const d = JSON.parse(host.file('content/descriptor.json')) as Descriptor;
+      if (limits === null) delete d.keys['seo_home_title']!.limits;
+      else d.keys['seo_home_title']!.limits = limits;
+      writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(d, null, 2));
+      writeFileSync(
+        join(host.cwd, 'content/defaults.json'),
+        JSON.stringify({ ...snapshot, default: { ...snapshot['default'], hero_headline: 'x'.repeat(55) } }, null, 2),
+      );
+      const code = await host.run('seo', 'check', '--json');
+      return [code, host.json<{ seo: Array<{ rule: string; severity: string }> }>().seo.filter((f) => f.rule === 'over-length').map((f) => f.severity)];
+    };
+    expect(await overBy({ max: 60, severity: 'advisory' })).toEqual([0, ['warning']]);
+    expect(await overBy({ max: 60, severity: 'hard' })).toEqual([1, ['error']]);
+    expect(await overBy(null)).toEqual([1, ['error']]);
+    expect(await overBy(null, { seoCheck: { 'over-length': 'warn' } })).toEqual([0, ['warning']]);
+    expect(await overBy({ max: 60, severity: 'hard' }, { seoCheck: { 'over-length': 'warn' } })).toEqual([1, ['error']]);
   });
 
   it('Requirement: The completeness rules', async () => {
@@ -1741,6 +1761,30 @@ describe('seo', () => {
     html.err.length = 0;
     expect(await html.run('seo', 'check')).toBe(1);
     expect(html.stderr()).toContain('page "about" declares no SEO title');
+
+    // A description marked after its page was declared fills the slot (journey C9, C3).
+    writeFileSync(
+      join(html.cwd, 'about.html'),
+      '<html><head><meta charset="utf-8"><title>About the partnership team</title>' +
+        '<meta name="description" content="Who runs the data partnerships, and how to reach them."></head>' +
+        '<body><p>About the team.</p></body></html>\n',
+    );
+    expect(await html.run('register', '--from', 'scan', '--write')).toBe(0);
+    html.out.length = 0;
+    html.err.length = 0;
+    expect(await html.run('pages', 'scan', '--apply')).toBe(0);
+    const afterFill = JSON.parse(html.file('content/descriptor.json')) as typeof bound;
+    const description = afterFill.pages['about']?.seo?.['description'] as string;
+    expect(html.out).toContain(`about.html: fills the description with ${description}`);
+    expect(afterFill.keys[description]?.pages).toEqual(['about']);
+    expect(html.stdout()).not.toMatch(/\block?s? a marked title/);
+    html.out.length = 0;
+    html.err.length = 0;
+    await html.run('seo', 'check');
+    expect(html.stderr()).not.toContain('page "about" declares no SEO description');
+    html.out.length = 0;
+    expect(await html.run('pages', 'scan', '--apply')).toBe(0);
+    expect(html.stdout()).not.toContain('fills the');
   });
 });
 
@@ -3466,6 +3510,44 @@ describe('cli', () => {
     html.err.length = 0;
     expect(await html.run('check')).toBe(1);
     expect(html.stderr()).toContain('names no descriptor key — run stet register, or remove the mark');
+
+    // Keys marked nowhere are named as one command, after the per-key warns.
+    const HERO = 'Data labelling and evaluation for AI teams.';
+    const TAIL = ' No raw data is needed to start.';
+    const sharePage = (share: string): string =>
+      '<!DOCTYPE html>\n<html><head>\n' +
+      `<meta property="og:description" content="${share}" data-stet-content="share">\n` +
+      `</head><body>\n<h1 data-stet="hero">${HERO}</h1>\n</body></html>\n`;
+    const near = `Data labelling and review for AI teams.${TAIL}`;
+    const noted = await makeHtmlHost({
+      files: { 'index.html': sharePage(near) },
+      keys: {
+        hero: { shape: 'text', target: 'web' },
+        share: { shape: 'text', target: 'web' },
+        old_one: { shape: 'text', target: 'web' },
+        old_two: { shape: 'text', target: 'web' },
+      },
+      defaults: { hero: HERO, share: near, old_one: 'One', old_two: 'Two' },
+    });
+    expect(await noted.run('check')).toBe(0);
+    const warns = noted.err.filter((line) => line.includes('no mark') || line.includes('marked in no document'));
+    expect(warns.at(-1)).toContain('2 keys have no mark — stet remove old_one old_two drops them, or mark them in the page');
+    expect(warns).toHaveLength(3);
+
+    // A share description one word from its headline is noted (journey G1).
+    expect(noted.out).toContain(
+      'note: index.html:3 the share description nearly repeats the headline (one word differs) — make them match and run stet register to link them',
+    );
+    // Made to match, register derives it from the headline and the note goes.
+    writeFileSync(join(noted.cwd, 'index.html'), sharePage(`${HERO}${TAIL}`));
+    const matched = JSON.parse(noted.file('content/defaults.json')) as Snapshot;
+    (matched['default'] as Record<string, unknown>)['share'] = `${HERO}${TAIL}`;
+    writeFileSync(join(noted.cwd, 'content/defaults.json'), JSON.stringify(matched, null, 2));
+    expect(await noted.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect((JSON.parse(noted.file('content/descriptor.json')) as Descriptor).keys['share']).toMatchObject({ derivesFrom: 'hero', tmpl: `{v}${TAIL}` });
+    noted.out.length = 0;
+    expect(await noted.run('check')).toBe(0);
+    expect(noted.stdout()).not.toContain('nearly repeats');
   });
 
   it('Requirement: pull materializes the truth into the repo forms', async () => {
@@ -4095,6 +4177,201 @@ describe('cli', () => {
     expect(snapshotOnly.stdout()).not.toContain('store (');
     expect(JSON.parse(snapshotOnly.file('content/defaults.json')).default.blog_opening).toBeDefined();
     expect(await snapshotOnly.run('check')).toBe(0);
+
+    // A site's keys get today's names in one plan (journey G2, A20).
+    const textNamed = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head><title data-stet="psyon_data_acquisition">Psyon data acquisition</title></head><body>\n' +
+          '<section id="services"><h2 data-stet="what_psyon_does">What Psyon does</h2></section>\n' +
+          '<section id="process"><ol><li><h3 data-stet="01_assess">01 Assess</h3><p data-stet="we_look_first">We look first.</p></li>\n' +
+          '<li><h3 data-stet="02_build">02 Build</h3><p data-stet="we_build_next">We build next.</p></li></ol></section>\n' +
+          '</body></html>\n',
+      },
+      keys: Object.fromEntries(
+        ['psyon_data_acquisition', 'what_psyon_does', '01_assess', 'we_look_first', '02_build', 'we_build_next'].map((k) => [k, { shape: 'text', target: 'web' }]),
+      ),
+      defaults: {
+        psyon_data_acquisition: 'Psyon data acquisition',
+        what_psyon_does: 'What Psyon does',
+        '01_assess': '01 Assess',
+        we_look_first: 'We look first.',
+        '02_build': '02 Build',
+        we_build_next: 'We build next.',
+      },
+    });
+    const textForms = ['index.html', 'content/descriptor.json', 'content/defaults.json'].map((rel) => textNamed.file(rel));
+    expect(await textNamed.run('rename', '--propose', 'naming.json')).toBe(0);
+    expect(textNamed.stdout()).toContain(
+      'wrote naming.json: 6 of 6 keys would take new names — edit key, label and help, then run stet rename --plan naming.json',
+    );
+    expect(['index.html', 'content/descriptor.json', 'content/defaults.json'].map((rel) => textNamed.file(rel))).toEqual(textForms);
+    const proposal = JSON.parse(textNamed.file('naming.json')) as { keys: Array<Record<string, unknown>> };
+    expect(proposal.keys.find((e) => e['old'] === 'what_psyon_does')).toEqual({
+      old: 'what_psyon_does',
+      key: 'home_services_headline',
+      label: null,
+      help: null,
+      section: 'services',
+      kind: 'headline',
+      places: ['index.html:3 <h2>'],
+      text: 'What Psyon does',
+    });
+    expect(proposal.keys.find((e) => e['old'] === '01_assess')?.['key']).toBe('home_process_step_1_headline');
+    expect(await textNamed.run('rename', '--plan', 'naming.json', '--write')).toBe(0);
+    const renamedKeys = JSON.parse(textNamed.file('content/descriptor.json')).keys as Record<string, { section?: string }>;
+    expect(renamedKeys['home_process_step_2_paragraph']?.section).toBe('process');
+    textNamed.out.length = 0;
+    expect(await textNamed.run('check')).toBe(0);
+    expect(await textNamed.run('rename', '--propose', 'again.json')).toBe(0);
+    expect(JSON.parse(textNamed.file('again.json')).keys).toEqual([]);
+
+    // A stale proposal is refused; a hand-written plan carrying no made is not checked for it (journey G2).
+    const stale = await makeHtmlHost({
+      files: { 'index.html': '<!DOCTYPE html>\n<html><body><h1 data-stet="big_words">Big words</h1></body></html>\n' },
+      keys: { big_words: { shape: 'text', target: 'web' } },
+      defaults: { big_words: 'Big words' },
+    });
+    expect(await stale.run('rename', '--propose', 'naming.json')).toBe(0);
+    writeFileSync(join(stale.cwd, 'index.html'), stale.file('index.html').replace('<body>', '<body>\n'));
+    stale.err.length = 0;
+    expect(await stale.run('rename', '--plan', 'naming.json', '--write')).toBe(1);
+    expect(stale.stderr()).toContain('naming.json: the files it was made from have changed — run stet rename --propose again');
+    writeFileSync(
+      join(stale.cwd, 'hand.json'),
+      JSON.stringify({ plan: 'stet rename', version: 1, keys: [{ old: 'big_words', key: 'home_page_headline', label: null, help: null }] }),
+    );
+    expect(await stale.run('rename', '--plan', 'hand.json', '--write')).toBe(0);
+
+    // A JavaScript host proposes from its accessor calls (journey G2).
+    const jsProposal = withKeys(makeCliHost({ config: { project: 't', managedSurfaces: ['app/**/*.tsx'] } }), {
+      hero_title: 'The hero title',
+      footer_note: 'A footer note',
+    });
+    put(
+      jsProposal,
+      'app/page.tsx',
+      "import { copy } from '@/lib/content';\nexport default function Page() {\n  return (\n" +
+        "    <section id=\"hero\"><h1>{copy('hero_title')}</h1><p>{copy.footer_note}</p></section>\n  );\n}\n",
+    );
+    expect(await jsProposal.run('rename', '--propose', 'naming.json')).toBe(0);
+    const jsPlan = JSON.parse(jsProposal.file('naming.json')) as { keys: Array<Record<string, unknown>> };
+    expect(jsPlan.keys.find((e) => e['old'] === 'hero_title')).toMatchObject({ key: 'home_hero_headline', places: ['app/page.tsx:4 <h1>'] });
+    expect(jsPlan.keys.map((e) => e['old'])).not.toContain('footer_note');
+    expect(jsProposal.stdout()).toMatch(/\d+ keys? ha(?:ve|s) no place stet can read — left out of the plan/);
+  });
+
+  it('Requirement: merge folds one key into another', async () => {
+    const BUTTON = 'Start a conversation ↗';
+    const page =
+      '<!DOCTYPE html>\n<html><head><title data-stet="home_page_title">Psyon</title>' +
+      `<meta property="og:description" content="${BUTTON} today." data-stet-content="home_share_description"></head><body>\n` +
+      `<header><a href="#c" data-stet="home_header_link_text">${BUTTON}</a></header>\n` +
+      `<section id="about"><a href="#c" data-stet="home_header_link_text">${BUTTON}</a></section>\n` +
+      `<section id="contact"><a href="#c" data-stet="home_contact_link_text">${BUTTON}</a></section>\n` +
+      `<footer><a href="#c" data-stet="home_header_link_text">${BUTTON}</a></footer>\n</body></html>\n`;
+    const psyon = async (de: Record<string, string>): Promise<CliHost> => {
+      const host = await makeHtmlHost({
+        files: { 'index.html': page },
+        keys: {
+          home_page_title: { shape: 'text', target: 'web' },
+          home_header_link_text: { shape: 'text', target: 'web', label: 'Header button' },
+          home_contact_link_text: { shape: 'text', target: 'web' },
+          home_share_description: { shape: 'text', target: 'web', derivesFrom: 'home_contact_link_text', tmpl: '{v} today.' },
+        },
+        defaults: { home_page_title: 'Psyon', home_header_link_text: BUTTON, home_contact_link_text: BUTTON },
+      });
+      const snap = JSON.parse(host.file('content/defaults.json')) as Record<string, Record<string, unknown>>;
+      snap['de'] = de;
+      writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snap, null, 2));
+      return host;
+    };
+    const FORMS = ['content/descriptor.json', 'content/defaults.json', 'index.html'];
+    const bytes = (host: CliHost): string[] => FORMS.map((rel) => host.file(rel));
+
+    // Two buttons with the same words become one key (journey G8).
+    const same = await psyon({});
+    const survivor = (JSON.parse(same.file('content/descriptor.json')) as Descriptor).keys['home_header_link_text'];
+    const before = bytes(same);
+    expect(await same.run('merge', 'home_contact_link_text', '--into', 'home_header_link_text')).toBe(0);
+    expect(same.out).toContain('merge home_contact_link_text into home_header_link_text');
+    expect(same.out).toContain('  index.html:5 the mark is renamed');
+    expect(same.out).toContain('merge: run with --write to apply');
+    expect(bytes(same)).toEqual(before);
+    expect(await same.run('merge', 'home_contact_link_text', '--into', 'home_header_link_text', '--write')).toBe(0);
+    const merged = JSON.parse(same.file('content/descriptor.json')) as Descriptor;
+    expect(merged.keys).not.toHaveProperty('home_contact_link_text');
+    expect(merged.keys['home_header_link_text']).toStrictEqual(survivor);
+    expect(same.file('index.html')).toBe(page.replace('data-stet="home_contact_link_text"', 'data-stet="home_header_link_text"'));
+    expect(same.stdout()).toContain('commit them together: git commit -m "stet: merge home_contact_link_text into home_header_link_text" -- ');
+    same.out.length = 0;
+    expect(await same.run('check')).toBe(0);
+
+    // A difference refuses the merge.
+    const differ = await psyon({ home_header_link_text: 'Gespräch beginnen ↗', home_contact_link_text: 'Ein Gespräch ↗' });
+    const held = bytes(differ);
+    expect(await differ.run('merge', 'home_contact_link_text', '--into', 'home_header_link_text', '--write')).toBe(1);
+    expect(differ.stderr()).toContain('cannot merge: home_contact_link_text and home_header_link_text differ in de');
+    expect(bytes(differ)).toEqual(held);
+
+    // A locale only the leaving key carries is kept, and the derived share text follows.
+    const kept = await psyon({ home_contact_link_text: 'Gespräch beginnen ↗' });
+    expect(await kept.run('merge', 'home_contact_link_text', '--into', 'home_header_link_text', '--write')).toBe(0);
+    expect(kept.stdout()).toContain('  home_share_description derives from it and follows');
+    const keptDescriptor = JSON.parse(kept.file('content/descriptor.json')) as Descriptor;
+    expect(keptDescriptor.keys['home_share_description']?.derivesFrom).toBe('home_header_link_text');
+    expect((JSON.parse(kept.file('content/defaults.json')) as Snapshot)['de']).toEqual({ home_header_link_text: 'Gespräch beginnen ↗' });
+    kept.out.length = 0;
+    expect(await kept.run('check')).toBe(0);
+  });
+
+  it('Requirement: split gives one place its own key', async () => {
+    const KEY = 'home_nav_link_text_3';
+    const page =
+      '<!DOCTYPE html>\n<html><head><title data-stet="home_page_title">Psyon</title></head><body>\n' +
+      `<nav><a href="#s" data-stet="${KEY}">Data sourcing</a></nav>\n` +
+      `<footer><a href="#s" data-stet="${KEY}">Data sourcing</a></footer>\n</body></html>\n`;
+    const host = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: { home_page_title: { shape: 'text', target: 'web' }, [KEY]: { shape: 'text', target: 'web', label: 'Nav link' } },
+      defaults: { home_page_title: 'Psyon', [KEY]: 'Data sourcing' },
+    });
+    const snap = JSON.parse(host.file('content/defaults.json')) as Record<string, Record<string, unknown>>;
+    snap['de'] = { [KEY]: 'Datenbeschaffung' };
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snap, null, 2));
+    const FORMS = ['content/descriptor.json', 'content/defaults.json', 'index.html'];
+    const before = FORMS.map((rel) => host.file(rel));
+
+    // A nav link and a footer link part ways (journey G9).
+    expect(await host.run('split', KEY, 'home_footer_link_text_3', '--at', 'index.html:4')).toBe(0);
+    expect(host.out).toEqual([
+      'index.html:4 the mark is renamed; the value "Data sourcing" is copied',
+      `index.html:3 keeps ${KEY}`,
+      'split: run with --write to give index.html:4 its own key',
+    ]);
+    expect(FORMS.map((rel) => host.file(rel))).toEqual(before);
+
+    // A split with nothing to split is refused: the line holds no mark, the new name is declared, the name is the key's own.
+    host.out.length = 0;
+    expect(await host.run('split', KEY, 'home_footer_link_text_3', '--at', 'index.html:2', '--write')).toBe(1);
+    expect(host.stderr()).toContain(`index.html:2 holds no mark or read of ${KEY}`);
+    host.err.length = 0;
+    expect(await host.run('split', KEY, 'home_page_title', '--at', 'index.html:4', '--write')).toBe(1);
+    host.err.length = 0;
+    expect(await host.run('split', KEY, KEY, '--at', 'index.html:4', '--write')).toBe(1);
+    expect(host.stderr()).toContain(`${KEY}: the new name is the old name — nothing to split`);
+    expect(FORMS.map((rel) => host.file(rel))).toEqual(before);
+
+    expect(await host.run('split', KEY, 'home_footer_link_text_3', '--at', 'index.html:4', '--write')).toBe(0);
+    expect(host.file('index.html')).toBe(
+      page.replace(`<footer><a href="#s" data-stet="${KEY}">`, '<footer><a href="#s" data-stet="home_footer_link_text_3">'),
+    );
+    const split = JSON.parse(host.file('content/descriptor.json')) as Descriptor;
+    expect(split.keys['home_footer_link_text_3']).toStrictEqual(split.keys[KEY]);
+    expect((JSON.parse(host.file('content/defaults.json')) as Snapshot)['de']).toEqual({ [KEY]: 'Datenbeschaffung', home_footer_link_text_3: 'Datenbeschaffung' });
+    host.out.length = 0;
+    expect(await host.run('check')).toBe(0);
+    // The JavaScript host's read-at-a-line move is proven in tests/split.test.ts (the Next fixture's lines 12 and 40).
   });
 
   it('Requirement: publish is one path — click, agent and clock', async () => {
@@ -4505,6 +4782,65 @@ describe('cli', () => {
           `(Postgres: ${message}). Rename or move that object, then run stet upgrade again`,
       );
     }
+
+    // upgrade arms the gate's SEO run where it passes, and leaves a failing site's gate as it was (journey A14, C1).
+    const gatedHost = async (): Promise<{ host: CliHost; log: string; commit: (message: string) => number | null }> => {
+      const host = makeCliHost({ config: {} });
+      const log = join(host.cwd, '.gate-log');
+      const git = (args: string[]): void => void execFileSync('git', args, { cwd: host.cwd });
+      git(['init', '-q']);
+      for (const [key, value] of [['user.email', 'gate@conformance'], ['user.name', 'gate'], ['commit.gpgsign', 'false']]) git(['config', key as string, value as string]);
+      writeFileSync(join(host.cwd, '.gitignore'), 'node_modules\n.gate-log\n');
+      mkdirSync(join(host.cwd, 'node_modules/.bin'), { recursive: true });
+      writeFileSync(join(host.cwd, 'node_modules/.bin/stet'), `#!/bin/sh\necho "$*" >> '${log}'\n`, { mode: 0o755 });
+      expect(await host.run('hook', 'install')).toBe(0);
+      // Taken back to what 0.5.1's install left: no `seo`, its own runner.
+      writeFileSync(join(host.cwd, '.git/stet-gate.json'), `${JSON.stringify({ entries: [{ checkout: '', worktree: '' }] }, null, 2)}\n`);
+      // 0.5.1's runner: the shipped one without the SEO run.
+      const shipped = readFileSync(join(packageRoot(), 'templates', 'stet-gate.mjs'), 'utf8');
+      const older = shipped.replace("  if (entry.seo === true && !run(stet, ['seo', 'check'], dir)) code = 1;\n", '');
+      expect(older).not.toBe(shipped);
+      writeFileSync(join(host.cwd, '.git/stet-gate.mjs'), older);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'base', '--no-verify']);
+      host.out.length = 0;
+      const commit = (message: string): number | null => {
+        git(['add', '-A']);
+        return spawnSync('git', ['commit', '-qm', message], { cwd: host.cwd, encoding: 'utf8' }).status;
+      };
+      return { host, log, commit };
+    };
+    const RUNNER_LINE = "hook: the pre-commit gate's runner is updated — it runs stet seo check too";
+    const passing = await gatedHost();
+    expect(await passing.host.run('upgrade')).toBe(0);
+    expect(passing.host.out).toContain(RUNNER_LINE);
+    expect(passing.host.file('.git/stet-gate.mjs')).toBe(readFileSync(join(packageRoot(), 'templates', 'stet-gate.mjs'), 'utf8'));
+    writeFileSync(join(passing.host.cwd, 'page.txt'), 'an edit\n');
+    expect(passing.commit('after the upgrade')).toBe(0);
+    expect(readFileSync(passing.log, 'utf8')).toBe('check\nscan\nseo check\n');
+    passing.host.out.length = 0;
+    expect(await passing.host.run('upgrade')).toBe(0);
+    expect(passing.host.stdout()).not.toContain('hook:');
+
+    const failing = await gatedHost();
+    const snap = JSON.parse(failing.host.file('content/defaults.json'));
+    snap.default.seo_home_desc = 'y'.repeat(161);
+    snap.default.seo_pricing_desc = 'z'.repeat(161);
+    writeFileSync(join(failing.host.cwd, 'content/defaults.json'), JSON.stringify(snap, null, 2));
+    const held = [failing.host.file('.git/stet-gate.json'), failing.host.file('.git/stet-gate.mjs')];
+    expect(await failing.host.run('upgrade')).toBe(0);
+    expect(failing.host.out).toContain(
+      'seo check reports 2 errors; the commit gate will run stet seo check once these pass — fix them, or set seoCheck severities, then run stet hook install',
+    );
+    expect([failing.host.file('.git/stet-gate.json'), failing.host.file('.git/stet-gate.mjs')]).toEqual(held);
+    expect(failing.commit('a snapshot change while seo check fails')).toBe(0);
+    expect(readFileSync(failing.log, 'utf8')).toBe('check\nscan\n');
+    snap.default.seo_home_desc = 'A short description.';
+    snap.default.seo_pricing_desc = 'Another short description.';
+    writeFileSync(join(failing.host.cwd, 'content/defaults.json'), JSON.stringify(snap, null, 2));
+    failing.host.out.length = 0;
+    expect(await failing.host.run('upgrade')).toBe(0);
+    expect(failing.host.out).toContain(RUNNER_LINE);
   });
 
   it('Requirement: The Python helper reads the bundle contract', () => {
@@ -4736,7 +5072,7 @@ const PSYON_SHAPED = [
   '      <p>Data acquisition for labs.</p>',
   '    </section>',
   '    <section id="faq">',
-  ...[1, 2, 3, 4].map((n) => `      <details><h3>Question number ${n} here?</h3><p>Answer number ${n} here.</p></details>`),
+  ...[1, 2, 3, 4].flatMap((n) => [`      <h3>Question number ${n} here?</h3>`, `      <p>Answer number ${n} here.</p>`]),
   '    </section>',
   '    <section id="does">',
   '      <article>',
@@ -5245,6 +5581,47 @@ describe('adoption', () => {
     );
     expect(await forced.run('init', '--host', 'html', '--yes')).toBe(0);
     expect(forced.stdout()).toContain('host: html (--host html)');
+
+    // The third question. A non-interactive run collects no sign-ups…
+    expect(host.stdout()).toContain('collects sign-ups: false (not asked)');
+    // …a Next 15.1+ App Router host answering yes gets the forms scaffold…
+    const signupsIo = (cwd: string, out: string[]): CliIo => ({
+      cwd,
+      env: {},
+      stdout: (l) => out.push(l),
+      stderr: (l) => out.push(l),
+      confirm: async (q) => q.includes('sign-ups'),
+    });
+    const forms = makeAdoptionHost();
+    writeFileSync(
+      join(forms.cwd, 'package.json'),
+      JSON.stringify({ name: 'host', private: true, dependencies: { next: '^15.5.0', react: '^19' } }, null, 2),
+    );
+    const formsOut: string[] = [];
+    expect(await runCli(['init'], signupsIo(forms.cwd, formsOut))).toBe(0);
+    expect(formsOut).toContain('collects sign-ups: true');
+    for (const rel of ['lib/stet-forms.ts', 'lib/limit.ts', 'app/api/stet/join/[group]/route.ts', 'app/api/stet/unsubscribe/route.ts']) {
+      expect(forms.exists(rel), rel).toBe(true);
+    }
+    expect(forms.file('.env.example')).toBe('STET_FORMS_SECRET=\nSTET_FORMS_BASE=\nSTET_CONTACTS_DATABASE_URL=\n');
+    expect(JSON.parse(forms.file('stet.config.json')).contacts).toMatchObject({ store: { adapter: 'pg', urlEnv: 'STET_CONTACTS_DATABASE_URL' } });
+    expect(formsOut).toContain('sign-ups: run stet upgrade to add the contacts tables, then stet contacts group add <key> --name "<name>"');
+    const rerun: string[] = [];
+    expect(await runCli(['init'], signupsIo(forms.cwd, rerun))).toBe(0);
+    expect(rerun.filter((line) => line.startsWith('wrote '))).toEqual([]);
+    // …and a host with no scaffold is pointed at the recipe, writing nothing for sign-ups.
+    const older = makeAdoptionHost();
+    writeFileSync(
+      join(older.cwd, 'package.json'),
+      JSON.stringify({ name: 'host', private: true, dependencies: { next: '^14.2.0', react: '^19' } }, null, 2),
+    );
+    const olderOut: string[] = [];
+    expect(await runCli(['init'], signupsIo(older.cwd, olderOut))).toBe(0);
+    expect(olderOut).toContain(
+      'sign-ups: this host has no scaffold yet — the recipe is at https://github.com/getstet/stet/blob/main/package/docs/operator/contacts.md#the-nextjs-recipe',
+    );
+    expect(older.exists('lib/stet-forms.ts')).toBe(false);
+    expect(older.exists('.env.example')).toBe(false);
   });
 
   it('Requirement: agents install writes the routing guidance into an already-adopted host', async () => {
@@ -5646,12 +6023,12 @@ describe('adoption', () => {
       value: 'You may already have the data<1> our AI lab partners need.</1>',
     });
     expect(located.proposals.find((p) => p.value === 'Hello <1>big <2>world</2></1>!')?.tags).toBe(2);
-    // Each run proposes its role name before its number: the heading in
-    // `<section id="qualify">`, and the mixed heading in no section.
+    // Each run proposes its role name before its number: the <h3> under the
+    // `<section id="qualify">` <h2> as a subheadline, and the mixed heading in no section.
     html.out.length = 0;
     expect(await html.run('scan')).toBe(0);
     expect(html.stderr()).toContain(
-      'index.html:34 possible copy "Software, product and engineering histories" — propose key home_qualify_headline',
+      'index.html:34 possible copy "Software, product and engineering histories" — propose key home_qualify_subheadline',
     );
     expect(html.stderr()).toContain(
       'index.html:25 possible copy "You may already have the data<1> our AI lab partners need..." — propose key home_page_headline',
@@ -5837,13 +6214,13 @@ describe('adoption', () => {
     expect(await refusing.run('init', '--yes')).toBe(0);
     const refusingConfig = JSON.parse(refusing.file('stet.config.json'));
     for (let i = 0; i < 4; i++) {
-      refusing.write(`src/pages/p${i}.astro`, '---\nconst t = 1;\n---\n<h1>Chapter</h1>\n');
+      refusing.write(`src/pages/p${i}.tsx`, 'export default function P() {\n  return <h1>Chapter</h1\n}\n');
     }
     refusing.write('src/copy.ts', 'export const copy = {\n  footer_note: "A working name",\n};\n');
     refusing.write(
       'stet.config.json',
       JSON.stringify(
-        { ...refusingConfig, managedSurfaces: ['src/pages/**/*.astro'], copyModules: ['src/copy.ts'] },
+        { ...refusingConfig, managedSurfaces: ['src/pages/**/*.tsx'], copyModules: ['src/copy.ts'] },
         null,
         2,
       ),
@@ -5854,7 +6231,7 @@ describe('adoption', () => {
     expect(collapsed.join('\n')).toContain(
       '4 file(s) could not be parsed cleanly — reported, not adopted; run with --verbose to list them',
     );
-    expect(collapsed.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toEqual([]);
+    expect(collapsed.filter((l) => /^src\/pages\/p\d\.tsx: could not be parsed/.test(l))).toEqual([]);
     // What the run achieved reads first; what it could not read follows.
     const adoptedAt = collapsed.findIndex((l) => l.startsWith('adopted footer_note'));
     expect(adoptedAt).toBeGreaterThanOrEqual(0);
@@ -5863,8 +6240,26 @@ describe('adoption', () => {
     const beforeVerbose = refusing.out.length;
     expect(await refusing.run('register', '--from', 'scan', '--verbose')).toBe(0);
     const listed = refusing.out.slice(beforeVerbose);
-    expect(listed.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toHaveLength(4);
+    expect(listed.filter((l) => /^src\/pages\/p\d\.tsx: could not be parsed/.test(l))).toHaveLength(4);
     expect(listed.join('\n')).not.toContain('run with --verbose to list them');
+
+    // A template-dialect file is named, never parsed and never counted among the refusals.
+    const astro = makeAdoptionHost();
+    expect(await astro.run('init', '--yes')).toBe(0);
+    const astroConfig = JSON.parse(astro.file('stet.config.json'));
+    astro.write('stet.config.json', JSON.stringify({ ...astroConfig, managedSurfaces: ['src/pages/**/*.astro'] }, null, 2));
+    astro.write('src/pages/index.astro', '---\nconst t = 1;\n---\n<h1>Chapter one</h1>\n');
+    const beforeDialect = astro.out.length;
+    expect(await astro.run('register', '--from', 'scan')).toBe(0);
+    const one = astro.out.slice(beforeDialect);
+    expect(one).toContain("src/pages/index.astro: .astro is not rewritten — place copy('<key>') by hand");
+    expect(one.join('\n')).not.toContain('could not be parsed');
+    for (let i = 1; i < 5; i++) astro.write(`src/pages/p${i}.astro`, '<h1>Another chapter</h1>\n');
+    const beforeFive = astro.out.length;
+    expect(await astro.run('register', '--from', 'scan')).toBe(0);
+    expect(astro.out.slice(beforeFive)).toContain(
+      "5 files are not rewritten (.astro) — place copy('<key>') by hand; run with --verbose to list them",
+    );
 
     // On the static-HTML host the ONE edit is the mark, and the plain run writes
     // nothing at all, as on the JavaScript branch above: a descriptor entry
@@ -5892,7 +6287,7 @@ describe('adoption', () => {
     expect(values['home_page_paragraph_1']).toBe('Research & development notes.');
     // Identical text shares ONE key; the near-misses take keys named by their roles.
     expect(values['home_nav_link_text']).toBe('How it works');
-    expect(values['home_qualify_headline_1']).toBe('How it works.');
+    expect(values['home_qualify_headline']).toBe('How it works.');
     expect(values['home_contact_button_text']).toBe('How it works →');
     expect(html.file('index.html').match(/data-stet="home_nav_link_text"/g)).toHaveLength(2);
     // A link carrying both a copy title and text takes both marks on one tag,
@@ -5994,12 +6389,31 @@ describe('adoption', () => {
     jsx.write('content/defaults.json', JSON.stringify(jsxDefaults, null, 2));
     expect(await jsx.run('register', '--from', 'scan', '--write')).toBe(0);
     const jsxKeys = JSON.parse(jsx.file('content/descriptor.json')).keys as Record<string, { section?: string }>;
-    for (const n of [1, 2, 3]) expect(jsxKeys[`home_frequently_asked_headline_${n}`]?.section).toBe('frequently_asked');
+    // The <h2> is the section's headline and its two <h3>s subheadlines (P4).
+    for (const name of ['home_frequently_asked_headline', 'home_frequently_asked_subheadline_1', 'home_frequently_asked_subheadline_2']) {
+      expect(jsxKeys[name]?.section).toBe('frequently_asked');
+    }
     expect(jsxKeys['home_hero_headline_2']?.section).toBe('hero');
     const jsxPage = jsx.file('app/page.tsx');
-    for (const name of ['home_hero_headline_2', 'home_frequently_asked_headline_1', 'home_frequently_asked_headline_2', 'home_frequently_asked_headline_3']) {
+    for (const name of ['home_hero_headline_2', 'home_frequently_asked_headline', 'home_frequently_asked_subheadline_1', 'home_frequently_asked_subheadline_2']) {
       expect(jsxPage).toContain(`copy('${name}')`);
     }
+
+    // A JSX run gives identical text one key: the hero's link adds it, the footer's shares it.
+    const sharing = makeAdoptionHost({
+      page:
+        'export default function Page() {\n  return (\n    <main>\n' +
+        '      <section id="hero"><h1>Your week, sorted</h1><a href="#c">Start a conversation</a></section>\n' +
+        '      <footer><a href="#c">Start a conversation</a></footer>\n' +
+        '    </main>\n  );\n}\n',
+    });
+    expect(await sharing.run('init', '--yes')).toBe(0);
+    sharing.out.length = 0;
+    expect(await sharing.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(sharing.stdout()).toContain('app/page.tsx: shares home_hero_link_text = Start a conversation');
+    expect(sharing.stdout()).toMatch(/, 1 shared$/m);
+    expect(JSON.parse(sharing.file('content/descriptor.json')).keys).not.toHaveProperty('home_footer_link_text');
+    expect(sharing.file('app/page.tsx').match(/copy\('home_hero_link_text'\)/g)).toHaveLength(2);
 
     // A third page carrying a derivation source's text shares the second
     // page's key (F40): a key tied to another document is passed over for the next.
@@ -6027,6 +6441,56 @@ describe('adoption', () => {
     expect(third.file('a.html')).toContain('<p data-stet="a_page_paragraph">');
     third.out.length = 0;
     expect(await third.run('check')).toBe(0);
+
+    // Head keys carry their SEO bound: a new page's title, description and an
+    // og:title equal to the title, then an adopted site's head keys backfilled.
+    const heads = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head>\n<title>Widgets for every team, shipped</title>\n' +
+          '<meta name="description" content="Widgets for every team, shipped the day you order them, with nothing to assemble.">\n' +
+          '<meta property="og:title" content="Widgets for every team, shipped">\n' +
+          '</head><body>\n<p>Ordinary page copy that repeats nothing.</p>\n</body></html>\n',
+      },
+    });
+    expect(await heads.run('register', '--from', 'scan', '--write')).toBe(0);
+    const headKeys = (JSON.parse(heads.file('content/descriptor.json')) as Descriptor).keys;
+    const titleKey = /<title data-stet="([^"]+)"/.exec(heads.file('index.html'))?.[1] as string;
+    const descriptionKey = /<meta name="description"[^>]*data-stet-content="([^"]+)"/.exec(heads.file('index.html'))?.[1] as string;
+    expect(headKeys[titleKey]?.limits).toEqual({ max: 60, severity: 'advisory' });
+    expect(headKeys[descriptionKey]?.limits).toEqual({ max: 160, severity: 'advisory' });
+    const LONG = 'Psyon — data partnerships for AI labs, all sourced with consent';
+    const backfilled = await makeHtmlHost({
+      files: {
+        'index.html':
+          `<!DOCTYPE html>\n<html><head>\n<title data-stet="home_page_title">${LONG}</title>\n` +
+          '<meta property="og:description" content="Data labelling and evaluation for AI teams. No raw data is needed to start." data-stet-content="home_share_description">\n' +
+          '</head><body>\n<h1 data-stet="home_hero_headline">Data labelling and evaluation for AI teams.</h1>\n</body></html>\n',
+      },
+      keys: {
+        home_page_title: { shape: 'text', target: 'web' },
+        home_share_description: { shape: 'text', target: 'web', derivesFrom: 'home_hero_headline', tmpl: '{v} No raw data is needed to start.' },
+        home_hero_headline: { shape: 'text', target: 'web' },
+      },
+      defaults: { home_page_title: LONG, home_hero_headline: 'Data labelling and evaluation for AI teams.' },
+    });
+    const backfilledBefore = backfilled.file('content/descriptor.json');
+    expect(await backfilled.run('register', '--from', 'scan')).toBe(0);
+    expect(backfilled.out).toEqual([
+      'home_page_title: limit 60 added',
+      'home_share_description: limit 160 added',
+      'register: run with --write to add the SEO limit to 2 keys',
+    ]);
+    expect(backfilled.file('content/descriptor.json')).toBe(backfilledBefore);
+    backfilled.out.length = 0;
+    expect(await backfilled.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(backfilled.out).toContain('wrote content/descriptor.json: the SEO limit added to 2 keys');
+    backfilled.out.length = 0;
+    expect(await backfilled.run('register', '--from', 'scan')).toBe(0);
+    expect(backfilled.out).toEqual(['register: nothing to adopt']);
+    backfilled.err.length = 0;
+    expect(await backfilled.run('check')).toBe(0);
+    expect(backfilled.stderr()).toContain('home_page_title: 63 characters exceeds the 60-character limit');
   });
 
   it("Requirement: A new key's name says where it sits and what it is", async () => {
@@ -6049,17 +6513,107 @@ describe('adoption', () => {
       'home_faq_paragraph_3',
       'home_faq_headline_4',
       'home_faq_paragraph_4',
-      'home_prepare_headline',
-      'home_prepare_span_1',
-      'home_prepare_span_2',
-      'home_prepare_span_3',
-      'home_prepare_span_4',
-      'home_prepare_span_5',
+      // The page's only <article> names its section by its tag.
+      'home_article_headline',
+      'home_article_span_1',
+      'home_article_span_2',
+      'home_article_span_3',
+      'home_article_span_4',
+      'home_article_span_5',
       'home_footer_paragraph',
       'home_page_title',
       'home_share_description',
     ]);
     expect(names.filter((n) => /^[0-9]/.test(n))).toEqual([]);
+
+    // Cards and steps are named by position, never by their title words.
+    const cards = await makeHtmlHost({
+      files: {
+        'index.html': [
+          '<!DOCTYPE html>',
+          '<html><body>',
+          '<header><nav><ul>',
+          ...['Services we offer', 'How we work', 'Data sourcing', 'Get in touch'].map((t) => `<li><a href="#">${t}</a></li>`),
+          '</ul></nav></header>',
+          '<section id="services">',
+          ...['Quality review and headline', 'Annotation at scale', 'Human evaluation work', 'Dataset sourcing help'].map(
+            (t, i) => `<article><h3>${t}</h3><p>What card ${i + 1} covers in a sentence.</p></article>`,
+          ),
+          '</section>',
+          '<section id="process"><h2>The way we work</h2><h3>Four steps from start</h3><ol>',
+          ...['Talk it over', 'Scope the set', 'Build and check', 'Hand it over'].map(
+            (t, i) => `<li><h3>${t}</h3><p>What happens in step ${i + 1} here.</p></li>`,
+          ),
+          '</ol></section>',
+          '</body></html>',
+          '',
+        ].join('\n'),
+      },
+    });
+    expect(await cards.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const cardNames = (JSON.parse(cards.file('naming.json')) as { keys: Array<{ proposed: string }> }).keys.map((e) => e.proposed);
+    expect(cardNames).toEqual([
+      'home_nav_link_text_1',
+      'home_nav_link_text_2',
+      'home_nav_link_text_3',
+      'home_nav_link_text_4',
+      ...[1, 2, 3, 4].flatMap((n) => [`home_services_card_${n}_headline`, `home_services_card_${n}_paragraph`]),
+      'home_process_headline',
+      'home_process_subheadline',
+      ...[1, 2, 3, 4].flatMap((n) => [`home_process_step_${n}_headline`, `home_process_step_${n}_paragraph`]),
+    ]);
+    expect(cardNames.filter((n) => /quality|review|annotation/.test(n))).toEqual([]);
+
+    // The item rule's guards: a loose <h3>, a <details> FAQ, a section titled by an
+    // <h3> alone, items inside steps, a lone <article> and a footer's link columns.
+    const guards = await makeHtmlHost({
+      files: {
+        'index.html': [
+          '<!DOCTYPE html>',
+          '<html><body>',
+          '<section id="hero"><h1>We sort the data out</h1><h3>For teams that train models</h3></section>',
+          '<section id="faq">',
+          '<details><summary>Is the first call free?</summary><p>Yes, the first call costs nothing.</p></details>',
+          '<details><summary>How long does it take?</summary><p>About two weeks from the first call.</p></details>',
+          '</section>',
+          '<section id="minor"><h3>A small aside here</h3></section>',
+          '<section id="steps"><ol>',
+          '<li><h3>First we talk it over</h3><ul><li><h4>Book a time slot</h4><p>Pick any free time you like.</p></li>',
+          '<li><h4>Join the video call</h4><p>Bring every question you have.</p></li></ul></li>',
+          '<li><h3>Then we build the set</h3><ul><li><h4>Collect the records</h4><p>We gather what is needed.</p></li>',
+          '<li><h4>Check the labels twice</h4><p>Every label gets a second look.</p></li></ul></li>',
+          '</ol></section>',
+          '<article><h2>A note from the founders</h2><p>We started in a small office.</p><p>We still answer every email.</p></article>',
+          '<footer><h2>Find your way around</h2><ul>',
+          '<li><h3>Company pages</h3><a href="/about">About the company</a><a href="/jobs">Open positions</a></li>',
+          '<li><h3>Help pages</h3><a href="/contact">Contact the team</a><a href="/support">Support desk hours</a></li>',
+          '</ul><a href="#top">Back to the top</a></footer>',
+          '</body></html>',
+          '',
+        ].join('\n'),
+      },
+    });
+    expect(await guards.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const guardNames = (JSON.parse(guards.file('naming.json')) as { keys: Array<{ proposed: string }> }).keys.map((e) => e.proposed);
+    for (const name of [
+      'home_hero_headline',
+      'home_hero_subheadline',
+      'home_faq_item_1_headline',
+      'home_faq_item_1_paragraph',
+      'home_minor_headline',
+      'home_steps_step_1_headline',
+      'home_steps_step_1_item_1_headline',
+      'home_article_headline',
+      'home_article_paragraph_1',
+      'home_article_paragraph_2',
+      'home_footer_headline',
+      'home_footer_item_1_headline',
+      'home_footer_item_1_link_text_1',
+      'home_footer_item_1_link_text_2',
+      'home_footer_link_text',
+    ]) {
+      expect(guardNames).toContain(name);
+    }
 
     // A component's keys carry no page.
     const component = makeAdoptionHost({ page: 'export default function Page() {\n  return null;\n}\n' });
@@ -6131,8 +6685,20 @@ describe('adoption', () => {
     });
     const existingForms = ['index.html', 'content/descriptor.json', 'content/defaults.json'].map((rel) => existing.file(rel));
     expect(await existing.run('register', '--from', 'scan', '--write')).toBe(0);
+    // The one change is the head key's SEO bound; every name is kept and no document moves.
+    expect(existing.out).toEqual([
+      'psyon_data_acquisition: limit 60 added',
+      'wrote content/descriptor.json: the SEO limit added to 1 key',
+      'register: applied',
+    ]);
+    expect(existing.file('index.html')).toBe(existingForms[0]);
+    expect(JSON.parse(existing.file('content/defaults.json'))).toEqual(JSON.parse(existingForms[2] as string));
+    expect(Object.keys(JSON.parse(existing.file('content/descriptor.json')).keys).sort()).toEqual(
+      ['01_assess', '2026_psyon_all_rights_reserved', 'psyon_data_acquisition'],
+    );
+    existing.out.length = 0;
+    expect(await existing.run('register', '--from', 'scan', '--write')).toBe(0);
     expect(existing.stdout()).toContain('register: nothing to adopt');
-    expect(['index.html', 'content/descriptor.json', 'content/defaults.json'].map((rel) => existing.file(rel))).toEqual(existingForms);
   });
 
   it('Requirement: register applies an edited naming plan', async () => {
@@ -6153,7 +6719,7 @@ describe('adoption', () => {
       section: 'hero',
     });
     Object.assign(entry(edited, 'home_top_paragraph'), { key: 'home_hero_intro', label: 'Hero introduction', section: 'hero' });
-    entry(edited, 'home_prepare_span_1')['adopt'] = false;
+    entry(edited, 'home_article_span_1')['adopt'] = false;
     writeFileSync(join(agent.cwd, 'naming.json'), JSON.stringify(edited, null, 2));
     agent.out.length = 0;
     expect(await agent.run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
@@ -6167,7 +6733,7 @@ describe('adoption', () => {
       help: 'The headline at the top of the home page. The share description repeats its words.',
     });
     expect(agentKeys['home_hero_intro']).toMatchObject({ section: 'hero', label: 'Hero introduction' });
-    expect(agentKeys['home_prepare_span_1']).toBeUndefined();
+    expect(agentKeys['home_article_span_1']).toBeUndefined();
     expect(agent.file('index.html')).toContain('<span>Select</span>');
     expect(agent.stdout()).toMatch(/index\.html:\d+ home_share_description derives from home_hero_headline through "\{v\} Start today\."/);
     agent.out.length = 0;
@@ -6567,7 +7133,9 @@ describe('adoption', () => {
     // One fixed hook; the runner and the list of checkouts sit in git's common directory.
     expect(host.file('.git/hooks/pre-commit')).toContain('stet-gate.mjs');
     expect(host.exists('.git/stet-gate.mjs')).toBe(true);
-    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '' }] });
+    // The operator ran the command, so its entry runs stet seo check too.
+    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '', seo: true }] });
+    expect(host.stdout()).toContain('it runs stet check, stet scan and stet seo check in the repository root when a commit touches it');
     // a differing existing hook is refused, not clobbered, naming the line to add
     host.write('.git/hooks/pre-commit', '#!/bin/sh\necho custom\n');
     expect(await host.run('hook', 'install')).toBe(1);
@@ -6602,7 +7170,7 @@ describe('adoption', () => {
       mkdirSync(join(top, 'site/node_modules/.bin'), { recursive: true });
       writeFileSync(join(top, 'site/stet.config.json'), '{}\n');
       // A stand-in local stet that records what the gate asked of it.
-      writeFileSync(join(top, 'site/node_modules/.bin/stet'), `#!/bin/sh\necho "$1 in \${PWD##*/}" >> '${log}'\n`, {
+      writeFileSync(join(top, 'site/node_modules/.bin/stet'), `#!/bin/sh\necho "$* in \${PWD##*/}" >> '${log}'\n`, {
         mode: 0o755,
       });
       writeFileSync(join(top, 'notes.md'), 'notes\n');
@@ -6621,7 +7189,7 @@ describe('adoption', () => {
 
       writeFileSync(join(top, 'site/page.txt'), 'an edit\n');
       expect(commit('touches site/').code).toBe(0);
-      expect(logged()).toBe('check in site\nscan in site\n');
+      expect(logged()).toBe('check in site\nscan in site\nseo check in site\n');
       writeFileSync(join(top, 'notes.md'), 'more notes\n');
       expect(commit('touches no checkout').code).toBe(0);
       expect(logged()).toBe('');
@@ -6975,12 +7543,13 @@ describe('dashboard', () => {
   };
 
   /** The page `stet dev` serves, over its own handler for a workspace holding `cwd`, booted in jsdom. */
-  const served = async (cwd: string): Promise<PaintedPage> => {
+  const served = async (cwd: string, storage?: Record<string, string>): Promise<PaintedPage> => {
     const { handler } = handlerOver([cwd], { page: dashboardPage() });
     const html = await (await handler(req('/', { token: null }))).text();
     return paintPage({
       html,
       token: TOKEN,
+      ...(storage === undefined ? {} : { storage }),
       serve: async (path, body) => {
         const res = await handler(req(path, body === undefined ? {} : { method: 'POST', body }));
         return { status: res.status, body: (await res.json()) as unknown };
@@ -7049,8 +7618,43 @@ describe('dashboard', () => {
       'Ship everything this week',
       'Start a trial today and see the whole catalogue for yourself.',
     ]);
+    // The derived title's editor holds the headline's draft grey between its two fields.
+    await page.change('group', 'seo');
+    await page.act('key:home_page_title');
+    expect(doc.getElementById('derivedsrc')?.textContent).toBe('Ship everything this week');
     expect(page.errors).toEqual([]);
     page.dom.window.close();
+
+    // A place gets its own key from the page: the nav link keeps the key, the footer link takes the proposed name.
+    const NAV = 'home_nav_link_text_3';
+    const split = await makeHtmlHost({
+      files: {
+        'index.html': [
+          '<!DOCTYPE html>',
+          '<html><head><title data-stet="home_page_title">Psyon</title></head><body>',
+          `<nav><a href="#s" data-stet="${NAV}">Data sourcing</a></nav>`,
+          `<footer><a href="#s" data-stet="${NAV}">Data sourcing</a></footer>`,
+          '</body></html>',
+          '',
+        ].join('\n'),
+      },
+      keys: { home_page_title: { shape: 'text', target: 'web' }, [NAV]: { shape: 'text', target: 'web' } },
+      defaults: { home_page_title: 'Psyon', [NAV]: 'Data sourcing' },
+    });
+    committed(split.cwd);
+    const splitPage = await served(split.cwd);
+    await splitPage.act(`key:${NAV}`);
+    await splitPage.act('splitAsk:index.html:4');
+    expect((splitPage.dom.window.document.querySelector('[data-act-input="splitName"]') as HTMLInputElement).value).toBe('home_footer_link_text');
+    await splitPage.act('splitApply');
+    expect(split.file('index.html').split('\n').slice(2, 4)).toEqual([
+      `<nav><a href="#s" data-stet="${NAV}">Data sourcing</a></nav>`,
+      '<footer><a href="#s" data-stet="home_footer_link_text">Data sourcing</a></footer>',
+    ]);
+    expect(splitPage.dom.window.document.querySelector('.row.on')?.getAttribute('data-act')).toBe('key:home_footer_link_text');
+    expect(await split.run('check')).toBe(0);
+    expect(splitPage.errors).toEqual([]);
+    splitPage.dom.window.close();
 
     // On a JavaScript host a documentation sample is no place, and every place carries its kind.
     const js = makeCliHost({ config: { project: 't', managedSurfaces: ['src/**/*.astro'] } });
@@ -7175,6 +7779,7 @@ describe('dashboard', () => {
     // Within it, the headline and the attribute land in one batch, and the commit names both.
     const saved = await save({ values: [{ key: 'hero_headline', value: 'You may already have data<1> our AI lab partners need.</1>' }] });
     expect(saved.status).toBe(200);
+    expect(saved.body['same']).toEqual([]);
     expect(host.file('index.html')).toContain(
       'content="You may already have data our AI lab partners need. No raw data is needed to start."',
     );
@@ -7207,6 +7812,177 @@ describe('dashboard', () => {
     expect(await host.run('rename', 'share_description', 'home_share_description', '--write')).toBe(0);
     const derived = await call(handler, `/api/site/commit${siteOf(host.cwd)}`, { files: ['content/descriptor.json', 'index.html'] });
     expect(derived.body['subject']).toBe('stet: rename 1 key — share_description → home_share_description');
+
+    // A branch with no upstream pushes with -u to its one remote, and the reply carries the state.
+    const bare = mkdtempSync(join(tmpdir(), 'stet-walk-bare-'));
+    execFileSync('git', ['init', '-q', '--bare'], { cwd: bare });
+    execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: host.cwd });
+    execFileSync('git', ['checkout', '-qb', 'develop'], { cwd: host.cwd });
+    const pushed = await call(handler, `/api/site/push${siteOf(host.cwd)}`, {});
+    expect(pushed.status).toBe(200);
+    expect(pushed.body).toMatchObject({ upstream: 'origin', branch: 'develop', at: { branch: 'develop', upstream: 'origin/develop', ahead: 0 } });
+  });
+
+  it('Requirement: The key list and the preview open on one page', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html': '<!DOCTYPE html>\n<html><head><title>Home</title></head><body><h1>Welcome to the lab</h1></body></html>\n',
+        'about.html': '<!DOCTYPE html>\n<html><head><title>About</title></head><body><h1>About the partner team</h1></body></html>\n',
+      },
+      register: true,
+    });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    const id = ((await call(handlerOver([host.cwd]).handler, `/api/site${siteOf(host.cwd)}`)).body as { id: string }).id;
+    const opens = async (route: string): Promise<{ group: string; route: string; loads: number }> => {
+      const page = await served(host.cwd, { [`stet.route.${id}`]: route });
+      const doc = page.dom.window.document;
+      const at = {
+        group: (doc.getElementById('gsel') as HTMLSelectElement).value,
+        route: (doc.getElementById('route') as HTMLInputElement).value,
+        loads: page.requested('/api/site/preview?').length,
+      };
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+      return at;
+    };
+    expect(await opens('/about.html?x=1')).toEqual({ group: 'page:about', route: '/about.html?x=1', loads: 1 });
+    expect(await opens('/')).toEqual({ group: 'page:home', route: '/', loads: 1 });
+    expect(await opens('/retired.html')).toEqual({ group: 'page:about', route: '/about.html', loads: 1 });
+  });
+
+  it('Requirement: The header shows the branch, the preview link and Publish to live', async () => {
+    const host = await makeHtmlHost({ register: true });
+    committed(host.cwd);
+    const git = (...args: string[]): string => execFileSync('git', args, { cwd: host.cwd, encoding: 'utf8' }).trim();
+    const bare = mkdtempSync(join(tmpdir(), 'stet-walk-bare-'));
+    execFileSync('git', ['init', '-q', '--bare'], { cwd: bare });
+    execFileSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bare });
+    git('branch', '-M', 'main');
+    git('remote', 'add', 'origin', bare);
+    git('push', '-q', 'origin', 'main');
+    git('checkout', '-qb', 'develop');
+    git('commit', '-q', '--allow-empty', '-m', 'develop work');
+    git('push', '-q', '-u', 'origin', 'develop');
+    git('remote', 'set-head', 'origin', 'main');
+    const page = await served(host.cwd);
+    const bar = page.dom.window.document.getElementById('branchbar') as HTMLElement;
+    expect(bar.querySelector('.bdg')?.textContent).toBe('develop · preview');
+    // The remote is no GitHub repository, so nothing reports a preview.
+    expect(bar.textContent).toContain('No preview reported for develop');
+    await page.act('publishAsk');
+    expect(page.dom.window.document.querySelector('#ask .term')?.textContent).toBe(
+      `Publish develop to main? main is what ${host.cwd.split('/').at(-1)} serves.`,
+    );
+    await page.act('publishLive');
+    // The push runs git against the remote: the toast lands once it answers.
+    for (let wait = 0; wait < 100 && page.toast() === ''; wait += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(page.toast()).toBe('Published develop to main.');
+    expect(execFileSync('git', ['rev-parse', 'main'], { cwd: bare, encoding: 'utf8' }).trim()).toBe(git('rev-parse', 'HEAD'));
+    expect(git('branch', '--show-current')).toBe('develop');
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it("Requirement: A save that makes two keys' words the same offers to link them", async () => {
+    const START = 'Start a conversation ↗';
+    const host = await makeHtmlHost({
+      files: {
+        'index.html': [
+          '<!DOCTYPE html>',
+          '<html><head><title data-stet="home_page_title">Psyon</title></head><body>',
+          `<header><a href="#c" data-stet="home_header_link_text">${START}</a></header>`,
+          `<section id="about"><h2>About</h2><a href="#c" data-stet="home_header_link_text">${START}</a></section>`,
+          '<section id="contact"><h2>Contact</h2><a href="#c" data-stet="home_contact_link_text">Book an introductory call ↗</a></section>',
+          `<footer><a href="#c" data-stet="home_header_link_text">${START}</a></footer>`,
+          '</body></html>',
+          '',
+        ].join('\n'),
+      },
+      keys: {
+        home_page_title: { shape: 'text', target: 'web' },
+        home_header_link_text: { shape: 'text', target: 'web' },
+        home_contact_link_text: { shape: 'text', target: 'web' },
+      },
+      defaults: { home_page_title: 'Psyon', home_header_link_text: START, home_contact_link_text: 'Book an introductory call ↗' },
+    });
+    committed(host.cwd);
+    const page = await served(host.cwd);
+    const doc = page.dom.window.document;
+    await page.act('key:home_contact_link_text');
+    await page.type('text:home_contact_link_text', START);
+    await page.act('save');
+    expect(doc.querySelector('.bar ~ .cb .term')?.textContent).toBe('Same words as home_header_link_text, shown in 3 other places');
+    await page.act('sameLink');
+    expect(page.toast()).toBe('Linked: home_contact_link_text now reads home_header_link_text');
+    expect(host.file('index.html').match(/data-stet="home_header_link_text"/g)).toHaveLength(4);
+    expect(JSON.parse(host.file('content/descriptor.json')).keys).not.toHaveProperty('home_contact_link_text');
+    expect(doc.querySelector('.row.on')?.getAttribute('data-act')).toBe('key:home_header_link_text');
+    expect(doc.querySelector('#gitbar [data-act="commit"]')?.classList.contains('pri')).toBe(true);
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('Requirement: Save asks before saving over an advisory limit', async () => {
+    const host = await makeHtmlHost({ register: true });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    committed(host.cwd);
+    const title = Object.entries(JSON.parse(host.file('content/descriptor.json')).keys as Record<string, { limits?: { max: number; severity: string } }>).find(
+      ([, def]) => def.limits?.max === 60 && def.limits.severity === 'advisory',
+    )?.[0] as string;
+    expect(title).toBeDefined();
+    const page = await served(host.cwd);
+    const doc = page.dom.window.document;
+    await page.change('group', 'seo');
+    await page.act(`key:${title}`);
+    await page.type(`text:${title}`, 'T'.repeat(63));
+    expect(doc.querySelector('.cb .cnt')?.textContent).toBe('63 / 60');
+    const before = host.file('content/defaults.json');
+    await page.act('save');
+    expect(doc.querySelector('.bar ~ .cb .term')?.textContent).toBe('Over the 60-character limit for a page title');
+    await page.act('saveCancel');
+    expect(host.file('content/defaults.json')).toBe(before);
+    await page.act('save');
+    await page.act('saveAnyway');
+    expect(JSON.parse(host.file('content/defaults.json')).default[title]).toBe('T'.repeat(63));
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('Requirement: History lists what a commit removed, and restores it', async () => {
+    const SECTION = '<section id="faq">\n<h2 data-stet="faq_headline">Questions</h2>\n<p data-stet="faq_answer">We never buy the data.</p>\n</section>';
+    const page = `<!DOCTYPE html>\n<html><head><title data-stet="home_page_title">Psyon</title></head><body>\n${SECTION}\n<footer><p data-stet="home_footer_text">Psyon Ltd</p></footer>\n</body></html>\n`;
+    const host = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: Object.fromEntries(['home_page_title', 'faq_headline', 'faq_answer', 'home_footer_text'].map((key) => [key, { shape: 'text', target: 'web' }])),
+      defaults: { home_page_title: 'Psyon', faq_headline: 'Questions', faq_answer: 'We never buy the data.', home_footer_text: 'Psyon Ltd' },
+    });
+    committed(host.cwd);
+    const base = { descriptor: host.file('content/descriptor.json'), defaults: host.file('content/defaults.json') };
+    const descriptor = JSON.parse(base.descriptor);
+    const snapshot = JSON.parse(base.defaults);
+    for (const key of ['faq_headline', 'faq_answer']) {
+      delete descriptor.keys[key];
+      delete snapshot.default[key];
+    }
+    writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(descriptor, null, 2));
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+    writeFileSync(join(host.cwd, 'index.html'), page.replace(`${SECTION}\n`, ''));
+    execFileSync('git', ['commit', '-qam', 'layout: FAQ removed'], { cwd: host.cwd });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: host.cwd, encoding: 'utf8' }).trim();
+    const { handler } = handlerOver([host.cwd]);
+    expect((await call(handler, `/api/site/removed${siteOf(host.cwd)}&sha=${sha}`)).body).toEqual({
+      keys: [
+        { key: 'faq_answer', section: 'faq', text: 'We never buy the data.' },
+        { key: 'faq_headline', section: 'faq', text: 'Questions' },
+      ],
+    });
+    const restored = await call(handler, `/api/site/restore${siteOf(host.cwd)}`, { sha });
+    expect(restored.status).toBe(200);
+    expect(restored.body['subject']).toBe(`stet: restore 2 keys removed by ${sha.slice(0, 7)}`);
+    expect(restored.body['markup']).toBeNull();
+    expect(host.file('index.html')).toBe(page);
+    expect(host.file('content/descriptor.json')).toBe(base.descriptor);
+    expect(host.file('content/defaults.json')).toBe(base.defaults);
   });
 
   it('Requirement: The preview finds the selected key and shows its draft in place', async () => {
@@ -7377,13 +8153,26 @@ describe('contacts', () => {
       body: JSON.stringify(body),
     });
 
+  it('Requirement: The contacts doc says where the handler runs', () => {
+    const doc = readFileSync(new URL('../../docs/operator/contacts.md', import.meta.url), 'utf8').replace(/\n(?!\n|#|\||```|- )\s*/g, ' ');
+    // A developer on SvelteKit learns the handler's contract (journey E14).
+    const section = doc.slice(doc.indexOf('## Where it runs'), doc.indexOf('## ', doc.indexOf('## Where it runs') + 3));
+    expect(doc.indexOf('## Where it runs')).toBeGreaterThan(doc.indexOf('## The Worker recipe'));
+    expect(section).toContain('The handler takes a web `Request` and answers a web `Response`.');
+    expect(section).toMatch(/SvelteKit.*hand a route a web `Request`, and are untested/);
+    expect(doc).toContain('Any web page can post a join to an open group');
+    expect(doc).toContain('pair it with allowedOrigins or a confirmation step');
+    expect(doc).toContain('a host that installs `pg` after `next build` builds again');
+  });
+
   it('Requirement: The join route records a membership and its consent evidence', async () => {
     const { store, forms, joins } = await websiteForms();
     const worked = {
       email: 'Ana@Lightfield.co',
       properties: { tier: 'team' },
       form: 'waitlist-page',
-      page: 'https://getstet.xyz/waitlist',
+      // The page the form sits on, on the origin the browser asserts.
+      page: 'https://www.getstet.xyz/waitlist',
     };
     const first = await forms.POST(websiteJoin(worked));
     expect(first.status).toBe(200);
@@ -7392,7 +8181,7 @@ describe('contacts', () => {
     expect(firstBody).toBe('{"ok":true}');
     const held = ok(await store.contacts.contact({ email: 'ana@lightfield.co' })).record;
     expect(held?.memberships).toEqual([
-      expect.objectContaining({ group: 'cloud-waitlist', form: 'waitlist-page', page: 'https://getstet.xyz/waitlist', properties: { tier: 'team' } }),
+      expect.objectContaining({ group: 'cloud-waitlist', form: 'waitlist-page', page: 'https://www.getstet.xyz/waitlist', properties: { tier: 'team' } }),
     ]);
     expect(joins[0]).toMatchObject({ isNew: true, suppressed: false });
     expect(joins[0]?.unsubscribeUrl).toMatch(/\/unsubscribe\?token=e\./);
@@ -7402,7 +8191,7 @@ describe('contacts', () => {
     expect(await again.text()).toBe(firstBody);
     const after = ok(await store.contacts.contact({ email: 'ana@lightfield.co' })).record?.memberships[0];
     expect(after).toMatchObject({ properties: { tier: 'business' }, joinedAt: held?.memberships[0]?.joinedAt, form: 'waitlist-page' });
-    expect(joins[1]).toMatchObject({ isNew: false, form: 'waitlist-page', page: 'https://getstet.xyz/waitlist' });
+    expect(joins[1]).toMatchObject({ isNew: false, form: 'waitlist-page', page: 'https://www.getstet.xyz/waitlist' });
 
     // A suppressed address is answered in the same bytes: the route never
     // tells a visitor who is on a list.
@@ -7413,6 +8202,28 @@ describe('contacts', () => {
       [...again.headers],
       firstBody,
     ]);
+
+    // A page claimed for another site is stored as the origin the browser asserted.
+    expect((await forms.POST(websiteJoin({ ...worked, email: 'kim@x.co', page: 'https://evil.example/x' }))).status).toBe(200);
+    expect(ok(await store.contacts.contact({ email: 'kim@x.co' })).record?.memberships[0]?.page).toBe('https://www.getstet.xyz/');
+
+    // A form on another site joins by default: no allowedOrigins opens the route.
+    const openStore = createMemoryStore({ project: 'default', db: createMemoryDb() });
+    ok(await openStore.contacts.addGroup({ key: 'news', name: 'News', properties: [] }));
+    const open = createStetFormsHandler({ store: openStore, secret: 'forms-secret', unsubscribeBase: 'https://app.example.com/api/stet', guard: 'none' });
+    const preflight = await open.OPTIONS(
+      new Request('https://app.example.com/api/stet/join/news', { method: 'OPTIONS', headers: { origin: 'https://example.com' } }),
+    );
+    expect([preflight.status, preflight.headers.get('access-control-allow-origin')]).toEqual([204, 'https://example.com']);
+    const joined = await open.POST(
+      new Request('https://app.example.com/api/stet/join/news', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://example.com' },
+        body: JSON.stringify({ email: 'lee@x.co', page: 'https://example.com/pricing?utm=x' }),
+      }),
+    );
+    expect([joined.status, joined.headers.get('access-control-allow-origin')]).toEqual([200, 'https://example.com']);
+    expect(ok(await openStore.contacts.contact({ email: 'lee@x.co' })).record?.memberships[0]?.page).toBe('https://example.com/pricing');
   });
 
   it('Requirement: The unsubscribe route suppresses marketing mail on a signed request', async () => {
@@ -7554,8 +8365,10 @@ describe('contacts', () => {
     expect(list[0]).toBe('cloud-waitlist: 3 members');
     expect(list.slice(1).map((line) => line.split('   ')[0])).toEqual(['ana@lightfield.co', 'sam@x.co', 'lee@x.co']);
     expect(list[1]).toMatch(/unsubscribed \(marketing\)$/);
+    // list names each member's page and form, after the answers, as get does.
+    expect(list[1]).toMatch(/ {3}tier=team {3}from https:\/\/getstet\.xyz\/waitlist \(form waitlist-page\) {3}unsubscribed/);
     const get = (await run('get', 'ana@lightfield.co')).out;
-    expect(get).toContain('from https://getstet.xyz/waitlist (form waitlist-page)');
+    expect(get).toMatch(/ {2}cloud-waitlist {3}joined .* {3}tier=team {3}from https:\/\/getstet\.xyz\/waitlist \(form waitlist-page\)/);
     expect(get).toContain('  suppressed: marketing, ');
     for (const argv of [['groups'], ['list', '--group', 'cloud-waitlist'], ['get', 'ana@lightfield.co']]) {
       expect(JSON.parse((await run(...argv, '--json')).out)).toMatchObject({ ok: true });

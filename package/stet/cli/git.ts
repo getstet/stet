@@ -144,30 +144,91 @@ export function operationInProgress(cwd: string): boolean {
   return false;
 }
 
+export interface GitState {
+  /** HEAD's short hash; null on an unborn branch or outside a repository. */
+  head: string | null;
+  /** The branch checked out; null when HEAD is detached or outside a repository. */
+  branch: string | null;
+  /** The branch's upstream (`origin/develop`); null where it has none or its ref is gone. */
+  upstream: string | null;
+  /** Commits the branch holds that its upstream lacks, and the reverse, as of the last fetch; 0 without an upstream. */
+  ahead: number;
+  behind: number;
+  dirty: boolean;
+  detached: boolean;
+}
+
 /**
- * Where a checkout stands: its short HEAD, its branch, and whether anything is
- * uncommitted. Every badge the dashboard paints names the commit it was
- * measured against, so this rides every reply that measured something.
+ * Where a checkout stands: its short HEAD, its branch, its upstream and how far
+ * ahead or behind it is, and whether anything is uncommitted — one
+ * `status --porcelain=v2 --branch` read. Every badge the dashboard paints names
+ * the commit it was measured against, so this rides every reply that measured
+ * something.
  *
  * A directory that is not a git repository answers all-null rather than
  * throwing — a workspace entry may legitimately be one, and the listing says so
  * rather than dying on it. `hooksDir` is the repo test, already resolved
- * worktree- and `core.hooksPath`-safe.
+ * worktree- and `core.hooksPath`-safe. `head` is the first seven hex digits of
+ * `branch.oid`: a label compared only against other `gitState` stamps.
  */
-export function gitState(cwd: string): { head: string | null; branch: string | null; dirty: boolean } {
-  if (hooksDir(cwd) === null) return { head: null, branch: null, dirty: false };
-  const head = git(cwd, ['rev-parse', '--short', 'HEAD']);
-  const branch = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+export function gitState(cwd: string): GitState {
+  const none: GitState = { head: null, branch: null, upstream: null, ahead: 0, behind: 0, dirty: false, detached: false };
+  if (hooksDir(cwd) === null) return none;
   // Through the data read, without the optional lock: this runs on every site
   // load, and a status that refreshes the index takes `index.lock` from the
   // operator's own terminal.
-  const status = gitData(cwd, ['status', '--porcelain']);
+  const status = gitData(cwd, ['status', '--porcelain=v2', '--branch']);
+  if (status.code !== 0) return none;
+  const state = { ...none };
+  let counted = false;
+  for (const line of status.stdout.split('\n')) {
+    if (line === '') continue;
+    // Every line that is not a `# ` header is a changed, untracked or unmerged path.
+    if (!line.startsWith('# ')) {
+      state.dirty = true;
+      continue;
+    }
+    const [, field, ...rest] = line.split(' ');
+    const value = rest.join(' ');
+    // An unborn branch reads `(initial)`: the stamp is honestly absent rather than invented.
+    if (field === 'branch.oid') state.head = value === '(initial)' ? null : value.slice(0, 7);
+    else if (field === 'branch.head') {
+      state.detached = value === '(detached)';
+      state.branch = state.detached ? null : value;
+    } else if (field === 'branch.upstream') state.upstream = value;
+    else if (field === 'branch.ab') {
+      const m = /^\+(\d+) -(\d+)$/.exec(value);
+      if (m !== null) {
+        state.ahead = Number(m[1]);
+        state.behind = Number(m[2]);
+        counted = true;
+      }
+    }
+  }
+  // git prints `branch.upstream` and no `branch.ab` when the upstream's ref is gone
+  // (deleted on the remote and pruned): a push must set it again.
+  if (!counted) state.upstream = null;
+  return state;
+}
+
+/**
+ * The remote a push of `branch` goes to, in git's own order: `branch.<b>.pushRemote`,
+ * `remote.pushDefault`, `branch.<b>.remote`, then `origin` where it exists, then the only
+ * remote. With several remotes and none of these set, none is chosen and the remotes are named.
+ */
+export function pushRemoteOf(cwd: string, branch: string): { remote: string } | { error: string } {
+  const config = (name: string): string | null => {
+    const read = gitData(cwd, ['config', '--get', name]);
+    return read.code === 0 && read.stdout.trim() !== '' ? read.stdout.trim() : null;
+  };
+  const chosen = config(`branch.${branch}.pushRemote`) ?? config('remote.pushDefault') ?? config(`branch.${branch}.remote`);
+  // `branch.<b>.remote` is `.` for a branch tracking another local branch: nothing to push to.
+  if (chosen !== null && chosen !== '.') return { remote: chosen };
+  const remotes = gitData(cwd, ['remote']).stdout.split('\n').filter((r) => r !== '');
+  if (remotes.includes('origin')) return { remote: 'origin' };
+  if (remotes.length === 1) return { remote: remotes[0] as string };
   return {
-    // An unborn HEAD is a repo with no commit yet: `rev-parse` fails and the
-    // stamp is honestly absent rather than invented.
-    head: head.code === 0 ? head.out.trim() : null,
-    branch: branch.code === 0 ? branch.out.trim() : null,
-    dirty: status.code === 0 && status.stdout.trim() !== '',
+    error: remotes.length === 0 ? 'this checkout has no remote' : `several remotes and none chosen for ${branch}: ${remotes.join(', ')}`,
   };
 }
 
@@ -178,16 +239,31 @@ export function gitState(cwd: string): { head: string | null; branch: string | n
  * pre-commit hook that runs a real check, or a push to a slow remote, would
  * freeze the page, every other checkout and every unrelated route for as long
  * as git took. The per-site queue does not help — it serialises one site's
- * requests, not the whole process. The two calls that can run for minutes go
- * through here; the three fast reads `gitState` makes stay synchronous, where
- * a promise per call would cost more than it saves.
+ * requests, not the whole process. The calls that can run for minutes go
+ * through here; the fast read `gitState` makes stays synchronous, where a
+ * promise per call would cost more than it saves.
  *
  * Same contract as `git`: never throws on git's own failure, stdout and stderr
  * merged in arrival order, the run token out of the child's environment. The
- * deadline is an argument so a fixture can reach it in a second; the two
+ * deadline is an argument so a fixture can reach it in a second; the
  * callers take the default.
  */
 export function gitRun(
+  cwd: string,
+  args: string[],
+  timeoutMs: number = GIT_TIMEOUT_MS,
+): Promise<{ code: number; out: string }> {
+  return runTool('git', cwd, args, timeoutMs);
+}
+
+/**
+ * One command-line tool run in a checkout — git, or the operator's own `gh` —
+ * with `gitRun`'s contract: its own process group so the deadline reaches what
+ * it spawned, the run token out of its environment, no prompt, stdout and
+ * stderr merged in arrival order, and never a throw.
+ */
+export function runTool(
+  cmd: string,
   cwd: string,
   args: string[],
   timeoutMs: number = GIT_TIMEOUT_MS,
@@ -203,9 +279,9 @@ export function gitRun(
       if (flush !== undefined) clearTimeout(flush);
       resolve({ code, out: `${out}${extra}` });
     };
-    const child = spawn('git', args, {
+    const child = spawn(cmd, args, {
       cwd,
-      env: { ...childEnv(), GIT_TERMINAL_PROMPT: '0' },
+      env: { ...childEnv(), GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
       // Its own process group, so the deadline can signal the hook git spawned
       // as well as git itself. A hook left running after git is gone holds the
@@ -228,7 +304,7 @@ export function gitRun(
       signalGroup('SIGTERM');
       const hard = setTimeout(() => signalGroup('SIGKILL'), KILL_GRACE_MS);
       hard.unref();
-      done(1, `git timed out after ${timeoutMs / 1000}s`);
+      done(1, `${cmd} timed out after ${timeoutMs / 1000}s`);
     }, timeoutMs);
     // One string in arrival order: a hook writes to stdout and git refuses on
     // stderr, and the reader needs to see them interleaved as they happened.

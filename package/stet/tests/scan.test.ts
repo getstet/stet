@@ -1623,11 +1623,11 @@ describe('runScan — the static-HTML host', () => {
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
     const found = cap.err.join('\n');
-    // The role name before its number: both of the section's headings read the
-    // same base, since one finding cannot know its role repeats in the run.
+    // The role name before its number: the section's <h2> is its headline, and
+    // the <h3> under it a subheadline (P4), so the two never number together.
     expect(found).toContain('index.html:33 possible copy "How it works." — propose key home_qualify_headline');
     expect(found).toContain(
-      'index.html:34 possible copy "Software, product and engineering histories" — propose key home_qualify_headline',
+      'index.html:34 possible copy "Software, product and engineering histories" — propose key home_qualify_subheadline',
     );
     // A tagged value prints with its tags.
     expect(found).toContain('possible copy "You may already have the data<1> our AI lab partners need...');

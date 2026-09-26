@@ -180,6 +180,9 @@ body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-ev
 fieldset.rec{border:1px solid hsl(var(--bd));border-radius:7px;padding:9px 11px;margin:0}
 fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
 .row .s .kd{color:hsl(var(--vi));margin-right:6px}
+.derive{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.derive .in{flex:1 1 90px;width:auto}
+.plist{padding:7px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px;display:flex;flex-direction:column;gap:4px}
 .kline{padding:7px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px;display:flex;flex-direction:column;gap:2px;overflow-wrap:anywhere}
 .tagged{position:relative}
 .tagged textarea,.tagmirror{scrollbar-gutter:stable}
@@ -219,11 +222,13 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
     <div class="stripe" id="stripe"></div>
     <div class="hdr"><div style="display:flex;gap:12px;align-items:center">
         <button class="envchip" id="envchip" data-act="cycleEnv"></button>
+        <span id="branchbar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"></span>
         <div class="muted" id="crumb"></div></div>
       <div style="display:flex;gap:10px;align-items:center"><span class="bdg d" id="dc" hidden></span>
         <span id="gitbar" style="display:flex;gap:8px;align-items:center"></span>
         <button class="btn sm" data-act="theme">Theme</button></div></div>
     <div id="giterr" hidden></div>
+    <div id="ask" hidden></div>
     <div class="tabs" id="tabs"></div>
     <div class="wrap" id="work"><div id="main"></div>
       <div id="grip" role="separator" aria-orientation="vertical" aria-controls="main" tabindex="0" aria-label="Resize the key column" title="Drag to resize the key column. Double-click to restore its width."></div>
@@ -316,6 +321,17 @@ const S = {
   rows: null,
   changes: null,
   removal: null,
+  // The same-words question a save asked, Save anyway's question, Publish's,
+  // a History row opened with the keys its commit removed, Restore's question
+  // and the markup it handed back, and a place being given its own key.
+  same: null,
+  overLimit: null,
+  publishAsk: false,
+  previewLink: null,
+  opened: null,
+  restoreAsk: false,
+  markup: null,
+  split: null,
   message: '',
   marks: { documents: [], keys: {}, places: {} },
   // Unsaved templates of derived keys, by key; a template has no locale.
@@ -409,14 +425,28 @@ function derivedValue(id, locale, seen) {
   const trail = seen || new Set();
   if (trail.has(id)) return undefined;
   trail.add(id);
-  // The source through the resolver's locale chain: its value in this locale, else the default locale's.
-  const loc = locale || S.locale;
-  const base = S.site.config.locales.default;
-  let source = shownValue(def.derivesFrom, loc, trail);
-  if (source === undefined && loc !== base) source = shownValue(def.derivesFrom, base, new Set([id]));
+  const source = sourceText(def.derivesFrom, locale, trail);
   if (source === undefined) return undefined;
   const tagged = (keyDef(def.derivesFrom) || {}).tags !== undefined;
   return deriveText(own(S.tmpl, id) ? S.tmpl[id] : def.tmpl, source, tagged);
+}
+/**
+ * A derived key's source as the page shows it: its draft, else its saved
+ * value, through the resolver's locale chain — this locale's, else the
+ * default locale's. "Reads as" and the derived editor's grey part both read it.
+ */
+function sourceText(source, locale, seen) {
+  const loc = locale || S.locale;
+  const base = S.site.config.locales.default;
+  const trail = seen || new Set();
+  const before = new Set(trail);
+  const text = shownValue(source, loc, trail);
+  return text === undefined && loc !== base ? shownValue(source, base, before) : text;
+}
+/** A template split at its one {v}: the text before it and the text after it. */
+function tmplParts(tmpl) {
+  const i = tmpl.indexOf('{v}');
+  return i === -1 ? { before: tmpl, after: '' } : { before: tmpl.slice(0, i), after: tmpl.slice(i + 3) };
 }
 /** The value a key shows: a derived key's derivation, else its unsaved edit or saved value. */
 function shownValue(id, locale, seen) {
@@ -426,7 +456,21 @@ function shownValue(id, locale, seen) {
 const edited = (id) => S.draft[S.locale + ' ' + id] !== undefined || own(S.tmpl, id);
 const edits = () => Object.keys(S.draft).length + Object.keys(S.tmpl).length;
 const dirty = () => edits() > 0;
-function setDraft(id, value) { S.draft[S.locale + ' ' + id] = value; draftChanged(); }
+/** The value a locale's snapshot holds for a key, or undefined. */
+function savedValue(id, locale) {
+  const block = (S.site && S.site.snapshot && own(S.site.snapshot, locale)) ? S.site.snapshot[locale] : {};
+  return own(block, id) ? block[id] : undefined;
+}
+/** A draft typed back to the saved value is no draft: it leaves the map, so Save greys again. */
+function setDraft(id, value) {
+  const k = S.locale + ' ' + id;
+  const saved = savedValue(id, S.locale);
+  // A locale with no saved value reads as empty: typing and then clearing leaves no draft.
+  const same = saved === undefined ? value === '' : JSON.stringify(value) === JSON.stringify(saved);
+  if (same) delete S.draft[k];
+  else S.draft[k] = value;
+  draftChanged();
+}
 
 // --- loading ----------------------------------------------------------------
 async function loadWorkspace() {
@@ -450,6 +494,8 @@ async function loadSite(path) {
   S.pending = [];
   S.message = '';
   S.removal = null;
+  S.same = null; S.overLimit = null; S.publishAsk = false; S.previewLink = null;
+  S.opened = null; S.restoreAsk = false; S.markup = null; S.split = null;
   S.health = null; S.seo = null; S.setup = null; S.verify = null;
   S.history = null; S.recent = null; S.preview = null; S.devlog = null;
   S.rows = null; S.changes = null;
@@ -478,10 +524,21 @@ async function loadSite(path) {
     if (marks.ok) S.marks = Object.assign({ documents: [], keys: {}, places: {} }, marks.body);
     S.locale = S.site.config.locales.default;
     S.group = firstGroup();
-    S.route = readStore('stet.route.' + S.site.id) || '/';
+    // The list and the preview open on one page: the group whose route is the remembered
+    // route's path, else the remembered route becomes the first group's.
+    const remembered = readStore('stet.route.' + S.site.id) || '/';
+    const path = (route) => route.replace(/[?#].*$/, '');
+    const match = groups().find((g) => groupRoute(g.id) !== null && path(groupRoute(g.id)) === path(remembered));
+    if (match) {
+      S.group = match.id;
+      S.route = remembered;
+    } else {
+      S.route = (S.group === null ? null : groupRoute(S.group)) || remembered;
+    }
   }
   render();
   if (ready()) void guard(loadPreview());
+  if (previewBranch() && S.site.git.upstream) void guard(loadPreviewLink());
 }
 
 function readEditor() {
@@ -672,7 +729,9 @@ function render() {
   document.getElementById('work').className = content ? (S.keysOpen ? 'wrap content' : 'wrap content wide') : 'wrap';
   paintColumn();
   document.getElementById('gitbar').innerHTML = gitBar();
+  document.getElementById('branchbar').innerHTML = branchBar();
   paintGitError();
+  paintAsk();
   document.getElementById('main').innerHTML = view();
   paintPane();
   restoreFocus();
@@ -692,15 +751,66 @@ function siteLabel(s) {
 /** The host kind, a JavaScript host named by its router as the config spells it. */
 const hostLabel = (s) => (s.host === 'html' ? 'html host' : 'js host · ' + s.router);
 
-/** Commit while stet files sit uncommitted; Push once there is nothing unsaved and nothing left to commit. */
+/**
+ * Commit and Push, both always shown on a snapshot-only site with a commit.
+ * Commit is blue while stet files sit uncommitted; Push is blue once nothing is
+ * committable or unsaved and the branch needs pushing.
+ */
 function gitBar() {
   if (!ready() || storeBacked() || S.site.git.head === null) return '';
-  if (S.pending.length > 0) {
-    return '<span class="muted" style="font-size:11px;white-space:nowrap" title="' + esc(S.pending.join('\n')) + '">' +
+  const git = S.site.git;
+  const commit = S.pending.length > 0
+    ? '<span class="muted" style="font-size:11px;white-space:nowrap" title="' + esc(S.pending.join('\n')) + '">' +
       plural(S.pending.length, 'stet file') + ' not yet committed</span>' +
-      '<button class="btn sm" data-act="commit">Commit</button>';
-  }
-  return dirty() ? '' : '<button class="btn sm" data-act="push">Push</button>';
+      '<button class="btn sm pri" data-act="commit">Commit</button>'
+    : '<button class="btn sm" data-act="commit" disabled>Commit</button>';
+  const grey = (label, title) => '<button class="btn sm" data-act="push" disabled' +
+    (title ? ' title="' + esc(title) + '"' : '') + '>' + esc(label) + '</button>';
+  const blue = (label) => '<button class="btn sm pri" data-act="push">' + esc(label) + '</button>';
+  const push = S.pending.length > 0 || dirty() ? grey('Push')
+    : git.branch === null ? grey('Push', 'HEAD is detached — check out a branch to push')
+      : git.upstream === null ? blue('Push · new branch')
+        : git.ahead > 0 ? blue('Push · ' + plural(git.ahead, 'commit'))
+          : grey('Pushed');
+  return commit + push;
+}
+
+/** The live branch: the remote's default branch as the site reply read it, else main. */
+const liveBranch = () => (S.site.git.live || 'main');
+/** A snapshot-only site on a branch other than the live one: the branch its preview deploys. */
+const previewBranch = () => ready() && !storeBacked() && !!S.site.git && S.site.git.head !== null &&
+  typeof S.site.git.branch === 'string' && S.site.git.branch !== liveBranch();
+
+/** Beside the environment chip: which branch this is, its preview, and Publish to live. */
+function branchBar() {
+  if (!ready() || storeBacked() || S.site.git.head === null) return '';
+  const git = S.site.git;
+  if (git.branch === null) return '<span class="bdg">detached · ' + esc(git.head) + '</span>';
+  if (!previewBranch()) return '<span class="bdg">' + esc(git.branch + ' · live') + '</span>';
+  const link = S.previewLink;
+  const preview = link === null ? ''
+    : typeof link.url === 'string' && /^https?:\/\//.test(link.url)
+      ? '<a href="' + esc(link.url) + '" target="_blank" rel="noopener" style="font-size:11.5px">' + esc('Preview: ' + link.url + ' ↗') + '</a>'
+      : '<span class="muted" style="font-size:11.5px">' + esc('No preview reported for ' + git.branch) + '</span>' +
+        '<button class="btn sm" data-act="previewCheck">Check again</button>';
+  const publish = S.pending.length === 0 && !dirty() && git.upstream && git.ahead === 0
+    ? '<button class="btn sm" data-act="publishAsk">Publish to live</button>' : '';
+  return '<span class="bdg">' + esc(git.branch + ' · preview') + '</span>' + preview + publish;
+}
+
+/** A question the header asked (Publish to live), under the header in the removal plan's shape. */
+function paintAsk() {
+  const box = document.getElementById('ask');
+  const show = S.publishAsk && previewBranch();
+  box.hidden = !show;
+  if (!show) { box.innerHTML = ''; return; }
+  const git = S.site.git;
+  const entry = S.sites.find((site) => site.path === S.path);
+  const name = entry ? siteLabel(entry) : S.site.name;
+  box.innerHTML = '<div class="card"><div class="cb"><div class="term">' +
+    esc('Publish ' + git.branch + ' to ' + liveBranch() + '? ' + liveBranch() + ' is what ' + name + ' serves.') + '</div>' +
+    '<div style="margin-top:8px"><button class="btn pri sm" data-act="publishLive">Publish</button>' +
+    '<button class="btn sm" data-act="publishCancel">Cancel</button></div></div></div>';
 }
 
 // CSI sequences (colour, cursor) and OSC ones (a hyperlink or a title, ended by BEL or ESC backslash).
@@ -859,7 +969,7 @@ function chooser(act, values, current, id, cls, labels) {
 }
 
 /** The commits that touched the snapshot (and, on an html host, the pages). Content's History card and Recent show the same table. */
-function commitTable(rows, loaded) {
+function commitTable(rows, loaded, open) {
   // Fixed columns, so the table is as wide as its card: the subject wraps, and
   // the author sits under it rather than in a fourth column the key column has
   // no room for.
@@ -868,8 +978,10 @@ function commitTable(rows, loaded) {
     (rows.length === 0
       ? '<tr><td colspan="3" class="muted">' + (!loaded ? 'Not loaded.'
         : htmlHost() ? 'No commits touch the snapshot or the pages yet.' : 'No commits touch the snapshot yet.') + '</td></tr>'
-      : rows.map((r) => '<tr><td class="mono">' + esc(r.short) + '</td><td class="muted" title="' + esc(r.at) + '">' + whenShort(r.at) +
-        '</td><td>' + esc(r.subject) + '<div class="muted mono" style="font-size:11px">' + esc(r.author) + '</div></td></tr>').join('')) +
+      : rows.map((r) => '<tr' + (open ? ' data-act="commitOpen:' + esc(r.sha) + '" style="cursor:pointer"' : '') + '><td class="mono">' + esc(r.short) +
+        '</td><td class="muted" title="' + esc(r.at) + '">' + whenShort(r.at) +
+        '</td><td>' + esc(r.subject) + '<div class="muted mono" style="font-size:11px">' + esc(r.author) + '</div></td></tr>' +
+        (open && S.opened && S.opened.sha === r.sha ? removedRow(r) : '')).join('')) +
     '</tbody></table></div>';
 }
 /** A commit's time as its author's clock read it: the date, and under it the minute. Anything but git's ISO form is shown as it is. */
@@ -896,7 +1008,7 @@ function editorCard() {
     '<span class="bdg">' + esc(def.shape || 'text') + '</span>' +
     (edited(id) ? '<span class="bdg d">edited</span>' : '') +
     (S.locale !== 'default' ? '<span class="bdg b">' + esc(S.locale) + '</span>' : '') +
-    '</span></div>' + kindLine(id);
+    '</span></div>' + kindLine(id) + placeList(id);
 
   const fallback = (S.locale !== 'default' && value === undefined && defaultValue(id) !== undefined)
     ? '<div class="inf">falls back to default — ' + esc(String(shown(defaultValue(id))).slice(0, 90)) + '</div>'
@@ -921,6 +1033,13 @@ function kindLine(id) {
   for (const dep of dependents(id)) lines.push('feeds: ' + named(dep));
   return lines.length === 0 ? '' : '<div class="kline">' + lines.map((line) => '<div>' + line + '</div>').join('') + '</div>';
 }
+/** A key shown in several places, each place listed with the offer to give it its own key. */
+function placeList(id) {
+  const places = placesOf(id);
+  if (storeBacked() || places.length < 2) return '';
+  return '<div class="plist">' + places.map((p) => '<div><span class="muted mono">' + esc(p.file + ':' + p.line) + '</span> ' +
+    '<button class="btn sm" data-act="splitAsk:' + esc(p.file + ':' + p.line) + '">Give this place its own key</button></div>').join('') + '</div>';
+}
 
 /** A tagged value as the mirror under its field shows it: each numbered tag muted on a shade, the words inside a pair muted. */
 function taggedHtml(text) {
@@ -939,11 +1058,14 @@ const TAG_NOTE = 'Words between &lt;1&gt; and &lt;/1&gt; keep the page&rsquo;s o
 function field(id, def, value, max) {
   const shape = def.shape || 'text';
   if (def.derivesFrom !== undefined) {
-    const tmpl = own(S.tmpl, id) ? S.tmpl[id] : (def.tmpl || '');
+    const parts = tmplParts(own(S.tmpl, id) ? S.tmpl[id] : (def.tmpl || ''));
+    const off = storeBacked() ? ' disabled' : '';
     return '<div class="muted" style="font-size:11px">Template</div>' +
-      '<input class="in mono" value="' + esc(tmpl) + '" data-act-input="tmpl:' + esc(id) + '"' + (storeBacked() ? ' disabled' : '') + '>' +
-      '<p class="note">{v} stands for the text of ' + esc(def.derivesFrom) + '.' +
-      (storeBacked() ? ' The template lives in the descriptor; edit it in the repository.' : '') + '</p>' +
+      '<div class="derive"><input class="in" aria-label="' + esc('Text before ' + def.derivesFrom) + '" value="' + esc(parts.before) +
+      '" data-act-input="tmplBefore:' + esc(id) + '"' + off + '>' + sourceBlock(id) +
+      '<input class="in" aria-label="' + esc('Text after ' + def.derivesFrom) + '" value="' + esc(parts.after) +
+      '" data-act-input="tmplAfter:' + esc(id) + '"' + off + '></div>' +
+      (storeBacked() ? '<p class="note">The template lives in the descriptor; edit it in the repository.</p>' : '') +
       '<div class="muted" style="font-size:11px;margin-top:8px">Reads as</div>' + derivedBlock(id, max);
   }
   if (shape === 'richtext' || shape === 'media') {
@@ -1014,6 +1136,15 @@ function paintDerived(id) {
   const box = document.getElementById('derived');
   const def = keyDef(id) || {};
   if (box) box.outerHTML = derivedBlock(id, def.limits ? def.limits.max : null);
+  const source = document.getElementById('derivedsrc');
+  if (source) source.outerHTML = sourceBlock(id);
+}
+/** The source's text between the derived editor's two fields: drafts applied, its tags dropped, grey and not editable. */
+function sourceBlock(id) {
+  const def = keyDef(id) || {};
+  const text = sourceText(def.derivesFrom, S.locale, new Set([id]));
+  const tagged = (keyDef(def.derivesFrom) || {}).tags !== undefined;
+  return '<span class="muted" id="derivedsrc">' + esc(text === undefined ? '' : deriveText('{v}', shown(text), tagged)) + '</span>';
 }
 
 /** What the last save said about this key, under the field it is about. */
@@ -1044,12 +1175,31 @@ function bar(id) {
       '<div style="margin-top:8px"><button class="btn dg sm" data-act="removeApply">Remove</button>' +
       '<button class="btn sm" data-act="removeCancel">Cancel</button></div></div>'
     : '';
-  return '<div class="bar e-' + envClass() + '">' +
-    '<button class="btn pri" data-act="save">' + (storeBacked() ? 'Save draft' : 'Save to repo') + '</button>' +
+  const ask = (lines, yes, no, extra) => '<div class="cb"><div class="term">' + esc(lines.join('\n')) + '</div>' + (extra || '') +
+    '<div style="margin-top:8px">' + yes + '<button class="btn sm" data-act="' + no + '">Cancel</button></div></div>';
+  const same = S.same
+    ? '<div class="cb"><div class="term">' +
+      esc('Same words as ' + S.same.other + ', shown in ' + plural(S.same.count, 'other place') + '') + '</div>' +
+      '<div style="margin-top:8px"><button class="btn pri sm" data-act="sameLink">Link them</button>' +
+      '<button class="btn sm" data-act="sameKeep">Keep separate</button></div></div>'
+    : '';
+  const over = S.overLimit
+    ? ask(S.overLimit, '<button class="btn pri sm" data-act="saveAnyway">Save anyway</button>', 'saveCancel')
+    : '';
+  const split = S.split && S.split.key === id
+    ? ask([S.split.at], '<button class="btn pri sm" data-act="splitApply">Split</button>', 'splitCancel',
+      '<input class="in sm mono" style="margin-top:8px" value="' + esc(S.split.name) + '" data-act-input="splitName">')
+    : '';
+  const save = storeBacked()
+    ? '<button class="btn pri" data-act="save">Save draft</button>'
+    : '<button class="btn' + (dirty() ? ' pri' : '') + '" data-act="save" title="' +
+      esc('Saves to ' + S.site.config.snapshotPath + ' on this machine. Commit from the header when the change is ready.') + '"' +
+      (dirty() ? '>Save' : ' disabled>Saved') + '</button>';
+  return '<div class="bar e-' + envClass() + '">' + save +
     (storeBacked()
       ? '<button class="btn env" data-act="publish">Publish</button><button class="btn" data-act="discard">Discard</button>'
       : '') +
-    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button></div>' + removal;
+    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button></div>' + removal + same + over + split;
 }
 
 function historyCard() {
@@ -1059,10 +1209,32 @@ function historyCard() {
     : S.history.mount
       ? '<div class="cb muted">This site is store-backed — its history is the store&rsquo;s, at ' +
         '<span class="mono">' + esc(S.history.mount) + '</span>.</div>'
-      : commitTable(rows, S.history !== null);
+      : commitTable(rows, S.history !== null, true);
   return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">History</h3>' +
     '<span class="bdg">' + (htmlHost() ? 'the commits that touched the snapshot or the pages' : 'the commits that touched the snapshot') +
-    '</span></div>' + body + '</div>';
+    '</span></div>' + body + markupPanel() + '</div>';
+}
+/** Under an opened History row: the keys its commit removed, each with its section and text, and Restore. */
+function removedRow(r) {
+  const keys = S.opened.keys || [];
+  if (keys.length === 0 && !S.opened.error) return '';
+  const lines = keys.map((k) => esc(k.key + (k.section ? ' — ' + k.section : '') + ' — "' + rowPreview(k.text) + '"'));
+  const ask = S.restoreAsk
+    ? '<div class="term" style="margin-top:6px">' + esc('Restore the ' + plural(keys.length, 'key') + ' ' + r.short + ' removed?') + '</div>' +
+      '<div style="margin-top:6px"><button class="btn pri sm" data-act="restoreApply">Restore</button>' +
+      '<button class="btn sm" data-act="restoreCancel">Cancel</button></div>'
+    : '<div style="margin-top:6px"><button class="btn sm" data-act="restoreAsk"' + (dirty() ? ' disabled' : '') + '>Restore</button></div>';
+  return '<tr><td colspan="3"><div class="mono" style="font-size:11px">' + lines.join('<br>') + '</div>' +
+    (S.opened.error ? '<div class="err">' + esc(S.opened.error) + '</div>' : '') + (keys.length === 0 ? '' : ask) + '</td></tr>';
+}
+/** The markup a restore handed back, section by section, each with Copy markup. */
+function markupPanel() {
+  if (!Array.isArray(S.markup) || S.markup.length === 0) return '';
+  return '<div class="cb"><p class="note">The page could not be restored automatically — later commits changed the same lines. ' +
+    'The keys are back; paste each section where it belongs, then save.</p>' +
+    S.markup.map((m, i) => '<div class="muted mono" style="font-size:11px;margin-top:8px">' + esc(m.file + (m.section ? ' — ' + m.section : '')) + '</div>' +
+      '<pre class="term">' + esc(m.text) + '</pre>' +
+      '<button class="btn sm" data-act="copyMarkup:' + i + '">Copy markup</button>').join('') + '</div>';
 }
 const htmlHost = () => ready() && S.site.host === 'html';
 
@@ -1964,6 +2136,22 @@ const ACTIONS = {
   commit: () => { void guard(commit()); },
   push: () => { void guard(push()); },
   removePlan: (el, id) => { void guard(removeKey(id, false)); },
+  sameLink: () => { void guard(linkThem()); },
+  sameKeep: () => { S.same = null; render(); },
+  saveAnyway: () => { S.overLimit = null; void guard(save(true)); },
+  saveCancel: () => { S.overLimit = null; render(); },
+  previewCheck: () => { void guard(loadPreviewLink()); },
+  publishAsk: () => { S.publishAsk = true; render(); },
+  publishCancel: () => { S.publishAsk = false; render(); },
+  publishLive: () => { S.publishAsk = false; void guard(publishLive()); },
+  commitOpen: (el, sha) => { void guard(openCommit(sha)); },
+  restoreAsk: () => { S.restoreAsk = true; render(); },
+  restoreCancel: () => { S.restoreAsk = false; render(); },
+  restoreApply: () => { S.restoreAsk = false; void guard(restore()); },
+  copyMarkup: (el, i) => { void guard(copyText(S.markup[Number(i)].text)); },
+  splitAsk: (el, at) => { void guard(askSplit(at)); },
+  splitCancel: () => { S.split = null; render(); },
+  splitApply: () => { void guard(split()); },
   removeCancel: () => { S.removal = null; render(); },
   removeApply: () => { void guard(removeKey(S.removal.key, true)); },
   history: () => {
@@ -2086,7 +2274,9 @@ const ACTIONS_INPUT = {
   search: (el) => { S.q = el.value; render(); },
   editor: (el) => { writeEditor(el.value); },
   text: (el, id) => { clearRefusal(); setDraft(id, el.value); paintMirror(el); softCount(el, id); paintRow(id); paintDirty(); },
-  tmpl: (el, id) => { clearRefusal(); S.tmpl[id] = el.value; paintDerived(id); paintRow(id); paintDirty(); paintPaneCards(); },
+  tmplBefore: (el, id) => { tmplEdit(id, { before: el.value }); },
+  tmplAfter: (el, id) => { tmplEdit(id, { after: el.value }); },
+  splitName: (el) => { if (S.split) S.split.name = el.value; },
   number: (el, id) => { clearRefusal(); setDraft(id, el.value === '' ? '' : Number(el.value)); paintRow(id); paintDirty(); },
   color: (el, id) => { clearRefusal(); setDraft(id, el.value); paintRow(id); paintDirty(); },
   list: (el, arg) => { listEdit(arg, (entries, i) => { entries[i] = el.value; }); },
@@ -2103,6 +2293,20 @@ const ACTIONS_INPUT = {
     paintDirty();
   },
 };
+
+/** One of the derived editor's two fields typed into: the template is the two around {v}, and one typed back to the saved template is no edit. */
+function tmplEdit(id, part) {
+  clearRefusal();
+  const def = keyDef(id) || {};
+  const parts = Object.assign(tmplParts(own(S.tmpl, id) ? S.tmpl[id] : (def.tmpl || '')), part);
+  const next = parts.before + '{v}' + parts.after;
+  if (next === def.tmpl) delete S.tmpl[id];
+  else S.tmpl[id] = next;
+  paintDerived(id);
+  paintRow(id);
+  paintDirty();
+  paintPaneCards();
+}
 
 /** A list edit that keeps the caret where it was: only the counter repaints. */
 function listEdit(arg, change) {
@@ -2155,13 +2359,15 @@ async function guard(work) {
   }
 }
 
-async function save() {
+async function save(anyway) {
   const values = Object.keys(S.draft).map((held) => {
     const cut = held.indexOf(' ');
     return { key: held.slice(cut + 1), locale: held.slice(0, cut), value: S.draft[held] };
   });
   const templates = Object.keys(S.tmpl).map((key) => ({ key: key, tmpl: S.tmpl[key] }));
   if (values.length === 0 && templates.length === 0) { tst('Nothing to save.'); return; }
+  const over = anyway ? [] : overLimits(values);
+  if (over.length > 0) { S.overLimit = over; render(); return; }
   if (storeBacked()) {
     for (const value of values) {
       const res = await post(mountPath('draft'), {
@@ -2201,7 +2407,9 @@ async function save() {
   // wrote nothing still answers the ones an earlier save left uncommitted.
   const wrote = res.body.written || [];
   if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
+  takeGit(res.body.at);
   S.site.snapshot = mergedSnapshot(values);
+  S.same = sameQuestion(res.body.same);
   tst(wrote.length === 0 ? 'Nothing changed.' : 'Wrote ' + wrote.join(', '));
   render();
   // A static site's pages were regenerated here, so its frame navigates again;
@@ -2232,7 +2440,7 @@ async function commit() {
   }
   tst('Committed ' + res.body.short + ' — ' + res.body.subject);
   S.pending = Array.isArray(res.body.pending) ? res.body.pending : [];
-  S.site.git = res.body.at || S.site.git;
+  takeGit(res.body.at);
   const entry = (ready() && S.site.entry) || {};
   if (entry.pushAfterCommit) await push();
   else render();
@@ -2241,12 +2449,150 @@ async function commit() {
 async function push() {
   clearGitError();
   const res = await post('/api/site/push' + query(), {});
+  takeGit(res.body.at);
   if (!res.ok) {
     S.gitError = gitFailure('The push failed. Git\'s output is below.', res.body);
     render();
     return;
   }
-  tst('Pushed.');
+  tst(res.body.upstream ? 'Pushed ' + res.body.branch + ' to ' + res.body.upstream + ' and set it as the upstream.' : 'Pushed.');
+  render();
+  if (previewBranch()) await loadPreviewLink();
+}
+
+/** A reply's checkout state taken as the site's, the live branch the site reply read kept. */
+function takeGit(at) {
+  if (!at || typeof at !== 'object' || !own(at, 'head')) return;
+  S.site.git = Object.assign({}, at, { live: S.site.git.live });
+}
+
+/** The preview address the operator's own gh reports for this branch's pushed commit. */
+async function loadPreviewLink() {
+  const res = await api('/api/site/preview-link' + query());
+  S.previewLink = res.ok ? res.body : { url: null };
+  render();
+}
+
+/** Publish to live: the branch's commit pushed to the live branch, fast-forward only. */
+async function publishLive() {
+  clearGitError();
+  const branch = S.site.git.branch;
+  const res = await post('/api/site/publish-live' + query(), {});
+  takeGit(res.body.at);
+  if (!res.ok) {
+    S.gitError = gitFailure('The push failed. Git\'s output is below.', res.body);
+    render();
+    return;
+  }
+  tst(res.body.already ? 'Already published' : 'Published ' + branch + ' to ' + res.body.live + '.');
+  render();
+}
+
+/**
+ * Advisory limits a save would run past: each drafted key, each key whose
+ * template is drafted, and each derived key whose source is drafted, in the
+ * drafted locale — one line each. A hard limit is the save gate's to refuse.
+ */
+function overLimits(values) {
+  const checks = [];
+  for (const value of values) {
+    checks.push([value.key, value.locale]);
+    for (const dep of dependents(value.key)) checks.push([dep, value.locale]);
+  }
+  for (const key of Object.keys(S.tmpl)) checks.push([key, S.locale]);
+  const lines = [];
+  const seen = new Set();
+  for (const [id, locale] of checks) {
+    const def = keyDef(id) || {};
+    const text = shownValue(id, locale);
+    if (seen.has(id) || !def.limits || def.limits.severity !== 'advisory' || typeof text !== 'string' || text.length <= def.limits.max) continue;
+    seen.add(id);
+    lines.push('Over the ' + def.limits.max + '-character limit for a ' + (kindsOf(id)[0] || 'text'));
+  }
+  return lines;
+}
+
+/**
+ * The same-words question for a save's first \`same\` entry. The survivor is the
+ * key with more places; on a tie, the key not edited. \`count\` is always the
+ * other key's place count.
+ */
+function sameQuestion(same) {
+  const first = Array.isArray(same) ? same[0] : undefined;
+  if (!first || !Array.isArray(first.others) || first.others.length === 0) return null;
+  const edited = first.key;
+  const other = first.others[0];
+  const survivor = placesOf(edited).length > placesOf(other).length ? edited : other;
+  return { key: edited, other: other, count: placesOf(other).length, survivor: survivor, leaving: survivor === edited ? other : edited };
+}
+
+/** Link them: the leaving key merged into the survivor, the page reloaded, the survivor selected. */
+async function linkThem() {
+  const q = S.same;
+  if (!q) return;
+  const res = await post('/api/site/merge' + query(), { key: q.leaving, into: q.survivor });
+  if (!res.ok) { S.message = res.body.error || 'the keys were not linked'; render(); return; }
+  S.same = null;
+  await loadWorkspace();
+  S.sel = q.survivor;
+  S.group = groupOf(q.survivor);
+  render();
+  tst('Linked: ' + q.leaving + ' now reads ' + q.survivor);
+}
+
+/** A History row opened: the keys its commit removed; a second click closes it. */
+async function openCommit(sha) {
+  S.restoreAsk = false;
+  if (S.opened && S.opened.sha === sha) { S.opened = null; render(); return; }
+  S.opened = { sha: sha, keys: null };
+  const res = await api('/api/site/removed' + query() + '&sha=' + encodeURIComponent(sha));
+  if (S.opened && S.opened.sha === sha) S.opened.keys = res.ok ? (res.body.keys || []) : [];
+  render();
+}
+
+/** Restore: the keys the opened commit removed, back; the page reloaded and History reopened with any markup. */
+async function restore() {
+  const sha = S.opened && S.opened.sha;
+  if (!sha) return;
+  const res = await post('/api/site/restore' + query(), { sha: sha });
+  if (!res.ok) {
+    S.opened.error = [res.body.error, res.body.output].filter(Boolean).join('\n');
+    if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
+    render();
+    return;
+  }
+  const markup = res.body.markup;
+  await loadWorkspace();
+  S.history = (await api('/api/site/history' + query())).body;
+  S.markup = Array.isArray(markup) ? markup : null;
+  render();
+  tst('Committed ' + res.body.short + ' — ' + res.body.subject);
+}
+
+/** The page's one clipboard write. */
+async function copyText(text) {
+  await navigator.clipboard.writeText(text);
+  tst('Copied');
+}
+
+/** Give this place its own key: the name the naming rule gives the place, proposed for the operator to keep or edit. */
+async function askSplit(at) {
+  const key = S.sel;
+  const res = await post('/api/site/split' + query(), { key: key, at: at });
+  if (!res.ok) { S.message = res.body.error || 'that place cannot be split'; render(); return; }
+  S.split = { key: key, at: at, name: res.body.proposed || '' };
+  render();
+}
+
+async function split() {
+  const q = S.split;
+  if (!q) return;
+  const res = await post('/api/site/split' + query(), { key: q.key, at: q.at, name: q.name });
+  if (!res.ok) { S.message = res.body.error || 'that place cannot be split'; render(); return; }
+  S.split = null;
+  await loadWorkspace();
+  S.sel = q.name;
+  S.group = groupOf(q.name);
   render();
 }
 

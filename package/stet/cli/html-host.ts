@@ -31,18 +31,25 @@ import { derivedText, resolve } from '../src/resolve.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { targetAdapter } from '../src/targets/adapter.js';
 import { DEFAULT_TARGET, type Descriptor, type KeyDef } from '../src/types.js';
+import { headLimitsFor } from '../src/seo.js';
 import { plainOf } from '../src/validate.js';
 import { CliError, Report } from './report.js';
 import {
   baseName,
   isHeadKind,
+  itemReader,
+  itemWord,
+  kindOf,
+  looseHeadingRole,
   metaCopyNameOf,
   META_NAME_COPY,
   META_PROPERTY_COPY,
   numberNames,
   roleOf,
+  sectionOf,
   sectionWord,
   SITE_PAGE,
+  type ItemNode,
   type Place,
   type SectionNode,
 } from './key-names.js';
@@ -261,11 +268,14 @@ export interface HtmlProposal {
   plain: string;
   tags: number;
   /**
-   * The section word of the element (`sectionWordOf`), `null` where no section
-   * answers — which the role name spells `page`.
+   * The section word the element's name is made from — above its outermost
+   * repeated item where it sits in one — `null` where no section answers,
+   * which the role name spells `page`.
    */
   sectionWord: string | null;
-  /** The role part of the element's name: its kind word underscored, else its tag or attribute. */
+  /** The repeated item the element sits in (`card_4`), where it sits in one. */
+  item?: string;
+  /** The role part of the element's name: its kind word underscored, else its tag or attribute, a loose heading's P4 role. */
   role: string;
   /** The offset of the open tag's `>` (or its `/>`), where a mark is inserted. */
   insertAt: number;
@@ -287,6 +297,12 @@ export interface HtmlMark {
   tags: number;
   element: Element;
   document: Document;
+  /** The section word, item and role the naming rule gives the marked element: what `rename --propose` names its key by. */
+  sectionWord: string | null;
+  item?: string;
+  role: string;
+  /** The element the section word was read from — above the outermost repeated item — where one answered. */
+  sectionElement?: Element;
 }
 
 export interface HtmlProposalSet {
@@ -905,12 +921,27 @@ interface AttrCandidate {
   metaName: string | null;
 }
 
-/** Every quoted, qualifying copy attribute in the document. */
-function attrCandidates(document: Document): AttrCandidate[] {
+/**
+ * Every quoted, qualifying copy attribute in the document. With `marked`, also
+ * every attribute a `data-stet-<attr>` mark names, whatever its value: the
+ * item rule counts a marked attribute as a text though it fails the copy bar.
+ */
+function attrCandidates(document: Document, options: { marked?: boolean } = {}): AttrCandidate[] {
   const found: AttrCandidate[] = [];
   const visit = (el: Element): void => {
     if (!isFaulted(document, el)) {
+      const named = new Set<string>();
+      if (options.marked === true) {
+        for (const attr of el.attrs) {
+          const target = MARK_ATTR.exec(attr.name)?.[1];
+          if (target !== undefined) named.add(target);
+        }
+      }
       for (const attr of el.attrs) {
+        if (named.has(attr.name)) {
+          found.push({ el, attr, metaName: attr.name === 'content' ? metaCopyName(el) : null });
+          continue;
+        }
         if (!attrIsCopy(el, attr.name) || !attr.quoted) continue;
         const text = attrValueOf(attr);
         if (text === '' || !qualifiesAsCopy(text)) continue;
@@ -934,15 +965,10 @@ function attrCandidates(document: Document): AttrCandidate[] {
  * the caller holds have nothing to contribute.
  */
 export function proposeHtml(cwd: string, files: string[]): HtmlProposalSet {
-  const proposals: HtmlProposal[] = [];
-  const claimed: HtmlMark[] = [];
-  const skips: HtmlSkip[] = [];
-  const documents: Document[] = [];
-
+  const sources: Array<{ file: string; source: string }> = [];
   for (const file of [...files].filter((f) => f.endsWith('.html')).sort()) {
-    let source: string;
     try {
-      source = readFileSync(join(cwd, file), 'utf8');
+      sources.push({ file, source: readFileSync(join(cwd, file), 'utf8') });
     } catch (error) {
       // ENOENT is the stated vanish case — the file went between the walk and
       // this read, and there is nothing to report. Anything else (a permission
@@ -956,6 +982,21 @@ export function proposeHtml(cwd: string, files: string[]): HtmlProposalSet {
           'or remove it from the managed surfaces',
       );
     }
+  }
+  return proposeHtmlSources(sources);
+}
+
+/**
+ * `proposeHtml`'s claim pass over sources the caller already holds — a
+ * revision's documents read from git, with no temporary directory written.
+ */
+export function proposeHtmlSources(sources: Array<{ file: string; source: string }>): HtmlProposalSet {
+  const proposals: HtmlProposal[] = [];
+  const claimed: HtmlMark[] = [];
+  const skips: HtmlSkip[] = [];
+  const documents: Document[] = [];
+
+  for (const { file, source } of sources) {
     const document = readDocument(file, source);
     documents.push(document);
     readOne(document, proposals, claimed, skips);
@@ -990,20 +1031,97 @@ export function parentsOf(document: Document): Map<Element, Element> {
  * keeps its meaning for scan's `--json` and the dashboard's grouping.
  */
 export function sectionWordOf(el: Element, parents: Map<Element, Element>): string | null {
-  function* chain(): Generator<SectionNode> {
-    for (let at: Element | undefined = el; at !== undefined; at = parents.get(at)) {
-      const here = at;
-      yield {
-        tag: here.tag,
-        id: () => here.attrs.find((a) => a.name === 'id')?.value,
-        heading: () => {
-          const found = here.descendants.find((d) => /^h[1-6]$/.test(d.tag));
-          return found === undefined ? undefined : valueOf(found).plain;
-        },
-      };
-    }
+  return sectionWord(sectionChain(el, parents));
+}
+
+/** One element of the chain the section rule reads, carrying the element it stands for. */
+interface HtmlSectionNode extends SectionNode {
+  element: Element;
+}
+
+/** The chain the section rule reads, from `el` up: each element's `id`, first heading's text and first heading's tag. */
+function* sectionChain(el: Element | undefined, parents: Map<Element, Element>): Generator<HtmlSectionNode> {
+  for (let at: Element | undefined = el; at !== undefined; at = parents.get(at)) {
+    const here = at;
+    const first = (): Element | undefined => here.descendants.find((d) => /^h[1-6]$/.test(d.tag));
+    yield {
+      tag: here.tag,
+      element: here,
+      id: () => here.attrs.find((a) => a.name === 'id')?.value,
+      heading: () => {
+        const found = first();
+        return found === undefined ? undefined : valueOf(found).plain;
+      },
+      headingTag: () => first()?.tag,
+    };
   }
-  return sectionWord(chain());
+}
+
+/** What the naming rule gives an element: its section word, the repeated item it sits in, its role and the section's element. */
+interface Naming {
+  sectionWord: string | null;
+  item?: string;
+  role: string;
+  sectionElement?: Element;
+}
+
+/**
+ * The section word, item and role an element is named by — a proposal's, and a
+ * mark's for `rename --propose`. Inside a repeated item the section is the one
+ * above the outermost item; outside one, a heading takes P4's role.
+ */
+function namingOf(el: Element, parents: Map<Element, Element>, items: (at: Element) => ItemNode, place: Place): Naming {
+  const up: Element[] = [];
+  for (let at: Element | undefined = el; at !== undefined; at = parents.get(at)) up.push(at);
+  const role = roleOf(place);
+  const found = itemWord(up.map(items));
+  const answered = (from: Element | undefined): Pick<Naming, 'sectionWord' | 'sectionElement'> => {
+    const section = sectionOf(sectionChain(from, parents));
+    return section === null ? { sectionWord: null } : { sectionWord: section.word, sectionElement: section.node.element };
+  };
+  if (found !== null) {
+    return { ...answered(parents.get(up[found.outermost] as Element)), item: found.item, role };
+  }
+  const loose = role === 'headline' && place.attr === undefined ? looseHeadingRole(el.tag, sectionChain(parents.get(el), parents)) : role;
+  return { ...answered(el), role: loose };
+}
+
+/** The item rule's reads over one document, over key-names' `itemReader`: a text is a key element or a copy attribute. */
+function htmlItems(parents: Map<Element, Element>, texts: ReadonlySet<Element>): (at: Element) => ItemNode {
+  return itemReader<Element>({
+    parentOf: (n) => parents.get(n),
+    childrenOf: (n) => n.children,
+    tagOf: (n) => n.tag,
+    textsIn: (n) => [n, ...n.descendants].filter((d) => texts.has(d)),
+  });
+}
+
+/**
+ * The one order register's two passes and `rename --propose` read marks and
+ * proposals in: visible text before head texts, then by file, then document
+ * order — an attribute before the element text at one offset.
+ */
+export function markOrder(
+  a: { file: string; kind: 'element' | 'attribute'; tag: string; attr?: string; metaName?: string; inSvg?: true; insertAt?: number; element?: Element },
+  b: { file: string; kind: 'element' | 'attribute'; tag: string; attr?: string; metaName?: string; inSvg?: true; insertAt?: number; element?: Element },
+): number {
+  const at = (x: typeof a): number => x.insertAt ?? x.element?.openStart ?? 0;
+  return (
+    Number(isHeadText(a)) - Number(isHeadText(b)) ||
+    a.file.localeCompare(b.file) ||
+    at(a) - at(b) ||
+    (a.kind === 'attribute' ? 0 : 1) - (b.kind === 'attribute' ? 0 : 1)
+  );
+}
+
+/** A proposal's or a mark's role name before its number: the page, the section (none for a head text), the item and the role. */
+export function htmlBaseName(page: string, at: { sectionWord: string | null; item?: string; role: string } & HeadTest): string {
+  return baseName({
+    page,
+    ...(isHeadText(at) ? {} : { section: at.sectionWord }),
+    ...(at.item === undefined ? {} : { item: at.item }),
+    role: at.role,
+  });
 }
 
 function readOne(
@@ -1033,6 +1151,10 @@ function readOne(
   };
   underSvg(document.roots, false);
   const parents = parentsOf(document);
+  // Every element carrying a text — a key element, or a copy attribute, marked or not: the item rule's count.
+  const texts = new Set<Element>([...keyElements, ...attrCandidates(document, { marked: true }).map((c) => c.el)]);
+  const items = htmlItems(parents, texts);
+  const naming = (el: Element, place: Place): Naming => namingOf(el, parents, items, place);
 
   // Which attributes a `data-stet-<attr>` already binds, so an attribute is
   // proposed exactly once and a bound one is silent.
@@ -1068,6 +1190,7 @@ function readOne(
         tags: read.tags,
         element: el,
         document,
+        ...naming(el, { file: document.file, line: line(el.openStart), tag: el.tag, ...(svg.has(el) ? { svg: true as const } : {}) }),
       });
       continue;
     }
@@ -1094,8 +1217,7 @@ function readOne(
       value: read.value,
       plain: read.plain,
       tags: read.tags,
-      sectionWord: sectionWordOf(el, parents),
-      role: roleOf({ file: document.file, line: line(el.openStart), tag: el.tag, ...(svg.has(el) ? { svg: true as const } : {}) }),
+      ...proposalNaming(naming(el, { file: document.file, line: line(el.openStart), tag: el.tag, ...(svg.has(el) ? { svg: true as const } : {}) })),
       insertAt: insertAtOf(document, el),
     });
   }
@@ -1156,6 +1278,13 @@ function readOne(
         tags: 0,
         element: el,
         document,
+        ...naming(el, {
+          file: document.file,
+          line: line(el.openStart),
+          tag: el.tag,
+          attr: target,
+          ...(metaName === null ? {} : { meta: metaName }),
+        }),
       });
     }
     for (const child of el.children) visitMarks(child);
@@ -1190,14 +1319,15 @@ function readOne(
       value: text,
       plain: text,
       tags: 0,
-      sectionWord: sectionWordOf(candidate.el, parents),
-      role: roleOf({
-        file: document.file,
-        line: line(candidate.el.openStart),
-        tag: candidate.el.tag,
-        attr: candidate.attr.name,
-        ...(candidate.metaName === null ? {} : { meta: candidate.metaName }),
-      }),
+      ...proposalNaming(
+        naming(candidate.el, {
+          file: document.file,
+          line: line(candidate.el.openStart),
+          tag: candidate.el.tag,
+          attr: candidate.attr.name,
+          ...(candidate.metaName === null ? {} : { meta: candidate.metaName }),
+        }),
+      ),
       insertAt: insertAtOf(document, candidate.el),
     });
   }
@@ -1315,6 +1445,11 @@ function readOne(
       ),
     );
   }
+}
+
+/** A proposal's naming fields: the section element stays with the marks, since a proposal is printed as data. */
+function proposalNaming({ sectionElement: _element, ...rest }: Naming): Omit<Naming, 'sectionElement'> {
+  return rest;
 }
 
 /** The offset a mark is inserted at: the open tag's `>`, or its `/>`. */
@@ -1623,6 +1758,8 @@ export interface HtmlRegisterPlan {
   derived: HtmlDerivation[];
   /** Existing literal head keys this run turns into derived ones; no document changes for them. */
   converted: HtmlDerivation[];
+  /** Existing keys marked only on head texts that this run gives their SEO bound. */
+  limited: Array<{ key: string; max: number }>;
   /** The keys this run adds, in the order it minted them: what a naming plan lists. */
   minted: HtmlMint[];
   /** The key each proposal the run marks receives, after naming — what `scan` prints as its proposed key. */
@@ -1670,13 +1807,16 @@ export interface HtmlDerivation {
  * text is copy: the description, and the share title and description. The page
  * shows these outside its body, and each may carry text the body shows.
  */
-export function isHeadText(at: {
+/** What the head-text test reads of a proposal or a mark. */
+export interface HeadTest {
   kind: 'element' | 'attribute';
   tag: string;
   attr?: string;
   metaName?: string;
   inSvg?: true;
-}): boolean {
+}
+
+export function isHeadText(at: HeadTest): boolean {
   return isHeadKind(placeOf({ file: '', line: 0, ...at }));
 }
 
@@ -1764,6 +1904,73 @@ export function derivationOf(
   return best === null ? null : { source: best.source, tmpl: best.tmpl };
 }
 
+/** The visible keys with their text, and the documents each key is marked in: what a head text may derive from. */
+export interface VisibleSources {
+  visible: Map<string, string>;
+  docsOf: Map<string, Set<string>>;
+}
+
+/** The sources the marks already carry: every visible key holding a literal text, and every marked key's documents. */
+export function visibleSources(set: HtmlProposalSet, descriptor: Descriptor, snapshot: Snapshot): VisibleSources {
+  const docsOf = new Map<string, Set<string>>();
+  const visible = new Map<string, string>();
+  for (const mark of set.claimed) {
+    docsOf.set(mark.key, (docsOf.get(mark.key) ?? new Set<string>()).add(mark.file));
+    const text = heldTextOf(descriptor, snapshot, mark.key);
+    if (text !== null && isVisibleText(mark)) visible.set(mark.key, text);
+  }
+  return { visible, docsOf };
+}
+
+/** The visible keys a head text in `file` may derive from: those marked in that document alone, by name. */
+export function visibleSourcesIn(sources: VisibleSources, file: string): Array<{ key: string; value: string }> {
+  const onlyIn = (key: string): boolean => {
+    const docs = sources.docsOf.get(key);
+    return docs !== undefined && docs.size === 1 && docs.has(file);
+  };
+  return [...sources.visible]
+    .filter(([key]) => onlyIn(key))
+    .map(([key, value]) => ({ key, value }))
+    .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+}
+
+/** Words as a derivation reads them: split on white space. */
+const wordsIn = (text: string): string[] => text.split(/\s+/).filter((w) => w !== '');
+
+/** Case folded, so a word that differs only in its capitals counts as the one differing word. */
+const folded = (words: readonly string[]): string[] => words.map((w) => w.toLowerCase());
+
+/** Whether `a` becomes `b` by replacing, inserting or deleting at most one word. */
+export function withinOneWord(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length === b.length) return a.filter((w, i) => w !== b[i]).length <= 1;
+  const [long, short] = a.length > b.length ? [a, b] : [b, a];
+  if (long.length - short.length !== 1) return false;
+  for (let i = 0; i < long.length; i += 1) if ([...long.slice(0, i), ...long.slice(i + 1)].join('\u0000') === short.join('\u0000')) return true;
+  return false;
+}
+
+/**
+ * A head text that nearly repeats a visible text: some run of the head text's words is within one word
+ * of the visible text's, compared case-folded (a case-only difference counts), both have at least four
+ * words, and once they match the derivation rule would link them (the visible text at least 12
+ * characters and at least half the head text) — so the note's remedy works. Never where `derivationOf`
+ * already links them, and never where a run of the head text's words equals the visible text's exactly.
+ */
+export function nearlyRepeats(descriptor: Descriptor, head: string, source: { key: string; value: string }): boolean {
+  const plain = derivedText(descriptor, source.key, source.value, '{v}');
+  const hw = wordsIn(head);
+  const vw = wordsIn(plain);
+  if (hw.length < 4 || vw.length < 4) return false;
+  if (derivationOf(descriptor, head, [source]) !== null) return false;
+  if (plain.length < DERIVE_MIN || plain.length * 2 < head.length) return false;
+  const exact = vw.join('\u0000');
+  for (let at = 0; at + vw.length <= hw.length; at += 1) if (hw.slice(at, at + vw.length).join('\u0000') === exact) return false;
+  for (let length = vw.length - 1; length <= vw.length + 1; length += 1) {
+    for (let at = 0; at + length <= hw.length; at += 1) if (withinOneWord(folded(hw.slice(at, at + length)), folded(vw))) return true;
+  }
+  return false;
+}
+
 /**
  * Every proposal turned into a key and a mark, and every literal head key that
  * carries visible text turned into a derivation — the descriptor and snapshot
@@ -1818,23 +2025,18 @@ export function planHtmlRegister(input: {
   const marksOf = new Map<string, HtmlMark[]>();
   for (const mark of set.claimed) marksOf.set(mark.key, [...(marksOf.get(mark.key) ?? []), mark]);
   const headOnly = new Set([...marksOf].filter(([, marks]) => marks.every(isHeadText)).map(([key]) => key));
-  // The documents each key is marked in, before the run and as it marks.
-  const docsOf = new Map<string, Set<string>>();
+  // The documents each key is marked in, and the visible keys and their text —
+  // the sources a head text may derive from — before the run and as it marks.
+  const carriedSources = visibleSources(set, descriptor, snapshot);
+  const { visible, docsOf } = carriedSources;
   const markedIn = (key: string, file: string): void => {
     docsOf.set(key, (docsOf.get(key) ?? new Set<string>()).add(file));
   };
-  for (const mark of set.claimed) markedIn(mark.key, mark.file);
   /** Whether every mark of `key` is in `file`. */
   const onlyIn = (key: string, file: string): boolean => {
     const docs = docsOf.get(key);
     return docs !== undefined && docs.size === 1 && docs.has(file);
   };
-  // Visible keys and their text, the sources a head text may derive from.
-  const visible = new Map<string, string>();
-  for (const [key, marks] of marksOf) {
-    const text = heldTextOf(descriptor, snapshot, key);
-    if (text !== null && marks.some(isVisibleText)) visible.set(key, text);
-  }
 
   // Keyed by value AND declared tag count: sharing a `tags: 1` key onto an
   // element with no descendants writes a value the regenerator must refuse. A
@@ -1903,13 +2105,8 @@ export function planHtmlRegister(input: {
     return key;
   };
 
-  // Document order within a file; an attribute before the element text at one offset.
-  const order = [...set.proposals].sort(
-    (a, b) =>
-      a.file.localeCompare(b.file) ||
-      a.insertAt - b.insertAt ||
-      (a.kind === 'attribute' ? 0 : 1) - (b.kind === 'attribute' ? 0 : 1),
-  );
+  // Visible text, then head texts; document order within a file; an attribute before the element text at one offset.
+  const order = [...set.proposals].sort(markOrder);
 
   // A derivation source keeps its single document: visible text elsewhere that
   // repeats it takes a key of its own, so the head texts derived from it never
@@ -1937,12 +2134,7 @@ export function planHtmlRegister(input: {
     markWith(proposal, key, true);
   }
 
-  /** The visible keys a head text in `file` may derive from: those marked in that document alone. */
-  const sourcesIn = (file: string): Array<{ key: string; value: string }> =>
-    [...visible]
-      .filter(([key]) => onlyIn(key, file))
-      .map(([key, value]) => ({ key, value }))
-      .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const sourcesIn = (file: string): Array<{ key: string; value: string }> => visibleSourcesIn(carriedSources, file);
 
   for (const proposal of order.filter(isHeadText)) {
     let key = byHeadText.get(proposal.value);
@@ -2001,16 +2193,33 @@ export function planHtmlRegister(input: {
     converted.push({ key, ...found, file: first.file, line: first.line });
   }
 
+  // Head keys carry their SEO bound as an advisory limit: each key marked only on
+  // head texts, minted by this run or found carrying no `limits`, takes the
+  // bound of the tightest field its head texts fill. A key already carrying
+  // `limits` is never touched.
+  const headRoles = new Map<string, string[] | null>();
+  const roleAt = (key: string, at: HeadTest & { role: string }): void => {
+    const roles = headRoles.get(key);
+    if (roles === null) return;
+    headRoles.set(key, isHeadText(at) ? [...(roles ?? []), at.role] : null);
+  };
+  for (const mark of set.claimed) roleAt(mark.key, mark);
+  for (const [proposal, key] of keyAt) roleAt(key, proposal);
+  const limited: Array<{ key: string; max: number }> = [];
+  for (const [key, roles] of headRoles) {
+    const def = defOf(key);
+    const limits = roles === null ? undefined : headLimitsFor(roles);
+    if (def === undefined || def.limits !== undefined || limits === undefined) continue;
+    descriptor.keys[key] = { ...def, limits };
+    if (before.has(key)) limited.push({ key, max: limits.max });
+  }
+
   // The names. Each key this run adds is named from its first mark — `site` for
   // its page where it is marked in more than one document, no section for a
   // head text — and the run's names are numbered together.
   const bases = minting.map(({ tmp, proposal }) => {
     const docs = docsOf.get(tmp) ?? new Set<string>();
-    return baseName({
-      page: docs.size > 1 ? SITE_PAGE : pageOf(proposal.file),
-      ...(isHeadText(proposal) ? {} : { section: proposal.sectionWord }),
-      role: proposal.role,
-    });
+    return htmlBaseName(docs.size > 1 ? SITE_PAGE : pageOf(proposal.file), proposal);
   });
   const proposedNames = numberNames(bases, (name) => before.has(name));
   const finalOf = new Map<string, string>();
@@ -2090,7 +2299,7 @@ export function planHtmlRegister(input: {
   const added = minted.length;
   const marked = kept.length;
   const shared = kept.filter((m) => m.shared).length;
-  return { edited, added, shared, marked, derived, converted, minted, keyAt };
+  return { edited, added, shared, marked, derived, converted, limited, minted, keyAt };
 }
 
 // --- check's documents ------------------------------------------------------
@@ -2117,6 +2326,7 @@ export function checkDocuments(
   const set = proposeHtml(cwd, files);
   const states: Record<string, { marks: number; status: string }> = {};
   const carried = new Set<string>();
+  const sources = visibleSources(set, descriptor, snapshot);
 
   for (const document of set.documents) {
     const marks = set.claimed.filter((m) => m.document === document);
@@ -2168,13 +2378,36 @@ export function checkDocuments(
     }
     if (clean) report.line(`document: ${document.file} current (${marks.length} marks)`);
     states[document.file] = { marks: marks.length, status: clean ? 'current' : 'differs' };
+    // A literal head text one word away from a visible text: made to match, register links them.
+    const visibleIn = visibleSourcesIn(sources, document.file);
+    for (const mark of marks.filter(isHeadText)) {
+      const head = heldTextOf(descriptor, snapshot, mark.key);
+      if (head === null) continue;
+      const near = visibleIn.find((source) => nearlyRepeats(descriptor, head, source));
+      const shown = near === undefined ? undefined : marks.find((m) => m.key === near.key && isVisibleText(m));
+      if (shown === undefined) continue;
+      report.line(
+        `note: ${document.file}:${mark.line} the ${kindOf(placeOf(mark))} nearly repeats the ${kindOf(placeOf(shown))} ` +
+          '(one word differs) — make them match and run stet register to link them',
+      );
+    }
   }
 
+  const dead: string[] = [];
   for (const key of Object.keys(descriptor.keys).sort()) {
     const def = descriptor.keys[key];
     if (def === undefined || def.target !== DEFAULT_TARGET) continue;
     if (typeof markValue(descriptor, snapshot, key) !== 'string' || carried.has(key)) continue;
     report.warn('config', `${key}: marked in no document`, key);
+    dead.push(key);
+  }
+  if (dead.length > 0) {
+    report.warn(
+      'config',
+      dead.length === 1
+        ? `1 key has no mark — stet remove ${dead[0]} drops it, or mark it in the page`
+        : `${dead.length} keys have no mark — stet remove ${dead.join(' ')} drops them, or mark them in the page`,
+    );
   }
   report.data('documents', states);
 }

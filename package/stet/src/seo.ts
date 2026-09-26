@@ -12,10 +12,11 @@
  * `Finding`'s `'error' | 'warning'`, so the package speaks one.
  */
 
+import { keyDefOf } from './descriptor.js';
 import { resolve } from './resolve.js';
 import type { Snapshot } from './snapshot.js';
 import { webTarget } from './targets/web.js';
-import type { Descriptor, PageDef } from './types.js';
+import type { Descriptor, Limits, PageDef } from './types.js';
 
 export type SeoRule =
   | 'missing-title'
@@ -65,8 +66,32 @@ export const SEO_SEVERITY: Record<SeoRule, 'error' | 'warning'> = {
  * font-metrics table that would measure it properly ships as a static asset in
  * phase 2 (§16); until then the caveat is stated here and in the operator doc.
  */
-const TITLE_MAX_CHARS = 60;
-const DESCRIPTION_MAX_CHARS = 160;
+export const TITLE_MAX_CHARS = 60;
+export const DESCRIPTION_MAX_CHARS = 160;
+
+/** The SEO field each head role fills: the key-names role words of the head texts. */
+const HEAD_FIELD: Record<string, 'title' | 'description'> = {
+  page_title: 'title',
+  share_title: 'title',
+  meta_description: 'description',
+  share_description: 'description',
+};
+
+/**
+ * The advisory limit a head key carries: the SEO bound of the tightest field its roles fill;
+ * undefined where none is a head role. The table lives beside the bounds, since `cli/key-names.ts`
+ * is the CLI's and `src/` imports nothing from `cli/`; every site that sets the limit calls this.
+ */
+export function headLimitsFor(roles: Iterable<string>): Limits | undefined {
+  let max: number | undefined;
+  for (const role of roles) {
+    const field = Object.hasOwn(HEAD_FIELD, role) ? HEAD_FIELD[role] : undefined;
+    if (field === undefined) continue;
+    const bound = field === 'title' ? TITLE_MAX_CHARS : DESCRIPTION_MAX_CHARS;
+    max = max === undefined ? bound : Math.min(max, bound);
+  }
+  return max === undefined ? undefined : { max, severity: 'advisory' };
+}
 
 /**
  * The generic-anchor list, shipped inside the package because the check is
@@ -150,7 +175,8 @@ export function seoCheck(
   const severity: Record<SeoRule, 'error' | 'warning'> = { ...SEO_SEVERITY, ...overrides };
   const findings: SeoFinding[] = [];
   const emit: Emit = (rule, message, about = {}) => {
-    findings.push({ rule, severity: severity[rule], ...about, message });
+    const { severity: own, ...rest } = about;
+    findings.push({ rule, severity: own ?? severity[rule], ...rest, message });
   };
 
   pageRules(d, snapshot, emit);
@@ -162,7 +188,7 @@ export function seoCheck(
 type Emit = (
   rule: SeoRule,
   message: string,
-  about?: { page?: string; key?: string; locale?: string },
+  about?: { page?: string; key?: string; locale?: string; severity?: 'error' | 'warning' },
 ) => void;
 
 /**
@@ -245,8 +271,8 @@ function pageRules(d: Descriptor, s: Snapshot, emit: Emit): void {
       }
 
       missingField(emit, 'missing-description', 'description', page, locale, descriptionKey, description);
-      overLength(emit, page, locale, titleKey, title, 'title', TITLE_MAX_CHARS);
-      overLength(emit, page, locale, descriptionKey, description, 'description', DESCRIPTION_MAX_CHARS);
+      overLength(d, emit, page, locale, titleKey, title, 'title', TITLE_MAX_CHARS);
+      overLength(d, emit, page, locale, descriptionKey, description, 'description', DESCRIPTION_MAX_CHARS);
       missingAlt(d, s, emit, page, def, locale);
       canonicalNoindex(d, s, emit, page, def, locale);
     }
@@ -296,6 +322,7 @@ function missingField(
  * attribute, because the crawler never sees the template.
  */
 function overLength(
+  d: Descriptor,
   emit: Emit,
   page: string,
   locale: string,
@@ -305,10 +332,12 @@ function overLength(
   max: number,
 ): void {
   if (key === undefined || value === undefined || value.length <= max) return;
+  // A key carrying a limit states its own severity: an advisory limit warns, a hard one errors.
+  const limit = keyDefOf(d, key)?.limits;
   emit(
     'over-length',
     `page "${page}"${at(locale)}: its ${field} resolves through "${key}" to ${value.length} characters, over the ${max}-character bound`,
-    { page, key, locale },
+    { page, key, locale, ...(limit === undefined ? {} : { severity: limit.severity === 'hard' ? 'error' : 'warning' }) },
   );
 }
 

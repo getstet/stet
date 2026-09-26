@@ -68,7 +68,7 @@ describe('runHookInstall', () => {
     // The runner beside its list, both in git's common directory.
     expect(readFileSync(join(dir, '.git/stet-gate.mjs'), 'utf8')).toBe(runner);
     expect(JSON.parse(readFileSync(join(dir, '.git/stet-gate.json'), 'utf8'))).toEqual({
-      entries: [{ worktree: '', checkout: '' }],
+      entries: [{ worktree: '', checkout: '', seo: true }],
     });
   });
 
@@ -104,7 +104,7 @@ describe('runHookInstall', () => {
     writeFileSync(join(dir, 'my-hooks/pre-commit'), `#!/bin/sh\n${GATE_LINE}\n`, { mode: 0o755 });
     writeFileSync(join(dir, 'page.txt'), 'a change\n');
     expect(commit(dir, 'gated by the pasted line').code).toBe(0);
-    expect(drain(log)).toEqual([`check in ${basename(dir)}`, `scan in ${basename(dir)}`]);
+    expect(drain(log)).toEqual([`check in ${basename(dir)}`, `scan in ${basename(dir)}`, `seo check in ${basename(dir)}`]);
   });
 
   it('is a no-op when the identical hook is already installed', async () => {
@@ -168,7 +168,7 @@ function gitRepo(): string {
 }
 
 /**
- * A stand-in `node_modules/.bin/stet` in `dir` that appends `<command> in
+ * A stand-in `node_modules/.bin/stet` in `dir` that appends `<arguments> in
  * <folder>` to `log`, as JSON so a folder name holding a newline stays one entry.
  */
 function standIn(dir: string, log: string): void {
@@ -178,7 +178,7 @@ function standIn(dir: string, log: string): void {
     bin,
     `#!${process.execPath}\n` +
       `require('node:fs').appendFileSync(${JSON.stringify(log)}, ` +
-      "JSON.stringify(process.argv[2] + ' in ' + require('node:path').basename(process.cwd())) + '\\n');\n",
+      "JSON.stringify(process.argv.slice(2).join(' ') + ' in ' + require('node:path').basename(process.cwd())) + '\\n');\n",
   );
   chmodSync(bin, 0o755);
 }
@@ -256,7 +256,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     execFileSync('git', ['worktree', 'add', '-q', '-b', 'linked', linked], { cwd: main });
     standIn(join(linked, 'site'), log);
     expect(await runHookInstall([], io(join(linked, 'site')))).toBe(0);
-    expect(readGate(join(main, '.git'))).toEqual([{ worktree: 'worktrees/linked', checkout: 'site' }]);
+    expect(readGate(join(main, '.git'))).toEqual([{ worktree: 'worktrees/linked', checkout: 'site', seo: true }]);
 
     appendFileSync(join(main, 'notes.md'), 'more\n');
     const notes = commit(main, 'a planning commit');
@@ -271,7 +271,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     writeFileSync(join(linked, 'site/page.txt'), 'linked\n');
     const gated = commit(linked, 'the linked worktree touches site/');
     expect(gated.code, gated.out).toBe(0);
-    expect(drain(log)).toEqual(['check in site', 'scan in site']);
+    expect(drain(log)).toEqual(['check in site', 'scan in site', 'seo check in site']);
   });
 
   it('(b) runs only the listed checkouts a commit touches', async () => {
@@ -284,17 +284,17 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(await runHookInstall([], io(a))).toBe(0);
     expect(await runHookInstall([], io(b))).toBe(0);
     expect(readGate(join(top, '.git'))).toEqual([
-      { worktree: '', checkout: 'a' },
-      { worktree: '', checkout: 'b' },
+      { worktree: '', checkout: 'a', seo: true },
+      { worktree: '', checkout: 'b', seo: true },
     ]);
 
     writeFileSync(join(a, 'page.txt'), 'a\n');
     expect(commit(top, 'a alone').code).toBe(0);
-    expect(drain(log)).toEqual(['check in a', 'scan in a']);
+    expect(drain(log)).toEqual(['check in a', 'scan in a', 'seo check in a']);
     writeFileSync(join(a, 'page.txt'), 'a again\n');
     writeFileSync(join(b, 'page.txt'), 'b\n');
     expect(commit(top, 'both').code).toBe(0);
-    expect(drain(log)).toEqual(['check in a', 'scan in a', 'check in b', 'scan in b']);
+    expect(drain(log)).toEqual(['check in a', 'scan in a', 'seo check in a', 'check in b', 'scan in b', 'seo check in b']);
     appendFileSync(join(top, 'notes.md'), 'more\n');
     expect(commit(top, 'neither').code).toBe(0);
     expect(drain(log)).toEqual([]);
@@ -321,7 +321,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     standIn(top, log);
     const hoisted = commit(top, 'a workspace install at the top');
     expect(hoisted.code, hoisted.out).toBe(0);
-    expect(drain(log)).toEqual(['check in b', 'scan in b']);
+    expect(drain(log)).toEqual(['check in b', 'scan in b', 'seo check in b']);
   });
 
   // The runner runs the stet installed in its checkout; here that is the built bin.
@@ -378,7 +378,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
       writeFileSync(join(dirs[i] as string, 'page.txt'), `${i}\n`);
       const ran = commit(top, `touch ${i}`);
       expect(ran.code, ran.out).toBe(0);
-      expect(drain(log)).toEqual([`check in ${name}`, `scan in ${name}`]);
+      expect(drain(log)).toEqual([`check in ${name}`, `scan in ${name}`, `seo check in ${name}`]);
     }
     // The first name spells `PWNED1` and `PWNED2`; only a file of that name would mean it ran.
     const pwned = (path: string): boolean => /^PWNED\d$/.test(basename(path));
@@ -397,7 +397,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     );
     expect(readdirSync(shared)).toEqual([]);
     // The runner and the list are in place, so the pasted line gates this repository.
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'site' }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'site', seo: true }]);
     expect(existsSync(join(top, '.git/stet-gate.mjs'))).toBe(true);
     const doctor = io(checkout);
     await runDoctor([], doctor);
@@ -408,7 +408,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     writeFileSync(join(shared, 'pre-commit'), `#!/bin/sh\n${SHARED_GATE_LINE}\n`, { mode: 0o755 });
     editDocument(checkout);
     expect(commit(top, 'gated through the shared folder').code).toBe(0);
-    expect(drain(log)).toEqual(['check in site', 'scan in site']);
+    expect(drain(log)).toEqual(['check in site', 'scan in site', 'seo check in site']);
     // Another repository reading the same folder has no gate: its commit passes untouched.
     const other = gitRepo();
     execFileSync('git', ['config', 'core.hooksPath', shared], { cwd: other });
@@ -434,7 +434,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(await runHookInstall([], install)).toBe(0);
     expect(install.out.join('\n')).toContain(`the stet pre-commit gate is ready; add this line to ${husky}: ${GATE_LINE}`);
     expect(existsSync(join(top, '.git/stet-gate.mjs'))).toBe(true);
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'site' }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'site', seo: true }]);
     expect(readFileSync(husky, 'utf8')).toBe(own);
     expect(existsSync(join(top, '.git/hooks/pre-commit'))).toBe(false);
 
@@ -448,11 +448,11 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     appendFileSync(husky, `${GATE_LINE}\n`);
     editDocument(checkout);
     expect(commit(top, 'after the paste').code).toBe(0);
-    expect(drain(log)).toEqual(['husky', 'check in site', 'scan in site']);
+    expect(drain(log)).toEqual(['husky', 'check in site', 'scan in site', 'seo check in site']);
     const again = io(checkout);
     expect(await runHookInstall([], again)).toBe(0);
     expect(again.out.join('\n')).toContain(
-      `${husky} runs the stet pre-commit gate — it runs stet check, then stet scan, in site/ when a commit touches it`,
+      `${husky} runs the stet pre-commit gate — it runs stet check, stet scan and stet seo check in site/ when a commit touches it`,
     );
     const present = io(checkout);
     await runDoctor([], present);
@@ -477,7 +477,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(again.out.join('\n')).toContain(`${hookPath} runs the stet pre-commit gate`);
     editDocument(checkout);
     expect(commit(top, 'through the foreign hook').code).toBe(0);
-    expect(drain(log)).toEqual(['check in site', 'scan in site']);
+    expect(drain(log)).toEqual(['check in site', 'scan in site', 'seo check in site']);
   });
 
   it("(f4) under husky v9 names .husky/pre-commit, where the line runs, and never the generated stub", async () => {
@@ -516,7 +516,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     appendFileSync(husky, `${GATE_LINE}\n`);
     editDocument(checkout);
     expect(commit(top, 'through husky').code).toBe(0);
-    expect(drain(log)).toEqual(['husky', 'check in site', 'scan in site']);
+    expect(drain(log)).toEqual(['husky', 'check in site', 'scan in site', 'seo check in site']);
     expect(readFileSync(join(generated, 'pre-commit'), 'utf8')).toBe(stub);
     const again = io(checkout);
     expect(await runHookInstall([], again)).toBe(0);
@@ -578,7 +578,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     execFileSync('git', ['update-index', '--index-info'], { cwd: top, input: `${info}\n` });
     const run = spawnSync('git', ['commit', '-qm', 'a large commit'], { cwd: top, encoding: 'utf8', env: REGISTRY_DOWN });
     expect(run.status, `${run.stdout}${run.stderr}`.slice(0, 400)).toBe(0);
-    expect(drain(log)).toEqual(['check in site', 'scan in site']);
+    expect(drain(log)).toEqual(['check in site', 'scan in site', 'seo check in site']);
   }, 30_000);
 
   it('(k) reads a checkout folder literally, never as a pattern or as pathspec magic', async () => {
@@ -597,7 +597,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(drain(log)).toEqual([]);
     writeFileSync(join(glob, 'page.txt'), 'b\n');
     expect(commit(top, 'touches [ab]/').code).toBe(0);
-    expect(drain(log)).toEqual(['check in [ab]', 'scan in [ab]']);
+    expect(drain(log)).toEqual(['check in [ab]', 'scan in [ab]', 'seo check in [ab]']);
   });
 
   it("(l) stops looking for stet at the committing worktree's top, even inside the main checkout", async () => {
@@ -632,7 +632,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     const install = io(checkout);
     expect(await runHookInstall([], install)).toBe(0);
     expect(install.out.join('\n')).toContain(
-      `replaced the older gate with the pre-commit gate at ${hookPath} — it runs stet check, then stet scan, in site/ when a commit touches it`,
+      `replaced the older gate with the pre-commit gate at ${hookPath} — it runs stet check, stet scan and stet seo check in site/ when a commit touches it`,
     );
     expect(readFileSync(hookPath, 'utf8')).toBe(shipped);
 
@@ -660,7 +660,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     const first = io(a);
     expect(await runEject(['--write'], first)).toBe(0);
     expect(first.out.join('\n')).toContain('remove this checkout from the stet pre-commit gate');
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'b' }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'b', seo: true }]);
     expect(existsSync(hookPath)).toBe(true);
 
     const last = io(b);
@@ -725,7 +725,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     const first = io(a);
     expect(await runHookRemove([], first)).toBe(0);
     expect(first.out).toEqual(['remove this checkout from the stet pre-commit gate']);
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'b' }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'b', seo: true }]);
     expect(existsSync(hookPath)).toBe(true);
     expect(allPaths(a).sort()).toEqual(before);
     const doctor = io(a);
@@ -735,7 +735,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     editDocument(a);
     editDocument(b);
     expect(commit(top, 'touches both').code).toBe(0);
-    expect(drain(log)).toEqual(['check in b', 'scan in b']);
+    expect(drain(log)).toEqual(['check in b', 'scan in b', 'seo check in b']);
 
     const again = io(a);
     expect(await runHookRemove([], again)).toBe(0);
@@ -773,5 +773,160 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
       'stet pre-commit gate: a/ is no longer a stet checkout in this worktree — run stet hook install in the checkout, or stet hook remove there',
     );
     expect(drain(log)).toEqual([]);
+  });
+});
+
+// --- the gate's SEO run: per entry, armed by install and a passing upgrade -----
+
+/** The gate list as git's common directory holds it, rewritten by hand the way 0.5.1 wrote it: no `seo`. */
+function unarm(top: string, checkout: string): void {
+  const path = join(top, '.git/stet-gate.json');
+  const list = JSON.parse(readFileSync(path, 'utf8')) as { entries: Array<Record<string, unknown>> };
+  for (const entry of list.entries) if (entry['checkout'] === checkout) delete entry['seo'];
+  writeFileSync(path, `${JSON.stringify(list, null, 2)}\n`);
+}
+
+/**
+ * An html checkout at `folder` of `top` with the built stet, one page record and
+ * a title under a key whose limit each case sets; `description` false leaves the
+ * page without one, which `seo check` reports as an error.
+ */
+async function seoCheckout(
+  top: string,
+  folder: string,
+  opts: { title: string; limits: { max: number; severity: 'advisory' | 'hard' }; description?: boolean },
+): Promise<string> {
+  const describe = opts.description !== false;
+  const host = await makeHtmlHost({
+    files: {
+      'index.html':
+        `<!DOCTYPE html>\n<html><head>\n<title data-stet="home_page_title">${opts.title}</title>\n` +
+        '<meta name="description" content="Licensed training data from the companies that already hold it." data-stet-content="home_meta_description">\n' +
+        '</head><body>\n<h1 data-stet="home_hero_headline">Data partnerships for AI labs.</h1>\n</body></html>\n',
+    },
+    keys: {
+      home_page_title: { shape: 'text', target: 'web', limits: opts.limits, pages: ['home'] },
+      home_meta_description: { shape: 'text', target: 'web', limits: { max: 160, severity: 'advisory' }, ...(describe ? { pages: ['home'] } : {}) },
+      home_hero_headline: { shape: 'text', target: 'web' },
+    },
+    defaults: {
+      home_page_title: opts.title,
+      home_meta_description: 'Licensed training data from the companies that already hold it.',
+      home_hero_headline: 'Data partnerships for AI labs.',
+    },
+  });
+  const descriptor = JSON.parse(host.file('content/descriptor.json'));
+  descriptor.pages = { home: { route: '/', seo: { title: 'home_page_title', ...(describe ? { description: 'home_meta_description' } : {}) } } };
+  writeFileSync(join(host.cwd, 'content/descriptor.json'), `${JSON.stringify(descriptor, null, 2)}\n`);
+  const checkout = folder === '' ? top : join(top, folder);
+  mkdirSync(checkout, { recursive: true });
+  cpSync(host.cwd, checkout, { recursive: true });
+  installStetShim(checkout);
+  return checkout;
+}
+
+/** The title's key given `limits` in the checkout's descriptor. */
+function setTitleLimits(checkout: string, limits: { max: number; severity: 'advisory' | 'hard' }): void {
+  const path = join(checkout, 'content/descriptor.json');
+  const descriptor = JSON.parse(readFileSync(path, 'utf8'));
+  descriptor.keys.home_page_title.limits = limits;
+  writeFileSync(path, `${JSON.stringify(descriptor, null, 2)}\n`);
+}
+
+describe('the gate runs stet seo check where the entry opted in', () => {
+  const LONG = 'Psyon — data partnerships for AI labs, all sourced with consent';
+
+  it.skipIf(!builtBinExists())(
+    'lands an advisory over-length with its warn, refuses a hard one, and lands a checkout with no page records',
+    async () => {
+      expect(LONG.length).toBe(63);
+      const top = gitRepo();
+      const site = await seoCheckout(top, 'site', { title: LONG, limits: { max: 60, severity: 'advisory' } });
+      commit(top, 'base');
+      expect(await runHookInstall([], io(site))).toBe(0);
+
+      editDocument(site);
+      const advisory = commit(top, 'a 63-character title under an advisory limit');
+      expect(advisory.code, advisory.out).toBe(0);
+      expect(advisory.out).toContain('over the 60-character bound');
+
+      // A hard limit wider than the text passes check, so seo check's own error is what refuses.
+      setTitleLimits(site, { max: 70, severity: 'hard' });
+      const before = head(top);
+      const hard = commit(top, 'the same title under a hard limit');
+      expect(hard.code).not.toBe(0);
+      expect(hard.out).toMatch(/error: .*over the 60-character bound/);
+      expect(head(top)).toBe(before);
+
+      const { top: bare, checkouts } = await gatedRepo(['site'], 'built');
+      expect(await runHookInstall([], io(checkouts[0] as string))).toBe(0);
+      editDocument(checkouts[0] as string);
+      const noPages = commit(bare, 'a checkout with no page records');
+      expect(noPages.code, noPages.out).toBe(0);
+      expect(noPages.out).toContain('no pages declared — the SEO rules have nothing to check');
+    },
+    90_000,
+  );
+
+  it.skipIf(!builtBinExists())(
+    'arms a fresh install whatever seo check answers, beside a checkout 0.5.1 listed without it',
+    async () => {
+      const log = logFile();
+      const top = gitRepo();
+      const a = await seoCheckout(top, 'a', { title: 'Psyon data partnerships', limits: { max: 60, severity: 'advisory' }, description: false });
+      const b = standInCheckout(top, 'b', log);
+      commit(top, 'base');
+      writeFileSync(join(top, '.git/stet-gate.json'), `${JSON.stringify({ entries: [{ checkout: 'b', worktree: '' }] }, null, 2)}\n`);
+      expect(await runHookInstall([], io(a))).toBe(0);
+      expect(readGate(join(top, '.git'))).toEqual([
+        { worktree: '', checkout: 'b' },
+        { worktree: '', checkout: 'a', seo: true },
+      ]);
+      editDocument(a);
+      writeFileSync(join(b, 'page.txt'), 'b\n');
+      const before = head(top);
+      const refused = commit(top, 'touches both');
+      expect(refused.code).not.toBe(0);
+      expect(refused.out).toContain('page "home" declares no SEO description');
+      expect(head(top)).toBe(before);
+      expect(drain(log)).toEqual(['check in b', 'scan in b']);
+    },
+    90_000,
+  );
+
+  it('runs seo check in the armed checkout alone, and a removal keeps the other entry armed', async () => {
+    const log = logFile();
+    const top = gitRepo();
+    const a = standInCheckout(top, 'a', log);
+    const b = standInCheckout(top, 'b', log);
+    const c = standInCheckout(top, 'c', log);
+    writeFileSync(join(top, 'notes.md'), 'notes\n');
+    commit(top, 'base');
+    for (const dir of [a, b, c]) expect(await runHookInstall([], io(dir))).toBe(0);
+    unarm(top, 'b');
+    writeFileSync(join(a, 'page.txt'), 'a\n');
+    writeFileSync(join(b, 'page.txt'), 'b\n');
+    expect(commit(top, 'both').code).toBe(0);
+    expect(drain(log)).toEqual(['check in a', 'scan in a', 'seo check in a', 'check in b', 'scan in b']);
+    expect(await runHookRemove([], io(c))).toBe(0);
+    expect(readGate(join(top, '.git'))).toEqual([
+      { worktree: '', checkout: 'a', seo: true },
+      { worktree: '', checkout: 'b' },
+    ]);
+  });
+
+  it('prints the armed line over a 0.5.1 entry, then the no-change line', async () => {
+    const top = gitRepo();
+    const site = standInCheckout(top, 'site', logFile());
+    expect(await runHookInstall([], io(site))).toBe(0);
+    unarm(top, 'site');
+    const hookPath = join(top, '.git/hooks/pre-commit');
+    const armed = io(site);
+    expect(await runHookInstall([], armed)).toBe(0);
+    expect(armed.out).toEqual([`${hookPath}: the stet pre-commit gate for site/ runs stet seo check from the next commit`]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', checkout: 'site', seo: true }]);
+    const again = io(site);
+    expect(await runHookInstall([], again)).toBe(0);
+    expect(again.out).toEqual([`${hookPath}: the stet pre-commit gate is already installed for site/ — no change`]);
   });
 });

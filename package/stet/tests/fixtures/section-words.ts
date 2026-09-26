@@ -1,9 +1,9 @@
 /**
- * The section rule's fixture table: each row a piece of markup, the element it
- * marks (the one carrying `data-mark`), and the section word that element's
- * key is named under. One table drives key-names' `sectionWord`, the
- * static-HTML walk (`sectionWordOf`) and the JSX walk (`jsxSectionWord`), so
- * the three readings of the rule cannot drift apart.
+ * The section and item rules' fixture table: each row a piece of markup, the
+ * element it marks (the one carrying `data-mark`), the section word that
+ * element's key is named under, and the repeated item it sits in. One table
+ * drives key-names' `sectionWord` and `itemWord`, the static-HTML walk and the
+ * JSX walk, so the three readings of the rules cannot drift apart.
  *
  * The markup is valid both as HTML and as JSX: every element closed, every
  * attribute quoted, `data-mark` bare.
@@ -13,6 +13,8 @@ export interface SectionWordRow {
   markup: string;
   /** The section word the marked element answers; `null` where no section does. */
   word: string | null;
+  /** The repeated item the marked element sits in (`card_2`); absent where it sits in none. */
+  item?: string;
 }
 
 export const SECTION_WORD_ROWS: readonly SectionWordRow[] = [
@@ -32,9 +34,9 @@ export const SECTION_WORD_ROWS: readonly SectionWordRow[] = [
     word: 'site_footer',
   },
   {
-    name: 'a headed article, by its heading',
+    name: 'a lone headed article, by its tag name',
     markup: '<article><h3>Outright acquisition</h3><p data-mark>Psyon acquires the data.</p></article>',
-    word: 'outright_acquisition',
+    word: 'article',
   },
   {
     name: 'a heading holding an inline element, read as all its text',
@@ -61,5 +63,49 @@ export const SECTION_WORD_ROWS: readonly SectionWordRow[] = [
     markup:
       '<section id="outer"><section id="inner" aria-label="The inner part" data-mark><p>Some words inside.</p></section></section>',
     word: 'inner',
+  },
+  {
+    name: 'a card among three headed articles, by its place, under the section above it',
+    markup:
+      '<section id="services"><article><h3>Data sourcing work</h3><p>We find the data.</p></article>' +
+      '<article><h3>Labelling the data</h3><p data-mark>We label the data.</p></article>' +
+      '<article><h3>Evaluation of models</h3><p>We test the models.</p></article></section>',
+    word: 'services',
+    item: 'card_2',
+  },
+  {
+    name: 'a nav item holding one link is no item',
+    markup: '<nav><ul><li><a href="/">Home page</a></li><li><a data-mark href="/about">About the team</a></li></ul></nav>',
+    word: 'nav',
+  },
+  {
+    name: 'a step of an ordered list holding a heading and a paragraph',
+    markup:
+      '<section id="process"><ol><li><h3>First we talk</h3><p data-mark>A short call to begin.</p></li>' +
+      '<li><h3>Then we build</h3><p>The work gets done.</p></li></ol></section>',
+    word: 'process',
+    item: 'step_1',
+  },
+  {
+    name: 'a headed item inside a step, chained outermost first',
+    markup:
+      '<section id="process"><ol><li><h3>First we talk</h3><ul><li><h4>Book a slot</h4><p>Pick any free time.</p></li>' +
+      '<li><h4>Join the call</h4><p data-mark>Bring your questions along.</p></li></ul></li>' +
+      '<li><h3>Then we build</h3><p>The work gets done.</p></li></ol></section>',
+    word: 'process',
+    item: 'step_1_item_2',
+  },
+  {
+    name: 'a details question and its answer, an item by its summary',
+    markup:
+      '<section id="faq"><details><summary>Is it free to start?</summary><p data-mark>Yes, the first call is free.</p></details>' +
+      '<details><summary>How long does it take?</summary><p>About two weeks in all.</p></details></section>',
+    word: 'faq',
+    item: 'item_1',
+  },
+  {
+    name: 'an article holding one text is no item, and names its section by its tag',
+    markup: '<section id="news"><article><h3 data-mark>First short news</h3></article><article><h3>Second short news</h3></article></section>',
+    word: 'article',
   },
 ];

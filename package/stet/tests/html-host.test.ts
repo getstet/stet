@@ -22,6 +22,7 @@ import {
   checkDocuments,
   derivationOf,
   isHeadText,
+  nearlyRepeats,
   planDocuments,
   planHtmlRegister,
   proposeHtml,
@@ -115,6 +116,8 @@ describe('the fixture document — the pinned proposal list', () => {
   it('gives each proposal the section word and the role its name is made from', () => {
     // `role | section word` per proposal, in document order: a head text sits in
     // no section, `<main>` never names one, and a tag with no kind word is its role.
+    // The page holds no repeated item: every `<li>` holds one text.
+    expect(set.proposals.every((p) => p.item === undefined)).toBe(true);
     expect(set.proposals.map((p) => `${p.role} | ${p.sectionWord ?? '-'}`)).toEqual([
       'page_title | -',
       'meta_description | -',
@@ -131,7 +134,8 @@ describe('the fixture document — the pinned proposal list', () => {
       'paragraph | -',
       'image_alt_text | -',
       'headline | qualify',
-      'headline | qualify',
+      // An <h3> under a section first headed by an <h2> is a subheadline (P4).
+      'subheadline | qualify',
       'list_item | qualify',
       'list_item | qualify',
       'list_item | qualify',
@@ -224,9 +228,9 @@ describe('section words', () => {
     expect(wordOf('Home of the site')).toBe('nav');
   });
 
-  it('names an article by its heading, and one with none by the section around it', () => {
-    expect(wordOf('Psyon acquires the data from you.')).toBe('outright_acquisition');
-    expect(wordOf('An answer with no heading of its own.')).toBe('faq');
+  it('names a lone article by its tag name, headed or not', () => {
+    expect(wordOf('Psyon acquires the data from you.')).toBe('article');
+    expect(wordOf('An answer with no heading of its own.')).toBe('article');
   });
 
   it('answers no section directly in <main>', () => {
@@ -247,6 +251,7 @@ describe('section words', () => {
       const found = readSource(source).proposals.filter((p) => p.insertAt === insertAt);
       expect(found).toHaveLength(1);
       expect(found[0]?.sectionWord).toBe(row.word);
+      expect(found[0]?.item).toBe(row.item);
     });
   }
 });
@@ -945,6 +950,129 @@ describe('the delta fold — the trim matches the collapse', () => {
   });
 });
 
+describe('repeated items', () => {
+  /** The adoption spec's "item rule's guards" page. */
+  const GUARDS = [
+    '<!DOCTYPE html>',
+    '<html><body>',
+    '<section id="hero"><h1>We sort the data out</h1><h3>For teams that train models</h3></section>',
+    '<section id="faq">',
+    '<details><summary>Is the first call free?</summary><p>Yes, the first call costs nothing.</p></details>',
+    '<details><summary>How long does it take?</summary><p>About two weeks from the first call.</p></details>',
+    '</section>',
+    '<section id="minor"><h3>A small aside here</h3></section>',
+    '<section id="steps"><ol>',
+    '<li><h3>First we talk it over</h3><ul>',
+    '<li><h4>Book a time slot</h4><p>Pick any free time you like.</p></li>',
+    '<li><h4>Join the video call</h4><p>Bring every question you have.</p></li>',
+    '</ul></li>',
+    '<li><h3>Then we build the set</h3><ul>',
+    '<li><h4>Collect the records</h4><p>We gather what is needed.</p></li>',
+    '<li><h4>Check the labels twice</h4><p>Every label gets a second look.</p></li>',
+    '</ul></li>',
+    '</ol></section>',
+    '<article><h2>A note from the founders</h2><p>We started in a small office.</p><p>We still answer every email.</p></article>',
+    '<footer><h2>Find your way around</h2><ul>',
+    '<li><h3>Company pages</h3><a href="/about">About the company</a><a href="/jobs">Open positions</a></li>',
+    '<li><h3>Help pages</h3><a href="/contact">Contact the team</a><a href="/support">Support desk hours</a></li>',
+    '</ul><a href="#top">Back to the top</a></footer>',
+    '</body></html>',
+    '',
+  ].join('\n');
+
+  const namesOf = (source: string): string[] => {
+    const dir = tempDir();
+    writeFileSync(join(dir, 'index.html'), source, 'utf8');
+    const plan = planHtmlRegister({
+      cwd: dir,
+      files: ['index.html'],
+      descriptor: { version: 1, keys: {} },
+      snapshot: { default: {} },
+      report: new Report(),
+      pageOf: () => 'home',
+    });
+    return plan.minted.map((m) => m.key);
+  };
+
+  it('names the guards page exactly as the adoption spec lists it', () => {
+    expect(namesOf(GUARDS)).toEqual([
+      'home_hero_headline',
+      'home_hero_subheadline',
+      'home_faq_item_1_headline',
+      'home_faq_item_1_paragraph',
+      'home_faq_item_2_headline',
+      'home_faq_item_2_paragraph',
+      'home_minor_headline',
+      'home_steps_step_1_headline',
+      'home_steps_step_1_item_1_headline',
+      'home_steps_step_1_item_1_paragraph',
+      'home_steps_step_1_item_2_headline',
+      'home_steps_step_1_item_2_paragraph',
+      'home_steps_step_2_headline',
+      'home_steps_step_2_item_1_headline',
+      'home_steps_step_2_item_1_paragraph',
+      'home_steps_step_2_item_2_headline',
+      'home_steps_step_2_item_2_paragraph',
+      'home_article_headline',
+      'home_article_paragraph_1',
+      'home_article_paragraph_2',
+      'home_footer_headline',
+      'home_footer_item_1_headline',
+      'home_footer_item_1_link_text_1',
+      'home_footer_item_1_link_text_2',
+      'home_footer_item_2_headline',
+      'home_footer_item_2_link_text_1',
+      'home_footer_item_2_link_text_2',
+      'home_footer_link_text',
+    ]);
+  });
+
+  it("gives a mark the section word, item and role the proposal had for the same element", () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, 'index.html'), GUARDS, 'utf8');
+    const before = proposeHtml(dir, ['index.html']).proposals;
+    const plan = planHtmlRegister({
+      cwd: dir,
+      files: ['index.html'],
+      descriptor: { version: 1, keys: {} },
+      snapshot: { default: {} },
+      report: new Report(),
+      pageOf: () => 'home',
+    });
+    writeFileSync(join(dir, 'index.html'), plan.edited[0]?.text as string, 'utf8');
+    const marks = proposeHtml(dir, ['index.html']).claimed;
+    expect(marks).toHaveLength(before.length);
+    for (const mark of marks) {
+      const proposal = before.find((p) => p.line === mark.line && p.tag === mark.tag && p.kind === mark.kind);
+      expect({ sectionWord: mark.sectionWord, item: mark.item, role: mark.role }).toEqual({
+        sectionWord: proposal?.sectionWord,
+        item: proposal?.item,
+        role: proposal?.role,
+      });
+    }
+  });
+
+  it('counts a marked attribute as a text though its value fails the copy bar', () => {
+    const set = readSource(
+      [
+        '<!DOCTYPE html>',
+        '<html><body><section id="team">',
+        '<article><h3 data-stet="ana">Ana Lima</h3><span aria-label="x" data-stet-aria-label="ana_icon"></span></article>',
+        '<article><h3 data-stet="bo">Bo Chen</h3><span aria-label="y" data-stet-aria-label="bo_icon"></span></article>',
+        '</section></body></html>',
+        '',
+      ].join('\n'),
+    );
+    const ana = set.claimed.find((m) => m.key === 'ana');
+    expect({ sectionWord: ana?.sectionWord, item: ana?.item, role: ana?.role }).toEqual({
+      sectionWord: 'team',
+      item: 'card_1',
+      role: 'headline',
+    });
+    expect(set.claimed.find((m) => m.key === 'bo_icon')?.item).toBe('card_2');
+  });
+});
+
 describe('the delta fold — a page too deep for the argument limit', () => {
   it('flattens 60,000 siblings and 50,000 children without overflowing', () => {
     const items = Array.from({ length: 60_000 }, (_, i) => `<li>Item number ${i} here.</li>`).join('');
@@ -1028,7 +1156,111 @@ describe('derived marks', () => {
   it('warns about a derived key marked in no document, since it renders nowhere', () => {
     const host = derivedHost();
     host.descriptor.keys['orphan'] = { shape: 'text', target: 'web', derivesFrom: 'hero', tmpl: '{v}!' };
-    expect(check(host)).toEqual(['warn orphan: marked in no document']);
+    expect(check(host)).toEqual([
+      'warn orphan: marked in no document',
+      'warn 1 key has no mark — stet remove orphan drops it, or mark it in the page',
+    ]);
+  });
+});
+
+describe('check — keys marked nowhere, and head texts one word from a visible text', () => {
+  const HERO = 'Data labelling and evaluation for AI teams.';
+  const TAIL = ' No raw data is needed to start.';
+  /** A page whose headline `hero` and share description `share` are both literal keys. */
+  function page(head: string, visible = HERO, extra: Descriptor['keys'] = {}) {
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, 'index.html'),
+      '<!DOCTYPE html>\n<html><head>\n' +
+        `<meta property="og:description" content="${head}" data-stet-content="share">\n` +
+        `</head><body>\n<h1 data-stet="hero">${visible}</h1>\n</body></html>\n`,
+      'utf8',
+    );
+    const descriptor: Descriptor = {
+      version: 1,
+      keys: { hero: { shape: 'text', target: 'web' }, share: { shape: 'text', target: 'web' }, ...extra },
+    };
+    const snapshot: Snapshot = { default: { hero: visible, share: head } };
+    return { dir, descriptor, snapshot };
+  }
+  /** What check prints, lines then findings, in the emitted order. */
+  const printed = (host: ReturnType<typeof page>): string[] => {
+    const report = new Report();
+    checkDocuments(host.dir, ['index.html'], host.descriptor, host.snapshot, report);
+    const out: string[] = [];
+    report.emit({ stdout: (line) => out.push(line), stderr: (line) => out.push(line) });
+    return out;
+  };
+  const NOTE =
+    'note: index.html:3 the share description nearly repeats the headline (one word differs) — make them match and run stet register to link them';
+
+  it('names every key marked nowhere in one command line, after the per-key warns', () => {
+    const host = page(`${HERO}${TAIL}`, HERO, {
+      old_one: { shape: 'text', target: 'web' },
+      old_two: { shape: 'text', target: 'web' },
+    });
+    host.snapshot['default'] = { ...host.snapshot['default'], old_one: 'One', old_two: 'Two' };
+    const out = printed(host);
+    expect(out.filter((line) => line.startsWith('warning:') || line.startsWith('warn'))).toEqual([
+      expect.stringContaining('old_one: marked in no document'),
+      expect.stringContaining('old_two: marked in no document'),
+      expect.stringContaining('2 keys have no mark — stet remove old_one old_two drops them, or mark them in the page'),
+    ]);
+    delete host.descriptor.keys['old_two'];
+    expect(printed(host).at(-1)).toContain('1 key has no mark — stet remove old_one drops it, or mark it in the page');
+    delete host.descriptor.keys['old_one'];
+    expect(printed(host).join('\n')).not.toContain('no mark');
+  });
+
+  it('notes a share description one word from its headline, and never moves the exit', () => {
+    const host = page(`Data labelling and review for AI teams.${TAIL}`);
+    const report = new Report();
+    checkDocuments(host.dir, ['index.html'], host.descriptor, host.snapshot, report);
+    expect(report.findings).toEqual([]);
+    const out = printed(host);
+    expect(out).toEqual(['document: index.html current (2 marks)', NOTE]);
+    // Made to match, the texts derive, and the note goes.
+    expect(printed(page(`${HERO}${TAIL}`))).toEqual(['document: index.html current (2 marks)']);
+  });
+
+  it('notes an inserted word, a deleted word, and a word that differs only in its capitals beside a changed one', () => {
+    expect(printed(page(`Data labelling and model evaluation for AI teams.${TAIL}`))).toContain(NOTE);
+    expect(printed(page(`Data labelling evaluation for AI teams.${TAIL}`))).toContain(NOTE);
+    expect(printed(page(`data labelling and review for AI teams.${TAIL}`))).toContain(NOTE);
+  });
+
+  it('gives no note where a run of the head text holds the visible words exactly', () => {
+    // A doubled space between two of them, which `derivationOf` does not link.
+    const doubled = page(`Data labelling and  evaluation for AI teams.${TAIL}`);
+    expect(derivationOf(doubled.descriptor, doubled.snapshot['default']?.['share'] as string, [{ key: 'hero', value: HERO }])).toBeNull();
+    expect(printed(doubled).join('\n')).not.toContain('nearly repeats');
+  });
+
+  it('gives no note to a head text whose key derives', () => {
+    // Its text follows a tagline one word from the headline.
+    const derived = page(`Data labelling and review for AI teams.${TAIL}`, HERO, { tagline: { shape: 'text', target: 'web' } });
+    derived.descriptor.keys['share'] = { shape: 'text', target: 'web', derivesFrom: 'tagline', tmpl: `{v}${TAIL}` };
+    derived.snapshot['default'] = { hero: HERO, tagline: 'Data labelling and review for AI teams.' };
+    writeFileSync(
+      join(derived.dir, 'index.html'),
+      readFileSync(join(derived.dir, 'index.html'), 'utf8').replace('</h1>', '</h1>\n<p data-stet="tagline">Data labelling and review for AI teams.</p>'),
+      'utf8',
+    );
+    expect(printed(derived).join('\n')).not.toContain('nearly repeats');
+  });
+
+  it('gives no note to three-word texts, a visible text under 12 characters, or two words apart', () => {
+    expect(printed(page('Evaluation for teams, today.', 'Evaluation for teams.')).join('\n')).not.toContain('nearly repeats');
+    expect(printed(page('Tag a b c. More words here.', 'Tag x b c.')).join('\n')).not.toContain('nearly repeats');
+    expect(printed(page(`Data labelling and review for ML teams.${TAIL}`)).join('\n')).not.toContain('nearly repeats');
+  });
+
+  it('nearlyRepeats reads the words as a derivation does', () => {
+    const descriptor: Descriptor = { version: 1, keys: { hero: { shape: 'text', target: 'web' } } };
+    const hero = { key: 'hero', value: HERO };
+    expect(nearlyRepeats(descriptor, `Data labelling and review for AI teams.${TAIL}`, hero)).toBe(true);
+    expect(nearlyRepeats(descriptor, `${HERO}${TAIL}`, hero)).toBe(false);
+    expect(nearlyRepeats(descriptor, 'Something else entirely, said in other words.', hero)).toBe(false);
   });
 });
 

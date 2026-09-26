@@ -8,8 +8,9 @@
  * hold several checkouts (the website's `site/`). The hook is therefore one
  * fixed file that runs `templates/stet-gate.mjs`, copied into git's common
  * directory; the runner reads the checkouts from `stet-gate.json` beside it and
- * runs `stet check` + `stet scan` in each one of the committing worktree that
- * the commit touches, with the stet installed there. Nothing an install records
+ * runs `stet check` + `stet scan` — and `stet seo check` where the checkout's
+ * entry carries `seo` — in each one of the committing worktree that the commit
+ * touches, with the stet installed there. Nothing an install records
  * reaches a shell, and the gate never fetches a package. A hook stet did not
  * write joins the gate by one line.
  *
@@ -64,13 +65,16 @@ export async function runHookInstall(args: string[], io: CliIo): Promise<number>
 
   writeAtomic(join(where.common, GATE_RUNNER), template(GATE_RUNNER));
   // Read and written under the lock, so an install started beside this one in
-  // another checkout keeps its entry too.
-  const known = withGateLock(where.common, () => {
+  // another checkout keeps its entry too. The operator ran the command, so its
+  // entry runs `seo check` whatever that answers today.
+  const found = withGateLock(where.common, () => {
     const listed = readGate(where.common);
-    const found = listed.some((entry) => entry.worktree === where.worktree && entry.checkout === where.checkout);
-    writeGate(where.common, found ? listed : [...listed, { worktree: where.worktree, checkout: where.checkout }]);
-    return found;
+    const entry = listed.find(isSite(where));
+    const armed: GateEntry = { worktree: where.worktree, checkout: where.checkout, seo: true };
+    writeGate(where.common, entry === undefined ? [...listed, armed] : listed.map((e) => (e === entry ? armed : e)));
+    return entry;
   });
+  const known = found !== undefined;
 
   // A hooks folder outside both this repository's git directory and its
   // worktree (core.hooksPath) may be every repository's on the machine: stet
@@ -81,7 +85,7 @@ export async function runHookInstall(args: string[], io: CliIo): Promise<number>
       `core.hooksPath points at ${dir}, which other repositories may share — add this line to the hook there by hand: ${SHARED_GATE_LINE}`,
     );
   }
-  const covers = `it runs stet check, then stet scan, in ${label(where.checkout)} when a commit touches it`;
+  const covers = `it runs stet check, stet scan and stet seo check in ${label(where.checkout)} when a commit touches it`;
   if (theirs) {
     report.line(
       held !== null && held.includes(GATE_LINE)
@@ -93,7 +97,11 @@ export async function runHookInstall(args: string[], io: CliIo): Promise<number>
     return report.emit(io);
   }
   if (held === hook && known) {
-    report.line(`${hookPath}: the stet pre-commit gate is already installed for ${label(where.checkout)} — no change`);
+    report.line(
+      found.seo === true
+        ? `${hookPath}: the stet pre-commit gate is already installed for ${label(where.checkout)} — no change`
+        : `${hookPath}: the stet pre-commit gate for ${label(where.checkout)} runs stet seo check from the next commit`,
+    );
     return report.emit(io);
   }
   mkdirSync(dir, { recursive: true });
@@ -139,7 +147,8 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
   if (dir === null || where === null) return false;
   const hook = operatorHook(dir).path;
   const listed = readGate(where.common);
-  const rest = listed.filter((entry) => !(entry.worktree === where.worktree && entry.checkout === where.checkout));
+  const here = isSite(where);
+  const rest = listed.filter((entry) => !here(entry));
   const listedHere = rest.length < listed.length;
   const takeOut = (): void => {
     report.line('remove this checkout from the stet pre-commit gate');
@@ -148,7 +157,7 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
     withGateLock(where.common, () =>
       writeGate(
         where.common,
-        readGate(where.common).filter((entry) => !(entry.worktree === where.worktree && entry.checkout === where.checkout)),
+        readGate(where.common).filter((entry) => !here(entry)),
       ),
     );
   };
@@ -177,6 +186,40 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
   return true;
 }
 
+/**
+ * `stet upgrade`'s half of the gate: this checkout's entry gains the SEO run
+ * only where `seo check` passes today (`errors` is its error count), so no
+ * site's commits are refused by surprise. Nothing where there is no gate;
+ * `not-listed` where stet's pre-commit is installed and this checkout is not in
+ * its list; `current` where the entry already runs it with the shipped runner;
+ * `failing` writes nothing; `armed` writes the runner where it differs and the
+ * entry with `seo`.
+ */
+export function armGateSeo(cwd: string, errors: number): 'armed' | 'current' | 'failing' | 'not-listed' | 'no-gate' {
+  const where = gateSite(cwd);
+  const dir = hooksDir(cwd);
+  if (where === null || dir === null) return 'no-gate';
+  const hook = operatorHook(dir).path;
+  const installed = existsSync(hook) && hookKind(readFileSync(hook, 'utf8')) !== null;
+  if (!existsSync(join(where.common, GATE_LIST)) && !installed) return 'no-gate';
+  return withGateLock(where.common, () => {
+    const listed = readGate(where.common);
+    const entry = listed.find(isSite(where));
+    if (entry === undefined) return installed ? 'not-listed' : 'no-gate';
+    const runner = join(where.common, GATE_RUNNER);
+    const shipped = template(GATE_RUNNER);
+    const same = existsSync(runner) && readFileSync(runner, 'utf8') === shipped;
+    if (entry.seo === true && same) return 'current';
+    if (errors > 0) return 'failing';
+    if (!same) writeAtomic(runner, shipped);
+    writeGate(
+      where.common,
+      listed.map((e) => (e === entry ? { ...e, seo: true as const } : e)),
+    );
+    return 'armed';
+  });
+}
+
 /** The hook 0.3.0 and earlier shipped: a bare `npx stet`, run from the top of the repository. */
 export const HOOK_BEFORE_0_3_1 =
   "#!/bin/sh\n# stet pre-commit gate — installed by `stet hook install`, removed by `stet eject`.\n# `check` blocks a commit on a broken descriptor/snapshot. `scan` warns about\n# unkeyed copy without blocking by default; with scan.severity: \"fail\" in\n# stet.config.json it exits non-zero and blocks the commit too — the opted-in\n# strict gate, which is correct when a project has chosen it.\nnpx stet check || exit 1\nnpx stet scan\n";
@@ -192,11 +235,21 @@ export const SHARED_GATE_LINE =
 export const GATE_RUNNER = 'stet-gate.mjs';
 export const GATE_LIST = 'stet-gate.json';
 
-/** One checkout the gate covers: its worktree's git dir under the common one ('' for the main worktree) and its folder under that worktree's top ('' at the top). */
+/**
+ * One checkout the gate covers: its worktree's git dir under the common one ('' for the main worktree) and its
+ * folder under that worktree's top ('' at the top); `seo` where the gate also runs `stet seo check` there.
+ */
 export interface GateEntry {
   worktree: string;
   checkout: string;
+  seo?: true;
 }
+
+/** Whether an entry is the checkout at `where`. */
+export const isSite =
+  (where: { worktree: string; checkout: string }) =>
+  (entry: GateEntry): boolean =>
+    entry.worktree === where.worktree && entry.checkout === where.checkout;
 
 const git = (cwd: string, args: string[]): string =>
   // Only the trailing newline goes: a folder name may begin or end with a space.
@@ -240,7 +293,10 @@ export function readGate(common: string): GateEntry[] {
 
 /** The list, replaced whole: a commit reading it meanwhile sees the old list or the new one, never half of one. */
 export function writeGate(common: string, entries: GateEntry[]): void {
-  writeAtomic(join(common, GATE_LIST), `${JSON.stringify({ entries: entries.map(({ checkout, worktree }) => ({ checkout, worktree })) }, null, 2)}\n`);
+  writeAtomic(
+    join(common, GATE_LIST),
+    `${JSON.stringify({ entries: entries.map(({ checkout, worktree, seo }) => ({ checkout, worktree, ...(seo === true ? { seo } : {}) })) }, null, 2)}\n`,
+  );
 }
 
 /**

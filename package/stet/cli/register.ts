@@ -15,9 +15,9 @@
  * leaf edit in one batch.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
 
+import { headLimitsFor } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { parse, flag, text as argText, noPositionals } from './args.js';
@@ -42,13 +42,24 @@ import {
 } from './config.js';
 import { filesForGlobs } from './files.js';
 import { planHtmlRegister, type ChosenName, type HtmlRegisterPlan } from './html-host.js';
-import { kindOf, type Place } from './key-names.js';
-import { fileHash, planProblems, planText, readPlan, refusePlan, type NamingPlan, type PlanEntry } from './key-plan.js';
+import { isHeadKind, kindOf, roleOf, type Place } from './key-names.js';
+import {
+  madeHashes,
+  placeLine,
+  planProblems,
+  planText,
+  readPlan,
+  refusePlan,
+  refusePlanOut,
+  type NamingPlan,
+  type PlanEntry,
+} from './key-plan.js';
 import { htmlPageOf } from './pages.js';
 import type { CliIo } from './main.js';
 import { clip, collapseLines, plural, CliError, HostTextReport, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff, planRewrite, type Edit } from './rewrite.js';
 import { classifyAdoption, planJsxRun, targetFor } from './register-run.js';
+import type { LocatedLiteral } from './source-scan.js';
 import { validateValue } from './validate.js';
 
 export async function runRegister(args: string[], io: CliIo): Promise<number> {
@@ -104,6 +115,8 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   let added = 0;
   // Literals that read a key the descriptor already held: no entry, no value.
   let reused = 0;
+  // Literals that read the key an earlier literal of this run added.
+  let shared = 0;
   // Files whose leaf rewrites were shown. A run that adopted only module shapes
   // has no source edit, and its closing line must not say it has.
   let printedDiffs = 0;
@@ -112,7 +125,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
 
   // Pass one, the copy modules' own names and the run's names: the naming pass
   // `scan` previews with. Then, under --plan, the plan's names.
-  const { adoptable, nameOf, reused: reusedLiterals, refusals, modules, propertyNames } = await planJsxRun({
+  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, modules, propertyNames } = await planJsxRun({
     cwd: io.cwd,
     config,
     descriptor,
@@ -120,8 +133,11 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report,
     ...(forcedKind === undefined ? {} : { forcedKind }),
   });
-  // A naming plan lists only the keys the run adds: a reused literal is never an entry.
-  const run = adoptable.flatMap((f) => f.literals).filter((literal) => !reusedLiterals.has(literal));
+  // A naming plan lists only the keys the run adds: a reused literal is never an
+  // entry, and a follower is a place of its leader's entry.
+  const run = adoptable.flatMap((f) => f.literals).filter((literal) => !reusedLiterals.has(literal) && !sharedWith.has(literal));
+  const followersOf = new Map<LocatedLiteral, LocatedLiteral[]>();
+  for (const [literal, leader] of sharedWith) followersOf.set(leader, [...(followersOf.get(leader) ?? []), literal]);
   const resolved = resolveNaming({
     io,
     report,
@@ -132,7 +148,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     mints: run.map((literal) => ({
       proposed: nameOf.get(literal) as string,
       sectionWord: literal.sectionWord ?? null,
-      places: literal.place === undefined ? [] : [literal.place],
+      places: [literal, ...(followersOf.get(literal) ?? [])].flatMap((l) => (l.place === undefined ? [] : [l.place])),
       text: literal.text,
     })),
     // A copy module's property adopts under its own name, so a plan's name may not take it.
@@ -148,11 +164,23 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   // Only a run that applies writes anything: without it, every host writes nothing.
   const applying = write && !planOnly;
 
-  // Pass two: each file's literals keyed and rewritten.
+  // Pass two: each file's literals keyed and rewritten. A leader comes before
+  // its followers in run order, so the key it lands under is known when they
+  // are met; a leader that did not land leaves its followers unrewritten.
+  const landed = new Map<LocatedLiteral, string>();
   for (const { file, source, literals, target, kind } of adoptable) {
     const edits: Edit[] = [];
     for (const literal of literals) {
       const proposed = nameOf.get(literal) as string;
+      const leader = sharedWith.get(literal);
+      if (leader !== undefined) {
+        const key = landed.get(leader);
+        if (key === undefined) continue;
+        edits.push(...planRewrite(source, literal, key, kind, config.readPath.import).edits);
+        shared += 1;
+        report.line(`${file}: shares ${key} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
+        continue;
+      }
       if (reusedLiterals.has(literal)) {
         // No entry, no value: the key already holds this text.
         edits.push(...planRewrite(source, literal, proposed, kind, config.readPath.import).edits);
@@ -164,11 +192,14 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       if (choice?.adopt === false) continue;
       const key = choice?.key ?? proposed;
       const section = (choice?.section === undefined ? literal.sectionWord : choice.section) ?? undefined;
+      // A head text carries its SEO bound as an advisory limit.
+      const limits = literal.place !== undefined && isHeadKind(literal.place) ? headLimitsFor([roleOf(literal.place)]) : undefined;
       // Tentatively add so the save gate can read the key's rules; revert on any refusal.
       descriptor.keys[key] = {
         shape: 'text',
         target,
         ...(section === undefined ? {} : { section }),
+        ...(limits === undefined ? {} : { limits }),
         ...(choice?.label === undefined ? {} : { label: choice.label }),
         ...(choice?.help === undefined ? {} : { help: choice.help }),
       };
@@ -177,6 +208,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       const planned = planRewrite(source, literal, key, kind, config.readPath.import);
       edits.push(...planned.edits);
       added += 1;
+      landed.set(literal, key);
     }
 
     if (edits.length === 0) continue;
@@ -246,6 +278,14 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     }
   }
 
+  const extensions = [...new Set(dialectFiles.map((f) => f.slice(f.lastIndexOf('.'))))].sort();
+  for (const line of collapseLines(
+    dialectFiles.map((f) => `${f}: ${f.slice(f.lastIndexOf('.'))} is not rewritten — place copy('<key>') by hand`),
+    `${dialectFiles.length} files are not rewritten (${extensions.join(', ')}) — place copy('<key>') by hand; run with --verbose to list them`,
+    verbose,
+  )) {
+    report.line(line);
+  }
   for (const line of collapseLines(
     refusals,
     `${refusals.length} file(s) could not be parsed cleanly — reported, not adopted; run with --verbose to list them`,
@@ -254,7 +294,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report.line(line);
   }
 
-  if (added + reused === 0) {
+  if (added + reused + shared === 0) {
     report.line('register: nothing to adopt');
     return report.emit(io);
   }
@@ -286,7 +326,8 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   if (added > 0) {
     report.line(
       `wrote ${config.descriptorPath}, ${config.snapshotPath} and the codegen modules: ${plural(added, 'key')} added` +
-        (reused > 0 ? `, ${reused} reused` : ''),
+        (reused > 0 ? `, ${reused} reused` : '') +
+        (shared > 0 ? `, ${shared} shared` : ''),
     );
   }
   // The closing line turns on whether there were LEAF EDITS: a `--write` run
@@ -406,8 +447,10 @@ function registerHtml(d: {
         `through ${JSON.stringify(derivation.tmpl)}`,
     );
   }
+  for (const { key, max } of plan.limited) report.line(`${key}: limit ${max} added`);
   const converted = plan.converted.length;
-  if (plan.marked === 0 && converted === 0) {
+  const limited = plan.limited.length;
+  if (plan.marked === 0 && converted === 0 && limited === 0) {
     report.line('register: nothing to adopt');
     return report.emit(io);
   }
@@ -417,8 +460,10 @@ function registerHtml(d: {
         ? []
         : [`apply ${plural(plan.marked, 'mark')} across ${plural(plan.edited.length, 'document')}`]),
       ...(converted === 0 ? [] : [`derive ${plural(converted, 'key')} from the page's visible text`]),
+      ...(limited === 0 ? [] : [`add the SEO limit to ${plural(limited, 'key')}`]),
     ];
-    report.line(`register: run with --write to ${parts.join(' and ')}`);
+    const listed = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts.at(-1) as string}` : (parts[0] as string);
+    report.line(`register: run with --write to ${listed}`);
     return report.emit(io);
   }
   try {
@@ -443,6 +488,7 @@ function registerHtml(d: {
         `${plural(converted, 'key')} now derived from the page's visible text; their documents are unchanged`,
     );
   }
+  if (limited > 0) report.line(`wrote ${config.descriptorPath}: the SEO limit added to ${plural(limited, 'key')}`);
   report.line('register: applied');
   return report.emit(io);
 }
@@ -522,44 +568,8 @@ function resolveNaming(d: {
   };
 }
 
-/**
- * `--plan-out` names a new file or an earlier plan. Any other file that exists
- * is refused — the descriptor, the snapshot, the config, a managed file, a copy
- * module, a codegen or read-path file, under whatever spelling a
- * case-insensitive disk or a link gives it — because the check reads the file
- * itself, never its name.
- */
-function refusePlanOut(cwd: string, planOut: string): void {
-  const target = resolvePath(cwd, planOut);
-  if (!existsSync(target)) return;
-  let marker: unknown;
-  try {
-    marker = (JSON.parse(readFileSync(target, 'utf8')) as { plan?: unknown } | null)?.plan;
-  } catch {
-    marker = undefined;
-  }
-  if (marker === 'stet register' || marker === 'stet rename') return;
-  throw new CliError(`--plan-out ${planOut}: the file exists and is not a stet plan — name a new file, or an earlier plan to replace`);
-}
-
 /** What `--plan` and `--plan-out` asked of this run. */
 interface Naming {
   planIn?: string;
   planOut?: string;
-}
-
-/** A place as a plan lists it: `index.html:467 <h1>`, `index.html:9 <meta> og:description`. */
-function placeLine(place: { file: string; line: number; tag?: string; attr?: string; meta?: string }): string {
-  const what = place.tag === undefined ? '' : ` <${place.tag}>`;
-  const attr = place.attr === undefined ? '' : place.meta === undefined ? ` ${place.attr}` : ` ${place.meta}`;
-  return `${place.file}:${place.line}${what}${attr}`;
-}
-
-/** The `made` map of a register plan: every file the run reads, hashed. */
-function madeHashes(cwd: string, config: StetConfig, files: string[]): Record<string, string> {
-  const made: Record<string, string> = {};
-  for (const rel of [config.descriptorPath, config.snapshotPath, ...files].sort()) {
-    if (existsSync(join(cwd, rel))) made[rel] = fileHash(cwd, rel);
-  }
-  return made;
 }

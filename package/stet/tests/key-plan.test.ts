@@ -3,13 +3,22 @@
  * refusal rules register and rename share — every problem listed in one run,
  * each naming its entry.
  */
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { planProblems, planText, readPlan, type NamingPlan, type PlanEntry } from '../cli/key-plan.js';
+import type { StetConfig } from '../cli/config.js';
+import {
+  madeHashes,
+  planProblems,
+  planText,
+  readPlan,
+  renameInputs,
+  type NamingPlan,
+  type PlanEntry,
+} from '../cli/key-plan.js';
 import { CliError, sanitizeLine } from '../cli/report.js';
 import { checkAnswers } from '../src/contacts.js';
 import type { Descriptor } from '../src/types.js';
@@ -184,6 +193,48 @@ describe('planProblems — a rename plan', () => {
   it('refuses an entry carrying adopt', () => {
     const plan = renamePlan([{ old: 'a_key', key: 'a_new', adopt: true }]);
     expect(planProblems(plan, 'r.json', DESCRIPTOR, keys)).toEqual(['a_key: a rename plan takes no "adopt"']);
+  });
+
+  it('refuses a section that is not a section word, as a register entry', () => {
+    const plan = renamePlan([{ old: 'a_key', key: 'a_new', section: 'Bad Word' }]);
+    expect(planProblems(plan, 'r.json', DESCRIPTOR, keys)).toEqual([
+      'a_key: its section "Bad Word" is not a section word — lowercase letters and digits in words joined by single underscores, at most 24 characters',
+    ]);
+  });
+
+  it('refuses a proposal made from files that have changed, in the rename wording (rule 6)', () => {
+    const plan: NamingPlan = { ...renamePlan([{ old: 'a_key', key: 'a_new' }]), made: MADE };
+    expect(planProblems(plan, 'r.json', DESCRIPTOR, keys, { hashes: { ...MADE, 'index.html': 'sha256:dd' } })).toEqual([
+      'r.json: the files it was made from have changed — run stet rename --propose again',
+    ]);
+    expect(planProblems(plan, 'r.json', DESCRIPTOR, keys, { hashes: MADE })).toEqual([]);
+  });
+
+  it('never checks a rename plan that carries no made', () => {
+    const plan = renamePlan([{ old: 'a_key', key: 'a_new' }]);
+    expect(planProblems(plan, 'r.json', DESCRIPTOR, keys, { hashes: { 'index.html': 'sha256:dd' } })).toEqual([]);
+  });
+
+  it('refuses a proposal once a copy module changes, since the pinned list holds every copy module', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-plan-'));
+    mkdirSync(join(dir, 'content'));
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'content/descriptor.json'), '{"version":1,"keys":{}}');
+    writeFileSync(join(dir, 'content/defaults.json'), '{"default":{}}');
+    writeFileSync(join(dir, 'index.html'), '<p>Hello there.</p>');
+    writeFileSync(join(dir, 'src/copy.ts'), "export const copy = { a_key: 'One' };\n");
+    const config = {
+      descriptorPath: 'content/descriptor.json',
+      snapshotPath: 'content/defaults.json',
+      managedSurfaces: ['*.html'],
+      copyModules: ['src/copy.ts'],
+    } as unknown as StetConfig;
+    expect(renameInputs(dir, config)).toEqual(['content/defaults.json', 'content/descriptor.json', 'index.html', 'src/copy.ts']);
+    const plan: NamingPlan = { ...renamePlan([{ old: 'a_key', key: 'a_new' }]), made: madeHashes(dir, config, renameInputs(dir, config)) };
+    writeFileSync(join(dir, 'src/copy.ts'), "export const copy = { a_key: 'Two' };\n");
+    expect(planProblems(plan, 'r.json', DESCRIPTOR, keys, { hashes: madeHashes(dir, config, renameInputs(dir, config)) })).toEqual([
+      'r.json: the files it was made from have changed — run stet rename --propose again',
+    ]);
   });
 
   it("gives the caller's own refusal as the entry's only line", () => {

@@ -24,9 +24,8 @@ import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { writeJsonDeterministic } from './artifacts.js';
 import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
-import { isHeadText, planHtmlRegister, proposeHtml } from './html-host.js';
+import { htmlBaseName, planHtmlRegister, proposeHtml } from './html-host.js';
 import { classifyAdoption, isRecord, planJsxRun, type Adoption } from './register-run.js';
-import { baseName } from './key-names.js';
 import type { CliIo } from './main.js';
 import { detectPagesRoots, htmlPageOf, pageOfFile, proposePages } from './pages.js';
 import { CliError, clip, lineCol, plural, posixRelative, Report } from './report.js';
@@ -261,11 +260,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
               ? ` (${proposal.attr})`
               : ` (meta ${proposal.metaName})`;
         // The role name before its number, where the naming pass gave none.
-        const base = baseName({
-          page: htmlPageOf(io.cwd, file, rawPages(descriptorOnce())),
-          ...(isHeadText(proposal) ? {} : { section: proposal.sectionWord }),
-          role: proposal.role,
-        });
+        const base = htmlBaseName(htmlPageOf(io.cwd, file, rawPages(descriptorOnce())), proposal);
         report.warn(
           'scan',
           `${file}:${proposal.line} possible copy ${JSON.stringify(clip(proposal.value, LITERAL_EXCERPT))}${suffix} — ` +

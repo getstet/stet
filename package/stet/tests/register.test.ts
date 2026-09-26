@@ -590,7 +590,8 @@ describe('runRegister — declared copy modules', () => {
  * share the one helper and the one threshold.
  */
 describe('runRegister — the parse-refusal wall', () => {
-  const REFUSED = '---\nconst t = 1;\n---\n<h1>Chapter</h1>\n';
+  // A broken `.tsx`: a template dialect is named apart and never reaches the parser (F46).
+  const REFUSED = 'export default function P() {\n  return <h1>Chapter</h1\n}\n';
 
   /**
    * `copyModules` is empty by construction, so the module loop never runs and
@@ -598,8 +599,8 @@ describe('runRegister — the parse-refusal wall', () => {
    * and this pins which one filled it.
    */
   function refusingHost(count: number): string {
-    const dir = project({ managedSurfaces: ['src/**/*.astro'], copyModules: [] });
-    for (let i = 0; i < count; i++) write(dir, `src/pages/p${i}.astro`, REFUSED);
+    const dir = project({ managedSurfaces: ['src/**/*.tsx'], copyModules: [] });
+    for (let i = 0; i < count; i++) write(dir, `src/pages/p${i}.tsx`, REFUSED);
     return dir;
   }
 
@@ -611,7 +612,7 @@ describe('runRegister — the parse-refusal wall', () => {
     expect(counts).toEqual([
       '5 file(s) could not be parsed cleanly — reported, not adopted; run with --verbose to list them',
     ]);
-    expect(cap.out.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toEqual([]);
+    expect(cap.out.filter((l) => /^src\/pages\/p\d\.tsx: could not be parsed/.test(l))).toEqual([]);
     // Below the adopted lines and above nothing else it displaced.
     expect(cap.out.join('\n')).toContain('register: nothing to adopt');
   });
@@ -620,7 +621,7 @@ describe('runRegister — the parse-refusal wall', () => {
     const dir = refusingHost(5);
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan', '--verbose'], cap)).toBe(0);
-    expect(cap.out.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toHaveLength(5);
+    expect(cap.out.filter((l) => /^src\/pages\/p\d\.tsx: could not be parsed/.test(l))).toHaveLength(5);
     expect(cap.out.join('\n')).not.toContain('run with --verbose to list them');
   });
 
@@ -628,7 +629,7 @@ describe('runRegister — the parse-refusal wall', () => {
     const dir = refusingHost(2);
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
-    expect(cap.out.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toHaveLength(2);
+    expect(cap.out.filter((l) => /^src\/pages\/p\d\.tsx: could not be parsed/.test(l))).toHaveLength(2);
     expect(cap.out.join('\n')).not.toContain('run with --verbose to list them');
   });
 
@@ -637,8 +638,8 @@ describe('runRegister — the parse-refusal wall', () => {
     // position is part of the contract: what the run ACHIEVED reads first, and
     // what it could not read follows. One adoptable module beside four refusals
     // is the smallest host that can tell the two orders apart.
-    const dir = project({ managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'] });
-    for (let i = 0; i < 4; i++) write(dir, `src/pages/p${i}.astro`, REFUSED);
+    const dir = project({ managedSurfaces: ['src/**/*.tsx'], copyModules: ['src/copy.ts'] });
+    for (let i = 0; i < 4; i++) write(dir, `src/pages/p${i}.tsx`, REFUSED);
     write(dir, 'src/copy.ts', 'export const copy = {\n  footer_note: "A working name",\n};\n');
 
     const cap = io(dir);
@@ -654,9 +655,9 @@ describe('runRegister — the parse-refusal wall', () => {
     // managed surface is refused by the module loop alone and has to reach the
     // same collection — the case above, with an empty `copyModules`, could never
     // see that half.
-    const dir = project({ managedSurfaces: ['src/**/*.astro'], copyModules: ['mod/**/*.astro'] });
-    for (let i = 0; i < 3; i++) write(dir, `src/pages/p${i}.astro`, REFUSED);
-    for (let i = 0; i < 2; i++) write(dir, `mod/m${i}.astro`, REFUSED);
+    const dir = project({ managedSurfaces: ['src/**/*.tsx'], copyModules: ['mod/**/*.tsx'] });
+    for (let i = 0; i < 3; i++) write(dir, `src/pages/p${i}.tsx`, REFUSED);
+    for (let i = 0; i < 2; i++) write(dir, `mod/m${i}.tsx`, REFUSED);
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan', '--verbose'], cap)).toBe(0);
     expect(cap.out.filter((l) => l.includes('could not be parsed cleanly'))).toHaveLength(5);
@@ -668,13 +669,52 @@ describe('runRegister — the parse-refusal wall', () => {
 
     // A file BOTH globs match is refused once: the walked map hands the module
     // loop the surface loop's own verdict rather than a second parse.
-    const dual = project({ managedSurfaces: ['both/**/*.astro'], copyModules: ['both/**/*.astro'] });
-    write(dual, 'both/one.astro', REFUSED);
+    const dual = project({ managedSurfaces: ['both/**/*.tsx'], copyModules: ['both/**/*.tsx'] });
+    write(dual, 'both/one.tsx', REFUSED);
     const dualCap = io(dual);
     expect(await runRegister(['--from', 'scan'], dualCap)).toBe(0);
     expect(dualCap.out.filter((l) => l.includes('could not be parsed cleanly'))).toEqual([
-      'both/one.astro: could not be parsed cleanly — reported, not adopted',
+      'both/one.tsx: could not be parsed cleanly — reported, not adopted',
     ]);
+  });
+});
+
+describe('runRegister — template-dialect files (F46)', () => {
+  /** An Astro host: its whole managed surface is `.astro`. */
+  function astroHost(count: number): string {
+    const dir = project({ managedSurfaces: ['src/**/*.astro'], copyModules: [] });
+    write(dir, 'src/pages/index.astro', '---\nconst t = 1;\n---\n<h1>Chapter one</h1>\n');
+    for (let i = 1; i < count; i++) write(dir, `src/pages/p${i}.astro`, '<h1>Another chapter</h1>\n');
+    return dir;
+  }
+
+  it('names one .astro page with its hand step, and no parse line', async () => {
+    const cap = io(astroHost(1));
+    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(cap.out).toContain("src/pages/index.astro: .astro is not rewritten — place copy('<key>') by hand");
+    expect(cap.out.join('\n')).not.toContain('could not be parsed');
+  });
+
+  it('collapses five to one line, and --verbose lists the five', async () => {
+    const dir = astroHost(5);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(cap.out.filter((l) => l.includes('not rewritten'))).toEqual([
+      "5 files are not rewritten (.astro) — place copy('<key>') by hand; run with --verbose to list them",
+    ]);
+    const verbose = io(dir);
+    expect(await runRegister(['--from', 'scan', '--verbose'], verbose)).toBe(0);
+    expect(verbose.out.filter((l) => /^src\/pages\/.*\.astro: \.astro is not rewritten/.test(l))).toHaveLength(5);
+  });
+
+  it('still refuses a genuinely broken .tsx with the parse line', async () => {
+    const dir = project({ managedSurfaces: ['src/**/*.tsx', 'src/**/*.astro'], copyModules: [] });
+    write(dir, 'src/pages/broken.tsx', 'export default function P() {\n  return <h1>Chapter</h1\n}\n');
+    write(dir, 'src/pages/index.astro', '<h1>Chapter one</h1>\n');
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(cap.out).toContain('src/pages/broken.tsx: could not be parsed cleanly — reported, not adopted');
+    expect(cap.out).toContain("src/pages/index.astro: .astro is not rewritten — place copy('<key>') by hand");
   });
 });
 
@@ -718,7 +758,8 @@ describe('runRegister — the static-HTML host', () => {
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
     const out = cap.out.join('\n');
-    expect(out).toContain('+      <h3 data-stet="home_qualify_headline_2">');
+    // The section's <h3> under its <h2> is a subheadline (P4), so neither is numbered.
+    expect(out).toContain('+      <h3 data-stet="home_qualify_subheadline">');
     expect(out).toContain('register: run with --write to apply 28 marks across 1 document');
     // The divergence from the JavaScript branch: a descriptor entry without its
     // mark is half a batch, so the plain run commits none of it.
@@ -762,9 +803,9 @@ describe('runRegister — the static-HTML host', () => {
     await runRegister(['--from', 'scan', '--write'], io(dir));
     const values = defaults(dir).default;
     const holding = Object.keys(values).filter((k) => String(values[k]).startsWith('How it works')).sort();
-    expect(holding).toEqual(['home_contact_button_text', 'home_nav_link_text', 'home_qualify_headline_1']);
+    expect(holding).toEqual(['home_contact_button_text', 'home_nav_link_text', 'home_qualify_headline']);
     expect(values['home_nav_link_text']).toBe('How it works');
-    expect(values['home_qualify_headline_1']).toBe('How it works.');
+    expect(values['home_qualify_headline']).toBe('How it works.');
     expect(values['home_contact_button_text']).toBe('How it works →');
     // One key, marked on BOTH links.
     const page = readFileSync(join(dir, 'index.html'), 'utf8');
@@ -786,8 +827,8 @@ describe('runRegister — the static-HTML host', () => {
       defaults: { existing_heading: 'Software, product and engineering histories' },
     });
     await runRegister(['--from', 'scan', '--write'], io(shared));
-    // The heading shares the key, so the section's one other headline goes unnumbered.
-    expect(descriptor(shared).keys['home_qualify_headline_2']).toBeUndefined();
+    // The subheadline shares the key, and the section's headline is minted beside it.
+    expect(descriptor(shared).keys['home_qualify_subheadline']).toBeUndefined();
     expect(descriptor(shared).keys['home_qualify_headline']).toBeDefined();
     expect(readFileSync(join(shared, 'index.html'), 'utf8')).toContain(
       '<h3 data-stet="existing_heading">',
@@ -798,7 +839,7 @@ describe('runRegister — the static-HTML host', () => {
       defaults: { existing_heading: 'Software, product and engineering histories' },
     });
     await runRegister(['--from', 'scan', '--write'], io(email));
-    expect(descriptor(email).keys['home_qualify_headline_2']).toEqual({
+    expect(descriptor(email).keys['home_qualify_subheadline']).toEqual({
       shape: 'text',
       target: 'web',
       section: 'qualify',
@@ -859,15 +900,16 @@ describe('runRegister — the JavaScript branch writes through the same batch', 
   });
 });
 
+/** The key a written document marks `<open tag start>` with, read back from the page. */
+const markOf = (page: string, open: string, attr = '(?:-content)?'): string => {
+  const found = new RegExp(`${open}[^>]*? data-stet${attr}="([^"]+)"`).exec(page);
+  if (found === null) throw new Error(`no mark on ${open}`);
+  return found[1] as string;
+};
+
 describe('register derives head texts', () => {
   afterAll(cleanupCliHosts);
   const DERIVE = readFileSync(fileURLToPath(new URL('./fixtures/html-host/derive.html', import.meta.url)), 'utf8');
-  /** The key a written document marks `<open tag start>` with, read back from the page. */
-  const markOf = (page: string, open: string, attr = '(?:-content)?'): string => {
-    const found = new RegExp(`${open}[^>]*? data-stet${attr}="([^"]+)"`).exec(page);
-    if (found === null) throw new Error(`no mark on ${open}`);
-    return found[1] as string;
-  };
   /** The plan over ad-hoc documents, with the descriptor and snapshot it mutated. */
   function plan(files: Record<string, string>, keys: Record<string, KeyDef> = {}, values: Snapshot = { default: {} }) {
     const dir = mkdtempSync(join(tmpdir(), 'stet-register-derive-'));
@@ -898,8 +940,8 @@ describe('register derives head texts', () => {
     const title = markOf(page, '<title');
     const description = markOf(page, '<meta name="description"');
     const p = markOf(page, '<p');
-    expect(keys[title]).toEqual({ shape: 'text', target: 'web', derivesFrom: h1, tmpl: '{v}' });
-    expect(keys[description]).toEqual({ shape: 'text', target: 'web', derivesFrom: p, tmpl: '{v} Book a call.' });
+    expect(keys[title]).toEqual({ shape: 'text', target: 'web', derivesFrom: h1, tmpl: '{v}', limits: { max: 60, severity: 'advisory' } });
+    expect(keys[description]).toEqual({ shape: 'text', target: 'web', derivesFrom: p, tmpl: '{v} Book a call.', limits: { max: 160, severity: 'advisory' } });
     expect(Object.hasOwn(values, title) || Object.hasOwn(values, description)).toBe(false);
     // Head texts share among themselves; the rest take literal keys.
     expect(markOf(page, '<meta property="og:title"')).toBe(title);
@@ -934,7 +976,7 @@ describe('register derives head texts', () => {
     const h1 = markOf(page('index.html'), '<h1');
     const share = markOf(page('index.html'), '<meta property="og:description"');
     expect(d.keys[h1]?.tags).toBe(1);
-    expect(d.keys[share]).toEqual({ shape: 'text', target: 'web', derivesFrom: h1, tmpl: '{v} No raw data is needed to start.' });
+    expect(d.keys[share]).toEqual({ shape: 'text', target: 'web', derivesFrom: h1, tmpl: '{v} No raw data is needed to start.', limits: { max: 160, severity: 'advisory' } });
     expect(result.derived.map((x) => x.key)).toEqual([share]);
   });
 
@@ -967,7 +1009,13 @@ describe('register derives head texts', () => {
         { key: 'share', source: 'hero', tmpl: '{v} No raw data is needed to start.', file: 'index.html', line: 4 },
       ]);
       expect(result.edited).toEqual([]);
-      expect(d.keys['share']).toEqual({ shape: 'text', target: 'web', derivesFrom: 'hero', tmpl: '{v} No raw data is needed to start.' });
+      expect(d.keys['share']).toEqual({
+        shape: 'text',
+        target: 'web',
+        derivesFrom: 'hero',
+        tmpl: '{v} No raw data is needed to start.',
+        limits: { max: 160, severity: 'advisory' },
+      });
       expect(Object.hasOwn(s['default'] ?? {}, 'share')).toBe(false);
       expect(d.keys['site_title']?.derivesFrom).toBeUndefined();
       expect(planDocuments(dir, ['index.html'], d, s, new Report()).writes).toEqual([]);
@@ -1000,7 +1048,8 @@ describe('register derives head texts', () => {
         { default: { h: 'Widgets for everyone', t: 'Widgets for everyone', z: 'Another page.' } },
       );
       expect(result.converted).toEqual([]);
-      expect(d.keys['t']).toEqual({ shape: 'text', target: 'web' });
+      // Left literal, and given its SEO bound as a head-only key.
+      expect(d.keys['t']).toEqual({ shape: 'text', target: 'web', limits: { max: 60, severity: 'advisory' } });
     });
 
     it('gives a new visible text equal to a head-only key’s value a fresh key', () => {
@@ -1110,7 +1159,12 @@ describe('register derives head texts — the lines', () => {
     const before = forms();
 
     expect(await host.run('register', '--from', 'scan')).toBe(0);
-    expect(host.out).toEqual([DERIVES, "register: run with --write to derive 1 key from the page's visible text"]);
+    expect(host.out).toEqual([
+      DERIVES,
+      'site_title: limit 60 added',
+      'share: limit 160 added',
+      "register: run with --write to derive 1 key from the page's visible text and add the SEO limit to 2 keys",
+    ]);
     expect(forms()).toEqual(before);
     expect(readFileSync(join(host.cwd, 'index.html'))).toEqual(page);
 
@@ -1118,11 +1172,15 @@ describe('register derives head texts — the lines', () => {
     expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
     expect(host.out).toEqual([
       DERIVES,
+      'site_title: limit 60 added',
+      'share: limit 160 added',
       "wrote content/descriptor.json and content/defaults.json: 1 key now derived from the page's visible text; their documents are unchanged",
+      'wrote content/descriptor.json: the SEO limit added to 2 keys',
       'register: applied',
     ]);
     expect(JSON.parse(host.file('content/descriptor.json')).keys.share).toEqual({
       derivesFrom: 'hero',
+      limits: { max: 160, severity: 'advisory' },
       shape: 'text',
       target: 'web',
       tmpl: '{v} No raw data is needed to start.',
@@ -1147,16 +1205,19 @@ describe('register derives head texts — the lines', () => {
       defaults: VALUES,
     });
     expect(await host.run('register', '--from', 'scan')).toBe(0);
-    expect(host.out.slice(-2)).toEqual([
+    expect(host.out.slice(-4)).toEqual([
       DERIVES,
-      "register: run with --write to apply 1 mark across 1 document and derive 1 key from the page's visible text",
+      'site_title: limit 60 added',
+      'share: limit 160 added',
+      "register: run with --write to apply 1 mark across 1 document, derive 1 key from the page's visible text and add the SEO limit to 2 keys",
     ]);
     host.out.length = 0;
     expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
-    expect(host.out.slice(-4)).toEqual([
-      DERIVES,
+    expect(host.out.slice(-5)).toEqual([
+      'share: limit 160 added',
       'wrote content/descriptor.json, content/defaults.json and 1 document: 1 key added, 0 shared',
       "wrote content/descriptor.json and content/defaults.json: 1 key now derived from the page's visible text; their documents are unchanged",
+      'wrote content/descriptor.json: the SEO limit added to 2 keys',
       'register: applied',
     ]);
   });
@@ -1190,10 +1251,10 @@ describe('register names by role', () => {
     'home_top_headline',
     'home_top_paragraph_1',
     'home_top_paragraph_2',
-    'home_faq_headline_1',
-    'home_faq_paragraph_1',
-    'home_faq_headline_2',
-    'home_faq_paragraph_2',
+    'home_faq_item_1_headline',
+    'home_faq_item_1_paragraph',
+    'home_faq_item_2_headline',
+    'home_faq_item_2_paragraph',
     'home_footer_paragraph',
     'home_page_title',
     'home_share_description',
@@ -1216,7 +1277,8 @@ describe('register names by role', () => {
     // The section word lands on each entry where one answered; the skip link
     // and the head texts carry none.
     expect(keys['home_top_headline']?.section).toBe('top');
-    expect(keys['home_faq_paragraph_2']?.section).toBe('faq');
+    // A <details> holding a heading and an answer is a repeated item, named by its place.
+    expect(keys['home_faq_item_2_paragraph']?.section).toBe('faq');
     expect(keys['home_header_span']?.section).toBe('header');
     expect(keys['home_nav_link_text_1']?.section).toBe('nav');
     expect(keys['home_footer_paragraph']?.section).toBe('footer');
@@ -1386,6 +1448,77 @@ const CARD = 'export function PricingCard() {\n  return <div><h2>Premium plan</h
 const footer = (name: string, text: string, head = ''): string =>
   `${head}export function ${name}() {\n  return <footer><p>${text}</p></footer>;\n}\n`;
 
+describe('register shares JSX text within a run', () => {
+  const SHARED_PAGE =
+    'export default function Page() {\n' +
+    '  return (\n' +
+    '    <main>\n' +
+    '      <section id="hero"><h1>Your data, sorted</h1><a href="#contact">Start a conversation</a></section>\n' +
+    '      <footer><a href="#contact">Start a conversation</a></footer>\n' +
+    '    </main>\n' +
+    '  );\n' +
+    '}\n';
+  /** Every `copy('<key>')` a file reads. */
+  const readsIn = (text: string): string[] => [...text.matchAll(/copy\('([^']+)'\)/g)].map((m) => m[1] as string);
+
+  it('gives identical text one key, named for its first literal, the later one sharing it', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SHARED_PAGE);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const out = cap.out.join('\n');
+    expect(out).toContain('app/page.tsx: shares home_hero_link_text = Start a conversation');
+    expect(out).toMatch(/: 2 keys added, 1 shared$/m);
+    const keys = descriptor(dir).keys;
+    expect(Object.keys(keys).sort()).toEqual(['home_hero_headline', 'home_hero_link_text']);
+    expect(readsIn(read(dir, 'app/page.tsx'))).toEqual(['home_hero_headline', 'home_hero_link_text', 'home_hero_link_text']);
+  });
+
+  it('leaves a follower unrewritten where its leader was refused', async () => {
+    const dir = project();
+    // Run order is file order: the client component's literal leads, and with no
+    // CopyProvider mounted its rewrite is refused.
+    write(dir, 'app/components/Cta.tsx', CLIENT_WIDGET('<a href="#contact">Start a conversation</a>'));
+    write(dir, 'app/page.tsx', 'export default function Page() {\n  return <main><h1>Your data, sorted</h1><a href="#c">Start a conversation</a></main>;\n}\n');
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const page = read(dir, 'app/page.tsx');
+    expect(page).toContain('<a href="#c">Start a conversation</a>');
+    const declared = Object.keys(descriptor(dir).keys);
+    for (const key of readsIn(page)) expect(declared).toContain(key);
+    expect(cap.out.join('\n')).not.toContain('shares');
+    expect(await runCli(['check'], io(dir))).toBe(0);
+  });
+
+  it('adopts neither literal where the plan leaves the leader out', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SHARED_PAGE);
+    const { run } = { run: (...argv: string[]) => runCli(argv, io(dir)) };
+    expect(await run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
+    const plan = JSON.parse(read(dir, 'naming.json')) as { keys: Array<Record<string, unknown>> };
+    const entry = plan.keys.find((e) => e['proposed'] === 'home_hero_link_text') as Record<string, unknown>;
+    expect(entry['places']).toEqual(['app/page.tsx:4 <a>', 'app/page.tsx:5 <a>']);
+    expect(plan.keys.map((e) => e['proposed'])).toEqual(['home_hero_headline', 'home_hero_link_text']);
+    entry['adopt'] = false;
+    writeFileSync(join(dir, 'naming.json'), JSON.stringify(plan, null, 2));
+    expect(await run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
+    const page = read(dir, 'app/page.tsx');
+    expect(page.match(/>Start a conversation</g)).toHaveLength(2);
+    expect(Object.keys(descriptor(dir).keys)).toEqual(['home_hero_headline']);
+  });
+
+  it('gives a head <title> and a visible <h1> of the same text two keys', async () => {
+    const dir = project();
+    write(
+      dir,
+      'app/page.tsx',
+      'export default function Page() {\n  return <><title>Your data, sorted</title><main><h1>Your data, sorted</h1></main></>;\n}\n',
+    );
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(Object.keys(descriptor(dir).keys).sort()).toEqual(['home_page_headline', 'home_page_title']);
+  });
+});
+
 describe('register names JSX by role', () => {
   type Entry = { section?: string };
 
@@ -1410,20 +1543,21 @@ describe('register names JSX by role', () => {
       [
         'home_hero_headline_2',
         'home_hero_paragraph',
-        'home_frequently_asked_headline_1',
-        'home_frequently_asked_headline_2',
-        'home_frequently_asked_headline_3',
+        // The section's <h2> is its headline and its <h3>s subheadlines (P4).
+        'home_frequently_asked_headline',
+        'home_frequently_asked_subheadline_1',
+        'home_frequently_asked_subheadline_2',
         'pricing_page_headline',
         'pricing_footer_paragraph',
       ].sort(),
     );
     expect(keys['home_hero_headline_2']?.section).toBe('hero');
     expect(keys['home_hero_paragraph']?.section).toBe('hero');
-    expect(keys['home_frequently_asked_headline_3']?.section).toBe('frequently_asked');
+    expect(keys['home_frequently_asked_subheadline_2']?.section).toBe('frequently_asked');
     expect(keys['pricing_footer_paragraph']?.section).toBe('footer');
     expect(keys['pricing_page_headline']).not.toHaveProperty('section');
     const home = read(dir, 'app/page.tsx');
-    for (const name of ['home_hero_headline_2', 'home_hero_paragraph', 'home_frequently_asked_headline_1', 'home_frequently_asked_headline_3']) {
+    for (const name of ['home_hero_headline_2', 'home_hero_paragraph', 'home_frequently_asked_headline', 'home_frequently_asked_subheadline_2']) {
       expect(home).toContain(`{copy('${name}')}`);
     }
     expect(read(dir, 'app/pricing/page.tsx')).toContain("{copy('pricing_footer_paragraph')}");
@@ -1565,10 +1699,10 @@ describe('register --plan', () => {
         'home_top_headline',
         'home_top_paragraph_1',
         'home_top_paragraph_2',
-        'home_faq_headline_1',
-        'home_faq_paragraph_1',
-        'home_faq_headline_2',
-        'home_faq_paragraph_2',
+        'home_faq_item_1_headline',
+        'home_faq_item_1_paragraph',
+        'home_faq_item_2_headline',
+        'home_faq_item_2_paragraph',
         'home_footer_paragraph',
         'home_page_title',
         'home_share_description',
@@ -1631,8 +1765,8 @@ describe('register --plan', () => {
       expect(await host.run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
       edit(host.cwd, 'naming.json', (plan) => {
         entryOf(plan, 'home_top_paragraph_1').key = 'home_hero__eyebrow';
-        entryOf(plan, 'home_faq_headline_1').key = 'home_faq_question';
-        entryOf(plan, 'home_faq_headline_2').key = 'home_faq_question';
+        entryOf(plan, 'home_faq_item_1_headline').key = 'home_faq_question';
+        entryOf(plan, 'home_faq_item_2_headline').key = 'home_faq_question';
         entryOf(plan, 'home_top_headline').label = 'x'.repeat(61);
       });
       const before = filesOf(host.cwd);
@@ -1641,7 +1775,7 @@ describe('register --plan', () => {
         'error: stet register: naming.json is refused — nothing written',
         'error: home_top_headline: its label is longer than 60 characters',
         'error: home_top_paragraph_1: "home_hero__eyebrow" uses "__", which names a template slot or the brand group',
-        'error: home_faq_headline_1 and home_faq_headline_2: both are named "home_faq_question"',
+        'error: home_faq_item_1_headline and home_faq_item_2_headline: both are named "home_faq_question"',
       ]);
       sameFiles(host.cwd, before);
     });
@@ -1741,9 +1875,9 @@ describe('register --plan', () => {
       expect(plan.keys.map((e) => e.proposed)).toEqual([
         'home_hero_headline',
         'home_hero_paragraph',
-        'home_frequently_asked_headline_1',
-        'home_frequently_asked_headline_2',
-        'home_frequently_asked_headline_3',
+        'home_frequently_asked_headline',
+        'home_frequently_asked_subheadline_1',
+        'home_frequently_asked_subheadline_2',
         'pricing_page_headline',
         'pricing_footer_paragraph',
       ]);
@@ -1797,7 +1931,7 @@ describe('register --plan', () => {
       const { run } = cli(app);
       expect(await run('register', '--from', 'scan', '--plan-out', 'naming.json')).toBe(0);
       expect(await run('register', '--from', 'scan', '--plan', 'naming.json', '--write')).toBe(0);
-      expect(read(app, 'app/page.tsx')).toContain("{copy('home_frequently_asked_headline_3')}");
+      expect(read(app, 'app/page.tsx')).toContain("{copy('home_frequently_asked_subheadline_2')}");
 
       const long = project({ managedSurfaces: ['components/**/*.tsx'] });
       write(
@@ -2158,5 +2292,122 @@ describe('register — the alias guard runs only where a leaf edit is applied', 
     const before = tree(dir);
     await expect(runRegister(['--from', 'scan', '--write'], io(dir))).rejects.toThrow(/no tsconfig\/jsconfig path mapping/);
     expect(tree(dir)).toEqual(before);
+  });
+});
+
+describe('register gives head keys their SEO bound', () => {
+  afterAll(cleanupCliHosts);
+  const ADVISORY = (max: number) => ({ max, severity: 'advisory' });
+  const TITLE = 'Psyon — data partnerships for AI labs, sourced with consent.';
+  const LONG_TITLE = 'Psyon — data partnerships for AI labs, all sourced with consent';
+  const DESCRIPTION = 'Psyon sources licensed training data from the companies that already hold it.';
+  const HEADLINE = 'You may already have the data<1> our AI lab partners need.</1>';
+  const HEAD = 'You may already have the data our AI lab partners need. No raw data is needed to start.';
+  /** psyon.ai's head at `c7b3961`: a title, a meta description and a share description derived from the headline. */
+  const PSYON = (title = TITLE): string =>
+    '<!DOCTYPE html>\n<html><head>\n' +
+    `<title data-stet="home_page_title">${title}</title>\n` +
+    `<meta name="description" content="${DESCRIPTION}" data-stet-content="home_meta_description">\n` +
+    `<meta property="og:description" content="${HEAD}" data-stet-content="home_share_description">\n` +
+    '</head><body>\n' +
+    '<h1 data-stet="home_hero_headline">You may already have the data<span class="tail"> our AI lab partners need.</span></h1>\n' +
+    '</body></html>\n';
+  const psyonKeys = (): Record<string, KeyDef> => ({
+    home_page_title: { shape: 'text', target: 'web' },
+    home_meta_description: { shape: 'text', target: 'web' },
+    home_share_description: { shape: 'text', target: 'web', derivesFrom: 'home_hero_headline', tmpl: '{v} No raw data is needed to start.' },
+    home_hero_headline: { shape: 'text', target: 'web', tags: 1 },
+  });
+  const psyonValues = (title = TITLE) => ({ home_page_title: title, home_meta_description: DESCRIPTION, home_hero_headline: HEADLINE });
+  const keysOf = (host: { file: (rel: string) => string }): Record<string, KeyDef> => JSON.parse(host.file('content/descriptor.json')).keys;
+
+  it('gives a newly adopted title 60 and its description 160, a share title equal to the title sharing its key', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head>\n<title>Widgets for every team, shipped</title>\n' +
+          '<meta name="description" content="Widgets for every team, shipped the day you order them, with nothing to assemble.">\n' +
+          '<meta property="og:title" content="Widgets for every team, shipped">\n' +
+          '</head><body>\n<p>Ordinary page copy that repeats nothing.</p>\n</body></html>\n',
+      },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const page = host.file('index.html');
+    const title = markOf(page, '<title');
+    expect(markOf(page, '<meta property="og:title"')).toBe(title);
+    expect(keysOf(host)[title]?.limits).toEqual(ADVISORY(60));
+    expect(keysOf(host)[markOf(page, '<meta name="description"')]?.limits).toEqual(ADVISORY(160));
+    expect(keysOf(host)[markOf(page, '<p')]?.limits).toBeUndefined();
+  });
+
+  it('backfills psyon’s three head keys, the derived share description among them, then adopts nothing', async () => {
+    const host = await makeHtmlHost({ files: { 'index.html': PSYON(LONG_TITLE) }, keys: psyonKeys(), defaults: psyonValues(LONG_TITLE) });
+    const before = [host.file('content/descriptor.json'), host.file('content/defaults.json'), host.file('index.html')];
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(host.out).toEqual([
+      'home_page_title: limit 60 added',
+      'home_meta_description: limit 160 added',
+      'home_share_description: limit 160 added',
+      'register: run with --write to add the SEO limit to 3 keys',
+    ]);
+    expect([host.file('content/descriptor.json'), host.file('content/defaults.json'), host.file('index.html')]).toEqual(before);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.out).toContain('wrote content/descriptor.json: the SEO limit added to 3 keys');
+    const keys = keysOf(host);
+    expect(keys['home_page_title']?.limits).toEqual(ADVISORY(60));
+    expect(keys['home_meta_description']?.limits).toEqual(ADVISORY(160));
+    expect(keys['home_share_description']?.limits).toEqual(ADVISORY(160));
+    expect(keys['home_hero_headline']?.limits).toBeUndefined();
+    expect(host.file('index.html')).toBe(before[2]);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan')).toBe(0);
+    expect(host.out).toEqual(['register: nothing to adopt']);
+    // The 63-character title warns, and check still passes.
+    expect(LONG_TITLE.length).toBe(63);
+    host.out.length = 0;
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).toContain('home_page_title: 63 characters exceeds the 60-character limit');
+  });
+
+  it('never touches a key already carrying limits', async () => {
+    const keys = psyonKeys();
+    keys['home_page_title'] = { shape: 'text', target: 'web', limits: { max: 70, severity: 'hard' } };
+    const host = await makeHtmlHost({ files: { 'index.html': PSYON() }, keys, defaults: psyonValues() });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.stdout()).not.toContain('home_page_title: limit');
+    expect(keysOf(host)['home_page_title']?.limits).toEqual({ max: 70, severity: 'hard' });
+  });
+
+  it('gives a key marked on an og:title alone 60, and one on a title and an og:title 60', async () => {
+    const page =
+      '<!DOCTYPE html>\n<html><head>\n<title data-stet="both">Widgets for every team, shipped</title>\n' +
+      '<meta property="og:title" content="Widgets for every team, shipped" data-stet-content="both">\n' +
+      '<meta name="twitter:title" content="Widgets, shipped the same day to every team" data-stet-content="share_only">\n' +
+      '</head><body>\n<p data-stet="body">Ordinary page copy that repeats nothing.</p>\n</body></html>\n';
+    const host = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: { both: { shape: 'text', target: 'web' }, share_only: { shape: 'text', target: 'web' }, body: { shape: 'text', target: 'web' } },
+      defaults: { both: 'Widgets for every team, shipped', share_only: 'Widgets, shipped the same day to every team', body: 'Ordinary page copy that repeats nothing.' },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(keysOf(host)['both']?.limits).toEqual(ADVISORY(60));
+    expect(keysOf(host)['share_only']?.limits).toEqual(ADVISORY(60));
+    expect(keysOf(host)['body']?.limits).toBeUndefined();
+  });
+
+  it('gives a JSX head literal its bound as it mints the key', async () => {
+    const dir = project();
+    write(
+      dir,
+      'app/page.tsx',
+      SERVER_PAGE('<><title>Widgets for every team, shipped</title><p>Ordinary page copy that repeats nothing.</p></>'),
+    );
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const keys = descriptor(dir).keys as Record<string, KeyDef>;
+    const title = Object.keys(keys).find((key) => key.endsWith('page_title')) as string;
+    expect(keys[title]?.limits).toEqual(ADVISORY(60));
+    expect(Object.values(keys).filter((def) => def.limits !== undefined)).toHaveLength(1);
   });
 });

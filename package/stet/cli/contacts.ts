@@ -133,6 +133,14 @@ function answersText(properties: Record<string, string>): string {
     .join(' ');
 }
 
+/** A membership as the terminal prints it: join date, answers, then where it came from. */
+function membershipLine(m: { joinedAt: string; properties: Record<string, string>; page: string | null; form: string | null }): string {
+  const answers = answersText(m.properties);
+  const from = m.page === null ? '' : `   from ${m.page}`;
+  const form = m.form === null ? '' : `${m.page === null ? '   ' : ' '}(form ${m.form})`;
+  return `joined ${when(m.joinedAt)}${answers ? `   ${answers}` : ''}${from}${form}`;
+}
+
 async function groups(store: StoreAdapter, parsed: ParsedArgs, report: Report): Promise<void> {
   noPositionals(parsed.positionals, 'contacts groups');
   const found = answered(await store.contacts.groups(), report);
@@ -166,10 +174,7 @@ async function list(store: StoreAdapter, parsed: ParsedArgs, report: Report): Pr
   report.data('group', group);
   report.data('members', rows);
   report.line(`${group}: ${plural(rows.length, 'member')}`);
-  for (const r of rows) {
-    const answers = answersText(r.properties);
-    report.line(`${r.email}   joined ${when(r.joinedAt)}${answers ? `   ${answers}` : ''}${r.suppressed ? '   unsubscribed (marketing)' : ''}`);
-  }
+  for (const r of rows) report.line(`${r.email}   ${membershipLine(r)}${r.suppressed ? '   unsubscribed (marketing)' : ''}`);
 }
 
 async function get(store: StoreAdapter, parsed: ParsedArgs, report: Report, _io: CliIo, project: string): Promise<void> {
@@ -187,12 +192,7 @@ async function get(store: StoreAdapter, parsed: ParsedArgs, report: Report, _io:
       ? `${r.email} in project ${project} — no contact row`
       : `${r.email} in project ${project} — first seen ${when(r.contact.createdAt)}`,
   );
-  for (const m of r.memberships) {
-    const answers = answersText(m.properties);
-    const from = m.page === null ? '' : ` from ${m.page}`;
-    const form = m.form === null ? '' : ` (form ${m.form})`;
-    report.line(`  ${m.group}   joined ${when(m.joinedAt)}${from}${form}${answers ? `   ${answers}` : ''}`);
-  }
+  for (const m of r.memberships) report.line(`  ${m.group}   ${membershipLine(m)}`);
   for (const s of r.suppressions) report.line(`  suppressed: ${s.scope}, ${when(s.createdAt)} (${s.source})`);
 }
 

@@ -249,3 +249,33 @@ describe('the scaffolded route compiles', () => {
     expect(r.ok).toBe(true);
   });
 });
+
+describe('the scaffolded forms routes compile', () => {
+  it('typechecks the handler module, the limiter and both routes against the package', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-forms-'));
+    writeFileSync(
+      join(dir, 'package.json'),
+      `${JSON.stringify({ name: 'host', private: true, dependencies: { next: '^15.5.0', react: '^19' } }, null, 2)}\n`,
+    );
+    mkdirSync(join(dir, 'app'), { recursive: true });
+    writeFileSync(join(dir, 'app/layout.tsx'), LAYOUT, 'utf8');
+    writeFileSync(join(dir, 'app/page.tsx'), 'export default function Page() { return null; }\n', 'utf8');
+    await runInit([], { cwd: dir, env: {}, stdout: () => {}, stderr: () => {}, confirm: async (q) => q.includes('sign-ups') });
+    // `next` is not installed here: `after` is declared as next/server declares it from 15.1.
+    writeFileSync(join(dir, 'next-server.d.ts'), 'export declare function after(task: () => unknown): void;\n', 'utf8');
+    const config = JSON.parse(nextTsconfig([])) as { compilerOptions: { paths: Record<string, string[]> } };
+    config.compilerOptions.paths['next/server'] = ['./next-server.d.ts'];
+    writeFileSync(
+      join(dir, 'tsconfig.json'),
+      JSON.stringify({ ...config, include: ['lib/stet-forms.ts', 'lib/limit.ts', 'app/api/stet/join/[group]/route.ts', 'app/api/stet/unsubscribe/route.ts'] }),
+    );
+    let output = '';
+    try {
+      execFileSync(process.execPath, [tsc, '--noEmit', '-p', 'tsconfig.json'], { cwd: dir, encoding: 'utf8', stdio: 'pipe' });
+    } catch (error) {
+      const failure = error as { stdout?: string; stderr?: string };
+      output = `${failure.stdout ?? ''}${failure.stderr ?? ''}`;
+    }
+    expect(output).toBe('');
+  }, 60_000);
+});
