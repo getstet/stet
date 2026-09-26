@@ -8,3 +8,5 @@ type Story = StoryObj<typeof meta>;
 
 export const Celsius: Story = { args: { value: 'celsius' } };
 export const Fahrenheit: Story = { args: { value: 'fahrenheit' } };
+export const Pressed: Story = { args: { value: 'celsius' }, parameters: { states: { UnitsPicker: 'pressed' } } };
+export const Focused: Story = { args: { value: 'celsius' }, parameters: { states: { UnitsPicker: 'focused' } } };

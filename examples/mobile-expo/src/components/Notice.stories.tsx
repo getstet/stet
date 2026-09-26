@@ -3,6 +3,7 @@ import type { Meta, StoryObj } from '@storybook/react-native-web-vite';
 import { resolved } from '@/copy';
 
 import { Notice } from './Notice';
+import { OfflineBanner } from './OfflineBanner';
 
 const meta = { title: 'Components/Notice', component: Notice } satisfies Meta<typeof Notice>;
 export default meta;
@@ -19,4 +20,5 @@ export const Warning: Story = {
 export const Danger: Story = {
   args: { tone: 'danger', title: String(resolved.session_expired_title), body: String(resolved.session_expired_body) },
 };
-export const Info: Story = { args: { tone: 'info', title: String(resolved.alerts_count_one) } };
+export const Info: Story = { args: { tone: 'info', title: String(resolved.alerts_count_one), dismissible: true } };
+export const Offline: Story = { args: Info.args as Story['args'], render: () => <OfflineBanner onRetry={() => {}} /> };

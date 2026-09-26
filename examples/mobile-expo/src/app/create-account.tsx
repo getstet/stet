@@ -12,6 +12,7 @@ export default function CreateAccount() {
   const copy = useCopy();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [status, setStatus] = useState<'idle' | 'loading' | 'success'>('idle');
   const ready = /.+@.+\..+/.test(email.trim()) && password.length >= 8;
   return (
     <Screen>
@@ -37,9 +38,15 @@ export default function CreateAccount() {
         testID="create-account-submit"
         title={copy('create_account_submit')}
         variant={ready ? 'primary' : 'disabled'}
+        status={status}
         onPress={() => {
-          createAccount(email, password);
-          router.replace('/onboarding/name');
+          // The account is local; the short wait shows the button's working and done states.
+          setStatus('loading');
+          setTimeout(() => {
+            createAccount(email, password);
+            setStatus('success');
+          }, 700);
+          setTimeout(() => router.replace('/onboarding/name'), 1400);
         }}
       />
     </Screen>

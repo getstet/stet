@@ -47,8 +47,23 @@ listing them all.
 On the web dev server a point opens by URL:
 `http://localhost:8081/?stet-state=home.weather-failed&appearance=dark&textScale=1.3`.
 A parent frame can post `{type: "stet:draft", key, value}`,
-`{type: "stet:draft-clear"}` and `{type: "stet:tokens", tokens: {"color.primary": "#1a7f37"}}`.
+`{type: "stet:draft-clear"}`, `{type: "stet:tokens", tokens: {"color.primary": "#1a7f37"}}`,
+`{type: "stet:state-force", states: {"PrimaryButton": "pressed"}}`,
+`{type: "stet:play", component: "PrimaryButton", animation: "press"}` and
+`{type: "stet:motion", motion: "reduced"}`.
 A link opens a point by hand: `stetweather://stet/state?point=home.offline`.
+
+## Components and motion
+
+Each shared component reads its own group in `theme/tokens.json` (colours,
+sizes, springs and durations per variant and state, aliasing the global
+tokens), animates with Reanimated, and falls back to a short fade when the
+device asks for reduced motion. In development builds the component sandbox
+draws one component alone:
+`http://localhost:8081/__stet/component?name=PrimaryButton&variant=primary&state=pressed&appearance=dark`
+(`stetweather://__stet/component?…` on a device; add `&play=press` to replay an
+animation). The route, the registry and the messages are described in the
+Flows contract's "Component sandbox" section.
 
 ## Checks
 

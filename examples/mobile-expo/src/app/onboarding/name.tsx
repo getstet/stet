@@ -14,7 +14,7 @@ export default function OnboardingName() {
   const [name, setName] = useState('');
   return (
     <Screen>
-      <ScreenHeader eyebrow={fill(copy('onboarding_step'), { step: 1 })} title={copy('onboarding_name_title')} />
+      <ScreenHeader progress={{ step: 1, of: 3 }} eyebrow={fill(copy('onboarding_step'), { step: 1 })} title={copy('onboarding_name_title')} />
       <TextField testID="name-field" value={name} onChangeText={setName} placeholder={copy('onboarding_name_placeholder')} autoCapitalize="words" />
       <PrimaryButton
         testID="onboarding-continue"

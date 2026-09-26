@@ -4,10 +4,12 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useCopy } from '@/copy';
 import { useTheme } from '@/theme';
 
-type Props = { title: string; eyebrow?: string; back?: boolean | (() => void) };
+import { StepProgress } from './StepProgress';
 
-/** A back link, an optional small line above the title, and the title. */
-export function ScreenHeader({ title, eyebrow, back }: Props) {
+type Props = { title: string; eyebrow?: string; back?: boolean | (() => void); progress?: { step: number; of: number } };
+
+/** A back link, an optional progress bar and small line above the title, and the title. */
+export function ScreenHeader({ title, eyebrow, back, progress }: Props) {
   const t = useTheme();
   const copy = useCopy();
   const onBack = typeof back === 'function' ? back : () => router.back();
@@ -21,6 +23,7 @@ export function ScreenHeader({ title, eyebrow, back }: Props) {
           </Text>
         </Pressable>
       ) : null}
+      {progress ? <StepProgress step={progress.step} of={progress.of} /> : null}
       {eyebrow ? (
         <Text style={{ color: t.color.textMuted, fontSize: t.font.size.caption, fontWeight: t.font.weight.semibold }}>{eyebrow}</Text>
       ) : null}

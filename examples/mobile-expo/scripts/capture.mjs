@@ -398,6 +398,29 @@ async function captureDevice(device) {
   return results;
 }
 
+/**
+ * Captures hold the app's animations still. Every way out (done, failed,
+ * interrupted) asks each helper that polled to let them run again; a helper
+ * that never hears it releases them itself after 10 s without a command.
+ */
+async function releaseAll() {
+  const seen = [...queues.entries()].filter(([, q]) => q.lastSeen).map(([id]) => id);
+  await Promise.all(seen.map((id) => ask(id, { cmd: 'release' }, 3000)));
+}
+
+let leaving = false;
+async function leave(code) {
+  if (leaving) return;
+  leaving = true;
+  await releaseAll();
+  server.close();
+  process.exit(code);
+}
+process.on('SIGINT', () => leave(130));
+process.on('SIGTERM', () => leave(143));
+process.on('uncaughtException', (e) => (console.error(e), leave(1)));
+process.on('unhandledRejection', (e) => (console.error(e), leave(1)));
+
 mkdirSync(OUT, { recursive: true });
 server.on('error', (e) => {
   console.error(`the capture channel cannot listen on 127.0.0.1:${PORT}: ${e.message}`);
@@ -420,6 +443,5 @@ server.listen(PORT, '127.0.0.1', async () => {
   }
   writeIndex();
   console.log(`done in ${((Date.now() - started) / 1000).toFixed(1)} s; index: ${path.relative(ROOT, path.join(OUT, 'index.json'))}`);
-  server.close();
-  process.exit(failed ? 1 : 0);
+  await leave(failed ? 1 : 0);
 });

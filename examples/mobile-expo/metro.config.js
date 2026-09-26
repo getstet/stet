@@ -8,4 +8,10 @@ const config = getDefaultConfig(__dirname);
 const blockList = [config.resolver.blockList].flat().filter(Boolean);
 config.resolver.blockList = [...blockList, /[\\/]\.stet[\\/].*/];
 
+// The component sandbox route is development tooling: a production bundle
+// (`expo export`, release builds) never sees the file, so the route is absent.
+if (process.env.NODE_ENV === 'production') {
+  config.resolver.blockList.push(/[\\/]src[\\/]app[\\/]__stet[\\/].*/);
+}
+
 module.exports = config;

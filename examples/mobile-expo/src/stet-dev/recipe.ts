@@ -55,7 +55,7 @@ export type Applied = { ok: true; target: string } | { ok: false; reason: string
 export function applyPoint(
   id: string,
   navRef: any,
-  variation: { appearance?: 'light' | 'dark'; textScale?: number; keepDrafts?: boolean },
+  variation: { appearance?: 'light' | 'dark'; textScale?: number; motion?: 'reduced' | 'still'; keepDrafts?: boolean },
 ): Applied {
   const point = pointOf(id);
   if (!point) return { ok: false, reason: `no point "${id}" in stet.flows.json` };
@@ -76,7 +76,8 @@ export function applyPoint(
     ...o,
     appearance: variation.appearance,
     textScale: variation.textScale,
-    ...(variation.keepDrafts ? {} : { tokens: undefined }),
+    motion: variation.motion,
+    ...(variation.keepDrafts ? {} : { tokens: undefined, states: undefined }),
   }));
   if (Platform.OS === 'web') {
     // On the web the URL is the navigation state: replace to the bottom of the

@@ -109,6 +109,11 @@
       "shape": "text",
       "target": "web"
     },
+    "notice_dismiss_label": {
+      "label": "Dismiss action on a notice, read by screen readers",
+      "shape": "text",
+      "target": "web"
+    },
     "notifications_allow": {
       "label": "Allow notifications button",
       "shape": "text",

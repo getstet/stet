@@ -12,12 +12,19 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 const OUT = path.join(ROOT, '.stet', 'release-check');
 
 // One name per dev-only piece: the web state hook, the preview messages, the
-// state links, the capture channel and helper, the key-read recorder, the mock
+// component sandbox and its forced-state, replay and motion messages, the state
+// links, the capture channel and helper, the key-read recorder, the mock
 // layer's fixtures and its seeded accounts.
 const NAMES = [
   'stet-state',
   'stet:draft',
   'stet:tokens',
+  'stet:state-force',
+  'stet:play',
+  'stet:motion',
+  'stet:sandbox',
+  '__stet/component',
+  'Component not found',
   'stet/state',
   '/next?device=',
   'stetDevice',

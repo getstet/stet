@@ -83,11 +83,12 @@ function SignedInHome({ account }: { account: Account }) {
             />
           ) : null}
           {alerts > 0 ? (
-            <Notice testID="notice-alerts" tone="info" title={alerts === 1 ? copy('alerts_count_one') : fill(copy('alerts_count_many'), { count: alerts })} />
+            <Notice testID="notice-alerts" dismissible tone="info" title={alerts === 1 ? copy('alerts_count_one') : fill(copy('alerts_count_many'), { count: alerts })} />
           ) : null}
           {params.setup === 'skipped' ? (
             <Notice
               testID="notice-setup"
+              dismissible
               tone="info"
               title={copy('home_setup_title')}
               body={copy('home_setup_body')}

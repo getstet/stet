@@ -1,5 +1,6 @@
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { AppCopyProvider, useCopy } from '@/copy';
 import { useTheme } from '@/theme';
@@ -11,10 +12,12 @@ const StetDev: React.ComponentType | null = __DEV__ ? require('@/stet-dev').Stet
 
 export default function RootLayout() {
   return (
-    <AppCopyProvider>
-      <AppStack />
-      {StetDev ? <StetDev /> : null}
-    </AppCopyProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <AppCopyProvider>
+        <AppStack />
+        {StetDev ? <StetDev /> : null}
+      </AppCopyProvider>
+    </GestureHandlerRootView>
   );
 }
 

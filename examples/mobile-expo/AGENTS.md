@@ -7,7 +7,10 @@ development builds carry the capture helper that `scripts/capture.mjs` drives.
 - Copy: `useCopy()` from `@/copy` (stet's `useCopy`, plus the development-only
   read recorder). Add or change words through `content/descriptor.json` and
   `content/defaults.json`, then `npx stet upgrade && npx stet pull && npx stet check`.
-- Styling: `theme/tokens.json`, read through `useTheme()` from `@/theme`.
+- Styling: `theme/tokens.json`, read through `useTheme()` from `@/theme`; a
+  shared component reads only its own group through `useTokens()`, takes its
+  state from `useComponentState()` and animates through `@/theme/motion`, which
+  honours reduced motion.
 - Development-only code sits behind `__DEV__` (`src/stet-dev/`, `src/api/mock/`);
   `npm run check-release` proves none of it reaches a release bundle.
 - `ios/` and `android/` are generated (`npx expo prebuild`); never edit them.
