@@ -6527,7 +6527,9 @@ describe('the page', () => {
       });
 
       it('names no icon it would fetch (stage-5 R7)', () => {
-        expect(dashboardPage()).toContain('<link rel="icon" href="data:,">');
+        const icons = [...dashboardPage().matchAll(/<link rel="icon"[^>]*href="([^"]*)"/g)].map((m) => m[1]);
+        expect(icons).toHaveLength(1);
+        expect(icons[0]).toMatch(/^data:image\/svg\+xml,/);
       });
 
       it('reads the numbered tags the way src does, in the page and in the agent (the placeholder grammar)', () => {
