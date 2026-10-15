@@ -192,6 +192,64 @@ export async function planMount(cwd: string, config: StetConfig): Promise<'mount
   return { layout: config.rootLayout, source, edits, text: applyFileEdits(source, edits) };
 }
 
+/**
+ * The layout with the CopyProvider mount taken out exactly — the bytes before
+ * `init` (0.6.0) or `register` (0.7.0) mounted it — or null where the mount is
+ * not one of those two forms as written. The proof is the round trip:
+ * mounting the result again gives back the layout byte for byte.
+ */
+export function unmountEdits(
+  ts: typeof import('typescript'),
+  layoutPath: string,
+  source: string,
+  cwd: string,
+  config: StetConfig,
+): { edits: Edit[]; block: { pos: number; end: number } } | null {
+  const router = config.router;
+  if (router === 'astro') return null;
+  const sf = ts.createSourceFile(layoutPath, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, layoutPath));
+  const providers: TS.JsxElement[] = [];
+  const visit = (node: TS.Node): void => {
+    if (ts.isJsxElement(node) && ts.isIdentifier(node.openingElement.tagName) && node.openingElement.tagName.text === 'CopyProvider') providers.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  if (providers.length !== 1) return null;
+  const element = providers[0] as TS.JsxElement;
+  const inner = source.slice(element.openingElement.getEnd(), element.closingElement.getStart(sf));
+  const nl = dominantEol(source);
+  for (const form of ['resolved', 'resolveAll'] as const) {
+    const block = mountBlock(layoutPath, cwd, config, form, nl);
+    const at = source.indexOf(block);
+    if (at === -1 || source.indexOf(block, at + 1) !== -1) continue;
+    // `providerEdits` inserted `${nl}${block}${nl}` after the last import, or `${block}${nl}${nl}` at offset 0.
+    // The blank line after the block is the mount's only where it is still there: a
+    // later `register` run inserts its own leaf import right after the block's last
+    // line, and taking the leading newline then would join two statements.
+    const span =
+      at === 0
+        ? { pos: 0, end: block.length + 2 * nl.length }
+        : source.startsWith(nl + nl, at + block.length)
+          ? { pos: at - nl.length, end: at + block.length + nl.length }
+          : { pos: at, end: at + block.length + nl.length };
+    const edits: Edit[] = [
+      { pos: span.pos, end: span.end, text: '' },
+      { pos: element.getStart(sf), end: element.getEnd(), text: inner },
+    ];
+    const candidate = applyFileEdits(source, edits);
+    const again = ts.createSourceFile(layoutPath, candidate, ts.ScriptTarget.Latest, true, scriptKindFor(ts, layoutPath));
+    const wrap = locateWrapTarget(ts, again, router, form);
+    if (wrap === null) continue;
+    // The block goes back where it was taken from, not after the last import: a
+    // leaf import `register` inserted after the block (its own `import { copy }`)
+    // would otherwise move `importInsertPos` past it and fail the round trip.
+    const descriptorExpr = jsHost(layoutPath) ? 'descriptorJson' : 'descriptorJson as unknown as Descriptor';
+    const remount = [{ pos: span.pos, end: span.pos, text: source.slice(span.pos, span.end) }, ...wrapEdit(again, wrap, descriptorExpr, form)];
+    if (applyFileEdits(candidate, remount) === source) return { edits, block: span };
+  }
+  return null;
+}
+
 /** After the last import (or the directive prologue), never before `'use client'`. */
 export function importInsertPos(ts: typeof import('typescript'), sf: TS.SourceFile): number {
   let pos = 0;

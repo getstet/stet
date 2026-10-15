@@ -56,6 +56,7 @@ import { planDocuments, stripMarks } from './html-host.js';
 import { removeFromGate } from './hook.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence } from './project.js';
+import { unmountEdits } from './provider-mount.js';
 import { walk } from './pages.js';
 import { CliError, Report, collapseLines, posixRelative } from './report.js';
 import { applyFileEdits, formatDiff, unRewriteFile, type Edit } from './rewrite.js';
@@ -189,10 +190,17 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
         }
         if (result.accessorCalls.length === 0 && !isLayout) continue;
 
-        const un = unRewriteFile(source, result.accessorCalls, values, [...result.stetImportSpans, ...result.copyDeclSpans]);
+        // The mount stet wrote comes out exactly; its block's imports go with the block.
+        const exact = isLayout ? unmountEdits(ts, abs, source, io.cwd, config) : null;
+        const inBlock = (span: { pos: number; end: number }): boolean => exact !== null && span.pos >= exact.block.pos && span.end <= exact.block.end;
+        const spans = [...result.stetImportSpans, ...result.copyDeclSpans].filter((span) => !inBlock(span));
+        const un = unRewriteFile(source, result.accessorCalls, values, spans);
         for (const call of un.skipped) foreign.push(`${file}: left copy('${call.key}') untouched — a foreign copy binding, not stet's`);
         const extra: Edit[] = [];
-        if (isLayout) {
+        if (exact !== null) {
+          extra.push(...exact.edits);
+        } else if (isLayout) {
+          // 0.6.0's path, for a mount the round trip does not prove.
           const unwrap = copyProviderUnwrap(ts, source, abs);
           if (unwrap) extra.push(unwrap);
           for (const span of result.resolvedMapDeclSpans) extra.push({ pos: span.pos, end: span.end, text: '' });

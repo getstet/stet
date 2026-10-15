@@ -21,6 +21,9 @@ import { runEject } from '../cli/eject.js';
 import { HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
 import { packageRoot } from '../cli/installed.js';
 import type { CliIo } from '../cli/main.js';
+import { locateWrapTarget, providerEdits } from '../cli/provider-mount.js';
+import { applyFileEdits } from '../cli/rewrite.js';
+import { loadTypescript } from '../cli/source-scan.js';
 
 const tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc');
 const pkg = packageRoot();
@@ -876,6 +879,77 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     const out = read(dir, 'app/layout.tsx');
     expect(out).toContain('<>{children}</>');
     expect(out).not.toMatch(/return\s*\{children\}/); // never a bare object literal
+    const compiled = tscClean(dir);
+    expect(compiled.output).toBe('');
+    expect(compiled.ok).toBe(true);
+  });
+});
+
+describe('runEject --write — the exact unwrap (F11)', () => {
+  /** A root layout as the host wrote it before any mount: imports, a blank line, and `<body>` content over three lines. */
+  const BEFORE = `import type { ReactNode } from 'react';
+import './globals.css';
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html lang="en">
+      <body className="antialiased">
+        {children}
+      </body>
+    </html>
+  );
+}
+`;
+  /** The layout as 0.6.0's `init` (resolveAll) or 0.7.0's `register` (resolved) mounted it. */
+  async function mounted(form: 'resolved' | 'resolveAll', dir: string): Promise<string> {
+    const ts = await loadTypescript();
+    const path = join(dir, 'app/layout.tsx');
+    const sf = ts.createSourceFile(path, BEFORE, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    const wrap = locateWrapTarget(ts, sf, 'app', form);
+    if (wrap === null) throw new Error('no wrap target');
+    const config = { ...BASE_CONFIG, codegen: { ...BASE_CONFIG.codegen, resolved: 'content/resolved.ts' } } as never;
+    return applyFileEdits(BEFORE, providerEdits(ts, sf, BEFORE, path, dir, config, wrap, form));
+  }
+  const ejectHost = (): string =>
+    scaffold({
+      config: BASE_CONFIG,
+      files: {
+        'app/globals.css': '',
+        'app/page.tsx': "import { copy } from '@/lib/content';\nexport default function Page() { return <h1>{copy('hero')}</h1>; }\n",
+        'lib/content.ts': READ_PATH,
+        'content/resolved.ts': 'export const RESOLVED = {} as const;\n',
+      },
+    });
+
+  for (const form of ['resolveAll', 'resolved'] as const) {
+    it(`leaves the layout byte-identical to the file before the ${form === 'resolveAll' ? "0.6.0 init" : "0.7.0 register"} mount, and the host builds`, async () => {
+      const dir = ejectHost();
+      const layout = await mounted(form, dir);
+      expect(layout).toContain('<CopyProvider ');
+      write(dir, 'app/layout.tsx', layout);
+      const cap = io(dir);
+      expect(await runEject(['--write'], cap)).toBe(0);
+      expect(read(dir, 'app/layout.tsx')).toBe(BEFORE);
+      expect(cap.out.join('\n')).toContain('app/layout.tsx: un-rewrite + unwrap CopyProvider');
+      const compiled = tscClean(dir);
+      expect(compiled.output).toBe('');
+      expect(compiled.ok).toBe(true);
+    });
+  }
+
+  it('unwraps a reformatted mount through the 0.6.0 path, and the host builds', async () => {
+    const dir = ejectHost();
+    const layout = (await mounted('resolveAll', dir)).replace(
+      '<CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={resolved}>',
+      '<CopyProvider\n          descriptor={descriptorJson as unknown as Descriptor}\n          resolved={resolved}>',
+    );
+    write(dir, 'app/layout.tsx', layout);
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    const out = read(dir, 'app/layout.tsx');
+    expect(out).not.toContain('CopyProvider');
+    expect(out).not.toContain('@getstet/stet');
+    expect(out).not.toContain('resolveAll');
+    expect(out).toContain('{children}');
     const compiled = tscClean(dir);
     expect(compiled.output).toBe('');
     expect(compiled.ok).toBe(true);

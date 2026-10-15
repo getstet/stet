@@ -34,14 +34,17 @@ import {
   type StoreAdapterName,
   type StoreBlock,
 } from './config.js';
-import { INIT_READ_IMPORT, readPathImport, SERVER_READ_IMPORT } from './footprint.js';
+import { clientReadFiles, INIT_READ_IMPORT, readPathImport, SERVER_READ_IMPORT } from './footprint.js';
 import { armGateSeo } from './hook.js';
 import { migrations, type Migration } from './installed.js';
 import type { CliIo } from './main.js';
 import { applyMigrationSql, readProjectMeta, stampDescriptorVersion } from './meta.js';
+import { unmountEdits } from './provider-mount.js';
 import { loadProject, type LoadedProject } from './project.js';
 import { CliError, plural, Report, UsageError } from './report.js';
+import { applyFileEdits } from './rewrite.js';
 import { seoFindings } from './seo.js';
+import { loadTypescript } from './source-scan.js';
 import { contactsConfig, isStoreBacked } from './store.js';
 import { seed } from './write.js';
 
@@ -109,7 +112,9 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
  * read path's import of the provider's index rewritten to the server subpath,
  * where it is the line `init` wrote and nothing else imports that index. Any
  * other import is named for the hand — the rewrite touches only the line it
- * can prove it wrote, its line ending kept.
+ * can prove it wrote, its line ending kept. Then the root layout's mount, taken
+ * out where no file reads `useCopy` and `unmountEdits`' round trip proves it
+ * is the mount stet wrote.
  */
 async function footprint(io: CliIo, project: LoadedProject, report: Report): Promise<void> {
   const config = project.config;
@@ -125,6 +130,24 @@ async function footprint(io: CliIo, project: LoadedProject, report: Report): Pro
   } else if (kind === 'other') {
     report.line(`${shown}: imports from '@getstet/stet/react' — change it to '@getstet/stet/react/server' by hand; the line is not the one stet init wrote`);
   }
+  if (config.rootLayout === undefined) return;
+  const layout = join(io.cwd, config.rootLayout);
+  if (!existsSync(layout)) return;
+  const source = readFileSync(layout, 'utf8');
+  if (!source.includes('<CopyProvider') || clientReadFiles(io.cwd, config).length > 0) return;
+  let ts: typeof import('typescript');
+  try {
+    ts = await loadTypescript();
+  } catch {
+    return;
+  }
+  const unmount = unmountEdits(ts, layout, source, io.cwd, config);
+  if (unmount === null) {
+    report.line(`${config.rootLayout}: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote`);
+    return;
+  }
+  writeText(layout, applyFileEdits(source, unmount.edits));
+  report.line(`${config.rootLayout}: CopyProvider unmounted — no client component reads copy; stet register mounts it again when one does`);
 }
 
 /**

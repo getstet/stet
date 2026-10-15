@@ -1547,6 +1547,83 @@ describe('upgrade', () => {
     });
   });
 
+  describe('the CopyProvider mount no client component reads (D7, P15)', () => {
+    const LAYOUT = 'export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang="en">\n      <body>\n        {children}\n      </body>\n    </html>\n  );\n}\n';
+    /** The layout as 0.6.0's `init` mounted it: the resolveAll block at offset 0 and the wrap over `{children}`. */
+    const MOUNTED_060 =
+      "import { CopyProvider } from '@getstet/stet/react';\n" +
+      "import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';\n" +
+      "import descriptorJson from '../content/descriptor.json';\n" +
+      "import { DEFAULTS } from '../content/defaults';\n" +
+      '\n' +
+      'const { resolved } = resolveAll(descriptorJson as unknown as Descriptor, readBundle(DEFAULTS));\n' +
+      '\n' +
+      LAYOUT.replace('        {children}\n', '        <CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={resolved}>{children}</CopyProvider>\n');
+    const UNMOUNTED = 'app/layout.tsx: CopyProvider unmounted — no client component reads copy; stet register mounts it again when one does';
+    const BY_HAND = 'app/layout.tsx: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote';
+    const adopted060 = (layout = MOUNTED_060): Host => {
+      const host = makeHost({ config: {} });
+      mkdirSync(join(host.cwd, 'lib'), { recursive: true });
+      writeFileSync(join(host.cwd, 'lib/content.ts'), "import { createServerCopy } from '@getstet/stet/react';\nexport const copy = createServerCopy(descriptor, resolved);\n");
+      mkdirSync(join(host.cwd, 'app'), { recursive: true });
+      writeFileSync(join(host.cwd, 'app/layout.tsx'), layout);
+      writeFileSync(join(host.cwd, 'app/page.tsx'), "import { copy } from '@/lib/content';\nexport default function Page() {\n  return <h1>{copy('k')}</h1>;\n}\n");
+      rmSync(join(host.cwd, 'content/resolved.ts'));
+      return host;
+    };
+
+    it('a 0.6.0 Next host stops shipping the provider: the read path rewritten, the mount taken out, the resolved module written; the second run says neither', async () => {
+      const host = adopted060();
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.out).toContain("lib/content.ts: imports from '@getstet/stet/react' — rewritten to '@getstet/stet/react/server', which carries no client code");
+      expect(host.out).toContain(UNMOUNTED);
+      expect(host.file('app/layout.tsx')).toBe(LAYOUT);
+      expect(host.exists('content/resolved.ts')).toBe(true);
+      host.out.length = 0;
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.stdout()).not.toContain('lib/content.ts:');
+      expect(host.stdout()).not.toContain('app/layout.tsx:');
+    });
+
+    it('leaves a reformatted mount for the hand, changing no byte of the layout', async () => {
+      const reformatted = MOUNTED_060.replace(
+        '<CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={resolved}>',
+        '<CopyProvider\n          descriptor={descriptorJson as unknown as Descriptor}\n          resolved={resolved}>',
+      );
+      const host = adopted060(reformatted);
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.out).toContain(BY_HAND);
+      expect(host.file('app/layout.tsx')).toBe(reformatted);
+    });
+
+    it('keeps the mount, and says nothing of it, where components/Nav.tsx outside the managed globs reads useCopy', async () => {
+      const host = adopted060();
+      mkdirSync(join(host.cwd, 'components'), { recursive: true });
+      writeFileSync(join(host.cwd, 'components/Nav.tsx'), "'use client';\nimport { useCopy } from '@getstet/stet/react';\nexport function Nav() {\n  const copy = useCopy();\n  return <nav>{copy('nav')}</nav>;\n}\n");
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.file('app/layout.tsx')).toBe(MOUNTED_060);
+      expect(host.stdout()).not.toContain('app/layout.tsx:');
+    });
+
+    it('keeps the mount, and says nothing of it, where typescript does not load', async () => {
+      vi.resetModules();
+      vi.doMock('../cli/source-scan.js', async (importOriginal) => ({
+        ...(await importOriginal<typeof import('../cli/source-scan.js')>()),
+        loadTypescript: () => Promise.reject(Object.assign(new Error("Cannot find package 'typescript'"), { code: 'ERR_MODULE_NOT_FOUND' })),
+      }));
+      try {
+        const fresh = await import('../cli/main.js');
+        const host = adopted060();
+        expect(await fresh.runCli(['upgrade'], host.io)).toBe(0);
+        expect(host.file('app/layout.tsx')).toBe(MOUNTED_060);
+        expect(host.stdout()).not.toContain('app/layout.tsx:');
+      } finally {
+        vi.doUnmock('../cli/source-scan.js');
+        vi.resetModules();
+      }
+    });
+  });
+
   it('writes the resolved module on a 0.6.0-shaped host, and a dry run names it without writing (D8)', async () => {
     const host = makeHost({ config: {} });
     rmSync(join(host.cwd, 'content/resolved.ts'));
