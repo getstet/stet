@@ -5685,7 +5685,7 @@ describe('adoption', () => {
       JSON.stringify({ name: 'spa', private: true, devDependencies: { vite: '^5' } }, null, 2),
     );
     expect(await vite.run('init', '--yes')).toBe(0);
-    expect(vite.stdout()).toContain('router: app (default — no route files found)');
+    expect(vite.stdout()).toContain('router: vite (vite in package.json and index.html at the root)');
     const forced = bareHtmlHost();
     writeFileSync(
       join(forced.cwd, 'package.json'),

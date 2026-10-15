@@ -41,7 +41,7 @@ import {
 } from './config.js';
 import { filesForGlobs } from './files.js';
 import { SERVER_READ_IMPORT } from './footprint.js';
-import { proposeHtml } from './html-host.js';
+import { attrOf, proposeHtml, readDocument } from './html-host.js';
 import { packageRoot, migrations } from './installed.js';
 import { detectPagesRoots } from './pages.js';
 import type { CliIo } from './main.js';
@@ -75,7 +75,8 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   else report.line(`router: ${router} (${evidence})`);
   // An Astro host has no root React layout, and a placeholder path is the lie
   // this absence exists to stop. Neither does a page with no build.
-  const rootLayout = isHtml || router === 'astro' ? undefined : probeRootLayout(target, base, router);
+  const rootLayout =
+    isHtml || router === 'astro' ? undefined : router === 'vite' ? viteEntry(target) : probeRootLayout(target, base, router);
   const storeBacked = detectStore(target, io.env);
   // The sub-package OR the invocation root: a hoisted monorepo declares react
   // once at the top, and reading only the app would call it react-less while
@@ -126,14 +127,19 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
       plan(config.codegen.dts, dts),
       plan(config.codegen.defaults, generateDefaultsModule(snapshot)),
       plan(config.codegen.resolved, generateResolvedModule(descriptor, snapshot)),
-      plan(
-        config.readPath.file,
-        // An Astro host takes the react-free scaffold whether or not react is
-        // declared: an island's React tree is not the site's layout, and
-        // `stet/react`'s server accessor is a Next server-component tool.
-        readPathModule(config, join(target, config.readPath.file), target, storeBacked, hasReact && router !== 'astro'),
-      ),
     );
+    // A Vite SPA has no server to read on: the browser reads the provider, and no read path is written.
+    if (router !== 'vite') {
+      plans.push(
+        plan(
+          config.readPath.file,
+          // An Astro host takes the react-free scaffold whether or not react is
+          // declared: an island's React tree is not the site's layout, and
+          // `stet/react`'s server accessor is a Next server-component tool.
+          readPathModule(config, join(target, config.readPath.file), target, storeBacked, hasReact && router !== 'astro'),
+        ),
+      );
+    }
     for (const migration of migrations()) {
       plans.push(plan(join(HOST_MIGRATIONS, migration.name), readFileSync(migration.path, 'utf8')));
     }
@@ -145,7 +151,7 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
       // Computed from the file as it stands, so an existing `.env.example` is extended and never refused.
       plans.push(asUpdate(plan('.env.example', envExample(target, formsEnvNames(config, storeBacked)))));
     }
-    plans.push(planJsonAt(CONFIG_FILE, config));
+    plans.push(planJsonAt(CONFIG_FILE, router === 'vite' ? viteConfigProjection(config) : config));
   }
 
   const { written, unchanged } = writePlanned(plans, {
@@ -191,7 +197,11 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   // step and the report says so rather than leaving a store-backed host with
   // no server surface named.
   if (!isHtml && storeBacked && config.mountRoute === undefined) {
-    report.line('mount route: not scaffolded on an Astro host — mount createStetHandler in an Astro endpoint by hand');
+    report.line(
+      router === 'vite'
+        ? 'mount route: not scaffolded on a Vite host — a Vite SPA reads the committed snapshot through the provider'
+        : 'mount route: not scaffolded on an Astro host — mount createStetHandler in an Astro endpoint by hand',
+    );
   }
   if (scaffoldForms) {
     if (!resolves(target, 'pg')) {
@@ -224,7 +234,7 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
       `${plural(pages, 'page')}, ${plural(elements, 'text element')}, ` +
         `${plural(attributes, 'attribute')} — next: stet scan, then stet hook install`,
     );
-  } else if (storeBacked) {
+  } else if (storeBacked && router !== 'vite') {
     report.line('next: stet pull (populate the store bundle the read path serves), then stet scan');
   } else {
     report.line('next: stet scan');
@@ -264,7 +274,7 @@ const ASTRO_CONFIGS = ['astro.config.mjs', 'astro.config.ts', 'astro.config.js',
  */
 function detectLayout(target: string): {
   base: '' | 'src/';
-  router: 'app' | 'pages' | 'astro';
+  router: 'app' | 'pages' | 'astro' | 'vite';
   host: 'html' | undefined;
   evidence: string;
 } {
@@ -293,6 +303,10 @@ function detectLayout(target: string): {
       host: undefined,
       evidence: `${pages.root} carries a page file`,
     };
+  }
+  // After the Next and Astro probes, so a Next app with `vite` in its tooling keeps its router.
+  if (declaredDep(target, 'vite', ['dependencies', 'devDependencies']) !== null && existsSync(join(target, 'index.html'))) {
+    return { base: 'src/', router: 'vite', host: undefined, evidence: 'vite in package.json and index.html at the root' };
   }
   const html = detectHtmlHost(target);
   if (html !== null) return { base: '', router: 'app', host: 'html', evidence: html };
@@ -389,6 +403,38 @@ function htmlConfigProjection(config: StetConfig): Record<string, unknown> {
     bundlePath: config.bundlePath,
     locales: config.locales,
   };
+}
+
+/** The config a Vite SPA writes: no read path and no mount route — the browser reads the provider. */
+function viteConfigProjection(config: StetConfig): Record<string, unknown> {
+  const { readPath: _readPath, mountRoute: _mountRoute, ...rest } = config;
+  return rest;
+}
+
+/**
+ * A Vite SPA's entry module, its root layout: the first module script
+ * `index.html` loads, where that file exists; else the first `src/main.*`
+ * present; else `src/main.tsx`.
+ */
+function viteEntry(target: string): string {
+  let html = '';
+  try {
+    html = readFileSync(join(target, 'index.html'), 'utf8');
+  } catch {
+    // No readable index.html: the conventional entry below.
+  }
+  // The reader blanks a script whole, tag included, so each open tag outside a
+  // comment is read on its own, its attributes through the same reader.
+  for (const [open] of html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<script\b[^>]*>/gi)) {
+    const el = readDocument('index.html', open.replace(/^<script/i, '<x-script')).roots[0];
+    if (el === undefined || (attrOf(el, 'type') ?? '').toLowerCase() !== 'module') continue;
+    const src = attrOf(el, 'src')?.replace(/^\//, '');
+    if (src === undefined) continue;
+    if (existsSync(join(target, src))) return src;
+    break;
+  }
+  for (const ext of ['tsx', 'jsx', 'ts', 'js']) if (existsSync(join(target, 'src', `main.${ext}`))) return `src/main.${ext}`;
+  return 'src/main.tsx';
 }
 
 /** App Router unless only `pages/` exists. A bare repo defaults to app. */
@@ -516,7 +562,7 @@ async function askEmail(io: CliIo, target: string, base: '' | 'src/', report: Re
 
 function buildConfig(d: {
   base: '' | 'src/';
-  router: 'app' | 'pages' | 'astro';
+  router: 'app' | 'pages' | 'astro' | 'vite';
   host: 'html' | undefined;
   rootLayout: string | undefined;
   storeBacked: boolean;
@@ -549,6 +595,23 @@ function buildConfig(d: {
   // no-op there (P2-11). stet's glob matcher has no brace expansion, so the
   // widening is separate array entries, not `{tsx,jsx,js}`.
   const js = jsHost(d.rootLayout ?? '');
+  // `.tsx` belongs in the TypeScript host's email list as much as `.ts`: a
+  // react-email template IS a `.tsx` component, and it is the shape the whole
+  // ecosystem ships. Leaving it out made `stet email extract` with no arguments
+  // walk right past a react-email project's entire template directory.
+  const emailGlobs = d.sendsEmail
+    ? js
+      ? [`${d.base}lib/email/**/*.ts`, `${d.base}lib/email/**/*.js`, `${d.base}lib/email/**/*.jsx`]
+      : [`${d.base}lib/email/**/*.ts`, `${d.base}lib/email/**/*.tsx`]
+    : [];
+  if (d.router === 'vite') {
+    // No read path and no mount route: a SPA has no server, and every literal reads the provider.
+    config.managedSurfaces = [...(js ? ['src/**/*.jsx', 'src/**/*.js'] : ['src/**/*.tsx']), ...emailGlobs];
+    config.emailSurfaces = emailGlobs;
+    // Recorded and dormant: a SPA reads the committed snapshot through the provider.
+    if (d.storeBacked) config.store = defaultStoreBlock('pg');
+    return config;
+  }
   const readPathFile = `${d.base}lib/content.${js ? 'js' : 'ts'}`;
   config.readPath = { file: readPathFile, import: resolveReadPathImport(d.target, d.base, readPathFile, d.report) };
   // Astro templates live in `pages/`, `layouts/` and `components/` alike, so
@@ -560,15 +623,6 @@ function buildConfig(d: {
       : js
         ? [`${d.base}${d.router}/**/*.tsx`, `${d.base}${d.router}/**/*.jsx`, `${d.base}${d.router}/**/*.js`]
         : [`${d.base}${d.router}/**/*.tsx`];
-  // `.tsx` belongs in the TypeScript host's email list as much as `.ts`: a
-  // react-email template IS a `.tsx` component, and it is the shape the whole
-  // ecosystem ships. Leaving it out made `stet email extract` with no arguments
-  // walk right past a react-email project's entire template directory.
-  const emailGlobs = d.sendsEmail
-    ? js
-      ? [`${d.base}lib/email/**/*.ts`, `${d.base}lib/email/**/*.js`, `${d.base}lib/email/**/*.jsx`]
-      : [`${d.base}lib/email/**/*.ts`, `${d.base}lib/email/**/*.tsx`]
-    : [];
   config.managedSurfaces = [...surfaceGlobs, ...emailGlobs];
   // The email surfaces are the target-derivation list `register` reads.
   config.emailSurfaces = emailGlobs;

@@ -7,6 +7,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -1062,7 +1063,7 @@ describe('runInit — the static-HTML host', () => {
     const dir = htmlProject({ devDependencies: { vite: '^5' } });
     const io = makeIo(dir);
     expect(await runInit(['--yes'], io)).toBe(0);
-    expect(io.out[0]).toBe('router: app (default — no route files found)');
+    expect(io.out[0]).toBe('router: vite (vite in package.json and index.html at the root)');
     expect(readConfig(dir)['host']).toBeUndefined();
   });
 
@@ -1305,5 +1306,80 @@ describe('runInit — the sign-up question and the forms scaffold', () => {
     expect(readConfig(dir)['contacts']).toBeUndefined();
     expect(readFileSync(join(dir, 'lib/stet-forms.ts'), 'utf8')).toContain('process.env.STET_DATABASE_URL');
     expect(readFileSync(join(dir, '.env.example'), 'utf8')).toBe('STET_FORMS_SECRET=\nSTET_FORMS_BASE=\n');
+  });
+});
+
+describe('runInit — the Vite arm (D9)', () => {
+  const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'vite-host');
+  const viteHost = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-init-vite-'));
+    cpSync(FIXTURE, dir, { recursive: true });
+    return dir;
+  };
+  const files = (dir: string): Record<string, string> =>
+    Object.fromEntries(['package.json', 'index.html', 'src/main.tsx', 'src/App.tsx'].map((rel) => [rel, readFileSync(join(dir, rel), 'utf8')]));
+
+  it('records the entry and the client surfaces, writes no read path, and changes no template file', async () => {
+    const dir = viteHost();
+    const before = files(dir);
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('router: vite (vite in package.json and index.html at the root)');
+    const config = readConfig(dir);
+    expect(config['router']).toBe('vite');
+    expect(config['rootLayout']).toBe('src/main.tsx');
+    expect(config['managedSurfaces']).toEqual(['src/**/*.tsx']);
+    expect(Object.hasOwn(config, 'readPath')).toBe(false);
+    expect(Object.hasOwn(config, 'mountRoute')).toBe(false);
+    expect(existsSync(join(dir, 'lib'))).toBe(false);
+    expect(existsSync(join(dir, 'src/lib'))).toBe(false);
+    expect(existsSync(join(dir, 'app'))).toBe(false);
+    expect(existsSync(join(dir, 'content/resolved.ts'))).toBe(true);
+    expect(files(dir)).toEqual(before);
+    expect(io.out).toContain('CopyProvider: not mounted — stet register mounts it in src/main.tsx when a client component first reads copy');
+    expect(await runCli(['check'], makeIo(dir))).toBe(0);
+  });
+
+  it('takes the html shape under --host html', async () => {
+    const dir = viteHost();
+    const io = makeIo(dir);
+    expect(await runInit(['--host', 'html', '--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('host: html (--host html)');
+    expect(readConfig(dir)['host']).toBe('html');
+  });
+
+  it('takes the JS globs on a .jsx entry, and records the entry index.html names', async () => {
+    const jsx = viteHost();
+    write(jsx, 'index.html', readFileSync(join(jsx, 'index.html'), 'utf8').replace('/src/main.tsx', '/src/main.jsx'));
+    write(jsx, 'src/main.jsx', readFileSync(join(jsx, 'src/main.tsx'), 'utf8').replace('!', ''));
+    expect(await runInit(['--yes'], makeIo(jsx))).toBe(0);
+    expect(readConfig(jsx)['rootLayout']).toBe('src/main.jsx');
+    expect(readConfig(jsx)['managedSurfaces']).toEqual(['src/**/*.jsx', 'src/**/*.js']);
+
+    const entry = viteHost();
+    write(entry, 'index.html', readFileSync(join(entry, 'index.html'), 'utf8').replace('/src/main.tsx', '/src/entry.tsx'));
+    write(entry, 'src/entry.tsx', readFileSync(join(entry, 'src/main.tsx'), 'utf8'));
+    expect(await runInit(['--yes'], makeIo(entry))).toBe(0);
+    expect(readConfig(entry)['rootLayout']).toBe('src/entry.tsx');
+  });
+
+  it('keeps a Next app with vite in its tooling on its router', async () => {
+    const dir = project();
+    write(dir, 'package.json', '{"name":"host","private":true,"dependencies":{"react":"^19"},"devDependencies":{"vite":"^8.3.0"}}\n');
+    write(dir, 'app/layout.tsx', APP_LAYOUT);
+    write(dir, 'app/page.tsx', 'export default function Page() { return <h1>Home</h1>; }\n');
+    write(dir, 'index.html', '<!doctype html><html><body></body></html>\n');
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('router: app (app carries a page file)');
+  });
+
+  it('records a detected store dormant, with the Vite mount-route line', async () => {
+    const dir = viteHost();
+    const io = makeIo(dir, { env: { STET_DATABASE_URL: 'postgres://localhost/x' } });
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(readConfig(dir)['store']).toBeDefined();
+    expect(io.out).toContain('mount route: not scaffolded on a Vite host — a Vite SPA reads the committed snapshot through the provider');
+    expect(io.out).toContain('next: stet scan');
   });
 });
