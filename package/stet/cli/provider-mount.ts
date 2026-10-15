@@ -1,15 +1,18 @@
 /**
  * The root-layout `CopyProvider` mount: whether a layout carries it, where it
- * wraps, the edits that insert it and the snippet that names it by hand.
+ * wraps, the edits that insert it (`register` plans them through `planMount`)
+ * and the snippet that names it by hand.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import type * as TS from 'typescript';
 
 import type { StetConfig } from './config.js';
 import { posixRelative, type Report } from './report.js';
-import { dominantEol, type Edit } from './rewrite.js';
+import { applyFileEdits, dominantEol, type Edit } from './rewrite.js';
+import { loadTypescript, scriptKindFor } from './source-scan.js';
 
 /** A `/`-normalized, `./`-prefixed specifier from one file to a target path. */
 export function relImport(fromFile: string, toDiskPath: string, opts: { stripExt?: boolean } = {}): string {
@@ -33,64 +36,160 @@ export function importsCopyProvider(ts: typeof import('typescript'), sf: TS.Sour
   });
 }
 
+/** Where the provider wraps: the span its element replaces. */
+export interface WrapTarget {
+  pos: number;
+  end: number;
+}
+
 /**
- * The node to wrap: the sole `{children}` expression in an App-Router layout, or
- * the sole `<Component … />` in a Pages `_app` (which has no `children` prop).
- * More than one candidate, or none, is ambiguous — the caller skips and prints
- * the snippet rather than guess.
+ * Where the provider wraps, or null where the layout does not say it
+ * unambiguously — the caller then mounts nothing rather than guess.
+ *
+ * - An App-Router layout under the `resolved` form: the content of its one
+ *   `<body>` element, from the opening element's end to the closing element's
+ *   start, so a component the layout renders beside `{children}` is served
+ *   too; else the sole `{children}` expression. Under the `resolveAll` form
+ *   (0.6.0's mount, kept for the unmount's round trip) the sole `{children}`.
+ * - A Pages `_app`: the sole `<Component … />`, the whole tree already.
+ * - A Vite entry: the one JSX argument of the one `….render(…)` call on a
+ *   `createRoot(…)` result.
  */
-export function locateWrapTarget(ts: typeof import('typescript'), sf: TS.SourceFile, router: 'app' | 'pages'): TS.Node | null {
+export function locateWrapTarget(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+  router: 'app' | 'pages' | 'vite',
+  form: 'resolved' | 'resolveAll',
+): WrapTarget | null {
   const hits: TS.Node[] = [];
+  const bodies: TS.JsxElement[] = [];
   const visit = (node: TS.Node): void => {
     if (router === 'app') {
       if (ts.isJsxExpression(node) && node.expression !== undefined && ts.isIdentifier(node.expression) && node.expression.text === 'children') {
         hits.push(node);
       }
-    } else if (ts.isJsxSelfClosingElement(node) && ts.isIdentifier(node.tagName) && node.tagName.text === 'Component') {
-      hits.push(node);
+      if (ts.isJsxElement(node) && ts.isIdentifier(node.openingElement.tagName) && node.openingElement.tagName.text === 'body') bodies.push(node);
+    } else if (router === 'pages') {
+      if (ts.isJsxSelfClosingElement(node) && ts.isIdentifier(node.tagName) && node.tagName.text === 'Component') hits.push(node);
+    } else if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'render' &&
+      ts.isCallExpression(node.expression.expression) &&
+      /(^|\.)createRoot$/.test(node.expression.expression.expression.getText(sf)) &&
+      node.arguments.length === 1 &&
+      (ts.isJsxElement(node.arguments[0] as TS.Node) ||
+        ts.isJsxSelfClosingElement(node.arguments[0] as TS.Node) ||
+        ts.isJsxFragment(node.arguments[0] as TS.Node))
+    ) {
+      hits.push(node.arguments[0] as TS.Node);
     }
     ts.forEachChild(node, visit);
   };
   visit(sf);
-  return hits.length === 1 ? (hits[0] as TS.Node) : null;
+  if (router === 'app' && form === 'resolved' && bodies.length === 1) {
+    const body = bodies[0] as TS.JsxElement;
+    return { pos: body.openingElement.getEnd(), end: body.closingElement.getStart(sf) };
+  }
+  if (hits.length !== 1) return null;
+  const hit = hits[0] as TS.Node;
+  return { pos: hit.getStart(sf), end: hit.getEnd() };
 }
 
-/** The import block + resolved-map declaration, plus the wrap of the target node. */
+/** The import block a mount inserts, in the layout's line endings. */
+export function mountBlock(layoutFile: string, cwd: string, config: StetConfig, form: 'resolved' | 'resolveAll', nl: string): string {
+  const relDescriptor = relImport(layoutFile, join(cwd, config.descriptorPath));
+  const js = jsHost(layoutFile);
+  if (form === 'resolveAll') {
+    const relDefaults = relImport(layoutFile, join(cwd, config.codegen.defaults), { stripExt: true });
+    const descriptorExpr = js ? 'descriptorJson' : 'descriptorJson as unknown as Descriptor';
+    return [
+      "import { CopyProvider } from '@getstet/stet/react';",
+      js ? "import { readBundle, resolveAll } from '@getstet/stet';" : "import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';",
+      `import descriptorJson from '${relDescriptor}';`,
+      `import { DEFAULTS } from '${relDefaults}';`,
+      '',
+      `const { resolved } = resolveAll(${descriptorExpr}, readBundle(DEFAULTS));`,
+    ].join(nl);
+  }
+  return [
+    "import { CopyProvider } from '@getstet/stet/react';",
+    ...(js ? [] : ["import type { Descriptor } from '@getstet/stet';"]),
+    `import descriptorJson from '${relDescriptor}';`,
+    `import { RESOLVED } from '${relImport(layoutFile, join(cwd, config.codegen.resolved), { stripExt: true })}';`,
+  ].join(nl);
+}
+
+/** The block's insert: before everything at offset 0, else on its own lines after the last import. */
+export function importEditAt(at: number, block: string, nl: string): Edit {
+  return { pos: at, end: at, text: at === 0 ? `${block}${nl}${nl}` : `${nl}${block}${nl}` };
+}
+
+/** The provider element around the wrap target, as two inserts, fed the map the form names. */
+export function wrapEdit(sf: TS.SourceFile, wrap: WrapTarget, descriptorExpr: string, form: 'resolved' | 'resolveAll'): Edit[] {
+  const map = form === 'resolveAll' ? 'resolved' : 'RESOLVED';
+  // `applyFileEdits` sorts descending by position, keeps list order among equal
+  // positions and applies in that order, so of two inserts at one offset the last
+  // listed lands first in the text: an empty span (`<body></body>`) comes out
+  // `<CopyProvider …></CopyProvider>` only with the closing tag listed first. On a
+  // non-empty span the positions order them, and an insert at the span's start
+  // lands before a leaf edit starting there, one at its end after a leaf edit
+  // ending there.
+  return [
+    { pos: wrap.end, end: wrap.end, text: '</CopyProvider>' },
+    { pos: wrap.pos, end: wrap.pos, text: `<CopyProvider descriptor={${descriptorExpr}} resolved={${map}}>` },
+  ];
+}
+
+/** The import block and the wrap of the target, in the layout's own line endings. */
 export function providerEdits(
   ts: typeof import('typescript'),
   sf: TS.SourceFile,
   source: string,
   layoutFile: string,
-  target: string,
+  cwd: string,
   config: StetConfig,
-  wrap: TS.Node,
+  wrap: WrapTarget,
+  form: 'resolved' | 'resolveAll',
 ): Edit[] {
-  const relDescriptor = relImport(layoutFile, join(target, config.descriptorPath));
-  const relDefaults = relImport(layoutFile, join(target, config.codegen.defaults), { stripExt: true });
   // A JS layout gets no TypeScript syntax — no `type` import, no `as` cast (P1-3).
-  const js = jsHost(layoutFile);
-  const descriptorExpr = js ? 'descriptorJson' : 'descriptorJson as unknown as Descriptor';
+  const descriptorExpr = jsHost(layoutFile) ? 'descriptorJson' : 'descriptorJson as unknown as Descriptor';
   // The layout's OWN line ending: a `\n` inserted into a CRLF file leaves
-  // mixed endings in a file stet did not write (P3-13, the same rule the
-  // guidance append follows).
+  // mixed endings in a file stet did not write (P3-13).
   const nl = dominantEol(source);
-  const block = [
-    "import { CopyProvider } from '@getstet/stet/react';",
-    js ? "import { readBundle, resolveAll } from '@getstet/stet';" : "import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';",
-    `import descriptorJson from '${relDescriptor}';`,
-    `import { DEFAULTS } from '${relDefaults}';`,
-    '',
-    `const { resolved } = resolveAll(${descriptorExpr}, readBundle(DEFAULTS));`,
-  ].join(nl);
+  return [importEditAt(importInsertPos(ts, sf), mountBlock(layoutFile, cwd, config, form, nl), nl), ...wrapEdit(sf, wrap, descriptorExpr, form)];
+}
 
-  const at = importInsertPos(ts, sf);
-  const importEdit: Edit = { pos: at, end: at, text: at === 0 ? `${block}${nl}${nl}` : `${nl}${block}${nl}` };
+/** A planned mount: the layout, its source, the edits and the text they give. */
+export interface MountPlan {
+  layout: string;
+  source: string;
+  edits: Edit[];
+  text: string;
+}
 
-  const inner = source.slice(wrap.getStart(sf), wrap.getEnd());
-  const wrapped = `<CopyProvider descriptor={${descriptorExpr}} resolved={resolved}>${inner}</CopyProvider>`;
-  const wrapEdit: Edit = { pos: wrap.getStart(sf), end: wrap.getEnd(), text: wrapped };
-
-  return [importEdit, wrapEdit];
+/**
+ * The CopyProvider mount on the root layout: `'mounted'` where the layout
+ * already imports it (`importsCopyProvider`, the one test), the plan, or null
+ * where there is no layout to edit or the wrap target cannot be located.
+ */
+export async function planMount(cwd: string, config: StetConfig): Promise<'mounted' | MountPlan | null> {
+  if (config.rootLayout === undefined || config.router === 'astro') return null;
+  const path = join(cwd, config.rootLayout);
+  if (!existsSync(path)) return null;
+  let ts: typeof import('typescript');
+  try {
+    ts = await loadTypescript();
+  } catch {
+    return null;
+  }
+  const source = readFileSync(path, 'utf8');
+  const sf = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, path));
+  if (importsCopyProvider(ts, sf)) return 'mounted';
+  const wrap = locateWrapTarget(ts, sf, config.router, 'resolved');
+  if (wrap === null) return null;
+  const edits = providerEdits(ts, sf, source, path, cwd, config, wrap, 'resolved');
+  return { layout: config.rootLayout, source, edits, text: applyFileEdits(source, edits) };
 }
 
 /** After the last import (or the directive prologue), never before `'use client'`. */
@@ -116,26 +215,23 @@ export function printProviderSnippet(
   report: Report,
   config: StetConfig,
   layoutFile: string,
-  target: string,
-  router: 'app' | 'pages',
+  cwd: string,
+  router: 'app' | 'pages' | 'vite',
 ): void {
-  const relDescriptor = relImport(layoutFile, join(target, config.descriptorPath));
-  const relDefaults = relImport(layoutFile, join(target, config.codegen.defaults), { stripExt: true });
-  const wrapee = router === 'app' ? '{children}' : '<Component {...pageProps} />';
-  const js = jsHost(layoutFile);
-  const descriptorExpr = js ? 'descriptorJson' : 'descriptorJson as unknown as Descriptor';
+  const descriptorExpr = jsHost(layoutFile) ? 'descriptorJson' : 'descriptorJson as unknown as Descriptor';
+  const wrapee =
+    router === 'app'
+      ? 'everything inside <body>'
+      : router === 'pages'
+        ? '<Component {...pageProps} />'
+        : 'the element createRoot(...).render() receives';
   for (const line of [
-    "  import { CopyProvider } from '@getstet/stet/react';",
-    js ? "  import { readBundle, resolveAll } from '@getstet/stet';" : "  import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';",
-    `  import descriptorJson from '${relDescriptor}';`,
-    `  import { DEFAULTS } from '${relDefaults}';`,
+    ...mountBlock(layoutFile, cwd, config, 'resolved', '\n').split('\n'),
     '',
-    `  const { resolved } = resolveAll(${descriptorExpr}, readBundle(DEFAULTS));`,
-    '',
-    `  wrap ${wrapee} in:`,
-    `  <CopyProvider descriptor={${descriptorExpr}} resolved={resolved}>…</CopyProvider>`,
+    `wrap ${wrapee} in:`,
+    `<CopyProvider descriptor={${descriptorExpr}} resolved={RESOLVED}>…</CopyProvider>`,
   ]) {
-    report.line(line);
+    report.line(line === '' ? '' : `  ${line}`);
   }
 }
 
