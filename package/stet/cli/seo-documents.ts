@@ -104,6 +104,14 @@ function where(document: Document, el: Element): string {
   return `${document.file}:${document.lineAt(el.openStart)} ${stripMarks(document.source.slice(el.openStart, el.openEnd))}`;
 }
 
+/** What an unlabelled control needs, by what it carries: an `id`, a `name` alone, or neither. */
+export function labelRemedy(el: Element): string {
+  const id = attr(el, 'id');
+  const name = attr(el, 'name');
+  if (id !== undefined) return `write a <label for="${id}">`;
+  return name !== undefined ? `give it id="${name}" and write a <label for="${name}">` : 'wrap it in a <label>';
+}
+
 function documentFindings(document: Document, emit: Emit): void {
   const all: Element[] = document.roots.flatMap((root) => [root, ...root.descendants]);
   const labelled = new Set(all.flatMap((el) => (el.tag === 'label' && attr(el, 'for') !== undefined ? [attr(el, 'for') as string] : [])));
@@ -128,13 +136,7 @@ function documentFindings(document: Document, emit: Emit): void {
         filled(attr(el, 'placeholder')) ||
         filled(attr(el, 'title'));
       if (!named) {
-        const remedy =
-          id !== undefined
-            ? `write a <label for="${id}">`
-            : attr(el, 'name') !== undefined
-              ? `give it id="${attr(el, 'name') as string}" and write a <label for="${attr(el, 'name') as string}">`
-              : 'wrap it in a <label>';
-        emit('missing-label', `${where(document, el)} has no label — ${remedy}, then run stet register`);
+        emit('missing-label', `${where(document, el)} has no label — ${labelRemedy(el)}, then run stet register`);
       }
     }
     const nameable =

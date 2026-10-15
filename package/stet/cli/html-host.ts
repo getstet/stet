@@ -713,8 +713,8 @@ export function attrOf(el: Element, name: string): string | undefined {
   return el.attrs.find((a) => a.name === name)?.value;
 }
 
-/** An attribute's value as the key would carry it. */
-function attrValueOf(attr: HtmlAttr): string {
+/** An attribute's value as the key would carry it: the collapsed raw value, its entities decoded. */
+export function attrValueOf(attr: HtmlAttr): string {
   return textOf(attr.value);
 }
 

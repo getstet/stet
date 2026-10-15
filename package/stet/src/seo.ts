@@ -230,7 +230,7 @@ function resolvedValue(d: Descriptor, s: Snapshot, key: string, locale: string):
  * `undefined`. The page-scoped rules read through this, so "resolves to nothing
  * or an empty string" covers a whitespace-only value too.
  */
-function resolvedString(
+export function resolvedString(
   d: Descriptor,
   s: Snapshot,
   key: string,
