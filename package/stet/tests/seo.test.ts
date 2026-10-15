@@ -9,6 +9,7 @@ import { miniDescriptor, miniSnapshot, mutable } from '../conformance/fixture.js
 import { SEO_SEVERITY, seoCheck } from '../src/index.js';
 import type { Descriptor, KeyDef, SeoFinding, SeoRule, Snapshot } from '../src/index.js';
 import { headLimitsFor } from '../src/seo.js';
+import { loadConfig } from '../cli/config.js';
 
 afterAll(cleanupCliHosts);
 
@@ -30,7 +31,7 @@ function only(findings: SeoFinding[], rule: SeoRule): SeoFinding[] {
 }
 
 describe('the severity table', () => {
-  it('is seven errors and two warns, and it is the runtime rule list', () => {
+  it('is ten errors and four warns, and it is the runtime rule list', () => {
     const errors = Object.keys(SEO_SEVERITY).filter((r) => SEO_SEVERITY[r as SeoRule] === 'error');
     const warns = Object.keys(SEO_SEVERITY).filter((r) => SEO_SEVERITY[r as SeoRule] === 'warning');
     expect(errors.sort()).toEqual([
@@ -38,11 +39,22 @@ describe('the severity table', () => {
       'duplicate-title',
       'missing-alt',
       'missing-description',
+      'missing-label',
+      'missing-lang',
+      'missing-name',
       'missing-title',
       'over-length',
       'visible-content',
     ]);
-    expect(warns.sort()).toEqual(['anchor-text', 'machine-field']);
+    expect(warns.sort()).toEqual(['anchor-text', 'empty-heading', 'machine-field', 'redundant-alt']);
+  });
+
+  it('takes an override of each accessibility rule, and refuses an id that is not one', () => {
+    const ids = ['missing-label', 'missing-name', 'missing-lang', 'empty-heading', 'redundant-alt'];
+    const host = makeCliHost({ config: { seoCheck: Object.fromEntries(ids.map((id) => [id, 'warn'])) } });
+    expect(Object.keys(loadConfig(host.cwd).seoCheck ?? {}).sort()).toEqual([...ids].sort());
+    const wrong = makeCliHost({ config: { seoCheck: { 'missing-labels': 'warn' } } });
+    expect(() => loadConfig(wrong.cwd)).toThrow(/seoCheck\.missing-labels is not a rule — declared rules: .*missing-label, missing-lang, missing-name/);
   });
 });
 
@@ -192,6 +204,15 @@ describe('seoCheck', () => {
     expect(findings[0]?.severity).toBe('warning');
     // Entry-pathed, the same grammar src/validate.ts reports under.
     expect(findings[0]?.key).toBe('footer_links[1]');
+  });
+
+  it('warns on the words Lighthouse\'s link-text audit fails, whole values only (journey C3)', () => {
+    const { d, s } = copies();
+    const eight = ['Click this', 'Go', 'Information', 'More info', 'More information', 'Right here', 'Start', 'this'];
+    s['default']!['footer_links'] = [...eight, 'Go home'];
+    const findings = only(seoCheck(d, s), 'anchor-text');
+    expect(findings.map((f) => f.key)).toEqual(eight.map((_, i) => `footer_links[${i}]`));
+    expect(findings.every((f) => f.severity === 'warning')).toBe(true);
   });
 
   it('leaves a non-web target to the lints that own it', () => {

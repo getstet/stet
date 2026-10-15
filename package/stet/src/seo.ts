@@ -1,6 +1,7 @@
 /**
  * The phase-1 SEO rules: nine checks over the descriptor and the committed
- * snapshot, one severity table, zero I/O. Every value the rules read is
+ * snapshot, one severity table for those and the five copy-shaped
+ * accessibility rules the CLI reads from the documents, zero I/O. Every value the rules read is
  * resolved through the package's one resolution path with no store rows, so the
  * check sees the same text production serves — and so it runs on a fork PR with
  * no network, no database and every secret unset.
@@ -26,8 +27,13 @@ export type SeoRule =
   | 'canonical-noindex'
   | 'visible-content'
   | 'missing-alt'
+  | 'missing-label'
+  | 'missing-name'
+  | 'missing-lang'
   | 'anchor-text'
-  | 'machine-field';
+  | 'machine-field'
+  | 'empty-heading'
+  | 'redundant-alt';
 
 export interface SeoFinding {
   rule: SeoRule;
@@ -41,7 +47,7 @@ export interface SeoFinding {
 }
 
 /**
- * The one severity table (§13.1c): seven errors, two warns. A project may flip a
+ * The one severity table (§13.1c): ten errors, four warnings. A project may flip a
  * rule either way through `stet.config.json`'s `seoCheck` block; there is no
  * third state, because a warn already never gates and an `off` would only add
  * surface. It doubles as the runtime rule list — `id in SEO_SEVERITY` is what
@@ -55,8 +61,13 @@ export const SEO_SEVERITY: Record<SeoRule, 'error' | 'warning'> = {
   'canonical-noindex': 'error',
   'visible-content': 'error',
   'missing-alt': 'error',
+  'missing-label': 'error',
+  'missing-name': 'error',
+  'missing-lang': 'error',
   'anchor-text': 'warning',
   'machine-field': 'warning',
+  'empty-heading': 'warning',
+  'redundant-alt': 'warning',
 };
 
 /**
@@ -97,15 +108,25 @@ export function headLimitsFor(roles: Iterable<string>): Limits | undefined {
  * The generic-anchor list, shipped inside the package because the check is
  * offline. Pack-configurable lists arrive with `add-packs`; until then this is
  * the list, and it is matched against a WHOLE value rather than searched for
- * inside one — see `anchorText`.
+ * inside one — see `anchorText`. It holds Lighthouse 13.5's English
+ * `link-text` block list beside stet's own, so a label Lighthouse fails is an
+ * anchor-text warn first.
  */
 const GENERIC_ANCHORS: readonly string[] = [
   'click here',
+  'click this',
+  'go',
   'here',
+  'information',
   'learn more',
   'read more',
   'more',
+  'more info',
+  'more information',
+  'right here',
   'see more',
+  'start',
+  'this',
   'this page',
   'link',
   'check it out',

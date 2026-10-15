@@ -564,7 +564,7 @@ describe('pages scan --apply', () => {
     // The vacuous pass FIRST, so "the warn is gone" below is a fact about this
     // host rather than about a warn that never had a reason to fire.
     expect(await host.run('seo', 'check')).toBe(0);
-    expect(host.stderr()).toContain('no pages declared — the SEO rules have nothing to check');
+    expect(host.stderr()).toContain('no pages declared — the page rules have nothing to check');
     expect(host.stdout()).toContain('seo: 0 pages checked');
     const vacuous = host.err.length;
 
@@ -972,10 +972,11 @@ describe('pages scan — the html arm', () => {
     expect(findings.find((f) => f.kind === 'over-length')?.level).toBe('warn');
 
     // A host declaring only `home` — whose two fields both bind — exits 0 under
-    // the same config: the over-length finding is the only one left, and it warns.
+    // the same config: the over-length finding is the only page finding left, and
+    // it warns. The fixture's unlabelled textarea is a document finding, warned too.
     const only = await makeHtmlHost({
       register: true,
-      config: { seoCheck: { 'over-length': 'warn' } },
+      config: { seoCheck: { 'over-length': 'warn', 'missing-label': 'warn' } },
     });
     await only.run('pages', 'scan', '--apply', 'home');
     only.out.length = 0;

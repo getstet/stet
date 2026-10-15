@@ -878,6 +878,21 @@ describe('runRegister — the static-HTML host', () => {
   });
 });
 
+describe('runRegister — a decorative image takes no key (P8, F68)', () => {
+  it('adopts no empty alt on a JSX component, and a second walk proposes nothing', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<div><img src="/hero.png" alt="" /><h1>Adopt the heading</h1></div>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(Object.keys(descriptor(dir).keys)).toEqual(['home_page_headline']);
+    expect(Object.values(defaults(dir).default)).not.toContain('');
+    expect(read(dir, 'app/page.tsx')).toContain('alt=""');
+    const again = io(dir);
+    expect(await runRegister(['--from', 'scan'], again)).toBe(0);
+    expect(again.out.at(-1)).toBe('register: nothing to adopt');
+  });
+});
+
 describe('runRegister — the JavaScript branch writes through the same batch', () => {
   it('rolls back the descriptor when a codegen write fails mid-batch', async () => {
     const dir = project();

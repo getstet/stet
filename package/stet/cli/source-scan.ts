@@ -917,6 +917,26 @@ export function scriptKindFor(ts: typeof import('typescript'), file: string): TS
 }
 
 /**
+ * A root layout's one `<html>` JSX element — opening or self-closing, its tag
+ * name the identifier `html` — or null for none or several. `seo check`'s
+ * shell `lang` and `stet audit lighthouse --fix`'s `lang` edit both read it.
+ */
+export function rootHtmlJsx(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+): TS.JsxOpeningElement | TS.JsxSelfClosingElement | null {
+  const hits: Array<TS.JsxOpeningElement | TS.JsxSelfClosingElement> = [];
+  const visit = (node: TS.Node): void => {
+    if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) && ts.isIdentifier(node.tagName) && node.tagName.text === 'html') {
+      hits.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return hits.length === 1 ? (hits[0] as TS.JsxOpeningElement | TS.JsxSelfClosingElement) : null;
+}
+
+/**
  * One managed-surface file, walked once for everything its three consumers need:
  * scan's/register's unkeyed literals, eject's already-adopted accessor calls,
  * and the orphan-import/decl spans eject drops. A file the compiler cannot parse
@@ -1345,7 +1365,8 @@ export async function scanSource(
       claimed.push({ pos: node.getStart(sf), end: node.end });
       const name = node.name.getText(sf);
       const init = node.initializer;
-      if (COPY_ATTRS.has(name) && init && ts.isStringLiteral(init) && !insideI18nElement(ts, sf, node)) {
+      // An empty `alt` declares a decorative image: no copy, no key.
+      if (COPY_ATTRS.has(name) && init && ts.isStringLiteral(init) && !(name === 'alt' && init.text === '') && !insideI18nElement(ts, sf, node)) {
         const element = elementOfAttr(node);
         if (!element || !hasJsxIgnoreBefore(ts, sf, element)) {
           // Decode entities so the seeded default matches what render shows —

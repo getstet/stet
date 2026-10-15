@@ -46,6 +46,7 @@ const TAG_KINDS: Record<string, string> = {
   p: 'paragraph',
   a: 'link text',
   button: 'button text',
+  label: 'label',
   li: 'list item',
   title: 'page title',
   // A `<details>`'s question: its answer beside it is the paragraph (P15).

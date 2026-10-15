@@ -438,7 +438,7 @@ describe('seo check', () => {
       { hero_headline: 'Never miss a post again.' },
     );
     expect(await host.run('seo', 'check')).toBe(0);
-    expect(host.stderr()).toContain('no pages declared — the SEO rules have nothing to check');
+    expect(host.stderr()).toContain('no pages declared — the page rules have nothing to check');
     expect(host.stderr()).toContain('run stet pages scan to declare them');
     expect(host.stdout()).toContain('seo: 0 pages checked');
   });
@@ -3093,6 +3093,13 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
     writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
   }
   const ARMED = "hook: the pre-commit gate's runner is updated — it runs stet seo check too";
+  /** The html fixture with its textarea labelled, so the document rules have nothing to refuse. */
+  const labelled = (): Record<string, string> => ({
+    'index.html': htmlFixture('index.html').replace(
+      '<textarea name="notes">',
+      '<label for="notes">Notes about the dataset</label>\n      <textarea id="notes" name="notes">',
+    ),
+  });
 
   it('arms a listed checkout whose seo check passes, rewriting its runner, and is silent the second time', async () => {
     const host = makeHost({ config: {} });
@@ -3144,7 +3151,7 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
   });
 
   it('arms a site whose only findings are advisory over-length warns: psyon’s 63-character title', async () => {
-    const html = await makeHtmlHost({ register: true });
+    const html = await makeHtmlHost({ register: true, files: labelled() });
     expect(await html.run('pages', 'scan', '--apply')).toBe(0);
     const descriptor = JSON.parse(html.file('content/descriptor.json'));
     const title = descriptor.pages.home.seo.title as string;
@@ -3173,7 +3180,7 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
   });
 
   it('arms an html host and a snapshot-only site alike', async () => {
-    const html = await makeHtmlHost({ register: true });
+    const html = await makeHtmlHost({ register: true, files: labelled() });
     await gated(html);
     expect(await html.run('upgrade')).toBe(0);
     expect(html.out).toContain(ARMED);
@@ -3183,5 +3190,33 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
     expect(await snapshotOnly.run('upgrade')).toBe(0);
     expect(snapshotOnly.stdout()).toContain('store: snapshot-only');
     expect(snapshotOnly.out).toContain(ARMED);
+  });
+
+  it('counts the document rules: an unarmed entry with an unlabelled textarea is not armed, and says so (journey A14, C3)', async () => {
+    const html = await makeHtmlHost({ register: true });
+    await gated(html);
+    expect(await html.run('upgrade')).toBe(0);
+    expect(html.out).toContain(
+      'seo check reports 1 error; the commit gate will run stet seo check once these pass — fix them, or set seoCheck severities, then run stet hook install',
+    );
+    expect(entries(html)).toEqual([{ checkout: '', worktree: '' }]);
+  });
+
+  it('tells an armed entry what the new rules refuse, writes nothing to the gate, and says nothing where they pass (journey A14, C3)', async () => {
+    const html = await makeHtmlHost({ register: true });
+    await gated(html);
+    writeFileSync(join(html.cwd, GATE), `${JSON.stringify({ entries: [{ checkout: '', worktree: '', seo: true }] }, null, 2)}\n`);
+    writeFileSync(join(html.cwd, RUNNER), shippedRunner());
+    const gate = [html.file(GATE), html.file(RUNNER)];
+    expect(await html.run('upgrade')).toBe(0);
+    expect(html.out).toContain('seo check reports 1 error the commit gate will refuse — fix them, or set seoCheck severities');
+    expect([html.file(GATE), html.file(RUNNER)]).toEqual(gate);
+
+    const passing = await makeHtmlHost({ register: true, files: labelled() });
+    await gated(passing);
+    writeFileSync(join(passing.cwd, GATE), `${JSON.stringify({ entries: [{ checkout: '', worktree: '', seo: true }] }, null, 2)}\n`);
+    writeFileSync(join(passing.cwd, RUNNER), shippedRunner());
+    expect(await passing.run('upgrade')).toBe(0);
+    expect(passing.stdout()).not.toMatch(/hook|seo check/);
   });
 });

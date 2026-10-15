@@ -1332,7 +1332,7 @@ describe('seo', () => {
       JSON.stringify({ default: { hero_headline: 'Never miss a post again.' } }, null, 2),
     );
     expect(await noPages.run('seo', 'check')).toBe(0);
-    expect(noPages.stderr()).toContain('no pages declared — the SEO rules have nothing to check');
+    expect(noPages.stderr()).toContain('no pages declared — the page rules have nothing to check');
     // The remedy is the command, named: the requirement says the warn tells the
     // host what to run, and the prefix above would pass whatever followed it.
     expect(noPages.stderr()).toContain('run stet pages scan');
@@ -1355,8 +1355,13 @@ describe('seo', () => {
       'canonical-noindex': 'error',
       'visible-content': 'error',
       'missing-alt': 'error',
+      'missing-label': 'error',
+      'missing-name': 'error',
+      'missing-lang': 'error',
       'anchor-text': 'warning',
       'machine-field': 'warning',
+      'empty-heading': 'warning',
+      'redundant-alt': 'warning',
     });
 
     // Warns are reported and do not gate.
@@ -1416,6 +1421,83 @@ describe('seo', () => {
     expect(await overBy(null)).toEqual([1, ['error']]);
     expect(await overBy(null, { seoCheck: { 'over-length': 'warn' } })).toEqual([0, ['warning']]);
     expect(await overBy({ max: 60, severity: 'hard' }, { seoCheck: { 'over-length': 'warn' } })).toEqual([1, ['error']]);
+
+    // The accessibility rules take overrides like the rest (journey C3).
+    const flippedA11y = await makeHtmlHost({
+      files: { 'index.html': '<!DOCTYPE html>\n<html>\n<head><title>T</title></head>\n<body>\n<h2></h2>\n</body>\n</html>\n' },
+      config: { seoCheck: { 'missing-lang': 'warn', 'empty-heading': 'error' } },
+    });
+    expect(await flippedA11y.run('seo', 'check')).toBe(1);
+    expect(flippedA11y.stderr()).toContain('warn: index.html: <html> has no lang');
+    expect(flippedA11y.stderr()).toContain('error: index.html:5 <h2> is empty');
+    const misnamed = makeCliHost({ config: { seoCheck: { 'missing-labels': 'warn' } } });
+    expect(await misnamed.run('seo', 'check')).toBe(1);
+    expect(misnamed.stderr()).toMatch(/seoCheck\.missing-labels is not a rule — declared rules: .*empty-heading.*missing-label, missing-lang, missing-name.*redundant-alt/);
+  });
+
+  it('Requirement: The copy-shaped accessibility rules read the documents and the keys', async () => {
+    // The fixture's unlabelled textarea is an error, gone once it is labelled (journey C3).
+    const fixture = await makeHtmlHost();
+    expect(await fixture.run('seo', 'check')).toBe(1);
+    expect(fixture.stderr()).toContain(
+      'error: index.html:50 <textarea name="notes"> has no label — give it id="notes" and write a <label for="notes">, then run stet register',
+    );
+    const labelled = await makeHtmlHost({
+      files: {
+        'index.html': htmlFixture('index.html').replace(
+          '<textarea name="notes">',
+          '<label for="notes">Notes about the dataset</label>\n      <textarea id="notes" name="notes">',
+        ),
+      },
+    });
+    expect(await labelled.run('seo', 'check')).toBe(0);
+
+    // Lighthouse 13.5's verdicts on the same page: the empty link alone is
+    // nameless, no image lacks alt, and the presentational input alone is unlabelled.
+    const shell = (body: string, lang = ' lang="en"'): string =>
+      `<!DOCTYPE html>\n<html${lang}>\n<head><title>T</title></head>\n<body>\n${body}\n</body>\n</html>\n`;
+    const verdicts = await makeHtmlHost({
+      files: {
+        'index.html': shell(
+          [
+            '<span id="lbl">Close</span>',
+            '<a href="/"><img src="logo.svg" alt="Home"></a>',
+            '<a href="/x"></a>',
+            '<button aria-labelledby="lbl"><svg></svg></button>',
+            '<a href="/home" aria-labelledby="lbl"><svg></svg></a>',
+            '<a href="/y"><svg><title>Home</title></svg></a>',
+            '<button><svg><title>Close</title></svg></button>',
+            '<img src="chart.png" aria-labelledby="lbl">',
+            '<input type="search" name="q" placeholder="Search the site">',
+            '<input type="text" name="ghost" role="presentation">',
+            '<input type="submit">',
+            '<img src="rule.svg" alt="">',
+          ].join('\n'),
+        ),
+      },
+    });
+    expect(await verdicts.run('seo', 'check', '--json')).toBe(1);
+    const found = verdicts.json<{ seo: Array<{ rule: string; message: string }> }>().seo;
+    expect(found.map((f) => f.rule).sort()).toEqual(['missing-label', 'missing-name']);
+    expect(found.find((f) => f.rule === 'missing-name')?.message).toContain('<a href="/x">');
+    expect(found.find((f) => f.rule === 'missing-label')?.message).toContain('name="ghost"');
+
+    // Lighthouse's bare subtags pass; a shortened code does not.
+    const und = await makeHtmlHost({ files: { 'index.html': shell('<p>x</p>', ' lang="und"') } });
+    expect(await und.run('seo', 'check')).toBe(0);
+    const eng = await makeHtmlHost({ files: { 'index.html': shell('<p>x</p>', ' lang="eng"') } });
+    expect(await eng.run('seo', 'check')).toBe(1);
+    expect(eng.stderr()).toContain('error: index.html: lang="eng" is not a language tag');
+
+    // An emptied button key is red (journey B17), and alt text that says the obvious warns.
+    const keyed = await makeHtmlHost({
+      files: { 'index.html': shell('<button data-stet="home_page_button_text"></button>\n<img src="park-bench.jpg" alt="park bench" data-stet-alt="home_page_image_alt">') },
+      keys: { home_page_button_text: { shape: 'text', target: 'web' }, home_page_image_alt: { shape: 'text', target: 'web' } },
+      defaults: { home_page_button_text: '', home_page_image_alt: 'park bench' },
+    });
+    expect(await keyed.run('seo', 'check')).toBe(1);
+    expect(keyed.stderr()).toContain('error: home_page_button_text is empty, and it names a button');
+    expect(keyed.stderr()).toContain('warn: home_page_image_alt: "park bench" is the file name');
   });
 
   it('Requirement: The completeness rules', async () => {
@@ -1540,6 +1622,15 @@ describe('seo', () => {
     // Whole values only: entry 1 IS a label, entry 2 merely contains the phrase.
     expect(anchors).toMatchObject([{ severity: 'warning', key: 'footer_links[1]' }]);
 
+    // Lighthouse 13.5's English link-text words are stet's too, so a label
+    // Lighthouse fails is an anchor-text warn offline first.
+    const lighthouse = broken();
+    lighthouse.s['default']!['footer_links'] = ['Go', 'More information'];
+    expect(of(seoCheck(lighthouse.d, lighthouse.s), 'anchor-text')).toMatchObject([
+      { severity: 'warning', key: 'footer_links[0]' },
+      { severity: 'warning', key: 'footer_links[1]' },
+    ]);
+
     // §13.1c's rule is anchors on pages, so a non-web target is outside it.
     const emailed = broken();
     emailed.s['default']!['welcome__subject'] = 'Click here';
@@ -1593,10 +1684,12 @@ describe('seo', () => {
     host.write('app/docs/page.tsx', 'export default function Docs() { return null; }\n');
     host.write('app/blog/[slug]/page.tsx', 'export default function Post() { return null; }\n');
     host.write('app/api/health/route.ts', 'export function GET() { return null; }\n');
+    // The root layout says its language, so missing-lang has nothing to say here.
+    host.write('app/layout.tsx', host.file('app/layout.tsx').replace('<html>', '<html lang="en">'));
 
     // Before anything is declared, the rules have nothing to check and say so.
     expect(await host.run('seo', 'check')).toBe(0);
-    expect(host.stderr()).toContain('no pages declared — the SEO rules have nothing to check');
+    expect(host.stderr()).toContain('no pages declared — the page rules have nothing to check');
 
     const before = {
       descriptor: host.file('content/descriptor.json'),

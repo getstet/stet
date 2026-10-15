@@ -21,7 +21,6 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { generateRegistry, generateResolvedModule } from '../src/codegen.js';
-import { seoCheck } from '../src/seo.js';
 import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { planWrite, writePlanned, writeText } from './artifacts.js';
 import {
@@ -31,7 +30,6 @@ import {
   defaultStoreBlock,
   isHtmlHost,
   loadConfig,
-  seoOverrides,
   type StetConfig,
   type StoreAdapterName,
   type StoreBlock,
@@ -42,6 +40,7 @@ import type { CliIo } from './main.js';
 import { applyMigrationSql, readProjectMeta, stampDescriptorVersion } from './meta.js';
 import { loadProject, type LoadedProject } from './project.js';
 import { CliError, plural, Report, UsageError } from './report.js';
+import { seoFindings } from './seo.js';
 import { contactsConfig, isStoreBacked } from './store.js';
 import { seed } from './write.js';
 
@@ -86,7 +85,7 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
       }
     }
     regenerate(io, project, report, dryRun);
-    if (!dryRun) armGate(io, project, report);
+    if (!dryRun) await armGate(io, project, report);
   } catch (error) {
     // A usage mistake keeps its exit code and its silence: it is raised before
     // any work, so there is no partial report worth printing over it.
@@ -105,15 +104,18 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
 
 /**
  * The commit gate's SEO run, armed only where `seo check` passes today — the
- * count is the in-process `seoCheck`, the function `stet seo check` runs, so
- * nothing is spawned.
+ * count is the in-process `seoFindings`, every rule `stet seo check` runs, so
+ * nothing is spawned. An entry already armed is told what the rules it runs
+ * now refuse.
  */
-function armGate(io: CliIo, project: LoadedProject, report: Report): void {
-  const errors = seoCheck(project.descriptor, project.snapshot, seoOverrides(project.config)).filter(
+async function armGate(io: CliIo, project: LoadedProject, report: Report): Promise<void> {
+  const errors = (await seoFindings(io.cwd, project.config, project.descriptor, project.snapshot)).filter(
     (finding) => finding.severity === 'error',
   ).length;
   const answer = armGateSeo(io.cwd, errors);
-  if (answer === 'armed') report.line("hook: the pre-commit gate's runner is updated — it runs stet seo check too");
+  if (answer === 'current' && errors > 0) {
+    report.line(`seo check reports ${plural(errors, 'error')} the commit gate will refuse — fix them, or set seoCheck severities`);
+  } else if (answer === 'armed') report.line("hook: the pre-commit gate's runner is updated — it runs stet seo check too");
   else if (answer === 'not-listed') report.line('run stet hook install to add the SEO check to the commit gate');
   else if (answer === 'failing') {
     report.line(

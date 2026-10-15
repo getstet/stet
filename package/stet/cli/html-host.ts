@@ -708,6 +708,11 @@ export function valueOf(el: Element): { value: string; plain: string; tags: numb
   return { value, plain: plainOf(value), tags: el.descendants.length };
 }
 
+/** An element's attribute, its raw value as the source spells it, or undefined where the tag carries none. */
+export function attrOf(el: Element, name: string): string | undefined {
+  return el.attrs.find((a) => a.name === name)?.value;
+}
+
 /** An attribute's value as the key would carry it. */
 function attrValueOf(attr: HtmlAttr): string {
   return textOf(attr.value);
@@ -906,7 +911,7 @@ function locate(document: Document): Located {
 
 /** The `name`/`property` a `<meta>`'s `content` is copy under, or null. */
 export function metaCopyName(el: Element): string | null {
-  return metaCopyNameOf(el.tag, (name) => el.attrs.find((a) => a.name === name)?.value);
+  return metaCopyNameOf(el.tag, (name) => attrOf(el, name));
 }
 
 /** Whether `<attr>` on this element is one stet manages — the refused set is everything else. */
