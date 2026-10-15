@@ -20,7 +20,7 @@ import { dirname, join } from 'node:path';
 
 import type { MemoryStore } from '../adapters/store-memory.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import { generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import { loadDescriptor, loadSnapshot, type StoreAdapter } from '../src/index.js';
 
 const FIXTURE = new URL('./fixtures/mini-project/', import.meta.url);
@@ -73,6 +73,7 @@ export function makeCliHost(opts: CliHostOptions = {}): CliHost {
   writeFileSync(join(cwd, 'content/keys.ts'), registry.keysTs);
   writeFileSync(join(cwd, 'content/stet-env.d.ts'), registry.dts);
   writeFileSync(join(cwd, 'content/defaults.ts'), generateDefaultsModule(snapshot));
+  writeFileSync(join(cwd, 'content/resolved.ts'), generateResolvedModule(descriptor, snapshot));
 
   const config = opts.config === undefined ? { store: { adapter: 'memory' } } : opts.config;
   if (config !== null) writeFileSync(join(cwd, 'stet.config.json'), JSON.stringify(config, null, 2));

@@ -3173,12 +3173,26 @@ describe('cli', () => {
     expect(loaded.apiTokenEnv).toBe('DASH_API_TOKEN');
     // The Astro shape: `router` takes a third value and `rootLayout` reads back
     // ABSENT — no `app/layout.tsx` default is filled in for a host that has no
-    // root React layout — while a `router` outside the three names all three.
+    // root React layout — the Vite shape likewise unless one is written, while
+    // a `router` outside the four names all four.
     const astro = makeCliHost({ config: { router: 'astro' } });
     expect(loadConfig(astro.cwd).router).toBe('astro');
     expect(loadConfig(astro.cwd).rootLayout).toBeUndefined();
+    const vite = makeCliHost({ config: { router: 'vite' } });
+    expect(loadConfig(vite.cwd).router).toBe('vite');
+    expect(loadConfig(vite.cwd).rootLayout).toBeUndefined();
     const nuxt = makeCliHost({ config: { router: 'nuxt' } });
-    expect(() => loadConfig(nuxt.cwd)).toThrow(/router must be "app", "pages" or "astro"/);
+    expect(() => loadConfig(nuxt.cwd)).toThrow(/router must be "app", "pages", "astro" or "vite"/);
+    // The site's language is a tag Lighthouse's html-lang-valid accepts, and
+    // `init` never writes one.
+    expect(loadConfig(makeCliHost({ config: { language: 'en-GB' } }).cwd).language).toBe('en-GB');
+    expect(loadConfig(makeCliHost({ config: { language: 'und' } }).cwd).language).toBe('und');
+    expect(loadConfig(bare.cwd).language).toBeUndefined();
+    for (const refused of ['english', 'eng']) {
+      expect(() => loadConfig(makeCliHost({ config: { language: refused } }).cwd)).toThrow(
+        `stet.config.json: language must be a BCP 47 language tag such as en or en-GB — got "${refused}"`,
+      );
+    }
     expect(loaded.managedSurfaces).toEqual(['app/**/*.tsx', 'lib/email/**/*.ts']);
     expect(loaded.emailSurfaces).toEqual(['lib/email/**/*.ts']);
     // A declared copy-module list survives the round trip untouched…
@@ -3872,7 +3886,7 @@ describe('cli', () => {
       mkdirSync(join(host.cwd, rel, '..'), { recursive: true });
       writeFileSync(join(host.cwd, rel), text, 'utf8');
     };
-    const REPO = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts'];
+    const REPO = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts', 'content/resolved.ts'];
     const bytes = (host: { cwd: string }, rels: string[]) => rels.map((rel) => readFileSync(join(host.cwd, rel)));
 
     // A static-HTML site renames three keys (journey G2).
@@ -6860,7 +6874,7 @@ describe('adoption', () => {
     // and an emitter that dropped either would read as complete here.
     expect(wired.stdout()).toContain(
       'stays (no stet imports): stet.config.json, content/descriptor.json, content/defaults.json, ' +
-        'content/keys.ts, stet/migrations/',
+        'content/keys.ts, content/resolved.ts, stet/migrations/',
     );
     expect(wired.stdout()).toContain('drop the stet dependency from package.json');
     expect(wired.stdout()).toContain('still imports stet: lib/content.ts');

@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 
+import { readBundle, resolveAll } from './bundle.js';
 import type { Snapshot } from './snapshot.js';
 import type { Descriptor, Shape } from './types.js';
 
 /**
- * Descriptor → generated artifacts — the registry, the ambient types and the
- * defaults module — the source hash they carry, and the generated-file currency
+ * Descriptor → generated artifacts — the registry, the ambient types, the
+ * defaults module and the resolved module — the source hash they carry, and the generated-file currency
  * check over that hash. The CLI is the one generator and reaches this module by
  * path; it sits outside the root entry's closure, which is what keeps the
  * hash's crypto builtin out of a browser bundle.
@@ -148,6 +149,22 @@ export function generateDefaultsModule(s: Snapshot): string {
     generatedHeader('defaults.json', sourceHash(s)) +
     '\n' +
     `export const DEFAULTS = ${JSON.stringify(sorted, null, 2)} as const;\n`
+  );
+}
+
+/**
+ * `resolved.ts` from the descriptor and the snapshot: the default locale's
+ * resolved map, derivations applied — what a client mount hands its provider
+ * without carrying the resolver into a browser bundle. Keys sort.
+ */
+export function generateResolvedModule(d: Descriptor, s: Snapshot): string {
+  const { resolved } = resolveAll(d, readBundle(s));
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(resolved).sort()) sorted[key] = resolved[key];
+  return (
+    generatedHeader('descriptor.json + defaults.json', sourceHash({ descriptor: d, snapshot: s })) +
+    '\n' +
+    `export const RESOLVED = ${JSON.stringify(sorted, null, 2)} as const;\n`
   );
 }
 

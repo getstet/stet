@@ -284,6 +284,48 @@ describe('runEject --write — snapshot-only', () => {
     expect(compiled.ok).toBe(true);
   });
 
+  it('takes a hand-edited mount\'s RESOLVED import with the unwrap, and the stays line names the resolved module (D8)', async () => {
+    const dir = host();
+    write(
+      dir,
+      'app/layout.tsx',
+      `import type { ReactNode } from 'react';
+import { CopyProvider } from '@getstet/stet/react';
+import type { Descriptor } from '@getstet/stet';
+import descriptorJson from '../content/descriptor.json';
+import { RESOLVED } from '../content/resolved';
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html>
+      <body>
+        <CopyProvider
+          descriptor={descriptorJson as unknown as Descriptor}
+          resolved={RESOLVED}
+        >
+          {children}
+        </CopyProvider>
+      </body>
+    </html>
+  );
+}
+`,
+    );
+    write(dir, 'content/resolved.ts', 'export const RESOLVED = { hero: "Hello world" } as const;\n');
+    const cap = io(dir);
+    expect(await runEject(['--write'], cap)).toBe(0);
+    const layout = read(dir, 'app/layout.tsx');
+    expect(layout).not.toContain('RESOLVED');
+    expect(layout).not.toContain('CopyProvider');
+    expect(layout).not.toContain('descriptorJson');
+    expect(cap.out.find((line) => line.startsWith('stays (no stet imports):'))).toContain('content/resolved.ts');
+    // Regenerated from the written-back snapshot, beside the defaults module.
+    expect(read(dir, 'content/resolved.ts')).toContain('export const RESOLVED = {');
+    expect(read(dir, 'content/resolved.ts')).not.toMatch(/^import /m);
+    const compiled = tscClean(dir);
+    expect(compiled.output).toBe('');
+  });
+
   it('exports no history on a snapshot-only project', async () => {
     const dir = host();
     await runEject(['--write'], io(dir));

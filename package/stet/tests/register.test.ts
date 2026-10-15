@@ -142,6 +142,13 @@ describe('runRegister — descriptor and default', () => {
     expect(edited).toContain("import { copy } from '@/lib/content'");
     expect(edited).toContain("{copy('home_page_headline')}");
   });
+  it('--write writes content/resolved.ts in its batch, the new key resolved (D8)', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Resolved here</h1>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'content/resolved.ts')).toContain('"home_page_headline": "Resolved here"');
+  });
 });
 
 describe('runRegister — batching and collisions', () => {

@@ -25,7 +25,7 @@ import { basename, dirname, join, resolve as resolvePath, sep } from 'node:path'
 
 import type * as TS from 'typescript';
 
-import { generateDefaultsModule } from '../src/codegen.js';
+import { generateDefaultsModule, generateResolvedModule } from '../src/codegen.js';
 import { escapeRegExp } from '../src/seo.js';
 import { activeRow, resolve } from '../src/resolve.js';
 import type { StoreRow } from '../src/resolve.js';
@@ -95,6 +95,7 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       config.codegen.dts,
       config.codegen.registry,
       config.codegen.defaults,
+      config.codegen.resolved,
       ...(config.mountRoute === undefined ? [] : [config.mountRoute]),
     ]);
     // Every surface file's text, read ONCE: the probe below and the un-rewrite
@@ -293,11 +294,12 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       if (write) throw refusal;
     }
 
-    // (1) The snapshot + regenerated defaults module.
+    // (1) The snapshot + regenerated defaults and resolved modules.
     report.line(`snapshot: ${Object.keys(merged[config.locales.default] ?? {}).length} default key(s) → ${config.snapshotPath}, + ${config.codegen.defaults}`);
     if (write) {
       writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
       writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged));
+      writeText(join(io.cwd, config.codegen.resolved), generateResolvedModule(descriptor, merged));
       for (const [file, out] of edited) writeText(join(io.cwd, file), out);
       // `force` because a file already gone is a completed deletion: a racing
       // remove must not throw here, after the snapshot has been written.
@@ -390,10 +392,10 @@ function copyProviderUnwrap(ts: typeof import('typescript'), source: string, fil
 }
 
 /**
- * The layout's now-orphan `descriptorJson` and `DEFAULTS` imports — the two
- * init added ONLY for the `resolveAll` call the un-rewrite drops. Left behind,
+ * The layout's now-orphan `descriptorJson`, `DEFAULTS` and `RESOLVED` imports —
+ * those a mount added ONLY to feed the provider the unwrap drops. Left behind,
  * they are unused imports (TS6133 under a host's `noUnusedLocals`), so eject
- * removes them in the same batch. Both are relative specifiers resolved against
+ * removes them in the same batch. Each is a relative specifier resolved against
  * the layout's absolute directory, so the match holds under any cwd.
  */
 function layoutOrphanImports(
@@ -401,12 +403,13 @@ function layoutOrphanImports(
   source: string,
   absFile: string,
   cwd: string,
-  config: { descriptorPath: string; codegen: { defaults: string } },
+  config: { descriptorPath: string; codegen: { defaults: string; resolved: string } },
 ): { pos: number; end: number }[] {
   const sf = ts.createSourceFile(absFile, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, absFile));
   const targets = new Set([
     normalizeNoExt(join(cwd, config.descriptorPath)),
     normalizeNoExt(join(cwd, config.codegen.defaults)),
+    normalizeNoExt(join(cwd, config.codegen.resolved)),
   ]);
   const spans: { pos: number; end: number }[] = [];
   for (const stmt of sf.statements) {
@@ -675,9 +678,9 @@ function reportContactsStay(config: StetConfig, report: Report): void {
 
 function staysList(
   cwd: string,
-  config: { descriptorPath: string; snapshotPath: string; codegen: { registry: string } },
+  config: { descriptorPath: string; snapshotPath: string; codegen: { registry: string; resolved: string } },
 ): string[] {
-  const candidates = [CONFIG_FILE, config.descriptorPath, config.snapshotPath, config.codegen.registry];
+  const candidates = [CONFIG_FILE, config.descriptorPath, config.snapshotPath, config.codegen.registry, config.codegen.resolved];
   const stays = candidates.filter((rel) => existsSync(join(cwd, rel)));
   if (existsSync(join(cwd, HOST_MIGRATIONS))) stays.push(`${HOST_MIGRATIONS.split(sep).join('/')}/`);
   return stays;

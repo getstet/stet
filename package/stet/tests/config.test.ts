@@ -16,6 +16,7 @@ import {
   defaultConfig,
   formsSecretEnvOf,
   isHtmlHost,
+  isLanguageTag,
   loadConfig,
   selectStoreBlock,
   writeConfig,
@@ -129,10 +130,10 @@ describe('stet.config.json', () => {
     );
   });
 
-  it('constrains router to the three values and scan.severity to warn|fail', () => {
+  it('constrains router to the four values and scan.severity to warn|fail', () => {
     const badRouter = tempDir();
     writeFileSync(join(badRouter, CONFIG_FILE), JSON.stringify({ router: 'nuxt' }));
-    expect(() => loadConfig(badRouter)).toThrow(/router must be "app", "pages" or "astro"/);
+    expect(() => loadConfig(badRouter)).toThrow('stet.config.json: router must be "app", "pages", "astro" or "vite" — got "nuxt"');
 
     const badScan = tempDir();
     writeFileSync(join(badScan, CONFIG_FILE), JSON.stringify({ scan: { severity: 'boom' } }));
@@ -154,6 +155,29 @@ describe('stet.config.json', () => {
     const next = tempDir();
     writeFileSync(join(next, CONFIG_FILE), JSON.stringify({ router: 'app' }));
     expect(loadConfig(next).rootLayout).toBe('app/layout.tsx');
+  });
+
+  it('reads a Vite host with no root-layout default, and keeps a declared entry (D9)', () => {
+    expect(loaded({ router: 'vite' }).router).toBe('vite');
+    expect(loaded({ router: 'vite' }).rootLayout).toBeUndefined();
+    expect(loaded({ router: 'vite', rootLayout: 'src/main.tsx' }).rootLayout).toBe('src/main.tsx');
+  });
+
+  it('reads the resolved module path beside the other codegen outputs, defaulting to content/resolved.ts (D8)', () => {
+    expect(loaded({}).codegen.resolved).toBe('content/resolved.ts');
+    expect(loaded({ codegen: { resolved: 'lib/resolved.ts' } }).codegen.resolved).toBe('lib/resolved.ts');
+  });
+
+  it('reads the site language as a tag Lighthouse accepts, and refuses any other (journey C12)', () => {
+    expect(loaded({ language: 'en-GB' }).language).toBe('en-GB');
+    expect(loaded({ language: 'und' }).language).toBe('und');
+    expect(loaded({}).language).toBeUndefined();
+    expect(() => loaded({ language: 'english' })).toThrow(
+      'stet.config.json: language must be a BCP 47 language tag such as en or en-GB — got "english"',
+    );
+    expect(() => loaded({ language: 'eng' })).toThrow('stet.config.json: language must be a BCP 47 language tag such as en or en-GB — got "eng"');
+    for (const refused of ['xx', 'eng', 'en_GB', '', 'english']) expect(isLanguageTag(refused), refused).toBe(false);
+    for (const accepted of ['en', 'en-GB', 'fil', 'haw', 'zh-Hant-TW', 'und', 'mis', 'qaa', 'iw']) expect(isLanguageTag(accepted), accepted).toBe(true);
   });
 
   /** A config file holding `source`, loaded — or the error it raises. */

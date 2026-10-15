@@ -1340,7 +1340,7 @@ describe('POST /api/site/save', () => {
       values: [{ key: 'hero_headline', value: 'A new headline' }],
     });
     expect(first.status).toBe(200);
-    expect(first.body['written']).toEqual(['content/defaults.json', 'content/defaults.ts']);
+    expect(first.body['written']).toEqual(['content/defaults.json', 'content/defaults.ts', 'content/resolved.ts']);
     // The registry and the ambient types carry the DESCRIPTOR's hash, and the
     // descriptor did not move.
     expect(first.body['unchanged']).toEqual(['content/descriptor.json', 'content/keys.ts', 'content/stet-env.d.ts']);
@@ -1920,7 +1920,7 @@ describe('POST /api/site/commit and /push', () => {
       values: [{ key: 'hero_headline', value: 'A committed headline' }],
     });
     const written = saved.body['written'] as string[];
-    expect(written).toHaveLength(2);
+    expect(written).toHaveLength(3);
 
     // An unrelated edit, sitting in the working tree while the commit runs.
     writeFileSync(join(host.cwd, 'notes.txt'), 'stray\n', 'utf8');
@@ -1934,6 +1934,7 @@ describe('POST /api/site/commit and /push', () => {
     const touched = git(host.cwd, ['show', '--stat', '--format=', 'HEAD']).out;
     expect(touched).toContain('content/defaults.json');
     expect(touched).toContain('content/defaults.ts');
+    expect(touched).toContain('content/resolved.ts');
     expect(touched).not.toContain('notes.txt');
     expect(git(host.cwd, ['status', '--porcelain']).out).toContain('?? notes.txt');
   });
@@ -2325,7 +2326,7 @@ async function twin(
     cwd: realpathSync(cwd),
     top: realpathSync(top),
     key,
-    written: kind === 'js' ? ['content/defaults.json', 'content/defaults.ts'] : ['content/defaults.json', 'index.html'],
+    written: kind === 'js' ? ['content/defaults.json', 'content/defaults.ts', 'content/resolved.ts'] : ['content/defaults.json', 'index.html'],
   };
 }
 
@@ -2485,7 +2486,7 @@ describe('the committable files', () => {
         const refused = await post(handler, `/api/site/commit${at(t)}`, { files: stale });
         expect(refused.status).toBe(400);
         expect(refused.body['error']).toBe(`${other} has nothing to commit`);
-        expect(refused.body['pending']).toEqual(['content/defaults.json']);
+        expect(refused.body['pending']).toEqual(stale.filter((rel) => rel !== other));
         expect(head(t.cwd)).toBe(before);
 
         rmSync(join(t.cwd, other));
@@ -2507,7 +2508,7 @@ describe('the committable files', () => {
         const made = await post(handler, `/api/site/commit${at(t)}`, { files: [other] });
         expect(made.status).toBe(200);
         expect(subject(t.cwd)).toBe(`stet: 1 file updated — ${other}`);
-        expect(made.body['pending']).toEqual(['content/defaults.json']);
+        expect(made.body['pending']).toEqual(t.written.filter((rel) => rel !== other));
       });
 
       it('leaves a conflicted form out, and refuses a commit while the merge runs', async () => {

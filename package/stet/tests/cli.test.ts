@@ -136,6 +136,26 @@ describe('check', () => {
     expect(ambient.stderr()).toContain('content/stet-env.d.ts: not generated — run stet upgrade');
   });
 
+  it('checks the resolved module like the defaults module, naming stet pull (journey G3)', async () => {
+    const host = makeHost({ config: {} });
+    rmSync(join(host.cwd, 'content/resolved.ts'));
+    // A 0.6.0 host: no resolved module yet is a warn, never the exit.
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).toContain('warn: content/resolved.ts: not generated — run stet pull');
+    expect(await host.run('pull')).toBe(0);
+    expect(host.stdout()).toContain('wrote content/resolved.ts');
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('generated: content/resolved.ts current');
+    // A snapshot edited by hand moves its source: stale, and the remedy closes the loop.
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as Record<string, Record<string, unknown>>;
+    snapshot['default']!['hero_headline'] = 'Edited by hand';
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('content/resolved.ts: stale — its source moved; run stet pull');
+    expect(await host.run('pull')).toBe(0);
+    expect(await host.run('check')).toBe(0);
+  });
+
   it('checks the ambient types too, so a stale key union cannot keep compiling', async () => {
     // The third generated file. Left unchecked, a key removed from the
     // descriptor stays typed here and `copy('removed_key')` goes on compiling
@@ -1452,6 +1472,20 @@ describe('contacts store selection', () => {
 
 describe('upgrade', () => {
   /** A PostgREST that has never seen migration 1: stet_meta is not there. */
+
+  it('writes the resolved module on a 0.6.0-shaped host, and a dry run names it without writing (D8)', async () => {
+    const host = makeHost({ config: {} });
+    rmSync(join(host.cwd, 'content/resolved.ts'));
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    expect(host.stdout()).toContain('would regenerate content/resolved.ts');
+    expect(host.exists('content/resolved.ts')).toBe(false);
+    expect(await host.run('upgrade')).toBe(0);
+    expect(host.stdout()).toContain('content/resolved.ts: regenerated');
+    expect(host.file('content/resolved.ts')).toContain('export const RESOLVED = {');
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('generated: content/resolved.ts current');
+  });
+
   const noMeta = fakeFetch(JSON.stringify({ code: 'PGRST205', message: 'not found' }), 404);
 
   function postgrestHost(): Host {

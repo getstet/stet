@@ -31,7 +31,7 @@
  * and blank real copy at exit 0.
  *
  * `--apply` writes one batch: the page records, their two scaffolded SEO keys,
- * the empty defaults and the regenerated codegen trio. Atomicity here is
+ * the empty defaults and the regenerated codegen files. Atomicity here is
  * correctness rather than hygiene — a page record whose keys did not land makes
  * the descriptor unloadable, and so does a key naming a page record that did
  * not, so the whole host bricks at `descriptorOf` in either direction.
@@ -976,13 +976,13 @@ function selectPages(set: PageProposalSet, names: string[]): PageProposal[] {
 
 /**
  * The selected pages written, as ONE batch: the records, their two scaffolded
- * keys, the empty defaults and the regenerated codegen trio.
+ * keys, the empty defaults and the regenerated codegen files.
  *
  * All-or-nothing because a half-landed batch BRICKS the host, both ways: a page
  * record whose seo keys are missing and a key naming a page that is not
  * declared each make `loadDescriptorWithWarnings` throw, so `descriptorOf`
  * returns null and check, seo check, register, remove, doctor and eject all
- * stop. The codegen trio rides along for two reasons at once — the new keys
+ * stop. The codegen files ride along for two reasons at once — the new keys
  * must typecheck in the host's editor without an intervening `stet upgrade`,
  * and `generateRegistry` stamps the WHOLE descriptor's source hash, so even a
  * page record alone would leave `stet check`'s currency gate red without it.

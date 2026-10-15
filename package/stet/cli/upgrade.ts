@@ -20,7 +20,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { generateRegistry } from '../src/codegen.js';
+import { generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import { seoCheck } from '../src/seo.js';
 import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { planWrite, writePlanned, writeText } from './artifacts.js';
@@ -519,7 +519,7 @@ async function stamp(io: CliIo, project: LoadedProject, report: Report): Promise
   );
 }
 
-/** The registry always regenerates: the descriptor is its only source. */
+/** The registry always regenerates: the descriptor is its only source. The resolved module rides with it, so a host from before it gains the file. */
 function regenerate(io: CliIo, project: LoadedProject, report: Report, dryRun: boolean): void {
   // There is no registry on the static-HTML host: the marked documents are what
   // that host generates, and `stet pull` is what regenerates them.
@@ -531,6 +531,7 @@ function regenerate(io: CliIo, project: LoadedProject, report: Report, dryRun: b
   const files: { path: string; text: string }[] = [
     { path: project.config.codegen.registry, text: keysTs },
     { path: project.config.codegen.dts, text: dts },
+    { path: project.config.codegen.resolved, text: generateResolvedModule(project.descriptor, project.snapshot) },
   ];
   for (const file of files) {
     const full = join(io.cwd, file.path);

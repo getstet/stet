@@ -141,11 +141,14 @@ describe('runInit — snapshot-only', () => {
       'content/keys.ts',
       'content/stet-env.d.ts',
       'content/defaults.ts',
+      'content/resolved.ts',
       'lib/content.ts',
       'stet.config.json',
     ]) {
       expect(existsSync(join(dir, f)), f).toBe(true);
     }
+    // The resolved module is one of init's codegen writes, and its own check reads it current.
+    expect(io.out).toContain('generated: content/resolved.ts current');
     // a migration was copied
     expect(existsSync(join(dir, 'stet', 'migrations'))).toBe(true);
     // no store -> no route

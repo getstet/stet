@@ -3,7 +3,7 @@
  * and store (never asks), asks only the three questions (what the site is,
  * whether it sends email, whether it collects sign-ups), and WRITES a project's
  * worth of new files: the descriptor and its snapshot (from the shipped starter
- * assets), the three codegen modules, the server read path, the migration, the
+ * assets), the codegen modules, the server read path, the migration, the
  * config, where a store exists the `createStetHandler` API-mount route, and on a
  * Next 15.1+ App Router host that collects sign-ups the forms routes.
  *
@@ -23,7 +23,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join, sep } from 'node:path';
 
-import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import { generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import { loadDescriptorWithWarnings } from '../src/descriptor.js';
 import { loadSnapshot } from '../src/snapshot.js';
 import { writeInitGuidance } from './agents.js';
@@ -132,6 +132,7 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
       plan(config.codegen.registry, keysTs),
       plan(config.codegen.dts, dts),
       plan(config.codegen.defaults, generateDefaultsModule(snapshot)),
+      plan(config.codegen.resolved, generateResolvedModule(descriptor, snapshot)),
       plan(
         config.readPath.file,
         // An Astro host takes the react-free scaffold whether or not react is

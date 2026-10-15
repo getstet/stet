@@ -661,7 +661,7 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
 }
 
 /**
- * The five repo forms, written in one all-or-nothing batch, with the batch's
+ * The repo forms, written in one all-or-nothing batch, with the batch's
  * own refusal raised under the caller's name.
  *
  * The two routes that rewrite the forms — a save and an applied removal — take
@@ -897,7 +897,7 @@ function keyMoves(
 /**
  * The forms stet writes on this site, enumerated once for the commit's accept
  * set and the pending list: the descriptor and the snapshot, then either the
- * codegen trio or — on the static-HTML host — the managed globs whose marked
+ * codegen files or — on the static-HTML host — the managed globs whose marked
  * documents count.
  */
 function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
@@ -912,6 +912,7 @@ function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
       config.codegen.registry,
       config.codegen.dts,
       config.codegen.defaults,
+      config.codegen.resolved,
     ].map(gitSpelling),
     globs: [],
   };
@@ -967,7 +968,7 @@ function canRead(path: string): boolean {
  *
  * The enumeration is `stetFormPaths`, the one `planRepoForms` itself walks, so
  * the two cannot drift: the descriptor, the snapshot, and then either the
- * marked documents or the codegen trio, each in git's spelling.
+ * marked documents or the codegen files, each in git's spelling.
  *
  * Scoped to the request's own files because the html arm PARSES what it
  * answers about, and parsing a whole checkout of documents on every commit
@@ -2209,7 +2210,7 @@ async function declarePages(req: Request, site: SiteState): Promise<Response> {
 
 /**
  * A key's removal — the terminal's own plan, and the same batch behind
- * `--write`. The plan writes nothing; `apply` writes the five repo forms in one
+ * `--write`. The plan writes nothing; `apply` writes the repo forms in one
  * go, as `stet remove --write` does.
  */
 async function removeKeys(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
