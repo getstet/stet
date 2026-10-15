@@ -839,7 +839,9 @@ describe('content-read', () => {
     // runtime, webpack has to load: one `node:` specifier in the closure is
     // where a pages-router build stops, naming Node's module and never stet.
     const generatorHalf = /(^|\/)(codegen|preview-token)\.ts$/;
-    for (const entry of ['../src/index.ts', '../react/index.ts']) {
+    // The audit's packages load only under `stet audit lighthouse`, never from a read entry.
+    const auditOnly = ['lighthouse', 'chrome-launcher', 'selfsigned', 'puppeteer-core'];
+    for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts']) {
       const closure = runtimeImportClosure(new URL(entry, import.meta.url));
       // The react closure legitimately names `react`; only builtins are the
       // property under test.
@@ -848,7 +850,16 @@ describe('content-read', () => {
         entry,
         generator: [],
       });
+      expect({ entry, audit: closure.bare.filter((spec) => auditOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
+        entry,
+        audit: [],
+      });
     }
+
+    // The server accessor's subpath carries no client code: no provider module, no `react` at all.
+    const server = runtimeImportClosure(new URL('../react/server.ts', import.meta.url));
+    expect(server.modules.filter((m) => /(^|\/)react\/provider\.tsx$/.test(m))).toEqual([]);
+    expect(server.bare.filter((spec) => spec === 'react' || spec.startsWith('react/') || spec.startsWith('react-dom'))).toEqual([]);
 
     // The walker is proven to SEE a builtin before it vouches for none: the two
     // modules that carry the crypto import are outside both closures above, and
