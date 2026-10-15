@@ -21,9 +21,7 @@
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join, sep } from 'node:path';
-
-import type * as TS from 'typescript';
+import { join, sep } from 'node:path';
 
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptorWithWarnings } from '../src/descriptor.js';
@@ -46,8 +44,16 @@ import { proposeHtml } from './html-host.js';
 import { packageRoot, migrations } from './installed.js';
 import { detectPagesRoots } from './pages.js';
 import type { CliIo } from './main.js';
+import {
+  importsCopyProvider,
+  jsHost,
+  locateWrapTarget,
+  printProviderSnippet,
+  providerEdits,
+  relImport,
+} from './provider-mount.js';
 import { plural, posixRelative, Report, UsageError } from './report.js';
-import { applyFileEdits, dominantEol, formatDiff, type Edit } from './rewrite.js';
+import { applyFileEdits, dominantEol, formatDiff } from './rewrite.js';
 import { loadTypescript, scriptKindFor } from './source-scan.js';
 import { contactsBlock } from './store.js';
 
@@ -684,14 +690,6 @@ function envExample(target: string, names: string[]): string {
   return `${current}${joint}${missing.map((name) => `${name}=`).join(eol)}${eol}`;
 }
 
-/** A `/`-normalized, `./`-prefixed specifier from one file to a target path. */
-function relImport(fromFile: string, toDiskPath: string, opts: { stripExt?: boolean } = {}): string {
-  let spec = posixRelative(dirname(fromFile), toDiskPath);
-  if (!spec.startsWith('.')) spec = `./${spec}`;
-  if (opts.stripExt) spec = spec.replace(/\.(tsx?|jsx?|json)$/, '');
-  return spec;
-}
-
 /**
  * The `createStetHandler` route, its body pinned to COMPILE: the factory from
  * `@getstet/stet/server`, the store from `@getstet/stet/store-pg` (there is no
@@ -908,134 +906,9 @@ async function mountProvider(args: {
   report.line(`${shown}: mounted CopyProvider`);
 }
 
-/** Already carries `import { CopyProvider } from '@getstet/stet/react'`? Then the mount is done. */
-function importsCopyProvider(ts: typeof import('typescript'), sf: TS.SourceFile): boolean {
-  return sf.statements.some((stmt) => {
-    if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) return false;
-    if (stmt.moduleSpecifier.text !== '@getstet/stet/react') return false;
-    const bindings = stmt.importClause?.namedBindings;
-    return (
-      bindings !== undefined &&
-      ts.isNamedImports(bindings) &&
-      bindings.elements.some((e) => e.name.text === 'CopyProvider')
-    );
-  });
-}
-
-/**
- * The node to wrap: the sole `{children}` expression in an App-Router layout, or
- * the sole `<Component … />` in a Pages `_app` (which has no `children` prop).
- * More than one candidate, or none, is ambiguous — the caller skips and prints
- * the snippet rather than guess.
- */
-function locateWrapTarget(ts: typeof import('typescript'), sf: TS.SourceFile, router: 'app' | 'pages'): TS.Node | null {
-  const hits: TS.Node[] = [];
-  const visit = (node: TS.Node): void => {
-    if (router === 'app') {
-      if (ts.isJsxExpression(node) && node.expression !== undefined && ts.isIdentifier(node.expression) && node.expression.text === 'children') {
-        hits.push(node);
-      }
-    } else if (ts.isJsxSelfClosingElement(node) && ts.isIdentifier(node.tagName) && node.tagName.text === 'Component') {
-      hits.push(node);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
-  return hits.length === 1 ? (hits[0] as TS.Node) : null;
-}
-
-/** The import block + resolved-map declaration, plus the wrap of the target node. */
-function providerEdits(
-  ts: typeof import('typescript'),
-  sf: TS.SourceFile,
-  source: string,
-  layoutFile: string,
-  target: string,
-  config: StetConfig,
-  wrap: TS.Node,
-): Edit[] {
-  const relDescriptor = relImport(layoutFile, join(target, config.descriptorPath));
-  const relDefaults = relImport(layoutFile, join(target, config.codegen.defaults), { stripExt: true });
-  // A JS layout gets no TypeScript syntax — no `type` import, no `as` cast (P1-3).
-  const js = jsHost(layoutFile);
-  const descriptorExpr = js ? 'descriptorJson' : 'descriptorJson as unknown as Descriptor';
-  // The layout's OWN line ending: a `\n` inserted into a CRLF file leaves
-  // mixed endings in a file stet did not write (P3-13, the same rule the
-  // guidance append follows).
-  const nl = dominantEol(source);
-  const block = [
-    "import { CopyProvider } from '@getstet/stet/react';",
-    js ? "import { readBundle, resolveAll } from '@getstet/stet';" : "import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';",
-    `import descriptorJson from '${relDescriptor}';`,
-    `import { DEFAULTS } from '${relDefaults}';`,
-    '',
-    `const { resolved } = resolveAll(${descriptorExpr}, readBundle(DEFAULTS));`,
-  ].join(nl);
-
-  const at = importInsertPos(ts, sf);
-  const importEdit: Edit = { pos: at, end: at, text: at === 0 ? `${block}${nl}${nl}` : `${nl}${block}${nl}` };
-
-  const inner = source.slice(wrap.getStart(sf), wrap.getEnd());
-  const wrapped = `<CopyProvider descriptor={${descriptorExpr}} resolved={resolved}>${inner}</CopyProvider>`;
-  const wrapEdit: Edit = { pos: wrap.getStart(sf), end: wrap.getEnd(), text: wrapped };
-
-  return [importEdit, wrapEdit];
-}
-
-/** After the last import (or the directive prologue), never before `'use client'`. */
-function importInsertPos(ts: typeof import('typescript'), sf: TS.SourceFile): number {
-  let pos = 0;
-  for (const stmt of sf.statements) {
-    if (ts.isImportDeclaration(stmt)) {
-      pos = stmt.getEnd();
-      continue;
-    }
-    if (
-      pos === 0 &&
-      ts.isExpressionStatement(stmt) &&
-      ts.isStringLiteral(stmt.expression)
-    ) {
-      pos = stmt.getEnd(); // a leading directive such as 'use client'
-    }
-  }
-  return pos;
-}
-
-function printProviderSnippet(
-  report: Report,
-  config: StetConfig,
-  layoutFile: string,
-  target: string,
-  router: 'app' | 'pages',
-): void {
-  const relDescriptor = relImport(layoutFile, join(target, config.descriptorPath));
-  const relDefaults = relImport(layoutFile, join(target, config.codegen.defaults), { stripExt: true });
-  const wrapee = router === 'app' ? '{children}' : '<Component {...pageProps} />';
-  const js = jsHost(layoutFile);
-  const descriptorExpr = js ? 'descriptorJson' : 'descriptorJson as unknown as Descriptor';
-  for (const line of [
-    "  import { CopyProvider } from '@getstet/stet/react';",
-    js ? "  import { readBundle, resolveAll } from '@getstet/stet';" : "  import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';",
-    `  import descriptorJson from '${relDescriptor}';`,
-    `  import { DEFAULTS } from '${relDefaults}';`,
-    '',
-    `  const { resolved } = resolveAll(${descriptorExpr}, readBundle(DEFAULTS));`,
-    '',
-    `  wrap ${wrapee} in:`,
-    `  <CopyProvider descriptor={${descriptorExpr}} resolved={resolved}>…</CopyProvider>`,
-  ]) {
-    report.line(line);
-  }
-}
-
 // --- small shared helpers --------------------------------------------------
 
 
-
-/** A `.js`/`.jsx` file — a JS host, so the scaffold must carry no TypeScript syntax (P1-3). */
-function jsHost(file: string): boolean {
-  return /\.(js|jsx)$/.test(file);
-}
 
 /** typescript if the optional peer is installed, else null — the mount degrades rather than aborting (P3-12). */
 async function loadTypescriptOrNull(): Promise<typeof import('typescript') | null> {

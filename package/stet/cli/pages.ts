@@ -778,6 +778,13 @@ export function fileRoute(rel: string): string {
   return `/${segments.join('/')}`;
 }
 
+/** A document's path as the static arm serves it: a folder's index at the folder, anything else at itself. */
+export function servedRoute(file: string): string {
+  if (file === 'index.html') return '/';
+  if (file.endsWith('/index.html')) return `/${file.slice(0, -'index.html'.length)}`;
+  return `/${file}`;
+}
+
 function isDynamic(route: string): boolean {
   return route.split('/').some((segment) => DYNAMIC_SEGMENT.test(segment));
 }

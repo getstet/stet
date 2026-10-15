@@ -396,7 +396,7 @@ function canonicalNoindex(
  * `max-snippet`, …) is naturally a list, and a string-only test would silently
  * never fire on the shape the field usually takes.
  */
-function noindexes(d: Descriptor, s: Snapshot, def: PageDef, locale: string): boolean {
+export function noindexes(d: Descriptor, s: Snapshot, def: PageDef, locale: string): boolean {
   const key = def.seo?.robots;
   if (key === undefined) return false;
   const value = resolvedValue(d, s, key, locale);

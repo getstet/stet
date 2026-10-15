@@ -781,7 +781,7 @@ function holdsBlankedSpan(document: Document, el: Element): boolean {
 }
 
 /** Whether the element sits over markup the tokenizer could not pair. */
-function isFaulted(document: Document, el: Element): boolean {
+export function isFaulted(document: Document, el: Element): boolean {
   return document.faults.some((f) => el.openStart <= f.offset && f.offset < el.closeEnd);
 }
 

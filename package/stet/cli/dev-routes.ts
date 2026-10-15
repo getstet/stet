@@ -17,8 +17,8 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { closeSync, openSync, readFileSync, realpathSync, statSync, utimesSync } from 'node:fs';
-import { join, posix, resolve as resolvePath, sep } from 'node:path';
+import { closeSync, openSync, readFileSync, utimesSync } from 'node:fs';
+import { join, posix } from 'node:path';
 
 import { json, readJson } from '../server/http.js';
 import { bearerMatches, createStetHandler } from '../server/mount.js';
@@ -53,13 +53,14 @@ import {
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
 import { runCli, type CliIo } from './main.js';
-import { applyPages, fileRoute, proposeForHost } from './pages.js';
+import { applyPages, fileRoute, proposeForHost, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { blankNonMarkup, dialectOf, matchGlob, type Dialect } from './source-scan.js';
+import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
 import { validateValue } from './validate.js';
@@ -79,7 +80,7 @@ import {
 } from './workspace.js';
 import { osUser } from './write.js';
 import { packageRoot, packageVersion } from './installed.js';
-import { gone } from './liveness.js';
+import { answers, endGroup } from './liveness.js';
 import { injectAgent, startPreviewProxy, type PreviewProxy } from './preview-proxy.js';
 
 /** A dev-server child the dashboard started: Start creates it, and the context holds it until Stop, the site's removal or the server's close ends it. */
@@ -1571,21 +1572,10 @@ async function staticRoute(ctx: DevContext, req: Request, url: URL): Promise<Res
     if (site.state !== 'ready' || site.host !== 'html') return json({ error: 'not found' }, 404);
     if (req.method !== 'GET' && req.method !== 'HEAD') return json({ error: 'not found' }, 404);
 
-    let parts: string[];
-    try {
-      parts = url.pathname.split('/').filter(Boolean).slice(3).map(decodeURIComponent);
-    } catch {
-      // A malformed percent-escape is a path this server does not have, the
-      // same as every other one it cannot resolve.
-      return json({ error: 'not found' }, 404);
-    }
-    // A checkout holds more than its documents. A dot-leading segment is the
-    // whole `.env`/`.git` family and `node_modules` is the other bulk of it;
-    // neither is ever a page, and the route carries no Bearer.
-    if (parts.some((part) => part.startsWith('.') || part === 'node_modules')) {
-      return json({ error: 'not found' }, 404);
-    }
-    const file = insideCheckout(site.path, resolvePath(site.path, ...parts));
+    // The site's own path, its segments still escaped: `servableFile` decodes
+    // each once, refuses the `.env`/`.git` family and `node_modules`, and
+    // contains the rest — the route carries no Bearer.
+    const file = servableFile(site.path, '/' + url.pathname.split('/').filter(Boolean).slice(3).join('/'));
     if (file === null) return json({ error: 'not found' }, 404);
 
     // A document gains the preview agent's tag as it is served; the file on
@@ -1609,95 +1599,16 @@ async function staticRoute(ctx: DevContext, req: Request, url: URL): Promise<Res
   });
 }
 
-/**
- * A path inside the checkout that names a readable file, or null.
- *
- * The containment test runs on the REAL path, so `..`, an absolute segment and
- * a symlink pointing out of the checkout are all one refusal. A directory
- * serves its `index.html` and nothing else — there is no listing.
- */
-export function insideCheckout(root: string, target: string): string | null {
-  let real: string;
-  let realRoot: string;
-  try {
-    realRoot = realpathSync(root);
-    real = realpathSync(statSync(target).isDirectory() ? join(target, 'index.html') : target);
-  } catch {
-    return null;
-  }
-  if (real !== realRoot && !real.startsWith(realRoot + sep)) return null;
-  try {
-    return statSync(real).isFile() ? real : null;
-  } catch {
-    return null;
-  }
-}
-
-/** The types a static site is served as. Anything else is bytes. */
-const CONTENT_TYPES: Record<string, string> = {
-  html: 'text/html; charset=utf-8',
-  css: 'text/css; charset=utf-8',
-  js: 'text/javascript; charset=utf-8',
-  mjs: 'text/javascript; charset=utf-8',
-  json: 'application/json',
-  webmanifest: 'application/manifest+json',
-  svg: 'image/svg+xml',
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  gif: 'image/gif',
-  webp: 'image/webp',
-  avif: 'image/avif',
-  ico: 'image/x-icon',
-  woff: 'font/woff',
-  woff2: 'font/woff2',
-  txt: 'text/plain; charset=utf-8',
-  xml: 'application/xml',
-  pdf: 'application/pdf',
-  mp4: 'video/mp4',
-  webm: 'video/webm',
-  map: 'application/json',
-};
-
-function contentTypeOf(file: string): string {
-  const dot = file.lastIndexOf('.');
-  const extension = dot === -1 ? '' : file.slice(dot + 1).toLowerCase();
-  return CONTENT_TYPES[extension] ?? 'application/octet-stream';
-}
-
 /** How long the preview probe waits before it answers down. */
 const PROBE_MS = 1_500;
 
 /**
- * Whether the site's dev server answers, under a short deadline.
- *
- * The fetch's own abort signal is RACED against the route's own timer: an
- * implementation that ignores the signal — a fake among them — must still
- * settle the route. Any response at all is up; only a throw or the deadline is
- * down, because a dev server answering 404 on the selected route is still a
- * dev server.
+ * Whether the site's dev server answers, under a short deadline. Any response
+ * at all is up, because a dev server answering 404 on the selected route is
+ * still a dev server.
  */
 async function probe(ctx: DevContext, target: string): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(false), PROBE_MS);
-  });
-  try {
-    let answered: Promise<boolean>;
-    try {
-      answered = Promise.resolve(
-        ctx.fetchImpl(target, { method: 'HEAD', signal: AbortSignal.timeout(PROBE_MS), redirect: 'manual' }),
-      ).then(
-        () => true,
-        () => false,
-      );
-    } catch {
-      return false;
-    }
-    return await Promise.race([answered, deadline]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
+  return answers(ctx.fetchImpl, target, PROBE_MS);
 }
 
 /**
@@ -1999,18 +1910,11 @@ function elementAt(
   return {};
 }
 
-/** A document's path as the static arm serves it: a folder's index at the folder, anything else at itself. */
-function servedRoute(file: string): string {
-  if (file === 'index.html') return '/';
-  if (file.endsWith('/index.html')) return `/${file.slice(0, -'index.html'.length)}`;
-  return `/${file}`;
-}
-
 /** A route that names a scheme rather than a path — `https:`, `javascript:`, `file:`. */
 const ABSOLUTE_ROUTE = /^[a-z][a-z0-9+.-]*:/i;
 
-/** How much of a child's output is kept for the log pane. */
-const LOG_LINES = 200;
+/** How much of a child's output is kept for the log pane, and for the audit's preview child. */
+export const LOG_LINES = 200;
 
 /** A child's state as the page reads it. */
 function childReply(child: DevChild): Record<string, unknown> {
@@ -2215,22 +2119,7 @@ function runStop(command: string, cwd: string, ms: number): Promise<void> {
 
 /** Whether the group was there to end. */
 async function endChild(child: DevChild): Promise<boolean> {
-  if (child.pid === 0) return false;
-  try {
-    process.kill(-child.pid, 'SIGTERM');
-  } catch {
-    return false;
-  }
-  if (await gone(-child.pid, 2_000)) return true;
-  try {
-    process.kill(-child.pid, 'SIGKILL');
-  } catch {
-    /* already gone */
-  }
-  // SIGKILL is delivered asynchronously: without this the caller can answer
-  // "stopped" while the port is still held.
-  await gone(-child.pid, 2_000);
-  return true;
+  return endGroup(child.pid);
 }
 
 /**
