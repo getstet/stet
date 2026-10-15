@@ -55,7 +55,9 @@ export function fakeLighthouse(byPath: Record<string, LighthouseResult | ((n: nu
           if (answer === undefined) throw new Error(`fake lighthouse: no result for ${path}`);
           const n = seen.get(path) ?? 0;
           seen.set(path, n + 1);
-          const lhr = typeof answer === 'function' ? answer(n) : structuredClone(answer);
+          const saved = typeof answer === 'function' ? answer(n) : answer;
+          // The saved origin becomes the run's, so the page's own requests stay first-party.
+          const lhr = JSON.parse(JSON.stringify(saved).replaceAll('https://127.0.0.1:1', new URL(url).origin)) as LighthouseResult;
           return { ...lhr, finalDisplayedUrl: url };
         },
         close: async () => {

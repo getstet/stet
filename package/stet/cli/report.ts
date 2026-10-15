@@ -39,7 +39,8 @@ export type CliFindingKind =
   | 'scan'
   | 'email'
   | 'pages'
-  | 'contacts';
+  | 'contacts'
+  | 'lighthouse';
 
 /** Two levels only: one fails the command, the other reports and does not. */
 export type CliLevel = 'error' | 'warn';

@@ -729,7 +729,7 @@ export function pageOfFile(
   cwd: string,
   file: string,
   pages: Record<string, PageDef> | undefined,
-  options: { html?: boolean } = {},
+  options: { html?: boolean; declaredOnly?: boolean } = {},
 ): string | undefined {
   let route: string | undefined;
   for (const root of detectPagesRoots(cwd, options)) {
@@ -756,6 +756,8 @@ export function pageOfFile(
     const page = (pages ?? {})[name];
     if (page !== undefined && typeof page.route === 'string' && normalizeRoute(page.route) === at) return name;
   }
+  // `declaredOnly` answers a declared page or nothing: the audit maps one document to one page.
+  if (options.declaredOnly === true) return undefined;
   return route === '/' ? 'home' : (normalize(route) ?? undefined);
 }
 

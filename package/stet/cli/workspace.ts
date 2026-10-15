@@ -37,6 +37,8 @@ export interface WorkspaceEntry {
   dev?: string;
   devCommand?: string;
   devStopCommand?: string;
+  /** What `stet audit lighthouse --build` runs after `npm run build`, in place of the router's preview command. */
+  previewCommand?: string;
   pushAfterCommit?: boolean;
 }
 
@@ -132,7 +134,7 @@ export function addSite(file: string, raw: string): { workspace: Workspace; adde
 export function updateSite(
   file: string,
   path: string,
-  patch: Pick<WorkspaceEntry, 'dev' | 'devCommand' | 'devStopCommand' | 'pushAfterCommit'>,
+  patch: Pick<WorkspaceEntry, 'dev' | 'devCommand' | 'devStopCommand' | 'previewCommand' | 'pushAfterCommit'>,
 ): Workspace {
   const workspace = readWorkspace(file);
   const entry = workspace.sites.find((site) => site.path === path);
@@ -148,6 +150,11 @@ export function updateSite(
     entry.devCommand = patch.devCommand;
   }
   if (patch.devStopCommand !== undefined) entry.devStopCommand = patch.devStopCommand;
+  // An empty preview command clears it: the router's own runs again.
+  if (patch.previewCommand !== undefined) {
+    if (patch.previewCommand.trim() === '') delete entry.previewCommand;
+    else entry.previewCommand = patch.previewCommand;
+  }
   if (patch.pushAfterCommit !== undefined) {
     if (typeof patch.pushAfterCommit !== 'boolean') throw new CliError('pushAfterCommit must be true or false');
     entry.pushAfterCommit = patch.pushAfterCommit;
@@ -425,5 +432,21 @@ function routerDefaults(config: StetConfig): Omit<DevDefaults, 'source'> {
   if (config.router === 'astro') {
     return { dev: 'http://localhost:4321', devCommand: 'npx astro dev', devStopCommand: 'npx astro dev stop' };
   }
+  if (config.router === 'vite') return { dev: 'http://localhost:5173', devCommand: 'npm run dev' };
   return { dev: 'http://localhost:3000', devCommand: 'npm run dev' };
 }
+
+/**
+ * What `stet audit lighthouse --build` runs after `npm run build`, per router,
+ * `{port}` the free loopback port. Each names 127.0.0.1: `vite preview` and
+ * `astro preview` listen on `[::1]` alone without it, where the wait and the
+ * relay never reach them. Astro's `--ignore-lock` keeps the preview in the
+ * foreground: in an agent session it otherwise backgrounds itself into a group
+ * the command cannot end.
+ */
+export const PREVIEW_COMMANDS: Readonly<Record<'app' | 'pages' | 'astro' | 'vite', string>> = {
+  app: 'npx next start -H 127.0.0.1 -p {port}',
+  pages: 'npx next start -H 127.0.0.1 -p {port}',
+  vite: 'npx vite preview --host 127.0.0.1 --port {port} --strictPort',
+  astro: 'npx astro preview --host 127.0.0.1 --port {port} --ignore-lock',
+};

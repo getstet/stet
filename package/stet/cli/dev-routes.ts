@@ -386,6 +386,7 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
       ...(typeof body['dev'] === 'string' ? { dev: body['dev'] } : {}),
       ...(typeof body['devCommand'] === 'string' ? { devCommand: body['devCommand'] } : {}),
       ...(typeof body['devStopCommand'] === 'string' ? { devStopCommand: body['devStopCommand'] } : {}),
+      ...(typeof body['previewCommand'] === 'string' ? { previewCommand: body['previewCommand'] } : {}),
       ...(typeof body['pushAfterCommit'] === 'boolean' ? { pushAfterCommit: body['pushAfterCommit'] } : {}),
     });
     return json({ sites: listing(ctx).map(summary) });

@@ -1722,7 +1722,7 @@ describe('dispatch', () => {
     const host = makeHost();
     expect(await host.run('help')).toBe(0);
     expect(host.stdout()).toContain(
-      'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor, both email commands, and contacts groups, list and get.',
+      'Options: --json on check, scan, seo check, pages scan, list, get, audit, audit lighthouse, doctor, both email commands, and contacts groups, list and get.',
     );
   });
 
@@ -3021,7 +3021,7 @@ describe('per-command help', () => {
     expect(commands).toEqual([
       'init', 'scan', 'register', 'remove', 'rename', 'merge', 'split', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
       'email extract', 'email verify', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
-      'seed', 'pull', 'audit', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
+      'seed', 'pull', 'audit', 'audit lighthouse', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
       'contacts export', 'contacts erase', 'contacts suppress', 'contacts import', 'contacts group add',
       'contacts group open', 'contacts group close', 'dev',
     ]);
@@ -3037,6 +3037,32 @@ describe('per-command help', () => {
       expect(lines.at(-2), command).toBe('');
       expect(host.stderr(), command).toBe('');
     }
+  });
+
+  it("explains the audit's two forms apart: the audit entry, and the audit lighthouse entry", async () => {
+    const audit = makeHost({ config: null });
+    expect(await audit.run('audit', '--help')).toBe(0);
+    expect(audit.stdout().split('\n')).toEqual([
+      '  audit [--strict]           descriptor against the store — reports, never deletes',
+      '',
+      'stet --help lists every command.',
+    ]);
+    const lighthouse = makeHost({ config: null });
+    expect(await lighthouse.run('audit', 'lighthouse', '--help')).toBe(0);
+    const lines = lighthouse.stdout().split('\n');
+    expect(lines[0]?.startsWith('  audit lighthouse [--url U | --build]')).toBe(true);
+    expect(lines.slice(1)).toEqual(['', 'stet --help lists every command.']);
+  });
+
+  it('keeps audit for everything that is not lighthouse, its refusal included', async () => {
+    const strict = makeHost();
+    // runAudit's own answer: its unseeded keys fail under --strict, and no usage line is printed.
+    expect(await strict.run('audit', '--strict')).toBe(1);
+    expect(strict.stderr()).not.toContain('usage:');
+    expect(strict.stdout()).not.toContain('lighthouse');
+    const foo = makeHost();
+    expect(await foo.run('audit', 'foo')).toBe(2);
+    expect(foo.stderr()).toContain('takes no arguments');
   });
 
   it('carries a wrapped entry whole, and both entries of a command listed twice', async () => {
