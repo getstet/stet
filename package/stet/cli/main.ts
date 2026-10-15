@@ -58,8 +58,8 @@ export interface CliIo {
   /**
    * Interactive input, wired to `node:readline/promises` by the bin entry on a
    * TTY and left undefined everywhere else. `init` is the sole consumer:
-   * undefined means non-interactive, so its two questions take their defaults
-   * and the provider-mount edit is skipped unless `--yes` is passed.
+   * undefined means non-interactive, so its questions take their defaults
+   * and the agent-guidance write is skipped unless `--yes` is passed.
    */
   ask?: (question: string, choices?: string[]) => Promise<string>;
   confirm?: (question: string) => Promise<boolean>;
@@ -256,7 +256,7 @@ export function usage(): string {
     'stet — typed, versioned content keys with a committed snapshot fallback',
     '',
     'Setup (write or edit files in the adopting project):',
-    '  init [--app DIR] [--host html] [--yes]   scaffold a project; the shown edits mount the CopyProvider and write the agent guidance',
+    '  init [--app DIR] [--host html] [--yes]   scaffold a project; the shown edit writes the agent guidance',
     '  scan                       report unkeyed copy in the managed surfaces — warn by default',
     '  register --from scan [--plan FILE | --plan-out FILE] [--write] [--verbose]   add keys named by role and rewrite the consuming leaf; --plan-out writes the names to edit, --plan applies them; --verbose lists every parse refusal',
     '  remove <key> [<key>...] [--write]   delete keys from descriptor + snapshot; plan first, --write applies',
@@ -338,8 +338,8 @@ if (import.meta.url === entryUrl()) {
     stderr: (line) => process.stderr.write(`${line}\n`),
   };
   // Interactive input only on a real TTY — `init` is the sole consumer. A pipe
-  // or CI leaves ask/confirm undefined, so init defaults its two questions and
-  // skips the provider-mount edit unless `--yes`. `readline/promises` is loaded
+  // or CI leaves ask/confirm undefined, so init defaults its questions and
+  // skips the agent-guidance write unless `--yes`. `readline/promises` is loaded
   // only here, so a library import of this module never pulls it in.
   if (process.stdin.isTTY === true && process.stdout.isTTY === true) {
     const { createInterface } = await import('node:readline/promises');

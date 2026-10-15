@@ -41,6 +41,7 @@ import {
 } from '../adapters/store-postgrest.js';
 import { createSnapshotStore } from '../adapters/store-snapshot.js';
 import { loadConfig } from '../cli/config.js';
+import { INIT_READ_IMPORT, SERVER_READ_IMPORT } from '../cli/footprint.js';
 import { createStetHandler, type PublishEvent } from '../server/mount.js';
 import { createStetFormsHandler, type JoinEvent } from '../server/forms.js';
 import { collision, GRANTS_003 } from '../cli/upgrade.js';
@@ -5388,14 +5389,17 @@ describe('adoption', () => {
 
   it('Requirement: init scaffolds a project with a single, shown edit to existing code', async () => {
     const host = makeAdoptionHost();
+    const unmounted = host.file('app/layout.tsx');
     expect(await host.run('init', '--yes')).toBe(0);
     // new files, written all at once
     expect(host.exists('content/descriptor.json')).toBe(true);
     expect(host.exists('stet.config.json')).toBe(true);
     expect(host.exists('lib/content.ts')).toBe(true);
     expect(host.exists('content/keys.ts')).toBe(true);
-    // the ONE edit to existing code: the root layout mounts the CopyProvider
-    expect(host.file('app/layout.tsx')).toContain('CopyProvider');
+    expect(host.exists('content/resolved.ts')).toBe(true);
+    // no edit to existing code: register mounts the CopyProvider at its first client rewrite
+    expect(host.file('app/layout.tsx')).toBe(unmounted);
+    expect(host.out).toContain('CopyProvider: not mounted — stet register mounts it in app/layout.tsx when a client component first reads copy');
     // snapshot-only: no store detected, so no mount route is written
     expect(host.exists('app/api/stet/[...stet]/route.ts')).toBe(false);
     // completion prints the next step
@@ -5406,8 +5410,9 @@ describe('adoption', () => {
     expect(host.file('app/layout.tsx')).toBe(layout);
 
     // The scaffold matches the host's own dependencies. A host declaring react
-    // gets the `@getstet/stet/react` server accessor…
-    expect(host.file('lib/content.ts')).toContain("import { createServerCopy } from '@getstet/stet/react';");
+    // gets the server accessor from `@getstet/stet/react/server`, which carries no client code…
+    expect(host.file('lib/content.ts')).toContain(SERVER_READ_IMPORT);
+    expect(host.file('lib/content.ts')).not.toContain(INIT_READ_IMPORT);
 
     // …and a host that declares none gets the framework-free accessor from the
     // package root, plus the resolved map: the accessor is callable-only, so a

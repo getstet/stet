@@ -1473,6 +1473,52 @@ describe('contacts store selection', () => {
 describe('upgrade', () => {
   /** A PostgREST that has never seen migration 1: stet_meta is not there. */
 
+  describe('the read path\'s import (D7, P14)', () => {
+    const INIT_LINE = "import { createServerCopy } from '@getstet/stet/react';";
+    const SERVER_LINE = "import { createServerCopy } from '@getstet/stet/react/server';";
+    const BODY = "\nimport { readBundle, resolveAll } from '@getstet/stet';\n\nexport const copy = createServerCopy(descriptor, resolved);\n";
+    const REWRITTEN = "lib/content.ts: imports from '@getstet/stet/react' — rewritten to '@getstet/stet/react/server', which carries no client code";
+    const BY_HAND = "lib/content.ts: imports from '@getstet/stet/react' — change it to '@getstet/stet/react/server' by hand; the line is not the one stet init wrote";
+    const withReadPath = (text: string): Host => {
+      const host = makeHost({ config: {} });
+      mkdirSync(join(host.cwd, 'lib'), { recursive: true });
+      writeFileSync(join(host.cwd, 'lib/content.ts'), text);
+      return host;
+    };
+
+    for (const eol of ['\n', '\r\n']) {
+      it(`rewrites the line init wrote, its ${eol === '\n' ? 'LF' : 'CRLF'} ending and every other byte kept, and is silent the second time`, async () => {
+        const host = withReadPath(`${INIT_LINE}${BODY}`.replace(/\n/g, eol));
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.out).toContain(REWRITTEN);
+        expect(host.file('lib/content.ts')).toBe(`${SERVER_LINE}${BODY}`.replace(/\n/g, eol));
+        host.out.length = 0;
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.stdout()).not.toContain('lib/content.ts:');
+      });
+    }
+
+    it('leaves any other import of the provider\'s index for the hand, beside the line or in its place', async () => {
+      for (const text of [
+        `import { createServerCopy, useCopy } from '@getstet/stet/react';${BODY}`,
+        `${INIT_LINE}\nimport { useCopy } from '@getstet/stet/react';${BODY}`,
+        `// ${INIT_LINE}\n${INIT_LINE}${BODY}`,
+      ]) {
+        const host = withReadPath(text);
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.out).toContain(BY_HAND);
+        expect(host.file('lib/content.ts')).toBe(text);
+      }
+    });
+
+    it('writes nothing under --dry-run', async () => {
+      const host = withReadPath(`${INIT_LINE}${BODY}`);
+      expect(await host.run('upgrade', '--dry-run')).toBe(0);
+      expect(host.file('lib/content.ts')).toBe(`${INIT_LINE}${BODY}`);
+      expect(host.stdout()).not.toContain('lib/content.ts:');
+    });
+  });
+
   it('writes the resolved module on a 0.6.0-shaped host, and a dry run names it without writing (D8)', async () => {
     const host = makeHost({ config: {} });
     rmSync(join(host.cwd, 'content/resolved.ts'));

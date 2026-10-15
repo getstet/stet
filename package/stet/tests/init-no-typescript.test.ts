@@ -1,10 +1,9 @@
 /**
  * `stet init` on a host with the optional `typescript` peer absent (P3-12).
- * `typescript` is loaded BEFORE any file is written, so its absence degrades the
- * ONE mount edit to a printed snippet rather than leaving a half-adopted repo
- * (the scaffold written, the mount then throwing). This file mocks `typescript`
- * so the dynamic import rejects — kept separate so the mock never shadows the
- * real compiler the other init/scan tests parse with.
+ * `init` mounts no provider, so nothing in it needs the compiler: the scaffold
+ * is written whole and the not-mounted line printed. This file mocks
+ * `typescript` so the dynamic import rejects — kept separate so the mock never
+ * shadows the real compiler the other init/scan tests parse with.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -48,8 +47,7 @@ describe('runInit — typescript absent (P3-12)', () => {
     const out: string[] = [];
     const io: CliIo = { cwd: dir, env: {}, stdout: (l) => out.push(l), stderr: () => {} };
 
-    // --yes would apply the mount if typescript were present; here it still cannot
-    // parse, so the mount degrades regardless.
+    // init mounts nothing, so it loads no compiler for a mount at all.
     const code = await runInit(['--yes'], io);
     expect(code).toBe(0);
 
@@ -57,11 +55,9 @@ describe('runInit — typescript absent (P3-12)', () => {
     for (const f of ['content/descriptor.json', 'lib/content.ts', 'stet.config.json']) {
       expect(existsSync(join(dir, f)), f).toBe(true);
     }
-    // The mount was skipped with the actionable message and the manual snippet,
-    // and the layout is untouched.
+    // The layout is untouched and the line says who mounts the provider.
     expect(readFileSync(join(dir, 'app/layout.tsx'), 'utf8')).toBe(APP_LAYOUT);
-    const joined = out.join('\n');
-    expect(joined).toContain("'typescript' is not installed");
-    expect(joined).toContain("import { CopyProvider } from '@getstet/stet/react'");
+    expect(out).toContain('CopyProvider: not mounted — stet register mounts it in app/layout.tsx when a client component first reads copy');
+    expect(out.join('\n')).not.toContain("'typescript' is not installed");
   });
 });

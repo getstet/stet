@@ -34,6 +34,7 @@ import {
   type StoreAdapterName,
   type StoreBlock,
 } from './config.js';
+import { INIT_READ_IMPORT, readPathImport, SERVER_READ_IMPORT } from './footprint.js';
 import { armGateSeo } from './hook.js';
 import { migrations, type Migration } from './installed.js';
 import type { CliIo } from './main.js';
@@ -85,6 +86,7 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
       }
     }
     regenerate(io, project, report, dryRun);
+    if (!dryRun) await footprint(io, project, report);
     if (!dryRun) await armGate(io, project, report);
   } catch (error) {
     // A usage mistake keeps its exit code and its silence: it is raised before
@@ -100,6 +102,29 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
     await project.dispose();
   }
   return report.emit(io);
+}
+
+/**
+ * What stet adds to a production page, taken back where nothing needs it: the
+ * read path's import of the provider's index rewritten to the server subpath,
+ * where it is the line `init` wrote and nothing else imports that index. Any
+ * other import is named for the hand — the rewrite touches only the line it
+ * can prove it wrote, its line ending kept.
+ */
+async function footprint(io: CliIo, project: LoadedProject, report: Report): Promise<void> {
+  const config = project.config;
+  if (isHtmlHost(config)) return;
+  const shown = config.readPath.file;
+  const kind = readPathImport(io.cwd, config);
+  if (kind === 'init-line') {
+    const path = join(io.cwd, shown);
+    // Separators kept at the odd indices, so each line ending survives the join.
+    const parts = readFileSync(path, 'utf8').split(/(\r?\n)/);
+    writeText(path, parts.map((part, i) => (i % 2 === 0 && part === INIT_READ_IMPORT ? SERVER_READ_IMPORT : part)).join(''));
+    report.line(`${shown}: imports from '@getstet/stet/react' — rewritten to '@getstet/stet/react/server', which carries no client code`);
+  } else if (kind === 'other') {
+    report.line(`${shown}: imports from '@getstet/stet/react' — change it to '@getstet/stet/react/server' by hand; the line is not the one stet init wrote`);
+  }
 }
 
 /**

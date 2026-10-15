@@ -7,12 +7,12 @@
  * config, where a store exists the `createStetHandler` API-mount route, and on a
  * Next 15.1+ App Router host that collects sign-ups the forms routes.
  *
- * Its ONE edit to pre-existing CODE is mounting the root-layout `CopyProvider`:
- * shown as a diff, applied only on confirm or `--yes`, skipped (with the manual
- * snippet) non-interactively, idempotent, and left alone where the wrap point is
- * ambiguous. It additionally APPENDS the agent-routing guidance block to the
- * host's `AGENTS.md`/`CLAUDE.md` (`cli/agents.ts`) — additive, marker-delimited,
- * shown before it is written, gated the same way, and reversed by `eject`.
+ * It edits no pre-existing CODE: the root-layout `CopyProvider` is mounted by
+ * `register --write` the first time it rewrites a client component, and `init`
+ * says so. It APPENDS the agent-routing guidance block to the host's
+ * `AGENTS.md`/`CLAUDE.md` (`cli/agents.ts`) — additive, marker-delimited, shown
+ * before it is written, applied only on confirm or `--yes`, and reversed by
+ * `eject`.
  * Everything is `<base>`-rebased on the detected
  * `src/`-vs-root layout so a `src/app` or JS host is scaffolded and later
  * located correctly. Every new-file write is plan-then-apply: a pristine re-run
@@ -28,7 +28,7 @@ import { loadDescriptorWithWarnings } from '../src/descriptor.js';
 import { loadSnapshot } from '../src/snapshot.js';
 import { writeInitGuidance } from './agents.js';
 import { flag, noPositionals, parse, text } from './args.js';
-import { asUpdate, planJson, planWrite, writePlanned, writeText, type WritePlan } from './artifacts.js';
+import { asUpdate, planJson, planWrite, writePlanned, type WritePlan } from './artifacts.js';
 import { check } from './check.js';
 import {
   CONFIG_FILE,
@@ -40,21 +40,14 @@ import {
   type StetConfig,
 } from './config.js';
 import { filesForGlobs } from './files.js';
+import { SERVER_READ_IMPORT } from './footprint.js';
 import { proposeHtml } from './html-host.js';
 import { packageRoot, migrations } from './installed.js';
 import { detectPagesRoots } from './pages.js';
 import type { CliIo } from './main.js';
-import {
-  importsCopyProvider,
-  jsHost,
-  locateWrapTarget,
-  printProviderSnippet,
-  providerEdits,
-  relImport,
-} from './provider-mount.js';
+import { jsHost, relImport } from './provider-mount.js';
 import { plural, posixRelative, Report, UsageError } from './report.js';
-import { applyFileEdits, dominantEol, formatDiff } from './rewrite.js';
-import { loadTypescript, scriptKindFor } from './source-scan.js';
+import { dominantEol } from './rewrite.js';
 import { contactsBlock } from './store.js';
 
 export async function runInit(args: string[], io: CliIo): Promise<number> {
@@ -155,13 +148,6 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
     plans.push(planJsonAt(CONFIG_FILE, config));
   }
 
-  // typescript parses the layout for the ONE mount edit. Load it BEFORE any
-  // write, so its absence degrades that edit to a printed snippet rather than
-  // leaving a half-adopted repo — the writes commit, then the mount can't parse
-  // (P3-12). The read path and codegen writes need no typescript. An html host
-  // has no layout and no read path, so it never asks for the compiler.
-  const ts = isHtml ? null : await loadTypescriptOrNull();
-
   const { written, unchanged } = writePlanned(plans, {
     refusal: (labels) =>
       `refusing to overwrite ${labels.join(', ')} — the file in this repo differs from the one stet init would write. ` +
@@ -171,14 +157,12 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   for (const name of written) report.line(`wrote ${name}`);
 
   // The mount exists to give CLIENT components an accessor through React
-  // context. Two hosts have no provider to mount: one that declares no react,
-  // and an Astro host, whose site layout is a `.astro` template rather than a
-  // React tree — an island's React subtree is not the site's layout, and the
-  // Astro reason wins whether or not react is declared. The step is skipped
-  // whole and the read route it does have is named instead. The gate sits at
-  // the CALL, which is what also silences every fallback inside: the wrap-point
-  // miss and the layout-not-found branch both print a snippet importing
-  // `@getstet/stet/react`, and on those hosts that import cannot load.
+  // context, and `register` adds it where a client component first reads copy.
+  // Two hosts have no provider to mount at all: one that declares no react, and
+  // an Astro host, whose site layout is a `.astro` template rather than a React
+  // tree — an island's React subtree is not the site's layout, and the Astro
+  // reason wins whether or not react is declared. The read route each does have
+  // is named instead, and no line names `@getstet/stet/react`.
   const skipMount = (reason: string): void => {
     report.line(
       `no CopyProvider mount: ${reason} — read copy from '${config.readPath.import}', ` +
@@ -192,7 +176,11 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   } else if (rootLayout === undefined || router === 'astro') {
     skipMount('an Astro host has no root React layout');
   } else if (!hasReact) skipMount('this host declares no react');
-  else await mountProvider({ io, target, config, rootLayout, router, yes, report, ts });
+  else {
+    report.line(
+      `CopyProvider: not mounted — stet register mounts it in ${posixRelative(io.cwd, join(target, rootLayout))} when a client component first reads copy`,
+    );
+  }
   // Outside the all-or-nothing batch above: that batch is over NEW files stet
   // owns, while the guidance append edits files it does not, under per-file
   // three-state semantics. Folding it in would let a host's edited CLAUDE.md
@@ -732,10 +720,11 @@ function routeModule(config: StetConfig, routeFile: string, target: string): str
  * client bundle.
  *
  * It is built on whichever accessor the HOST can resolve: `createServerCopy`
- * from `@getstet/stet/react` where the host declares `react`, and the framework-free
- * `createAccessor` from the package root where it does not — `@getstet/stet/react`'s
- * index re-exports the provider, so a react-less host cannot even load the
- * subpath. The react-free form additionally exports the resolved map, because
+ * from `@getstet/stet/react/server` where the host declares `react` — the
+ * subpath carries no client code, so no server module reaching the read path
+ * registers the provider as a client reference — and the framework-free
+ * `createAccessor` from the package root where it does not. The react-free
+ * form additionally exports the resolved map, because
  * an accessor is callable-only: property access on it returns `undefined`
  * silently, and a template reading `{copy.key}` would render nothing.
  */
@@ -832,7 +821,7 @@ function readPathModule(
     "import { readFileSync, statSync } from 'node:fs';",
     "import { join } from 'node:path';",
     '',
-    "import { createServerCopy } from '@getstet/stet/react';",
+    SERVER_READ_IMPORT,
     js ? "import { readBundle, resolveAll } from '@getstet/stet';" : "import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';",
     '',
     `import descriptorJson from '${relDescriptor}';`,
@@ -844,81 +833,9 @@ function readPathModule(
   ].join('\n')}\n`;
 }
 
-// --- the one edit: the root-layout CopyProvider mount ----------------------
-
-async function mountProvider(args: {
-  io: CliIo;
-  target: string;
-  config: StetConfig;
-  /** `config.rootLayout`, narrowed by the caller: this step is not reached without one. */
-  rootLayout: string;
-  router: 'app' | 'pages';
-  yes: boolean;
-  report: Report;
-  ts: typeof import('typescript') | null;
-}): Promise<void> {
-  const { io, target, config, rootLayout, router, yes, report, ts } = args;
-  const layoutPath = join(target, rootLayout);
-  const shown = posixRelative(io.cwd, layoutPath);
-
-  if (!existsSync(layoutPath)) {
-    report.line(`${shown}: not found — mount the CopyProvider by hand:`);
-    printProviderSnippet(report, config, layoutPath, target, router);
-    return;
-  }
-  if (ts === null) {
-    report.line(`${shown}: 'typescript' is not installed, so the CopyProvider mount was skipped — install it (npm i -D typescript) or mount by hand:`);
-    printProviderSnippet(report, config, layoutPath, target, router);
-    return;
-  }
-
-  const source = readFileSync(layoutPath, 'utf8');
-  const sf = ts.createSourceFile(layoutPath, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, layoutPath));
-
-  if (importsCopyProvider(ts, sf)) {
-    report.line(`${shown}: CopyProvider already mounted — no change`);
-    return;
-  }
-
-  const wrap = locateWrapTarget(ts, sf, router);
-  if (wrap === null) {
-    report.line(`${shown}: could not locate the wrap point unambiguously — mount the CopyProvider by hand:`);
-    printProviderSnippet(report, config, layoutPath, target, router);
-    return;
-  }
-
-  const edited = applyFileEdits(source, providerEdits(ts, sf, source, layoutPath, target, config, wrap));
-  report.line(`${shown}: the one edit to existing code — mount the CopyProvider:`);
-  report.line(formatDiff(shown, source, edited));
-
-  const apply = yes || (io.confirm ? await io.confirm(`Apply the CopyProvider mount to ${shown}?`) : false);
-  if (!apply) {
-    report.line(
-      io.confirm && !yes
-        ? `${shown}: not confirmed — left unchanged`
-        : `${shown}: non-interactive — left unchanged (pass --yes to apply). Mount it by hand:`,
-    );
-    // The spec (adoption §: init) names the manual snippet on the skip path, so a
-    // non-interactive run leaves the operator the exact edit, not just a diff.
-    if (!(io.confirm && !yes)) printProviderSnippet(report, config, layoutPath, target, router);
-    return;
-  }
-  writeText(layoutPath, edited);
-  report.line(`${shown}: mounted CopyProvider`);
-}
-
 // --- small shared helpers --------------------------------------------------
 
 
-
-/** typescript if the optional peer is installed, else null — the mount degrades rather than aborting (P3-12). */
-async function loadTypescriptOrNull(): Promise<typeof import('typescript') | null> {
-  try {
-    return await loadTypescript();
-  } catch {
-    return null;
-  }
-}
 
 function readJson(path: string): unknown {
   return JSON.parse(readFileSync(path, 'utf8'));
