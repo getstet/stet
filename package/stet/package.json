@@ -1,10 +1,10 @@
 {
   "name": "@getstet/stet",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19"
   },
   "description": "Typed, versioned content keys with a committed snapshot fallback.",
   "exports": {

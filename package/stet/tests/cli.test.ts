@@ -20,6 +20,7 @@ import { CONNECT_TIMEOUT_MS, contactsBlock, contactsConfig } from '../cli/store.
 import { defaultConfig, type StetConfig } from '../cli/config.js';
 import { openContactsStore } from '../cli/project.js';
 import { migrations, packageRoot } from '../cli/installed.js';
+import { nodeAtLeast } from '../cli/doctor.js';
 import { collision, GRANTS_003 } from '../cli/upgrade.js';
 import { usage } from '../cli/main.js';
 import {
@@ -1126,6 +1127,33 @@ describe('pull', () => {
 });
 
 describe('doctor', () => {
+  it('compares a Node version by major, then minor', () => {
+    expect(nodeAtLeast('v22.18.0', 22, 19)).toBe(false);
+    expect(nodeAtLeast('v22.19.0', 22, 19)).toBe(true);
+    expect(nodeAtLeast('v23.0.0', 22, 19)).toBe(true);
+    expect(nodeAtLeast('v24.1.0', 22, 19)).toBe(true);
+  });
+
+  it('names Node below 22.19 as the audit floor, and nothing at 22.19', async () => {
+    const real = process.version;
+    const runOn = async (version: string): Promise<{ code: number; out: string }> => {
+      Object.defineProperty(process, 'version', { value: version, configurable: true, enumerable: true, writable: false });
+      try {
+        const host = makeHost({ config: {} });
+        const code = await host.run('doctor');
+        return { code, out: host.stdout() };
+      } finally {
+        Object.defineProperty(process, 'version', { value: real, configurable: true, enumerable: true, writable: false });
+      }
+    };
+    const old = await runOn('v22.18.0');
+    expect(old.code).toBe(0);
+    expect(old.out).toContain('node v22.18.0: stet audit lighthouse needs Node 22.19 or later; everything else runs');
+    const current = await runOn('v22.19.0');
+    expect(current.code).toBe(0);
+    expect(current.out).not.toContain('needs Node 22.19');
+  });
+
   it('reports every section, and snapshot-only is a clean bill', async () => {
     const host = makeHost({ config: {} });
     expect(await host.run('doctor')).toBe(0);

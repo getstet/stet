@@ -33,6 +33,12 @@ import { Report, UsageError, formatFinding, plural, posixRelative, shapeOf } fro
 import { TS7_REFUSAL, carriesToken, dialectOf, loadTypescript, mentionsToken, scriptKindFor } from './source-scan.js';
 import { contactsConfig, isStoreBacked } from './store.js';
 
+/** Whether a `process.version` string (`v22.19.0`) is at least `major.minor`. */
+export function nodeAtLeast(version: string, major: number, minor: number): boolean {
+  const [have, haveMinor] = version.replace(/^v/, '').split('.').map(Number) as [number, number];
+  return have > major || (have === major && haveMinor >= minor);
+}
+
 export async function runDoctor(args: string[], io: CliIo): Promise<number> {
   const { values, positionals } = parse(args, {
     ...ENV_OPTION,
@@ -66,6 +72,10 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
     report.line(`descriptor: ${config.descriptorPath}, ${Object.keys(project.descriptor.keys).length} keys`);
     if (isHtmlHost(config)) {
       report.line('host: html — the marked documents are the rendered form; publish = commit');
+    }
+    // Lighthouse 13.5's own floor; every other command runs on the package's older one.
+    if (!nodeAtLeast(process.version, 22, 19)) {
+      report.line(`node ${process.version}: stet audit lighthouse needs Node 22.19 or later; everything else runs`);
     }
 
     // The descriptor, snapshot, currency and generated-file sections are `stet
