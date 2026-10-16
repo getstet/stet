@@ -26,6 +26,7 @@ import { flag, noPositionals, parse, text } from './args.js';
 import { CONFIG_FILE } from './config.js';
 import { createDevHandler, stopEveryChild, type DevChild, type DevContext } from './dev-routes.js';
 import { packageRoot } from './installed.js';
+import { untilInterrupted } from './liveness.js';
 import { disposeStore } from './project.js';
 import type { CliIo } from './main.js';
 import { CliError, UsageError } from './report.js';
@@ -306,18 +307,6 @@ function parsePort(raw: string | undefined): number {
     throw new UsageError('--port must be an integer between 0 and 65535; 0 picks a free port');
   }
   return port;
-}
-
-/** The run, held open until the operator ends it. The listeners stay until `release`, so a signal during the close is absorbed (F48). */
-function untilInterrupted(): { interrupted: Promise<void>; release: () => void } {
-  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
-  let resolve: () => void = () => {};
-  const interrupted = new Promise<void>((r) => {
-    resolve = r;
-  });
-  const stop = (): void => resolve();
-  for (const signal of signals) process.on(signal, stop);
-  return { interrupted, release: () => signals.forEach((signal) => process.off(signal, stop)) };
 }
 
 /**

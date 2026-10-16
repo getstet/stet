@@ -31,13 +31,13 @@
  * and blank real copy at exit 0.
  *
  * `--apply` writes one batch: the page records, their two scaffolded SEO keys,
- * the empty defaults and the regenerated codegen trio. Atomicity here is
+ * the empty defaults and the regenerated codegen files. Atomicity here is
  * correctness rather than hygiene — a page record whose keys did not land makes
  * the descriptor unloadable, and so does a key naming a page record that did
  * not, so the whole host bricks at `descriptorOf` in either direction.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { join, sep } from 'node:path';
 
 import { headLimitsFor, route as normalizeRoute } from '../src/seo.js';
@@ -52,6 +52,7 @@ import { proposeHtml } from './html-host.js';
 import { NAME_PART, wordsOf } from './key-names.js';
 import type { CliIo } from './main.js';
 import { clip, plural, posixRelative, CliError, Report, UsageError } from './report.js';
+import { servableFile } from './static-files.js';
 
 // --- The dirent walk --------------------------------------------------------
 
@@ -729,7 +730,7 @@ export function pageOfFile(
   cwd: string,
   file: string,
   pages: Record<string, PageDef> | undefined,
-  options: { html?: boolean } = {},
+  options: { html?: boolean; declaredOnly?: boolean } = {},
 ): string | undefined {
   let route: string | undefined;
   for (const root of detectPagesRoots(cwd, options)) {
@@ -756,6 +757,8 @@ export function pageOfFile(
     const page = (pages ?? {})[name];
     if (page !== undefined && typeof page.route === 'string' && normalizeRoute(page.route) === at) return name;
   }
+  // `declaredOnly` answers a declared page or nothing: the audit maps one document to one page.
+  if (options.declaredOnly === true) return undefined;
   return route === '/' ? 'home' : (normalize(route) ?? undefined);
 }
 
@@ -776,6 +779,56 @@ export function fileRoute(rel: string): string {
   const segments = rel.slice(0, rel.length - extensionOf(rel).length).split('/');
   if (segments[segments.length - 1] === 'index') segments.pop();
   return `/${segments.join('/')}`;
+}
+
+/** A document's path as the static arm serves it: a folder's index at the folder, anything else at itself. */
+export function servedRoute(file: string): string {
+  if (file === 'index.html') return '/';
+  if (file.endsWith('/index.html')) return `/${file.slice(0, -'index.html'.length)}`;
+  return `/${file}`;
+}
+
+/** A page `stet audit lighthouse` can name, and the document that serves it on the static-HTML host. */
+export interface AuditablePage {
+  page: string;
+  route: string;
+  declared: boolean;
+  /** The managed document, repo-relative; absent on a JavaScript host and for a declared route no document serves. */
+  file?: string;
+}
+
+/**
+ * The pages the audit can name: every declared page, and on the static-HTML
+ * host the page each managed document proposes where no declared page claims
+ * it — `pageOfFile`'s fallback name, the one `pages scan` would declare — so a
+ * document is audited by name before its page exists (R9). A declared page's
+ * document is the one whose file route is its route (`declaredOnly`), else the
+ * managed document its route names on disk (`servableFile`, R7); two documents
+ * proposing one name (`about.html` beside `about/index.html`) keep the first
+ * in file order. A JavaScript host declaring no page answers `home` at `/`.
+ */
+export function auditablePages(cwd: string, config: StetConfig, descriptor: Descriptor): AuditablePage[] {
+  const pages = descriptor.pages ?? {};
+  const declared: AuditablePage[] = Object.keys(pages)
+    .sort()
+    .map((page) => ({ page, route: pages[page]?.route ?? '/', declared: true }));
+  // A JavaScript host declaring none still has `/`, which every surface calls `home`.
+  if (!isHtmlHost(config)) return declared.length === 0 ? [{ page: 'home', route: '/', declared: false }] : declared;
+  const files = filesForGlobs(cwd, config.managedSurfaces).sort();
+  const root = realpathSync(cwd); // `servableFile` answers a real path
+  const out = declared.map((entry) => {
+    const byRoute = files.find((file) => pageOfFile(cwd, file, pages, { html: true, declaredOnly: true }) === entry.page);
+    const served = byRoute === undefined ? servableFile(root, entry.route) : null;
+    const file = byRoute ?? (served !== null && files.includes(posixRelative(root, served)) ? posixRelative(root, served) : undefined);
+    return file === undefined ? entry : { ...entry, file };
+  });
+  for (const file of files) {
+    const page = pageOfFile(cwd, file, pages, { html: true });
+    // `out` holds every declared page, so a declared name is never proposed beside it.
+    if (page === undefined || out.some((entry) => entry.page === page)) continue;
+    out.push({ page, route: fileRoute(file), declared: false, file });
+  }
+  return out;
 }
 
 function isDynamic(route: string): boolean {
@@ -969,13 +1022,13 @@ function selectPages(set: PageProposalSet, names: string[]): PageProposal[] {
 
 /**
  * The selected pages written, as ONE batch: the records, their two scaffolded
- * keys, the empty defaults and the regenerated codegen trio.
+ * keys, the empty defaults and the regenerated codegen files.
  *
  * All-or-nothing because a half-landed batch BRICKS the host, both ways: a page
  * record whose seo keys are missing and a key naming a page that is not
  * declared each make `loadDescriptorWithWarnings` throw, so `descriptorOf`
  * returns null and check, seo check, register, remove, doctor and eject all
- * stop. The codegen trio rides along for two reasons at once — the new keys
+ * stop. The codegen files ride along for two reasons at once — the new keys
  * must typecheck in the host's editor without an intervening `stet upgrade`,
  * and `generateRegistry` stamps the WHOLE descriptor's source hash, so even a
  * page record alone would leave `stet check`'s currency gate red without it.

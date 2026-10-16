@@ -71,6 +71,7 @@ import {
   parseEnvText,
   readWorkspace,
   removeSite,
+  routerPreviewCommand,
   siteEnv,
   siteId,
   siteIo,
@@ -738,6 +739,19 @@ describe('the per-site environment', () => {
   });
 });
 
+describe('routerPreviewCommand', () => {
+  it('answers the router’s own production preview, Next’s for app and pages', () => {
+    const preview = (router: 'app' | 'pages' | 'astro' | 'vite'): string => {
+      const host = makeCliHost({ config: { project: 't', router } });
+      return routerPreviewCommand(loadConfig(host.cwd));
+    };
+    expect(preview('app')).toBe('npx next start -H 127.0.0.1 -p {port}');
+    expect(preview('pages')).toBe('npx next start -H 127.0.0.1 -p {port}');
+    expect(preview('astro')).toBe('npx astro preview --host 127.0.0.1 --port {port} --ignore-lock');
+    expect(preview('vite')).toBe('npx vite preview --host 127.0.0.1 --port {port} --strictPort');
+  });
+});
+
 describe('devDefaults', () => {
   it('answers null on an html host, whatever router the loader filled in', async () => {
     const html = await makeHtmlHost();
@@ -756,6 +770,13 @@ describe('devDefaults', () => {
     const next = makeCliHost({ config: { project: 't', router: 'app' } });
     expect(devDefaults(loadConfig(next.cwd), { path: next.cwd })).toEqual({
       dev: 'http://localhost:3000',
+      devCommand: 'npm run dev',
+      source: 'router',
+    });
+
+    const vite = makeCliHost({ config: { project: 't', router: 'vite' } });
+    expect(devDefaults(loadConfig(vite.cwd), { path: vite.cwd })).toEqual({
+      dev: 'http://localhost:5173',
       devCommand: 'npm run dev',
       source: 'router',
     });
@@ -1278,6 +1299,17 @@ describe('GET /api/site', () => {
     expect(body.environments).toEqual([{ name: 'default', adapter: 'snapshot', vars: [] }]);
   });
 
+  it('carries the router’s preview command as previewDefault, the placeholder Setup shows', async () => {
+    const ask = async (router: 'app' | 'astro' | 'vite'): Promise<any> => {
+      const host = makeCliHost({ config: { project: 't', router } });
+      const { handler } = handlerOver([host.cwd]);
+      return (await (await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.cwd))}`))).json()) as any;
+    };
+    expect((await ask('app')).previewDefault).toBe('npx next start -H 127.0.0.1 -p {port}');
+    expect((await ask('astro')).previewDefault).toBe('npx astro preview --host 127.0.0.1 --port {port} --ignore-lock');
+    expect((await ask('vite')).previewDefault).toBe('npx vite preview --host 127.0.0.1 --port {port} --strictPort');
+  });
+
   it('reads each connection variable from the checkout’s own files, without dialing', async () => {
     const host = snapshotHost();
     writeFileSync(
@@ -1340,7 +1372,7 @@ describe('POST /api/site/save', () => {
       values: [{ key: 'hero_headline', value: 'A new headline' }],
     });
     expect(first.status).toBe(200);
-    expect(first.body['written']).toEqual(['content/defaults.json', 'content/defaults.ts']);
+    expect(first.body['written']).toEqual(['content/defaults.json', 'content/defaults.ts', 'content/resolved.ts']);
     // The registry and the ambient types carry the DESCRIPTOR's hash, and the
     // descriptor did not move.
     expect(first.body['unchanged']).toEqual(['content/descriptor.json', 'content/keys.ts', 'content/stet-env.d.ts']);
@@ -1920,7 +1952,7 @@ describe('POST /api/site/commit and /push', () => {
       values: [{ key: 'hero_headline', value: 'A committed headline' }],
     });
     const written = saved.body['written'] as string[];
-    expect(written).toHaveLength(2);
+    expect(written).toHaveLength(3);
 
     // An unrelated edit, sitting in the working tree while the commit runs.
     writeFileSync(join(host.cwd, 'notes.txt'), 'stray\n', 'utf8');
@@ -1934,6 +1966,7 @@ describe('POST /api/site/commit and /push', () => {
     const touched = git(host.cwd, ['show', '--stat', '--format=', 'HEAD']).out;
     expect(touched).toContain('content/defaults.json');
     expect(touched).toContain('content/defaults.ts');
+    expect(touched).toContain('content/resolved.ts');
     expect(touched).not.toContain('notes.txt');
     expect(git(host.cwd, ['status', '--porcelain']).out).toContain('?? notes.txt');
   });
@@ -2325,7 +2358,7 @@ async function twin(
     cwd: realpathSync(cwd),
     top: realpathSync(top),
     key,
-    written: kind === 'js' ? ['content/defaults.json', 'content/defaults.ts'] : ['content/defaults.json', 'index.html'],
+    written: kind === 'js' ? ['content/defaults.json', 'content/defaults.ts', 'content/resolved.ts'] : ['content/defaults.json', 'index.html'],
   };
 }
 
@@ -2485,7 +2518,7 @@ describe('the committable files', () => {
         const refused = await post(handler, `/api/site/commit${at(t)}`, { files: stale });
         expect(refused.status).toBe(400);
         expect(refused.body['error']).toBe(`${other} has nothing to commit`);
-        expect(refused.body['pending']).toEqual(['content/defaults.json']);
+        expect(refused.body['pending']).toEqual(stale.filter((rel) => rel !== other));
         expect(head(t.cwd)).toBe(before);
 
         rmSync(join(t.cwd, other));
@@ -2507,7 +2540,7 @@ describe('the committable files', () => {
         const made = await post(handler, `/api/site/commit${at(t)}`, { files: [other] });
         expect(made.status).toBe(200);
         expect(subject(t.cwd)).toBe(`stet: 1 file updated — ${other}`);
-        expect(made.body['pending']).toEqual(['content/defaults.json']);
+        expect(made.body['pending']).toEqual(t.written.filter((rel) => rel !== other));
       });
 
       it('leaves a conflicted form out, and refuses a commit while the merge runs', async () => {
@@ -7722,6 +7755,318 @@ describe('the page', () => {
       page.dom.window.close();
     });
   });
+
+  describe('the Lighthouse card (D10)', () => {
+    const lighthouse = { version: '13.5.0', formFactor: 'mobile', runs: 1, target: 'http://127.0.0.1:5001/', targetKind: 'documents', protocol: 'h2' };
+    const audit = (owner: string, id: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      id,
+      category: 'seo',
+      weight: 1,
+      score: 0,
+      owner,
+      remedy: `fix ${id}`,
+      ...over,
+    });
+    const pageOf = (page: string, scores: Record<string, number | null>, audits: unknown[] = [], over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      page,
+      route: page === 'home' ? '/' : `/${page}`,
+      url: 'http://127.0.0.1:5001/',
+      scores: { performance: 100, accessibility: 100, bestPractices: 100, seo: 100, ...scores },
+      metrics: {},
+      audits,
+      diagnostics: [],
+      thirdParty: [],
+      ...over,
+    });
+    const resultOf = (pages: unknown[], over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      ok: true,
+      lighthouse,
+      footprint: [],
+      fixes: [],
+      findings: [],
+      pages,
+      ...over,
+    });
+    const done = (result: unknown, elapsed = 4): Record<string, unknown> => ({ state: 'done', elapsed, lines: [], result });
+    const indexPage = (): Record<string, unknown> =>
+      pageOf('home', { accessibility: 89, bestPractices: 96 }, [
+        audit('copy', 'label', { at: 'index.html:12', snippet: '<textarea id="notes">', key: 'hero_headline', remedy: 'name the field through a key' }),
+        audit('copy', 'meta-description', { key: 'hero_story', remedy: 'hero_story is empty' }),
+        audit('host', 'target-size', { at: 'index.html:30', snippet: '<a href="/c">c</a>', remedy: 'pad the link' }),
+        audit('host', 'is-crawlable', { remedy: 'serve a 404' }),
+      ], { file: 'index.html' });
+
+    /** The page over a site, `GET site/audit` answering whatever `held.reply` is; the SEO tab open. */
+    async function card(
+      site: Record<string, unknown>,
+      held: { reply: unknown },
+      more: Array<[string, number, unknown, number?]> = [],
+    ): Promise<Painted> {
+      const page = await paint({
+        site,
+        routes: [
+          ['/api/site/audit', 200, () => held.reply],
+          ['/api/site/audit-start', 200, { state: 'running' }],
+          ...more,
+        ],
+        // The page polls every two seconds; the case does not wait that long.
+        prepare: (window) => {
+          const real = window.setTimeout.bind(window);
+          (window as unknown as { setTimeout: unknown }).setTimeout = (fn: () => void, ms?: number) => real(fn, ms === 2000 ? 10 : ms);
+        },
+      });
+      await page.act('tab:SEO');
+      return page;
+    }
+    const htmlSite = (): Record<string, unknown> => siteBody({ host: 'html', config: { ...(siteBody()['config'] as object), host: 'html' }, dev: null });
+    const body = (page: Painted): string => painted(page);
+    const lastStart = (page: Painted): unknown => page.sent.filter((r) => r.path.startsWith('/api/site/audit-start')).at(-1)?.body;
+
+    it('reads Not run yet by host, and Run fills the card (journey C13)', async () => {
+      const held = { reply: { state: 'none', elapsed: 0, lines: [], result: null } as unknown };
+      const html = await card(htmlSite(), held);
+      expect(body(html)).toContain("Not run yet. Runs against the checkout's documents.");
+      expect(docOf(html).querySelector('[data-act="auditRun"]')?.textContent).toBe('Run');
+      held.reply = done(resultOf([indexPage()]));
+      await html.act('auditRun');
+      expect(lastStart(html)).toEqual({});
+      const text = docOf(html).querySelector('.card')?.textContent ?? '';
+      expect(text).toContain("lighthouse 13.5.0 · mobile · the checkout's documents · 1 page · 4 s");
+      expect(text).toContain('index.html');
+      const tiles = [...docOf(html).querySelectorAll('.lht > div')].map((tile) => [tile.querySelector('.lb')?.textContent, tile.querySelector('.bdg')?.textContent, tile.querySelector('.bdg')?.className]);
+      expect(tiles).toEqual([
+        ['Performance', '100', 'bdg g'],
+        ['Accessibility', '89', 'bdg d'],
+        ['Best Practices', '96', 'bdg g'],
+        ['SEO', '100', 'bdg g'],
+      ]);
+      expect(text).toContain('stet fixes (2)');
+      expect(text).toContain('The host owns (2)');
+      expect(docOf(html).querySelector('[data-act="auditRun"]')?.textContent).toBe('Run again');
+      expect([...docOf(html).querySelectorAll('[data-act^="edit:"]')].map((b) => b.getAttribute('data-act'))).toEqual(['edit:hero_headline', 'edit:hero_story']);
+      await html.act('edit:hero_headline');
+      expect(docOf(html).querySelector('.row.on')?.getAttribute('data-act')).toBe('key:hero_headline');
+      expect(html.errors).toEqual([]);
+      html.dom.window.close();
+
+      const js = await card(siteBody(), { reply: { state: 'none' } });
+      expect(body(js)).toContain('Not run yet. Runs against the production build.');
+      js.dom.window.close();
+    });
+
+    it('bands the tiles at 90 and 50, a missing score reading a dash', async () => {
+      const held = { reply: done(resultOf([pageOf('home', { performance: 90, accessibility: 89, bestPractices: 50, seo: 49 }), pageOf('about', { performance: null })])) };
+      const page = await card(htmlSite(), held);
+      const classes = [...docOf(page).querySelectorAll('.lht .bdg')].map((b) => `${b.textContent}:${b.className}`);
+      expect(classes.slice(0, 4)).toEqual(['90:bdg g', '89:bdg d', '50:bdg d', '49:bdg r']);
+      expect(classes[4]).toBe('–:bdg ');
+      page.dom.window.close();
+    });
+
+    it('applies the head fixes from the card and re-fills it with the re-run (journey C13)', async () => {
+      const fixed = pageOf('home', { accessibility: 89 }, [audit('fix', 'html-has-lang'), audit('fix', 'meta-viewport'), audit('fix', 'document-title'), audit('copy', 'link-name', { key: 'home_link' })], { file: 'index.html' });
+      const held = { reply: done(resultOf([fixed])) };
+      const page = await card(htmlSite(), held);
+      expect(body(page)).toContain('3 head edits');
+      held.reply = done(resultOf([fixed, pageOf('home', {}, [audit('copy', 'meta-description', { key: 'minted_key', remedy: 'minted_key is empty' })], { file: 'index.html' })]));
+      // The write minted the key: the site read after it declares it.
+      page.answer('/api/site', 200, siteBody({ host: 'html', descriptor: { ...descriptor, keys: { ...descriptor.keys, minted_key: { shape: 'text', target: 'web' } } } }));
+      await page.act('auditFix:home');
+      expect(lastStart(page)).toEqual({ fix: true, pages: ['home'] });
+      expect(body(page)).not.toContain('head edits');
+      expect(docOf(page).querySelector('.card [data-act="edit:minted_key"]')?.textContent).toBe('→ open');
+      expect(page.requested('/api/site?')).toHaveLength(2);
+      expect(docOf(page).querySelectorAll('.lht').length).toBe(1);
+      page.dom.window.close();
+    });
+
+    it('keeps the drafts a person has open when Apply fixes reads the site again', async () => {
+      const fixed = pageOf('home', { accessibility: 89 }, [audit('fix', 'html-has-lang')], { file: 'index.html' });
+      const held = { reply: done(resultOf([fixed])) };
+      const page = await card(htmlSite(), held);
+      await page.act('tab:Content');
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'A draft the fix must not eat');
+      expect(page.html()).toContain('1 unsaved edit');
+      await page.act('tab:SEO');
+      held.reply = done(resultOf([pageOf('home', {}, [], { file: 'index.html' })]));
+      page.answer('/api/site', 200, siteBody({ host: 'html', descriptor: { ...descriptor, keys: { ...descriptor.keys, minted_key: { shape: 'text', target: 'web' } } } }));
+      await page.act('auditFix:home');
+      expect(page.requested('/api/site?')).toHaveLength(2);
+      await page.act('tab:Content');
+      expect(page.html()).toContain('1 unsaved edit');
+      expect((docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('A draft the fix must not eat');
+      // The refresh did read the site: the key the fix minted is in the list.
+      expect(page.html()).toContain('<option value="prefix:minted">minted</option>');
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('keeps the drafts a person has open when the SEO tab declares a page', async () => {
+      const page = await paint();
+      await page.act('tab:Content');
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'A draft declaring must not eat');
+      expect(page.html()).toContain('1 unsaved edit');
+      await page.act('tab:SEO');
+      await page.act('seoLoad');
+      await page.act('declare:about');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/pages/declare')).at(-1)?.body).toEqual({ names: ['about'] });
+      await page.act('tab:Content');
+      expect(page.html()).toContain('1 unsaved edit');
+      expect((docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('A draft declaring must not eat');
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('opens a key only where the audit carries it, never for a remedy word that happens to name a declared key', async () => {
+      const keyed: Descriptor = { ...descriptor, keys: { ...descriptor.keys, label: { shape: 'text', target: 'web' }, alt: { shape: 'text', target: 'web' }, home_meta_description: { shape: 'text', target: 'web' } } };
+      const held = {
+        reply: done(
+          resultOf([
+            pageOf('home', {}, [
+              audit('copy', 'label', { at: 'index.html:12', snippet: '<textarea id="notes">', remedy: 'has no label — give it id="notes" and write a <label for="notes">' }),
+              audit('copy', 'image-alt', { remedy: 'has no alt — write alt text, or alt="" for a decorative image' }),
+              audit('copy', 'meta-description', { key: 'home_meta_description', remedy: 'index.html has no description — in the plan below, bound to home_meta_description' }),
+            ], { file: 'index.html' }),
+          ]),
+        ),
+      };
+      const page = await card(siteBody({ host: 'html', descriptor: keyed }), held);
+      await page.act('auditRun');
+      expect([...docOf(page).querySelectorAll('.card [data-act^="edit:"]')].map((b) => b.getAttribute('data-act'))).toEqual(['edit:home_meta_description']);
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('audits a JavaScript site’s build, shows the building line, and posts the toggle and the preview url (journey C13)', async () => {
+      const held = { reply: { state: 'none' } as unknown };
+      const page = await card(siteBody({ git: { head: 'c7b3961', branch: 'develop', upstream: 'origin/develop', ahead: 0, behind: 0, dirty: false, live: 'main' } }), held, [
+        ['/api/site/preview-link', 200, { url: 'https://develop.psyon-site.pages.dev' }],
+      ]);
+      expect(docOf(page).querySelector('[data-act="auditPreview"]')?.textContent).toBe('Audit the deployed preview');
+      held.reply = { state: 'running', elapsed: 3, lines: ['building (npm run build)…', 'compiling'], result: null };
+      await page.act('auditForm:desktop');
+      await page.act('auditRun');
+      expect(lastStart(page)).toEqual({ desktop: true });
+      expect(body(page)).toContain('Building the production preview (npm run build)…');
+      held.reply = done(resultOf([pageOf('home', {})], { lighthouse: { ...lighthouse, formFactor: 'desktop', targetKind: 'build' } }), 41);
+      await until(() => body(page).includes('the production build'));
+      expect(docOf(page).querySelector('.card')?.textContent).toContain('lighthouse 13.5.0 · desktop · the production build · 1 page · 41 s');
+      held.reply = done(resultOf([pageOf('home', {})], { lighthouse: { ...lighthouse, targetKind: 'url', target: 'https://develop.psyon-site.pages.dev' } }));
+      await page.act('auditForm:mobile');
+      await page.act('auditPreview');
+      expect(lastStart(page)).toEqual({ url: 'https://develop.psyon-site.pages.dev' });
+      expect(docOf(page).querySelector('.card')?.textContent).toContain('lighthouse 13.5.0 · mobile · https://develop.psyon-site.pages.dev · 1 page');
+      page.dom.window.close();
+    });
+
+    it('says Auditing <page>… <n> s while a run goes on, and polls until it ends', async () => {
+      const held = { reply: { state: 'running', elapsed: 7, lines: ['auditing home… 1/1'], result: null } as unknown };
+      const page = await card(htmlSite(), held);
+      expect(body(page)).toContain('Auditing home… 7 s');
+      expect((docOf(page).querySelector('[data-act="auditRun"]') as HTMLButtonElement).disabled).toBe(true);
+      held.reply = done(resultOf([pageOf('home', {})]));
+      expect(await until(() => body(page).includes('lighthouse 13.5.0'))).toBe(true);
+      const reads = page.requested('/api/site/audit?').length;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(page.requested('/api/site/audit?')).toHaveLength(reads);
+      page.dom.window.close();
+    });
+
+    it('shows the refusals and failures in the card', async () => {
+      const held = { reply: { state: 'none' } as unknown };
+      const page = await card(siteBody(), held);
+      page.answer('/api/site/audit-start', 409, { error: 'stop the dev server first — next build writes the .next folder it is serving from' });
+      await page.act('auditRun');
+      expect(docOf(page).querySelector('.card .err')?.textContent).toBe('stop the dev server first — next build writes the .next folder it is serving from');
+      page.answer('/api/site/audit-start', 200, { state: 'running' });
+      held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary' }] });
+      await page.act('auditRun');
+      expect(docOf(page).querySelector('.card .err')?.textContent).toBe('Chrome was not found — install Google Chrome, or set CHROME_PATH in the shell that runs stet dev');
+      held.reply = { state: 'done', elapsed: 9, lines: ['building (npm run build)…', 'boom'], result: { ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: 'npm run build exited 1 — its output is above' }] } };
+      await page.act('auditRun');
+      expect(docOf(page).querySelector('.card .err')?.textContent).toBe('The build failed — its output is under Setup');
+      await page.act('tab:Setup');
+      expect(body(page)).toContain('Lighthouse output');
+      expect(docOf(page).querySelector('.term')?.textContent).toContain('boom');
+      page.dom.window.close();
+    });
+
+    it('clears the card on a site switch, leaves the child, and reads the finished result on return', async () => {
+      const held = { reply: { state: 'running', elapsed: 1, lines: ['auditing home… 1/1'], result: null } as unknown };
+      const page = await card(htmlSite(), held);
+      const reads = (): number => page.requested('/api/site/audit?').length;
+      // The other checkout has no audit; the server keys them by site.
+      held.reply = { state: 'none', elapsed: 0, lines: [], result: null };
+      await page.act('site:/checkouts/other');
+      expect(body(page)).not.toContain('Auditing home');
+      const afterSwitch = reads();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(reads()).toBe(afterSwitch);
+      held.reply = done(resultOf([pageOf('home', {})]));
+      await page.act('site:/checkouts/mini');
+      await page.act('tab:SEO');
+      expect(body(page)).toContain('lighthouse 13.5.0');
+      page.dom.window.close();
+    });
+
+    it('escapes every string a result carries (the hostile snippet)', async () => {
+      const hostile = '<img src=x onerror=alert(1)>';
+      const held = {
+        reply: done(
+          resultOf([pageOf(hostile, {}, [audit('copy', 'x', { snippet: hostile, remedy: hostile, at: hostile, key: hostile }), audit('host', hostile, { snippet: hostile, remedy: hostile })], { file: hostile, route: hostile })], {
+            lighthouse: { ...lighthouse, version: hostile, targetKind: 'url', target: hostile },
+          }),
+        ),
+      };
+      const page = await card(htmlSite(), held);
+      expect(docOf(page).querySelector('.card img')).toBeNull();
+      expect(docOf(page).querySelector('.card')?.textContent).toContain(hostile);
+      held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: hostile }] });
+      await page.act('auditRun');
+      expect(docOf(page).querySelector('.card img')).toBeNull();
+      expect(docOf(page).querySelector('.card .err')?.textContent).toBe(hostile);
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('lays the tiles and lists out for a phone, every line wrapping (journey C13)', async () => {
+      const held = { reply: done(resultOf([indexPage()])) };
+      const page = await card(htmlSite(), held);
+      const window = page.dom.window;
+      const tiles = docOf(page).querySelector('.lht') as HTMLElement;
+      const row = docOf(page).querySelector('.lhi') as HTMLElement;
+      expect(window.getComputedStyle(tiles).gridTemplateColumns).toBe('repeat(auto-fit,minmax(140px,1fr))');
+      expect(window.getComputedStyle(row).overflowWrap).toBe('anywhere');
+      expect(window.getComputedStyle(docOf(page).querySelector('.lhi code') as HTMLElement).overflowWrap).toBe('anywhere');
+      const style = [...docOf(page).querySelectorAll('style')].map((el) => el.textContent).join('');
+      expect(style).toContain('@media(max-width:760px){.cards{grid-template-columns:1fr}}');
+      expect(style).not.toMatch(/\.(lht|lhi|lhp)[^{]*\{[^}]*[;{]width:/);
+      page.dom.window.close();
+    });
+
+    it('sets the preview command in Setup, the router’s command its placeholder, a cleared field removing it (journey C13)', async () => {
+      const page = await paint({ site: siteBody({ previewDefault: 'npx astro preview --host 127.0.0.1 --port {port} --ignore-lock' }) });
+      await page.act('tab:Setup');
+      const field = (): HTMLInputElement => docOf(page).getElementById('previewcmd') as HTMLInputElement;
+      expect(field().value).toBe('');
+      expect(field().placeholder).toBe('npx astro preview --host 127.0.0.1 --port {port} --ignore-lock');
+      expect(body(page)).toContain('Preview command');
+      expect(body(page)).toContain('Runs after npm run build for stet audit lighthouse --build; {port} and PORT carry the port, and the server must listen on 127.0.0.1');
+      await page.change('entryPreview', 'node serve.mjs --port {port}');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/workspace/update')).at(-1)?.body).toEqual({ path: '/checkouts/mini', previewCommand: 'node serve.mjs --port {port}' });
+      expect(field().value).toBe('node serve.mjs --port {port}');
+      await page.change('entryPreview', '');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/workspace/update')).at(-1)?.body).toEqual({ path: '/checkouts/mini', previewCommand: '' });
+      page.dom.window.close();
+
+      const html = await paint({ site: htmlSite() });
+      await html.act('tab:Setup');
+      expect(docOf(html).getElementById('previewcmd')).toBeNull();
+      html.dom.window.close();
+    });
+  });
 });
 
 describe('stet dev holds its signal listeners through the close (F48)', () => {
@@ -7773,4 +8118,211 @@ describe('stet dev holds its signal listeners through the close (F48)', () => {
     expect(Date.now() - began).toBeLessThan(5_500);
     expect(await gone(-pid, 0)).toBe(true);
   }, 20_000);
+});
+
+describe('the audit child (D10)', () => {
+  /** Stub CLIs the audit route runs in place of the installed one, each a node script. */
+  const STUBS = {
+    argv:
+      "import { appendFileSync } from 'node:fs';\n" +
+      "appendFileSync(process.env.STET_AUDIT_SPAWNS ?? 'spawns.txt', 'x\\n');\n" +
+      'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), token: process.env.STET_DEV_TOKEN ?? null }));\n',
+    failing: "process.stdout.write(JSON.stringify({ ok: false }));\nprocess.exit(1);\n",
+    forever:
+      "import { appendFileSync, writeFileSync } from 'node:fs';\n" +
+      "appendFileSync('spawns.txt', 'x\\n');\nwriteFileSync('audit.pid', String(process.pid));\n" +
+      "process.stderr.write('auditing home… 1/1\\n');\nsetInterval(() => {}, 1000);\n",
+    trap:
+      "import { writeFileSync } from 'node:fs';\nwriteFileSync('audit.pid', String(process.pid));\n" +
+      "process.on('SIGTERM', () => { process.stderr.write('stopped by SIGTERM\\n'); process.exit(143); });\n" +
+      "process.stderr.write('auditing home… 1/1\\n');\nsetInterval(() => {}, 1000);\n",
+    slow: "setTimeout(() => process.stdout.write('{}'), 1100);\n",
+  } as const;
+
+  function stub(kind: keyof typeof STUBS): string {
+    const path = join(tempDir('stet-audit-stub-'), `${kind}.mjs`);
+    writeFileSync(path, STUBS[kind]);
+    return path;
+  }
+
+  function auditHost(cwd: string, kind: keyof typeof STUBS, over: Partial<WorkspaceEntry> = {}): {
+    handler: (r: Request) => Promise<Response>;
+    ctx: DevContext;
+    query: string;
+    path: string;
+  } {
+    const file = workspaceFile();
+    addSite(file, cwd);
+    const path = realpathSync(cwd);
+    if (Object.keys(over).length > 0) updateSite(file, path, over);
+    // Nothing answers: a dev server the case starts is ended by its group, and no stop command runs.
+    const refused = (async () => {
+      throw new Error('connection refused');
+    }) as unknown as typeof fetch;
+    const ctx = contextOver(file, { fetchImpl: refused, auditCli: stub(kind) });
+    return { handler: createDevHandler(ctx), ctx, query: `?site=${encodeURIComponent(path)}`, path };
+  }
+
+  async function settled(handler: (r: Request) => Promise<Response>, query: string, ms = 8_000): Promise<any> {
+    const deadline = Date.now() + ms;
+    let last: any;
+    while (Date.now() < deadline) {
+      last = await get(handler, `/api/site/audit${query}`);
+      if (last.state !== 'running') return last;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    return last;
+  }
+
+  async function pidFile(cwd: string, ms = 5_000): Promise<number> {
+    const deadline = Date.now() + ms;
+    while (!existsSync(join(cwd, 'audit.pid')) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 40));
+    return Number(readFileSync(join(cwd, 'audit.pid'), 'utf8'));
+  }
+
+  it('answers none before a run, and passes the arguments per site kind', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'argv');
+    expect(await get(h.handler, `/api/site/audit${h.query}`)).toEqual({ state: 'none', elapsed: 0, lines: [], result: null });
+    expect((await post(h.handler, `/api/site/audit-start${h.query}`, {})).status).toBe(200);
+    expect((await settled(h.handler, h.query)).result.argv).toEqual(['audit', 'lighthouse', '--json']);
+
+    const js = auditHost(snapshotHost().cwd, 'argv');
+    await post(js.handler, `/api/site/audit-start${js.query}`, { desktop: true, pages: ['home', 'pricing'], fix: true });
+    expect((await settled(js.handler, js.query)).result.argv).toEqual([
+      'audit', 'lighthouse', '--json', '--desktop', '--pages', 'home,pricing', '--fix', '--write', '--build',
+    ]);
+
+    const url = auditHost(snapshotHost().cwd, 'argv');
+    await post(url.handler, `/api/site/audit-start${url.query}`, { url: 'https://preview.example.dev/' });
+    expect((await settled(url.handler, url.query)).result.argv).toEqual(['audit', 'lighthouse', '--json', '--url', 'https://preview.example.dev/']);
+  });
+
+  it('accepts a page an html document proposes, and answers 400 for an unknown page or a non-http url', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'argv');
+    expect((await post(h.handler, `/api/site/audit-start${h.query}`, { pages: ['nosuch'] })).body).toEqual({ error: 'nosuch is not a declared page' });
+    expect((await post(h.handler, `/api/site/audit-start${h.query}`, { pages: ['nosuch'] })).status).toBe(400);
+    expect((await post(h.handler, `/api/site/audit-start${h.query}`, { pages: ['home'], fix: true })).status).toBe(200);
+    expect((await settled(h.handler, h.query)).result.argv).toEqual(['audit', 'lighthouse', '--json', '--pages', 'home', '--fix', '--write']);
+
+    const js = auditHost(snapshotHost().cwd, 'argv');
+    const refused = await post(js.handler, `/api/site/audit-start${js.query}`, { url: 'ftp://example.com/' });
+    expect(refused).toEqual({ status: 400, body: { error: 'url must be an http or https address' } });
+  });
+
+  it('accepts home on a JavaScript site declaring no page, for the audit and its fixes alike', async () => {
+    const js = auditHost(
+      snapshotHost((descriptor) => {
+        delete (descriptor as { pages?: unknown }).pages;
+        for (const def of Object.values(descriptor.keys)) delete (def as { pages?: unknown }).pages;
+      }).cwd,
+      'argv',
+    );
+    const started = await post(js.handler, `/api/site/audit-start${js.query}`, { fix: true, pages: ['home'] });
+    expect(started.status).toBe(200);
+    expect((await settled(js.handler, js.query)).result.argv).toEqual(['audit', 'lighthouse', '--json', '--pages', 'home', '--fix', '--write', '--build']);
+    expect((await post(js.handler, `/api/site/audit-start${js.query}`, { pages: ['pricing'] })).body).toEqual({ error: 'pricing is not a declared page' });
+  });
+
+  it('refuses --build on a Next site below 16 whose dev server runs, and on one whose version cannot be read', async () => {
+    const STOP = 'stop the dev server first — next build writes the .next folder it is serving from';
+    const cases: Array<[string, string | null, number]> = [
+      ['app', '15.5.26', 409],
+      ['app', null, 409],
+      ['app', '16.4.1', 200],
+      ['astro', '15.5.26', 200],
+    ];
+    for (const [router, version, status] of cases) {
+      const host = makeCliHost({ config: { project: 't', router } });
+      if (version !== null) {
+        mkdirSync(join(host.cwd, 'node_modules/next'), { recursive: true });
+        writeFileSync(join(host.cwd, 'node_modules/next/package.json'), JSON.stringify({ name: 'next', version }));
+      }
+      const h = auditHost(host.cwd, 'argv', { devCommand: 'node -e "setInterval(()=>{},1000)"' });
+      expect((await post(h.handler, `/api/site/dev-start${h.query}`, {})).body['running']).toBe(true);
+      try {
+        const started = await post(h.handler, `/api/site/audit-start${h.query}`, {});
+        expect(started.status, `${router} ${version}`).toBe(status);
+        if (status === 409) expect(started.body).toEqual({ error: STOP });
+        else await settled(h.handler, h.query);
+      } finally {
+        await post(h.handler, `/api/site/dev-stop${h.query}`, {});
+      }
+    }
+  }, 30_000);
+
+  it('answers the running child on a second start, and spawns once', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'forever');
+    try {
+      const first = await post(h.handler, `/api/site/audit-start${h.query}`, {});
+      expect(first.body['state']).toBe('running');
+      await pidFile(html.cwd);
+      const second = await post(h.handler, `/api/site/audit-start${h.query}`, {});
+      expect(second.body['state']).toBe('running');
+      // Time for a second child, were one spawned, to record itself.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(readFileSync(join(html.cwd, 'spawns.txt'), 'utf8')).toBe('x\n');
+    } finally {
+      await stopEveryChild(h.ctx);
+    }
+  });
+
+  it('reads done from stdout whatever the exit, and failed from a child ended with no JSON, its lines kept', async () => {
+    const html = await makeHtmlHost();
+    const failing = auditHost(html.cwd, 'failing');
+    await post(failing.handler, `/api/site/audit-start${failing.query}`, {});
+    expect(await settled(failing.handler, failing.query)).toEqual(expect.objectContaining({ state: 'done', result: { ok: false } }));
+
+    const other = await makeHtmlHost();
+    const trap = auditHost(other.cwd, 'trap');
+    await post(trap.handler, `/api/site/audit-start${trap.query}`, {});
+    const pid = await pidFile(other.cwd);
+    process.kill(pid, 'SIGTERM');
+    const read = await settled(trap.handler, trap.query);
+    expect(read.state).toBe('failed');
+    expect(read.lines).toEqual(['auditing home… 1/1', 'stopped by SIGTERM']);
+  });
+
+  it('freezes elapsed at the exit', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'slow');
+    await post(h.handler, `/api/site/audit-start${h.query}`, {});
+    const done = await settled(h.handler, h.query);
+    expect(done.state).toBe('done');
+    expect(done.elapsed).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    expect((await get(h.handler, `/api/site/audit${h.query}`)).elapsed).toBe(1);
+  });
+
+  it('never hands the child the run token', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'argv');
+    const held = process.env['STET_DEV_TOKEN'];
+    process.env['STET_DEV_TOKEN'] = TOKEN;
+    try {
+      await post(h.handler, `/api/site/audit-start${h.query}`, {});
+      expect((await settled(h.handler, h.query)).result.token).toBeNull();
+    } finally {
+      if (held === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held;
+    }
+  });
+
+  it("ends the child when the site leaves the workspace, and at the server's close", async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'forever');
+    await post(h.handler, `/api/site/audit-start${h.query}`, {});
+    const pid = await pidFile(html.cwd);
+    await post(h.handler, '/api/workspace/remove', { path: h.path });
+    expect(await waitGone(pid)).toBe(true);
+
+    const other = await makeHtmlHost();
+    const closing = auditHost(other.cwd, 'forever');
+    await post(closing.handler, `/api/site/audit-start${closing.query}`, {});
+    const second = await pidFile(other.cwd);
+    await stopEveryChild(closing.ctx);
+    expect(await waitGone(second)).toBe(true);
+  });
 });

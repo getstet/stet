@@ -19,7 +19,7 @@
 import { join } from 'node:path';
 
 import type { Bundle } from '../src/bundle.js';
-import { generateDefaultsModule } from '../src/codegen.js';
+import { generateDefaultsModule, generateResolvedModule } from '../src/codegen.js';
 import { activeRow, resolve } from '../src/resolve.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
@@ -134,8 +134,10 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
     } else {
       writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
       writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged));
+      writeText(join(io.cwd, config.codegen.resolved), generateResolvedModule(project.descriptor, merged));
       report.line(`wrote ${config.snapshotPath}`);
       report.line(`wrote ${config.codegen.defaults}`);
+      report.line(`wrote ${config.codegen.resolved}`);
     }
 
     if (isStoreBacked(project.environment.block)) {

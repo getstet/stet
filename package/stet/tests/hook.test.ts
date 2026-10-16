@@ -27,7 +27,7 @@ import { basename, join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { cleanupCliHosts, makeHtmlHost } from '../conformance/cli-host.js';
+import { cleanupCliHosts, htmlFixture, makeHtmlHost } from '../conformance/cli-host.js';
 import { runDoctor } from '../cli/doctor.js';
 import { runEject } from '../cli/eject.js';
 import { GATE_LINE, HOOK_BEFORE_0_3_1, readGate, runHookInstall, runHookRemove, SHARED_GATE_LINE } from '../cli/hook.js';
@@ -193,10 +193,10 @@ function standInCheckout(top: string, folder: string, log: string): string {
 }
 
 /** Everything staged and committed from `cwd` — a worktree's top, where git runs a hook. */
-function commit(cwd: string, message: string): { code: number; out: string; ms: number } {
+function commit(cwd: string, message: string, env: NodeJS.ProcessEnv = {}): { code: number; out: string; ms: number } {
   execFileSync('git', ['add', '-A'], { cwd });
   const started = Date.now();
-  const run = spawnSync('git', ['commit', '-m', message], { cwd, encoding: 'utf8', env: REGISTRY_DOWN });
+  const run = spawnSync('git', ['commit', '-m', message], { cwd, encoding: 'utf8', env: { ...REGISTRY_DOWN, ...env } });
   return { code: run.status ?? 1, out: `${run.stdout}${run.stderr}`, ms: Date.now() - started };
 }
 
@@ -211,7 +211,12 @@ async function gatedRepo(folders: string[], stet: 'built' | { log: string }): Pr
   const top = gitRepo();
   const checkouts: string[] = [];
   for (const folder of folders) {
-    const host = await makeHtmlHost({ register: true });
+    // The fixture's textarea labelled, so the gate's seo check passes on it.
+    const labelled = htmlFixture('index.html').replace(
+      '<textarea name="notes">',
+      '<label for="notes">Notes about the dataset</label>\n      <textarea id="notes" name="notes">',
+    );
+    const host = await makeHtmlHost({ register: true, files: { 'index.html': labelled } });
     const checkout = folder === '' ? top : join(top, folder);
     mkdirSync(checkout, { recursive: true });
     cpSync(host.cwd, checkout, { recursive: true });
@@ -800,7 +805,7 @@ async function seoCheckout(
   const host = await makeHtmlHost({
     files: {
       'index.html':
-        `<!DOCTYPE html>\n<html><head>\n<title data-stet="home_page_title">${opts.title}</title>\n` +
+        `<!DOCTYPE html>\n<html lang="en"><head>\n<title data-stet="home_page_title">${opts.title}</title>\n` +
         '<meta name="description" content="Licensed training data from the companies that already hold it." data-stet-content="home_meta_description">\n' +
         '</head><body>\n<h1 data-stet="home_hero_headline">Data partnerships for AI labs.</h1>\n</body></html>\n',
     },
@@ -837,6 +842,43 @@ describe('the gate runs stet seo check where the entry opted in', () => {
   const LONG = 'Psyon — data partnerships for AI labs, all sourced with consent';
 
   it.skipIf(!builtBinExists())(
+    'stays offline: a commit with Chrome missing lands through check, scan and seo check, and the runner names no audit (journey C3)',
+    async () => {
+      const { top, checkouts } = await gatedRepo(['site'], 'built');
+      expect(await runHookInstall([], io(checkouts[0] as string))).toBe(0);
+      editDocument(checkouts[0] as string);
+      const landed = commit(top, 'a commit on a machine with no Chrome', { CHROME_PATH: join(top, 'no-such-chrome') });
+      expect(landed.code, landed.out).toBe(0);
+      expect(landed.out).toContain('document: index.html current');
+      expect(landed.out).toMatch(/scan: \d+ file/);
+      expect(landed.out).toMatch(/seo: \d+ pages checked/);
+      expect(readFileSync(join(top, '.git', 'stet-gate.mjs'), 'utf8')).not.toMatch(/\baudit\b/);
+    },
+    90_000,
+  );
+
+  it.skipIf(!builtBinExists())(
+    'refuses a commit naming the unlabelled textarea where the entry runs seo check (journey A14, C3)',
+    async () => {
+      const top = gitRepo();
+      const host = await makeHtmlHost({ register: true });
+      const site = join(top, 'site');
+      mkdirSync(site, { recursive: true });
+      cpSync(host.cwd, site, { recursive: true });
+      installStetShim(site);
+      commit(top, 'base');
+      expect(await runHookInstall([], io(site))).toBe(0);
+      editDocument(site);
+      const before = head(top);
+      const refused = commit(top, 'an edit beside an unlabelled textarea');
+      expect(refused.code).not.toBe(0);
+      expect(refused.out).toContain('<textarea name="notes"> has no label');
+      expect(head(top)).toBe(before);
+    },
+    90_000,
+  );
+
+  it.skipIf(!builtBinExists())(
     'lands an advisory over-length with its warn, refuses a hard one, and lands a checkout with no page records',
     async () => {
       expect(LONG.length).toBe(63);
@@ -863,7 +905,7 @@ describe('the gate runs stet seo check where the entry opted in', () => {
       editDocument(checkouts[0] as string);
       const noPages = commit(bare, 'a checkout with no page records');
       expect(noPages.code, noPages.out).toBe(0);
-      expect(noPages.out).toContain('no pages declared — the SEO rules have nothing to check');
+      expect(noPages.out).toContain('no pages declared — the page rules have nothing to check');
     },
     90_000,
   );

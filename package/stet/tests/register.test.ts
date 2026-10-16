@@ -5,8 +5,10 @@
  * never-touch-a-published-value guarantee, idempotence, the server/client
  * choice, and every refusal (ambiguous, no-provider, foreign `copy`).
  */
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +39,7 @@ vi.mock('../cli/artifacts.js', async (importOriginal) => {
 import { runRegister } from '../cli/register.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { planDocuments, planHtmlRegister } from '../cli/html-host.js';
+import { packageRoot } from '../cli/installed.js';
 import { fileHash } from '../cli/key-plan.js';
 import { Report } from '../cli/report.js';
 import type { Snapshot } from '../src/snapshot.js';
@@ -61,6 +64,8 @@ interface SetupOpts {
   readPathImport?: string;
   /** Where the read path sits — the guard resolves the specifier ONTO this file. */
   readPathFile?: string;
+  /** The root layout's text, in place of the one-line `<html><body>{children}</body></html>` layout. */
+  layout?: string;
 }
 function project(opts: SetupOpts = {}): string {
   const dir = mkdtempSync(join(tmpdir(), 'stet-register-'));
@@ -92,7 +97,8 @@ function project(opts: SetupOpts = {}): string {
   write(
     dir,
     `${router}/layout.tsx`,
-    `${providerImport}export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <html><body>{children}</body></html>;\n}\n`,
+    opts.layout ??
+      `${providerImport}export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <html><body>{children}</body></html>;\n}\n`,
   );
   return dir;
 }
@@ -116,6 +122,11 @@ function io(dir: string): Captured {
   return { cwd: dir, env: {}, stdout: (l) => out.push(l), stderr: (l) => err.push(l), out, err };
 }
 
+/** A root layout with no `<body>` and `{children}` twice: the mount cannot be located. */
+const UNLOCATABLE_LAYOUT =
+  'export default function RootLayout({ children }: { children: React.ReactNode }) {\n' +
+  '  return <>{children}<aside>{children}</aside></>;\n' +
+  '}\n';
 const SERVER_PAGE = (body: string): string => `export default function Page() {\n  return ${body};\n}\n`;
 const CLIENT_WIDGET = (body: string): string => `'use client';\nexport default function Widget() {\n  return ${body};\n}\n`;
 
@@ -141,6 +152,13 @@ describe('runRegister — descriptor and default', () => {
     const edited = read(dir, 'app/page.tsx');
     expect(edited).toContain("import { copy } from '@/lib/content'");
     expect(edited).toContain("{copy('home_page_headline')}");
+  });
+  it('--write writes content/resolved.ts in its batch, the new key resolved (D8)', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Resolved here</h1>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'content/resolved.ts')).toContain('"home_page_headline": "Resolved here"');
   });
 });
 
@@ -210,13 +228,15 @@ describe('runRegister — the server/client choice and refusals', () => {
     expect(read(dir2, 'app/widget.tsx')).toContain("{copy('page_headline')}");
   });
 
-  it('a client rewrite with no CopyProvider mounted is skipped with a mount-first message', async () => {
-    const dir = project({ provider: false });
+  it('a client rewrite where the CopyProvider mount cannot be located is skipped with the by-hand message', async () => {
+    const dir = project({ layout: UNLOCATABLE_LAYOUT });
     write(dir, 'app/widget.tsx', CLIENT_WIDGET('<h1>Needs provider</h1>'));
     const cap = io(dir);
     await runRegister(['--from', 'scan', '--write'], cap);
     expect(descriptor(dir).keys['widget_headline']).toBeUndefined();
-    expect(cap.err.join('\n')).toContain('CopyProvider');
+    expect(cap.err.join('\n')).toContain(
+      'app/widget.tsx: "widget_headline" needs a client rewrite, but the CopyProvider mount could not be located in app/layout.tsx — mount it by hand, then run stet register again',
+    );
     expect(read(dir, 'app/widget.tsx')).not.toContain('useCopy');
   });
 
@@ -231,6 +251,396 @@ describe('runRegister — the server/client choice and refusals', () => {
     await runRegister(['--from', 'scan', '--write'], cap);
     expect(descriptor(dir).keys['widget_headline']).toBeUndefined();
     expect(cap.err.join('\n')).toContain('foreign');
+  });
+});
+
+/** A Next root layout rendering a client `Nav` beside `{children}` (the A2 scenario). */
+const NAV_LAYOUT =
+  "import { Nav } from '../components/Nav';\n" +
+  '\n' +
+  'export default function RootLayout({ children }: { children: React.ReactNode }) {\n' +
+  '  return (\n' +
+  '    <html lang="en">\n' +
+  '      <body className="antialiased">\n' +
+  '        <Nav />\n' +
+  '        {children}\n' +
+  '      </body>\n' +
+  '    </html>\n' +
+  '  );\n' +
+  '}\n';
+const NAV = "'use client';\nexport function Nav() {\n  return <nav><a href=\"/about\">About the studio</a></nav>;\n}\n";
+/** The `resolved` form's block from `app/layout.tsx`, in a TypeScript layout. */
+const RESOLVED_BLOCK =
+  "import { CopyProvider } from '@getstet/stet/react';\n" +
+  "import type { Descriptor } from '@getstet/stet';\n" +
+  "import descriptorJson from '../content/descriptor.json';\n" +
+  "import { RESOLVED } from '../content/resolved';";
+const OPEN = '<CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={RESOLVED}>';
+
+/**
+ * The layout rendered on the server, its imports loaded from the temp host:
+ * each `.tsx`/`.ts` transpiled to CommonJS, JSON read as data, and
+ * `@getstet/stet/react` the package's own provider.
+ */
+async function renderLayout(dir: string, layoutRel: string): Promise<string> {
+  const ts = (await import('typescript')).default;
+  const { createRequire } = await import('node:module');
+  const req = createRequire(import.meta.url);
+  const { createElement } = req('react') as typeof import('react');
+  const { renderToString } = req('react-dom/server') as typeof import('react-dom/server');
+  // By a path tsc does not follow: the provider is `.tsx`, which the tests' compile has no JSX setting for.
+  const reactLayer = '../react/index.js';
+  const stetReact: unknown = await import(/* @vite-ignore */ reactLayer);
+  const cache = new Map<string, unknown>();
+  const resolveFile = (from: string, spec: string): string => {
+    const base = join(from, spec);
+    for (const candidate of [base, `${base}.tsx`, `${base}.ts`]) if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
+    throw new Error(`unresolved ${spec} from ${from}`);
+  };
+  const load = (abs: string): unknown => {
+    if (cache.has(abs)) return cache.get(abs);
+    if (abs.endsWith('.json')) {
+      const data: unknown = JSON.parse(readFileSync(abs, 'utf8'));
+      cache.set(abs, data);
+      return data;
+    }
+    const code = ts.transpileModule(readFileSync(abs, 'utf8'), {
+      fileName: abs,
+      compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true, target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const mod = { exports: {} as Record<string, unknown> };
+    cache.set(abs, mod.exports);
+    const localRequire = (spec: string): unknown =>
+      spec === '@getstet/stet/react' ? stetReact : spec.startsWith('.') ? load(resolveFile(dirname(abs), spec)) : req(spec);
+    new Function('require', 'module', 'exports', code)(localRequire, mod, mod.exports);
+    return mod.exports;
+  };
+  const layout = load(join(dir, layoutRel)) as { default: (props: { children: unknown }) => unknown };
+  return renderToString(createElement(layout.default as never, { children: createElement('main', null, 'the page') }));
+}
+
+describe('runRegister — the provider mount (P15)', () => {
+  const navHost = (layout = NAV_LAYOUT): string => {
+    const dir = project({ layout, managedSurfaces: ['app/**/*.tsx', 'components/**/*.tsx'] });
+    write(dir, 'components/Nav.tsx', NAV);
+    return dir;
+  };
+
+  it('mounts over everything inside <body> where the layout renders a client Nav beside {children}, and the layout renders with Nav reading copy (A2)', async () => {
+    const dir = navHost();
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'components/Nav.tsx')).toContain("import { useCopy } from '@getstet/stet/react';");
+    expect(read(dir, 'app/layout.tsx')).toBe(
+      NAV_LAYOUT.replace("'../components/Nav';\n", `'../components/Nav';\n${RESOLVED_BLOCK}\n\n`)
+        .replace('<body className="antialiased">', `<body className="antialiased">${OPEN}`)
+        .replace('        {children}\n      </body>', '        {children}\n      </CopyProvider></body>'),
+    );
+    const out = cap.out.join('\n');
+    expect(out).toContain('app/layout.tsx: the one edit to existing code — mount the CopyProvider:');
+    expect(out.indexOf('mount the CopyProvider:')).toBeLessThan(out.indexOf('--- a/app/layout.tsx'));
+    expect(out).toMatch(/^app\/layout\.tsx: mounted CopyProvider$/m);
+    expect(existsSync(join(dir, 'content/resolved.ts'))).toBe(true);
+    expect(await runCli(['check'], io(dir))).toBe(0);
+    const html = await renderLayout(dir, 'app/layout.tsx');
+    expect(html).toContain('About the studio');
+    expect(html).toContain('the page');
+  });
+
+  it('wraps the sole {children} where the layout has two <body> elements', async () => {
+    const layout =
+      'export default function RootLayout({ children, ok }: { children: React.ReactNode; ok: boolean }) {\n' +
+      '  return ok ? <html><body>{children}</body></html> : <html><body><main /></body></html>;\n' +
+      '}\n';
+    const dir = navHost(layout);
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/layout.tsx')).toBe(
+      `${RESOLVED_BLOCK}\n\n` + layout.replace('<body>{children}</body>', `<body>${OPEN}{children}</CopyProvider></body>`),
+    );
+  });
+
+  it('applies with no io.confirm, and never calls one that is present', async () => {
+    const dir = navHost();
+    const confirm = vi.fn(async () => false);
+    expect(await runRegister(['--from', 'scan', '--write'], { ...io(dir), confirm })).toBe(0);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(read(dir, 'app/layout.tsx')).toContain(OPEN);
+  });
+
+  it('a second run mounts nothing, and its new client literal adopts with no warn', async () => {
+    const dir = navHost();
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const mounted = read(dir, 'app/layout.tsx');
+    write(dir, 'components/Footer.tsx', "'use client';\nexport function Footer() {\n  return <footer><p>Made in Lisbon</p></footer>;\n}\n");
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'app/layout.tsx')).toBe(mounted);
+    expect(read(dir, 'components/Footer.tsx')).toContain('useCopy()');
+    expect(cap.out.join('\n')).not.toContain('CopyProvider');
+    expect(cap.err.join('\n')).not.toContain('CopyProvider');
+  });
+
+  it('an unlocatable layout adopts no client literal, adopts the server ones with no gap, leaves the layout and prints the snippet', async () => {
+    const dir = project({ layout: UNLOCATABLE_LAYOUT });
+    write(dir, 'app/components/Cta.tsx', CLIENT_WIDGET('<a href="#contact">Book a call</a>'));
+    write(dir, 'app/page.tsx', SERVER_PAGE('<main><h1>Your data, sorted</h1><p>Every week</p></main>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'app/layout.tsx')).toBe(UNLOCATABLE_LAYOUT);
+    expect(read(dir, 'app/components/Cta.tsx')).not.toContain('useCopy');
+    expect(cap.err.join('\n')).toContain('app/components/Cta.tsx: "');
+    expect(cap.err.join('\n')).toContain('needs a client rewrite, but the CopyProvider mount could not be located in app/layout.tsx');
+    expect(Object.keys(descriptor(dir).keys).sort()).toEqual(['home_page_headline', 'home_page_paragraph']);
+    const out = cap.out.join('\n');
+    expect(out).toContain('app/layout.tsx: could not locate the wrap point unambiguously — mount the CopyProvider by hand:');
+    expect(out).toContain('  wrap everything inside <body> in:');
+    expect(out).toContain(`  ${OPEN}…</CopyProvider>`);
+    expect(out).not.toContain('mounted CopyProvider');
+  });
+
+  it('wraps <Component /> on a Pages Router _app, in the resolved form', async () => {
+    const app =
+      "import type { AppProps } from 'next/app';\n\nexport default function App({ Component, pageProps }: AppProps) {\n  return <Component {...pageProps} />;\n}\n";
+    const dir = project({ router: 'pages', layout: app });
+    write(dir, 'pages/index.tsx', SERVER_PAGE('<h1>Pages copy</h1>'));
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(read(dir, 'pages/layout.tsx')).toBe(
+      app
+        .replace("'next/app';\n", `'next/app';\n${RESOLVED_BLOCK}\n\n`)
+        .replace('<Component {...pageProps} />', `${OPEN}<Component {...pageProps} /></CopyProvider>`),
+    );
+  });
+
+  it('writes the layout in its own line endings (CRLF)', async () => {
+    const crlf = NAV_LAYOUT.replace(/\n/g, '\r\n');
+    const dir = navHost(crlf);
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const layout = read(dir, 'app/layout.tsx');
+    expect(layout).toContain(RESOLVED_BLOCK.replace(/\n/g, '\r\n'));
+    expect(layout).toContain(OPEN);
+    expect(layout).not.toMatch(/(?<!\r)\n/);
+  });
+
+  it('writes a JS layout no TypeScript syntax', async () => {
+    const dir = project({ managedSurfaces: ['app/**/*.jsx', 'components/**/*.jsx'] });
+    const config = JSON.parse(read(dir, 'stet.config.json')) as Record<string, unknown>;
+    write(dir, 'stet.config.json', JSON.stringify({ ...config, rootLayout: 'app/layout.jsx' }));
+    write(dir, 'app/layout.jsx', 'export default function RootLayout({ children }) {\n  return <html><body>{children}</body></html>;\n}\n');
+    write(dir, 'components/Nav.jsx', NAV);
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/layout.jsx')).toBe(
+      "import { CopyProvider } from '@getstet/stet/react';\nimport descriptorJson from '../content/descriptor.json';\nimport { RESOLVED } from '../content/resolved';\n\n" +
+        'export default function RootLayout({ children }) {\n  return <html><body><CopyProvider descriptor={descriptorJson} resolved={RESOLVED}>{children}</CopyProvider></body></html>;\n}\n',
+    );
+  });
+
+  it('a run with only server-kind literals mounts nothing', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<h1>Server only</h1>'));
+    const before = read(dir, 'app/layout.tsx');
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'app/layout.tsx')).toBe(before);
+    expect(cap.out.join('\n')).not.toContain('CopyProvider');
+  });
+
+  it('a layout with its own server literal and a client file planned out takes no mount, its diff the leaf edit alone', async () => {
+    const layout =
+      'export default function RootLayout({ children }: { children: React.ReactNode }) {\n' +
+      '  return <html><body><header>Northwind Studio</header>{children}</body></html>;\n' +
+      '}\n';
+    const dir = project({ layout });
+    write(dir, 'app/widget.tsx', CLIENT_WIDGET('<p>Planned out</p>'));
+    expect(await runCli(['register', '--from', 'scan', '--plan-out', 'naming.json'], io(dir))).toBe(0);
+    const plan = JSON.parse(read(dir, 'naming.json')) as { keys: Array<Record<string, unknown>> };
+    const widget = plan.keys.find((e) => String(e['places']).startsWith('app/widget.tsx')) as Record<string, unknown>;
+    widget['adopt'] = false;
+    writeFileSync(join(dir, 'naming.json'), JSON.stringify(plan, null, 2));
+    const cap = io(dir);
+    expect(await runCli(['register', '--from', 'scan', '--plan', 'naming.json', '--write'], cap)).toBe(0);
+    const written = read(dir, 'app/layout.tsx');
+    expect(written).toContain("{copy('");
+    expect(written).not.toContain('CopyProvider');
+    expect(cap.out.join('\n')).not.toContain('mount the CopyProvider');
+    expect(read(dir, 'app/widget.tsx')).not.toContain('useCopy');
+  });
+
+  it('a layout with its own literal takes the mount and its rewrite in one write', async () => {
+    const layout = NAV_LAYOUT.replace('        <Nav />\n', '        <Nav />\n        <p>Northwind Studio</p>\n');
+    const dir = navHost(layout);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const written = read(dir, 'app/layout.tsx');
+    expect(written).toContain(OPEN);
+    expect(written).toMatch(/<p>\{copy\('[a-z_]+'\)\}<\/p>/);
+    expect(written).toContain("import { copy } from '@/lib/content';");
+    expect(cap.out.join('\n')).toMatch(/^app\/layout\.tsx: rewrote \d+ edits$/m);
+    expect(cap.out.join('\n').match(/^--- a\/app\/layout\.tsx/gm)).toHaveLength(1);
+    expect(await runCli(['check'], io(dir))).toBe(0);
+  });
+
+  it('prints the header and the mounted line once where two client files are rewritten', async () => {
+    const dir = navHost();
+    write(dir, 'components/Footer.tsx', "'use client';\nexport function Footer() {\n  return <footer><p>Made in Lisbon</p></footer>;\n}\n");
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const out = cap.out.join('\n');
+    expect(out.match(/the one edit to existing code — mount the CopyProvider:/g)).toHaveLength(1);
+    expect(out.match(/^app\/layout\.tsx: mounted CopyProvider$/gm)).toHaveLength(1);
+    expect(read(dir, 'app/layout.tsx').match(/<CopyProvider /g)).toHaveLength(1);
+  });
+
+  it('prints the could-not-locate line and the snippet once, above the per-file warns', async () => {
+    const dir = project({ layout: UNLOCATABLE_LAYOUT });
+    write(dir, 'app/components/Cta.tsx', CLIENT_WIDGET('<a href="#contact">Book a call</a>'));
+    write(dir, 'app/components/Nav.tsx', CLIENT_WIDGET('<a href="/about">About the studio</a>'));
+    const all: string[] = [];
+    const sink = (line: string): void => {
+      all.push(line);
+    };
+    expect(await runRegister(['--from', 'scan', '--write'], { cwd: dir, env: {}, stdout: sink, stderr: sink })).toBe(0);
+    const text = all.join('\n');
+    expect(text.match(/could not locate the wrap point unambiguously/g)).toHaveLength(1);
+    expect(text.match(/wrap everything inside <body> in:/g)).toHaveLength(1);
+    expect(text.match(/needs a client rewrite, but the CopyProvider mount could not be located in app\/layout\.tsx/g)).toHaveLength(2);
+    expect(text.indexOf('wrap everything inside <body> in:')).toBeLessThan(text.indexOf('needs a client rewrite'));
+  });
+
+  it('names the root layout in the warn, and prints no snippet, where the config names none', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-register-'));
+    write(dir, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } }));
+    write(dir, 'stet.config.json', JSON.stringify({ project: 't', router: 'vite', managedSurfaces: ['src/**/*.tsx'] }));
+    write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    write(dir, 'content/defaults.json', JSON.stringify({ default: {} }));
+    write(dir, 'src/Cta.tsx', CLIENT_WIDGET('<a href="#contact">Book a call</a>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(cap.err.join('\n')).toContain('needs a client rewrite, but the CopyProvider mount could not be located in the root layout — mount it by hand, then run stet register again');
+    expect(cap.out.join('\n')).not.toContain('could not locate the wrap point');
+    expect(cap.out.join('\n')).not.toContain('CopyProvider descriptor=');
+  });
+
+  it("prints the Vite snippet line where the entry's render cannot be located", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-register-'));
+    write(dir, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } }));
+    write(dir, 'stet.config.json', JSON.stringify({ project: 't', router: 'vite', rootLayout: 'src/main.tsx', managedSurfaces: ['src/**/*.tsx'] }));
+    write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    write(dir, 'content/defaults.json', JSON.stringify({ default: {} }));
+    const twice =
+      "import { createRoot } from 'react-dom/client';\nimport App from './App';\n\n" +
+      "createRoot(document.getElementById('a')!).render(<App />);\ncreateRoot(document.getElementById('b')!).render(<App />);\n";
+    write(dir, 'src/main.tsx', twice);
+    write(dir, 'src/App.tsx', CLIENT_WIDGET('<a href="#contact">Book a call</a>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'src/main.tsx')).toBe(twice);
+    const out = cap.out.join('\n');
+    expect(out).toContain('src/main.tsx: could not locate the wrap point unambiguously — mount the CopyProvider by hand:');
+    expect(out).toContain('  wrap the element createRoot(...).render() receives in:');
+  });
+
+  it('mounts <CopyProvider …></CopyProvider> into an empty <body></body>', async () => {
+    const layout = 'export default function RootLayout() {\n  return <html><body></body></html>;\n}\n';
+    const dir = navHost(layout);
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/layout.tsx')).toBe(`${RESOLVED_BLOCK}\n\n` + layout.replace('<body></body>', `<body>${OPEN}</CopyProvider></body>`));
+  });
+
+  it("lands a literal starting right after <body>, and one ending right before </body>, inside the provider", async () => {
+    const layout =
+      'export default function RootLayout({ children }: { children: React.ReactNode }) {\n' +
+      '  return <html><body>Northwind Studio<Nav />{children}Made in Lisbon</body></html>;\n' +
+      '}\n';
+    const dir = navHost(`import { Nav } from '../components/Nav';\n\n${layout}`);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const written = read(dir, 'app/layout.tsx');
+    expect(written).toMatch(/<body><CopyProvider [^>]+>\{copy\('[a-z0-9_]+'\)\}<Nav \/>\{children\}\{copy\('[a-z0-9_]+'\)\}<\/CopyProvider><\/body>/);
+    expect(await runCli(['check'], io(dir))).toBe(0);
+  });
+
+  it('scan over the same host plans no mount and writes nothing', async () => {
+    const dir = navHost();
+    const before = tree(dir);
+    const cap = io(dir);
+    await runCli(['scan'], cap);
+    expect(tree(dir)).toEqual(before);
+    expect(cap.out.join('\n')).not.toContain('mount the CopyProvider');
+  });
+});
+
+describe('runRegister — the Vite arm (D9)', () => {
+  const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'vite-host');
+  const viteHost = async (): Promise<string> => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-register-vite-'));
+    cpSync(FIXTURE, dir, { recursive: true });
+    expect(await runCli(['init', '--yes'], io(dir))).toBe(0);
+    return dir;
+  };
+
+  it('rewrites every literal to useCopy(), mounts over the render argument, and the entry type-checks', async () => {
+    const dir = await viteHost();
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const app = read(dir, 'src/App.tsx');
+    expect(app).toContain("import { useCopy } from '@getstet/stet/react';");
+    expect(app).not.toContain('<h1>Get started</h1>');
+    expect(app).not.toContain("'@/lib/content'");
+    expect(cap.err.join('\n')).not.toContain('needs a client rewrite');
+    const main = read(dir, 'src/main.tsx');
+    expect(main).toContain("import { RESOLVED } from '../content/resolved';");
+    expect(main).toContain('.render(\n  <CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={RESOLVED}><StrictMode>');
+    expect(main).toContain('</StrictMode></CopyProvider>,\n)');
+    expect(cap.out).toContain('src/main.tsx: mounted CopyProvider');
+
+    // tsc over the entry and the app, `@getstet/stet` resolved to the built package.
+    if (!existsSync(join(packageRoot(), 'dist', 'src', 'index.js'))) execFileSync('npm', ['run', 'build'], { cwd: packageRoot(), stdio: 'pipe' });
+    symlinkSync(join(packageRoot(), '..', 'node_modules'), join(dir, 'node_modules'), 'dir');
+    write(dir, 'src/assets.d.ts', "declare module '*.png' { const src: string; export default src; }\ndeclare module '*.svg' { const src: string; export default src; }\ndeclare module '*.css';\n");
+    write(
+      dir,
+      'tsconfig.json',
+      JSON.stringify({
+        compilerOptions: {
+          target: 'ES2022',
+          lib: ['ES2022', 'DOM', 'DOM.Iterable'],
+          module: 'ESNext',
+          moduleResolution: 'bundler',
+          jsx: 'react-jsx',
+          strict: true,
+          resolveJsonModule: true,
+          allowImportingTsExtensions: true,
+          verbatimModuleSyntax: true,
+          skipLibCheck: true,
+          noEmit: true,
+        },
+        include: ['src'],
+      }),
+    );
+    const tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc');
+    let output = '';
+    try {
+      execFileSync(process.execPath, [tsc, '--noEmit', '-p', 'tsconfig.json'], { cwd: dir, encoding: 'utf8', stdio: 'pipe' });
+    } catch (error) {
+      output = String((error as { stdout?: string }).stdout ?? error);
+    }
+    expect(output).toBe('');
+  }, 60_000);
+
+  it('adopts no literal where main.tsx renders twice, or passes render a second argument', async () => {
+    for (const main of [
+      "import { createRoot } from 'react-dom/client'\nimport App from './App.tsx'\n\ncreateRoot(document.getElementById('a')!).render(<App />)\ncreateRoot(document.getElementById('b')!).render(<App />)\n",
+      "import { createRoot } from 'react-dom/client'\nimport App from './App.tsx'\n\ncreateRoot(document.getElementById('root')!).render(<App />, document.body)\n",
+    ]) {
+      const dir = await viteHost();
+      write(dir, 'src/main.tsx', main);
+      const before = read(dir, 'src/App.tsx');
+      const cap = io(dir);
+      expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+      expect(read(dir, 'src/main.tsx')).toBe(main);
+      expect(read(dir, 'src/App.tsx')).toBe(before);
+      expect(cap.err.join('\n')).toContain('needs a client rewrite, but the CopyProvider mount could not be located in src/main.tsx');
+    }
   });
 });
 
@@ -871,6 +1281,21 @@ describe('runRegister — the static-HTML host', () => {
   });
 });
 
+describe('runRegister — a decorative image takes no key (P8, F68)', () => {
+  it('adopts no empty alt on a JSX component, and a second walk proposes nothing', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<div><img src="/hero.png" alt="" /><h1>Adopt the heading</h1></div>'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(Object.keys(descriptor(dir).keys)).toEqual(['home_page_headline']);
+    expect(Object.values(defaults(dir).default)).not.toContain('');
+    expect(read(dir, 'app/page.tsx')).toContain('alt=""');
+    const again = io(dir);
+    expect(await runRegister(['--from', 'scan'], again)).toBe(0);
+    expect(again.out.at(-1)).toBe('register: nothing to adopt');
+  });
+});
+
 describe('runRegister — the JavaScript branch writes through the same batch', () => {
   it('rolls back the descriptor when a codegen write fails mid-batch', async () => {
     const dir = project();
@@ -1475,9 +1900,9 @@ describe('register shares JSX text within a run', () => {
   });
 
   it('leaves a follower unrewritten where its leader was refused', async () => {
-    const dir = project();
-    // Run order is file order: the client component's literal leads, and with no
-    // CopyProvider mounted its rewrite is refused.
+    const dir = project({ layout: UNLOCATABLE_LAYOUT });
+    // Run order is file order: the client component's literal leads, and with the
+    // CopyProvider mount unlocatable its rewrite is refused.
     write(dir, 'app/components/Cta.tsx', CLIENT_WIDGET('<a href="#contact">Start a conversation</a>'));
     write(dir, 'app/page.tsx', 'export default function Page() {\n  return <main><h1>Your data, sorted</h1><a href="#c">Start a conversation</a></main>;\n}\n');
     const cap = io(dir);

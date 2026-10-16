@@ -69,6 +69,20 @@ describe('runScan', () => {
     expect(findings).toContain('"Your week, sorted" — propose key home_page_headline');
   });
 
+  it('reports no decorative image: an empty alt is no copy, on a JSX component and an html page (P8, F68)', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', COMPONENT('<div><img src="/hero.png" alt="" /><img src="/team.png" alt="The team" /></div>'));
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    const joined = cap.err.join('\n') + cap.out.join('\n');
+    expect(joined).toContain('The team');
+    expect(joined).not.toMatch(/hero\.png|alt text.*""/);
+    expect(cap.out.join('\n')).toContain('1 unkeyed literal');
+    const html = await makeHtmlHost({ files: { 'index.html': '<!DOCTYPE html>\n<html lang="en"><head><title>A page</title></head><body>\n<img src="bench.jpg" alt="">\n<p>A paragraph of copy here.</p>\n</body></html>\n' } });
+    expect(await html.run('scan')).toBe(0);
+    expect(`${html.stdout()}\n${html.stderr()}`).not.toContain('bench.jpg');
+  });
+
   it('still reports a literal whose proposed key collides with an existing descriptor key (P2-B)', async () => {
     const dir = project();
     write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: { home_page_headline: { shape: 'text', target: 'web' } } }));

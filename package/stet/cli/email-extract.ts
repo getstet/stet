@@ -19,7 +19,7 @@
  * shell rewrite are written once.
  *
  * `--apply` writes one batch: the descriptor entries and their key definitions,
- * the seeded defaults, the regenerated codegen trio, the shell rewrites and the
+ * the seeded defaults, the regenerated codegen files, the shell rewrites and the
  * surface lists. It lands whole or not at all — a descriptor declaring slots
  * whose shell was never rewritten renders `undefined` into a real send.
  */
@@ -224,7 +224,7 @@ export async function runEmailExtract(args: string[], io: CliIo): Promise<number
 
 /**
  * The proposals written, as ONE batch: the descriptor entries with their
- * flattened key definitions, the seeded defaults, the regenerated codegen trio,
+ * flattened key definitions, the seeded defaults, the regenerated codegen files,
  * the shell rewrites and the surface lists. Every write is shown and the batch
  * lands whole or not at all, because a descriptor declaring slots whose shell
  * was never rewritten is a project that renders `undefined` into somebody's
@@ -297,7 +297,7 @@ function applyProposals(
     const at = (rel: string): string => join(io.cwd, rel);
     const plans: WritePlan[] = [];
     if (landed.length > 0) {
-      // The five repo forms, and the codegen trio among them rides the key add
+      // The repo forms, and the codegen files among them ride the key add
       // exactly as `register` regenerates it: the slot keys this run wrote must
       // typecheck in the host's editor without an intervening `stet upgrade`.
       plans.push(...planRepoForms(io.cwd, config, descriptor, snapshot, report));

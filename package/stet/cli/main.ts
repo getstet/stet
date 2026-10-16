@@ -16,6 +16,8 @@ import { pathToFileURL } from 'node:url';
 import type { StoreAdapter } from '../src/store.js';
 import { runAgentsInstall } from './agents.js';
 import { runAudit } from './audit.js';
+import { runAuditLighthouse } from './lighthouse.js';
+import type { LighthouseRunner } from './lighthouse-run.js';
 import { runCheck } from './check.js';
 import { runContacts } from './contacts.js';
 import { runDev } from './dev.js';
@@ -55,11 +57,15 @@ export interface CliIo {
   stores?: Record<string, StoreAdapter>;
   /** `doctor --url`; tests inject a fake. */
   fetchImpl?: typeof globalThis.fetch;
+  /** `stet audit lighthouse`'s runner; tests inject a fake, the command starts Chrome. */
+  lighthouse?: (insecure: boolean) => Promise<{ run: LighthouseRunner; close: () => Promise<void> }>;
+  /** How long `stet audit lighthouse --build` waits for the preview to answer; 60 s where unset. */
+  previewWaitMs?: number;
   /**
    * Interactive input, wired to `node:readline/promises` by the bin entry on a
    * TTY and left undefined everywhere else. `init` is the sole consumer:
-   * undefined means non-interactive, so its two questions take their defaults
-   * and the provider-mount edit is skipped unless `--yes` is passed.
+   * undefined means non-interactive, so its questions take their defaults
+   * and the agent-guidance write is skipped unless `--yes` is passed.
    */
   ask?: (question: string, choices?: string[]) => Promise<string>;
   confirm?: (question: string) => Promise<boolean>;
@@ -187,6 +193,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case 'pull':
         return await runPull(rest, io);
       case 'audit':
+        // `audit lighthouse` is its own command; anything else stays `audit`'s, its refusals included.
+        if (rest[0] === 'lighthouse') return await runAuditLighthouse(rest.slice(1), io);
         return await runAudit(rest, io);
       case 'doctor':
         return await runDoctor(rest, io);
@@ -215,7 +223,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 }
 
 /** The commands whose second word is part of the name `--help` asks about. */
-const TWO_TOKEN = new Set(['hook', 'agents', 'pages', 'email', 'seo', 'contacts']);
+const TWO_TOKEN = new Set(['hook', 'agents', 'pages', 'email', 'seo', 'contacts', 'audit']);
 /** The two-word names whose third word is part of the name too. */
 const THREE_TOKEN = new Set(['contacts group']);
 
@@ -236,10 +244,15 @@ export function commandHelp(argv: string[]): string | null {
   const two = TWO_TOKEN.has(first) && second !== undefined ? `${first} ${second}` : first;
   const name = THREE_TOKEN.has(two) && words[2] !== undefined ? `${two} ${words[2]}` : two;
   const lines = usage().split('\n');
+  // A first word with an entry of its own (`audit [--strict]`) answers with that
+  // entry alone, not its two-word neighbours (`audit lighthouse …`).
+  const ownEntry = (line: string): boolean => /^[[<-]/.test(line.slice(name.length + 3));
+  const own = name === first && lines.some((line) => line.startsWith(`  ${name} `) && ownEntry(line));
   const picked: string[] = [];
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i] ?? '';
     if (line !== `  ${name}` && !line.startsWith(`  ${name} `)) continue;
+    if (own && !ownEntry(line)) continue;
     picked.push(line);
     // An entry that wraps continues on the lines indented deeper than two.
     while (/^ {3,}\S/.test(lines[i + 1] ?? '')) {
@@ -256,7 +269,7 @@ export function usage(): string {
     'stet — typed, versioned content keys with a committed snapshot fallback',
     '',
     'Setup (write or edit files in the adopting project):',
-    '  init [--app DIR] [--host html] [--yes]   scaffold a project; the shown edits mount the CopyProvider and write the agent guidance',
+    '  init [--app DIR] [--host html] [--yes]   scaffold a project; the shown edit writes the agent guidance',
     '  scan                       report unkeyed copy in the managed surfaces — warn by default',
     '  register --from scan [--plan FILE | --plan-out FILE] [--write] [--verbose]   add keys named by role and rewrite the consuming leaf; --plan-out writes the names to edit, --plan applies them; --verbose lists every parse refusal',
     '  remove <key> [<key>...] [--write]   delete keys from descriptor + snapshot; plan first, --write applies',
@@ -290,6 +303,7 @@ export function usage(): string {
     'Project:',
     '  pull                       resolve into the repo forms: snapshot, defaults module, bundle',
     '  audit [--strict]           descriptor against the store — reports, never deletes',
+    "  audit lighthouse [--url U | --build] [--desktop] [--applied] [--pages P] [--runs N] [--fix [--write]] [--strict]   Lighthouse's four scores per page, each failing audit tagged stet or host; --fix plans the head rewrites",
     '  doctor [--report] [--url U --key K]      mode, health, and what is serving production',
     '  upgrade [--store A] [--dry-run] [--verify]   migrations, the registry, the version stamp',
     '',
@@ -308,7 +322,7 @@ export function usage(): string {
     'Dashboard:',
     '  dev [--port N] [--no-open] [--add PATH]   the local dashboard on 127.0.0.1:4400 over your workspace of checkouts',
     '',
-    'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor, both email commands, and contacts groups, list and get.',
+    'Options: --json on check, scan, seo check, pages scan, list, get, audit, audit lighthouse, doctor, both email commands, and contacts groups, list and get.',
     '  --env <name>             the environments-map connection to run against; check and seo check take none',
     '',
     'Global flags:',
@@ -338,8 +352,8 @@ if (import.meta.url === entryUrl()) {
     stderr: (line) => process.stderr.write(`${line}\n`),
   };
   // Interactive input only on a real TTY — `init` is the sole consumer. A pipe
-  // or CI leaves ask/confirm undefined, so init defaults its two questions and
-  // skips the provider-mount edit unless `--yes`. `readline/promises` is loaded
+  // or CI leaves ask/confirm undefined, so init defaults its questions and
+  // skips the agent-guidance write unless `--yes`. `readline/promises` is loaded
   // only here, so a library import of this module never pulls it in.
   if (process.stdin.isTTY === true && process.stdout.isTTY === true) {
     const { createInterface } = await import('node:readline/promises');

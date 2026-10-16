@@ -244,7 +244,7 @@ export function storeRowsLine(config: StetConfig, report: Report): void {
 }
 
 /**
- * The five repo forms, written as ONE batch. A mid-batch failure puts back
+ * The repo forms, written as ONE batch. A mid-batch failure puts back
  * every file the run had already written, so a removal either lands whole or
  * leaves the project exactly as it found it.
  *

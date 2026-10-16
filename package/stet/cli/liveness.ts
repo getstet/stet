@@ -10,7 +10,9 @@
  * `kill` alone decides.
  *
  * A target is a pid, or a process group written as `-pgid` — the `kill`
- * convention.
+ * convention. Beside the two reads: `answers`, whether a server answers at
+ * all, `endGroup`, the one way a detached child's group is ended, and
+ * `untilInterrupted`, a run held open until a signal.
  */
 
 import { readdirSync, readFileSync } from 'node:fs';
@@ -63,4 +65,68 @@ function procStat(pid: string): { state: string; pgrp: number } | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether `url` answers at all within `ms` — any response is up, a throw or the deadline is down.
+ *
+ * The fetch's own abort signal is RACED against a timer of its own: an
+ * implementation that ignores the signal — a fake among them — must still
+ * settle. A server answering 404 or 500 is still a server.
+ */
+export async function answers(fetchImpl: typeof globalThis.fetch, url: string, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    let answered: Promise<boolean>;
+    try {
+      answered = Promise.resolve(fetchImpl(url, { method: 'HEAD', signal: AbortSignal.timeout(ms), redirect: 'manual' })).then(
+        () => true,
+        () => false,
+      );
+    } catch {
+      return false;
+    }
+    return await Promise.race([answered, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** A process group ended: SIGTERM, two seconds, SIGKILL, and the wait for it to go. False where there was no group. */
+export async function endGroup(pid: number): Promise<boolean> {
+  if (pid === 0) return false;
+  try {
+    process.kill(-pid, 'SIGTERM');
+  } catch {
+    return false;
+  }
+  if (await gone(-pid, 2_000)) return true;
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    /* already gone */
+  }
+  // SIGKILL is delivered asynchronously: without this the caller can answer
+  // "stopped" while the port is still held.
+  await gone(-pid, 2_000);
+  return true;
+}
+
+/**
+ * A run held open until the operator ends it: `interrupted` resolves with the
+ * signal that arrived. The listeners stay until `release`, so a signal during
+ * the close is absorbed (F48).
+ */
+export function untilInterrupted(): { interrupted: Promise<NodeJS.Signals>; release: () => void } {
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+  let resolve: (signal: NodeJS.Signals) => void = () => {};
+  const interrupted = new Promise<NodeJS.Signals>((r) => {
+    resolve = r;
+  });
+  const stop = (signal: NodeJS.Signals): void => resolve(signal);
+  for (const signal of signals) process.on(signal, stop);
+  return { interrupted, release: () => signals.forEach((signal) => process.off(signal, stop)) };
 }

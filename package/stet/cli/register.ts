@@ -58,6 +58,7 @@ import { htmlPageOf } from './pages.js';
 import type { CliIo } from './main.js';
 import { clip, collapseLines, plural, CliError, HostTextReport, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff, planRewrite, type Edit } from './rewrite.js';
+import { printProviderSnippet } from './provider-mount.js';
 import { classifyAdoption, planJsxRun, targetFor } from './register-run.js';
 import type { LocatedLiteral } from './source-scan.js';
 import { validateValue } from './validate.js';
@@ -125,7 +126,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
 
   // Pass one, the copy modules' own names and the run's names: the naming pass
   // `scan` previews with. Then, under --plan, the plan's names.
-  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, modules, propertyNames } = await planJsxRun({
+  const jsxRun = await planJsxRun({
     cwd: io.cwd,
     config,
     descriptor,
@@ -133,6 +134,12 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report,
     ...(forcedKind === undefined ? {} : { forcedKind }),
   });
+  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, modules, propertyNames, mount } = jsxRun;
+  // The fallback warns named the layout; the snippet names the edit, once.
+  if (jsxRun.mountUnlocated && config.rootLayout !== undefined && config.router !== 'astro') {
+    report.line(`${config.rootLayout}: could not locate the wrap point unambiguously — mount the CopyProvider by hand:`);
+    printProviderSnippet(report, config, join(io.cwd, config.rootLayout), io.cwd, config.router);
+  }
   // A naming plan lists only the keys the run adds: a reused literal is never an
   // entry, and a follower is a place of its leader's entry.
   const run = adoptable.flatMap((f) => f.literals).filter((literal) => !reusedLiterals.has(literal) && !sharedWith.has(literal));
@@ -166,10 +173,16 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
 
   // Pass two: each file's literals keyed and rewritten. A leader comes before
   // its followers in run order, so the key it lands under is known when they
-  // are met; a leader that did not land leaves its followers unrewritten.
+  // are met; a leader that did not land leaves its followers unrewritten. Every
+  // file's edits are built before any diff prints: the mount joins the layout's
+  // list only where a client rewrite landed.
   const landed = new Map<LocatedLiteral, string>();
+  const entries: Array<{ file: string; source: string; edits: Edit[]; lines: string[] }> = [];
+  let clientEdited = 0;
+  let serverEdited = 0;
   for (const { file, source, literals, target, kind } of adoptable) {
     const edits: Edit[] = [];
+    const lines: string[] = [];
     for (const literal of literals) {
       const proposed = nameOf.get(literal) as string;
       const leader = sharedWith.get(literal);
@@ -178,14 +191,14 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
         if (key === undefined) continue;
         edits.push(...planRewrite(source, literal, key, kind, config.readPath.import).edits);
         shared += 1;
-        report.line(`${file}: shares ${key} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
+        lines.push(`${file}: shares ${key} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
         continue;
       }
       if (reusedLiterals.has(literal)) {
         // No entry, no value: the key already holds this text.
         edits.push(...planRewrite(source, literal, proposed, kind, config.readPath.import).edits);
         reused += 1;
-        report.line(`${file}: reuses ${proposed} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
+        lines.push(`${file}: reuses ${proposed} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
         continue;
       }
       const choice = chosen?.(proposed);
@@ -211,9 +224,27 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       landed.set(literal, key);
     }
 
+    if (edits.length > 0 && kind === 'client') clientEdited += 1;
+    if (edits.length > 0 && kind === 'server') serverEdited += 1;
+    entries.push({ file, source, edits, lines });
+  }
+  // The mount, where a client rewrite landed: into the layout's own list where
+  // the run rewrites the layout too, else a list of its own in file order.
+  if (mount !== undefined && clientEdited > 0) {
+    const own = entries.find((e) => e.file === mount.layout);
+    if (own !== undefined) own.edits.push(...mount.edits);
+    else {
+      const at = entries.findIndex((e) => e.file > mount.layout);
+      entries.splice(at === -1 ? entries.length : at, 0, { file: mount.layout, source: mount.source, edits: mount.edits, lines: [] });
+    }
+  }
+  const mounted = mount !== undefined && clientEdited > 0;
+  for (const { file, source, edits, lines } of entries) {
+    for (const line of lines) report.line(line);
     if (edits.length === 0) continue;
     const text = applyFileEdits(source, edits);
     printedDiffs += 1;
+    if (mounted && file === mount.layout) report.line(`${file}: the one edit to existing code — mount the CopyProvider:`);
     report.line(formatDiff(file, source, text));
     edited.push({ abs: join(io.cwd, file), rel: file, text, edits: edits.length });
   }
@@ -307,8 +338,9 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   }
   // Before ANY write, the descriptor and snapshot included: a rewrite that
   // inserts an import the host cannot resolve breaks every file it touched. Every
-  // write is in the batch below, and a run that applies no leaf edit writes no import.
-  if (edited.length > 0) refuseUnresolvableAlias(io.cwd, config);
+  // write is in the batch below. Only a server-kind rewrite imports the read path:
+  // a run of client rewrites and the mount alone (every Vite run) writes none.
+  if (serverEdited > 0) refuseUnresolvableAlias(io.cwd, config);
   // ONE batch, with rollback: the descriptor, the snapshot, the codegen modules
   // and every leaf edit land together or not at all. The codegen regenerates
   // here so the `copy('new_key')` leaf register just wrote typechecks
@@ -323,6 +355,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     rethrowBatchFailure('stet register', error);
   }
   for (const e of edited) report.line(`${e.rel}: rewrote ${plural(e.edits, 'edit')}`);
+  if (mounted) report.line(`${mount.layout}: mounted CopyProvider`);
   if (added > 0) {
     report.line(
       `wrote ${config.descriptorPath}, ${config.snapshotPath} and the codegen modules: ${plural(added, 'key')} added` +

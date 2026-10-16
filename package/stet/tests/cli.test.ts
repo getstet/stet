@@ -20,6 +20,7 @@ import { CONNECT_TIMEOUT_MS, contactsBlock, contactsConfig } from '../cli/store.
 import { defaultConfig, type StetConfig } from '../cli/config.js';
 import { openContactsStore } from '../cli/project.js';
 import { migrations, packageRoot } from '../cli/installed.js';
+import { nodeAtLeast } from '../cli/doctor.js';
 import { collision, GRANTS_003 } from '../cli/upgrade.js';
 import { usage } from '../cli/main.js';
 import {
@@ -134,6 +135,26 @@ describe('check', () => {
     rmSync(join(ambient.cwd, 'content/stet-env.d.ts'));
     expect(await ambient.run('check')).toBe(0);
     expect(ambient.stderr()).toContain('content/stet-env.d.ts: not generated — run stet upgrade');
+  });
+
+  it('checks the resolved module like the defaults module, naming stet pull (journey G3)', async () => {
+    const host = makeHost({ config: {} });
+    rmSync(join(host.cwd, 'content/resolved.ts'));
+    // A 0.6.0 host: no resolved module yet is a warn, never the exit.
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).toContain('warn: content/resolved.ts: not generated — run stet pull');
+    expect(await host.run('pull')).toBe(0);
+    expect(host.stdout()).toContain('wrote content/resolved.ts');
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('generated: content/resolved.ts current');
+    // A snapshot edited by hand moves its source: stale, and the remedy closes the loop.
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as Record<string, Record<string, unknown>>;
+    snapshot['default']!['hero_headline'] = 'Edited by hand';
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('content/resolved.ts: stale — its source moved; run stet pull');
+    expect(await host.run('pull')).toBe(0);
+    expect(await host.run('check')).toBe(0);
   });
 
   it('checks the ambient types too, so a stale key union cannot keep compiling', async () => {
@@ -418,7 +439,7 @@ describe('seo check', () => {
       { hero_headline: 'Never miss a post again.' },
     );
     expect(await host.run('seo', 'check')).toBe(0);
-    expect(host.stderr()).toContain('no pages declared — the SEO rules have nothing to check');
+    expect(host.stderr()).toContain('no pages declared — the page rules have nothing to check');
     expect(host.stderr()).toContain('run stet pages scan to declare them');
     expect(host.stdout()).toContain('seo: 0 pages checked');
   });
@@ -1106,6 +1127,33 @@ describe('pull', () => {
 });
 
 describe('doctor', () => {
+  it('compares a Node version by major, then minor', () => {
+    expect(nodeAtLeast('v22.18.0', 22, 19)).toBe(false);
+    expect(nodeAtLeast('v22.19.0', 22, 19)).toBe(true);
+    expect(nodeAtLeast('v23.0.0', 22, 19)).toBe(true);
+    expect(nodeAtLeast('v24.1.0', 22, 19)).toBe(true);
+  });
+
+  it('names Node below 22.19 as the audit floor, and nothing at 22.19', async () => {
+    const real = process.version;
+    const runOn = async (version: string): Promise<{ code: number; out: string }> => {
+      Object.defineProperty(process, 'version', { value: version, configurable: true, enumerable: true, writable: false });
+      try {
+        const host = makeHost({ config: {} });
+        const code = await host.run('doctor');
+        return { code, out: host.stdout() };
+      } finally {
+        Object.defineProperty(process, 'version', { value: real, configurable: true, enumerable: true, writable: false });
+      }
+    };
+    const old = await runOn('v22.18.0');
+    expect(old.code).toBe(0);
+    expect(old.out).toContain('node v22.18.0: stet audit lighthouse needs Node 22.19 or later; everything else runs');
+    const current = await runOn('v22.19.0');
+    expect(current.code).toBe(0);
+    expect(current.out).not.toContain('needs Node 22.19');
+  });
+
   it('reports every section, and snapshot-only is a clean bill', async () => {
     const host = makeHost({ config: {} });
     expect(await host.run('doctor')).toBe(0);
@@ -1452,6 +1500,221 @@ describe('contacts store selection', () => {
 
 describe('upgrade', () => {
   /** A PostgREST that has never seen migration 1: stet_meta is not there. */
+
+  describe('the read path\'s import (D7, P14)', () => {
+    const INIT_LINE = "import { createServerCopy } from '@getstet/stet/react';";
+    const SERVER_LINE = "import { createServerCopy } from '@getstet/stet/react/server';";
+    const BODY = "\nimport { readBundle, resolveAll } from '@getstet/stet';\n\nexport const copy = createServerCopy(descriptor, resolved);\n";
+    const REWRITTEN = "lib/content.ts: imports from '@getstet/stet/react' — rewritten to '@getstet/stet/react/server', which carries no client code";
+    const BY_HAND = "lib/content.ts: imports from '@getstet/stet/react' — change it to '@getstet/stet/react/server' by hand; the line is not the one stet init wrote";
+    const withReadPath = (text: string): Host => {
+      const host = makeHost({ config: {} });
+      mkdirSync(join(host.cwd, 'lib'), { recursive: true });
+      writeFileSync(join(host.cwd, 'lib/content.ts'), text);
+      return host;
+    };
+
+    for (const eol of ['\n', '\r\n']) {
+      it(`rewrites the line init wrote, its ${eol === '\n' ? 'LF' : 'CRLF'} ending and every other byte kept, and is silent the second time`, async () => {
+        const host = withReadPath(`${INIT_LINE}${BODY}`.replace(/\n/g, eol));
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.out).toContain(REWRITTEN);
+        expect(host.file('lib/content.ts')).toBe(`${SERVER_LINE}${BODY}`.replace(/\n/g, eol));
+        host.out.length = 0;
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.stdout()).not.toContain('lib/content.ts:');
+      });
+    }
+
+    it('leaves any other import of the provider\'s index for the hand, beside the line or in its place', async () => {
+      for (const text of [
+        `import { createServerCopy, useCopy } from '@getstet/stet/react';${BODY}`,
+        `${INIT_LINE}\nimport { useCopy } from '@getstet/stet/react';${BODY}`,
+        `// ${INIT_LINE}\n${INIT_LINE}${BODY}`,
+      ]) {
+        const host = withReadPath(text);
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.out).toContain(BY_HAND);
+        expect(host.file('lib/content.ts')).toBe(text);
+      }
+    });
+
+    it('writes nothing under --dry-run', async () => {
+      const host = withReadPath(`${INIT_LINE}${BODY}`);
+      expect(await host.run('upgrade', '--dry-run')).toBe(0);
+      expect(host.file('lib/content.ts')).toBe(`${INIT_LINE}${BODY}`);
+      expect(host.stdout()).not.toContain('lib/content.ts:');
+    });
+  });
+
+  describe('the CopyProvider mount no client component reads (D7, P15)', () => {
+    const LAYOUT = 'export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <html lang="en">\n      <body>\n        {children}\n      </body>\n    </html>\n  );\n}\n';
+    /** The layout as 0.6.0's `init` mounted it: the resolveAll block at offset 0 and the wrap over `{children}`. */
+    const MOUNTED_060 =
+      "import { CopyProvider } from '@getstet/stet/react';\n" +
+      "import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';\n" +
+      "import descriptorJson from '../content/descriptor.json';\n" +
+      "import { DEFAULTS } from '../content/defaults';\n" +
+      '\n' +
+      'const { resolved } = resolveAll(descriptorJson as unknown as Descriptor, readBundle(DEFAULTS));\n' +
+      '\n' +
+      LAYOUT.replace('        {children}\n', '        <CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={resolved}>{children}</CopyProvider>\n');
+    const UNMOUNTED = 'app/layout.tsx: CopyProvider unmounted — no client component reads copy; stet register mounts it again when one does';
+    const BY_HAND = 'app/layout.tsx: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote';
+    const adopted060 = (layout = MOUNTED_060): Host => {
+      const host = makeHost({ config: {} });
+      mkdirSync(join(host.cwd, 'lib'), { recursive: true });
+      writeFileSync(join(host.cwd, 'lib/content.ts'), "import { createServerCopy } from '@getstet/stet/react';\nexport const copy = createServerCopy(descriptor, resolved);\n");
+      mkdirSync(join(host.cwd, 'app'), { recursive: true });
+      writeFileSync(join(host.cwd, 'app/layout.tsx'), layout);
+      writeFileSync(join(host.cwd, 'app/page.tsx'), "import { copy } from '@/lib/content';\nexport default function Page() {\n  return <h1>{copy('k')}</h1>;\n}\n");
+      rmSync(join(host.cwd, 'content/resolved.ts'));
+      return host;
+    };
+
+    it('a 0.6.0 Next host stops shipping the provider: the read path rewritten, the mount taken out, the resolved module written; the second run says neither', async () => {
+      const host = adopted060();
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.out).toContain("lib/content.ts: imports from '@getstet/stet/react' — rewritten to '@getstet/stet/react/server', which carries no client code");
+      expect(host.out).toContain(UNMOUNTED);
+      expect(host.file('app/layout.tsx')).toBe(LAYOUT);
+      expect(host.exists('content/resolved.ts')).toBe(true);
+      host.out.length = 0;
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.stdout()).not.toContain('lib/content.ts:');
+      expect(host.stdout()).not.toContain('app/layout.tsx:');
+    });
+
+    it('leaves a reformatted mount for the hand, changing no byte of the layout', async () => {
+      const reformatted = MOUNTED_060.replace(
+        '<CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={resolved}>',
+        '<CopyProvider\n          descriptor={descriptorJson as unknown as Descriptor}\n          resolved={resolved}>',
+      );
+      const host = adopted060(reformatted);
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.out).toContain(BY_HAND);
+      expect(host.file('app/layout.tsx')).toBe(reformatted);
+    });
+
+    it('leaves a CRLF mount whose RESOLVED import carries a trailing comment for the hand, changing no byte of the layout', async () => {
+      const mounted = LAYOUT.replace(
+        '<body>\n        {children}\n      </body>',
+        '<body><CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={RESOLVED}>\n        {children}\n      </CopyProvider></body>',
+      );
+      const commented =
+        [
+          "import { CopyProvider } from '@getstet/stet/react';",
+          "import type { Descriptor } from '@getstet/stet';",
+          "import descriptorJson from '../content/descriptor.json';",
+          "import { RESOLVED } from '../content/resolved'; // generated by stet",
+        ].join('\r\n') +
+        '\r\n\r\n' +
+        mounted.replace(/\n/g, '\r\n');
+      const host = adopted060(commented);
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.out).toContain(BY_HAND);
+      expect(host.file('app/layout.tsx')).toBe(commented);
+    });
+
+    for (const eol of ['\n', '\r\n']) {
+      it(`leaves a mount whose first import is joined onto the line above for the hand, changing no byte of the layout (${eol === '\n' ? 'LF' : 'CRLF'})`, async () => {
+        const joined = `import './globals.css'; ${MOUNTED_060}`.replace(/\n/g, eol);
+        const host = adopted060(joined);
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.out).toContain(BY_HAND);
+        expect(host.file('app/layout.tsx')).toBe(joined);
+      });
+    }
+
+    it('keeps the mount, and says nothing of it, where components/Nav.tsx outside the managed globs reads useCopy', async () => {
+      const host = adopted060();
+      mkdirSync(join(host.cwd, 'components'), { recursive: true });
+      writeFileSync(join(host.cwd, 'components/Nav.tsx'), "'use client';\nimport { useCopy } from '@getstet/stet/react';\nexport function Nav() {\n  const copy = useCopy();\n  return <nav>{copy('nav')}</nav>;\n}\n");
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.file('app/layout.tsx')).toBe(MOUNTED_060);
+      expect(host.stdout()).not.toContain('app/layout.tsx:');
+    });
+
+    it('keeps the mount, and says nothing of it, where a client reaches the provider module by a namespace import or a require', async () => {
+      const readers: Record<string, string> = {
+        'components/Nav.tsx': "'use client';\nimport * as stet from '@getstet/stet/react';\nexport function Nav() {\n  const copy = stet.useCopy();\n  return <nav>{copy('nav')}</nav>;\n}\n",
+        'components/Foot.tsx': "'use client';\nconst { useCopy } = require('@getstet/stet/react');\nexport function Foot() {\n  const copy = useCopy();\n  return <footer>{copy('foot')}</footer>;\n}\n",
+      };
+      for (const [file, text] of Object.entries(readers)) {
+        const host = adopted060();
+        mkdirSync(join(host.cwd, 'components'), { recursive: true });
+        writeFileSync(join(host.cwd, file), text);
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.file('app/layout.tsx'), file).toBe(MOUNTED_060);
+        expect(host.stdout(), file).not.toContain('app/layout.tsx:');
+      }
+    });
+
+    it("keeps a Vite host's mount, and says nothing of it, where register wrote the read into main.tsx's own App", async () => {
+      const host = makeHost({
+        config: {
+          project: 't',
+          router: 'vite',
+          rootLayout: 'src/main.tsx',
+          managedSurfaces: ['src/**/*.tsx'],
+          emailSurfaces: [],
+          readPath: { file: 'src/lib/content.ts', import: '@/src/lib/content' },
+          descriptorPath: 'content/descriptor.json',
+          snapshotPath: 'content/defaults.json',
+          codegen: { registry: 'content/keys.ts', defaults: 'content/defaults.ts', dts: 'content/stet-env.d.ts', resolved: 'content/resolved.ts' },
+        },
+      });
+      writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify({ version: 1, keys: {} }));
+      writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify({ default: {} }));
+      writeFileSync(join(host.cwd, 'tsconfig.json'), JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } }));
+      writeFileSync(join(host.cwd, 'package.json'), JSON.stringify({ name: 'h', dependencies: { '@getstet/stet': '^0.7.0', react: '^18' } }));
+      mkdirSync(join(host.cwd, 'src'), { recursive: true });
+      writeFileSync(
+        join(host.cwd, 'src/main.tsx'),
+        "import { createRoot } from 'react-dom/client';\n\nfunction App() {\n  return <h1>Northwind Studio makes furniture</h1>;\n}\n\ncreateRoot(document.getElementById('root')!).render(<App />);\n",
+      );
+      expect(await host.run('register', '--from', 'scan', '--write'), host.stdout()).toBe(0);
+      const mounted = host.file('src/main.tsx');
+      expect(mounted).toContain('<CopyProvider ');
+      expect(mounted).toContain('useCopy()');
+      host.out.length = 0;
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.file('src/main.tsx')).toBe(mounted);
+      expect(host.stdout()).not.toContain('src/main.tsx:');
+    });
+
+    it('keeps the mount, and says nothing of it, where typescript does not load', async () => {
+      vi.resetModules();
+      vi.doMock('../cli/source-scan.js', async (importOriginal) => ({
+        ...(await importOriginal<typeof import('../cli/source-scan.js')>()),
+        loadTypescript: () => Promise.reject(Object.assign(new Error("Cannot find package 'typescript'"), { code: 'ERR_MODULE_NOT_FOUND' })),
+      }));
+      try {
+        const fresh = await import('../cli/main.js');
+        const host = adopted060();
+        expect(await fresh.runCli(['upgrade'], host.io)).toBe(0);
+        expect(host.file('app/layout.tsx')).toBe(MOUNTED_060);
+        expect(host.stdout()).not.toContain('app/layout.tsx:');
+      } finally {
+        vi.doUnmock('../cli/source-scan.js');
+        vi.resetModules();
+      }
+    });
+  });
+
+  it('writes the resolved module on a 0.6.0-shaped host, and a dry run names it without writing (D8)', async () => {
+    const host = makeHost({ config: {} });
+    rmSync(join(host.cwd, 'content/resolved.ts'));
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    expect(host.stdout()).toContain('would regenerate content/resolved.ts');
+    expect(host.exists('content/resolved.ts')).toBe(false);
+    expect(await host.run('upgrade')).toBe(0);
+    expect(host.stdout()).toContain('content/resolved.ts: regenerated');
+    expect(host.file('content/resolved.ts')).toContain('export const RESOLVED = {');
+    expect(await host.run('check')).toBe(0);
+    expect(host.stdout()).toContain('generated: content/resolved.ts current');
+  });
+
   const noMeta = fakeFetch(JSON.stringify({ code: 'PGRST205', message: 'not found' }), 404);
 
   function postgrestHost(): Host {
@@ -1614,7 +1877,7 @@ describe('dispatch', () => {
     const host = makeHost();
     expect(await host.run('help')).toBe(0);
     expect(host.stdout()).toContain(
-      'Options: --json on check, scan, seo check, pages scan, list, get, audit, doctor, both email commands, and contacts groups, list and get.',
+      'Options: --json on check, scan, seo check, pages scan, list, get, audit, audit lighthouse, doctor, both email commands, and contacts groups, list and get.',
     );
   });
 
@@ -2913,7 +3176,7 @@ describe('per-command help', () => {
     expect(commands).toEqual([
       'init', 'scan', 'register', 'remove', 'rename', 'merge', 'split', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
       'email extract', 'email verify', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
-      'seed', 'pull', 'audit', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
+      'seed', 'pull', 'audit', 'audit lighthouse', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
       'contacts export', 'contacts erase', 'contacts suppress', 'contacts import', 'contacts group add',
       'contacts group open', 'contacts group close', 'dev',
     ]);
@@ -2929,6 +3192,32 @@ describe('per-command help', () => {
       expect(lines.at(-2), command).toBe('');
       expect(host.stderr(), command).toBe('');
     }
+  });
+
+  it("explains the audit's two forms apart: the audit entry, and the audit lighthouse entry", async () => {
+    const audit = makeHost({ config: null });
+    expect(await audit.run('audit', '--help')).toBe(0);
+    expect(audit.stdout().split('\n')).toEqual([
+      '  audit [--strict]           descriptor against the store — reports, never deletes',
+      '',
+      'stet --help lists every command.',
+    ]);
+    const lighthouse = makeHost({ config: null });
+    expect(await lighthouse.run('audit', 'lighthouse', '--help')).toBe(0);
+    const lines = lighthouse.stdout().split('\n');
+    expect(lines[0]?.startsWith('  audit lighthouse [--url U | --build]')).toBe(true);
+    expect(lines.slice(1)).toEqual(['', 'stet --help lists every command.']);
+  });
+
+  it('keeps audit for everything that is not lighthouse, its refusal included', async () => {
+    const strict = makeHost();
+    // runAudit's own answer: its unseeded keys fail under --strict, and no usage line is printed.
+    expect(await strict.run('audit', '--strict')).toBe(1);
+    expect(strict.stderr()).not.toContain('usage:');
+    expect(strict.stdout()).not.toContain('lighthouse');
+    const foo = makeHost();
+    expect(await foo.run('audit', 'foo')).toBe(2);
+    expect(foo.stderr()).toContain('takes no arguments');
   });
 
   it('carries a wrapped entry whole, and both entries of a command listed twice', async () => {
@@ -3059,6 +3348,13 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
     writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
   }
   const ARMED = "hook: the pre-commit gate's runner is updated — it runs stet seo check too";
+  /** The html fixture with its textarea labelled, so the document rules have nothing to refuse. */
+  const labelled = (): Record<string, string> => ({
+    'index.html': htmlFixture('index.html').replace(
+      '<textarea name="notes">',
+      '<label for="notes">Notes about the dataset</label>\n      <textarea id="notes" name="notes">',
+    ),
+  });
 
   it('arms a listed checkout whose seo check passes, rewriting its runner, and is silent the second time', async () => {
     const host = makeHost({ config: {} });
@@ -3110,7 +3406,7 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
   });
 
   it('arms a site whose only findings are advisory over-length warns: psyon’s 63-character title', async () => {
-    const html = await makeHtmlHost({ register: true });
+    const html = await makeHtmlHost({ register: true, files: labelled() });
     expect(await html.run('pages', 'scan', '--apply')).toBe(0);
     const descriptor = JSON.parse(html.file('content/descriptor.json'));
     const title = descriptor.pages.home.seo.title as string;
@@ -3139,7 +3435,7 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
   });
 
   it('arms an html host and a snapshot-only site alike', async () => {
-    const html = await makeHtmlHost({ register: true });
+    const html = await makeHtmlHost({ register: true, files: labelled() });
     await gated(html);
     expect(await html.run('upgrade')).toBe(0);
     expect(html.out).toContain(ARMED);
@@ -3149,5 +3445,33 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
     expect(await snapshotOnly.run('upgrade')).toBe(0);
     expect(snapshotOnly.stdout()).toContain('store: snapshot-only');
     expect(snapshotOnly.out).toContain(ARMED);
+  });
+
+  it('counts the document rules: an unarmed entry with an unlabelled textarea is not armed, and says so (journey A14, C3)', async () => {
+    const html = await makeHtmlHost({ register: true });
+    await gated(html);
+    expect(await html.run('upgrade')).toBe(0);
+    expect(html.out).toContain(
+      'seo check reports 1 error; the commit gate will run stet seo check once these pass — fix them, or set seoCheck severities, then run stet hook install',
+    );
+    expect(entries(html)).toEqual([{ checkout: '', worktree: '' }]);
+  });
+
+  it('tells an armed entry what the new rules refuse, writes nothing to the gate, and says nothing where they pass (journey A14, C3)', async () => {
+    const html = await makeHtmlHost({ register: true });
+    await gated(html);
+    writeFileSync(join(html.cwd, GATE), `${JSON.stringify({ entries: [{ checkout: '', worktree: '', seo: true }] }, null, 2)}\n`);
+    writeFileSync(join(html.cwd, RUNNER), shippedRunner());
+    const gate = [html.file(GATE), html.file(RUNNER)];
+    expect(await html.run('upgrade')).toBe(0);
+    expect(html.out).toContain('seo check reports 1 error the commit gate will refuse — fix them, or set seoCheck severities');
+    expect([html.file(GATE), html.file(RUNNER)]).toEqual(gate);
+
+    const passing = await makeHtmlHost({ register: true, files: labelled() });
+    await gated(passing);
+    writeFileSync(join(passing.cwd, GATE), `${JSON.stringify({ entries: [{ checkout: '', worktree: '', seo: true }] }, null, 2)}\n`);
+    writeFileSync(join(passing.cwd, RUNNER), shippedRunner());
+    expect(await passing.run('upgrade')).toBe(0);
+    expect(passing.stdout()).not.toMatch(/hook|seo check/);
   });
 });

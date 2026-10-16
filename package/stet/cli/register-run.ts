@@ -7,7 +7,7 @@
  * key register adds.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import { keyDefOf, pageKeyReferences } from '../src/descriptor.js';
@@ -18,6 +18,7 @@ import { filesForGlobs } from './files.js';
 import { heldTextOf } from './html-host.js';
 import { isHeadKind, numberNames } from './key-names.js';
 import { pageOfFile } from './pages.js';
+import { planMount, type MountPlan } from './provider-mount.js';
 import type { Report } from './report.js';
 import { planRewrite } from './rewrite.js';
 import {
@@ -140,6 +141,10 @@ export interface JsxRun {
   /** The copy-module walk's results and property names, which the naming reserves. */
   modules: Map<string, ModuleScanResult>;
   propertyNames: Map<string, string>;
+  /** The CopyProvider mount the run's client rewrites need, where the layout does not carry it yet. */
+  mount?: MountPlan;
+  /** A client file met a layout whose mount could not be located: its literals took the fallback warn. */
+  mountUnlocated?: true;
 }
 
 export async function planJsxRun(input: {
@@ -177,6 +182,7 @@ export async function planJsxRun(input: {
   // located is kept in run order, adopted or not, for the share rule below.
   const adoptable: JsxRun['adoptable'] = [];
   const located: Array<{ literal: LocatedLiteral; target: Target }> = [];
+  let mount: 'mounted' | MountPlan | null | undefined;
   for (const file of filesForGlobs(cwd, config.managedSurfaces)) {
     if (dialectOf(file) !== null) {
       // A template dialect is read by scan's dialect walk and never rewritten: its copy is placed by hand.
@@ -207,12 +213,14 @@ export async function planJsxRun(input: {
       report.warn('scan', `${file}: ambiguous — an un-directived App-Router component; re-run with --kind server|client`);
       continue;
     }
-    if (kind === 'client' && !providerMounted(cwd, config)) {
+    // The first client-kind file asks for the mount once; the answer holds for the run.
+    if (kind === 'client' && mount === undefined) mount = await planMount(cwd, config);
+    if (kind === 'client' && mount === null) {
       for (const literal of result.literals) {
         report.warn(
           'scan',
-          `${file}: ${JSON.stringify(literal.proposedKey)} needs a client rewrite, but no CopyProvider is mounted — ` +
-            'mount CopyProvider in the root layout first (stet init can do it)',
+          `${file}: ${JSON.stringify(literal.proposedKey)} needs a client rewrite, but the CopyProvider mount could not be located in ` +
+            `${config.rootLayout ?? 'the root layout'} — mount it by hand, then run stet register again`,
         );
       }
       continue;
@@ -291,7 +299,19 @@ export async function planJsxRun(input: {
     const name = nameOf.get(leader);
     if (name !== undefined) nameOf.set(literal, name);
   }
-  return { parsed, adoptable, nameOf, reused: new Set(reuseOf.keys()), sharedWith, refusals, dialectFiles, modules, propertyNames };
+  return {
+    parsed,
+    adoptable,
+    nameOf,
+    reused: new Set(reuseOf.keys()),
+    sharedWith,
+    refusals,
+    dialectFiles,
+    modules,
+    propertyNames,
+    ...(typeof mount === 'object' && mount !== null ? { mount } : {}),
+    ...(mount === null ? { mountUnlocated: true as const } : {}),
+  };
 }
 
 /** The accessor kind, or null when an un-directived App-Router component is ambiguous. */
@@ -305,10 +325,10 @@ function kindFor(
   // router — checked FIRST, so a Pages host's email mailer is still server (and
   // reaches EMAIL_TARGET), not client-skipped for want of a provider.
   if (!isJsxFile(file)) return 'server';
-  // Only `pages` forces the client form: a Pages-Router file is client-rendered
-  // with no directive to detect it by. `app` and `astro` both fall through to
-  // the directive and the route-file test.
-  if (config.router === 'pages' || hasUseClient) return 'client';
+  // `pages` and `vite` force the client form: a Pages-Router file and a Vite SPA's
+  // component are client-rendered with no directive to detect them by. `app` and
+  // `astro` both fall through to the directive and the route-file test.
+  if (config.router === 'pages' || config.router === 'vite' || hasUseClient) return 'client';
   if (isRouteFile(file)) return 'server';
   if (forced === 'server' || forced === 'client') return forced;
   return null;
@@ -326,17 +346,6 @@ function isRouteFile(file: string): boolean {
  */
 export function targetFor(file: string, config: StetConfig): Target {
   return config.emailSurfaces.some((g) => matchGlob(g, file)) ? EMAIL_TARGET : DEFAULT_TARGET;
-}
-
-/** The live grep P1-H uses: a `CopyProvider` import from `@getstet/stet/react` in the root layout. */
-function providerMounted(cwd: string, config: StetConfig): boolean {
-  // No recorded root layout is no layout, and no layout is no provider — an
-  // Astro host, whose site layout is a `.astro` template.
-  if (config.rootLayout === undefined) return false;
-  const path = join(cwd, config.rootLayout);
-  if (!existsSync(path)) return false;
-  const source = readFileSync(path, 'utf8');
-  return /import\s*\{[^}]*\bCopyProvider\b[^}]*\}\s*from\s*['"]@getstet\/stet\/react['"]/.test(source);
 }
 
 function skipReason(skip: 'no-component-body' | 'copy-collision'): string {

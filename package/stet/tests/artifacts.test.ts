@@ -240,7 +240,7 @@ describe('planRepoForms — which forms a host has', () => {
     'utf8',
   );
 
-  it('plans the five codegen-carrying forms on a JavaScript host', () => {
+  it('plans the six codegen-carrying forms on a JavaScript host', () => {
     const cwd = tempDir();
     const plans = planRepoForms(
       cwd,
@@ -255,6 +255,7 @@ describe('planRepoForms — which forms a host has', () => {
       'content/keys.ts',
       'content/stet-env.d.ts',
       'content/defaults.ts',
+      'content/resolved.ts',
     ]);
   });
 

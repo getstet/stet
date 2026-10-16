@@ -17,6 +17,7 @@ import {
   checkGeneratedCurrent,
   generateDefaultsModule,
   generateRegistry,
+  generateResolvedModule,
 } from '../src/codegen.js';
 import { checkCurrency, loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
@@ -48,7 +49,7 @@ export function check(config: StetConfig, cwd: string, report: Report): void {
 
   currency(descriptor, snapshot, report);
   // On an html host the generated files ARE the marked documents: there is no
-  // codegen trio to regenerate and compare.
+  // codegen files to regenerate and compare.
   if (isHtmlHost(config)) {
     checkDocuments(cwd, filesForGlobs(cwd, config.managedSurfaces), descriptor, snapshot, report);
   } else {
@@ -165,6 +166,14 @@ function generated(
       path: config.codegen.defaults,
       source: snapshot,
       generate: () => generateDefaultsModule(snapshot),
+      remedy: 'stet pull',
+    },
+    {
+      // The client mount's map: both forms are its source, and `pull` rewrites
+      // it from them on both hosts' arms.
+      path: config.codegen.resolved,
+      source: { descriptor, snapshot },
+      generate: () => generateResolvedModule(descriptor, snapshot),
       remedy: 'stet pull',
     },
   ];

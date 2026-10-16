@@ -64,6 +64,11 @@ describe('kindOf', () => {
     for (const [tag, kind] of rows) expect(kindOf(at({ tag }))).toBe(kind);
   });
 
+  it('reads a <label> as a label, its role name unchanged (F71)', () => {
+    expect(kindOf(at({ tag: 'label' }))).toBe('label');
+    expect(roleOf(at({ tag: 'label' }))).toBe('label');
+  });
+
   it("reads a <title> inside an <svg> as a tooltip, the graphic's name", () => {
     expect(kindOf(at({ tag: 'title', svg: true }))).toBe('tooltip');
   });

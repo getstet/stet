@@ -17,8 +17,8 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { closeSync, openSync, readFileSync, realpathSync, statSync, utimesSync } from 'node:fs';
-import { join, posix, resolve as resolvePath, sep } from 'node:path';
+import { closeSync, openSync, readFileSync, utimesSync } from 'node:fs';
+import { join, posix } from 'node:path';
 
 import { json, readJson } from '../server/http.js';
 import { bearerMatches, createStetHandler } from '../server/mount.js';
@@ -53,13 +53,14 @@ import {
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
 import { runCli, type CliIo } from './main.js';
-import { applyPages, fileRoute, proposeForHost } from './pages.js';
+import { applyPages, auditablePages, fileRoute, proposeForHost, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { blankNonMarkup, dialectOf, matchGlob, type Dialect } from './source-scan.js';
+import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
 import { validateValue } from './validate.js';
@@ -70,6 +71,7 @@ import {
   loadSite,
   readWorkspace,
   removeSite,
+  routerPreviewCommand,
   siteEnv,
   siteId,
   siteIo,
@@ -79,7 +81,7 @@ import {
 } from './workspace.js';
 import { osUser } from './write.js';
 import { packageRoot, packageVersion } from './installed.js';
-import { gone } from './liveness.js';
+import { answers, endGroup } from './liveness.js';
 import { injectAgent, startPreviewProxy, type PreviewProxy } from './preview-proxy.js';
 
 /** A dev-server child the dashboard started: Start creates it, and the context holds it until Stop, the site's removal or the server's close ends it. */
@@ -96,6 +98,11 @@ export interface DevChild {
   /** Whether the exited-or-detached question has been answered once. */
   checked?: boolean;
   handle?: ChildProcess;
+  /** An audit child's stdout, whole: the one JSON object it prints. */
+  stdout?: string;
+  /** When an audit child started, and when it exited: its `elapsed`, frozen at exit. */
+  started?: number;
+  ended?: number;
 }
 
 export interface DevContext {
@@ -118,6 +125,8 @@ export interface DevContext {
   proxies?: Map<string, PreviewProxy>;
   /** The run's preview channel, minted on first use. */
   previewChannel?: string;
+  /** Test seam: the script the audit child runs in place of the installed CLI. */
+  auditCli?: string;
 }
 
 /**
@@ -385,6 +394,7 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
       ...(typeof body['dev'] === 'string' ? { dev: body['dev'] } : {}),
       ...(typeof body['devCommand'] === 'string' ? { devCommand: body['devCommand'] } : {}),
       ...(typeof body['devStopCommand'] === 'string' ? { devStopCommand: body['devStopCommand'] } : {}),
+      ...(typeof body['previewCommand'] === 'string' ? { previewCommand: body['previewCommand'] } : {}),
       ...(typeof body['pushAfterCommit'] === 'boolean' ? { pushAfterCommit: body['pushAfterCommit'] } : {}),
     });
     return json({ sites: listing(ctx).map(summary) });
@@ -392,8 +402,9 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
   if (route === 'workspace/remove' && req.method === 'POST') {
     const body = await readJson(req);
     const path = reqStr(body, 'path');
-    // A site that leaves the workspace takes its dev server with it.
+    // A site that leaves the workspace takes its dev server and its audit with it.
     await stopChild(ctx, path);
+    await stopChild(ctx, auditKey(path));
     await closeProxy(ctx, path);
     removeSite(ctx.workspaceFile, path);
     return json({ sites: listing(ctx).map(summary) });
@@ -452,6 +463,10 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await devStop(ctx, site, entry);
       case 'GET site/dev-log':
         return await devLog(ctx, site, entry);
+      case 'POST site/audit-start':
+        return await auditStart(ctx, req, site);
+      case 'GET site/audit':
+        return auditRead(ctx, site);
       default:
         return json({ error: 'not found' }, 404);
     }
@@ -516,6 +531,7 @@ function siteReply(site: SiteState, entry: WorkspaceEntry): Response {
     },
     environments,
     dev: devDefaults(config, entry),
+    previewDefault: routerPreviewCommand(config),
     entry,
     pending: pendingForms(site),
     git: { ...site.git, live: liveOf(site.path, site.git.branch) },
@@ -660,7 +676,7 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
 }
 
 /**
- * The five repo forms, written in one all-or-nothing batch, with the batch's
+ * The repo forms, written in one all-or-nothing batch, with the batch's
  * own refusal raised under the caller's name.
  *
  * The two routes that rewrite the forms — a save and an applied removal — take
@@ -896,7 +912,7 @@ function keyMoves(
 /**
  * The forms stet writes on this site, enumerated once for the commit's accept
  * set and the pending list: the descriptor and the snapshot, then either the
- * codegen trio or — on the static-HTML host — the managed globs whose marked
+ * codegen files or — on the static-HTML host — the managed globs whose marked
  * documents count.
  */
 function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
@@ -911,6 +927,7 @@ function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
       config.codegen.registry,
       config.codegen.dts,
       config.codegen.defaults,
+      config.codegen.resolved,
     ].map(gitSpelling),
     globs: [],
   };
@@ -966,7 +983,7 @@ function canRead(path: string): boolean {
  *
  * The enumeration is `stetFormPaths`, the one `planRepoForms` itself walks, so
  * the two cannot drift: the descriptor, the snapshot, and then either the
- * marked documents or the codegen trio, each in git's spelling.
+ * marked documents or the codegen files, each in git's spelling.
  *
  * Scoped to the request's own files because the html arm PARSES what it
  * answers about, and parsing a whole checkout of documents on every commit
@@ -1571,21 +1588,10 @@ async function staticRoute(ctx: DevContext, req: Request, url: URL): Promise<Res
     if (site.state !== 'ready' || site.host !== 'html') return json({ error: 'not found' }, 404);
     if (req.method !== 'GET' && req.method !== 'HEAD') return json({ error: 'not found' }, 404);
 
-    let parts: string[];
-    try {
-      parts = url.pathname.split('/').filter(Boolean).slice(3).map(decodeURIComponent);
-    } catch {
-      // A malformed percent-escape is a path this server does not have, the
-      // same as every other one it cannot resolve.
-      return json({ error: 'not found' }, 404);
-    }
-    // A checkout holds more than its documents. A dot-leading segment is the
-    // whole `.env`/`.git` family and `node_modules` is the other bulk of it;
-    // neither is ever a page, and the route carries no Bearer.
-    if (parts.some((part) => part.startsWith('.') || part === 'node_modules')) {
-      return json({ error: 'not found' }, 404);
-    }
-    const file = insideCheckout(site.path, resolvePath(site.path, ...parts));
+    // The site's own path, its segments still escaped: `servableFile` decodes
+    // each once, refuses the `.env`/`.git` family and `node_modules`, and
+    // contains the rest — the route carries no Bearer.
+    const file = servableFile(site.path, '/' + url.pathname.split('/').filter(Boolean).slice(3).join('/'));
     if (file === null) return json({ error: 'not found' }, 404);
 
     // A document gains the preview agent's tag as it is served; the file on
@@ -1609,95 +1615,16 @@ async function staticRoute(ctx: DevContext, req: Request, url: URL): Promise<Res
   });
 }
 
-/**
- * A path inside the checkout that names a readable file, or null.
- *
- * The containment test runs on the REAL path, so `..`, an absolute segment and
- * a symlink pointing out of the checkout are all one refusal. A directory
- * serves its `index.html` and nothing else — there is no listing.
- */
-export function insideCheckout(root: string, target: string): string | null {
-  let real: string;
-  let realRoot: string;
-  try {
-    realRoot = realpathSync(root);
-    real = realpathSync(statSync(target).isDirectory() ? join(target, 'index.html') : target);
-  } catch {
-    return null;
-  }
-  if (real !== realRoot && !real.startsWith(realRoot + sep)) return null;
-  try {
-    return statSync(real).isFile() ? real : null;
-  } catch {
-    return null;
-  }
-}
-
-/** The types a static site is served as. Anything else is bytes. */
-const CONTENT_TYPES: Record<string, string> = {
-  html: 'text/html; charset=utf-8',
-  css: 'text/css; charset=utf-8',
-  js: 'text/javascript; charset=utf-8',
-  mjs: 'text/javascript; charset=utf-8',
-  json: 'application/json',
-  webmanifest: 'application/manifest+json',
-  svg: 'image/svg+xml',
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  gif: 'image/gif',
-  webp: 'image/webp',
-  avif: 'image/avif',
-  ico: 'image/x-icon',
-  woff: 'font/woff',
-  woff2: 'font/woff2',
-  txt: 'text/plain; charset=utf-8',
-  xml: 'application/xml',
-  pdf: 'application/pdf',
-  mp4: 'video/mp4',
-  webm: 'video/webm',
-  map: 'application/json',
-};
-
-function contentTypeOf(file: string): string {
-  const dot = file.lastIndexOf('.');
-  const extension = dot === -1 ? '' : file.slice(dot + 1).toLowerCase();
-  return CONTENT_TYPES[extension] ?? 'application/octet-stream';
-}
-
 /** How long the preview probe waits before it answers down. */
 const PROBE_MS = 1_500;
 
 /**
- * Whether the site's dev server answers, under a short deadline.
- *
- * The fetch's own abort signal is RACED against the route's own timer: an
- * implementation that ignores the signal — a fake among them — must still
- * settle the route. Any response at all is up; only a throw or the deadline is
- * down, because a dev server answering 404 on the selected route is still a
- * dev server.
+ * Whether the site's dev server answers, under a short deadline. Any response
+ * at all is up, because a dev server answering 404 on the selected route is
+ * still a dev server.
  */
 async function probe(ctx: DevContext, target: string): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(false), PROBE_MS);
-  });
-  try {
-    let answered: Promise<boolean>;
-    try {
-      answered = Promise.resolve(
-        ctx.fetchImpl(target, { method: 'HEAD', signal: AbortSignal.timeout(PROBE_MS), redirect: 'manual' }),
-      ).then(
-        () => true,
-        () => false,
-      );
-    } catch {
-      return false;
-    }
-    return await Promise.race([answered, deadline]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
+  return answers(ctx.fetchImpl, target, PROBE_MS);
 }
 
 /**
@@ -1999,18 +1926,11 @@ function elementAt(
   return {};
 }
 
-/** A document's path as the static arm serves it: a folder's index at the folder, anything else at itself. */
-function servedRoute(file: string): string {
-  if (file === 'index.html') return '/';
-  if (file.endsWith('/index.html')) return `/${file.slice(0, -'index.html'.length)}`;
-  return `/${file}`;
-}
-
 /** A route that names a scheme rather than a path — `https:`, `javascript:`, `file:`. */
 const ABSOLUTE_ROUTE = /^[a-z][a-z0-9+.-]*:/i;
 
-/** How much of a child's output is kept for the log pane. */
-const LOG_LINES = 200;
+/** How much of a child's output is kept for the log pane, and for the audit's preview child. */
+export const LOG_LINES = 200;
 
 /** A child's state as the page reads it. */
 function childReply(child: DevChild): Record<string, unknown> {
@@ -2135,6 +2055,121 @@ async function devStop(ctx: DevContext, site: SiteState, entry: WorkspaceEntry):
   return json({ running: false, state: 'stopped', lines: child.lines });
 }
 
+/** The audit child's key in `ctx.children`, beside the site's dev server under its path. */
+function auditKey(path: string): string {
+  return `${path}#audit`;
+}
+
+/**
+ * `stet audit lighthouse --json` as a child of this server, keyed to the site:
+ * the installed CLI under the environment the dev child gets. A start while
+ * one runs answers the running one. A Next build below 16 shares `.next/`
+ * with a running dev server and is refused.
+ */
+async function auditStart(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const held = ctx.children.get(auditKey(ready.path));
+  if (held !== undefined && held.state === 'running') return json(auditReply(held));
+  const body = await readJson(req);
+  const args = ['audit', 'lighthouse', '--json'];
+  if (body['desktop'] === true) args.push('--desktop');
+  const pages = body['pages'];
+  if (pages !== undefined) {
+    if (!Array.isArray(pages) || pages.length === 0 || !pages.every((page): page is string => typeof page === 'string')) {
+      return json({ error: 'pages must be a list of page names' }, 400);
+    }
+    const known = auditablePages(ready.path, ready.config, ready.descriptor);
+    const unknown = pages.find((page) => !known.some((entry) => entry.page === page));
+    if (unknown !== undefined) return json({ error: `${unknown} is not a declared page` }, 400);
+    args.push('--pages', pages.join(','));
+  }
+  if (body['fix'] === true) args.push('--fix', '--write');
+  if (ready.host === 'js') {
+    const url = body['url'];
+    if (url !== undefined) {
+      let protocol = '';
+      try {
+        protocol = typeof url === 'string' ? new URL(url).protocol : '';
+      } catch {
+        protocol = '';
+      }
+      if (protocol !== 'http:' && protocol !== 'https:') return json({ error: 'url must be an http or https address' }, 400);
+      args.push('--url', url as string);
+    } else {
+      const dev = ctx.children.get(ready.path);
+      const router = ready.config.router;
+      if ((router === 'app' || router === 'pages') && dev?.state === 'running' && nextMajorBelow16(ready.path)) {
+        return json({ error: 'stop the dev server first — next build writes the .next folder it is serving from' }, 409);
+      }
+      args.push('--build');
+    }
+  }
+  const spawned = spawn(process.execPath, [ctx.auditCli ?? join(packageRoot(), 'dist', 'cli', 'main.js'), ...args], {
+    cwd: ready.path,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: childEnv(),
+  });
+  const child: DevChild = {
+    pid: spawned.pid ?? 0,
+    command: `stet ${args.join(' ')}`,
+    lines: [],
+    state: 'running',
+    code: null,
+    handle: spawned,
+    stdout: '',
+    started: Date.now(),
+  };
+  spawned.stdout?.on('data', (chunk: Buffer) => {
+    child.stdout += chunk.toString('utf8');
+  });
+  spawned.stderr?.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString('utf8').split('\n')) if (line.trim() !== '') child.lines.push(line);
+    if (child.lines.length > LOG_LINES) child.lines.splice(0, child.lines.length - LOG_LINES);
+  });
+  spawned.on('exit', (code) => {
+    child.state = 'exited';
+    child.code = code;
+    child.ended = Date.now();
+  });
+  spawned.on('error', (error) => {
+    child.state = 'exited';
+    child.ended = Date.now();
+    child.lines.push(error.message);
+  });
+  ctx.children.set(auditKey(ready.path), child);
+  return json(auditReply(child));
+}
+
+/** Before Next 16, `next build` and `next dev` share `.next/`; an unreadable version counts as before. */
+function nextMajorBelow16(checkout: string): boolean {
+  try {
+    const version = (JSON.parse(readFileSync(join(checkout, 'node_modules', 'next', 'package.json'), 'utf8')) as { version?: unknown }).version;
+    const major = typeof version === 'string' ? Number.parseInt(version, 10) : Number.NaN;
+    return !(major >= 16);
+  } catch {
+    return true;
+  }
+}
+
+/** The site's audit: none, running, done (stdout parsed, whatever the exit) or failed (stdout not JSON). */
+function auditRead(ctx: DevContext, site: SiteState): Response {
+  const ready = requireReady(site);
+  const child = ctx.children.get(auditKey(ready.path));
+  if (child === undefined) return json({ state: 'none', elapsed: 0, lines: [], result: null });
+  return json(auditReply(child));
+}
+
+function auditReply(child: DevChild): Record<string, unknown> {
+  const elapsed = Math.floor(((child.ended ?? Date.now()) - (child.started ?? Date.now())) / 1000);
+  if (child.state === 'running') return { state: 'running', elapsed, lines: child.lines, result: null };
+  try {
+    return { state: 'done', elapsed, lines: child.lines, result: JSON.parse(child.stdout ?? '') as unknown };
+  } catch {
+    return { state: 'failed', elapsed, lines: child.lines, result: null };
+  }
+}
+
 /** How long Stop gives the entry's stop command. */
 const STOP_COMMAND_MS = 30_000;
 
@@ -2215,22 +2250,7 @@ function runStop(command: string, cwd: string, ms: number): Promise<void> {
 
 /** Whether the group was there to end. */
 async function endChild(child: DevChild): Promise<boolean> {
-  if (child.pid === 0) return false;
-  try {
-    process.kill(-child.pid, 'SIGTERM');
-  } catch {
-    return false;
-  }
-  if (await gone(-child.pid, 2_000)) return true;
-  try {
-    process.kill(-child.pid, 'SIGKILL');
-  } catch {
-    /* already gone */
-  }
-  // SIGKILL is delivered asynchronously: without this the caller can answer
-  // "stopped" while the port is still held.
-  await gone(-child.pid, 2_000);
-  return true;
+  return endGroup(child.pid);
 }
 
 /**
@@ -2320,7 +2340,7 @@ async function declarePages(req: Request, site: SiteState): Promise<Response> {
 
 /**
  * A key's removal — the terminal's own plan, and the same batch behind
- * `--write`. The plan writes nothing; `apply` writes the five repo forms in one
+ * `--write`. The plan writes nothing; `apply` writes the repo forms in one
  * go, as `stet remove --write` does.
  */
 async function removeKeys(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {

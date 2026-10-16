@@ -7,6 +7,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -141,11 +142,14 @@ describe('runInit — snapshot-only', () => {
       'content/keys.ts',
       'content/stet-env.d.ts',
       'content/defaults.ts',
+      'content/resolved.ts',
       'lib/content.ts',
       'stet.config.json',
     ]) {
       expect(existsSync(join(dir, f)), f).toBe(true);
     }
+    // The resolved module is one of init's codegen writes, and its own check reads it current.
+    expect(io.out).toContain('generated: content/resolved.ts current');
     // a migration was copied
     expect(existsSync(join(dir, 'stet', 'migrations'))).toBe(true);
     // no store -> no route
@@ -165,16 +169,15 @@ describe('runInit — snapshot-only', () => {
     expect(io.out.filter((line) => line.startsWith('next:')).join('\n')).not.toContain('stet pull');
   });
 
-  it('skips the provider mount non-interactively and prints the snippet', async () => {
+  it('prints that the provider is not mounted', async () => {
     const dir = project();
     write(dir, 'app/layout.tsx', APP_LAYOUT);
     const io = makeIo(dir);
     await runInit([], io);
     // layout untouched
     expect(readFileSync(join(dir, 'app/layout.tsx'), 'utf8')).toBe(APP_LAYOUT);
-    const joined = io.out.join('\n');
-    expect(joined).toContain('non-interactive');
-    expect(joined).toContain("import { CopyProvider } from '@getstet/stet/react'");
+    expect(io.out).toContain('CopyProvider: not mounted — stet register mounts it in app/layout.tsx when a client component first reads copy');
+    expect(io.out.join('\n')).not.toContain('non-interactive');
   });
 });
 
@@ -205,82 +208,46 @@ describe('runInit — store-backed', () => {
   });
 });
 
-describe('runInit — the provider mount edit', () => {
-  it('applies on confirm: imports CopyProvider and wraps {children}', async () => {
-    const dir = project();
-    write(dir, 'app/layout.tsx', APP_LAYOUT);
-    const io = makeIo(dir, { mount: true });
-    await runInit([], io);
-    const layout = readFileSync(join(dir, 'app/layout.tsx'), 'utf8');
-    expect(layout).toContain("import { CopyProvider } from '@getstet/stet/react'");
-    expect(layout).toContain('const { resolved } = resolveAll(descriptorJson as unknown as Descriptor, readBundle(DEFAULTS))');
-    expect(layout).toContain('<CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={resolved}>{children}</CopyProvider>');
-    // client-safe: no server-only builtins reach the layout
-    expect(layout).not.toContain('node:');
-    expect(layout).not.toContain('readFileSync');
+describe('runInit — no provider mount (P15)', () => {
+  it('edits no layout on confirm or with --yes, and asks nothing about a mount', async () => {
+    for (const [args, opts] of [[[], { mount: true, guidance: false }], [['--yes'], {}]] as const) {
+      const dir = project();
+      write(dir, 'app/layout.tsx', APP_LAYOUT);
+      const asked: string[] = [];
+      const io = makeIo(dir, opts);
+      if (io.confirm !== undefined) {
+        const answer = io.confirm;
+        io.confirm = async (q: string) => {
+          asked.push(q);
+          return answer(q);
+        };
+      }
+      expect(await runInit([...args], io)).toBe(0);
+      expect(readFileSync(join(dir, 'app/layout.tsx'), 'utf8')).toBe(APP_LAYOUT);
+      expect(asked.some((q) => /CopyProvider|mount/i.test(q))).toBe(false);
+      expect(io.out).toContain('CopyProvider: not mounted — stet register mounts it in app/layout.tsx when a client component first reads copy');
+    }
   });
 
-  it('applies with --yes even when non-interactive', async () => {
-    const dir = project();
-    write(dir, 'app/layout.tsx', APP_LAYOUT);
-    const io = makeIo(dir);
-    await runInit(['--yes'], io);
-    expect(readFileSync(join(dir, 'app/layout.tsx'), 'utf8')).toContain('<CopyProvider');
-  });
-
-  it('is idempotent — a second init with the provider present makes no change', async () => {
-    const dir = project();
-    write(dir, 'app/layout.tsx', APP_LAYOUT);
-    await runInit(['--yes'], makeIo(dir));
-    const afterFirst = readFileSync(join(dir, 'app/layout.tsx'), 'utf8');
-    const io = makeIo(dir, { mount: true });
-    await runInit([], io);
-    expect(readFileSync(join(dir, 'app/layout.tsx'), 'utf8')).toBe(afterFirst);
-    expect(io.out.join('\n')).toContain('already mounted');
-  });
-
-  it('skips and prints the snippet where the wrap point is ambiguous', async () => {
-    const dir = project();
-    write(
-      dir,
-      'app/layout.tsx',
-      `export default function RootLayout({ children }: { children: React.ReactNode }) {
-  return (<div>{children}<aside>{children}</aside></div>);
-}
-`,
+  it('names the layout relative to the invocation directory, under --app and on a Pages host alike', async () => {
+    const mono = project();
+    write(mono, 'apps/web/package.json', hostManifest());
+    write(mono, 'apps/web/src/app/layout.tsx', APP_LAYOUT);
+    const io = makeIo(mono);
+    expect(await runInit(['--app', 'apps/web', '--yes'], io)).toBe(0);
+    expect(io.out).toContain(
+      'CopyProvider: not mounted — stet register mounts it in apps/web/src/app/layout.tsx when a client component first reads copy',
     );
-    const io = makeIo(dir, { mount: true });
-    await runInit([], io);
-    expect(readFileSync(join(dir, 'app/layout.tsx'), 'utf8')).not.toContain('CopyProvider');
-    expect(io.out.join('\n')).toContain('could not locate the wrap point');
-  });
+    expect(readFileSync(join(mono, 'apps/web/src/app/layout.tsx'), 'utf8')).toBe(APP_LAYOUT);
 
-  it('writes the layout its OWN line endings', async () => {
-    // A `\n` inserted into a CRLF file leaves mixed endings in a file stet did
-    // not write (P3-13). The census is the assertion: every LF in the result
-    // must be part of a CRLF pair, which a `toContain` could never show.
-    const dir = project();
-    const crlf = APP_LAYOUT.replace(/\n/g, '\r\n');
-    write(dir, 'app/layout.tsx', crlf);
-    await runInit(['--yes'], makeIo(dir));
-
-    const out = readFileSync(join(dir, 'app/layout.tsx'));
-    expect(out.includes('<CopyProvider')).toBe(true); // the mount did apply
-    const lf = (out.toString('utf8').match(/\n/g) ?? []).length;
-    const pairs = (out.toString('utf8').match(/\r\n/g) ?? []).length;
-    expect(`bare LF: ${lf - pairs}`).toBe('bare LF: 0');
-  });
-
-  it('wraps <Component> on a Pages Router _app', async () => {
-    const dir = project();
-    write(dir, 'pages/_app.tsx', PAGES_APP);
-    const io = makeIo(dir, { mount: true });
-    const code = await runInit([], io);
-    expect(code).toBe(0);
-    const app = readFileSync(join(dir, 'pages/_app.tsx'), 'utf8');
-    expect(app).toContain('<CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={resolved}><Component {...pageProps} /></CopyProvider>');
-    expect(readConfig(dir)['router']).toBe('pages');
-    expect(readConfig(dir)['managedSurfaces']).toEqual(['pages/**/*.tsx']);
+    const pages = project();
+    write(pages, 'pages/_app.tsx', PAGES_APP);
+    write(pages, 'pages/index.tsx', 'export default function Home() { return <h1>Hi</h1>; }\n');
+    const pagesIo = makeIo(pages);
+    expect(await runInit(['--yes'], pagesIo)).toBe(0);
+    expect(readConfig(pages)['router']).toBe('pages');
+    expect(pagesIo.out).toContain('CopyProvider: not mounted — stet register mounts it in pages/_app.tsx when a client component first reads copy');
+    expect(readFileSync(join(pages, 'pages/_app.tsx'), 'utf8')).toBe(PAGES_APP);
   });
 });
 
@@ -309,6 +276,8 @@ describe('runInit — layout probing and rebasing', () => {
     write(dir, 'app/layout.js', JS_LAYOUT);
     const io = makeIo(dir, { mount: true });
     await runInit([], io);
+    // The layout is the host's own: init mounts nothing (register's JS-host case pins the JS mount form).
+    expect(readFileSync(join(dir, 'app/layout.js'), 'utf8')).toBe(JS_LAYOUT);
 
     // P2-11: the surface globs widen to .jsx AND .js alongside .tsx (create-next-app
     // JS mode generates app/page.js; stet's matcher has no brace expansion, so it is
@@ -326,12 +295,6 @@ describe('runInit — layout probing and rebasing', () => {
     for (const ts of ['as unknown as Descriptor', 'type Descriptor', ': unknown', ': Descriptor']) {
       expect(readPath, `read path must not contain ${ts}`).not.toContain(ts);
     }
-    // And the mounted JS layout: no cast, no type-only import.
-    const layout = readFileSync(join(dir, 'app/layout.js'), 'utf8');
-    expect(layout).toContain('<CopyProvider descriptor={descriptorJson} resolved={resolved}>');
-    expect(layout).toContain("import { readBundle, resolveAll } from '@getstet/stet';");
-    expect(layout).not.toContain('as unknown as Descriptor');
-    expect(layout).not.toContain('type Descriptor');
   });
 });
 
@@ -367,6 +330,8 @@ describe('runInit — the router is detected by route files', () => {
         "either copy('key') for text or copyMap.key by property",
     );
     expect(out).not.toContain('stet/react');
+    // There is no React layout for register to mount into, so no line promises one.
+    expect(out).not.toContain('CopyProvider: not mounted');
   });
 
   it('writes no Next-shaped mount route on a store-backed Astro host', async () => {
@@ -451,7 +416,7 @@ describe('runInit — the read path matches the host (F5)', () => {
   const REACT_READ_PATH = `import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { createServerCopy } from '@getstet/stet/react';
+import { createServerCopy } from '@getstet/stet/react/server';
 import { readBundle, resolveAll, type Descriptor } from '@getstet/stet';
 
 import descriptorJson from '../content/descriptor.json';
@@ -608,7 +573,7 @@ export const copy = createAccessor(descriptor, resolved);
 export const copyMap = resolved;
 `;
 
-  it('a host declaring react gets the @getstet/stet/react module, byte for byte', async () => {
+  it('a host declaring react gets the @getstet/stet/react/server module, byte for byte', async () => {
     const dir = project();
     write(dir, 'app/layout.tsx', APP_LAYOUT);
     await runInit([], makeIo(dir));
@@ -836,11 +801,12 @@ export const copyMap = resolved;
     const io = makeIo(dir);
     expect(await runInit(['--app', 'apps/web', '--yes'], io)).toBe(0);
 
-    // The react module, and the mount actually applied.
+    // The react module, and the not-mounted line a react host prints.
     expect(readFileSync(join(dir, 'apps/web/lib/content.ts'), 'utf8')).toContain(
-      "import { createServerCopy } from '@getstet/stet/react';",
+      "import { createServerCopy } from '@getstet/stet/react/server';",
     );
-    expect(readFileSync(join(dir, 'apps/web/app/layout.tsx'), 'utf8')).toContain('<CopyProvider');
+    expect(readFileSync(join(dir, 'apps/web/app/layout.tsx'), 'utf8')).toBe(APP_LAYOUT);
+    expect(io.out).toContain('CopyProvider: not mounted — stet register mounts it in apps/web/app/layout.tsx when a client component first reads copy');
     expect(io.out.join('\n')).not.toContain('no CopyProvider mount');
 
     // Root AND sub react-less stays react-free, as before.
@@ -863,7 +829,7 @@ export const copyMap = resolved;
     write(dir, 'app/layout.tsx', APP_LAYOUT);
     await runInit(['--yes'], makeIo(dir));
     expect(readFileSync(join(dir, 'lib/content.ts'), 'utf8')).toContain(
-      "import { createServerCopy } from '@getstet/stet/react';",
+      "import { createServerCopy } from '@getstet/stet/react/server';",
     );
   });
 
@@ -1097,7 +1063,7 @@ describe('runInit — the static-HTML host', () => {
     const dir = htmlProject({ devDependencies: { vite: '^5' } });
     const io = makeIo(dir);
     expect(await runInit(['--yes'], io)).toBe(0);
-    expect(io.out[0]).toBe('router: app (default — no route files found)');
+    expect(io.out[0]).toBe('router: vite (vite in package.json and index.html at the root)');
     expect(readConfig(dir)['host']).toBeUndefined();
   });
 
@@ -1340,5 +1306,80 @@ describe('runInit — the sign-up question and the forms scaffold', () => {
     expect(readConfig(dir)['contacts']).toBeUndefined();
     expect(readFileSync(join(dir, 'lib/stet-forms.ts'), 'utf8')).toContain('process.env.STET_DATABASE_URL');
     expect(readFileSync(join(dir, '.env.example'), 'utf8')).toBe('STET_FORMS_SECRET=\nSTET_FORMS_BASE=\n');
+  });
+});
+
+describe('runInit — the Vite arm (D9)', () => {
+  const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'vite-host');
+  const viteHost = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-init-vite-'));
+    cpSync(FIXTURE, dir, { recursive: true });
+    return dir;
+  };
+  const files = (dir: string): Record<string, string> =>
+    Object.fromEntries(['package.json', 'index.html', 'src/main.tsx', 'src/App.tsx'].map((rel) => [rel, readFileSync(join(dir, rel), 'utf8')]));
+
+  it('records the entry and the client surfaces, writes no read path, and changes no template file', async () => {
+    const dir = viteHost();
+    const before = files(dir);
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('router: vite (vite in package.json and index.html at the root)');
+    const config = readConfig(dir);
+    expect(config['router']).toBe('vite');
+    expect(config['rootLayout']).toBe('src/main.tsx');
+    expect(config['managedSurfaces']).toEqual(['src/**/*.tsx']);
+    expect(Object.hasOwn(config, 'readPath')).toBe(false);
+    expect(Object.hasOwn(config, 'mountRoute')).toBe(false);
+    expect(existsSync(join(dir, 'lib'))).toBe(false);
+    expect(existsSync(join(dir, 'src/lib'))).toBe(false);
+    expect(existsSync(join(dir, 'app'))).toBe(false);
+    expect(existsSync(join(dir, 'content/resolved.ts'))).toBe(true);
+    expect(files(dir)).toEqual(before);
+    expect(io.out).toContain('CopyProvider: not mounted — stet register mounts it in src/main.tsx when a client component first reads copy');
+    expect(await runCli(['check'], makeIo(dir))).toBe(0);
+  });
+
+  it('takes the html shape under --host html', async () => {
+    const dir = viteHost();
+    const io = makeIo(dir);
+    expect(await runInit(['--host', 'html', '--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('host: html (--host html)');
+    expect(readConfig(dir)['host']).toBe('html');
+  });
+
+  it('takes the JS globs on a .jsx entry, and records the entry index.html names', async () => {
+    const jsx = viteHost();
+    write(jsx, 'index.html', readFileSync(join(jsx, 'index.html'), 'utf8').replace('/src/main.tsx', '/src/main.jsx'));
+    write(jsx, 'src/main.jsx', readFileSync(join(jsx, 'src/main.tsx'), 'utf8').replace('!', ''));
+    expect(await runInit(['--yes'], makeIo(jsx))).toBe(0);
+    expect(readConfig(jsx)['rootLayout']).toBe('src/main.jsx');
+    expect(readConfig(jsx)['managedSurfaces']).toEqual(['src/**/*.jsx', 'src/**/*.js']);
+
+    const entry = viteHost();
+    write(entry, 'index.html', readFileSync(join(entry, 'index.html'), 'utf8').replace('/src/main.tsx', '/src/entry.tsx'));
+    write(entry, 'src/entry.tsx', readFileSync(join(entry, 'src/main.tsx'), 'utf8'));
+    expect(await runInit(['--yes'], makeIo(entry))).toBe(0);
+    expect(readConfig(entry)['rootLayout']).toBe('src/entry.tsx');
+  });
+
+  it('keeps a Next app with vite in its tooling on its router', async () => {
+    const dir = project();
+    write(dir, 'package.json', '{"name":"host","private":true,"dependencies":{"react":"^19"},"devDependencies":{"vite":"^8.3.0"}}\n');
+    write(dir, 'app/layout.tsx', APP_LAYOUT);
+    write(dir, 'app/page.tsx', 'export default function Page() { return <h1>Home</h1>; }\n');
+    write(dir, 'index.html', '<!doctype html><html><body></body></html>\n');
+    const io = makeIo(dir);
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(io.out[0]).toBe('router: app (app carries a page file)');
+  });
+
+  it('records a detected store dormant, with the Vite mount-route line', async () => {
+    const dir = viteHost();
+    const io = makeIo(dir, { env: { STET_DATABASE_URL: 'postgres://localhost/x' } });
+    expect(await runInit(['--yes'], io)).toBe(0);
+    expect(readConfig(dir)['store']).toBeDefined();
+    expect(io.out).toContain('mount route: not scaffolded on a Vite host — a Vite SPA reads the committed snapshot through the provider');
+    expect(io.out).toContain('next: stet scan');
   });
 });

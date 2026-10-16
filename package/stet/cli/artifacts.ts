@@ -12,7 +12,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { canonicalize, generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import { canonicalize, generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { isHtmlHost, type StetConfig } from './config.js';
@@ -154,10 +154,10 @@ export function writePlanned(
 }
 
 /**
- * The five repo forms as one update batch — the descriptor, the snapshot and
- * the regenerated codegen trio.
+ * The six repo forms as one update batch — the descriptor, the snapshot and
+ * the regenerated codegen files.
  *
- * The three commands that write keys write exactly these five, and a batch that
+ * The three commands that write keys write exactly these six, and a batch that
  * missed one would leave a permanent finding: `generateRegistry` stamps the
  * WHOLE descriptor's source hash, so a descriptor edit alone stales the
  * currency gate. Every plan is `asUpdate` — each file's new text was computed
@@ -183,7 +183,7 @@ export function planRepoForms(
 ): WritePlan[] {
   const at = (rel: string): string => join(cwd, rel);
   // On the static-HTML host the repo forms are the descriptor, the snapshot and
-  // the MARKED DOCUMENTS: there is no codegen trio, and each document is
+  // the MARKED DOCUMENTS: there are no codegen files, and each document is
   // regenerated from the snapshot rather than written from a generator.
   if (isHtmlHost(config)) {
     const { writes, skips } = planDocuments(
@@ -215,6 +215,7 @@ export function planRepoForms(
     asUpdate(planWrite(at(config.codegen.registry), keysTs, config.codegen.registry)),
     asUpdate(planWrite(at(config.codegen.dts), dts, config.codegen.dts)),
     asUpdate(planWrite(at(config.codegen.defaults), generateDefaultsModule(snapshot), config.codegen.defaults)),
+    asUpdate(planWrite(at(config.codegen.resolved), generateResolvedModule(descriptor, snapshot), config.codegen.resolved)),
   ];
 }
 

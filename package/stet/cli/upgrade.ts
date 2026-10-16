@@ -20,8 +20,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { generateRegistry } from '../src/codegen.js';
-import { seoCheck } from '../src/seo.js';
+import { generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { planWrite, writePlanned, writeText } from './artifacts.js';
 import {
@@ -31,17 +30,21 @@ import {
   defaultStoreBlock,
   isHtmlHost,
   loadConfig,
-  seoOverrides,
   type StetConfig,
   type StoreAdapterName,
   type StoreBlock,
 } from './config.js';
+import { clientReadFiles, INIT_READ_IMPORT, readPathImport, SERVER_READ_IMPORT } from './footprint.js';
 import { armGateSeo } from './hook.js';
 import { migrations, type Migration } from './installed.js';
 import type { CliIo } from './main.js';
 import { applyMigrationSql, readProjectMeta, stampDescriptorVersion } from './meta.js';
+import { unmountEdits } from './provider-mount.js';
 import { loadProject, type LoadedProject } from './project.js';
 import { CliError, plural, Report, UsageError } from './report.js';
+import { applyFileEdits } from './rewrite.js';
+import { seoFindings } from './seo.js';
+import { loadTypescript } from './source-scan.js';
 import { contactsConfig, isStoreBacked } from './store.js';
 import { seed } from './write.js';
 
@@ -86,7 +89,8 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
       }
     }
     regenerate(io, project, report, dryRun);
-    if (!dryRun) armGate(io, project, report);
+    if (!dryRun) await footprint(io, project, report);
+    if (!dryRun) await armGate(io, project, report);
   } catch (error) {
     // A usage mistake keeps its exit code and its silence: it is raised before
     // any work, so there is no partial report worth printing over it.
@@ -104,16 +108,62 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
 }
 
 /**
- * The commit gate's SEO run, armed only where `seo check` passes today — the
- * count is the in-process `seoCheck`, the function `stet seo check` runs, so
- * nothing is spawned.
+ * What stet adds to a production page, taken back where nothing needs it: the
+ * read path's import of the provider's index rewritten to the server subpath,
+ * where it is the line `init` wrote and nothing else imports that index. Any
+ * other import is named for the hand — the rewrite touches only the line it
+ * can prove it wrote, its line ending kept. Then the root layout's mount, taken
+ * out where no file reads `useCopy` and `unmountEdits`' round trip proves it
+ * is the mount stet wrote.
  */
-function armGate(io: CliIo, project: LoadedProject, report: Report): void {
-  const errors = seoCheck(project.descriptor, project.snapshot, seoOverrides(project.config)).filter(
+async function footprint(io: CliIo, project: LoadedProject, report: Report): Promise<void> {
+  const config = project.config;
+  if (isHtmlHost(config)) return;
+  const shown = config.readPath.file;
+  const kind = readPathImport(io.cwd, config);
+  if (kind === 'init-line') {
+    const path = join(io.cwd, shown);
+    // Separators kept at the odd indices, so each line ending survives the join.
+    const parts = readFileSync(path, 'utf8').split(/(\r?\n)/);
+    writeText(path, parts.map((part, i) => (i % 2 === 0 && part === INIT_READ_IMPORT ? SERVER_READ_IMPORT : part)).join(''));
+    report.line(`${shown}: imports from '@getstet/stet/react' — rewritten to '@getstet/stet/react/server', which carries no client code`);
+  } else if (kind === 'other') {
+    report.line(`${shown}: imports from '@getstet/stet/react' — change it to '@getstet/stet/react/server' by hand; the line is not the one stet init wrote`);
+  }
+  if (config.rootLayout === undefined) return;
+  const layout = join(io.cwd, config.rootLayout);
+  if (!existsSync(layout)) return;
+  const source = readFileSync(layout, 'utf8');
+  if (!source.includes('<CopyProvider') || clientReadFiles(io.cwd, config).length > 0) return;
+  let ts: typeof import('typescript');
+  try {
+    ts = await loadTypescript();
+  } catch {
+    return;
+  }
+  const unmount = unmountEdits(ts, layout, source, io.cwd, config);
+  if (unmount === null) {
+    report.line(`${config.rootLayout}: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote`);
+    return;
+  }
+  writeText(layout, applyFileEdits(source, unmount.edits));
+  report.line(`${config.rootLayout}: CopyProvider unmounted — no client component reads copy; stet register mounts it again when one does`);
+}
+
+/**
+ * The commit gate's SEO run, armed only where `seo check` passes today — the
+ * count is the in-process `seoFindings`, every rule `stet seo check` runs, so
+ * nothing is spawned. An entry already armed is told what the rules it runs
+ * now refuse.
+ */
+async function armGate(io: CliIo, project: LoadedProject, report: Report): Promise<void> {
+  const errors = (await seoFindings(io.cwd, project.config, project.descriptor, project.snapshot)).filter(
     (finding) => finding.severity === 'error',
   ).length;
   const answer = armGateSeo(io.cwd, errors);
-  if (answer === 'armed') report.line("hook: the pre-commit gate's runner is updated — it runs stet seo check too");
+  if (answer === 'current' && errors > 0) {
+    report.line(`seo check reports ${plural(errors, 'error')} the commit gate will refuse — fix them, or set seoCheck severities`);
+  } else if (answer === 'armed') report.line("hook: the pre-commit gate's runner is updated — it runs stet seo check too");
   else if (answer === 'not-listed') report.line('run stet hook install to add the SEO check to the commit gate');
   else if (answer === 'failing') {
     report.line(
@@ -519,7 +569,7 @@ async function stamp(io: CliIo, project: LoadedProject, report: Report): Promise
   );
 }
 
-/** The registry always regenerates: the descriptor is its only source. */
+/** The registry always regenerates: the descriptor is its only source. The resolved module rides with it, so a host from before it gains the file. */
 function regenerate(io: CliIo, project: LoadedProject, report: Report, dryRun: boolean): void {
   // There is no registry on the static-HTML host: the marked documents are what
   // that host generates, and `stet pull` is what regenerates them.
@@ -531,6 +581,7 @@ function regenerate(io: CliIo, project: LoadedProject, report: Report, dryRun: b
   const files: { path: string; text: string }[] = [
     { path: project.config.codegen.registry, text: keysTs },
     { path: project.config.codegen.dts, text: dts },
+    { path: project.config.codegen.resolved, text: generateResolvedModule(project.descriptor, project.snapshot) },
   ];
   for (const file of files) {
     const full = join(io.cwd, file.path);

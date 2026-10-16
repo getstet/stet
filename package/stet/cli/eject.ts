@@ -25,7 +25,7 @@ import { basename, dirname, join, resolve as resolvePath, sep } from 'node:path'
 
 import type * as TS from 'typescript';
 
-import { generateDefaultsModule } from '../src/codegen.js';
+import { generateDefaultsModule, generateResolvedModule } from '../src/codegen.js';
 import { escapeRegExp } from '../src/seo.js';
 import { activeRow, resolve } from '../src/resolve.js';
 import type { StoreRow } from '../src/resolve.js';
@@ -56,9 +56,10 @@ import { planDocuments, stripMarks } from './html-host.js';
 import { removeFromGate } from './hook.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence } from './project.js';
+import { unmountEdits } from './provider-mount.js';
 import { walk } from './pages.js';
 import { CliError, Report, collapseLines, posixRelative } from './report.js';
-import { applyFileEdits, formatDiff, unRewriteFile, type Edit } from './rewrite.js';
+import { applyFileEdits, dominantEol, formatDiff, unRewriteFile, type Edit } from './rewrite.js';
 import { filesForGlobs } from './scan.js';
 import { TS7_REFUSAL, isDialectFile, loadTypescript, matchGlob, scanSource, scriptKindFor } from './source-scan.js';
 import { isStoreBacked } from './store.js';
@@ -95,6 +96,7 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       config.codegen.dts,
       config.codegen.registry,
       config.codegen.defaults,
+      config.codegen.resolved,
       ...(config.mountRoute === undefined ? [] : [config.mountRoute]),
     ]);
     // Every surface file's text, read ONCE: the probe below and the un-rewrite
@@ -188,12 +190,27 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
         }
         if (result.accessorCalls.length === 0 && !isLayout) continue;
 
-        const un = unRewriteFile(source, result.accessorCalls, values, [...result.stetImportSpans, ...result.copyDeclSpans]);
+        // The mount stet wrote comes out exactly; its block's imports go with the block.
+        const exact = isLayout ? unmountEdits(ts, abs, source, io.cwd, config) : null;
+        if (exact !== null) {
+          // A leaf import a later register run put directly below the block carries the block's trailing newline below it.
+          const nl = dominantEol(source);
+          const leaf = [...result.stetImportSpans, ...result.copyDeclSpans].find((span) => span.pos === exact.block.end);
+          if (leaf !== undefined && !source.startsWith(nl + nl, exact.block.end - 2 * nl.length) && source.startsWith(nl, leaf.end)) {
+            exact.block = { pos: exact.block.pos, end: leaf.end + nl.length };
+            exact.edits[0] = { pos: exact.block.pos, end: exact.block.end, text: '' };
+          }
+        }
+        const inBlock = (span: { pos: number; end: number }): boolean => exact !== null && span.pos >= exact.block.pos && span.end <= exact.block.end;
+        const spans = [...result.stetImportSpans, ...result.copyDeclSpans].filter((span) => !inBlock(span));
+        const un = unRewriteFile(source, result.accessorCalls, values, spans);
         for (const call of un.skipped) foreign.push(`${file}: left copy('${call.key}') untouched — a foreign copy binding, not stet's`);
         const extra: Edit[] = [];
-        if (isLayout) {
-          const unwrap = copyProviderUnwrap(ts, source, abs);
-          if (unwrap) extra.push(unwrap);
+        if (exact !== null) {
+          extra.push(...exact.edits);
+        } else if (isLayout) {
+          // 0.6.0's path, for a mount the round trip does not prove.
+          extra.push(...copyProviderUnwrap(ts, source, abs));
           for (const span of result.resolvedMapDeclSpans) extra.push({ pos: span.pos, end: span.end, text: '' });
           for (const span of layoutOrphanImports(ts, source, abs, io.cwd, config)) extra.push({ pos: span.pos, end: span.end, text: '' });
         }
@@ -293,11 +310,12 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       if (write) throw refusal;
     }
 
-    // (1) The snapshot + regenerated defaults module.
+    // (1) The snapshot + regenerated defaults and resolved modules.
     report.line(`snapshot: ${Object.keys(merged[config.locales.default] ?? {}).length} default key(s) → ${config.snapshotPath}, + ${config.codegen.defaults}`);
     if (write) {
       writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
       writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged));
+      writeText(join(io.cwd, config.codegen.resolved), generateResolvedModule(descriptor, merged));
       for (const [file, out] of edited) writeText(join(io.cwd, file), out);
       // `force` because a file already gone is a completed deletion: a racing
       // remove must not throw here, after the snapshot has been written.
@@ -361,7 +379,7 @@ function buildSnapshot(descriptor: Descriptor, snapshot: Snapshot, rows: StoreRo
  * returned-expression slot — but a lone `{expr}` returned bare becomes an object
  * literal (`return {children}`), so it must be `<>{expr}</>`.
  */
-function copyProviderUnwrap(ts: typeof import('typescript'), source: string, file: string): Edit | null {
+function copyProviderUnwrap(ts: typeof import('typescript'), source: string, file: string): Edit[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
   let found: TS.JsxElement | null = null;
   const visit = (node: TS.Node): void => {
@@ -375,9 +393,8 @@ function copyProviderUnwrap(ts: typeof import('typescript'), source: string, fil
     ts.forEachChild(node, visit);
   };
   visit(sf);
-  if (found === null) return null;
+  if (found === null) return [];
   const element = found as TS.JsxElement;
-  const inner = source.slice(element.openingElement.getEnd(), element.closingElement.getStart(sf));
   const meaningful = element.children.filter((child) => !(ts.isJsxText(child) && child.containsOnlyTriviaWhiteSpaces));
   const parent = element.parent;
   const inJsxContainer = ts.isJsxElement(parent) || ts.isJsxFragment(parent);
@@ -385,15 +402,18 @@ function copyProviderUnwrap(ts: typeof import('typescript'), source: string, fil
   const singleIsElement =
     single !== undefined && (ts.isJsxElement(single) || ts.isJsxSelfClosingElement(single) || ts.isJsxFragment(single));
   const needsFragment = meaningful.length !== 1 || (!inJsxContainer && !singleIsElement);
-  const text = needsFragment ? `<>${inner}</>` : inner;
-  return { pos: element.getStart(sf), end: element.getEnd(), text };
+  // Two edits over the tags alone, so a read inside the element un-rewrites in the same batch.
+  return [
+    { pos: element.openingElement.getStart(sf), end: element.openingElement.getEnd(), text: needsFragment ? '<>' : '' },
+    { pos: element.closingElement.getStart(sf), end: element.closingElement.getEnd(), text: needsFragment ? '</>' : '' },
+  ];
 }
 
 /**
- * The layout's now-orphan `descriptorJson` and `DEFAULTS` imports — the two
- * init added ONLY for the `resolveAll` call the un-rewrite drops. Left behind,
+ * The layout's now-orphan `descriptorJson`, `DEFAULTS` and `RESOLVED` imports —
+ * those a mount added ONLY to feed the provider the unwrap drops. Left behind,
  * they are unused imports (TS6133 under a host's `noUnusedLocals`), so eject
- * removes them in the same batch. Both are relative specifiers resolved against
+ * removes them in the same batch. Each is a relative specifier resolved against
  * the layout's absolute directory, so the match holds under any cwd.
  */
 function layoutOrphanImports(
@@ -401,12 +421,13 @@ function layoutOrphanImports(
   source: string,
   absFile: string,
   cwd: string,
-  config: { descriptorPath: string; codegen: { defaults: string } },
+  config: { descriptorPath: string; codegen: { defaults: string; resolved: string } },
 ): { pos: number; end: number }[] {
   const sf = ts.createSourceFile(absFile, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, absFile));
   const targets = new Set([
     normalizeNoExt(join(cwd, config.descriptorPath)),
     normalizeNoExt(join(cwd, config.codegen.defaults)),
+    normalizeNoExt(join(cwd, config.codegen.resolved)),
   ]);
   const spans: { pos: number; end: number }[] = [];
   for (const stmt of sf.statements) {
@@ -675,9 +696,9 @@ function reportContactsStay(config: StetConfig, report: Report): void {
 
 function staysList(
   cwd: string,
-  config: { descriptorPath: string; snapshotPath: string; codegen: { registry: string } },
+  config: { descriptorPath: string; snapshotPath: string; codegen: { registry: string; resolved: string } },
 ): string[] {
-  const candidates = [CONFIG_FILE, config.descriptorPath, config.snapshotPath, config.codegen.registry];
+  const candidates = [CONFIG_FILE, config.descriptorPath, config.snapshotPath, config.codegen.registry, config.codegen.resolved];
   const stays = candidates.filter((rel) => existsSync(join(cwd, rel)));
   if (existsSync(join(cwd, HOST_MIGRATIONS))) stays.push(`${HOST_MIGRATIONS.split(sep).join('/')}/`);
   return stays;

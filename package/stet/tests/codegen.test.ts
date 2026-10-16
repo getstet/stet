@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { miniDescriptor, mutable } from '../conformance/fixture.js';
-import { embeddedHash, generateRegistry, generatedBody, sourceHash } from '../src/codegen.js';
+import ts from 'typescript';
+
+import { miniDescriptor, miniSnapshot, mutable } from '../conformance/fixture.js';
+import { embeddedHash, generateRegistry, generateResolvedModule, generatedBody, sourceHash } from '../src/codegen.js';
 import { DESCRIPTOR_SCHEMA, loadDescriptor } from '../src/index.js';
 import { installRegistryDts, typecheckHost } from './helpers/ts-host.js';
 
@@ -152,4 +154,47 @@ describe('the generated types in a host', () => {
     expect(bad.ok).toBe(false);
     expect(bad.output).toContain('hero_headlin');
   }, 60_000);
+});
+
+describe('generateResolvedModule — the default locale\'s resolved map a client mount reads (D8)', () => {
+  /** The module compiled the way a host's bundler would, and its export read back. */
+  function evaluate(text: string): Record<string, unknown> {
+    const js = ts.transpileModule(text, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+    const module = { exports: {} as Record<string, unknown> };
+    new Function('module', 'exports', js)(module, module.exports);
+    return module.exports['RESOLVED'] as Record<string, unknown>;
+  }
+
+  it('carries a derived key\'s rendered value, not its template', () => {
+    const resolved = evaluate(generateResolvedModule(miniDescriptor(), miniSnapshot()));
+    const headline = (miniSnapshot()['default'] as Record<string, unknown>)['hero_headline'] as string;
+    expect(resolved['seo_home_title']).toBe(`${headline} — Mirra`);
+  });
+
+  it('sorts its keys, so the module is a stable diff', () => {
+    const resolved = evaluate(generateResolvedModule(miniDescriptor(), miniSnapshot()));
+    expect(Object.keys(resolved)).toEqual(Object.keys(resolved).sort());
+  });
+
+  it('names both sources in its header, and its hash moves with either', () => {
+    const d = miniDescriptor();
+    const s = miniSnapshot();
+    const text = generateResolvedModule(d, s);
+    expect(text.split('\n')[1]).toBe('// source: descriptor.json + defaults.json · do not hand-edit; regenerate instead.');
+    const base = embeddedHash(text);
+    const s2 = mutable(s);
+    (s2['default'] as Record<string, unknown>)['hero_headline'] = 'Another headline';
+    expect(embeddedHash(generateResolvedModule(d, s2))).not.toBe(base);
+    const d2 = mutable(d);
+    delete d2.keys['blog_intro'];
+    expect(embeddedHash(generateResolvedModule(d2, s))).not.toBe(base);
+  });
+
+  it('emits a value holding </script> and a U+2028 as valid TypeScript, and imports nothing', () => {
+    const s = mutable(miniSnapshot());
+    (s['default'] as Record<string, unknown>)['blog_intro'] = 'a </script> b \u2028 c';
+    const text = generateResolvedModule(miniDescriptor(), s);
+    expect(evaluate(text)['blog_intro']).toBe('a </script> b \u2028 c');
+    expect(text).not.toMatch(/^import /m);
+  });
 });

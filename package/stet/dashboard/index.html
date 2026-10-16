@@ -199,6 +199,18 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
 .cards .tt{font-size:14px;color:hsl(var(--bl));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cards .share .tt{color:hsl(var(--fg));font-weight:600;font-size:13px}
 .cards .ds{font-size:12px;color:hsl(var(--mf));display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.lhbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.lhp{border-bottom:1px solid hsl(var(--bd))}.lhp:last-child{border-bottom:0}
+.lhh{padding:9px 12px 0;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;overflow-wrap:anywhere}
+.lht{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;padding:8px 12px}
+.lht>div{border:1px solid hsl(var(--bd));border-radius:8px;padding:8px 10px;min-width:0;display:flex;flex-direction:column;gap:4px;align-items:flex-start}
+.lht .lb{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:hsl(var(--mf))}
+.lht .bdg{font-size:18px;padding:1px 12px}
+.lhi{padding:6px 0;border-bottom:1px solid hsl(var(--bd));font-size:11.5px;display:flex;flex-direction:column;gap:3px;overflow-wrap:anywhere;min-width:0}
+.lhi:last-child{border-bottom:0}
+.lhi code{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;color:hsl(var(--mf))}
+.lhmsg{white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:760px){.lhbar .btn,.lhbar .tg button,.lhi .btn{min-height:36px;padding:6px 12px}}
 </style>
 </head>
 <body data-theme="light">
@@ -312,6 +324,7 @@ const S = {
   pending: [],
   health: null,
   seo: null,
+  audit: null,
   setup: null,
   verify: null,
   history: null,
@@ -496,7 +509,7 @@ async function loadSite(path) {
   S.removal = null;
   S.same = null; S.overLimit = null; S.publishAsk = false; S.previewLink = null;
   S.opened = null; S.restoreAsk = false; S.markup = null; S.split = null;
-  S.health = null; S.seo = null; S.setup = null; S.verify = null;
+  S.health = null; S.seo = null; S.audit = null; auditGen += 1; S.setup = null; S.verify = null;
   S.history = null; S.recent = null; S.preview = null; S.devlog = null;
   S.rows = null; S.changes = null;
   S.marks = { documents: [], keys: {}, places: {} };
@@ -520,8 +533,7 @@ async function loadSite(path) {
   if (ready()) {
     // Awaited before the first group is chosen: the marks decide the groups,
     // and a group chosen before they arrive would be one they dissolve.
-    const marks = await api('/api/site/marks' + query());
-    if (marks.ok) S.marks = Object.assign({ documents: [], keys: {}, places: {} }, marks.body);
+    await loadMarks();
     S.locale = S.site.config.locales.default;
     S.group = firstGroup();
     // The list and the preview open on one page: the group whose route is the remembered
@@ -539,6 +551,34 @@ async function loadSite(path) {
   render();
   if (ready()) void guard(loadPreview());
   if (previewBranch() && S.site.git.upstream) void guard(loadPreviewLink());
+  if (S.tab === 'SEO' && ready()) void guard(pollAudit());
+}
+
+async function loadMarks() {
+  const marks = await api('/api/site/marks' + query());
+  if (marks.ok) S.marks = Object.assign({ documents: [], keys: {}, places: {} }, marks.body);
+}
+
+/**
+ * The site read again after a write the page did not make (Apply fixes): the
+ * key list, the marks and the pending files, with the drafts, the template
+ * edits, the locale and the open key left as they are. The Health and SEO
+ * results, read from the checkout before the write, are dropped for their own Run.
+ */
+async function refreshSite() {
+  const gen = auditGen;
+  const res = await api('/api/site' + query());
+  if (gen !== auditGen) return;
+  S.site = res.body;
+  S.pending = Array.isArray(S.site.pending) ? S.site.pending : [];
+  S.health = null; S.seo = null;
+  if (ready()) {
+    await loadMarks();
+    if (gen !== auditGen) return;
+    if (S.group !== null && !groups().some((g) => g.id === S.group)) S.group = firstGroup();
+    if (S.sel !== null && !own(S.site.descriptor.keys, S.sel)) S.sel = null;
+  }
+  render();
 }
 
 function readEditor() {
@@ -1802,7 +1842,7 @@ function vBrand() {
 // --- SEO ---------------------------------------------------------------------
 function vSeo() {
   if (S.seo === null) {
-    return '<div class="card"><div class="ch"><h3>SEO</h3><button class="btn sm" data-act="seoLoad">Run</button></div>' +
+    return vLighthouse() + '<div class="card"><div class="ch"><h3>SEO</h3><button class="btn sm" data-act="seoLoad">Run</button></div>' +
       '<div class="cb muted">Not run yet.</div></div>';
   }
   const findings = (S.seo.seo && S.seo.seo.seo) || [];
@@ -1851,7 +1891,108 @@ function vSeo() {
           '<td>' + (desc ? esc(String(desc).slice(0, 70)) : '<span class="bdg d">missing</span>') + '</td></tr>';
       }).join('')) + '</tbody></table></div>';
 
-  return rules + undeclared + perPage;
+  return vLighthouse() + rules + undeclared + perPage;
+}
+
+// --- Lighthouse --------------------------------------------------------------
+const AUDIT_TILES = [['performance', 'Performance'], ['accessibility', 'Accessibility'], ['bestPractices', 'Best Practices'], ['seo', 'SEO']];
+/** The tile's band: green at 90-100, amber at 50-89, red below 50. */
+const scoreBand = (n) => (n >= 90 ? 'g' : n >= 50 ? 'd' : 'r');
+const AUDIT_TAGS = { copy: 'b', fix: 'v', stet: 'g', host: '' };
+
+/** The declared key a copy line names: the one the audit's own `key` carries, never a word of its remedy. */
+function auditKey(a) {
+  if (a.owner !== 'copy' || !ready()) return null;
+  return typeof a.key === 'string' && keyDef(a.key) !== null ? a.key : null;
+}
+
+/** One failing audit: its tag, id and place, the snippet, the remedy, and the key's editor where it names one. */
+function auditRow(a) {
+  const tag = own(AUDIT_TAGS, a.owner) ? AUDIT_TAGS[a.owner] : '';
+  const key = auditKey(a);
+  return '<div class="lhi"><div><span class="bdg ' + tag + '">' + esc(a.owner) + '</span> <span class="mono">' + esc(a.id) + '</span>' +
+    (a.at ? ' <span class="mono muted">' + esc(a.at) + '</span>' : '') + '</div>' +
+    (a.snippet ? '<code class="mono">' + esc(a.snippet) + '</code>' : '') +
+    '<div>' + esc(a.remedy) + '</div>' +
+    (key ? '<div><span class="mono">' + esc(key) + '</span> <button class="btn sm" data-act="edit:' + esc(key) + '">→ open</button></div>' : '') +
+    '</div>';
+}
+
+/** A page's result: its name and route, the four tiles, and the two lists. */
+function auditPage(p, r) {
+  const scores = p.scores || {};
+  const audits = Array.isArray(p.audits) ? p.audits : [];
+  const fixes = audits.filter((a) => a.owner === 'fix');
+  const mine = audits.filter((a) => a.owner === 'copy' || a.owner === 'stet');
+  const host = audits.filter((a) => a.owner === 'host');
+  const tiles = AUDIT_TILES.map((t) => {
+    const n = scores[t[0]];
+    return '<div><span class="lb">' + t[1] + '</span><span class="bdg ' + (typeof n === 'number' ? scoreBand(n) : '') + '">' +
+      (typeof n === 'number' ? n : '–') + '</span></div>';
+  }).join('');
+  const fold = fixes.length === 0 ? '' :
+    '<div class="lhi"><div><span class="bdg v">fix</span> ' + esc(plural(fixes.length, 'head edit')) + '</div>' +
+    '<div><button class="btn sm pri" data-act="auditFix:' + esc(p.page) + '">Apply fixes</button></div></div>';
+  const list = (rows) => rows.length === 0 ? '<span class="muted">—</span>' : rows.map(auditRow).join('');
+  return '<div class="lhp"><div class="lhh"><b>' + esc(p.file || p.page) + '</b><span class="mono muted">' + esc(p.route) + '</span></div>' +
+    '<div class="lht">' + tiles + '</div>' +
+    '<div class="cards"><div><div class="lb">' + esc('stet fixes (' + (mine.length + fixes.length) + ')') + '</div>' +
+    mine.map(auditRow).join('') + fold + (mine.length + fixes.length === 0 ? '<span class="muted">—</span>' : '') + '</div>' +
+    '<div><div class="lb">' + esc('The host owns (' + host.length + ')') + '</div>' + list(host) + '</div></div></div>';
+}
+
+/** The card's body for a reply: not run, running, a result, or why there is none. */
+function auditBody(a) {
+  const reply = a && a.reply ? a.reply : { state: 'none' };
+  const lines = Array.isArray(reply.lines) ? reply.lines : [];
+  if (reply.state === 'running') {
+    const last = lines.length === 0 ? '' : lines[lines.length - 1];
+    const naming = /^auditing (.+?)… /.exec(last);
+    const building = !naming && !htmlHost() && lines.some((l) => l === 'building (npm run build)…');
+    return '<div class="cb muted">' + esc(building ? 'Building the production preview (npm run build)…'
+      : 'Auditing' + (naming ? ' ' + naming[1] : '') + '… ' + (reply.elapsed || 0) + ' s') + '</div>';
+  }
+  if (reply.state === 'failed') {
+    return '<div class="cb"><div class="term">' + esc(lines.join('\n')) + '</div></div>';
+  }
+  if (reply.state === 'done' && reply.result && typeof reply.result === 'object') {
+    const r = reply.result;
+    const pages = [];
+    for (const p of Array.isArray(r.pages) ? r.pages : []) {
+      // A re-run after Apply fixes lists the page again; its last entry is the current one.
+      const at = pages.findIndex((q) => q.page === p.page);
+      if (at === -1) pages.push(p); else pages[at] = p;
+    }
+    if (pages.length === 0) {
+      const errors = (Array.isArray(r.findings) ? r.findings : []).filter((f) => f.level === 'error').map((f) =>
+        /^Chrome was not found/.test(f.message) ? 'Chrome was not found — install Google Chrome, or set CHROME_PATH in the shell that runs stet dev'
+          : /^npm run build exited/.test(f.message) ? 'The build failed — its output is under Setup' : f.message);
+      return '<div class="cb">' + errors.map((m) => '<div class="err lhmsg">' + esc(m) + '</div>').join('') + '</div>';
+    }
+    const lh = r.lighthouse || {};
+    const what = lh.targetKind === 'build' ? 'the production build' : lh.targetKind === 'url' ? lh.target : "the checkout's documents";
+    const summary = 'lighthouse ' + lh.version + ' · ' + (lh.formFactor === 'desktop' ? 'desktop' : 'mobile') + ' · ' + what + ' · ' +
+      plural(pages.length, 'page') + ' · ' + (reply.elapsed || 0) + ' s';
+    return '<div class="cb mono muted" style="font-size:11.5px;overflow-wrap:anywhere">' + esc(summary) + '</div>' +
+      pages.map((p) => auditPage(p, r)).join('');
+  }
+  return '<div class="cb muted">' + (htmlHost() ? "Not run yet. Runs against the checkout's documents." : 'Not run yet. Runs against the production build.') + '</div>';
+}
+
+function vLighthouse() {
+  const a = S.audit;
+  const reply = a && a.reply ? a.reply : { state: 'none' };
+  const form = a ? a.form : 'mobile';
+  const link = S.previewLink;
+  const url = !htmlHost() && link && typeof link.url === 'string' && /^https?:\/\//.test(link.url) ? link.url : null;
+  const toggle = '<span class="tg">' + [['mobile', 'Mobile'], ['desktop', 'Desktop']].map((f) =>
+    '<button class="' + (form === f[0] ? 'on' : '') + '" data-act="auditForm:' + f[0] + '">' + f[1] + '</button>').join('') + '</span>';
+  return '<div class="card"><div class="ch"><h3>Lighthouse</h3><div class="lhbar">' + toggle +
+    '<button class="btn sm pri" data-act="auditRun"' + (reply.state === 'running' ? ' disabled' : '') + '>' +
+    (reply.state === 'done' ? 'Run again' : 'Run') + '</button>' +
+    (url ? '<button class="btn sm" data-act="auditPreview"' + (reply.state === 'running' ? ' disabled' : '') + '>Audit the deployed preview</button>' : '') +
+    '</div></div>' + (a && a.error ? '<div class="cb"><div class="err lhmsg">' + esc(a.error) + '</div></div>' : '') +
+    auditBody(a) + '</div>';
 }
 
 // --- Scheduled, Environments, Recent ----------------------------------------
@@ -1979,7 +2120,12 @@ function vSetup() {
       esc(implied.dev || 'http://localhost:4321') + '" data-act-change="entryDev">' +
       '<div class="muted" style="font-size:11px;margin-top:7px">Dev command</div>' +
       '<input class="in sm" id="devcmd" value="' + esc(entry.devCommand || '') + '" placeholder="' +
-      esc(implied.devCommand || 'npm run dev') + '" data-act-change="entryCommand">';
+      esc(implied.devCommand || 'npm run dev') + '" data-act-change="entryCommand">' +
+      '<div class="muted" style="font-size:11px;margin-top:7px">Preview command</div>' +
+      '<input class="in sm" id="previewcmd" value="' + esc(entry.previewCommand || '') + '" placeholder="' +
+      esc((ready() && S.site.previewDefault) || '') + '" data-act-change="entryPreview">' +
+      '<div class="muted" style="font-size:11px;margin-top:3px">Runs after npm run build for stet audit lighthouse --build; ' +
+      '{port} and PORT carry the port, and the server must listen on 127.0.0.1</div>';
   const workspace = !S.site ? '' : '<div class="card"><div class="ch"><h3>' + esc(S.site.name) + '</h3>' +
     '<span class="bdg mono">' + esc(S.site.path) + '</span></div><div class="cb">' + devFields +
     '<label style="display:flex;gap:7px;align-items:center;margin-top:9px;font-size:12px">' +
@@ -1994,7 +2140,10 @@ function vSetup() {
       : '<div class="cb"><div class="term">' +
       esc((S.setup.lines || []).concat(S.setup.stderr || []).join('\n')) + '</div></div>') + '</div>';
 
-  return attribution + workspace + upgrades;
+  const auditLines = (S.audit && S.audit.reply && S.audit.reply.lines) || [];
+  const audit = auditLines.length === 0 ? '' : '<div class="card"><div class="ch"><h3>Lighthouse output</h3></div>' +
+    '<div class="cb"><div class="term">' + esc(auditLines.join('\n')) + '</div></div></div>';
+  return attribution + workspace + audit + upgrades;
 }
 
 // --- the greyed fixtures the dark tabs show ----------------------------------
@@ -2041,7 +2190,23 @@ const ACTIONS = {
   theme: () => {
     document.body.dataset.theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
   },
-  tab: (el, name) => { S.tab = name; render(); },
+  tab: (el, name) => {
+    S.tab = name;
+    render();
+    if (name === 'SEO' && ready() && S.audit === null) void guard(pollAudit());
+  },
+  auditForm: (el, form) => {
+    S.audit = Object.assign({ reply: { state: 'none' }, error: null }, S.audit, { form: form });
+    render();
+  },
+  auditRun: () => { void guard(startAudit({})); },
+  auditPreview: () => { void guard(startAudit({ url: S.previewLink.url })); },
+  auditFix: (el, page) => {
+    // The fix runs in the form factor and against the target the result was measured on.
+    const lh = (S.audit && S.audit.reply && S.audit.reply.result && S.audit.reply.result.lighthouse) || {};
+    S.audit = Object.assign({}, S.audit, { form: lh.formFactor === 'desktop' ? 'desktop' : 'mobile' });
+    void guard(startAudit(Object.assign({ fix: true, pages: [page] }, lh.targetKind === 'url' ? { url: lh.target } : {})));
+  },
   site: (el, path) => { void guard(loadSite(path)); },
   addSite: () => {
     const input = document.getElementById('addpath');
@@ -2267,6 +2432,7 @@ const ACTIONS_CHANGE = {
   enum: (el, id) => { setDraft(id, el.value); render(); },
   entryDev: (el) => { void guard(updateEntry({ dev: el.value })); },
   entryCommand: (el) => { void guard(updateEntry({ devCommand: el.value })); },
+  entryPreview: (el) => { void guard(updateEntry({ previewCommand: el.value })); },
   entryPush: (el) => { void guard(updateEntry({ pushAfterCommit: el.checked })); },
 };
 
@@ -2623,7 +2789,7 @@ async function declare(names) {
   const res = await post('/api/site/pages/declare' + query(), { names: names });
   if (!res.ok) { tst(res.body.error || 'nothing was declared'); return; }
   tst((res.body.lines || []).slice(-1)[0] || 'Declared.');
-  await loadWorkspace();
+  await refreshSite();
   S.tab = 'SEO';
   await loadSeo();
 }
@@ -2646,6 +2812,51 @@ async function removeKey(key, apply) {
 async function loadSeo() {
   S.seo = (await api('/api/site/seo' + query())).body;
   render();
+}
+
+const AUDIT_POLL_MS = 2000;
+let auditGen = 0;      // bumped by loadSite: a poll for an earlier site ends
+let auditPollId = 0;   // bumped by each poll: a second poll ends the first
+/**
+ * The site's audit as the server holds it, read now and then every two seconds
+ * while it runs. Returning to a site reads the result an audit left behind.
+ */
+async function pollAudit() {
+  const gen = auditGen;
+  const id = ++auditPollId;
+  for (;;) {
+    const res = await api('/api/site/audit' + query());
+    if (gen !== auditGen || id !== auditPollId) return;
+    const reply = res.ok && res.body.state ? res.body : { state: 'none' };
+    // A finished result read on return takes its form factor; a toggle already set stays.
+    const form = S.audit ? S.audit.form
+      : reply.state === 'done' && reply.result && reply.result.lighthouse && reply.result.lighthouse.formFactor === 'desktop' ? 'desktop' : 'mobile';
+    S.audit = { form: form, reply: reply, error: S.audit ? S.audit.error : null };
+    render();
+    if (reply.state !== 'running') return;
+    await new Promise((resolve) => setTimeout(resolve, AUDIT_POLL_MS));
+    if (gen !== auditGen || id !== auditPollId) return;
+  }
+}
+
+/** Starts the audit with the card's form factor, then polls it. A refusal's line shows in the card. */
+async function startAudit(extra) {
+  const gen = auditGen;
+  const form = S.audit ? S.audit.form : 'mobile';
+  const body = Object.assign(form === 'desktop' ? { desktop: true } : {}, extra);
+  const fixing = extra.fix === true;
+  S.audit = { form: form, reply: { state: 'running', elapsed: 0, lines: [], result: null }, error: null };
+  render();
+  const res = await post('/api/site/audit-start' + query(), body);
+  if (gen !== auditGen) return;
+  if (!res.ok) {
+    S.audit = { form: form, reply: { state: 'none' }, error: res.body.error || 'the audit was refused' };
+    render();
+    return;
+  }
+  await pollAudit();
+  // The fix wrote documents and minted keys: the key list is read again, the drafts a person has open kept.
+  if (fixing && gen === auditGen && S.audit && S.audit.reply.state === 'done') await refreshSite();
 }
 
 /** What the dev server has printed so far, and what the launcher turned out to be. */

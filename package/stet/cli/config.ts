@@ -78,11 +78,12 @@ export interface StetConfig {
    */
   scan: { severity: 'warn' | 'fail'; baseline: string };
   /**
-   * The detected router. `register` reads it to choose the accessor: only
-   * `pages` forces the client form, a Pages-Router file being client-rendered
-   * with no `'use client'` directive to detect it by.
+   * The detected router. `register` reads it to choose the accessor: `pages`
+   * and `vite` force the client form, a Pages-Router file and a Vite SPA's
+   * every file being client-rendered with no `'use client'` directive to
+   * detect them by.
    */
-  router: 'app' | 'pages' | 'astro';
+  router: 'app' | 'pages' | 'astro' | 'vite';
   /**
    * The host kind. Absent is a JavaScript host — a framework with a build, read
    * through a scaffolded module. `"html"` is the static-HTML host, whose
@@ -104,7 +105,8 @@ export interface StetConfig {
    *
    * ABSENT on an `astro` host, which has no root React layout: both readers
    * treat its absence as no layout, and the parse fills no default there — a
-   * placeholder path is the lie this optionality exists to stop.
+   * placeholder path is the lie this optionality exists to stop. On a `vite`
+   * host it is the SPA's entry module, read with no default the same way.
    */
   rootLayout?: string;
   /**
@@ -113,6 +115,12 @@ export interface StetConfig {
    * compares against `process.env[apiTokenEnv]`.
    */
   apiTokenEnv: string;
+  /**
+   * The site's language, a BCP 47 tag `isLanguageTag` accepts — the source of
+   * the `lang` on `<html>` that `stet audit lighthouse --fix` writes. Optional
+   * with no default: `init` writes none.
+   */
+  language?: string;
   /**
    * The API-mount route `init` scaffolded, where it scaffolded one. Absent on a
    * snapshot-only project, which has no store to mount — and it is `eject`'s
@@ -140,7 +148,7 @@ export interface StetConfig {
   descriptorPath: string;
   snapshotPath: string;
   bundlePath: string;
-  codegen: { registry: string; defaults: string; dts: string };
+  codegen: { registry: string; defaults: string; dts: string; resolved: string };
   /** v1: the default locale IS the literal 'default' — every seam binds it. */
   locales: { default: 'default'; enabled: string[] };
 }
@@ -296,6 +304,7 @@ export function defaultConfig(): StetConfig {
       // A distinct stem (mirroring `next-env.d.ts`) keeps the ambient file in
       // the program (P1-2).
       dts: 'content/stet-env.d.ts',
+      resolved: 'content/resolved.ts',
     },
     locales: { default: 'default', enabled: ['default'] },
   };
@@ -341,12 +350,20 @@ export function loadConfig(cwd: string): StetConfig {
 
   config.router = router(source);
   // The default is filled for a Next host only: on Astro `undefined` is the
-  // truth, and `app/layout.tsx` would name a file that is not there.
+  // truth, and `app/layout.tsx` would name a file that is not there; a Vite
+  // entry is whatever `init` found, and has no default either.
   config.rootLayout =
-    config.router === 'astro'
+    config.router === 'astro' || config.router === 'vite'
       ? optionalStr(source, 'rootLayout')
       : str(source, 'rootLayout', DEFAULT_ROOT_LAYOUT);
   config.apiTokenEnv = str(source, 'apiTokenEnv', config.apiTokenEnv);
+  const language = optionalStr(source, 'language');
+  if (language !== undefined) {
+    if (!isLanguageTag(language)) {
+      throw new CliError(`${CONFIG_FILE}: language must be a BCP 47 language tag such as en or en-GB — got ${JSON.stringify(language)}`);
+    }
+    config.language = language;
+  }
   const mountRoute = source['mountRoute'];
   // Optional with no default: absent MEANS no scaffolded route, so a filled-in
   // fallback would send `eject` looking for a file nobody wrote.
@@ -404,6 +421,7 @@ export function loadConfig(cwd: string): StetConfig {
       registry: str(codegen, 'registry', config.codegen.registry, 'codegen.'),
       defaults: str(codegen, 'defaults', config.codegen.defaults, 'codegen.'),
       dts: str(codegen, 'dts', config.codegen.dts, 'codegen.'),
+      resolved: str(codegen, 'resolved', config.codegen.resolved, 'codegen.'),
     };
   }
 
@@ -644,14 +662,39 @@ export function isHtmlHost(config: Pick<StetConfig, 'host'>): boolean {
 }
 
 /** The three routers, constrained at the parse so `register` never branches on a typo. */
-function router(source: Record<string, unknown>): 'app' | 'pages' | 'astro' {
+function router(source: Record<string, unknown>): 'app' | 'pages' | 'astro' | 'vite' {
   const value = str(source, 'router', 'app');
-  if (value !== 'app' && value !== 'pages' && value !== 'astro') {
+  if (value !== 'app' && value !== 'pages' && value !== 'astro' && value !== 'vite') {
     throw new CliError(
-      `${CONFIG_FILE}: router must be "app", "pages" or "astro" — got ${JSON.stringify(source['router'] ?? null)}`,
+      `${CONFIG_FILE}: router must be "app", "pages", "astro" or "vite" — got ${JSON.stringify(source['router'] ?? null)}`,
     );
   }
   return value;
+}
+
+/** Primary subtags Lighthouse's `html-lang-valid` accepts that `Intl.DisplayNames` does not name. */
+const BARE_SUBTAGS = new Set(['und', 'mis', 'mul', 'zxx', 'qaa']);
+
+/**
+ * A BCP 47 tag Lighthouse's `html-lang-valid` accepts: `Intl.getCanonicalLocales`
+ * takes it as one tag, and its primary subtag is one `Intl.DisplayNames` names
+ * or one of the bare subtags. The canonicalizer alone accepts `english` (a
+ * well-formed eight-letter subtag) and shortens `eng` to `en`; Lighthouse
+ * fails both, so a three-letter code shortened to two is refused (`iw`, two
+ * letters canonicalized to `he`, stays accepted, as Lighthouse does).
+ */
+export function isLanguageTag(value: string): boolean {
+  let canonical: string[];
+  try {
+    canonical = Intl.getCanonicalLocales(value);
+  } catch {
+    return false;
+  }
+  if (canonical.length !== 1) return false;
+  const primary = (canonical[0] as string).split('-')[0] as string;
+  if ((value.split('-')[0] as string).length === 3 && primary.length === 2) return false;
+  if (BARE_SUBTAGS.has(primary)) return true;
+  return new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }).of(primary) !== undefined;
 }
 
 function str(

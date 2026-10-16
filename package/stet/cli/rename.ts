@@ -8,7 +8,7 @@
  * half re-keys each key's rows through `rename_content_key`, one transaction per
  * key per environment, after a read-only pass that finds every store reachable
  * and every new name free. The code half is one all-or-nothing batch: the
- * descriptor, the snapshot in every locale, the codegen trio or the marked
+ * descriptor, the snapshot in every locale, the codegen files or the marked
  * documents, and the host files whose reads it rewrites.
  *
  * A run that writes to a store first writes a pending record — the pairs, the
@@ -759,7 +759,7 @@ export function renamedForms(
 
 /**
  * The one batch a key move writes — rename's, merge's and split's: the
- * descriptor and the snapshot, with the codegen trio on a JavaScript host, and
+ * descriptor and the snapshot, with the codegen files on a JavaScript host, and
  * every host file whose marks or reads change. On the static-HTML host the
  * documents change only where a mark is renamed: a moved key's text is the one
  * it had, so nothing is regenerated.
@@ -869,7 +869,7 @@ export async function readRenames(
 ): Promise<HostRenames> {
   const ts = await loadTypescript();
   const mappings = pathAliasMappings(cwd);
-  const own = new Set([config.codegen.registry, config.codegen.dts, config.codegen.defaults, config.readPath.file]);
+  const own = new Set([config.codegen.registry, config.codegen.dts, config.codegen.defaults, config.codegen.resolved, config.readPath.file]);
   const modules = filesForGlobs(cwd, config.copyModules);
   const stetTargets = new Set([config.readPath.file, ...modules].map((rel) => normalizeNoExt(join(cwd, rel))));
   const out: HostRenames = { edited: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };

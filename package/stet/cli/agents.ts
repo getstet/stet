@@ -81,7 +81,9 @@ export function buildGuidanceBlock(config: StetConfig): string {
       'Never hardcode user-facing copy; route copy work through the stet CLI ' +
       '(run `stet` for the commands), not source edits.';
   const derived = `A derived key's fixed sentence is its tmpl in \`${config.descriptorPath}\`; edit it there and run \`stet pull\`.`;
-  return [GUIDANCE_BEGIN, `${body} ${derived}`, GUIDANCE_END, ''].join('\n');
+  const lighthouse =
+    "Lighthouse findings tagged stet are copy or stet's own fixes; run `stet audit lighthouse --fix --write` for the head edits and write the words through the keys it names.";
+  return [GUIDANCE_BEGIN, `${body} ${derived} ${lighthouse}`, GUIDANCE_END, ''].join('\n');
 }
 
 /**

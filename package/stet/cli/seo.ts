@@ -1,6 +1,7 @@
 /**
- * `stet seo check` — the nine SEO rules over the descriptor and the committed
- * snapshot.
+ * `stet seo check` — the SEO rules over the descriptor and the committed
+ * snapshot, and the copy-shaped accessibility rules over the checkout's own
+ * documents and each key's places (`cli/seo-documents.ts`).
  *
  * It builds no adapter, exactly as `check` does not: the loading path is
  * `check`'s own, not `loadProject`, which constructs an adapter and throws on a
@@ -14,7 +15,7 @@
  * never moves the exit code (§14 S8).
  */
 
-import { seoCheck } from '../src/seo.js';
+import { seoCheck, type SeoFinding } from '../src/seo.js';
 import type { Descriptor } from '../src/types.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
@@ -22,6 +23,7 @@ import { descriptorOf, snapshotOf } from './check.js';
 import { loadConfig, seoOverrides, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
 import { Report } from './report.js';
+import { documentRules } from './seo-documents.js';
 import { isStoreBacked } from './store.js';
 
 export async function runSeoCheck(args: string[], io: CliIo): Promise<number> {
@@ -38,7 +40,7 @@ export async function runSeoCheck(args: string[], io: CliIo): Promise<number> {
   // suppress: the descriptor is this command's input as much as check's.
   const descriptor = descriptorOf(config, io.cwd, report);
   const snapshot = descriptor === null ? null : snapshotOf(config, io.cwd, report);
-  if (descriptor !== null && snapshot !== null) rules(config, descriptor, snapshot, report);
+  if (descriptor !== null && snapshot !== null) await rules(io.cwd, config, descriptor, snapshot, report);
 
   return report.emit(io, { json: flag(values, 'json') });
 }
@@ -66,13 +68,22 @@ function staleness(config: StetConfig, report: Report): void {
  * break that field's documented contract — a `--json` consumer filters on the
  * structured block without parsing prose.
  */
-function rules(
+/** Every SEO finding `stet seo check` reports: the descriptor rules, then the document and key rules. */
+export async function seoFindings(cwd: string, config: StetConfig, descriptor: Descriptor, snapshot: Snapshot): Promise<SeoFinding[]> {
+  return [
+    ...seoCheck(descriptor, snapshot, seoOverrides(config)),
+    ...(await documentRules(cwd, config, descriptor, snapshot, seoOverrides(config))),
+  ];
+}
+
+async function rules(
+  cwd: string,
   config: StetConfig,
   descriptor: Descriptor,
   snapshot: Snapshot,
   report: Report,
-): void {
-  const findings = seoCheck(descriptor, snapshot, seoOverrides(config));
+): Promise<void> {
+  const findings = await seoFindings(cwd, config, descriptor, snapshot);
   for (const finding of findings) {
     const where = finding.key ?? finding.page;
     if (finding.severity === 'error') report.error(finding.rule, finding.message, where);
@@ -88,7 +99,7 @@ function rules(
   if (Object.keys(descriptor.keys).length > 0 && Object.keys(descriptor.pages ?? {}).length === 0) {
     report.warn(
       'config',
-      'no pages declared — the SEO rules have nothing to check; run stet pages scan to declare them',
+      'no pages declared — the page rules have nothing to check; run stet pages scan to declare them',
     );
   }
 

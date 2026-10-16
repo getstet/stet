@@ -14,7 +14,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMemoryStore, type MemoryStore } from '../adapters/store-memory.js';
 import { writeJsonDeterministic } from '../cli/artifacts.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
+import { generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
 import type { Snapshot } from '../src/snapshot.js';
@@ -290,6 +290,7 @@ function withKeys(host: CliHost, keys: Record<string, string>): CliHost {
   writeFileSync(join(host.cwd, 'content/keys.ts'), registry.keysTs);
   writeFileSync(join(host.cwd, 'content/stet-env.d.ts'), registry.dts);
   writeFileSync(join(host.cwd, 'content/defaults.ts'), generateDefaultsModule(snapshot));
+  writeFileSync(join(host.cwd, 'content/resolved.ts'), generateResolvedModule(descriptor, snapshot));
   return host;
 }
 const put = (host: { cwd: string }, rel: string, text: string): void => {
@@ -298,7 +299,7 @@ const put = (host: { cwd: string }, rel: string, text: string): void => {
 };
 
 describe('rename — a JavaScript host', () => {
-  const TRIO = ['content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts'];
+  const CODEGEN = ['content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts', 'content/resolved.ts'];
   function site(): CliHost {
     const host = withKeys(
       makeCliHost({ config: { project: 't', managedSurfaces: ['src/**/*.astro', 'content/**/*.ts'], copyModules: ['src/copy.ts'] } }),
@@ -326,7 +327,7 @@ describe('rename — a JavaScript host', () => {
     return host;
   }
 
-  it('rewrites the reads through the copy module with the descriptor, the snapshot and the trio, in one batch', async () => {
+  it('rewrites the reads through the copy module with the descriptor, the snapshot and the codegen files, in one batch', async () => {
     const host = site();
     expect(await host.run('rename', 'nav_docs', 'nav_documentation', '--write')).toBe(0);
     const out = host.stdout();
@@ -336,7 +337,7 @@ describe('rename — a JavaScript host', () => {
     expect(out).toContain('stet cannot see reads outside the declared surfaces: other repositories, a Python reader of the bundle, or an agent calling the API by the old name');
     expect(control.planned).toHaveLength(1);
     expect([...(control.planned[0] ?? [])].sort()).toEqual(
-      ['content/descriptor.json', 'content/defaults.json', ...TRIO, 'src/components/ui/SiteNav.astro', 'src/layouts/Base.astro'].sort(),
+      ['content/descriptor.json', 'content/defaults.json', ...CODEGEN, 'src/components/ui/SiteNav.astro', 'src/layouts/Base.astro'].sort(),
     );
     expect(host.file('src/layouts/Base.astro')).toContain('{copy.nav_documentation}');
     expect(host.file('src/components/ui/SiteNav.astro').match(/copy\.nav_documentation/g)).toHaveLength(2);
@@ -365,7 +366,7 @@ describe('rename — a JavaScript host', () => {
   it('refuses the write while a read it cannot rewrite remains, and writes once it is edited by hand', async () => {
     const host = site();
     put(host, 'src/pages/probe.astro', '---\nimport { copy } from "../copy";\nconst name = "nav_docs";\n---\n<p>{copy["nav_docs"]}</p>\n');
-    const rels = ['content/descriptor.json', 'content/defaults.json', ...TRIO, 'src/layouts/Base.astro', 'src/pages/probe.astro'];
+    const rels = ['content/descriptor.json', 'content/defaults.json', ...CODEGEN, 'src/layouts/Base.astro', 'src/pages/probe.astro'];
     const before = bytesOf(host, rels);
     expect(await host.run('rename', 'nav_docs', 'nav_documentation', '--write')).toBe(1);
     expect(host.stdout()).toContain('  src/pages/probe.astro:5 <p>{copy["nav_docs"]}</p>');
@@ -433,7 +434,7 @@ const hasRowsUnder = async (store: StoreAdapter, key: string): Promise<boolean> 
   const rows = await store.read({ keys: [key], preview: true });
   return Array.isArray(rows) && rows.length > 0;
 };
-const REPO = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts'];
+const REPO = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts', 'content/resolved.ts'];
 const git = (cwd: string, ...args: string[]): string =>
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, encoding: 'utf8', stdio: 'pipe' });
 
