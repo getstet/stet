@@ -132,6 +132,14 @@ describe('elementOfSnippet (D4)', () => {
     expect(elementOfSnippet(document, '<a href="/y">')).toBeNull();
   });
 
+  it("reads link-text's own rows, href and text with no node, and names the key by the text", () => {
+    const lhr = failing('link-text', { href: 'https://react.dev/', text: 'Learn more', textLang: 'en' });
+    const descriptor: Descriptor = { version: 1, keys: { app_link_text: { shape: 'text', target: 'web' } } };
+    const read = readRun(lhr, context({ router: 'vite', document: null, descriptor, def: undefined, snapshot: { default: { app_link_text: 'Learn more' } }, file: 'index.html' }));
+    expect(read.lines[0]).toBe('copy  link-text  "Learn more" (app_link_text) is a generic link label — anchor text should name where it goes');
+    expect(read.audits[0]?.key).toBe('app_link_text');
+  });
+
   it("names the key on a JavaScript host by the element's text", () => {
     const lhr = failing('link-text', { node: { snippet: '<a href="/docs">', nodeLabel: 'Learn more' } });
     const descriptor: Descriptor = { version: 1, keys: { home_link_text: { shape: 'text', target: 'web' } } };

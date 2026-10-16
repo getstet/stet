@@ -158,6 +158,12 @@ function firstNode(audit: Audit): Record<string, unknown> | undefined {
 
 const str = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
 
+/** `link-text`'s items are `{ href, text }` rows with no node: the first row's text stands as the node's label. */
+function linkTextNode(audit: Audit): Record<string, unknown> | undefined {
+  const text = str(audit.details?.items?.[0]?.['text']);
+  return text === undefined ? undefined : { nodeLabel: text };
+}
+
 /** `a`, `a and b`, `a, b and c`. */
 function listed(names: string[]): string {
   return names.length <= 1 ? (names[0] ?? '') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1] as string}`;
@@ -243,7 +249,7 @@ function remedyOf(
       return { text: audit.title, place: false };
     }
     case 'link-text': {
-      const text = str(node?.['nodeLabel']) ?? '';
+      const text = str(node?.['nodeLabel']) ?? str(linkTextNode(audit)?.['nodeLabel']) ?? '';
       return { text: `"${text}"${key === undefined ? '' : ` (${key})`} is a generic link label — anchor text should name where it goes`, place: true };
     }
     case 'is-crawlable':
@@ -343,7 +349,7 @@ export function readRun(lhr: LighthouseResult, context: PageContext): PageRead {
       const owner = ownerOf(ref.id, lhr, context);
       if (owner === 'diag') continue;
       seen.add(ref.id);
-      const node = firstNode(audit);
+      const node = firstNode(audit) ?? (ref.id === 'link-text' ? linkTextNode(audit) : undefined);
       const snippet = str(node?.['snippet']);
       const el = context.document !== null && snippet !== undefined ? elementOfSnippet(context.document, snippet) : null;
       const key = keyOf(el, node, context);

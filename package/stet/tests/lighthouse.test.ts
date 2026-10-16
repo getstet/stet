@@ -866,5 +866,11 @@ describe('stet audit lighthouse — the exit, the JSON and --raw (D2)', () => {
     const saved = JSON.parse(readFileSync(join(h.cwd, 'raw/home.json'), 'utf8')) as LighthouseResult;
     expect(saved.categories['accessibility']?.score).toBe(1);
     expect(saved.finalDisplayedUrl).toMatch(/^https:\/\/127\.0\.0\.1:\d+\/$/);
+
+    // An absolute directory is that directory, not one under the checkout.
+    write(h.cwd, '.gitignore', 'raw/\nabs/\n');
+    h.out.length = 0;
+    expect(await h.run('--json', '--raw', join(h.cwd, 'abs'))).toBe(0);
+    expect(existsSync(join(h.cwd, 'abs/home.json'))).toBe(true);
   });
 });

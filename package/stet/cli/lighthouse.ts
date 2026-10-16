@@ -10,7 +10,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
 import { constants as osConstants } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { headLimitsFor } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
@@ -239,7 +239,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     report.data('pages', pageReports);
 
     if (raw !== undefined) {
-      const dir = join(io.cwd, raw);
+      const dir = resolve(io.cwd, raw);
       // git matches a `dir/` ignore rule against a directory that exists, so the probe runs on one made for it.
       const made = mkdirSync(dir, { recursive: true });
       if (trackable(dir) === true) {
