@@ -179,6 +179,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   const landed = new Map<LocatedLiteral, string>();
   const entries: Array<{ file: string; source: string; edits: Edit[]; lines: string[] }> = [];
   let clientEdited = 0;
+  let serverEdited = 0;
   for (const { file, source, literals, target, kind } of adoptable) {
     const edits: Edit[] = [];
     const lines: string[] = [];
@@ -224,6 +225,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     }
 
     if (edits.length > 0 && kind === 'client') clientEdited += 1;
+    if (edits.length > 0 && kind === 'server') serverEdited += 1;
     entries.push({ file, source, edits, lines });
   }
   // The mount, where a client rewrite landed: into the layout's own list where
@@ -336,8 +338,9 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   }
   // Before ANY write, the descriptor and snapshot included: a rewrite that
   // inserts an import the host cannot resolve breaks every file it touched. Every
-  // write is in the batch below, and a run that applies no leaf edit writes no import.
-  if (edited.length > 0) refuseUnresolvableAlias(io.cwd, config);
+  // write is in the batch below. Only a server-kind rewrite imports the read path:
+  // a run of client rewrites and the mount alone (every Vite run) writes none.
+  if (serverEdited > 0) refuseUnresolvableAlias(io.cwd, config);
   // ONE batch, with rollback: the descriptor, the snapshot, the codegen modules
   // and every leaf edit land together or not at all. The codegen regenerates
   // here so the `copy('new_key')` leaf register just wrote typechecks

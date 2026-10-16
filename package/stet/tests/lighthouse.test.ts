@@ -14,11 +14,10 @@ import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { defaultConfig } from '../cli/config.js';
 import { INIT_READ_IMPORT } from '../cli/footprint.js';
 import { ChromeMissing, type LighthouseResult } from '../cli/lighthouse-run.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { devDefaults, PREVIEW_COMMANDS, readWorkspace, updateSite } from '../cli/workspace.js';
+import { PREVIEW_COMMANDS, readWorkspace, updateSite } from '../cli/workspace.js';
 import { cleanLhr, fakeLighthouse, savedLhr, type FakeLighthouse } from './helpers/lighthouse.js';
 import { BUILT_BIN, builtBinExists } from './helpers/stet-shim.js';
 
@@ -476,12 +475,11 @@ describe('stet audit lighthouse --build (D3)', () => {
     expect(Object.hasOwn(readWorkspace(h.workspace).sites[0] ?? {}, 'previewCommand')).toBe(false);
   });
 
-  it("carries each router's preview command with its loopback host, and Vite's dev default", () => {
+  it("carries each router's preview command with its loopback host", () => {
     expect(PREVIEW_COMMANDS.vite).toBe('npx vite preview --host 127.0.0.1 --port {port} --strictPort');
     expect(PREVIEW_COMMANDS.astro).toBe('npx astro preview --host 127.0.0.1 --port {port} --ignore-lock');
     expect(PREVIEW_COMMANDS.app).toBe('npx next start -H 127.0.0.1 -p {port}');
     expect(PREVIEW_COMMANDS.pages).toBe('npx next start -H 127.0.0.1 -p {port}');
-    expect(devDefaults({ ...defaultConfig(), router: 'vite' }, { path: '/x' })?.dev).toBe('http://localhost:5173');
   });
 });
 

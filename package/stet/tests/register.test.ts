@@ -5,8 +5,10 @@
  * never-touch-a-published-value guarantee, idempotence, the server/client
  * choice, and every refusal (ambiguous, no-provider, foreign `copy`).
  */
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +39,7 @@ vi.mock('../cli/artifacts.js', async (importOriginal) => {
 import { runRegister } from '../cli/register.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { planDocuments, planHtmlRegister } from '../cli/html-host.js';
+import { packageRoot } from '../cli/installed.js';
 import { fileHash } from '../cli/key-plan.js';
 import { Report } from '../cli/report.js';
 import type { Snapshot } from '../src/snapshot.js';
@@ -563,6 +566,81 @@ describe('runRegister — the provider mount (P15)', () => {
     await runCli(['scan'], cap);
     expect(tree(dir)).toEqual(before);
     expect(cap.out.join('\n')).not.toContain('mount the CopyProvider');
+  });
+});
+
+describe('runRegister — the Vite arm (D9)', () => {
+  const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'vite-host');
+  const viteHost = async (): Promise<string> => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-register-vite-'));
+    cpSync(FIXTURE, dir, { recursive: true });
+    expect(await runCli(['init', '--yes'], io(dir))).toBe(0);
+    return dir;
+  };
+
+  it('rewrites every literal to useCopy(), mounts over the render argument, and the entry type-checks', async () => {
+    const dir = await viteHost();
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const app = read(dir, 'src/App.tsx');
+    expect(app).toContain("import { useCopy } from '@getstet/stet/react';");
+    expect(app).not.toContain('<h1>Get started</h1>');
+    expect(app).not.toContain("'@/lib/content'");
+    expect(cap.err.join('\n')).not.toContain('needs a client rewrite');
+    const main = read(dir, 'src/main.tsx');
+    expect(main).toContain("import { RESOLVED } from '../content/resolved';");
+    expect(main).toContain('.render(\n  <CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={RESOLVED}><StrictMode>');
+    expect(main).toContain('</StrictMode></CopyProvider>,\n)');
+    expect(cap.out).toContain('src/main.tsx: mounted CopyProvider');
+
+    // tsc over the entry and the app, `@getstet/stet` resolved to the built package.
+    if (!existsSync(join(packageRoot(), 'dist', 'src', 'index.js'))) execFileSync('npm', ['run', 'build'], { cwd: packageRoot(), stdio: 'pipe' });
+    symlinkSync(join(packageRoot(), '..', 'node_modules'), join(dir, 'node_modules'), 'dir');
+    write(dir, 'src/assets.d.ts', "declare module '*.png' { const src: string; export default src; }\ndeclare module '*.svg' { const src: string; export default src; }\ndeclare module '*.css';\n");
+    write(
+      dir,
+      'tsconfig.json',
+      JSON.stringify({
+        compilerOptions: {
+          target: 'ES2022',
+          lib: ['ES2022', 'DOM', 'DOM.Iterable'],
+          module: 'ESNext',
+          moduleResolution: 'bundler',
+          jsx: 'react-jsx',
+          strict: true,
+          resolveJsonModule: true,
+          allowImportingTsExtensions: true,
+          verbatimModuleSyntax: true,
+          skipLibCheck: true,
+          noEmit: true,
+        },
+        include: ['src'],
+      }),
+    );
+    const tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc');
+    let output = '';
+    try {
+      execFileSync(process.execPath, [tsc, '--noEmit', '-p', 'tsconfig.json'], { cwd: dir, encoding: 'utf8', stdio: 'pipe' });
+    } catch (error) {
+      output = String((error as { stdout?: string }).stdout ?? error);
+    }
+    expect(output).toBe('');
+  }, 60_000);
+
+  it('adopts no literal where main.tsx renders twice, or passes render a second argument', async () => {
+    for (const main of [
+      "import { createRoot } from 'react-dom/client'\nimport App from './App.tsx'\n\ncreateRoot(document.getElementById('a')!).render(<App />)\ncreateRoot(document.getElementById('b')!).render(<App />)\n",
+      "import { createRoot } from 'react-dom/client'\nimport App from './App.tsx'\n\ncreateRoot(document.getElementById('root')!).render(<App />, document.body)\n",
+    ]) {
+      const dir = await viteHost();
+      write(dir, 'src/main.tsx', main);
+      const before = read(dir, 'src/App.tsx');
+      const cap = io(dir);
+      expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+      expect(read(dir, 'src/main.tsx')).toBe(main);
+      expect(read(dir, 'src/App.tsx')).toBe(before);
+      expect(cap.err.join('\n')).toContain('needs a client rewrite, but the CopyProvider mount could not be located in src/main.tsx');
+    }
   });
 });
 

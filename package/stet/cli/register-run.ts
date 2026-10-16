@@ -325,10 +325,10 @@ function kindFor(
   // router — checked FIRST, so a Pages host's email mailer is still server (and
   // reaches EMAIL_TARGET), not client-skipped for want of a provider.
   if (!isJsxFile(file)) return 'server';
-  // Only `pages` forces the client form: a Pages-Router file is client-rendered
-  // with no directive to detect it by. `app` and `astro` both fall through to
-  // the directive and the route-file test.
-  if (config.router === 'pages' || hasUseClient) return 'client';
+  // `pages` and `vite` force the client form: a Pages-Router file and a Vite SPA's
+  // component are client-rendered with no directive to detect them by. `app` and
+  // `astro` both fall through to the directive and the route-file test.
+  if (config.router === 'pages' || config.router === 'vite' || hasUseClient) return 'client';
   if (isRouteFile(file)) return 'server';
   if (forced === 'server' || forced === 'client') return forced;
   return null;

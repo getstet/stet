@@ -759,6 +759,13 @@ describe('devDefaults', () => {
       devCommand: 'npm run dev',
       source: 'router',
     });
+
+    const vite = makeCliHost({ config: { project: 't', router: 'vite' } });
+    expect(devDefaults(loadConfig(vite.cwd), { path: vite.cwd })).toEqual({
+      dev: 'http://localhost:5173',
+      devCommand: 'npm run dev',
+      source: 'router',
+    });
   });
 
   it('lets the entry’s own values win, and says they are the entry’s', () => {
