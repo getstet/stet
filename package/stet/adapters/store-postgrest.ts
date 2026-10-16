@@ -121,10 +121,25 @@ function fetchOf(conn: { fetchImpl?: Fetch }): Fetch {
   return conn.fetchImpl ?? ((...args) => globalThis.fetch(...args));
 }
 
+/** `message` with `url` shown as its origin: a user and password the URL carries never reach a store error. */
+function withoutUrl(message: string, url: string): string {
+  let origin: string;
+  let secrets: string[] = [];
+  try {
+    const parsed = new URL(url);
+    origin = parsed.origin;
+    secrets = [parsed.username, parsed.password].filter((part) => part !== '');
+  } catch {
+    origin = url.replace(/\/\/[^/]*@/, '//');
+  }
+  return secrets.reduce((text, secret) => text.split(secret).join(''), message.split(url).join(origin));
+}
+
 /**
  * One request and its body under one deadline — every request this file makes
  * goes through here. A deadline that passes, before the answer or while the
- * body streams, throws the no-answer error; anything else is rethrown as is.
+ * body streams, throws the no-answer error; any other failure is rethrown with
+ * the URL in its message reduced to the origin.
  */
 async function fetchText(
   conn: { fetchImpl?: Fetch; requestTimeoutMillis?: number },
@@ -139,7 +154,9 @@ async function fetchText(
     if ((error as { name?: unknown } | null)?.name === 'TimeoutError') {
       throw new Error(`no answer from ${new URL(url).origin} within ${ms} ms`);
     }
-    throw error;
+    if (!(error instanceof Error)) throw error;
+    const message = withoutUrl(error.message, url);
+    throw message === error.message ? error : new Error(message);
   }
 }
 

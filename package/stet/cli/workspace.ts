@@ -412,15 +412,28 @@ export function childEnv(): NodeJS.ProcessEnv {
 /**
  * The environment a child started for one site receives: `childEnv`, and —
  * for every checkout but the one `stet dev` was started in — none of the
- * connection variables that checkout's config names. A dev server reads its
- * store from the process environment ahead of its own `.env` files, so a
- * shell value left in would point another site's preview, API and build at
- * the started-in site's database.
+ * connection variables that checkout's config names, nor those the started-in
+ * checkout's config names (read now, so an edit during the run counts; a config
+ * that does not load names none). A dev server reads its store from the process
+ * environment ahead of its own `.env` files, so a shell value left in would
+ * point another site's preview, API and build at the started-in site's
+ * database, whichever names its own config uses. The started-in checkout's own
+ * children keep their values, except one the shell holds empty, which stet
+ * reads as unset and the child must too.
  */
 export function siteChildEnv(site: { path: string; config: StetConfig }, launched: string | undefined): NodeJS.ProcessEnv {
   const env = childEnv();
-  if (site.path === launched) return env;
-  for (const name of connectionNames(site.config)) delete env[name];
+  if (site.path === launched) {
+    for (const name of connectionNames(site.config)) if (env[name] === '') delete env[name];
+    return env;
+  }
+  let shell: string[] = [];
+  try {
+    shell = launched === undefined ? [] : connectionNames(loadConfig(launched));
+  } catch {
+    /* no config to read: nothing more to strip */
+  }
+  for (const name of [...connectionNames(site.config), ...shell]) delete env[name];
   return env;
 }
 

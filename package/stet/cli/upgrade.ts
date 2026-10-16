@@ -325,7 +325,8 @@ async function applyPending(
     report.line(`migrations: up to date at ${installed}`);
     // The schema has not moved and the descriptor still may have: the stamp is
     // "where a store answers and the value moved", not "where a migration ran".
-    await stamp(io, project, report);
+    // A dry run writes nothing, the stamp included.
+    if (!dryRun) await stamp(io, project, report);
     return;
   }
   report.line(

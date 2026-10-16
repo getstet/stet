@@ -8,7 +8,7 @@
  * so the fake applies the write for real (into an in-process memory store),
  * counts the call, and then throws on the way back.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
 import {
@@ -725,11 +725,14 @@ describe('store-postgrest, the gateway key and the request bound', () => {
     await store.read({ preview: true });
     await store.saveDraft({ key: 'hero_headline', value: 'v', target: 'web', editor: 'neil' });
     await store.changesets.list();
+    // A request that sets `Prefer` builds its headers on another branch of `send`.
+    await store.changesets.open({ name: 'a change' });
     await readStetMeta(conn);
     await writeDescriptorVersion(conn, '3');
     await renameRecorded(conn, { project: 'site', oldKey: 'a', newKey: 'b' });
 
-    expect(sent.length).toBeGreaterThanOrEqual(6);
+    expect(sent.length).toBeGreaterThanOrEqual(7);
+    expect(sent.some((request) => request.headers['Prefer'] !== undefined)).toBe(true);
     for (const request of sent) {
       expect(request.headers['apikey'], request.url).toBe('tok');
       expect(request.headers['Authorization'], request.url).toBe('Bearer tok');
@@ -797,6 +800,48 @@ describe('store-postgrest, the gateway key and the request bound', () => {
     const answer = await store.saveDraft({ key: 'hero_headline', value: 'v', target: 'web', editor: 'neil' });
     expect(answer).toMatchObject({ storeError: true, code: 'unreachable' });
     expect(calls.n).toBe(1);
+  });
+
+  it('with no bound given, the request is bounded at ten seconds', async () => {
+    // `AbortSignal.timeout` runs on Node's own timers, which fake timers do not reach: the bound is read off the call.
+    const bounds = vi.spyOn(AbortSignal, 'timeout');
+    try {
+      const store = createPostgrestStore({
+        url: ORIGIN_URL,
+        token: 'tok',
+        project: 'site',
+        fetchImpl: (async () => new Response('[]', { status: 200 })) as typeof globalThis.fetch,
+      });
+      await store.read();
+      expect(bounds.mock.calls).toEqual([[10_000]]);
+    } finally {
+      bounds.mockRestore();
+    }
+  });
+
+  it('a failure that is not a timeout names the origin alone, never a user or password', async () => {
+    const url = 'http://neil:s3cret@postgrest.test/rest/v1';
+    const refuses = (async (input: string | URL | Request) => {
+      throw new TypeError(`Request cannot be constructed from a URL that includes credentials: ${String(input)}`);
+    }) as typeof globalThis.fetch;
+    const store = createPostgrestStore({ url, token: 'tok', project: 'site', fetchImpl: refuses });
+    const answer = await store.read();
+    expect(answer).toMatchObject({ storeError: true, code: 'unreachable' });
+    const message = (answer as { message: string }).message;
+    expect(message).not.toContain('s3cret');
+    expect(message).not.toContain('neil');
+    expect(message).toContain('http://postgrest.test');
+    await expect(readStetMeta({ url, token: 'tok', fetchImpl: refuses })).rejects.toThrow(/^(?!.*s3cret)/s);
+    // A URL that does not parse is shown without its userinfo too.
+    const malformed = createPostgrestStore({
+      url: 'http://neil:s3cret@[bad/rest/v1',
+      token: 'tok',
+      project: 'site',
+      fetchImpl: (async (input: string | URL | Request) => {
+        throw new TypeError(`Failed to parse URL from ${String(input)}`);
+      }) as typeof globalThis.fetch,
+    });
+    expect(JSON.stringify(await malformed.read())).not.toContain('s3cret');
   });
 
   it('with no bound given the default applies and a prompt answer still reads', async () => {

@@ -1822,6 +1822,30 @@ describe('upgrade', () => {
     expect(patched).toContain('"descriptor_version":"1"');
   });
 
+  it('a dry run on an up-to-date database stamps nothing, and a real run stamps it', async () => {
+    const current = fakeFetch(JSON.stringify([{ schema_version: 3, descriptor_version: 'old' }]));
+    const writes: string[] = [];
+    const host = makeHost({
+      config: { store: { adapter: 'postgrest' } },
+      env: { STET_POSTGREST_URL: 'http://postgrest.test', STET_POSTGREST_TOKEN: 'test' },
+      store: createMemoryStore({ project: 'default' }),
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method !== undefined && init.method !== 'GET') {
+          writes.push(`${init.method} ${String(input)}`);
+          return new Response(JSON.stringify([{ id: 1 }]));
+        }
+        return current(input as never, init as never);
+      }) as typeof globalThis.fetch,
+    });
+
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    expect(host.stdout()).toContain('migrations: up to date at 3');
+    expect(writes).toEqual([]);
+    expect(await host.run('upgrade')).toBe(0);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatch(/^PATCH .*stet_meta/);
+  });
+
   it('--verify refuses a database that has only walked as far as 001', async () => {
     // The upgrade path every existing install walks: 001 is in, 002 is not, and
     // "verified" would be a lie the seed step would then build on.

@@ -828,6 +828,36 @@ describe('the connection environment', () => {
       expect('FSG_URL' in siteChildEnv(site, undefined)).toBe(false);
     });
   });
+
+  it('hands another checkout’s children none of the started-in checkout’s variables either, whatever names its own config uses', async () => {
+    const started = makeCliHost({ config: { project: 't', store: pair } });
+    const names = [
+      makeCliHost({ config: { project: 't' } }),
+      makeCliHost({ config: { project: 't', store: { adapter: 'pg', urlEnv: 'FSG_DATABASE_URL' } } }),
+    ];
+    await withProcessEnv({ FSG_URL: 'http://process.test', FSG_TOKEN: 'secret', FSG_DATABASE_URL: 'own', FSG_UNNAMED: 'kept' }, () => {
+      for (const host of names) {
+        const other = siteChildEnv({ path: host.cwd, config: loadConfig(host.cwd) }, started.cwd);
+        expect('FSG_URL' in other).toBe(false);
+        expect('FSG_TOKEN' in other).toBe(false);
+        expect(other['FSG_UNNAMED']).toBe('kept');
+      }
+      // Its own names still go.
+      expect('FSG_DATABASE_URL' in siteChildEnv({ path: names[1]!.cwd, config: loadConfig(names[1]!.cwd) }, started.cwd)).toBe(false);
+    });
+  });
+
+  it('hands the started-in checkout’s children no variable the shell holds empty', async () => {
+    const host = makeCliHost({ config: { project: 't', store: pair } });
+    const site = { path: host.cwd, config: loadConfig(host.cwd) };
+    await withProcessEnv({ FSG_URL: 'http://process.test', FSG_TOKEN: '', FSG_UNNAMED: '' }, () => {
+      const launched = siteChildEnv(site, host.cwd);
+      expect(launched['FSG_URL']).toBe('http://process.test');
+      expect('FSG_TOKEN' in launched).toBe(false);
+      // Only the variables the config names: another empty variable passes as it was.
+      expect(launched['FSG_UNNAMED']).toBe('');
+    });
+  });
 });
 
 describe('routerPreviewCommand', () => {
@@ -4966,11 +4996,14 @@ describe('the dev child', () => {
     const SHOW_TOKEN = `node -e "console.log('tok:'+(process.env.STET_POSTGREST_TOKEN??'unset'))"`;
 
     /** Two checkouts declaring the pair in one workspace, `launched` the first. */
-    function pairHosts(over: (index: number) => Partial<WorkspaceEntry>): {
+    function pairHosts(
+      over: (index: number) => Partial<WorkspaceEntry>,
+      second: Record<string, unknown> = PAIR,
+    ): {
       handler: (r: Request) => Promise<Response>;
       paths: [string, string];
     } {
-      const hosts = [makeCliHost({ config: PAIR }), makeCliHost({ config: PAIR })];
+      const hosts = [makeCliHost({ config: PAIR }), makeCliHost({ config: second })];
       const file = workspaceFile();
       const paths = hosts.map((host) => realpathSync(host.cwd)) as [string, string];
       for (const [index, host] of hosts.entries()) {
@@ -5001,6 +5034,38 @@ describe('the dev child', () => {
           }
         } finally {
           for (const path of paths) await post(handler, `/api/site/dev-stop${query(path)}`, {});
+        }
+      });
+    });
+
+    it('starts another checkout’s dev command without the started-in checkout’s variables, whatever names its config uses', async () => {
+      const others = {
+        'no store': { project: 't' },
+        'other names': { project: 't', store: { adapter: 'pg', urlEnv: 'FSG_DATABASE_URL' } },
+      };
+      for (const [name, config] of Object.entries(others)) {
+        await withProcessEnv(SHELL, async () => {
+          const { handler, paths } = pairHosts(() => ({ devCommand: SHOW_TOKEN }), config);
+          try {
+            expect((await post(handler, `/api/site/dev-start${query(paths[1])}`, {})).status, name).toBe(200);
+            const logged = await until(handler, `/api/site/dev-log${query(paths[1])}`, (b) => (b.lines as string[]).length > 0);
+            expect(logged.lines, name).toContain('tok:unset');
+          } finally {
+            await post(handler, `/api/site/dev-stop${query(paths[1])}`, {});
+          }
+        });
+      }
+    });
+
+    it('starts the started-in checkout’s dev command without a variable the shell holds empty', async () => {
+      await withProcessEnv({ ...SHELL, STET_POSTGREST_TOKEN: '' }, async () => {
+        const { handler, paths } = pairHosts(() => ({ devCommand: SHOW_TOKEN }));
+        try {
+          expect((await post(handler, `/api/site/dev-start${query(paths[0])}`, {})).status).toBe(200);
+          const logged = await until(handler, `/api/site/dev-log${query(paths[0])}`, (b) => (b.lines as string[]).length > 0);
+          expect(logged.lines).toContain('tok:unset');
+        } finally {
+          await post(handler, `/api/site/dev-stop${query(paths[0])}`, {});
         }
       });
     });
