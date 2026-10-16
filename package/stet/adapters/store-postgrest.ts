@@ -18,6 +18,9 @@
  * No write is ever retried, and there is no retry wrapper in this file to
  * disable: a truncated response to a write that actually landed would duplicate
  * the row. One call is one request is one transaction.
+ *
+ * Every request carries `apikey` beside the Bearer, which Supabase's gateway
+ * requires and plain PostgREST ignores, and is bounded by `REQUEST_TIMEOUT_MS`.
  */
 
 import { normalEmail } from '../src/contacts.js';
@@ -86,7 +89,17 @@ export interface PostgrestConnection {
   url: string;
   token: string;
   fetchImpl?: Fetch;
+  /** The bound on each request, answer and body; `REQUEST_TIMEOUT_MS` where absent. */
+  requestTimeoutMillis?: number;
 }
+
+/**
+ * How long one request may take, its answer and its body together, before it
+ * counts as unreachable. A render caller reads `unreachable` as absence and
+ * serves the snapshot, so a store that stops answering degrades the page
+ * within this bound instead of hanging it.
+ */
+export const REQUEST_TIMEOUT_MS = 10_000;
 
 /** One trailing slash, removed once. Every path below is written with a leading one. */
 function baseOf(url: string): string {
@@ -95,6 +108,9 @@ function baseOf(url: string): string {
 
 function authHeaders(token: string): Record<string, string> {
   return {
+    // Supabase's gateway refuses a request that carries no `apikey` (401 "No
+    // API key found in request"); plain PostgREST ignores the header.
+    apikey: token,
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
     Accept: 'application/json',
@@ -105,14 +121,36 @@ function fetchOf(conn: { fetchImpl?: Fetch }): Fetch {
   return conn.fetchImpl ?? ((...args) => globalThis.fetch(...args));
 }
 
+/**
+ * One request and its body under one deadline — every request this file makes
+ * goes through here. A deadline that passes, before the answer or while the
+ * body streams, throws the no-answer error; anything else is rethrown as is.
+ */
+async function fetchText(
+  conn: { fetchImpl?: Fetch; requestTimeoutMillis?: number },
+  url: string,
+  init: RequestInit,
+): Promise<{ response: Response; text: string }> {
+  const ms = conn.requestTimeoutMillis ?? REQUEST_TIMEOUT_MS;
+  try {
+    const response = await fetchOf(conn)(url, { ...init, signal: AbortSignal.timeout(ms) });
+    return { response, text: await response.text() };
+  } catch (error) {
+    if ((error as { name?: unknown } | null)?.name === 'TimeoutError') {
+      throw new Error(`no answer from ${new URL(url).origin} within ${ms} ms`);
+    }
+    throw error;
+  }
+}
+
 export function createPostgrestStore(opts: {
   url: string;
   token: string;
   project: string;
   fetchImpl?: Fetch;
+  requestTimeoutMillis?: number;
 }): StoreAdapter {
   const base = baseOf(opts.url);
-  const call: Fetch = fetchOf(opts);
 
   const headers = (): Record<string, string> => authHeaders(opts.token);
 
@@ -121,24 +159,19 @@ export function createPostgrestStore(opts: {
     path: string,
     init?: { method: string; body?: string; prefer?: string },
   ): Promise<RpcAnswer> {
-    let response: Response;
-    try {
-      const request: RequestInit = { headers: headers() };
-      if (init !== undefined) {
-        request.method = init.method;
-        if (init.body !== undefined) request.body = init.body;
-        // `return=representation`, where a write must read back what it
-        // touched: a PATCH or DELETE blocked by row level security comes back
-        // 204 having changed nothing, and a row count is the only honest check.
-        if (init.prefer !== undefined) request.headers = { ...headers(), Prefer: init.prefer };
-      }
-      response = await call(`${base}${path}`, request);
-    } catch (error) {
-      return mapError(error);
+    const request: RequestInit = { headers: headers() };
+    if (init !== undefined) {
+      request.method = init.method;
+      if (init.body !== undefined) request.body = init.body;
+      // `return=representation`, where a write must read back what it
+      // touched: a PATCH or DELETE blocked by row level security comes back
+      // 204 having changed nothing, and a row count is the only honest check.
+      if (init.prefer !== undefined) request.headers = { ...headers(), Prefer: init.prefer };
     }
+    let response: Response;
     let text: string;
     try {
-      text = await response.text();
+      ({ response, text } = await fetchText(opts, `${base}${path}`, request));
     } catch (error) {
       return mapError(error);
     }
@@ -713,11 +746,11 @@ const SCHEMA_CACHE_MISS = /^PGRST20\d$/;
  * is what catches that case honestly.
  */
 export async function readStetMeta(conn: PostgrestConnection): Promise<StetMeta | null> {
-  const response = await fetchOf(conn)(
+  const { response, text } = await fetchText(
+    conn,
     `${baseOf(conn.url)}/stet_meta?id=eq.1&select=schema_version,descriptor_version`,
     { headers: authHeaders(conn.token) },
   );
-  const text = await response.text();
   if (!response.ok) {
     if (response.status === 404 || SCHEMA_CACHE_MISS.test(codeOf(text) ?? '')) return null;
     throw new Error(`stet_meta read failed: ${response.status} ${response.statusText}: ${text}`);
@@ -741,10 +774,9 @@ export async function renameRecorded(
   params.set('old_key', eqFilter(p.oldKey));
   params.set('new_key', eqFilter(p.newKey));
   params.set('limit', '1');
-  const response = await fetchOf(conn)(`${baseOf(conn.url)}/stet_renames?${params.toString()}`, {
+  const { response, text } = await fetchText(conn, `${baseOf(conn.url)}/stet_renames?${params.toString()}`, {
     headers: authHeaders(conn.token),
   });
-  const text = await response.text();
   if (!response.ok) throw new Error(`stet_renames read failed: ${response.status} ${response.statusText}: ${text}`);
   const rows = JSON.parse(text === '' ? '[]' : text) as unknown;
   return Array.isArray(rows) && rows.length > 0;
@@ -760,12 +792,11 @@ export async function renameRecorded(
  * and a column default fires only on insert.
  */
 export async function writeDescriptorVersion(conn: PostgrestConnection, v: string): Promise<void> {
-  const response = await fetchOf(conn)(`${baseOf(conn.url)}/stet_meta?id=eq.1`, {
+  const { response, text } = await fetchText(conn, `${baseOf(conn.url)}/stet_meta?id=eq.1`, {
     method: 'PATCH',
     headers: { ...authHeaders(conn.token), Prefer: 'return=representation' },
     body: JSON.stringify({ descriptor_version: v, updated_at: new Date().toISOString() }),
   });
-  const text = await response.text();
   if (!response.ok) {
     throw new Error(`stet_meta stamp failed: ${response.status} ${response.statusText}: ${text}`);
   }

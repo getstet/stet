@@ -14,6 +14,7 @@ import { createMemoryStore } from '../adapters/store-memory.js';
 import {
   createPostgrestStore,
   readStetMeta,
+  renameRecorded,
   writeDescriptorVersion,
 } from '../adapters/store-postgrest.js';
 import { isStoreError } from '../conformance/store.suite.js';
@@ -687,5 +688,131 @@ describe('store-postgrest, the wire shapes', () => {
     // whose membership reads undefined, and the `--due` split would treat every
     // grouped draft as ungrouped.
     for (const request of sent) expect(request.url).toContain('changeset_id');
+  });
+});
+
+/**
+ * The gateway key and the request bound. Supabase's gateway refuses a request
+ * with no `apikey`, and a store that accepts the connection and never answers
+ * must read as an absence within the bound, not hang the page.
+ */
+describe('store-postgrest, the gateway key and the request bound', () => {
+  const ORIGIN_URL = 'http://postgrest.test/rest/v1';
+
+  /** A fetch that never settles until its signal aborts, then rejects with the signal's reason. */
+  const hung = (calls?: { n: number }): typeof globalThis.fetch =>
+    ((_input: string | URL | Request, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        if (calls !== undefined) calls.n += 1;
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+      })) as typeof globalThis.fetch;
+
+  it('every request carries apikey beside the Bearer, the install-time helpers included', async () => {
+    const sent: { url: string; headers: Record<string, string>; signal: unknown }[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      sent.push({ url, headers: (init?.headers ?? {}) as Record<string, string>, signal: init?.signal });
+      const body = url.includes('/stet_meta?id=eq.1&select')
+        ? [{ schema_version: 3, descriptor_version: '' }]
+        : url.includes('/stet_meta?id=eq.1')
+          ? [{ id: 1 }]
+          : [];
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof globalThis.fetch;
+    const conn = { url: ORIGIN_URL, token: 'tok', fetchImpl };
+    const store = createPostgrestStore({ ...conn, project: 'site' });
+
+    await store.read({ preview: true });
+    await store.saveDraft({ key: 'hero_headline', value: 'v', target: 'web', editor: 'neil' });
+    await store.changesets.list();
+    await readStetMeta(conn);
+    await writeDescriptorVersion(conn, '3');
+    await renameRecorded(conn, { project: 'site', oldKey: 'a', newKey: 'b' });
+
+    expect(sent.length).toBeGreaterThanOrEqual(6);
+    for (const request of sent) {
+      expect(request.headers['apikey'], request.url).toBe('tok');
+      expect(request.headers['Authorization'], request.url).toBe('Bearer tok');
+      expect(request.signal, request.url).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it('a store that never answers is unreachable after the bound, naming the origin alone', async () => {
+    const store = createPostgrestStore({
+      url: ORIGIN_URL,
+      token: 'tok',
+      project: 'site',
+      fetchImpl: hung(),
+      requestTimeoutMillis: 20,
+    });
+    expect(await store.read()).toEqual({
+      storeError: true,
+      code: 'unreachable',
+      message: 'no answer from http://postgrest.test within 20 ms',
+    });
+  });
+
+  it('a body that stalls after its first byte is the same answer', async () => {
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('['));
+            init?.signal?.addEventListener('abort', () => controller.error(init.signal?.reason));
+          },
+        }),
+        { status: 200 },
+      )) as typeof globalThis.fetch;
+    const store = createPostgrestStore({
+      url: ORIGIN_URL,
+      token: 'tok',
+      project: 'site',
+      fetchImpl,
+      requestTimeoutMillis: 20,
+    });
+    expect(await store.read()).toEqual({
+      storeError: true,
+      code: 'unreachable',
+      message: 'no answer from http://postgrest.test within 20 ms',
+    });
+  });
+
+  it('the install-time helpers throw the same message', async () => {
+    const conn = { url: ORIGIN_URL, token: 'tok', fetchImpl: hung(), requestTimeoutMillis: 20 };
+    const message = 'no answer from http://postgrest.test within 20 ms';
+    await expect(readStetMeta(conn)).rejects.toThrow(message);
+    await expect(renameRecorded(conn, { project: 'site', oldKey: 'a', newKey: 'b' })).rejects.toThrow(message);
+    await expect(writeDescriptorVersion(conn, '3')).rejects.toThrow(message);
+  });
+
+  it('a write the bound cuts off is not retried', async () => {
+    const calls = { n: 0 };
+    const store = createPostgrestStore({
+      url: ORIGIN_URL,
+      token: 'tok',
+      project: 'site',
+      fetchImpl: hung(calls),
+      requestTimeoutMillis: 20,
+    });
+    const answer = await store.saveDraft({ key: 'hero_headline', value: 'v', target: 'web', editor: 'neil' });
+    expect(answer).toMatchObject({ storeError: true, code: 'unreachable' });
+    expect(calls.n).toBe(1);
+  });
+
+  it('with no bound given the default applies and a prompt answer still reads', async () => {
+    const signals: AbortSignal[] = [];
+    const store = createPostgrestStore({
+      url: ORIGIN_URL,
+      token: 'tok',
+      project: 'site',
+      fetchImpl: (async (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.signal) signals.push(init.signal);
+        return new Response('[]', { status: 200 });
+      }) as typeof globalThis.fetch,
+    });
+    expect(await store.read()).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.aborted).toBe(false);
   });
 });

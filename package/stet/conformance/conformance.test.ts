@@ -2159,6 +2159,61 @@ describe('store', () => {
     await (adapters[2] as ReturnType<typeof createPgStore>).end();
   });
 
+  it('Requirement: store-postgrest carries the gateway key and bounds every request', async () => {
+    // Every request carries both headers and a deadline signal.
+    const sent: { url: string; headers: Record<string, string>; signal: unknown }[] = [];
+    const recording = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      sent.push({ url, headers: (init?.headers ?? {}) as Record<string, string>, signal: init?.signal });
+      const body = url.includes('/stet_meta?id=eq.1&select')
+        ? [{ schema_version: 3, descriptor_version: '' }]
+        : url.includes('/stet_meta?id=eq.1')
+          ? [{ id: 1 }]
+          : [];
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as typeof globalThis.fetch;
+    const conn = { url: 'http://postgrest.test/rest/v1', token: 'tok', fetchImpl: recording };
+    const recorded = createPostgrestStore({ ...conn, project: 'walk' });
+    await recorded.read({ preview: true });
+    await recorded.saveDraft({ key: 'hero_headline', value: 'v', target: 'web', editor: 'neil' });
+    await recorded.changesets.list();
+    await readPostgrestMeta(conn);
+    await writePostgrestDescriptorVersion(conn, '3');
+    expect(sent).toHaveLength(5);
+    for (const request of sent) {
+      expect(request.headers['apikey']).toBe('tok');
+      expect(request.headers['Authorization']).toBe('Bearer tok');
+      expect(request.signal).toBeInstanceOf(AbortSignal);
+    }
+
+    // A store that never answers is an absence on the render path: every key
+    // still resolves from the committed snapshot. A write is never retried.
+    let calls = 0;
+    const hung = ((_input: string | URL | Request, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        calls += 1;
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+      })) as typeof globalThis.fetch;
+    const silent = createPostgrestStore({ ...conn, project: 'walk', fetchImpl: hung, requestTimeoutMillis: 20 });
+    const down = await silent.read();
+    expect(down).toEqual({
+      storeError: true,
+      code: 'unreachable',
+      message: 'no answer from http://postgrest.test within 20 ms',
+    });
+    for (const key of keys) {
+      const resolution = resolve(descriptor, snapshot, null, { key });
+      expect(resolution.value).toBeDefined();
+      expect(resolution.value).not.toBe('');
+    }
+    calls = 0;
+    expect(await silent.saveDraft({ key: 'hero_headline', value: 'v', target: 'web', editor: 'neil' })).toMatchObject({
+      storeError: true,
+      code: 'unreachable',
+    });
+    expect(calls).toBe(1);
+  });
+
   it('Requirement: Writes are never retried through the store transport', async () => {
     const store = createMemoryStore({ project: 'walk' });
     ok(await store.saveDraft({ key: 'hero_headline', value: 'landed', target: 'web', editor: 'neil' }));
