@@ -125,6 +125,28 @@ describe('stet audit lighthouse — the html host (journey C11)', () => {
     expect(bare.out.join('\n')).toMatch(/^home {2}\/ {2}Performance 100/m);
   });
 
+  it("labels a --url page by its own path, and a declared page by its name", async () => {
+    const fake = fakeLighthouse({ '/docs/check/': cleanLhr() });
+    const bare = nextHost(fake);
+    write(bare.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await bare.run('--url', 'http://127.0.0.1:3999/docs/check/')).toBe(0);
+    expect(fake.runs.map((run) => run.url)).toEqual(['http://127.0.0.1:3999/docs/check/']);
+    expect(bare.out.join('\n')).toMatch(/^\/docs\/check\/ {2}Performance 100/m);
+    expect(bare.out.join('\n')).not.toMatch(/^home /m);
+    expect(bare.err).toContain('auditing /docs/check/… 1/1');
+    const json = nextHost(fake);
+    write(json.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await json.run('--url', 'http://127.0.0.1:3999/docs/check/', '--json', '--raw', 'raw')).toBe(0);
+    expect(existsSync(join(json.cwd, 'raw/docs_check.json'))).toBe(true);
+    const pages = JSON.parse(json.out.join('\n')) as { pages: Array<{ page: string; route: string }> };
+    expect(pages.pages.map(({ page, route }) => [page, route])).toEqual([['/docs/check/', '/docs/check/']]);
+
+    const declared = nextHost(fake);
+    write(declared.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { docs: { route: '/docs/check/' } } }));
+    expect(await declared.run('--url', 'http://127.0.0.1:3999/docs/check/')).toBe(0);
+    expect(declared.out.join('\n')).toMatch(/^docs {2}\/docs\/check\/ {2}Performance 100/m);
+  });
+
   it('prints the median of five, the audit lines from the first run', async () => {
     const scores = [92, 99, 92, 100, 92];
     const fake = fakeLighthouse({
@@ -897,6 +919,23 @@ describe('stet audit lighthouse --fix --write (D5)', () => {
     expect(descriptor.pages?.['home']?.route).toBe('/');
     expect(descriptor.keys['home_page_title']?.pages).toEqual(['home']);
     expect(await runCli(['check'], { ...h.io, stdout: () => undefined, stderr: () => undefined })).toBe(0);
+  });
+
+  it('reads the declaration the write just made, so the re-run names the key it minted', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'stet-lighthouse-fix-'));
+    write(cwd, 'index.html', '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <title>Hello</title>\n</head>\n<body><main><p>Hi</p></main></body>\n</html>\n');
+    write(cwd, 'stet.config.json', JSON.stringify({ project: 't', host: 'html', managedSurfaces: ['**/*.html'] }));
+    write(cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    write(cwd, 'content/defaults.json', JSON.stringify({ default: {} }));
+    const lhr = cleanLhr();
+    (lhr.audits['meta-description'] as { score: number | null }).score = 0;
+    (lhr.categories['seo'] as { score: number | null }).score = 0.9;
+    const h = host(cwd, { lighthouse: fakeLighthouse({ '/': lhr }).start });
+    expect(await h.run('--fix', '--write')).toBe(0);
+    const out = h.out.join('\n');
+    expect(out).toContain('bound to home_meta_description');
+    expect(out).toContain('home_meta_description is empty');
+    expect(out).not.toContain('home_meta_description_2');
   });
 
   it('writes nothing where the snapshot write fails, and names the failure', async () => {

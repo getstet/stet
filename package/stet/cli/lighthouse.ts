@@ -255,7 +255,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         if (made !== undefined) rmSync(made, { recursive: true });
         report.error('lighthouse', `--raw ${raw}: git would track it — name a directory git ignores`);
       } else {
-        for (const [name, chosen] of chosenOf) writeJsonDeterministic(join(dir, `${name}.json`), chosen);
+        for (const [name, chosen] of chosenOf) writeJsonDeterministic(join(dir, `${name.replace(/^\/+|\/+$/g, '').replace(/\//g, '_')}.json`), chosen);
       }
     }
     return emit();
@@ -452,7 +452,13 @@ function pageTargets(cwd: string, config: StetConfig, selected: AuditablePage[] 
   const base = target.front?.url ?? target.base;
   const html = isHtmlHost(config);
   if (selected === null) {
-    if (!html) return { pages: [{ page: '/', label: 'home', route: '/', url: new URL('/', base).href }], skips: [] };
+    if (!html) {
+      // A URL to a page of its own is audited as that page, named by its path; `home` is `/` alone.
+      const path = new URL(base).pathname;
+      const page: PageTarget =
+        path === '/' ? { page: '/', label: 'home', route: '/', url: new URL('/', base).href } : { page: path, label: path, route: path, url: new URL(base).href };
+      return { pages: [page], skips: [] };
+    }
     const file = filesForGlobs(cwd, config.managedSurfaces).find((doc) => servedRoute(doc) === '/');
     if (file === undefined) return { pages: [], skips: ['/: no managed document serves / — skipped'] };
     return { pages: [{ page: '/', label: file, route: '/', url: base, file }], skips: [] };
@@ -469,11 +475,19 @@ function pageTargets(cwd: string, config: StetConfig, selected: AuditablePage[] 
 
 /** What one page's run is read against. */
 function pageContext(cwd: string, config: StetConfig, descriptor: Descriptor, snapshot: Snapshot, page: PageTarget, fix: boolean): PageContext {
-  const def = page.page === '/' ? undefined : descriptor.pages?.[page.page];
   const router = isHtmlHost(config) ? 'html' : config.router;
   const document = page.file === undefined ? null : readDocument(page.file, readFileSync(join(cwd, page.file), 'utf8'));
   // `/` audited alone is the page `planFixes` and `nameOf` call `home`: a document's own name, else `home`.
-  const name = page.page === '/' ? (page.file === undefined ? 'home' : (pageOfFile(cwd, page.file, descriptor.pages, { html: true }) ?? null)) : page.page;
+  const name =
+    page.page === '/'
+      ? page.file === undefined
+        ? 'home'
+        : (pageOfFile(cwd, page.file, descriptor.pages, { html: true }) ?? null)
+      : page.page.startsWith('/')
+        ? null
+        : page.page;
+  // Its declaration is read as it stands, so a re-run after `--fix --write` sees the page the write declared.
+  const def = name === null ? undefined : descriptor.pages?.[name];
   return {
     router,
     page: name,

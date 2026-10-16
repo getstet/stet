@@ -445,7 +445,7 @@ export function scoreLine(label: string, route: string, runs: LighthouseResult[]
     const suffix = runs.length > 1 ? ` (median of ${runs.length}: ${values.join(' · ')})` : options.devServer ? ' (dev server)' : '';
     return `${LABELS[category]} ${shown}${suffix}`;
   });
-  return `${label}  ${route}  ${parts.join(' · ')}`;
+  return `${label === route ? label : `${label}  ${route}`}  ${parts.join(' · ')}`;
 }
 
 /** Each category's median score, 0–100 or null. */
