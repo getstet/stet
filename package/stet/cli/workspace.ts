@@ -450,3 +450,8 @@ export const PREVIEW_COMMANDS: Readonly<Record<'app' | 'pages' | 'astro' | 'vite
   vite: 'npx vite preview --host 127.0.0.1 --port {port} --strictPort',
   astro: 'npx astro preview --host 127.0.0.1 --port {port} --ignore-lock',
 };
+
+/** The router's own preview command: what an entry without `previewCommand` runs. */
+export function routerPreviewCommand(config: StetConfig): string {
+  return PREVIEW_COMMANDS[config.router === 'pages' || config.router === 'astro' || config.router === 'vite' ? config.router : 'app'];
+}

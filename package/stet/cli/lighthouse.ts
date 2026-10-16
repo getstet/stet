@@ -43,7 +43,7 @@ import { applyPages, auditablePages, pageOfFile, proposeForHost, servedRoute, ty
 import { plural, Report, UsageError } from './report.js';
 import { applyFileEdits } from './rewrite.js';
 import { loadTypescript } from './source-scan.js';
-import { childEnv, devDefaults, PREVIEW_COMMANDS, readWorkspace, workspacePath, type WorkspaceEntry } from './workspace.js';
+import { childEnv, devDefaults, readWorkspace, routerPreviewCommand, workspacePath, type WorkspaceEntry } from './workspace.js';
 
 const CHROME_MISSING = 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary';
 const NO_TARGET = 'this host builds before it serves — pass --url <server>, or --build to build and serve the production output here';
@@ -383,7 +383,7 @@ async function startBuild(io: CliIo, config: StetConfig, report: Report, held: H
 function previewCommandOf(io: CliIo, config: StetConfig): string {
   const entry = workspaceEntry(io);
   if (entry?.previewCommand !== undefined) return entry.previewCommand;
-  return PREVIEW_COMMANDS[config.router === 'pages' || config.router === 'astro' || config.router === 'vite' ? config.router : 'app'];
+  return routerPreviewCommand(config);
 }
 
 /** This checkout's workspace entry, where the workspace lists it. */
@@ -547,6 +547,7 @@ function pageJson(
   const number = (value: unknown): number | null => (typeof value === 'number' ? value : null);
   return {
     page: nameOf(page),
+    ...(page.file === undefined ? {} : { file: page.file }),
     route: page.route,
     url: page.url,
     scores: medianScores(results),

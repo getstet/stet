@@ -7730,6 +7730,259 @@ describe('the page', () => {
       page.dom.window.close();
     });
   });
+
+  describe('the Lighthouse card (D10)', () => {
+    const lighthouse = { version: '13.5.0', formFactor: 'mobile', runs: 1, target: 'http://127.0.0.1:5001/', targetKind: 'documents', protocol: 'h2' };
+    const audit = (owner: string, id: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      id,
+      category: 'seo',
+      weight: 1,
+      score: 0,
+      owner,
+      remedy: `fix ${id}`,
+      ...over,
+    });
+    const pageOf = (page: string, scores: Record<string, number | null>, audits: unknown[] = [], over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      page,
+      route: page === 'home' ? '/' : `/${page}`,
+      url: 'http://127.0.0.1:5001/',
+      scores: { performance: 100, accessibility: 100, bestPractices: 100, seo: 100, ...scores },
+      metrics: {},
+      audits,
+      diagnostics: [],
+      thirdParty: [],
+      ...over,
+    });
+    const resultOf = (pages: unknown[], over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      ok: true,
+      lighthouse,
+      footprint: [],
+      fixes: [],
+      findings: [],
+      pages,
+      ...over,
+    });
+    const done = (result: unknown, elapsed = 4): Record<string, unknown> => ({ state: 'done', elapsed, lines: [], result });
+    const indexPage = (): Record<string, unknown> =>
+      pageOf('home', { accessibility: 89, bestPractices: 96 }, [
+        audit('copy', 'label', { at: 'index.html:12', snippet: '<textarea id="notes">', key: 'hero_headline', remedy: 'name the field through a key' }),
+        audit('copy', 'meta-description', { remedy: 'hero_story is empty' }),
+        audit('host', 'target-size', { at: 'index.html:30', snippet: '<a href="/c">c</a>', remedy: 'pad the link' }),
+        audit('host', 'is-crawlable', { remedy: 'serve a 404' }),
+      ], { file: 'index.html' });
+
+    /** The page over a site, `GET site/audit` answering whatever `held.reply` is; the SEO tab open. */
+    async function card(
+      site: Record<string, unknown>,
+      held: { reply: unknown },
+      more: Array<[string, number, unknown, number?]> = [],
+    ): Promise<Painted> {
+      const page = await paint({
+        site,
+        routes: [
+          ['/api/site/audit', 200, () => held.reply],
+          ['/api/site/audit-start', 200, { state: 'running' }],
+          ...more,
+        ],
+        // The page polls every two seconds; the case does not wait that long.
+        prepare: (window) => {
+          const real = window.setTimeout.bind(window);
+          (window as unknown as { setTimeout: unknown }).setTimeout = (fn: () => void, ms?: number) => real(fn, ms === 2000 ? 10 : ms);
+        },
+      });
+      await page.act('tab:SEO');
+      return page;
+    }
+    const htmlSite = (): Record<string, unknown> => siteBody({ host: 'html', config: { ...(siteBody()['config'] as object), host: 'html' }, dev: null });
+    const body = (page: Painted): string => painted(page);
+    const lastStart = (page: Painted): unknown => page.sent.filter((r) => r.path.startsWith('/api/site/audit-start')).at(-1)?.body;
+
+    it('reads Not run yet by host, and Run fills the card (journey C13)', async () => {
+      const held = { reply: { state: 'none', elapsed: 0, lines: [], result: null } as unknown };
+      const html = await card(htmlSite(), held);
+      expect(body(html)).toContain("Not run yet. Runs against the checkout's documents.");
+      expect(docOf(html).querySelector('[data-act="auditRun"]')?.textContent).toBe('Run');
+      held.reply = done(resultOf([indexPage()]));
+      await html.act('auditRun');
+      expect(lastStart(html)).toEqual({});
+      const text = docOf(html).querySelector('.card')?.textContent ?? '';
+      expect(text).toContain("lighthouse 13.5.0 · mobile · the checkout's documents · 1 page · 4 s");
+      expect(text).toContain('index.html');
+      const tiles = [...docOf(html).querySelectorAll('.lht > div')].map((tile) => [tile.querySelector('.lb')?.textContent, tile.querySelector('.bdg')?.textContent, tile.querySelector('.bdg')?.className]);
+      expect(tiles).toEqual([
+        ['Performance', '100', 'bdg g'],
+        ['Accessibility', '89', 'bdg d'],
+        ['Best Practices', '96', 'bdg g'],
+        ['SEO', '100', 'bdg g'],
+      ]);
+      expect(text).toContain('stet fixes (2)');
+      expect(text).toContain('The host owns (2)');
+      expect(docOf(html).querySelector('[data-act="auditRun"]')?.textContent).toBe('Run again');
+      expect([...docOf(html).querySelectorAll('[data-act^="edit:"]')].map((b) => b.getAttribute('data-act'))).toEqual(['edit:hero_headline', 'edit:hero_story']);
+      await html.act('edit:hero_headline');
+      expect(docOf(html).querySelector('.row.on')?.getAttribute('data-act')).toBe('key:hero_headline');
+      expect(html.errors).toEqual([]);
+      html.dom.window.close();
+
+      const js = await card(siteBody(), { reply: { state: 'none' } });
+      expect(body(js)).toContain('Not run yet. Runs against the production build.');
+      js.dom.window.close();
+    });
+
+    it('bands the tiles at 90 and 50, a missing score reading a dash', async () => {
+      const held = { reply: done(resultOf([pageOf('home', { performance: 90, accessibility: 89, bestPractices: 50, seo: 49 }), pageOf('about', { performance: null })])) };
+      const page = await card(htmlSite(), held);
+      const classes = [...docOf(page).querySelectorAll('.lht .bdg')].map((b) => `${b.textContent}:${b.className}`);
+      expect(classes.slice(0, 4)).toEqual(['90:bdg g', '89:bdg d', '50:bdg d', '49:bdg r']);
+      expect(classes[4]).toBe('–:bdg ');
+      page.dom.window.close();
+    });
+
+    it('applies the head fixes from the card and re-fills it with the re-run (journey C13)', async () => {
+      const fixed = pageOf('home', { accessibility: 89 }, [audit('fix', 'html-has-lang'), audit('fix', 'meta-viewport'), audit('fix', 'document-title'), audit('copy', 'link-name', { key: 'home_link' })], { file: 'index.html' });
+      const held = { reply: done(resultOf([fixed])) };
+      const page = await card(htmlSite(), held);
+      expect(body(page)).toContain('3 head edits');
+      held.reply = done(resultOf([fixed, pageOf('home', {}, [audit('copy', 'meta-description', { remedy: 'minted_key is empty' })], { file: 'index.html' })]));
+      // The write minted the key: the site read after it declares it.
+      page.answer('/api/site', 200, siteBody({ host: 'html', descriptor: { ...descriptor, keys: { ...descriptor.keys, minted_key: { shape: 'text', target: 'web' } } } }));
+      await page.act('auditFix:home');
+      expect(lastStart(page)).toEqual({ fix: true, pages: ['home'] });
+      expect(body(page)).not.toContain('head edits');
+      expect(docOf(page).querySelector('.card [data-act="edit:minted_key"]')?.textContent).toBe('→ open');
+      expect(page.requested('/api/site?')).toHaveLength(2);
+      expect(docOf(page).querySelectorAll('.lht').length).toBe(1);
+      page.dom.window.close();
+    });
+
+    it('audits a JavaScript site’s build, shows the building line, and posts the toggle and the preview url (journey C13)', async () => {
+      const held = { reply: { state: 'none' } as unknown };
+      const page = await card(siteBody({ git: { head: 'c7b3961', branch: 'develop', upstream: 'origin/develop', ahead: 0, behind: 0, dirty: false, live: 'main' } }), held, [
+        ['/api/site/preview-link', 200, { url: 'https://develop.psyon-site.pages.dev' }],
+      ]);
+      expect(docOf(page).querySelector('[data-act="auditPreview"]')?.textContent).toBe('Audit the deployed preview');
+      held.reply = { state: 'running', elapsed: 3, lines: ['building (npm run build)…', 'compiling'], result: null };
+      await page.act('auditForm:desktop');
+      await page.act('auditRun');
+      expect(lastStart(page)).toEqual({ desktop: true });
+      expect(body(page)).toContain('Building the production preview (npm run build)…');
+      held.reply = done(resultOf([pageOf('home', {})], { lighthouse: { ...lighthouse, formFactor: 'desktop', targetKind: 'build' } }), 41);
+      await until(() => body(page).includes('the production build'));
+      expect(docOf(page).querySelector('.card')?.textContent).toContain('lighthouse 13.5.0 · desktop · the production build · 1 page · 41 s');
+      held.reply = done(resultOf([pageOf('home', {})], { lighthouse: { ...lighthouse, targetKind: 'url', target: 'https://develop.psyon-site.pages.dev' } }));
+      await page.act('auditForm:mobile');
+      await page.act('auditPreview');
+      expect(lastStart(page)).toEqual({ url: 'https://develop.psyon-site.pages.dev' });
+      expect(docOf(page).querySelector('.card')?.textContent).toContain('lighthouse 13.5.0 · mobile · https://develop.psyon-site.pages.dev · 1 page');
+      page.dom.window.close();
+    });
+
+    it('says Auditing <page>… <n> s while a run goes on, and polls until it ends', async () => {
+      const held = { reply: { state: 'running', elapsed: 7, lines: ['auditing home… 1/1'], result: null } as unknown };
+      const page = await card(htmlSite(), held);
+      expect(body(page)).toContain('Auditing home… 7 s');
+      expect((docOf(page).querySelector('[data-act="auditRun"]') as HTMLButtonElement).disabled).toBe(true);
+      held.reply = done(resultOf([pageOf('home', {})]));
+      expect(await until(() => body(page).includes('lighthouse 13.5.0'))).toBe(true);
+      const reads = page.requested('/api/site/audit?').length;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(page.requested('/api/site/audit?')).toHaveLength(reads);
+      page.dom.window.close();
+    });
+
+    it('shows the refusals and failures in the card', async () => {
+      const held = { reply: { state: 'none' } as unknown };
+      const page = await card(siteBody(), held);
+      page.answer('/api/site/audit-start', 409, { error: 'stop the dev server first — next build writes the .next folder it is serving from' });
+      await page.act('auditRun');
+      expect(docOf(page).querySelector('.card .err')?.textContent).toBe('stop the dev server first — next build writes the .next folder it is serving from');
+      page.answer('/api/site/audit-start', 200, { state: 'running' });
+      held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary' }] });
+      await page.act('auditRun');
+      expect(docOf(page).querySelector('.card .err')?.textContent).toBe('Chrome was not found — install Google Chrome, or set CHROME_PATH in the shell that runs stet dev');
+      held.reply = { state: 'done', elapsed: 9, lines: ['building (npm run build)…', 'boom'], result: { ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: 'npm run build exited 1 — its output is above' }] } };
+      await page.act('auditRun');
+      expect(docOf(page).querySelector('.card .err')?.textContent).toBe('The build failed — its output is under Setup');
+      await page.act('tab:Setup');
+      expect(body(page)).toContain('Lighthouse output');
+      expect(docOf(page).querySelector('.term')?.textContent).toContain('boom');
+      page.dom.window.close();
+    });
+
+    it('clears the card on a site switch, leaves the child, and reads the finished result on return', async () => {
+      const held = { reply: { state: 'running', elapsed: 1, lines: ['auditing home… 1/1'], result: null } as unknown };
+      const page = await card(htmlSite(), held);
+      const reads = (): number => page.requested('/api/site/audit?').length;
+      // The other checkout has no audit; the server keys them by site.
+      held.reply = { state: 'none', elapsed: 0, lines: [], result: null };
+      await page.act('site:/checkouts/other');
+      expect(body(page)).not.toContain('Auditing home');
+      const afterSwitch = reads();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(reads()).toBe(afterSwitch);
+      held.reply = done(resultOf([pageOf('home', {})]));
+      await page.act('site:/checkouts/mini');
+      await page.act('tab:SEO');
+      expect(body(page)).toContain('lighthouse 13.5.0');
+      page.dom.window.close();
+    });
+
+    it('escapes every string a result carries (the hostile snippet)', async () => {
+      const hostile = '<img src=x onerror=alert(1)>';
+      const held = {
+        reply: done(
+          resultOf([pageOf(hostile, {}, [audit('copy', 'x', { snippet: hostile, remedy: hostile, at: hostile, key: hostile }), audit('host', hostile, { snippet: hostile, remedy: hostile })], { file: hostile, route: hostile })], {
+            lighthouse: { ...lighthouse, version: hostile, targetKind: 'url', target: hostile },
+          }),
+        ),
+      };
+      const page = await card(htmlSite(), held);
+      expect(docOf(page).querySelector('.card img')).toBeNull();
+      expect(docOf(page).querySelector('.card')?.textContent).toContain(hostile);
+      held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: hostile }] });
+      await page.act('auditRun');
+      expect(docOf(page).querySelector('.card img')).toBeNull();
+      expect(docOf(page).querySelector('.card .err')?.textContent).toBe(hostile);
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('lays the tiles and lists out for a phone, every line wrapping (journey C13)', async () => {
+      const held = { reply: done(resultOf([indexPage()])) };
+      const page = await card(htmlSite(), held);
+      const window = page.dom.window;
+      const tiles = docOf(page).querySelector('.lht') as HTMLElement;
+      const row = docOf(page).querySelector('.lhi') as HTMLElement;
+      expect(window.getComputedStyle(tiles).gridTemplateColumns).toBe('repeat(auto-fit,minmax(140px,1fr))');
+      expect(window.getComputedStyle(row).overflowWrap).toBe('anywhere');
+      expect(window.getComputedStyle(docOf(page).querySelector('.lhi code') as HTMLElement).overflowWrap).toBe('anywhere');
+      const style = [...docOf(page).querySelectorAll('style')].map((el) => el.textContent).join('');
+      expect(style).toContain('@media(max-width:760px){.cards{grid-template-columns:1fr}}');
+      expect(style).not.toMatch(/\.(lht|lhi|lhp)[^{]*\{[^}]*[;{]width:/);
+      page.dom.window.close();
+    });
+
+    it('sets the preview command in Setup, the router’s command its placeholder, a cleared field removing it (journey C13)', async () => {
+      const page = await paint({ site: siteBody({ previewDefault: 'npx astro preview --host 127.0.0.1 --port {port} --ignore-lock' }) });
+      await page.act('tab:Setup');
+      const field = (): HTMLInputElement => docOf(page).getElementById('previewcmd') as HTMLInputElement;
+      expect(field().value).toBe('');
+      expect(field().placeholder).toBe('npx astro preview --host 127.0.0.1 --port {port} --ignore-lock');
+      expect(body(page)).toContain('Preview command');
+      expect(body(page)).toContain('Runs after npm run build for stet audit lighthouse --build; {port} and PORT carry the port, and the server must listen on 127.0.0.1');
+      await page.change('entryPreview', 'node serve.mjs --port {port}');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/workspace/update')).at(-1)?.body).toEqual({ path: '/checkouts/mini', previewCommand: 'node serve.mjs --port {port}' });
+      expect(field().value).toBe('node serve.mjs --port {port}');
+      await page.change('entryPreview', '');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/workspace/update')).at(-1)?.body).toEqual({ path: '/checkouts/mini', previewCommand: '' });
+      page.dom.window.close();
+
+      const html = await paint({ site: htmlSite() });
+      await html.act('tab:Setup');
+      expect(docOf(html).getElementById('previewcmd')).toBeNull();
+      html.dom.window.close();
+    });
+  });
 });
 
 describe('stet dev holds its signal listeners through the close (F48)', () => {
