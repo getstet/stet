@@ -20,6 +20,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -68,7 +69,7 @@ describe('runHookInstall', () => {
     // The runner beside its list, both in git's common directory.
     expect(readFileSync(join(dir, '.git/stet-gate.mjs'), 'utf8')).toBe(runner);
     expect(JSON.parse(readFileSync(join(dir, '.git/stet-gate.json'), 'utf8'))).toEqual({
-      entries: [{ worktree: '', id: expect.any(Number), checkout: '', seo: true }],
+      entries: [{ worktree: '', id: expect.any(String), checkout: '', seo: true }],
     });
   });
 
@@ -268,7 +269,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     const linked = linkedWorktree(main, 'linked');
     standIn(join(linked, 'site'), log);
     expect(await runHookInstall([], io(join(linked, 'site')))).toBe(0);
-    expect(readGate(join(main, '.git'))).toEqual([{ worktree: 'worktrees/linked', id: expect.any(Number), checkout: 'site', seo: true }]);
+    expect(readGate(join(main, '.git'))).toEqual([{ worktree: 'worktrees/linked', id: expect.any(String), checkout: 'site', seo: true }]);
 
     appendFileSync(join(main, 'notes.md'), 'more\n');
     const notes = commit(main, 'a planning commit');
@@ -334,7 +335,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     const remove = io(join(main, 'site'));
     expect(await runHookRemove([], remove)).toBe(0);
     expect(remove.out).toEqual(['remove this checkout from the stet pre-commit gate']);
-    expect(readGate(join(main, '.git'))).toEqual([{ worktree: '', id: expect.any(Number), checkout: 'b', seo: true }]);
+    expect(readGate(join(main, '.git'))).toEqual([{ worktree: '', id: expect.any(String), checkout: 'b', seo: true }]);
     expect(await runHookRemove([], io(join(main, 'b')))).toBe(0);
     expect(existsSync(join(main, '.git/hooks/pre-commit'))).toBe(false);
     expect(existsSync(join(main, '.git/stet-gate.mjs'))).toBe(false);
@@ -434,6 +435,168 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(drain(log)).toEqual(['check in site', 'scan in site', 'seo check in site']);
   });
 
+  it('(a7) a worktree is told apart by its id file, not by its git dir’s inode', async () => {
+    const log = logFile();
+    const main = gitRepo();
+    standInCheckout(main, 'site', log);
+    commit(main, 'base');
+    const linked = linkedWorktree(main, 'wt');
+    expect(await runHookInstall([], io(join(linked, 'site')))).toBe(0);
+    const gitDir = join(main, '.git/worktrees/wt');
+    const [entry] = readGate(join(main, '.git'));
+    expect(readFileSync(join(gitDir, 'stet-gate-id'), 'utf8').trim()).toBe(entry?.id);
+    // The main worktree's id file lives in the common directory.
+    expect(await runHookInstall([], io(join(main, 'site')))).toBe(0);
+    expect(readFileSync(join(main, '.git/stet-gate-id'), 'utf8').trim()).toBe(readGate(join(main, '.git'))[1]?.id);
+
+    // Its own entry: no stet is installed in the linked worktree, so its commit is refused.
+    writeFileSync(join(linked, 'site/page.txt'), 'one\n');
+    expect(commit(linked, 'the installing worktree').out).toContain('stet is not installed in site/');
+    // The same git dir, with an id file that is not the one install wrote: another worktree's entry now.
+    writeFileSync(join(gitDir, 'stet-gate-id'), 'a-later-worktree\n');
+    const landed = commit(linked, 'a worktree with another id');
+    expect(landed.code, landed.out).toBe(0);
+    const listed = readGate(join(main, '.git'));
+    const remove = io(join(linked, 'site'));
+    expect(await runHookRemove([], remove)).toBe(0);
+    expect(remove.out).toEqual([
+      'site/ is still gated here by the entry a removed worktree made — run stet hook remove in the main worktree to take it out',
+    ]);
+    expect(readGate(join(main, '.git'))).toEqual(listed);
+  });
+
+  it('(a8) coverage from another worktree never runs a stet the branch committed through a symlink or a package file', async () => {
+    const log = logFile();
+    const main = gitRepo();
+    for (const folder of ['linked-in', 'package-file', 'real-in', 'link-out', 's*']) {
+      mkdirSync(join(main, folder), { recursive: true });
+      writeFileSync(join(main, folder, 'stet.config.json'), '{}\n');
+    }
+    commit(main, 'base');
+    const linked = linkedWorktree(main, 'installed');
+    for (const folder of ['linked-in', 'package-file', 'real-in', 'link-out', 's*']) {
+      standIn(join(linked, folder), log);
+      expect(await runHookInstall([], io(join(linked, folder)))).toBe(0);
+    }
+
+    // A branch tracks node_modules as a symlink to a tracked tools/.bin/stet, which main never installed.
+    standIn(join(main, 'scratch'), log);
+    mkdirSync(join(main, 'tools'));
+    renameSync(join(main, 'scratch/node_modules/.bin'), join(main, 'tools/.bin'));
+    rmSync(join(main, 'scratch'), { recursive: true });
+    symlinkSync('../tools', join(main, 'linked-in/node_modules'));
+    execFileSync('git', ['add', '-f', 'tools/.bin/stet', 'linked-in/node_modules'], { cwd: main });
+    writeFileSync(join(main, 'linked-in/page.txt'), 'x\n');
+    const symlinked = commit(main, 'a tracked node_modules symlink');
+    expect(symlinked.code, symlinked.out).toBe(0);
+    expect(drain(log)).toEqual([]);
+
+    // An untracked node_modules link into a tracked folder of the worktree.
+    standIn(join(main, 'scratch'), log);
+    mkdirSync(join(main, 'tools2'));
+    renameSync(join(main, 'scratch/node_modules/.bin'), join(main, 'tools2/.bin'));
+    rmSync(join(main, 'scratch'), { recursive: true });
+    symlinkSync('../tools2', join(main, 'real-in/node_modules'));
+    execFileSync('git', ['add', '-f', 'tools2/.bin/stet'], { cwd: main });
+    writeFileSync(join(main, 'real-in/page.txt'), 'x\n');
+    const real = commit(main, 'an untracked link into tracked code');
+    expect(real.code, real.out).toBe(0);
+    expect(drain(log)).toEqual([]);
+
+    // A tracked node_modules link to a folder outside the worktree, which git cannot see through.
+    const outside = mkdtempSync(join(tmpdir(), 'stet-gate-out-'));
+    made.push(outside);
+    standIn(outside, log);
+    symlinkSync(join(outside, 'node_modules'), join(main, 'link-out/node_modules'));
+    execFileSync('git', ['add', '-f', 'link-out/node_modules'], { cwd: main });
+    writeFileSync(join(main, 'link-out/page.txt'), 'x\n');
+    const away = commit(main, 'a tracked link out of the worktree');
+    expect(away.code, away.out).toBe(0);
+    expect(drain(log)).toEqual([]);
+
+    // Main's real install, whose package file the branch force-added: the untracked .bin/stet reaches tracked code.
+    const package_ = join(main, 'package-file/node_modules');
+    mkdirSync(join(package_, '@getstet/stet'), { recursive: true });
+    mkdirSync(join(package_, '.bin'));
+    standIn(join(main, 'scratch'), log);
+    renameSync(join(main, 'scratch/node_modules/.bin/stet'), join(package_, '@getstet/stet/cli.js'));
+    rmSync(join(main, 'scratch'), { recursive: true });
+    symlinkSync('../@getstet/stet/cli.js', join(package_, '.bin/stet'));
+    execFileSync('git', ['add', '-f', 'package-file/node_modules/@getstet/stet/cli.js'], { cwd: main });
+    writeFileSync(join(main, 'package-file/page.txt'), 'x\n');
+    const tracked = commit(main, 'a tracked package file');
+    expect(tracked.code, tracked.out).toBe(0);
+    expect(drain(log)).toEqual([]);
+
+    // A folder named with a glob reads its own node_modules literally: another folder's tracked path is no match.
+    standIn(join(main, 's*'), log);
+    mkdirSync(join(main, 'sa'));
+    writeFileSync(join(main, 'sa/node_modules'), 'a file, not a folder\n');
+    execFileSync('git', ['add', '-f', 'sa/node_modules'], { cwd: main });
+    writeFileSync(join(main, 's*/page.txt'), 'x\n');
+    const literal = commit(main, 'a folder named with a glob');
+    expect(literal.code, literal.out).toBe(0);
+    expect(drain(log)).toEqual(['check in s*', 'scan in s*', 'seo check in s*']);
+  });
+
+  it('(a9) hook remove and eject in the main worktree drop an entry whose folder it does not hold, once its worktree is gone', async () => {
+    for (const remove of ['hook remove', 'eject'] as const) {
+      const { top: main } = await gatedRepo(['site'], { log: logFile() });
+      const live = linkedWorktree(main, 'live');
+      const gone = linkedWorktree(main, 'gone');
+      for (const worktree of [live, gone]) {
+        // A branch never merged: the folder exists in that worktree alone.
+        mkdirSync(join(worktree, `exp-${basename(worktree)}`));
+        writeFileSync(join(worktree, `exp-${basename(worktree)}/stet.config.json`), '{}\n');
+        expect(await runHookInstall([], io(join(worktree, `exp-${basename(worktree)}`)))).toBe(0);
+      }
+      execFileSync('git', ['worktree', 'remove', '--force', gone], { cwd: main });
+      expect(await runHookInstall([], io(join(main, 'site')))).toBe(0);
+      const entries = (): string[] => readGate(join(main, '.git')).map((entry) => `${entry.worktree}|${entry.checkout}`);
+      expect(entries()).toEqual([`worktrees/live|exp-${basename(live)}`, `worktrees/gone|exp-${basename(gone)}`, '|site']);
+
+      // The live worktree's entry stays, and with it the gate; the dead one goes.
+      const run = (cwd: string) => (remove === 'eject' ? runEject(['--write'], io(cwd)) : runHookRemove([], io(cwd)));
+      expect(await run(join(main, 'site'))).toBe(0);
+      expect(entries()).toEqual([`worktrees/live|exp-${basename(live)}`]);
+      expect(existsSync(join(main, '.git/hooks/pre-commit'))).toBe(true);
+
+      // With no live worktree left, the same command takes the gate away.
+      execFileSync('git', ['worktree', 'remove', '--force', live], { cwd: main });
+      expect(await runHookInstall([], io(join(main, 'site')))).toBe(0);
+      expect(await run(join(main, 'site'))).toBe(0);
+      expect(existsSync(join(main, '.git/hooks/pre-commit')), remove).toBe(false);
+      expect(existsSync(join(main, '.git/stet-gate.mjs')), remove).toBe(false);
+      expect(existsSync(join(main, '.git/stet-gate.json')), remove).toBe(false);
+    }
+  });
+
+  it('(a10) an entry a 0.7.0 install wrote, with no id, goes once its worktree is gone and stays while it is there', async () => {
+    const log = logFile();
+    const main = gitRepo();
+    standInCheckout(main, 'b', log);
+    commit(main, 'base');
+    const live = linkedWorktree(main, 'live');
+    const list = join(main, '.git/stet-gate.json');
+    expect(await runHookInstall([], io(join(main, 'b')))).toBe(0);
+    const own = readGate(join(main, '.git'));
+    writeFileSync(
+      list,
+      `${JSON.stringify({
+        entries: [
+          { checkout: 'site', worktree: 'worktrees/gone', seo: true },
+          { checkout: 'site', worktree: 'worktrees/live', seo: true },
+          ...own,
+        ],
+      })}\n`,
+    );
+    expect(readGate(join(main, '.git')).map((entry) => `${entry.worktree}|${entry.checkout}`)).toEqual([
+      'worktrees/live|site',
+      '|b',
+    ]);
+    expect(existsSync(live)).toBe(true);
+  });
+
   it('(b) runs only the listed checkouts a commit touches', async () => {
     const log = logFile();
     const top = gitRepo();
@@ -444,8 +607,8 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(await runHookInstall([], io(a))).toBe(0);
     expect(await runHookInstall([], io(b))).toBe(0);
     expect(readGate(join(top, '.git'))).toEqual([
-      { worktree: '', id: expect.any(Number), checkout: 'a', seo: true },
-      { worktree: '', id: expect.any(Number), checkout: 'b', seo: true },
+      { worktree: '', id: expect.any(String), checkout: 'a', seo: true },
+      { worktree: '', id: expect.any(String), checkout: 'b', seo: true },
     ]);
 
     writeFileSync(join(a, 'page.txt'), 'a\n');
@@ -557,7 +720,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     );
     expect(readdirSync(shared)).toEqual([]);
     // The runner and the list are in place, so the pasted line gates this repository.
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(Number), checkout: 'site', seo: true }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(String), checkout: 'site', seo: true }]);
     expect(existsSync(join(top, '.git/stet-gate.mjs'))).toBe(true);
     const doctor = io(checkout);
     await runDoctor([], doctor);
@@ -594,7 +757,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(await runHookInstall([], install)).toBe(0);
     expect(install.out.join('\n')).toContain(`the stet pre-commit gate is ready; add this line to ${husky}: ${GATE_LINE}`);
     expect(existsSync(join(top, '.git/stet-gate.mjs'))).toBe(true);
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(Number), checkout: 'site', seo: true }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(String), checkout: 'site', seo: true }]);
     expect(readFileSync(husky, 'utf8')).toBe(own);
     expect(existsSync(join(top, '.git/hooks/pre-commit'))).toBe(false);
 
@@ -857,7 +1020,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     const first = io(a);
     expect(await runEject(['--write'], first)).toBe(0);
     expect(first.out.join('\n')).toContain('remove this checkout from the stet pre-commit gate');
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(Number), checkout: 'b', seo: true }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(String), checkout: 'b', seo: true }]);
     expect(existsSync(hookPath)).toBe(true);
 
     const last = io(b);
@@ -922,7 +1085,7 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     const first = io(a);
     expect(await runHookRemove([], first)).toBe(0);
     expect(first.out).toEqual(['remove this checkout from the stet pre-commit gate']);
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(Number), checkout: 'b', seo: true }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(String), checkout: 'b', seo: true }]);
     expect(existsSync(hookPath)).toBe(true);
     expect(allPaths(a).sort()).toEqual(before);
     const doctor = io(a);
@@ -1114,7 +1277,7 @@ describe('the gate runs stet seo check where the entry opted in', () => {
       expect(await runHookInstall([], io(a))).toBe(0);
       expect(readGate(join(top, '.git'))).toEqual([
         { worktree: '', checkout: 'b' },
-        { worktree: '', id: expect.any(Number), checkout: 'a', seo: true },
+        { worktree: '', id: expect.any(String), checkout: 'a', seo: true },
       ]);
       editDocument(a);
       writeFileSync(join(b, 'page.txt'), 'b\n');
@@ -1144,8 +1307,8 @@ describe('the gate runs stet seo check where the entry opted in', () => {
     expect(drain(log)).toEqual(['check in a', 'scan in a', 'seo check in a', 'check in b', 'scan in b']);
     expect(await runHookRemove([], io(c))).toBe(0);
     expect(readGate(join(top, '.git'))).toEqual([
-      { worktree: '', id: expect.any(Number), checkout: 'a', seo: true },
-      { worktree: '', id: expect.any(Number), checkout: 'b' },
+      { worktree: '', id: expect.any(String), checkout: 'a', seo: true },
+      { worktree: '', id: expect.any(String), checkout: 'b' },
     ]);
   });
 
@@ -1158,7 +1321,7 @@ describe('the gate runs stet seo check where the entry opted in', () => {
     const armed = io(site);
     expect(await runHookInstall([], armed)).toBe(0);
     expect(armed.out).toEqual([`${hookPath}: the stet pre-commit gate for site/ runs stet seo check from the next commit`]);
-    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(Number), checkout: 'site', seo: true }]);
+    expect(readGate(join(top, '.git'))).toEqual([{ worktree: '', id: expect.any(String), checkout: 'site', seo: true }]);
     const again = io(site);
     expect(await runHookInstall([], again)).toBe(0);
     expect(again.out).toEqual([`${hookPath}: the stet pre-commit gate is already installed for site/ — no change`]);

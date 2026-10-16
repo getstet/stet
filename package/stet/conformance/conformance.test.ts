@@ -7332,7 +7332,7 @@ describe('adoption', () => {
     expect(host.file('.git/hooks/pre-commit')).toContain('stet-gate.mjs');
     expect(host.exists('.git/stet-gate.mjs')).toBe(true);
     // The operator ran the command, so its entry runs stet seo check too.
-    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '', id: expect.any(Number), seo: true }] });
+    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '', id: expect.any(String), seo: true }] });
     expect(host.stdout()).toContain('it runs stet check, stet scan and stet seo check in the repository root when a commit touches it');
     // a differing existing hook is refused, not clobbered, naming the line to add
     host.write('.git/hooks/pre-commit', '#!/bin/sh\necho custom\n');

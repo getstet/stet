@@ -22,6 +22,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 
@@ -70,8 +71,11 @@ export async function runHookInstall(args: string[], io: CliIo): Promise<number>
   // entry runs `seo check` whatever that answers today.
   const found = withGateLock(where.common, () => {
     const listed = readGate(where.common);
-    const entry = listed.find(isSite(where));
-    const armed: GateEntry = { worktree: where.worktree, id: where.id, checkout: where.checkout, seo: true };
+    // This worktree's id file, written where absent: a worktree git adds later
+    // under a removed one's name has none, which is what tells them apart.
+    const mine = { ...where, id: readGateId(where.gitDir) ?? writeGateId(where.gitDir) };
+    const entry = listed.find(isSite(mine));
+    const armed: GateEntry = { worktree: mine.worktree, id: mine.id, checkout: mine.checkout, seo: true };
     writeGate(where.common, entry === undefined ? [...listed, armed] : listed.map((e) => (e === entry ? armed : e)));
     return entry;
   });
@@ -151,9 +155,15 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
   // This worktree's own entry and, run in the main worktree, every entry for
   // this folder whose worktree is gone: a merged branch's coverage leaves only
   // from the checkout it covers, and a live worktree's entry always stays.
+  // A dead entry for a folder this worktree does not hold is taken out too: no
+  // checkout remains here for it to gate, and without this a merged-never
+  // branch's entry could not be removed by any stet command.
+  const top = where.worktree === '' ? worktreeTop(cwd) : null;
   const here = (entry: GateEntry): boolean =>
     isSite(where)(entry) ||
-    (where.worktree === '' && entry.checkout === where.checkout && !entryAlive(where.common, entry));
+    (top !== null &&
+      !entryAlive(where.common, entry) &&
+      (entry.checkout === where.checkout || !existsSync(join(top, entry.checkout, CONFIG_FILE))));
   const rest = listed.filter((entry) => !here(entry));
   const listedHere = rest.length < listed.length;
   const through = rest.find((entry) => entry.checkout === where.checkout);
@@ -269,38 +279,64 @@ export const GATE_LIST = 'stet-gate.json';
 export interface GateEntry {
   worktree: string;
   /**
-   * The inode of the worktree's git dir when install wrote the entry: git
-   * reuses `worktrees/<name>` once a worktree is removed, and a new worktree
-   * under the old name is a different worktree. Absent on a 0.7.0 entry.
+   * The content of the worktree's `stet-gate-id` file when install wrote the
+   * entry: git reuses `worktrees/<name>` once a worktree is removed, and a new
+   * worktree under the old name has no such file, so it is a different
+   * worktree. Absent on a 0.7.0 entry.
    */
-  id?: number;
+  id?: string;
   checkout: string;
   seo?: true;
 }
 
-/** Whether an entry is the checkout at `where`: its worktree by name and, where the entry records one, by inode. */
+/** The file in a worktree's git dir that names the worktree: git deletes it with the worktree. */
+export const GATE_ID = 'stet-gate-id';
+
+/** The id a worktree's git dir holds; undefined where install never wrote one. */
+export function readGateId(gitDir: string): string | undefined {
+  try {
+    return readFileSync(join(gitDir, GATE_ID), 'utf8').trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A new random id, written to the worktree's git dir. */
+function writeGateId(gitDir: string): string {
+  const id = randomUUID();
+  writeAtomic(join(gitDir, GATE_ID), `${id}\n`);
+  return id;
+}
+
+/** Whether an entry is the checkout at `where`: its worktree by name and, where the entry records one, by id. */
 export const isSite =
-  (where: { worktree: string; id: number; checkout: string }) =>
+  (where: { worktree: string; id: string | undefined; checkout: string }) =>
   (entry: GateEntry): boolean =>
     entry.worktree === where.worktree && entry.checkout === where.checkout && (entry.id === undefined || entry.id === where.id);
 
 /** Whether the worktree an entry names still exists and is the one install ran in. */
 function entryAlive(common: string, entry: GateEntry): boolean {
   const dir = join(common, entry.worktree);
-  return existsSync(dir) && (entry.id === undefined || statSync(dir).ino === entry.id);
+  return existsSync(dir) && (entry.id === undefined || readGateId(dir) === entry.id);
 }
 
 const git = (cwd: string, args: string[]): string =>
   // Only the trailing newline goes: a folder name may begin or end with a space.
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).replace(/\n$/, '');
 
-/** Where the checkout at `cwd` sits: git's common directory, its worktree, and its folder under that worktree's top. */
-export function gateSite(cwd: string): { common: string; worktree: string; id: number; checkout: string } | null {
+/**
+ * Where the checkout at `cwd` sits: git's common directory, its worktree (the
+ * git dir `gitDir` and the id file in it, undefined before install), and its
+ * folder under that worktree's top.
+ */
+export function gateSite(
+  cwd: string,
+): { common: string; worktree: string; gitDir: string; id: string | undefined; checkout: string } | null {
   try {
     const common = realpathSync(resolvePath(cwd, git(cwd, ['rev-parse', '--git-common-dir'])));
     const here = realpathSync(resolvePath(cwd, git(cwd, ['rev-parse', '--git-dir'])));
     const checkout = git(cwd, ['rev-parse', '--show-prefix']).replace(/\/$/, '');
-    return { common, worktree: relative(common, here), id: statSync(here).ino, checkout };
+    return { common, worktree: relative(common, here), gitDir: here, id: readGateId(here), checkout };
   } catch {
     return null; // not a git repo
   }
@@ -309,7 +345,9 @@ export function gateSite(cwd: string): { common: string; worktree: string; id: n
 /**
  * The gate's entries; empty where there is none. An entry whose worktree git
  * has since removed is kept, because it still gates its folder in the worktrees
- * that remain. A list that does not parse is refused, never overwritten.
+ * that remain; a 0.7.0 entry, which has no id to tell a worktree from a later
+ * one of its name, goes with its worktree. A list that does not parse is
+ * refused, never overwritten.
  */
 export function readGate(common: string): GateEntry[] {
   const path = join(common, GATE_LIST);
@@ -323,9 +361,10 @@ export function readGate(common: string): GateEntry[] {
   }
   return entries
     .filter((entry): entry is GateEntry => typeof entry?.worktree === 'string' && typeof entry?.checkout === 'string')
+    .filter((entry) => typeof entry.id === 'string' || existsSync(join(common, entry.worktree)))
     .map(({ worktree, id, checkout, seo }) => ({
       worktree,
-      ...(typeof id === 'number' ? { id } : {}),
+      ...(typeof id === 'string' ? { id } : {}),
       checkout,
       ...(seo === true ? { seo } : {}),
     }));
