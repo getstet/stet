@@ -20,7 +20,7 @@ import { cleanupCliHosts, htmlFixture, makeHtmlHost } from '../conformance/cli-h
 import { runEject } from '../cli/eject.js';
 import { HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
 import { packageRoot } from '../cli/installed.js';
-import type { CliIo } from '../cli/main.js';
+import { runCli, type CliIo } from '../cli/main.js';
 import { locateWrapTarget, providerEdits } from '../cli/provider-mount.js';
 import { applyFileEdits } from '../cli/rewrite.js';
 import { loadTypescript } from '../cli/source-scan.js';
@@ -964,6 +964,41 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       const compiled = tscClean(dir);
       expect(compiled.output).toBe('');
       expect(compiled.ok).toBe(true);
+    });
+  }
+
+  for (const eol of ['\n', '\r\n']) {
+    for (const form of ['resolveAll', 'resolved'] as const) {
+      it(`ejects to the exact original bytes when the layout's copy import is the last import above the ${form === 'resolveAll' ? '0.6.0' : '0.7.0'} block (${eol === '\n' ? 'LF' : 'CRLF'})`, async () => {
+        const dir = readHost();
+        // `copy` sits below `./globals.css`, so the block goes in directly after it.
+        const before = BEFORE_READ.replace("import { copy } from '@/lib/content';\nimport './globals.css';", "import './globals.css';\nimport { copy } from '@/lib/content';").replace(/\n/g, eol);
+        write(dir, 'app/layout.tsx', await mounted(form, dir, before));
+        expect(await runEject(['--write'], io(dir))).toBe(0);
+        expect(read(dir, 'app/layout.tsx')).toBe(AFTER_READ.replace(/\n/g, eol));
+      });
+    }
+
+    it(`ejects a layout two plain register runs produced to its exact original bytes (${eol === '\n' ? 'LF' : 'CRLF'})`, async () => {
+      // Run 1 adopts the layout literal (server kind) and writes `import { copy }` last; run 2 adopts a client Nav and mounts right after it.
+      const dir = scaffold({
+        config: { ...BASE_CONFIG, managedSurfaces: ['app/**/*.tsx', 'components/**/*.tsx'], codegen: { ...BASE_CONFIG.codegen, resolved: 'content/resolved.ts' } },
+        descriptor: { version: 1, keys: {} },
+        defaults: { default: {} },
+        files: { 'app/globals.css': '', 'lib/content.ts': READ_PATH.replace("'@getstet/stet/react'", "'@getstet/stet/react/server'") },
+      });
+      write(dir, 'content/resolved.ts', 'export const RESOLVED = {} as const;\n');
+      const layout = BEFORE.replace('        {children}\n', '        <p>Northwind Studio makes furniture</p>\n        {children}\n').replace(/\n/g, eol);
+      write(dir, 'app/layout.tsx', layout);
+      const first = io(dir);
+      expect(await runCli(['register', '--from', 'scan', '--write'], first), first.out.join('\n')).toBe(0);
+      write(dir, 'components/Nav.tsx', "'use client';\n\nexport function Nav() {\n  return <nav>Shop the spring collection</nav>;\n}\n");
+      const second = io(dir);
+      expect(await runCli(['register', '--from', 'scan', '--write'], second), second.out.join('\n')).toBe(0);
+      expect(read(dir, 'app/layout.tsx')).toContain('<CopyProvider ');
+      const cap = io(dir);
+      expect(await runEject(['--write'], cap), cap.out.join('\n')).toBe(0);
+      expect(read(dir, 'app/layout.tsx')).toBe(layout);
     });
   }
 

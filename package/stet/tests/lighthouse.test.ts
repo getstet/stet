@@ -589,6 +589,32 @@ describe('stet audit lighthouse --build (D3)', () => {
     expect(existsSync(join(h.cwd, 'preview.pid'))).toBe(false);
   }, 30_000);
 
+  it.skipIf(!builtBinExists())('prints no report for a build it ended on a signal, text or --json', async () => {
+    for (const flags of [['--build'], ['--build', '--json']]) {
+      const h = buildHost(fakeLighthouse({}), {
+        build: "node -e \"require('fs').writeFileSync('build.pid', String(process.pid)); setTimeout(() => {}, 8000)\"",
+      });
+      const stet = spawn(process.execPath, [BUILT_BIN, 'audit', 'lighthouse', ...flags], {
+        cwd: h.cwd,
+        env: { ...process.env, STET_WORKSPACE: h.workspace },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      stet.stdout.on('data', (chunk) => (stdout += chunk));
+      stet.stderr.on('data', (chunk) => (stderr += chunk));
+      const exited = new Promise<number | null>((resolve) => stet.on('exit', (exit) => resolve(exit)));
+      const deadline = Date.now() + 15_000;
+      while (!existsSync(join(h.cwd, 'build.pid')) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(existsSync(join(h.cwd, 'build.pid'))).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      stet.kill('SIGINT');
+      expect(await exited).toBe(130);
+      expect(stdout, flags.join(' ')).toBe('');
+      expect(stderr, flags.join(' ')).not.toContain('npm run build exited');
+    }
+  }, 60_000);
+
   it('names the bundle before the paint on a Vite build below 100, and nowhere else', async () => {
     const vite = (performance: number): LighthouseResult => {
       const lhr = cleanLhr();
@@ -773,6 +799,21 @@ describe('stet audit lighthouse --fix --write (D5)', () => {
     const stillBelow = edgesHost(fakeLighthouse({ '/edges.html': (n: number) => (n === 0 ? before : after) }));
     expect(await stillBelow.run('--fix', '--write', '--strict', '--json', '--pages', 'edges')).toBe(1);
     expect((JSON.parse(stillBelow.out.join('\n')) as { findings: Array<{ message: string }> }).findings.map((f) => f.message)).toEqual(['edges: seo 90 below 100']);
+  });
+
+  it("writes --raw from the re-run after --fix --write, so the raw file and the JSON page agree", async () => {
+    const before = cleanLhr(savedLhr('edges.html'));
+    (before.categories['accessibility'] as { score: number | null }).score = 0.9;
+    const fake = fakeLighthouse({ '/edges.html': (n: number) => (n === 0 ? before : cleanLhr(savedLhr('edges.html'))) });
+    const h = edgesHost(fake);
+    spawnSync('git', ['init', '-q'], { cwd: h.cwd, stdio: 'ignore' });
+    write(h.cwd, '.gitignore', 'raw/\n');
+    expect(await h.run('--fix', '--write', '--json', '--raw', 'raw', '--pages', 'edges')).toBe(0);
+    expect(fake.runs).toHaveLength(2);
+    const report = JSON.parse(h.out.join('\n')) as { pages: Array<{ scores: Record<string, number> }> };
+    const saved = JSON.parse(readFileSync(join(h.cwd, 'raw/edges.json'), 'utf8')) as LighthouseResult;
+    expect(report.pages[0]?.scores['accessibility']).toBe(100);
+    expect(saved.categories['accessibility']?.score).toBe(1);
   });
 
   it('declares a page --pages named before it was declared, and fills it (C12)', async () => {

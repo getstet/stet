@@ -1620,6 +1620,39 @@ describe('upgrade', () => {
       }
     });
 
+    it("keeps a Vite host's mount, and says nothing of it, where register wrote the read into main.tsx's own App", async () => {
+      const host = makeHost({
+        config: {
+          project: 't',
+          router: 'vite',
+          rootLayout: 'src/main.tsx',
+          managedSurfaces: ['src/**/*.tsx'],
+          emailSurfaces: [],
+          readPath: { file: 'src/lib/content.ts', import: '@/src/lib/content' },
+          descriptorPath: 'content/descriptor.json',
+          snapshotPath: 'content/defaults.json',
+          codegen: { registry: 'content/keys.ts', defaults: 'content/defaults.ts', dts: 'content/stet-env.d.ts', resolved: 'content/resolved.ts' },
+        },
+      });
+      writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify({ version: 1, keys: {} }));
+      writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify({ default: {} }));
+      writeFileSync(join(host.cwd, 'tsconfig.json'), JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } }));
+      writeFileSync(join(host.cwd, 'package.json'), JSON.stringify({ name: 'h', dependencies: { '@getstet/stet': '^0.7.0', react: '^18' } }));
+      mkdirSync(join(host.cwd, 'src'), { recursive: true });
+      writeFileSync(
+        join(host.cwd, 'src/main.tsx'),
+        "import { createRoot } from 'react-dom/client';\n\nfunction App() {\n  return <h1>Northwind Studio makes furniture</h1>;\n}\n\ncreateRoot(document.getElementById('root')!).render(<App />);\n",
+      );
+      expect(await host.run('register', '--from', 'scan', '--write'), host.stdout()).toBe(0);
+      const mounted = host.file('src/main.tsx');
+      expect(mounted).toContain('<CopyProvider ');
+      expect(mounted).toContain('useCopy()');
+      host.out.length = 0;
+      expect(await host.run('upgrade')).toBe(0);
+      expect(host.file('src/main.tsx')).toBe(mounted);
+      expect(host.stdout()).not.toContain('src/main.tsx:');
+    });
+
     it('keeps the mount, and says nothing of it, where typescript does not load', async () => {
       vi.resetModules();
       vi.doMock('../cli/source-scan.js', async (importOriginal) => ({

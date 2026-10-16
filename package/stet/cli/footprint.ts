@@ -41,14 +41,17 @@ export function readPathImport(cwd: string, config: StetConfig): ReadPathImport 
 const PROVIDER_MODULE_REF =
   /\b(?:import|export)\b[^;'"`]*?\bfrom\b\s*['"]@getstet\/stet\/react['"]|\bimport\s*['"]@getstet\/stet\/react['"]|\b(?:import|require)\s*\(\s*['"]@getstet\/stet\/react['"]\s*\)/;
 
+/** The root layout's own mount import: the one reference to the provider module that is not a read. */
+const ROOT_LAYOUT_MOUNT_IMPORT = /\bimport\s*\{\s*CopyProvider\s*\}\s*from\s*['"]@getstet\/stet\/react['"]/g;
+
 /** Build and cache output the walk never reads, beside `WALK_SKIP`'s four: a bundle there mentions the import without being a source. */
 const BUILT_OUTPUT = new Set(['out', 'build', 'coverage', '.turbo', '.cache', '.vercel', '.output', '.astro']);
 
 /**
  * Every source file of the checkout that references `@getstet/stet/react` —
  * the client reads a provider serves, however a file reaches `useCopy`. The
- * root layout (its own `CopyProvider` import) and a read path that `upgrade`
- * rewrites to the server subpath first are not reads. A text walk over the
+ * root layout counts once its own `CopyProvider` import is blanked, and a read
+ * path that `upgrade` rewrites to the server subpath first is not a read. A text walk over the
  * whole checkout (`walk`, which skips `node_modules`, `.git`, `dist` and
  * `.next`, with `BUILT_OUTPUT` skipped here — `WALK_SKIP`'s other consumers
  * are glob walks), not the managed surfaces alone: a hand-written
@@ -58,7 +61,6 @@ const BUILT_OUTPUT = new Set(['out', 'build', 'coverage', '.turbo', '.cache', '.
  */
 export function clientReadFiles(cwd: string, config: StetConfig): string[] {
   const skipped = new Set<string>();
-  if (config.rootLayout !== undefined) skipped.add(config.rootLayout);
   if (readPathImport(cwd, config) === 'init-line') skipped.add(config.readPath.file);
   const out: string[] = [];
   walk(cwd, (abs) => {
@@ -71,6 +73,9 @@ export function clientReadFiles(cwd: string, config: StetConfig): string[] {
     } catch {
       return;
     }
+    // The root layout is read like any file with its own provider import blanked: on Vite it is the
+    // entry file, and a component `register` wrote a `useCopy` into there reads the provider too.
+    if (rel === config.rootLayout) text = text.replace(ROOT_LAYOUT_MOUNT_IMPORT, '');
     if (PROVIDER_MODULE_REF.test(text)) out.push(rel);
   });
   return out.sort();

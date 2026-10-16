@@ -130,9 +130,12 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
 
   const interrupt = untilInterrupted();
   const held: Held = {};
+  // Set when a signal ends the run: the work still unwinding (a build that exited on the kill) prints nothing.
+  let stopped = false;
+  const emit = (): number => (stopped ? 1 : report.emit(io, { json }));
   const work = (async (): Promise<number> => {
     const target = await startTarget(io, config, { url, build }, report, held);
-    if (target === null) return report.emit(io, { json });
+    if (target === null) return emit();
     held.target = target;
     const { pages, skips } = pageTargets(io.cwd, config, rootAlone ? null : selected, target);
     try {
@@ -140,7 +143,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     } catch (error) {
       if (!(error instanceof ChromeMissing)) throw error;
       report.error('lighthouse', CHROME_MISSING);
-      return report.emit(io, { json });
+      return emit();
     }
     const runner = held.runner as { run: LighthouseRunner; close: () => Promise<void> };
     const measure = async (list: PageTarget[]): Promise<Array<{ target: PageTarget; results: LighthouseResult[] }> | null> => {
@@ -162,7 +165,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     };
 
     const measured = await measure(pages);
-    if (measured === null) return report.emit(io, { json });
+    if (measured === null) return emit();
 
     // The fixes, planned over the files as they stand: the documents on the html
     // host, the shell on Vite, the root layout's lang on Next, lines on Astro.
@@ -181,6 +184,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     // One entry and one strict finding per page: a re-run after `--fix --write` replaces the page's first result.
     const pageReports = new Map<string, unknown>();
     const judged = new Map<string, LighthouseResult[]>();
+    const chosenOf = new Map<string, LighthouseResult>();
     const contextFor = (page: PageTarget): PageContext => pageContext(io.cwd, config, descriptor, snapshot, page, fix);
     const printPages = (list: Array<{ target: PageTarget; results: LighthouseResult[] }>): void => {
       for (const { target: page, results } of list) {
@@ -194,6 +198,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         owners.push(...read.audits.map((audit) => audit.owner));
         pageReports.set(nameOf(page), pageJson(page, results, chosen, read.audits, read.diagnostics, notes.thirdParty, runsText !== undefined));
         judged.set(nameOf(page), results);
+        chosenOf.set(nameOf(page), chosen);
       }
     };
     printPages(measured);
@@ -226,7 +231,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
             // The edit is in source the running build does not carry: build and serve again.
             await stopServing(held);
             const again = await startTarget(io, config, { url, build }, report, held);
-            if (again === null) return report.emit(io, { json });
+            if (again === null) return emit();
             held.target = again;
           }
           const base = held.target?.front?.url ?? target.base;
@@ -234,7 +239,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
             .filter((page) => edited.includes(page.file ?? '') || target.kind === 'build')
             .map((page) => ({ ...page, url: page.url.replace(target.front?.url ?? target.base, base) }));
           const again = await measure(rerun);
-          if (again === null) return report.emit(io, { json });
+          if (again === null) return emit();
           printPages(again);
         }
       }
@@ -250,18 +255,19 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         if (made !== undefined) rmSync(made, { recursive: true });
         report.error('lighthouse', `--raw ${raw}: git would track it — name a directory git ignores`);
       } else {
-        for (const { target: page, results } of measured) {
-          writeJsonDeterministic(join(dir, `${nameOf(page)}.json`), results[chosenRun(results)]);
-        }
+        for (const [name, chosen] of chosenOf) writeJsonDeterministic(join(dir, `${name}.json`), chosen);
       }
     }
-    return report.emit(io, { json });
+    return emit();
   })();
   // Its late rejection, once Chrome is gone, is never unhandled.
   work.catch(() => undefined);
   try {
     const signal = await Promise.race([work.then(() => null), interrupt.interrupted]);
-    if (signal !== null) return 128 + (osConstants.signals[signal] ?? 0);
+    if (signal !== null) {
+      stopped = true;
+      return 128 + (osConstants.signals[signal] ?? 0);
+    }
     return await work;
   } catch (error) {
     // Raised before any measurement: `startFront` and the runner import the audit's packages.

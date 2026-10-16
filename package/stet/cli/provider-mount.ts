@@ -222,15 +222,13 @@ export function unmountEdits(
     const at = source.indexOf(block);
     if (at === -1 || source.indexOf(block, at + 1) !== -1) continue;
     // `providerEdits` inserted `${nl}${block}${nl}` after the last import, or `${block}${nl}${nl}` at offset 0.
-    // The blank line after the block is the mount's only where it is still there: a
-    // later `register` run inserts its own leaf import right after the block's last
-    // line, and taking the leading newline then would join two statements.
-    const span =
-      at === 0
-        ? { pos: 0, end: block.length + 2 * nl.length }
-        : source.startsWith(nl + nl, at + block.length)
-          ? { pos: at - nl.length, end: at + block.length + nl.length }
-          : { pos: at, end: at + block.length + nl.length };
+    // The blank line after the block is the mount's only where it is still there, and then
+    // `${block}${nl}${nl}` comes out, which leaves the same bytes as the leading newline would
+    // without reaching the line above (the last import's own newline). A later `register` run
+    // inserts its own leaf import right after the block's last line, and the block alone goes.
+    const span = source.startsWith(nl + nl, at + block.length)
+      ? { pos: at, end: at + block.length + 2 * nl.length }
+      : { pos: at, end: at + block.length + nl.length };
     // The two tags come out alone, so an edit inside the element (the layout's own read, un-rewritten
     // in the same batch) does not overlap the unwrap.
     const edits: Edit[] = [

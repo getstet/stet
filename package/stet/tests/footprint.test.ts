@@ -84,6 +84,16 @@ describe('clientReadFiles — the files that read copy on the client (D7)', () =
     expect(clientReadFiles(dir, withLayout)).toContain('lib/content.ts');
   });
 
+  it("lists a root layout that reads copy beyond its own CopyProvider import, and not one holding the import alone", () => {
+    const withLayout = { ...config(), rootLayout: 'src/main.tsx' };
+    write(dir, 'src/main.tsx', "import { CopyProvider } from '@getstet/stet/react';\n");
+    expect(clientReadFiles(dir, withLayout)).toEqual([]);
+    write(dir, 'src/main.tsx', "import { CopyProvider } from '@getstet/stet/react';\nimport { useCopy } from '@getstet/stet/react';\n");
+    expect(clientReadFiles(dir, withLayout)).toEqual(['src/main.tsx']);
+    write(dir, 'src/main.tsx', "import { CopyProvider, useCopy } from '@getstet/stet/react';\n");
+    expect(clientReadFiles(dir, withLayout)).toEqual(['src/main.tsx']);
+  });
+
   it('answers the same with typescript absent: the walk is text, no compiler', async () => {
     write(dir, 'components/Nav.tsx', "'use client';\nimport { useCopy } from '@getstet/stet/react';\n");
     vi.resetModules();
