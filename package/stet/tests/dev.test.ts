@@ -7782,3 +7782,196 @@ describe('stet dev holds its signal listeners through the close (F48)', () => {
     expect(await gone(-pid, 0)).toBe(true);
   }, 20_000);
 });
+
+describe('the audit child (D10)', () => {
+  /** Stub CLIs the audit route runs in place of the installed one, each a node script. */
+  const STUBS = {
+    argv:
+      "import { appendFileSync } from 'node:fs';\n" +
+      "appendFileSync(process.env.STET_AUDIT_SPAWNS ?? 'spawns.txt', 'x\\n');\n" +
+      'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), token: process.env.STET_DEV_TOKEN ?? null }));\n',
+    failing: "process.stdout.write(JSON.stringify({ ok: false }));\nprocess.exit(1);\n",
+    forever:
+      "import { appendFileSync, writeFileSync } from 'node:fs';\n" +
+      "appendFileSync('spawns.txt', 'x\\n');\nwriteFileSync('audit.pid', String(process.pid));\n" +
+      "process.stderr.write('auditing home… 1/1\\n');\nsetInterval(() => {}, 1000);\n",
+    trap:
+      "import { writeFileSync } from 'node:fs';\nwriteFileSync('audit.pid', String(process.pid));\n" +
+      "process.on('SIGTERM', () => { process.stderr.write('stopped by SIGTERM\\n'); process.exit(143); });\n" +
+      "process.stderr.write('auditing home… 1/1\\n');\nsetInterval(() => {}, 1000);\n",
+    slow: "setTimeout(() => process.stdout.write('{}'), 1100);\n",
+  } as const;
+
+  function stub(kind: keyof typeof STUBS): string {
+    const path = join(tempDir('stet-audit-stub-'), `${kind}.mjs`);
+    writeFileSync(path, STUBS[kind]);
+    return path;
+  }
+
+  function auditHost(cwd: string, kind: keyof typeof STUBS, over: Partial<WorkspaceEntry> = {}): {
+    handler: (r: Request) => Promise<Response>;
+    ctx: DevContext;
+    query: string;
+    path: string;
+  } {
+    const file = workspaceFile();
+    addSite(file, cwd);
+    const path = realpathSync(cwd);
+    if (Object.keys(over).length > 0) updateSite(file, path, over);
+    // Nothing answers: a dev server the case starts is ended by its group, and no stop command runs.
+    const refused = (async () => {
+      throw new Error('connection refused');
+    }) as unknown as typeof fetch;
+    const ctx = contextOver(file, { fetchImpl: refused, auditCli: stub(kind) });
+    return { handler: createDevHandler(ctx), ctx, query: `?site=${encodeURIComponent(path)}`, path };
+  }
+
+  async function settled(handler: (r: Request) => Promise<Response>, query: string, ms = 8_000): Promise<any> {
+    const deadline = Date.now() + ms;
+    let last: any;
+    while (Date.now() < deadline) {
+      last = await get(handler, `/api/site/audit${query}`);
+      if (last.state !== 'running') return last;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    return last;
+  }
+
+  async function pidFile(cwd: string, ms = 5_000): Promise<number> {
+    const deadline = Date.now() + ms;
+    while (!existsSync(join(cwd, 'audit.pid')) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 40));
+    return Number(readFileSync(join(cwd, 'audit.pid'), 'utf8'));
+  }
+
+  it('answers none before a run, and passes the arguments per site kind', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'argv');
+    expect(await get(h.handler, `/api/site/audit${h.query}`)).toEqual({ state: 'none', elapsed: 0, lines: [], result: null });
+    expect((await post(h.handler, `/api/site/audit-start${h.query}`, {})).status).toBe(200);
+    expect((await settled(h.handler, h.query)).result.argv).toEqual(['audit', 'lighthouse', '--json']);
+
+    const js = auditHost(snapshotHost().cwd, 'argv');
+    await post(js.handler, `/api/site/audit-start${js.query}`, { desktop: true, pages: ['home', 'pricing'], fix: true });
+    expect((await settled(js.handler, js.query)).result.argv).toEqual([
+      'audit', 'lighthouse', '--json', '--desktop', '--pages', 'home,pricing', '--fix', '--write', '--build',
+    ]);
+
+    const url = auditHost(snapshotHost().cwd, 'argv');
+    await post(url.handler, `/api/site/audit-start${url.query}`, { url: 'https://preview.example.dev/' });
+    expect((await settled(url.handler, url.query)).result.argv).toEqual(['audit', 'lighthouse', '--json', '--url', 'https://preview.example.dev/']);
+  });
+
+  it('accepts a page an html document proposes, and answers 400 for an unknown page or a non-http url', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'argv');
+    expect((await post(h.handler, `/api/site/audit-start${h.query}`, { pages: ['nosuch'] })).body).toEqual({ error: 'nosuch is not a declared page' });
+    expect((await post(h.handler, `/api/site/audit-start${h.query}`, { pages: ['nosuch'] })).status).toBe(400);
+    expect((await post(h.handler, `/api/site/audit-start${h.query}`, { pages: ['home'], fix: true })).status).toBe(200);
+    expect((await settled(h.handler, h.query)).result.argv).toEqual(['audit', 'lighthouse', '--json', '--pages', 'home', '--fix', '--write']);
+
+    const js = auditHost(snapshotHost().cwd, 'argv');
+    const refused = await post(js.handler, `/api/site/audit-start${js.query}`, { url: 'ftp://example.com/' });
+    expect(refused).toEqual({ status: 400, body: { error: 'url must be an http or https address' } });
+  });
+
+  it('refuses --build on a Next site below 16 whose dev server runs, and on one whose version cannot be read', async () => {
+    const STOP = 'stop the dev server first — next build writes the .next folder it is serving from';
+    const cases: Array<[string, string | null, number]> = [
+      ['app', '15.5.26', 409],
+      ['app', null, 409],
+      ['app', '16.4.1', 200],
+      ['astro', '15.5.26', 200],
+    ];
+    for (const [router, version, status] of cases) {
+      const host = makeCliHost({ config: { project: 't', router } });
+      if (version !== null) {
+        mkdirSync(join(host.cwd, 'node_modules/next'), { recursive: true });
+        writeFileSync(join(host.cwd, 'node_modules/next/package.json'), JSON.stringify({ name: 'next', version }));
+      }
+      const h = auditHost(host.cwd, 'argv', { devCommand: 'node -e "setInterval(()=>{},1000)"' });
+      expect((await post(h.handler, `/api/site/dev-start${h.query}`, {})).body['running']).toBe(true);
+      try {
+        const started = await post(h.handler, `/api/site/audit-start${h.query}`, {});
+        expect(started.status, `${router} ${version}`).toBe(status);
+        if (status === 409) expect(started.body).toEqual({ error: STOP });
+        else await settled(h.handler, h.query);
+      } finally {
+        await post(h.handler, `/api/site/dev-stop${h.query}`, {});
+      }
+    }
+  }, 30_000);
+
+  it('answers the running child on a second start, and spawns once', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'forever');
+    try {
+      const first = await post(h.handler, `/api/site/audit-start${h.query}`, {});
+      expect(first.body['state']).toBe('running');
+      await pidFile(html.cwd);
+      const second = await post(h.handler, `/api/site/audit-start${h.query}`, {});
+      expect(second.body['state']).toBe('running');
+      // Time for a second child, were one spawned, to record itself.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(readFileSync(join(html.cwd, 'spawns.txt'), 'utf8')).toBe('x\n');
+    } finally {
+      await stopEveryChild(h.ctx);
+    }
+  });
+
+  it('reads done from stdout whatever the exit, and failed from a child ended with no JSON, its lines kept', async () => {
+    const html = await makeHtmlHost();
+    const failing = auditHost(html.cwd, 'failing');
+    await post(failing.handler, `/api/site/audit-start${failing.query}`, {});
+    expect(await settled(failing.handler, failing.query)).toEqual(expect.objectContaining({ state: 'done', result: { ok: false } }));
+
+    const other = await makeHtmlHost();
+    const trap = auditHost(other.cwd, 'trap');
+    await post(trap.handler, `/api/site/audit-start${trap.query}`, {});
+    const pid = await pidFile(other.cwd);
+    process.kill(pid, 'SIGTERM');
+    const read = await settled(trap.handler, trap.query);
+    expect(read.state).toBe('failed');
+    expect(read.lines).toEqual(['auditing home… 1/1', 'stopped by SIGTERM']);
+  });
+
+  it('freezes elapsed at the exit', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'slow');
+    await post(h.handler, `/api/site/audit-start${h.query}`, {});
+    const done = await settled(h.handler, h.query);
+    expect(done.state).toBe('done');
+    expect(done.elapsed).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    expect((await get(h.handler, `/api/site/audit${h.query}`)).elapsed).toBe(1);
+  });
+
+  it('never hands the child the run token', async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'argv');
+    const held = process.env['STET_DEV_TOKEN'];
+    process.env['STET_DEV_TOKEN'] = TOKEN;
+    try {
+      await post(h.handler, `/api/site/audit-start${h.query}`, {});
+      expect((await settled(h.handler, h.query)).result.token).toBeNull();
+    } finally {
+      if (held === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held;
+    }
+  });
+
+  it("ends the child when the site leaves the workspace, and at the server's close", async () => {
+    const html = await makeHtmlHost();
+    const h = auditHost(html.cwd, 'forever');
+    await post(h.handler, `/api/site/audit-start${h.query}`, {});
+    const pid = await pidFile(html.cwd);
+    await post(h.handler, '/api/workspace/remove', { path: h.path });
+    expect(await waitGone(pid)).toBe(true);
+
+    const other = await makeHtmlHost();
+    const closing = auditHost(other.cwd, 'forever');
+    await post(closing.handler, `/api/site/audit-start${closing.query}`, {});
+    const second = await pidFile(other.cwd);
+    await stopEveryChild(closing.ctx);
+    expect(await waitGone(second)).toBe(true);
+  });
+});

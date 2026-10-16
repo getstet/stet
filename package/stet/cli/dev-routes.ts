@@ -53,7 +53,7 @@ import {
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
 import { runCli, type CliIo } from './main.js';
-import { applyPages, fileRoute, proposeForHost, servedRoute } from './pages.js';
+import { applyPages, auditablePages, fileRoute, proposeForHost, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
@@ -97,6 +97,11 @@ export interface DevChild {
   /** Whether the exited-or-detached question has been answered once. */
   checked?: boolean;
   handle?: ChildProcess;
+  /** An audit child's stdout, whole: the one JSON object it prints. */
+  stdout?: string;
+  /** When an audit child started, and when it exited: its `elapsed`, frozen at exit. */
+  started?: number;
+  ended?: number;
 }
 
 export interface DevContext {
@@ -119,6 +124,8 @@ export interface DevContext {
   proxies?: Map<string, PreviewProxy>;
   /** The run's preview channel, minted on first use. */
   previewChannel?: string;
+  /** Test seam: the script the audit child runs in place of the installed CLI. */
+  auditCli?: string;
 }
 
 /**
@@ -394,8 +401,9 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
   if (route === 'workspace/remove' && req.method === 'POST') {
     const body = await readJson(req);
     const path = reqStr(body, 'path');
-    // A site that leaves the workspace takes its dev server with it.
+    // A site that leaves the workspace takes its dev server and its audit with it.
     await stopChild(ctx, path);
+    await stopChild(ctx, auditKey(path));
     await closeProxy(ctx, path);
     removeSite(ctx.workspaceFile, path);
     return json({ sites: listing(ctx).map(summary) });
@@ -454,6 +462,10 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await devStop(ctx, site, entry);
       case 'GET site/dev-log':
         return await devLog(ctx, site, entry);
+      case 'POST site/audit-start':
+        return await auditStart(ctx, req, site);
+      case 'GET site/audit':
+        return auditRead(ctx, site);
       default:
         return json({ error: 'not found' }, 404);
     }
@@ -2039,6 +2051,121 @@ async function devStop(ctx: DevContext, site: SiteState, entry: WorkspaceEntry):
   }
   ctx.children.delete(ready.path);
   return json({ running: false, state: 'stopped', lines: child.lines });
+}
+
+/** The audit child's key in `ctx.children`, beside the site's dev server under its path. */
+function auditKey(path: string): string {
+  return `${path}#audit`;
+}
+
+/**
+ * `stet audit lighthouse --json` as a child of this server, keyed to the site:
+ * the installed CLI under the environment the dev child gets. A start while
+ * one runs answers the running one. A Next build below 16 shares `.next/`
+ * with a running dev server and is refused.
+ */
+async function auditStart(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const held = ctx.children.get(auditKey(ready.path));
+  if (held !== undefined && held.state === 'running') return json(auditReply(held));
+  const body = await readJson(req);
+  const args = ['audit', 'lighthouse', '--json'];
+  if (body['desktop'] === true) args.push('--desktop');
+  const pages = body['pages'];
+  if (pages !== undefined) {
+    if (!Array.isArray(pages) || pages.length === 0 || !pages.every((page): page is string => typeof page === 'string')) {
+      return json({ error: 'pages must be a list of page names' }, 400);
+    }
+    const known = auditablePages(ready.path, ready.config, ready.descriptor);
+    const unknown = pages.find((page) => !known.some((entry) => entry.page === page));
+    if (unknown !== undefined) return json({ error: `${unknown} is not a declared page` }, 400);
+    args.push('--pages', pages.join(','));
+  }
+  if (body['fix'] === true) args.push('--fix', '--write');
+  if (ready.host === 'js') {
+    const url = body['url'];
+    if (url !== undefined) {
+      let protocol = '';
+      try {
+        protocol = typeof url === 'string' ? new URL(url).protocol : '';
+      } catch {
+        protocol = '';
+      }
+      if (protocol !== 'http:' && protocol !== 'https:') return json({ error: 'url must be an http or https address' }, 400);
+      args.push('--url', url as string);
+    } else {
+      const dev = ctx.children.get(ready.path);
+      const router = ready.config.router;
+      if ((router === 'app' || router === 'pages') && dev?.state === 'running' && nextMajorBelow16(ready.path)) {
+        return json({ error: 'stop the dev server first — next build writes the .next folder it is serving from' }, 409);
+      }
+      args.push('--build');
+    }
+  }
+  const spawned = spawn(process.execPath, [ctx.auditCli ?? join(packageRoot(), 'dist', 'cli', 'main.js'), ...args], {
+    cwd: ready.path,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: childEnv(),
+  });
+  const child: DevChild = {
+    pid: spawned.pid ?? 0,
+    command: `stet ${args.join(' ')}`,
+    lines: [],
+    state: 'running',
+    code: null,
+    handle: spawned,
+    stdout: '',
+    started: Date.now(),
+  };
+  spawned.stdout?.on('data', (chunk: Buffer) => {
+    child.stdout += chunk.toString('utf8');
+  });
+  spawned.stderr?.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString('utf8').split('\n')) if (line.trim() !== '') child.lines.push(line);
+    if (child.lines.length > LOG_LINES) child.lines.splice(0, child.lines.length - LOG_LINES);
+  });
+  spawned.on('exit', (code) => {
+    child.state = 'exited';
+    child.code = code;
+    child.ended = Date.now();
+  });
+  spawned.on('error', (error) => {
+    child.state = 'exited';
+    child.ended = Date.now();
+    child.lines.push(error.message);
+  });
+  ctx.children.set(auditKey(ready.path), child);
+  return json(auditReply(child));
+}
+
+/** Before Next 16, `next build` and `next dev` share `.next/`; an unreadable version counts as before. */
+function nextMajorBelow16(checkout: string): boolean {
+  try {
+    const version = (JSON.parse(readFileSync(join(checkout, 'node_modules', 'next', 'package.json'), 'utf8')) as { version?: unknown }).version;
+    const major = typeof version === 'string' ? Number.parseInt(version, 10) : Number.NaN;
+    return !(major >= 16);
+  } catch {
+    return true;
+  }
+}
+
+/** The site's audit: none, running, done (stdout parsed, whatever the exit) or failed (stdout not JSON). */
+function auditRead(ctx: DevContext, site: SiteState): Response {
+  const ready = requireReady(site);
+  const child = ctx.children.get(auditKey(ready.path));
+  if (child === undefined) return json({ state: 'none', elapsed: 0, lines: [], result: null });
+  return json(auditReply(child));
+}
+
+function auditReply(child: DevChild): Record<string, unknown> {
+  const elapsed = Math.floor(((child.ended ?? Date.now()) - (child.started ?? Date.now())) / 1000);
+  if (child.state === 'running') return { state: 'running', elapsed, lines: child.lines, result: null };
+  try {
+    return { state: 'done', elapsed, lines: child.lines, result: JSON.parse(child.stdout ?? '') as unknown };
+  } catch {
+    return { state: 'failed', elapsed, lines: child.lines, result: null };
+  }
 }
 
 /** How long Stop gives the entry's stop command. */
