@@ -6,7 +6,7 @@
  * served by the real HTTP/2 front; Chrome is never started.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import http, { ClientRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -151,6 +151,47 @@ describe('stet audit lighthouse — the html host (journey C11)', () => {
     expect(declared.out).not.toContain('no pages declared — audited / alone; run stet pages scan to declare them');
   });
 
+  it('names a --url page by the declared page at its route, however either is encoded', async () => {
+    const fake = fakeLighthouse({ '/caf%C3%A9': cleanLhr() });
+    const h = nextHost(fake);
+    write(h.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { cafe: { route: '/café' } } }));
+    expect(await h.run('--url', 'http://127.0.0.1:3999/café')).toBe(0);
+    expect(h.out.join('\n')).toMatch(/^cafe {2}\/café {2}Performance 100/m);
+  });
+
+  it('writes --raw for a long path under a short hashed name', async () => {
+    const long = `/${'é'.repeat(60)}/${'é'.repeat(60)}/`;
+    const fake = fakeLighthouse({ [new URL(long, 'http://127.0.0.1:3999').pathname]: cleanLhr() });
+    const h = nextHost(fake);
+    write(h.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await h.run('--url', `http://127.0.0.1:3999${long}`, '--json', '--raw', 'raw')).toBe(0);
+    const [file] = readdirSync(join(h.cwd, 'raw'));
+    expect(file).toMatch(/^.{1,}-[0-9a-f]{12}\.json$/);
+    expect(Buffer.byteLength(file as string)).toBeLessThan(255);
+  });
+
+  it('writes --raw for a // path as root.json, not a hidden file', async () => {
+    const fake = fakeLighthouse({ '//': cleanLhr() });
+    const slashes = nextHost(fake);
+    write(slashes.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await slashes.run('--url', 'http://127.0.0.1:3999//', '--json', '--raw', 'raw')).toBe(0);
+    expect(readdirSync(join(slashes.cwd, 'raw'))).toEqual(['root.json']);
+  });
+
+  it('names a path page in an Astro fix line, not /', async () => {
+    const lhr = cleanLhr();
+    (lhr.audits['html-has-lang'] as { score: number | null }).score = 0;
+    const fake = fakeLighthouse({ '/docs/x/': lhr });
+    const h = nextHost(fake);
+    write(h.cwd, 'stet.config.json', JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], language: 'en' }));
+    write(h.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    write(h.cwd, 'src/pages/index.astro', '<html><body></body></html>\n');
+    await h.run('--url', 'http://127.0.0.1:3999/docs/x/', '--fix');
+    const out = h.out.join('\n');
+    expect(out).not.toMatch(/ \/ has no lang/);
+    expect(out).toMatch(/fix {2}html-has-lang {2}\/docs\/x\/ has no lang/);
+  });
+
   it('prints the median of five, the audit lines from the first run', async () => {
     const scores = [92, 99, 92, 100, 92];
     const fake = fakeLighthouse({
@@ -222,6 +263,10 @@ describe('stet audit lighthouse — refusals before anything starts', () => {
       [['--runs', '0'], 'stet audit lighthouse --runs takes a whole number from 1 to 9'],
       [['--write'], "stet audit lighthouse --write applies --fix's plan — pass both"],
       [['--raw', 'out'], 'stet audit lighthouse --raw writes beside --json — pass both'],
+      [
+        ['--url', 'http://127.0.0.1:3000/docs/', '--pages', 'home'],
+        'stet audit lighthouse --url with a path audits that one page — drop --pages, or give --url the origin',
+      ],
     ];
     for (const [argv, message] of cases) {
       const fake = fakeLighthouse({ '/': cleanLhr() });

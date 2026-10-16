@@ -452,10 +452,15 @@ const label = (checkout: string): string => (checkout === '' ? 'the repository r
 const worktreeLabel = (worktree: string): string =>
   worktree === '' ? 'the main worktree' : `the worktree ${worktree.replace(/^worktrees\//, '')}`;
 
-/** Whether the repository whose common git directory is `common` is bare. */
+/**
+ * Whether the repository whose common git directory is `common` is bare: its
+ * `core.bare` says so. `rev-parse --is-bare-repository` run inside the git
+ * directory answers true whenever the key is unset, which a non-bare
+ * repository can lack.
+ */
 function bareRepository(common: string): boolean {
   try {
-    return git(common, ['rev-parse', '--is-bare-repository']) === 'true';
+    return git(common, ['config', '--bool', '--get', 'core.bare']) === 'true';
   } catch {
     return false;
   }

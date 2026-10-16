@@ -639,6 +639,23 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(existsSync(join(bare, 'stet-gate.mjs'))).toBe(false);
   });
 
+  it('(a9d) a repository whose config has no core.bare key is not bare, so a linked worktree leaves the main worktree’s gate', async () => {
+    const log = logFile();
+    const main = gitRepo();
+    standInCheckout(main, 'site', log);
+    commit(main, 'base');
+    // `git rev-parse --is-bare-repository` answers true inside the git directory once the key is unset.
+    execFileSync('git', ['config', '--unset', 'core.bare'], { cwd: main });
+    const gone = linkedWorktree(main, 'gone');
+    expect(await runHookInstall([], io(join(gone, 'site')))).toBe(0);
+    execFileSync('git', ['worktree', 'remove', '--force', gone], { cwd: main });
+    const live = linkedWorktree(main, 'live');
+
+    expect(await runHookRemove([], io(join(live, 'site')))).toBe(0);
+    expect(readGate(join(main, '.git')).map((entry) => entry.checkout)).toEqual(['site']);
+    expect(existsSync(join(main, '.git/hooks/pre-commit'))).toBe(true);
+  });
+
   it('(a10) an entry a 0.7.0 install wrote, with no id, goes once its worktree is gone and stays while it is there', async () => {
     const log = logFile();
     const main = gitRepo();

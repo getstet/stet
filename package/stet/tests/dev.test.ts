@@ -884,6 +884,28 @@ describe('the connection environment', () => {
     }
   });
 
+  it('strips the adapters’ default names when the started-in config was already broken at start', async () => {
+    const started = makeCliHost({ config: { project: 't', store: pair } });
+    const other = makeCliHost({ config: { project: 't' } });
+    const site = { path: other.cwd, config: loadConfig(other.cwd) };
+    writeFileSync(join(started.cwd, 'stet.config.json'), '{"store":{"adapter":"postgrest"},', 'utf8');
+    const handle = await startDevServer({
+      port: 0,
+      workspaceFile: workspaceFile(),
+      io: { cwd: started.cwd, env: {}, stdout: () => {}, stderr: () => {} },
+      launched: started.cwd,
+    });
+    try {
+      await withProcessEnv({ STET_POSTGREST_TOKEN: 'secret', STET_POSTGREST_URL: 'http://process.test', STET_DATABASE_URL: 'postgres://x', FSG_UNNAMED: 'kept' }, () => {
+        const env = siteChildEnv(site, started.cwd);
+        for (const name of ['STET_POSTGREST_TOKEN', 'STET_POSTGREST_URL', 'STET_DATABASE_URL']) expect(name in env, name).toBe(false);
+        expect(env['FSG_UNNAMED']).toBe('kept');
+      });
+    } finally {
+      await handle.close();
+    }
+  });
+
   it('hands the started-in checkout’s children no variable the shell holds empty', async () => {
     const host = makeCliHost({ config: { project: 't', store: pair } });
     const site = { path: host.cwd, config: loadConfig(host.cwd) };

@@ -7,6 +7,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
 import { constants as osConstants } from 'node:os';
@@ -95,6 +96,9 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   if (runsText !== undefined && !/^[1-9]$/.test(runsText)) throw new UsageError('stet audit lighthouse --runs takes a whole number from 1 to 9');
   if (write && !fix) throw new UsageError("stet audit lighthouse --write applies --fix's plan — pass both");
   if (raw !== undefined && !json) throw new UsageError('stet audit lighthouse --raw writes beside --json — pass both');
+  if (url !== undefined && urlPathOf(url) !== '/' && text(values, 'pages') !== undefined) {
+    throw new UsageError('stet audit lighthouse --url with a path audits that one page — drop --pages, or give --url the origin');
+  }
   const runs = runsText === undefined ? 1 : Number(runsText);
   const formFactor: FormFactor = flag(values, 'desktop') ? 'desktop' : 'mobile';
   const applied = flag(values, 'applied');
@@ -257,7 +261,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         if (made !== undefined) rmSync(made, { recursive: true });
         report.error('lighthouse', `--raw ${raw}: git would track it — name a directory git ignores`);
       } else {
-        for (const [name, chosen] of chosenOf) writeJsonDeterministic(join(dir, `${name.replace(/^\/+|\/+$/g, '').replace(/\//g, '_')}.json`), chosen);
+        for (const [name, chosen] of chosenOf) writeJsonDeterministic(join(dir, `${rawFileName(name)}.json`), chosen);
       }
     }
     return emit();
@@ -464,7 +468,8 @@ function pageTargets(
       // A URL to a page of its own is that page, named by the declared page at its route, else by its path; `home` is `/` alone.
       const path = target.kind === 'url' ? urlPathOf(base) : '/';
       if (path === '/') return { pages: [{ page: '/', label: 'home', route: '/', url: new URL(base).href }], skips: [] };
-      const trimmed = (route: string): string => route.replace(/\/+$/, '');
+      // Both sides as the URL parser writes them, so a declared `/café` meets the URL's `/caf%C3%A9`.
+      const trimmed = (route: string): string => new URL(route, base).pathname.replace(/\/+$/, '');
       const own = declared.find((entry) => trimmed(entry.route) === trimmed(path));
       const name = own?.page ?? path;
       return { pages: [{ page: name, label: name, route: own?.route ?? path, url: new URL(base).href }], skips: [] };
@@ -510,6 +515,7 @@ function pageContext(cwd: string, config: StetConfig, descriptor: Descriptor, sn
   return {
     router,
     page: name,
+    label: page.label,
     def,
     descriptor,
     snapshot,
@@ -640,6 +646,22 @@ function pageJson(
 /** A page's name in the output: `/` audited alone is `home`, the name `pages scan` gives it. */
 function nameOf(page: PageTarget): string {
   return page.page === '/' ? 'home' : page.page;
+}
+
+/**
+ * A page's `--raw` file name, without the extension: its slashes folded to `_`,
+ * `root` where nothing is left, and past 200 bytes its first 100 and 12 hex of
+ * the full name's hash, so a long path stays under the file system's limit.
+ */
+function rawFileName(name: string): string {
+  const slug = name.replace(/^\/+|\/+$/g, '').replace(/\//g, '_') || 'root';
+  if (Buffer.byteLength(slug) <= 200) return slug;
+  let head = '';
+  for (const char of slug) {
+    if (Buffer.byteLength(head + char) > 100) break;
+    head += char;
+  }
+  return `${head}-${createHash('sha256').update(slug).digest('hex').slice(0, 12)}`;
 }
 
 /** `--strict`: one error per page with a category below 100. */

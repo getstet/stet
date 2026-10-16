@@ -24,7 +24,7 @@ import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { writeJsonDeterministic } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { CONFIG_FILE, isHtmlHost, loadConfig, selectStoreBlock, type StetConfig, type StoreBlock } from './config.js';
+import { CONFIG_FILE, defaultStoreBlock, isHtmlHost, loadConfig, selectStoreBlock, STORE_ADAPTERS, type StetConfig, type StoreBlock } from './config.js';
 import { gitState } from './git.js';
 import type { CliIo } from './main.js';
 import { CliError, Report } from './report.js';
@@ -423,7 +423,9 @@ export function launchedConnectionNames(launched: string): string[] {
   try {
     current = connectionNames(loadConfig(launched));
   } catch {
-    /* no config to read: the names seen before still count */
+    // No config to read: the names seen before still count. A config that never loaded
+    // names what a bare `{ "adapter": … }` block would, each adapter's defaults.
+    if (!launchedNames.has(launched)) current = STORE_ADAPTERS.flatMap((adapter) => blockVariables(defaultStoreBlock(adapter)));
   }
   const names = [...new Set([...(launchedNames.get(launched) ?? []), ...current])];
   launchedNames.set(launched, names);
