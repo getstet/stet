@@ -31,7 +31,7 @@ import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
-import type { StetConfig } from './config.js';
+import type { StetConfig, StoreBlock } from './config.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, type GitState } from './git.js';
 import {
@@ -66,13 +66,14 @@ import { CliError, plural, Report, UsageError } from './report.js';
 import { validateValue } from './validate.js';
 import {
   addSite,
-  childEnv,
+  blockVariables,
+  connectionEnv,
   devDefaults,
   loadSite,
   readWorkspace,
   removeSite,
   routerPreviewCommand,
-  siteEnv,
+  siteChildEnv,
   siteId,
   siteIo,
   updateSite,
@@ -91,8 +92,8 @@ export interface DevChild {
   lines: string[];
   state: 'running' | 'exited' | 'detached';
   code: number | null;
-  /** The entry's stop command, for a server that outlived its launcher. */
-  stop?: string;
+  /** The entry's stop command and the environment it runs in, for a server that outlived its launcher. */
+  stop?: { command: string; env: NodeJS.ProcessEnv };
   /** The dev URL at Start, which the stop path polls until the server lets go of it. */
   dev?: string;
   /** Whether the exited-or-detached question has been answered once. */
@@ -119,6 +120,8 @@ export interface DevContext {
   stores: Map<string, StoreAdapter>;
   /** One promise chain per checkout, so this server's requests never interleave on one site. */
   queues: Map<string, Promise<unknown>>;
+  /** The checkout `stet dev` was started in: the one site the process environment supplies connection variables to. */
+  launched?: string;
   /** Test seam: an adapter to use in place of the one the config would build. */
   storeFor?: (path: string, env: string | undefined) => StoreAdapter | undefined;
   /** One preview proxy per JavaScript site, keyed by checkout, started on its first answering probe. */
@@ -194,7 +197,7 @@ function crossOrigin(req: Request, origin: string): boolean {
 export function withEnvFilesHint(message: string): string {
   const clause = ' is unset — set it or remove the store block';
   return message.endsWith(clause)
-    ? `${message.slice(0, -clause.length)} is unset — stet dev reads it from the checkout's .env and .env.local`
+    ? `${message.slice(0, -clause.length)} is unset — stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in`
     : message;
 }
 
@@ -289,11 +292,11 @@ export interface Captured {
 export async function captured(
   ctx: DevContext,
   argv: string[],
-  site: { path: string },
+  site: { path: string; config: StetConfig },
   env?: string,
 ): Promise<Captured> {
   const sink: { out: string[]; err: string[] } = { out: [], err: [] };
-  const io = siteIo(site.path, sink, {
+  const io = siteIo(site.path, connectionEnv(site, ctx.launched), sink, {
     ...(ctx.fetchImpl === undefined ? {} : { fetchImpl: ctx.fetchImpl }),
   });
   const full = env === undefined ? argv : [...argv, '--env', env];
@@ -420,7 +423,7 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
   return withSite(ctx, url, async (site, entry) => {
     switch (`${req.method} ${route}`) {
       case 'GET site':
-        return siteReply(site, entry);
+        return siteReply(site, entry, ctx.launched);
       case 'POST site/save':
         return await save(ctx, req, site);
       case 'POST site/commit':
@@ -492,27 +495,24 @@ function requireReady(site: SiteState): Extract<SiteState, { state: 'ready' }> {
  * DIALING: a listing that opened a connection per environment would hang on
  * the first unreachable one, and `doctor` is where a live check belongs.
  */
-function siteReply(site: SiteState, entry: WorkspaceEntry): Response {
+function siteReply(site: SiteState, entry: WorkspaceEntry, launched: string | undefined): Response {
   if (site.state !== 'ready') return json(summary(site));
   const { config } = site;
-  const env = siteEnv(site.path);
+  const env = connectionEnv(site, launched);
   // `requireEnv`'s own rule: an empty value is unset. A `DATABASE_URL=` line
   // reads as unset here exactly as it does at the mount.
-  const vars = (block: { urlEnv: string; tokenEnv: string } | undefined, adapter: string): Array<{ name: string; set: boolean }> => {
-    if (block === undefined) return [];
-    const names = adapter === 'postgrest' ? [block.urlEnv, block.tokenEnv] : adapter === 'pg' ? [block.urlEnv] : [];
-    return names.filter((name) => name !== '').map((name) => ({ name, set: (env[name] ?? '') !== '' }));
-  };
+  const vars = (block: StoreBlock | undefined): Array<{ name: string; set: boolean }> =>
+    block === undefined ? [] : blockVariables(block).map((name) => ({ name, set: (env[name] ?? '') !== '' }));
   const environments = [
     {
       name: 'default',
       adapter: config.store?.adapter ?? 'snapshot',
-      vars: vars(config.store, config.store?.adapter ?? 'snapshot'),
+      vars: vars(config.store),
     },
     ...Object.entries(config.environments ?? {}).map(([name, block]) => ({
       name,
       adapter: block.adapter,
-      vars: vars(block, block.adapter),
+      vars: vars(block),
     })),
   ];
   return json({
@@ -1564,7 +1564,7 @@ async function storeOf(
   const key = JSON.stringify([site.path, env ?? null]);
   const held = ctx.stores.get(key);
   if (held !== undefined) return held;
-  const store = await resolveStore(site.config, siteEnv(site.path), ctx.storeFor?.(site.path, env), env);
+  const store = await resolveStore(site.config, connectionEnv(site, ctx.launched), ctx.storeFor?.(site.path, env), env);
   ctx.stores.set(key, store);
   return store;
 }
@@ -1963,12 +1963,13 @@ async function devStart(ctx: DevContext, site: SiteState, entry: WorkspaceEntry)
   if (command === undefined) {
     return json({ error: 'the workspace entry has no dev command — set it in Setup' }, 400);
   }
+  const env = siteChildEnv(ready, ctx.launched);
   const spawned = spawn(command, {
     cwd: ready.path,
     shell: true,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv(),
+    env,
   });
   const stop = entry.devStopCommand ?? defaults?.devStopCommand;
   const child: DevChild = {
@@ -1977,7 +1978,7 @@ async function devStart(ctx: DevContext, site: SiteState, entry: WorkspaceEntry)
     lines: [],
     state: 'running',
     code: null,
-    ...(stop === undefined ? {} : { stop }),
+    ...(stop === undefined ? {} : { stop: { command: stop, env } }),
     ...(defaults === null ? {} : { dev: defaults.dev }),
     handle: spawned,
   };
@@ -2108,7 +2109,7 @@ async function auditStart(ctx: DevContext, req: Request, site: SiteState): Promi
     cwd: ready.path,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv(),
+    env: siteChildEnv(ready, ctx.launched),
   });
   const child: DevChild = {
     pid: spawned.pid ?? 0,
@@ -2220,13 +2221,13 @@ async function launcherExit(child: DevChild, ms: number): Promise<void> {
 }
 
 /** The entry's stop command, in the checkout, in a group of its own that is killed at the deadline. */
-function runStop(command: string, cwd: string, ms: number): Promise<void> {
+function runStop(stop: { command: string; env: NodeJS.ProcessEnv }, cwd: string, ms: number): Promise<void> {
   return new Promise((resolve) => {
     if (ms <= 0) {
       resolve();
       return;
     }
-    const run = spawn(command, { cwd, shell: true, detached: true, stdio: 'ignore', env: childEnv() });
+    const run = spawn(stop.command, { cwd, shell: true, detached: true, stdio: 'ignore', env: stop.env });
     const timer = setTimeout(() => {
       // Never `kill(-0)`: a spawn that failed has no pid, and -0 is this
       // process's own group.

@@ -57,6 +57,7 @@ import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { handlerOver, paintPage, req, TOKEN, type PaintedPage } from '../tests/helpers/dashboard-page.js';
 import { dashboardPage } from '../cli/dev.js';
+import { siteId, updateSite } from '../cli/workspace.js';
 import { DASHED, closeFrames, frame, located, tick } from '../tests/helpers/preview-frame.js';
 import { installRegistryDts, typecheckHost } from '../tests/helpers/ts-host.js';
 import { generateDefaultsModule, generateRegistry, generatedBody } from '../src/codegen.js';
@@ -4878,6 +4879,25 @@ describe('cli', () => {
     expect(neither.stdout()).not.toContain('contacts:');
   });
 
+  it('Requirement: upgrade --dry-run prints what a store that cannot apply DDL needs', async () => {
+    const host = makeCliHost({
+      config: { store: { adapter: 'postgrest' } },
+      env: { STET_POSTGREST_URL: 'http://postgrest.test', STET_POSTGREST_TOKEN: 'test' },
+      store: createMemoryStore({ project: 'default' }),
+      fetchImpl: (async () => new Response(JSON.stringify({ code: 'PGRST205', message: 'not found' }), { status: 404 })) as typeof fetch,
+    });
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    const output = host.stdout();
+    expect(output).toContain('installed 0, pending 1, 2, 3');
+    expect(output).toContain('this adapter cannot apply DDL (canApplyDDL: false) — apply it out of band:');
+    expect(output).toContain('create table content_versions');
+    expect(output).toContain("notify pgrst, 'reload schema';");
+    expect(output).toContain('stet upgrade --verify');
+    expect(output).not.toContain('would apply');
+    // A dry run writes no migration copy.
+    expect(existsSync(join(host.cwd, 'stet/migrations'))).toBe(false);
+  });
+
   it('Requirement: upgrade knows what it upgrades from', async () => {
     // stet_meta absent: an unversioned database, reported as migration 1
     // pending — never "up to date".
@@ -8039,6 +8059,68 @@ describe('dashboard', () => {
     const pushed = await call(handler, `/api/site/push${siteOf(host.cwd)}`, {});
     expect(pushed.status).toBe(200);
     expect(pushed.body).toMatchObject({ upstream: 'origin', branch: 'develop', at: { branch: 'develop', upstream: 'origin/develop', ahead: 0 } });
+  });
+
+  it('Requirement: A store-backed site is served by the mounted API handler', async () => {
+    const pair = { project: 'walk', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } };
+    const a = makeCliHost({ config: pair });
+    const b = makeCliHost({ config: pair });
+    writeFileSync(join(a.cwd, '.env.local'), 'STET_POSTGREST_URL=http://stale.test/rest/v1\n');
+    const mounted = (host: { cwd: string }): string => `/s/${siteId(realpathSync(host.cwd))}/api/stet/keys`;
+    const shell = { STET_POSTGREST_URL: 'http://store.test/rest/v1', STET_POSTGREST_TOKEN: 'proc-token', STET_DEV_TOKEN: TOKEN };
+    const held = Object.fromEntries(Object.keys(shell).map((name) => [name, process.env[name]]));
+    const heldFetch = globalThis.fetch;
+    const calls: Array<{ url: string; apikey: string | undefined }> = [];
+    Object.assign(process.env, shell);
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), apikey: (init?.headers as Record<string, string> | undefined)?.['apikey'] });
+      return new Response('[]', { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { handler, file } = handlerOver([a.cwd, b.cwd], { launched: realpathSync(a.cwd) });
+      const setFlags = async (host: { cwd: string }): Promise<boolean[]> =>
+        (await call(handler, `/api/site${siteOf(host.cwd)}`)).body['environments'][0].vars.map((v: { set: boolean }) => v.set);
+      // The started-in site reads the shell's pair over its files; the other reads its files alone.
+      expect(await setFlags(a)).toEqual([true, true]);
+      expect(await setFlags(b)).toEqual([false, false]);
+      expect((await call(handler, mounted(a))).status).toBe(200);
+      expect(calls[0]?.url).toMatch(/^http:\/\/store\.test\/rest\/v1\/content_versions/);
+      expect(calls[0]?.apikey).toBe('proc-token');
+      const refused = await call(handler, mounted(b));
+      expect(refused.status).toBe(409);
+      expect(refused.body['error']).toBe(
+        "store adapter 'postgrest' is configured but STET_POSTGREST_URL is unset — " +
+          "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
+      );
+
+      // The dev command of each site: the started-in one holds the token, the other does not.
+      for (const host of [a, b]) {
+        updateSite(file, realpathSync(host.cwd), {
+          devCommand: `node -e "console.log('tok:'+(process.env.STET_POSTGREST_TOKEN??'unset'))"`,
+        });
+      }
+      const logged = async (host: { cwd: string }): Promise<string[]> => {
+        expect((await call(handler, `/api/site/dev-start${siteOf(host.cwd)}`, {})).status).toBe(200);
+        const deadline = Date.now() + 4_000;
+        for (;;) {
+          const lines = (await call(handler, `/api/site/dev-log${siteOf(host.cwd)}`)).body['lines'] as string[];
+          if (lines.length > 0 || Date.now() > deadline) return lines;
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+      };
+      try {
+        expect(await logged(a)).toEqual(['tok:proc-token']);
+        expect(await logged(b)).toEqual(['tok:unset']);
+      } finally {
+        for (const host of [a, b]) await call(handler, `/api/site/dev-stop${siteOf(host.cwd)}`, {});
+      }
+    } finally {
+      globalThis.fetch = heldFetch;
+      for (const [name, value] of Object.entries(held)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   it('Requirement: The key list and the preview open on one page', async () => {

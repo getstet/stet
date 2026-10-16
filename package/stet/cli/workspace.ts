@@ -24,7 +24,7 @@ import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { writeJsonDeterministic } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { CONFIG_FILE, isHtmlHost, loadConfig, selectStoreBlock, type StetConfig } from './config.js';
+import { CONFIG_FILE, isHtmlHost, loadConfig, selectStoreBlock, type StetConfig, type StoreBlock } from './config.js';
 import { gitState } from './git.js';
 import type { CliIo } from './main.js';
 import { CliError, Report } from './report.js';
@@ -302,6 +302,45 @@ export function siteEnv(path: string): NodeJS.ProcessEnv {
   return env;
 }
 
+/** The variables one store block reads: a postgrest block's url and token, a pg block's url, none for the others. */
+export function blockVariables(block: StoreBlock): string[] {
+  const names = block.adapter === 'postgrest' ? [block.urlEnv, block.tokenEnv] : block.adapter === 'pg' ? [block.urlEnv] : [];
+  return names.filter((name) => name !== '');
+}
+
+/**
+ * Every connection variable a config names — the default store's, each
+ * environment's, the contacts store's and each of its environments' — each
+ * once, in that order.
+ */
+export function connectionNames(config: StetConfig): string[] {
+  const blocks = [
+    config.store,
+    ...Object.values(config.environments ?? {}),
+    config.contacts?.store,
+    ...Object.values(config.contacts?.environments ?? {}),
+  ];
+  return [...new Set(blocks.flatMap((block) => (block === undefined ? [] : blockVariables(block))))];
+}
+
+/**
+ * One site's connection environment: its `.env` files, and — for the checkout
+ * `stet dev` was started in — this process's own value of each connection
+ * variable the config names, over them, so `sops exec-env … stet dev` and its
+ * kind supply the store. Every other checkout reads its files alone: two
+ * checkouts naming one variable never share a value. A value the process holds
+ * empty is unset, as `requireEnv` reads it, and the run token is never one.
+ */
+export function connectionEnv(site: { path: string; config: StetConfig }, launched: string | undefined): NodeJS.ProcessEnv {
+  const env = siteEnv(site.path);
+  if (site.path !== launched) return env;
+  for (const name of connectionNames(site.config)) {
+    const value = process.env[name];
+    if (name !== 'STET_DEV_TOKEN' && value !== undefined && value !== '') env[name] = value;
+  }
+  return env;
+}
+
 const ENV_LINE = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
 
 /** The grammar above, as pairs in file order. Exported for its own fixture. */
@@ -371,6 +410,21 @@ export function childEnv(): NodeJS.ProcessEnv {
 }
 
 /**
+ * The environment a child started for one site receives: `childEnv`, and —
+ * for every checkout but the one `stet dev` was started in — none of the
+ * connection variables that checkout's config names. A dev server reads its
+ * store from the process environment ahead of its own `.env` files, so a
+ * shell value left in would point another site's preview, API and build at
+ * the started-in site's database.
+ */
+export function siteChildEnv(site: { path: string; config: StetConfig }, launched: string | undefined): NodeJS.ProcessEnv {
+  const env = childEnv();
+  if (site.path === launched) return env;
+  for (const name of connectionNames(site.config)) delete env[name];
+  return env;
+}
+
+/**
  * A `CliIo` pointed at one checkout, with its own environment and collecting
  * sinks.
  *
@@ -380,12 +434,13 @@ export function childEnv(): NodeJS.ProcessEnv {
  */
 export function siteIo(
   path: string,
+  connection: NodeJS.ProcessEnv,
   sink: { out: string[]; err: string[] },
   extra: Pick<CliIo, 'fetchImpl' | 'store' | 'stores'> = {},
 ): CliIo {
   return {
     cwd: path,
-    env: { ...siteEnv(path), ...baseEnv() },
+    env: { ...connection, ...baseEnv() },
     stdout: (line) => sink.out.push(line),
     stderr: (line) => sink.err.push(line),
     ...extra,

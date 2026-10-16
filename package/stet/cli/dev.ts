@@ -55,6 +55,8 @@ export interface StartDevServerOptions {
   /** The run token. Minted here when absent; a fixture passes its own. */
   token?: string;
   fetchImpl?: typeof globalThis.fetch;
+  /** The checkout `stet dev` was started in, which the process environment supplies connection variables to. */
+  launched?: string;
   /** Test seam: an adapter to use in place of the one a site's config would build. */
   storeFor?: (path: string, env: string | undefined) => StoreAdapter | undefined;
   /** The page's html. Defaults to the copy shipped inside the package. */
@@ -97,6 +99,7 @@ export async function startDevServer(opts: StartDevServerOptions): Promise<DevSe
     children,
     stores,
     queues: new Map(),
+    ...(opts.launched === undefined ? {} : { launched: opts.launched }),
     ...(opts.storeFor === undefined ? {} : { storeFor: opts.storeFor }),
   };
   const handler = createDevHandler(ctx);
@@ -282,7 +285,7 @@ export async function runDev(args: string[], io: CliIo, hooks: RunDevHooks = {})
   const adding = text(values, 'add') ?? (existsSync(join(io.cwd, CONFIG_FILE)) ? io.cwd : undefined);
   const opened = adding === undefined ? undefined : addSite(workspaceFile, adding).path;
 
-  const handle = await startDevServer({ port, workspaceFile, io });
+  const handle = await startDevServer({ port, workspaceFile, io, ...(opened === undefined ? {} : { launched: opened }) });
   const run = untilInterrupted();
   try {
     const url = opened === undefined ? handle.url : `${handle.url}&site=${encodeURIComponent(opened)}`;

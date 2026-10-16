@@ -333,7 +333,13 @@ async function applyPending(
   );
 
   if (dryRun) {
-    for (const migration of pending) report.line(`would apply ${migration.name}`);
+    // An adapter that cannot apply DDL prints the same out-of-band instructions
+    // a real run prints, since a real run applies nothing there either.
+    if (project.store.canApplyDDL) {
+      for (const migration of pending) report.line(`would apply ${migration.name}`);
+    } else {
+      printForOutOfBandApply(io, project, pending, report);
+    }
     return;
   }
 
