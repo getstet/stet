@@ -47,3 +47,21 @@ describe('the contacts doc', () => {
     expect(anchors).toContain('the-worker-recipe');
   });
 });
+
+describe('the Lighthouse docs', () => {
+  const seoCheck = readFileSync(new URL('../../docs/operator/seo-check.md', import.meta.url), 'utf8');
+
+  it('keeps both READMEs byte-identical', () => {
+    const inPackage = readFileSync(new URL('../README.md', import.meta.url));
+    const atRoot = readFileSync(new URL('../../../README.md', import.meta.url));
+    expect(atRoot.equals(inPackage)).toBe(true);
+  });
+
+  it('finds the command, the five rule ids and the footprint figure in the SEO doc', () => {
+    expect([...seoCheck.matchAll(/^## (.+)$/gm)].map((m) => m[1])).toEqual(expect.arrayContaining(['`stet audit lighthouse`', 'The footprint']));
+    for (const rule of ['missing-label', 'missing-name', 'missing-lang', 'empty-heading', 'redundant-alt']) {
+      expect(seoCheck).toContain(`| \`${rule}\` |`);
+    }
+    expect(seoCheck).toContain('2,467 bytes raw and 315 bytes\ngzipped');
+  });
+});

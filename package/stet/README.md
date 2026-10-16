@@ -83,6 +83,10 @@ npx stet hook install                    # the pre-commit gate
   anything deploys. The pre-commit gate `stet hook install` writes runs `stet
   check`, `stet scan` and `stet seo check` on each commit that touches the
   checkout.
+- **Lighthouse, with the owner of each failure.** `stet audit lighthouse` runs
+  Lighthouse over your declared pages and tags every failing audit as copy to
+  write through a key, a head edit `--fix --write` applies, or the site's own
+  markup. It needs Google Chrome.
 - **Page declaration from your routes.** `stet pages scan` reads your
   file-based routing convention, proposes page records with scaffolded SEO
   keys, and writes nothing without `--apply`.
@@ -115,7 +119,7 @@ all-or-nothing write batch the terminal uses, then commits the stet files the
 checkout holds uncommitted and pushes the commit. On a store-backed project it
 writes drafts and publishes them through the project's own mounted API, against
 the environment selected in the header. Health runs `check`, `doctor`, `scan`
-and `audit` in the same process; the SEO tab runs `seo check` and `pages scan`;
+and `audit` in the same process; the SEO tab runs `seo check`, `pages scan` and the Lighthouse audit;
 Setup runs `stet upgrade --dry-run`. Every command answers `--help` with its own
 usage.
 
@@ -159,7 +163,7 @@ stdlib-only Python helper ships in the package.
 
 ## Requirements
 
-Node.js 22 or later. Scanning and adoption use the TypeScript compiler API, so
+Node.js 22 or later; `stet audit lighthouse` needs 22.19 or later and Google Chrome. Scanning and adoption use the TypeScript compiler API, so
 projects using those commands need `typescript` 5 or 6 as a dev dependency.
 
 ## Documentation
