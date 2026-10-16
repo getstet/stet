@@ -781,6 +781,16 @@ describe('stet audit lighthouse — the exit, the JSON and --raw (D2)', () => {
     expect(pages[0]?.scores).toEqual({ performance: 100, accessibility: 100, bestPractices: 100, seo: 100 });
   });
 
+  it('names / audited alone home in the finding, the progress line and the JSON', async () => {
+    const h = astroHost(scored(0.94, 0.9));
+    write(h.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await h.run('--url', 'http://127.0.0.1:4399/', '--strict', '--json')).toBe(1);
+    const report = jsonOf(h);
+    expect(report['findings']).toEqual([expect.objectContaining({ kind: 'lighthouse', message: 'home: accessibility 94, seo 90 below 100' })]);
+    expect((report['pages'] as Array<{ page: string; route: string }>)[0]).toEqual(expect.objectContaining({ page: 'home', route: '/' }));
+    expect(h.err).toContain('auditing home… 1/1');
+  });
+
   it("carries the walkthrough's shape and the footprint in --json, each page's runs with --runs", async () => {
     const h = astroHost(cleanLhr());
     expect(await h.run('--url', 'http://127.0.0.1:4399/', '--json', '--runs', '3')).toBe(0);

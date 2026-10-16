@@ -147,7 +147,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
       for (const page of list) {
         const results: LighthouseResult[] = [];
         for (let n = 1; n <= runs; n += 1) {
-          io.stderr(`auditing ${page.page}… ${n}/${runs}`);
+          io.stderr(`auditing ${nameOf(page)}… ${n}/${runs}`);
           const result = await runner.run(page.url, { formFactor, applied });
           if (result.runtimeError !== undefined) {
             report.error('lighthouse', `${page.url} did not answer — start the server, or pass --url (${result.runtimeError.message})`);
@@ -190,7 +190,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         for (const line of [...read.lines.filter((line) => !line.startsWith('diag  ')), ...notes.lines, ...diag]) report.line(`  ${line}`);
         owners.push(...read.audits.map((audit) => audit.owner));
         pageReports.push(pageJson(page, results, chosen, read.audits, read.diagnostics, notes.thirdParty, runsText !== undefined));
-        strictFinding(report, page.page, results, flag(values, 'strict'));
+        strictFinding(report, nameOf(page), results, flag(values, 'strict'));
       }
     };
     printPages(measured);
@@ -247,7 +247,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         report.error('lighthouse', `--raw ${raw}: git would track it — name a directory git ignores`);
       } else {
         for (const { target: page, results } of measured) {
-          writeJsonDeterministic(join(dir, `${page.page === '/' ? 'root' : page.page}.json`), results[chosenRun(results)]);
+          writeJsonDeterministic(join(dir, `${nameOf(page)}.json`), results[chosenRun(results)]);
         }
       }
     }
@@ -540,7 +540,7 @@ function pageJson(
   const metric = (chosen.audits['metrics']?.details?.items?.[0] ?? {}) as Record<string, unknown>;
   const number = (value: unknown): number | null => (typeof value === 'number' ? value : null);
   return {
-    page: page.page,
+    page: nameOf(page),
     route: page.route,
     url: page.url,
     scores: medianScores(results),
@@ -558,6 +558,11 @@ function pageJson(
       ? { runs: CATEGORIES.map((category) => results.map((run) => (typeof run.categories[category]?.score === 'number' ? Math.round((run.categories[category]?.score as number) * 100) : null))) }
       : {}),
   };
+}
+
+/** A page's name in the output: `/` audited alone is `home`, the name `pages scan` gives it. */
+function nameOf(page: PageTarget): string {
+  return page.page === '/' ? 'home' : page.page;
 }
 
 /** `--strict`: one error per page with a category below 100. */
