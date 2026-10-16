@@ -221,6 +221,8 @@ export function unmountEdits(
     const block = mountBlock(layoutPath, cwd, config, form, nl);
     const at = source.indexOf(block);
     if (at === -1 || source.indexOf(block, at + 1) !== -1) continue;
+    // Text before the block's first line is no line start: the mount is not the one stet wrote.
+    if (at !== 0 && !source.startsWith(nl, at - nl.length)) continue;
     // `providerEdits` inserted `${nl}${block}${nl}` after the last import, or `${block}${nl}${nl}` at offset 0.
     // The blank line after the block is the mount's only where it is still there, and then
     // `${block}${nl}${nl}` comes out, which leaves the same bytes as the leading newline would

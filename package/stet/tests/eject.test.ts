@@ -1018,6 +1018,23 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   });
 
   for (const eol of ['\n', '\r\n']) {
+    it(`ejects a mount whose first import is joined onto the line above to a layout that parses (${eol === '\n' ? 'LF' : 'CRLF'})`, async () => {
+      const dir = readHost();
+      const layout = (await mounted('resolved', dir, BEFORE_READ.replace(/\n/g, eol))).replace(`';${eol}import { CopyProvider }`, "'; import { CopyProvider }");
+      expect(layout).toContain("'; import { CopyProvider }");
+      write(dir, 'app/layout.tsx', layout);
+      expect(await runEject(['--write'], io(dir))).toBe(0);
+      const out = read(dir, 'app/layout.tsx');
+      const ts = await loadTypescript();
+      const sf = ts.createSourceFile('layout.tsx', out, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+      expect((sf as unknown as { parseDiagnostics: unknown[] }).parseDiagnostics).toEqual([]);
+      expect(out).toContain("import './globals.css';");
+      expect(out).not.toContain('@getstet');
+      expect(out).not.toContain('CopyProvider');
+    });
+  }
+
+  for (const eol of ['\n', '\r\n']) {
     for (const atStart of [false, true]) {
       it(`ejects two register runs, the mount first and then a layout literal, to the exact original bytes (${eol === '\n' ? 'LF' : 'CRLF'}, block ${atStart ? 'at offset 0' : 'after the imports'})`, async () => {
         // Run 1 mounts for a client Nav; the host then adds a literal to the mounted layout, and run 2 adopts it, writing `import { copy }` right below the block.

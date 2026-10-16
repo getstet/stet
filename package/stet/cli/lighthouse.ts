@@ -131,9 +131,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
 
   const interrupt = untilInterrupted();
   const held: Held = {};
-  // Set when a signal ends the run: the work still unwinding (a build that exited on the kill) prints nothing.
-  let stopped = false;
-  const emit = (): number => (stopped ? 1 : report.emit(io, { json }));
+  const emit = (): number => (held.stopped === true ? 1 : report.emit(io, { json }));
   const work = (async (): Promise<number> => {
     const target = await startTarget(io, config, { url, build }, report, held);
     if (target === null) return emit();
@@ -231,7 +229,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
           if (target.kind === 'build') {
             // The edit is in source the running build does not carry: build and serve again.
             await stopServing(held);
-            if (stopped) return emit();
+            if (held.stopped === true) return emit();
             const again = await startTarget(io, config, { url, build }, report, held);
             if (again === null) return emit();
             held.target = again;
@@ -267,7 +265,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   try {
     const signal = await Promise.race([work.then(() => null), interrupt.interrupted]);
     if (signal !== null) {
-      stopped = true;
+      held.stopped = true;
       return 128 + (osConstants.signals[signal] ?? 0);
     }
     return await work;
@@ -284,6 +282,8 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
 
 /** What the run has started, held for the one `finally`: the build and the preview from their spawn, the preview before it answers. */
 interface Held {
+  /** Set when a signal ends the run: the work still unwinding (a build that exited on the kill) prints nothing and starts nothing. */
+  stopped?: boolean;
   runner?: { run: LighthouseRunner; close: () => Promise<void> };
   target?: Target;
   build?: number;
@@ -322,15 +322,15 @@ async function footprintOf(cwd: string, config: StetConfig): Promise<{ lines: st
   const layout = config.rootLayout === undefined ? undefined : join(cwd, config.rootLayout);
   const source = layout !== undefined && existsSync(layout) ? readFileSync(layout, 'utf8') : '';
   if (layout !== undefined && source.includes('<CopyProvider') && clientReadFiles(cwd, config).length === 0) {
-    // The line promises what upgrade does: it names the unmount only where `unmountEdits` takes the mount out (typescript not loading leaves the mount, as in upgrade).
-    const unmount = await loadTypescript().then(
-      (ts) => unmountEdits(ts, layout, source, cwd, config),
-      () => null,
-    );
+    // The line promises what upgrade does: it names the unmount only where `unmountEdits` takes the mount out, and says to install typescript where it does not load (upgrade leaves the mount then).
+    const ts = await loadTypescript().catch(() => null);
+    const unmount = ts === null ? null : unmountEdits(ts, layout, source, cwd, config);
     lines.push(
-      unmount === null
-        ? `stet  ${config.rootLayout as string}: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote`
-        : `stet  ${config.rootLayout as string} mounts CopyProvider and no client component reads copy — stet upgrade unmounts it`,
+      ts === null
+        ? `stet  ${config.rootLayout as string} mounts CopyProvider and no client reads — install typescript, then stet upgrade can unmount it`
+        : unmount === null
+          ? `stet  ${config.rootLayout as string}: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote`
+          : `stet  ${config.rootLayout as string} mounts CopyProvider and no client component reads copy — stet upgrade unmounts it`,
     );
     entries.push({ file: config.rootLayout as string, kind: 'provider' });
   }
@@ -385,6 +385,8 @@ async function startBuild(io: CliIo, config: StetConfig, report: Report, held: H
     return null;
   }
   const port = await freePort();
+  // A signal during the port probe has already ended the run: no preview is spawned after the `finally`.
+  if (held.stopped === true) return null;
   const command = previewCommandOf(io, config).replaceAll('{port}', String(port));
   const child = spawn(command, { cwd: io.cwd, shell: true, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...childEnv(), PORT: String(port) } });
   const lines: string[] = [];

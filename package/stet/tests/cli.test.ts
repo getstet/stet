@@ -1616,6 +1616,16 @@ describe('upgrade', () => {
       expect(host.file('app/layout.tsx')).toBe(commented);
     });
 
+    for (const eol of ['\n', '\r\n']) {
+      it(`leaves a mount whose first import is joined onto the line above for the hand, changing no byte of the layout (${eol === '\n' ? 'LF' : 'CRLF'})`, async () => {
+        const joined = `import './globals.css'; ${MOUNTED_060}`.replace(/\n/g, eol);
+        const host = adopted060(joined);
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.out).toContain(BY_HAND);
+        expect(host.file('app/layout.tsx')).toBe(joined);
+      });
+    }
+
     it('keeps the mount, and says nothing of it, where components/Nav.tsx outside the managed globs reads useCopy', async () => {
       const host = adopted060();
       mkdirSync(join(host.cwd, 'components'), { recursive: true });
