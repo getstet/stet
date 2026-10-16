@@ -5046,6 +5046,23 @@ describe('the dev child', () => {
     }
   });
 
+  it('starts an Astro site’s dev command in the foreground, whatever agent environment runs stet', async () => {
+    const SHOW = `node -e "console.log('bg:'+String(process.env.ASTRO_DEV_BACKGROUND))"; true`;
+    for (const [router, expected] of [['astro', 'bg:1'], ['app', 'bg:undefined']] as const) {
+      const host = makeCliHost({ config: { project: 't', router } });
+      const file = workspaceFile();
+      addSite(file, host.cwd);
+      const path = realpathSync(host.cwd);
+      updateSite(file, path, { devCommand: SHOW });
+      const { handler } = { handler: createDevHandler(contextOver(file, { fetchImpl: fakeFetch('') })) };
+      const query = `?site=${encodeURIComponent(path)}`;
+      // The command prints and exits, so there is nothing to stop.
+      await post(handler, `/api/site/dev-start${query}`, {});
+      const logged = await until(handler, `/api/site/dev-log${query}`, (b) => (b.lines as string[]).length > 0);
+      expect(logged.lines).toContain(expected);
+    }
+  });
+
   describe('under a shell that supplies the store', () => {
     const PAIR = { project: 't', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } };
     const SHELL = { STET_POSTGREST_URL: 'http://store.test/rest/v1', STET_POSTGREST_TOKEN: 'proc-token' };

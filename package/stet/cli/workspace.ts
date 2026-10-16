@@ -533,9 +533,8 @@ function routerDefaults(config: StetConfig): Omit<DevDefaults, 'source'> {
  * What `stet audit lighthouse --build` runs after `npm run build`, per router,
  * `{port}` the free loopback port. Each names 127.0.0.1: `vite preview` and
  * `astro preview` listen on `[::1]` alone without it, where the wait and the
- * relay never reach them. Astro's `--ignore-lock` keeps the preview in the
- * foreground: in an agent session it otherwise backgrounds itself into a group
- * the command cannot end.
+ * relay never reach them. Astro's `--ignore-lock` keeps 7.3's preview in the
+ * foreground in an agent session, and `foregroundEnv` does it for 7.2's.
  */
 export const PREVIEW_COMMANDS: Readonly<Record<'app' | 'pages' | 'astro' | 'vite', string>> = {
   app: 'npx next start -H 127.0.0.1 -p {port}',
@@ -543,6 +542,19 @@ export const PREVIEW_COMMANDS: Readonly<Record<'app' | 'pages' | 'astro' | 'vite
   vite: 'npx vite preview --host 127.0.0.1 --port {port} --strictPort',
   astro: 'npx astro preview --host 127.0.0.1 --port {port} --ignore-lock',
 };
+
+/**
+ * The environment that keeps an Astro dev or preview server in the foreground.
+ * Astro 7 detects an agent session and then starts the server as a detached
+ * background daemon, prints its pid and exits 0, so the command that was run
+ * neither holds the server nor can end it. `ASTRO_DEV_BACKGROUND` and
+ * `ASTRO_PREVIEW_BACKGROUND` are the marker Astro gives the daemon's own worker,
+ * which skips that detection; 7.2.2 and 7.3.8 both read them, and 7.2's
+ * `--ignore-lock` does not reach this check.
+ */
+export function foregroundEnv(config: StetConfig, server: 'dev' | 'preview'): NodeJS.ProcessEnv {
+  return config.router === 'astro' ? { [server === 'dev' ? 'ASTRO_DEV_BACKGROUND' : 'ASTRO_PREVIEW_BACKGROUND']: '1' } : {};
+}
 
 /** The router's own preview command: what an entry without `previewCommand` runs. */
 export function routerPreviewCommand(config: StetConfig): string {

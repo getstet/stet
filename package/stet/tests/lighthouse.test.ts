@@ -141,10 +141,14 @@ describe('stet audit lighthouse — the html host (journey C11)', () => {
     const pages = JSON.parse(json.out.join('\n')) as { pages: Array<{ page: string; route: string }> };
     expect(pages.pages.map(({ page, route }) => [page, route])).toEqual([['/docs/check/', '/docs/check/']]);
 
+    // The runner gets exactly the URL given, query kept, whatever pages are declared; the declared page at its route names it.
     const declared = nextHost(fake);
-    write(declared.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { docs: { route: '/docs/check/' } } }));
-    expect(await declared.run('--url', 'http://127.0.0.1:3999/docs/check/')).toBe(0);
-    expect(declared.out.join('\n')).toMatch(/^docs {2}\/docs\/check\/ {2}Performance 100/m);
+    write(declared.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { home: { route: '/' }, docs: { route: '/docs/check' } } }));
+    fake.runs.length = 0;
+    expect(await declared.run('--url', 'http://127.0.0.1:3999/docs/check/?v=2')).toBe(0);
+    expect(fake.runs.map((run) => run.url)).toEqual(['http://127.0.0.1:3999/docs/check/?v=2']);
+    expect(declared.out.join('\n')).toMatch(/^docs {2}\/docs\/check {2}Performance 100/m);
+    expect(declared.out).not.toContain('no pages declared — audited / alone; run stet pages scan to declare them');
   });
 
   it('prints the median of five, the audit lines from the first run', async () => {
@@ -517,6 +521,41 @@ describe('stet audit lighthouse --build (D3)', () => {
     expect(fake.starts).toEqual([true]);
     expect(fake.runs).toHaveLength(1);
     expect(await previewGone(h.cwd)).toBe(true);
+  }, 30_000);
+
+  it('keeps an Astro preview in the foreground where astro would start a background daemon and exit 0', async () => {
+    // astro preview detaches itself when it detects an agent, printing its message and exiting 0, unless its own worker marker is set.
+    const DAEMONISES = [
+      "import { spawn } from 'node:child_process';",
+      "import { writeFileSync } from 'node:fs';",
+      "const at = process.argv.indexOf('--port');",
+      "const port = process.argv[at + 1];",
+      "if (!process.env.ASTRO_PREVIEW_BACKGROUND) {",
+      "  const daemon = spawn(process.execPath, [process.argv[1], '--port', port], { detached: true, stdio: 'ignore', env: { ...process.env, ASTRO_PREVIEW_BACKGROUND: '1' } });",
+      "  daemon.unref();",
+      "  console.log(JSON.stringify({ message: `Preview server running at http://127.0.0.1:${port} (pid ${daemon.pid})` }));",
+      "  process.exit(0);",
+      "}",
+      "const { createServer } = await import('node:http');",
+      "writeFileSync('preview.pid', String(process.pid));",
+      "createServer((req, res) => { res.writeHead(200); res.end('ok'); }).listen(Number(port), '127.0.0.1');",
+    ].join('\n');
+    const fake = fakeLighthouse({ '/': cleanLhr() });
+    const h = buildHost(fake, { preview: 'node astro-preview.mjs --port {port}' });
+    write(h.cwd, 'astro-preview.mjs', DAEMONISES);
+    write(h.cwd, 'stet.config.json', JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'] }));
+    try {
+      expect(await h.run('--build')).toBe(0);
+      expect(fake.runs).toHaveLength(1);
+      expect(await previewGone(h.cwd)).toBe(true);
+    } finally {
+      // A daemon the run left behind is this test's to end.
+      try {
+        process.kill(Number(readFileSync(join(h.cwd, 'preview.pid'), 'utf8')), 'SIGKILL');
+      } catch {
+        /* gone */
+      }
+    }
   }, 30_000);
 
   it('builds and serves again for the re-run after --fix --write, to the same Chrome', async () => {

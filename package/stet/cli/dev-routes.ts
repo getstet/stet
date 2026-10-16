@@ -70,6 +70,7 @@ import {
   connectionEnv,
   devDefaults,
   foreignConnectionNames,
+  foregroundEnv,
   loadSite,
   readWorkspace,
   removeSite,
@@ -1973,7 +1974,7 @@ async function devStart(ctx: DevContext, site: SiteState, entry: WorkspaceEntry)
   if (command === undefined) {
     return json({ error: 'the workspace entry has no dev command — set it in Setup' }, 400);
   }
-  const env = siteChildEnv(ready, ctx.launched);
+  const env = { ...siteChildEnv(ready, ctx.launched), ...foregroundEnv(ready.config, 'dev') };
   const spawned = spawn(command, {
     cwd: ready.path,
     shell: true,
