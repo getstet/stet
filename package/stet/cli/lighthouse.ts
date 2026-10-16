@@ -93,6 +93,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   const raw = text(values, 'raw');
   const runsText = text(values, 'runs');
   if (url !== undefined && build) throw new UsageError('stet audit lighthouse takes --url or --build, not both');
+  if (url !== undefined && !URL.canParse(url)) throw new UsageError('stet audit lighthouse --url must be a full URL, such as http://localhost:3000/');
   if (runsText !== undefined && !/^[1-9]$/.test(runsText)) throw new UsageError('stet audit lighthouse --runs takes a whole number from 1 to 9');
   if (write && !fix) throw new UsageError("stet audit lighthouse --write applies --fix's plan — pass both");
   if (raw !== undefined && !json) throw new UsageError('stet audit lighthouse --raw writes beside --json — pass both');
@@ -469,7 +470,11 @@ function pageTargets(
       const path = target.kind === 'url' ? urlPathOf(base) : '/';
       if (path === '/') return { pages: [{ page: '/', label: 'home', route: '/', url: new URL(base).href }], skips: [] };
       // Both sides as the URL parser writes them, so a declared `/café` meets the URL's `/caf%C3%A9`.
-      const trimmed = (route: string): string => new URL(route, base).pathname.replace(/\/+$/, '');
+      const trimmed = (route: string): string => {
+        const at = new URL(base);
+        at.pathname = route;
+        return at.pathname.replace(/\/+$/, '');
+      };
       const own = declared.find((entry) => trimmed(entry.route) === trimmed(path));
       const name = own?.page ?? path;
       return { pages: [{ page: name, label: name, route: own?.route ?? path, url: new URL(base).href }], skips: [] };

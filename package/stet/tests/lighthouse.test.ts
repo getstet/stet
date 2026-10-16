@@ -159,6 +159,17 @@ describe('stet audit lighthouse — the html host (journey C11)', () => {
     expect(h.out.join('\n')).toMatch(/^cafe {2}\/café {2}Performance 100/m);
   });
 
+  it('audits a --url whose path starts with two slashes as that path, whatever pages are declared', async () => {
+    const fake = fakeLighthouse({ '//foo': cleanLhr(), '//': cleanLhr() });
+    const h = nextHost(fake);
+    write(h.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { home: { route: '/' }, docs: { route: '/docs' } } }));
+    expect(await h.run('--url', 'http://127.0.0.1:3999//foo')).toBe(0);
+    expect(h.out.join('\n')).toMatch(/^\/\/foo {2}Performance/m);
+    const bare = nextHost(fake);
+    write(bare.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { home: { route: '/' } } }));
+    await expect(bare.run('--url', 'http://127.0.0.1:3999//')).resolves.toEqual(expect.any(Number));
+  });
+
   it('writes --raw for a long path under a short hashed name', async () => {
     const long = `/${'é'.repeat(60)}/${'é'.repeat(60)}/`;
     const fake = fakeLighthouse({ [new URL(long, 'http://127.0.0.1:3999').pathname]: cleanLhr() });
@@ -263,6 +274,7 @@ describe('stet audit lighthouse — refusals before anything starts', () => {
       [['--runs', '0'], 'stet audit lighthouse --runs takes a whole number from 1 to 9'],
       [['--write'], "stet audit lighthouse --write applies --fix's plan — pass both"],
       [['--raw', 'out'], 'stet audit lighthouse --raw writes beside --json — pass both'],
+      [['--url', 'not a url'], 'stet audit lighthouse --url must be a full URL, such as http://localhost:3000/'],
       [
         ['--url', 'http://127.0.0.1:3000/docs/', '--pages', 'home'],
         'stet audit lighthouse --url with a path audits that one page — drop --pages, or give --url the origin',

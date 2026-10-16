@@ -182,6 +182,7 @@ A line tagged `copy` is words to write through the key it names. A line tagged
 `--fix --write` applies. A line tagged `host` is the site's own markup, which
 stet reports and leaves alone. `--json` prints the same result as one object;
 `--strict` exits 1 when any category of any page is below 100.
+`--url` with a path audits that one page and cannot be combined with `--pages`.
 
 The command needs Google Chrome (or `CHROME_PATH`) and Node 22.19 or later;
 every other command runs on Node 22. It loads Lighthouse only inside its own
