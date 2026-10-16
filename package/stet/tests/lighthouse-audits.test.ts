@@ -110,6 +110,15 @@ describe('the owner table (D4)', () => {
     expect(isFailing({ ...audit, score: null })).toBe(false);
     expect(isFailing({ ...audit, score: 1 })).toBe(false);
   });
+
+  it("fails a numeric audit only below Lighthouse's 0.9 pass band, a binary one below 1", () => {
+    const audit = { id: 'x', title: 'x', description: '', score: 0.95, scoreDisplayMode: 'numeric' };
+    expect(isFailing(audit)).toBe(false);
+    expect(isFailing({ ...audit, score: 0.9 })).toBe(false);
+    expect(isFailing({ ...audit, score: 0.85 })).toBe(true);
+    expect(isFailing({ ...audit, score: 0, scoreDisplayMode: 'binary' })).toBe(true);
+    expect(isFailing({ ...audit, score: 0.95, scoreDisplayMode: 'binary' })).toBe(true);
+  });
 });
 
 describe('elementOfSnippet (D4)', () => {
@@ -191,7 +200,7 @@ describe('the lines (D4)', () => {
     const fonts = 'https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap';
     const lhr = cleanLhr();
     for (const id of ['first-contentful-paint', 'largest-contentful-paint']) {
-      lhr.audits[id] = { ...(lhr.audits[id] as LighthouseResult['audits'][string]), score: 0.94, scoreDisplayMode: 'numeric', displayValue: '1.6 s' };
+      lhr.audits[id] = { ...(lhr.audits[id] as LighthouseResult['audits'][string]), score: 0.85, scoreDisplayMode: 'numeric', displayValue: '1.6 s' };
     }
     lhr.audits['render-blocking-insight'] = { id: 'render-blocking-insight', title: 'Render blocking requests', description: '', score: 0, scoreDisplayMode: 'metricSavings', details: { type: 'table', items: [{ url: fonts, totalBytes: 1245, wastedMs: 869 }] } };
     lhr.audits['network-requests']?.details?.items?.push({ url: fonts, resourceType: 'Stylesheet' });
@@ -202,6 +211,21 @@ describe('the lines (D4)', () => {
     const items = lhr.audits['network-requests']?.details?.items ?? [];
     (items[items.length - 1] as Record<string, unknown>)['resourceType'] = 'Script';
     expect(readRun(lhr, context({ document: null })).lines[0]).toMatch(/blocks the first paint for 0\.9 s: defer it$/);
+  });
+
+  it("prints Lighthouse's title where the render-blocking saving is under 50 ms", () => {
+    const fonts = 'https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap';
+    const lhr = cleanLhr();
+    for (const id of ['first-contentful-paint', 'largest-contentful-paint']) {
+      lhr.audits[id] = { ...(lhr.audits[id] as LighthouseResult['audits'][string]), score: 0.85, scoreDisplayMode: 'numeric', displayValue: '1.6 s' };
+    }
+    lhr.audits['render-blocking-insight'] = { id: 'render-blocking-insight', title: 'Render blocking requests', description: '', score: 0, scoreDisplayMode: 'metricSavings', details: { type: 'table', items: [{ url: fonts, totalBytes: 1245, wastedMs: 20 }] } };
+    lhr.audits['network-requests']?.details?.items?.push({ url: fonts, resourceType: 'Stylesheet' });
+    const fcp = lhr.audits['first-contentful-paint'] as LighthouseResult['audits'][string];
+    expect(readRun(lhr, context({ document: null })).lines[0]).toBe(`host  first-contentful-paint  1.6 s — ${fcp.title}`);
+    // 50 ms is the bound itself: the remedy prints.
+    (lhr.audits['render-blocking-insight']?.details?.items?.[0] as Record<string, unknown>)['wastedMs'] = 50;
+    expect(readRun(lhr, context({ document: null })).lines[0]).toMatch(/blocks the first paint for 0\.1 s: load it with media="print"/);
   });
 
   it("reads color-contrast's explanation, and prints the title where it cannot", () => {

@@ -823,7 +823,8 @@ export function auditablePages(cwd: string, config: StetConfig, descriptor: Desc
   });
   for (const file of files) {
     const page = pageOfFile(cwd, file, pages, { html: true });
-    if (page === undefined || Object.hasOwn(pages, page) || out.some((entry) => entry.page === page)) continue;
+    // `out` holds every declared page, so a declared name is never proposed beside it.
+    if (page === undefined || out.some((entry) => entry.page === page)) continue;
     out.push({ page, route: fileRoute(file), declared: false, file });
   }
   return out;

@@ -53,14 +53,23 @@ export const AUDIT_OWNERS: Readonly<Record<string, Owner | 'robots' | 'canonical
   hreflang: 'host', 'http-status-code': 'host', 'crawlable-anchors': 'host', 'robots-txt': 'host',
 };
 
+/** The least `wastedMs` a render-blocking remedy is printed for. */
+const BLOCKING_MIN_MS = 50;
+
 type Audit = LighthouseResult['audits'][string];
 
-/** A failing audit: a score below 1 that is not a not-applicable, manual or informative one. */
+/** Lighthouse's pass band for a `numeric` audit, the five Performance metrics: the tiles' green from 90. */
+const NUMERIC_PASS = 0.9;
+
+/**
+ * A failing audit: a score below 1 that is not a not-applicable, manual or
+ * informative one — below `NUMERIC_PASS` where the mode is `numeric`.
+ */
 export function isFailing(audit: Audit | undefined): boolean {
   return (
     audit !== undefined &&
     typeof audit.score === 'number' &&
-    audit.score < 1 &&
+    audit.score < (audit.scoreDisplayMode === 'numeric' ? NUMERIC_PASS : 1) &&
     audit.scoreDisplayMode !== 'notApplicable' &&
     audit.scoreDisplayMode !== 'manual' &&
     audit.scoreDisplayMode !== 'informative'
@@ -311,9 +320,11 @@ function remedyOf(
       const blocking = lhr.audits['render-blocking-insight']?.details?.items?.[0];
       const url = str(blocking?.['url']);
       const shown = audit.displayValue ?? '';
-      if (url === undefined) return { text: `${shown} — ${audit.title}`, place: false };
+      const wastedMs = Number(blocking?.['wastedMs'] ?? 0);
+      // Below the bound the figure reads `0.0 s`: advice to defer a resource for nothing.
+      if (url === undefined || wastedMs < BLOCKING_MIN_MS) return { text: `${shown} — ${audit.title}`, place: false };
       const request = (lhr.audits['network-requests']?.details?.items ?? []).find((item) => item['url'] === url);
-      const seconds = (Number(blocking?.['wastedMs'] ?? 0) / 1000).toFixed(1);
+      const seconds = (wastedMs / 1000).toFixed(1);
       const how = request?.['resourceType'] === 'Script' ? 'defer it' : `load it with media="print" onload="this.media='all'", or self-host it`;
       return { text: `${shown} — ${url} blocks the first paint for ${seconds} s: ${how}`, place: false };
     }

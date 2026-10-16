@@ -71,6 +71,7 @@ import {
   parseEnvText,
   readWorkspace,
   removeSite,
+  routerPreviewCommand,
   siteEnv,
   siteId,
   siteIo,
@@ -738,6 +739,19 @@ describe('the per-site environment', () => {
   });
 });
 
+describe('routerPreviewCommand', () => {
+  it('answers the router’s own production preview, Next’s for app and pages', () => {
+    const preview = (router: 'app' | 'pages' | 'astro' | 'vite'): string => {
+      const host = makeCliHost({ config: { project: 't', router } });
+      return routerPreviewCommand(loadConfig(host.cwd));
+    };
+    expect(preview('app')).toBe('npx next start -H 127.0.0.1 -p {port}');
+    expect(preview('pages')).toBe('npx next start -H 127.0.0.1 -p {port}');
+    expect(preview('astro')).toBe('npx astro preview --host 127.0.0.1 --port {port} --ignore-lock');
+    expect(preview('vite')).toBe('npx vite preview --host 127.0.0.1 --port {port} --strictPort');
+  });
+});
+
 describe('devDefaults', () => {
   it('answers null on an html host, whatever router the loader filled in', async () => {
     const html = await makeHtmlHost();
@@ -1283,6 +1297,17 @@ describe('GET /api/site', () => {
     expect(body.git.head).toMatch(/^[0-9a-f]{7,}$/);
     expect(body.mode).toBe('snapshot');
     expect(body.environments).toEqual([{ name: 'default', adapter: 'snapshot', vars: [] }]);
+  });
+
+  it('carries the router’s preview command as previewDefault, the placeholder Setup shows', async () => {
+    const ask = async (router: 'app' | 'astro' | 'vite'): Promise<any> => {
+      const host = makeCliHost({ config: { project: 't', router } });
+      const { handler } = handlerOver([host.cwd]);
+      return (await (await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.cwd))}`))).json()) as any;
+    };
+    expect((await ask('app')).previewDefault).toBe('npx next start -H 127.0.0.1 -p {port}');
+    expect((await ask('astro')).previewDefault).toBe('npx astro preview --host 127.0.0.1 --port {port} --ignore-lock');
+    expect((await ask('vite')).previewDefault).toBe('npx vite preview --host 127.0.0.1 --port {port} --strictPort');
   });
 
   it('reads each connection variable from the checkout’s own files, without dialing', async () => {
@@ -7852,6 +7877,28 @@ describe('the page', () => {
       expect(docOf(page).querySelector('.card [data-act="edit:minted_key"]')?.textContent).toBe('→ open');
       expect(page.requested('/api/site?')).toHaveLength(2);
       expect(docOf(page).querySelectorAll('.lht').length).toBe(1);
+      page.dom.window.close();
+    });
+
+    it('keeps the drafts a person has open when Apply fixes reads the site again', async () => {
+      const fixed = pageOf('home', { accessibility: 89 }, [audit('fix', 'html-has-lang')], { file: 'index.html' });
+      const held = { reply: done(resultOf([fixed])) };
+      const page = await card(htmlSite(), held);
+      await page.act('tab:Content');
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'A draft the fix must not eat');
+      expect(page.html()).toContain('1 unsaved edit');
+      await page.act('tab:SEO');
+      held.reply = done(resultOf([pageOf('home', {}, [], { file: 'index.html' })]));
+      page.answer('/api/site', 200, siteBody({ host: 'html', descriptor: { ...descriptor, keys: { ...descriptor.keys, minted_key: { shape: 'text', target: 'web' } } } }));
+      await page.act('auditFix:home');
+      expect(page.requested('/api/site?')).toHaveLength(2);
+      await page.act('tab:Content');
+      expect(page.html()).toContain('1 unsaved edit');
+      expect((docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('A draft the fix must not eat');
+      // The refresh did read the site: the key the fix minted is in the list.
+      expect(page.html()).toContain('<option value="prefix:minted">minted</option>');
+      expect(page.errors).toEqual([]);
       page.dom.window.close();
     });
 

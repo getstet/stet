@@ -533,8 +533,7 @@ async function loadSite(path) {
   if (ready()) {
     // Awaited before the first group is chosen: the marks decide the groups,
     // and a group chosen before they arrive would be one they dissolve.
-    const marks = await api('/api/site/marks' + query());
-    if (marks.ok) S.marks = Object.assign({ documents: [], keys: {}, places: {} }, marks.body);
+    await loadMarks();
     S.locale = S.site.config.locales.default;
     S.group = firstGroup();
     // The list and the preview open on one page: the group whose route is the remembered
@@ -553,6 +552,33 @@ async function loadSite(path) {
   if (ready()) void guard(loadPreview());
   if (previewBranch() && S.site.git.upstream) void guard(loadPreviewLink());
   if (S.tab === 'SEO' && ready()) void guard(pollAudit());
+}
+
+async function loadMarks() {
+  const marks = await api('/api/site/marks' + query());
+  if (marks.ok) S.marks = Object.assign({ documents: [], keys: {}, places: {} }, marks.body);
+}
+
+/**
+ * The site read again after a write the page did not make (Apply fixes): the
+ * key list, the marks and the pending files, with the drafts, the template
+ * edits, the locale and the open key left as they are. The Health and SEO
+ * results, read from the checkout before the write, are dropped for their own Run.
+ */
+async function refreshSite() {
+  const gen = auditGen;
+  const res = await api('/api/site' + query());
+  if (gen !== auditGen) return;
+  S.site = res.body;
+  S.pending = Array.isArray(S.site.pending) ? S.site.pending : [];
+  S.health = null; S.seo = null;
+  if (ready()) {
+    await loadMarks();
+    if (gen !== auditGen) return;
+    if (S.group !== null && !groups().some((g) => g.id === S.group)) S.group = firstGroup();
+    if (S.sel !== null && !own(S.site.descriptor.keys, S.sel)) S.sel = null;
+  }
+  render();
 }
 
 function readEditor() {
@@ -2830,8 +2856,8 @@ async function startAudit(extra) {
     return;
   }
   await pollAudit();
-  // The fix wrote documents and minted keys: the site is read again, and the finished result with it.
-  if (fixing && gen === auditGen && S.audit && S.audit.reply.state === 'done') await loadSite(S.path);
+  // The fix wrote documents and minted keys: the key list is read again, the drafts a person has open kept.
+  if (fixing && gen === auditGen && S.audit && S.audit.reply.state === 'done') await refreshSite();
 }
 
 /** What the dev server has printed so far, and what the launcher turned out to be. */

@@ -134,6 +134,17 @@ describe('stet audit lighthouse — the html host (journey C11)', () => {
     expect(Object.keys(parsed).sort()).toEqual(['findings', 'fixes', 'footprint', 'lighthouse', 'ok', 'pages']);
   });
 
+  it("names each page's document in the --json, on an html host alone", async () => {
+    const html = htmlHost(fakeLighthouse({ '/': cleanLhr() }));
+    expect(await html.run('--json')).toBe(0);
+    const [page] = (JSON.parse(html.out.join('\n')) as { pages: Array<Record<string, unknown>> }).pages;
+    expect(page).toEqual(expect.objectContaining({ page: 'home', route: '/', file: 'index.html' }));
+    const next = nextHost(fakeLighthouse({ '/': cleanLhr() }));
+    expect(await next.run('--url', 'http://127.0.0.1:3999/', '--json')).toBe(0);
+    const [nextPage] = (JSON.parse(next.out.join('\n')) as { pages: Array<Record<string, unknown>> }).pages;
+    expect(nextPage).not.toHaveProperty('file');
+  });
+
   it('reads Chrome missing as an error, with or without --strict, and leaves no front', async () => {
     for (const strict of [[], ['--strict']]) {
       const h = htmlHost(null);
