@@ -39,11 +39,10 @@ import { astroFixLines, planDocumentFix, planNextLang, planViteShell, type Docum
 import { CATEGORIES, ChromeMissing, chromeRunner, type FormFactor, type LighthouseResult, type LighthouseRunner } from './lighthouse-run.js';
 import { answers, endGroup, untilInterrupted } from './liveness.js';
 import type { CliIo } from './main.js';
-import { applyPages, pageOfFile, proposeForHost, servedRoute } from './pages.js';
+import { applyPages, auditablePages, pageOfFile, proposeForHost, servedRoute, type AuditablePage } from './pages.js';
 import { plural, Report, UsageError } from './report.js';
 import { applyFileEdits } from './rewrite.js';
 import { loadTypescript } from './source-scan.js';
-import { servableFile } from './static-files.js';
 import { childEnv, devDefaults, PREVIEW_COMMANDS, readWorkspace, workspacePath, type WorkspaceEntry } from './workspace.js';
 
 const CHROME_MISSING = 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary';
@@ -105,17 +104,18 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   const snapshot = snapshotOf(config, io.cwd, report);
   if (snapshot === null) return report.emit(io, { json });
 
-  // The pages: the declared ones in name order, narrowed by --pages; none declared is `/` alone.
-  const declared = descriptor.pages ?? {};
-  const names = Object.keys(declared).sort();
-  let selected = names;
+  // The pages: the declared ones in name order, narrowed by --pages, which may also
+  // name a page an html document proposes; none declared and none named is `/` alone.
+  const auditable = auditablePages(io.cwd, config, descriptor);
+  let selected = auditable.filter((entry) => entry.declared);
   const pagesText = text(values, 'pages');
+  const rootAlone = pagesText === undefined && selected.length === 0;
   if (pagesText !== undefined) {
     const asked = pagesText.split(',').map((name) => name.trim()).filter((name) => name !== '');
     for (const name of asked) {
-      if (!Object.hasOwn(declared, name)) throw new UsageError(`stet audit lighthouse --pages: ${name} is not a declared page`);
+      if (!auditable.some((entry) => entry.page === name)) throw new UsageError(`stet audit lighthouse --pages: ${name} is not a declared page`);
     }
-    selected = names.filter((name) => asked.includes(name));
+    selected = auditable.filter((entry) => asked.includes(entry.page));
   }
 
   const html = isHtmlHost(config);
@@ -133,7 +133,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     const target = await startTarget(io, config, { url, build }, report, held);
     if (target === null) return report.emit(io, { json });
     held.target = target;
-    const { pages, skips } = pageTargets(io.cwd, config, declared, selected, target);
+    const { pages, skips } = pageTargets(io.cwd, config, rootAlone ? null : selected, target);
     try {
       held.runner = await (io.lighthouse ?? chromeRunner)(target.kind !== 'url');
     } catch (error) {
@@ -174,7 +174,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     for (const line of skips) report.line(line);
     for (const line of footprint.lines) report.line(line);
     if (devServer) report.line('note  Performance is measured on the dev server — run with --build for the production number');
-    if (selected.length === 0 && names.length === 0) report.line('no pages declared — audited / alone; run stet pages scan to declare them');
+    if (rootAlone) report.line('no pages declared — audited / alone; run stet pages scan to declare them');
 
     const owners: Owner[] = footprint.entries.map(() => 'stet' as const);
     const pageReports: unknown[] = [];
@@ -403,44 +403,25 @@ function freePort(): Promise<number> {
 }
 
 /**
- * Each page's URL. On the html host a page's document is the managed document
- * whose file route is the page's route, else the managed document its route
- * names on disk, else the page is skipped; elsewhere the base joined with the
- * route.
+ * Each page's URL: on the html host its document as the static arm serves it
+ * (`auditablePages` found the document), the page skipped where none serves
+ * its route; elsewhere the base joined with the route. Null is `/` alone.
  */
-function pageTargets(
-  cwd: string,
-  config: StetConfig,
-  declared: Record<string, PageDef>,
-  selected: string[],
-  target: Target,
-): { pages: PageTarget[]; skips: string[] } {
+function pageTargets(cwd: string, config: StetConfig, selected: AuditablePage[] | null, target: Target): { pages: PageTarget[]; skips: string[] } {
   const base = target.front?.url ?? target.base;
-  const wanted = selected.length > 0 ? selected.map((name) => ({ name, route: (declared[name] as PageDef).route })) : Object.keys(declared).length > 0 ? [] : [{ name: '/', route: '/' }];
-  if (!isHtmlHost(config)) {
-    return { pages: wanted.map(({ name, route }) => ({ page: name, label: name, route, url: new URL(route, base).href })), skips: [] };
+  const html = isHtmlHost(config);
+  if (selected === null) {
+    if (!html) return { pages: [{ page: '/', label: '/', route: '/', url: new URL('/', base).href }], skips: [] };
+    const file = filesForGlobs(cwd, config.managedSurfaces).find((doc) => servedRoute(doc) === '/');
+    if (file === undefined) return { pages: [], skips: ['/: no managed document serves / — skipped'] };
+    return { pages: [{ page: '/', label: file, route: '/', url: base, file }], skips: [] };
   }
-  const documents = filesForGlobs(cwd, config.managedSurfaces).filter((file) => file.endsWith('.html'));
+  if (!html) return { pages: selected.map(({ page, route }) => ({ page, label: page, route, url: new URL(route, base).href })), skips: [] };
   const pages: PageTarget[] = [];
   const skips: string[] = [];
-  for (const { name, route } of wanted) {
-    const file =
-      name === '/'
-        ? documents.find((doc) => servedRoute(doc) === '/')
-        : documents.find((doc) => pageOfFile(cwd, doc, declared, { html: true, declaredOnly: true }) === name);
-    if (file !== undefined) {
-      pages.push({ page: name, label: file, route, url: base + servedRoute(file).slice(1), file });
-      continue;
-    }
-    // The front serves the file the route names, so it is that page's document.
-    const served = servableFile(cwd, route);
-    // `servableFile` answers the real path, so each document is compared by its own.
-    const onDisk = served === null ? undefined : documents.find((doc) => realpathSync(join(cwd, doc)) === served);
-    if (onDisk !== undefined) {
-      pages.push({ page: name, label: onDisk, route, url: base + route.replace(/^\//, ''), file: onDisk });
-      continue;
-    }
-    skips.push(`${name}: no managed document serves ${route} — skipped`);
+  for (const { page, route, file } of selected) {
+    if (file === undefined) skips.push(`${page}: no managed document serves ${route} — skipped`);
+    else pages.push({ page, label: file, route, url: base + servedRoute(file).slice(1), file });
   }
   return { pages, skips };
 }

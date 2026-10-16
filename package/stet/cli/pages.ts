@@ -37,7 +37,7 @@
  * not, so the whole host bricks at `descriptorOf` in either direction.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { join, sep } from 'node:path';
 
 import { headLimitsFor, route as normalizeRoute } from '../src/seo.js';
@@ -52,6 +52,7 @@ import { proposeHtml } from './html-host.js';
 import { NAME_PART, wordsOf } from './key-names.js';
 import type { CliIo } from './main.js';
 import { clip, plural, posixRelative, CliError, Report, UsageError } from './report.js';
+import { servableFile } from './static-files.js';
 
 // --- The dirent walk --------------------------------------------------------
 
@@ -785,6 +786,47 @@ export function servedRoute(file: string): string {
   if (file === 'index.html') return '/';
   if (file.endsWith('/index.html')) return `/${file.slice(0, -'index.html'.length)}`;
   return `/${file}`;
+}
+
+/** A page `stet audit lighthouse` can name, and the document that serves it on the static-HTML host. */
+export interface AuditablePage {
+  page: string;
+  route: string;
+  declared: boolean;
+  /** The managed document, repo-relative; absent on a JavaScript host and for a declared route no document serves. */
+  file?: string;
+}
+
+/**
+ * The pages the audit can name: every declared page, and on the static-HTML
+ * host the page each managed document proposes where no declared page claims
+ * it — `pageOfFile`'s fallback name, the one `pages scan` would declare — so a
+ * document is audited by name before its page exists (R9). A declared page's
+ * document is the one whose file route is its route (`declaredOnly`), else the
+ * managed document its route names on disk (`servableFile`, R7); two documents
+ * proposing one name (`about.html` beside `about/index.html`) keep the first
+ * in file order.
+ */
+export function auditablePages(cwd: string, config: StetConfig, descriptor: Descriptor): AuditablePage[] {
+  const pages = descriptor.pages ?? {};
+  const declared: AuditablePage[] = Object.keys(pages)
+    .sort()
+    .map((page) => ({ page, route: pages[page]?.route ?? '/', declared: true }));
+  if (!isHtmlHost(config)) return declared;
+  const files = filesForGlobs(cwd, config.managedSurfaces).sort();
+  const root = realpathSync(cwd); // `servableFile` answers a real path
+  const out = declared.map((entry) => {
+    const byRoute = files.find((file) => pageOfFile(cwd, file, pages, { html: true, declaredOnly: true }) === entry.page);
+    const served = byRoute === undefined ? servableFile(root, entry.route) : null;
+    const file = byRoute ?? (served !== null && files.includes(posixRelative(root, served)) ? posixRelative(root, served) : undefined);
+    return file === undefined ? entry : { ...entry, file };
+  });
+  for (const file of files) {
+    const page = pageOfFile(cwd, file, pages, { html: true });
+    if (page === undefined || Object.hasOwn(pages, page) || out.some((entry) => entry.page === page)) continue;
+    out.push({ page, route: fileRoute(file), declared: false, file });
+  }
+  return out;
 }
 
 function isDynamic(route: string): boolean {

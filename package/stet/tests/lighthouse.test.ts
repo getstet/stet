@@ -90,15 +90,16 @@ describe('stet audit lighthouse — the html host (journey C11)', () => {
     expect(process.listenerCount('SIGINT')).toBe(listeners);
   });
 
-  it('audits / alone where no page is declared, and refuses --pages naming an undeclared page', async () => {
+  it('audits / alone where no page is declared, and refuses --pages naming no page on a JavaScript host', async () => {
     const fake = fakeLighthouse({ '/': cleanLhr() });
     const h = htmlHost(fake, { pages: {} });
     expect(await h.run()).toBe(0);
     expect(h.out).toContain('no pages declared — audited / alone; run stet pages scan to declare them');
     expect(fake.runs).toHaveLength(1);
-    const refused = htmlHost(fake, { pages: {} });
-    expect(await refused.run('--pages', 'home')).toBe(2);
-    expect(refused.err.join('\n')).toContain('stet audit lighthouse --pages: home is not a declared page');
+    const next = nextHost(fake);
+    write(next.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await next.run('--url', 'http://127.0.0.1:3999/', '--pages', 'home')).toBe(2);
+    expect(next.err.join('\n')).toContain('stet audit lighthouse --pages: home is not a declared page');
     expect(fake.starts).toHaveLength(1);
   });
 
@@ -285,6 +286,52 @@ describe('stet audit lighthouse — the page URL on the html host (D3)', () => {
     const h = htmlHost(fake, { pages: { about: { route: '/about.html' } } });
     cpSync(join(HTML_FIXTURE, 'index.html'), join(h.cwd, 'about.html'));
     expect(await h.run()).toBe(0);
+    expect(paths(fake)).toEqual(['/about.html']);
+  });
+
+  it('names a page a document proposes on the adopted fixture, which declares none (C12)', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'stet-lighthouse-adopted-'));
+    for (const name of ['index.html', 'edges.html']) cpSync(join(HTML_FIXTURE, name), join(cwd, name));
+    // The four marks `check` refuses, removed as the C12 scenario removes them.
+    const edgesDoc = readFileSync(join(cwd, 'edges.html'), 'utf8');
+    writeFileSync(join(cwd, 'edges.html'), edgesDoc.replace(/ data-stet(?:-content|-href)?="edge_(?:url|noscript|list|href)"/g, ''));
+    const quiet = { cwd, env: {}, stdout: () => undefined, stderr: () => undefined };
+    await runCli(['init', '--yes'], quiet);
+    expect(await runCli(['register', '--from', 'scan', '--write'], quiet)).toBe(0);
+    const adopted = JSON.parse(readFileSync(join(cwd, 'content/descriptor.json'), 'utf8')) as { keys: object; pages?: unknown };
+    expect(Object.keys(adopted.keys).length).toBeGreaterThan(0);
+    expect(adopted.pages).toBeUndefined();
+
+    const fake = fakeLighthouse({ '/': cleanLhr(), '/edges.html': cleanLhr(savedLhr('edges.html')) });
+    const edges = host(cwd, { lighthouse: fake.start });
+    expect(await edges.run('--pages', 'edges')).toBe(0);
+    expect(paths(fake)).toEqual(['/edges.html']);
+    expect(fake.runs[0]?.url).toMatch(/^https:\/\/127\.0\.0\.1:\d+\/edges\.html$/);
+    expect(edges.out.join('\n')).toMatch(/^edges\.html {2}\/edges {2}Performance/m);
+    expect(edges.out).not.toContain('no pages declared — audited / alone; run stet pages scan to declare them');
+
+    const home = host(cwd, { lighthouse: fake.start });
+    expect(await home.run('--pages', 'home')).toBe(0);
+    expect(paths(fake).slice(1)).toEqual(['/']);
+
+    const bare = host(cwd, { lighthouse: fake.start });
+    expect(await bare.run()).toBe(0);
+    expect(paths(fake).slice(2)).toEqual(['/']);
+    expect(bare.out).toContain('no pages declared — audited / alone; run stet pages scan to declare them');
+
+    const nosuch = host(cwd, { lighthouse: fake.start });
+    expect(await nosuch.run('--pages', 'nosuch')).toBe(2);
+    expect(nosuch.err.join('\n')).toContain('stet audit lighthouse --pages: nosuch is not a declared page');
+    expect(fake.starts).toHaveLength(3);
+  });
+
+  it('audits about.html, the first in file order, where about/index.html proposes about too', async () => {
+    const fake = fakeLighthouse({ '/about.html': cleanLhr() });
+    const h = htmlHost(fake, { pages: {} });
+    cpSync(join(HTML_FIXTURE, 'index.html'), join(h.cwd, 'about.html'));
+    mkdirSync(join(h.cwd, 'about'));
+    cpSync(join(HTML_FIXTURE, 'index.html'), join(h.cwd, 'about/index.html'));
+    expect(await h.run('--pages', 'about')).toBe(0);
     expect(paths(fake)).toEqual(['/about.html']);
   });
 
@@ -589,6 +636,34 @@ describe('stet audit lighthouse --fix --write (D5)', () => {
     expect(descriptor.pages?.['edges']?.seo?.['description']).toBe('edges_meta_description');
     expect(descriptor.keys['edges_meta_description']?.pages).toEqual(['edges']);
     expect(descriptor.keys['edges_meta_description']?.limits).toEqual({ max: 160, severity: 'advisory' });
+    expect(fake2.runs).toHaveLength(2);
+    expect(await runCli(['check'], { ...h.io, stdout: () => undefined, stderr: () => undefined })).toBe(0);
+  });
+
+  it('declares a page --pages named before it was declared, and fills it (C12)', async () => {
+    const fake = fakeLighthouse({ '/edges.html': cleanLhr(savedLhr('edges.html')) });
+    const plan = edgesHost(fake, { declared: false });
+    expect(await plan.run('--fix', '--pages', 'edges')).toBe(0);
+    expect(plan.out.join('\n')).toContain(
+      [
+        'fixes (3) — edges.html:',
+        '  <meta charset="utf-8"> as the first element of <head>',
+        '  <meta name="viewport" content="width=device-width, initial-scale=1"> after it',
+      ].join('\n'),
+    );
+    expect(plan.out.join('\n')).toContain('data-stet-content="edges_meta_description">');
+    expect(plan.out.join('\n')).not.toMatch(/lang=/);
+    expect(readFileSync(join(plan.cwd, 'edges.html'), 'utf8')).toBe(EDGES);
+
+    const fake2 = fakeLighthouse({ '/edges.html': cleanLhr(savedLhr('edges.html')) });
+    const h = edgesHost(fake2, { declared: false });
+    expect(await h.run('--fix', '--write', '--pages', 'edges')).toBe(0);
+    expect(h.out).toContain('edges.html: 3 edits applied');
+    expect(h.out).toContain("edges: declared (/edges) — edges_meta_description is empty; fill it in the dashboard's SEO group or content/defaults.json");
+    const descriptor = descriptorOf(h);
+    expect(descriptor.pages?.['edges']?.route).toBe('/edges');
+    expect(descriptor.pages?.['edges']?.seo?.['description']).toBe('edges_meta_description');
+    expect(descriptor.keys['edges_meta_description']?.pages).toEqual(['edges']);
     expect(fake2.runs).toHaveLength(2);
     expect(await runCli(['check'], { ...h.io, stdout: () => undefined, stderr: () => undefined })).toBe(0);
   });
