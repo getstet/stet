@@ -152,18 +152,19 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
   if (dir === null || where === null) return false;
   const hook = operatorHook(dir).path;
   const listed = readGate(where.common);
-  // This worktree's own entry and, run in the main worktree, every entry for
-  // this folder whose worktree is gone: a merged branch's coverage leaves only
-  // from the checkout it covers, and a live worktree's entry always stays.
-  // A dead entry for a folder this worktree does not hold is taken out too: no
-  // checkout remains here for it to gate, and without this a merged-never
-  // branch's entry could not be removed by any stet command.
-  const top = where.worktree === '' ? worktreeTop(cwd) : null;
-  const here = (entry: GateEntry): boolean =>
-    isSite(where)(entry) ||
-    (top !== null &&
-      !entryAlive(where.common, entry) &&
-      (entry.checkout === where.checkout || !existsSync(join(top, entry.checkout, CONFIG_FILE))));
+  // This worktree's own entry and, run in the main worktree (any worktree of a
+  // bare repository, which has no main one), every entry for this folder whose
+  // worktree is gone: a merged branch's coverage leaves only from the checkout
+  // it covers, and a live worktree's entry always stays. A dead entry for a
+  // folder this worktree does not hold is taken out too: no checkout remains
+  // here for it to gate, and without this a merged-never branch's entry could
+  // not be removed by any stet command.
+  const top = where.worktree === '' || bareRepository(where.common) ? worktreeTop(cwd) : null;
+  const dead = (entry: GateEntry): boolean => top !== null && !entryAlive(where.common, entry);
+  const ofThis = (entry: GateEntry): boolean => isSite(where)(entry) || (dead(entry) && entry.checkout === where.checkout);
+  const stale = (entry: GateEntry): boolean =>
+    dead(entry) && entry.checkout !== where.checkout && !existsSync(join(top as string, entry.checkout, CONFIG_FILE));
+  const here = (entry: GateEntry): boolean => ofThis(entry) || stale(entry);
   const rest = listed.filter((entry) => !here(entry));
   const listedHere = rest.length < listed.length;
   const through = rest.find((entry) => entry.checkout === where.checkout);
@@ -177,7 +178,10 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
     }
   };
   const takeOut = (): void => {
-    report.line('remove this checkout from the stet pre-commit gate');
+    if (listed.some(ofThis)) report.line('remove this checkout from the stet pre-commit gate');
+    for (const folder of new Set(listed.filter(stale).map((entry) => entry.checkout))) {
+      report.line(`${label(folder)}: ${write ? 'removed' : 'remove'} the gate entry a removed worktree left`);
+    }
     if (!write) return;
     // Read again under the lock: another checkout may have joined since.
     withGateLock(where.common, () =>
@@ -447,6 +451,15 @@ const label = (checkout: string): string => (checkout === '' ? 'the repository r
 /** A gate entry's worktree in words: '' is the main worktree, `worktrees/<name>` a linked one. */
 const worktreeLabel = (worktree: string): string =>
   worktree === '' ? 'the main worktree' : `the worktree ${worktree.replace(/^worktrees\//, '')}`;
+
+/** Whether the repository whose common git directory is `common` is bare. */
+function bareRepository(common: string): boolean {
+  try {
+    return git(common, ['rev-parse', '--is-bare-repository']) === 'true';
+  } catch {
+    return false;
+  }
+}
 
 export function worktreeTop(cwd: string): string | null {
   try {

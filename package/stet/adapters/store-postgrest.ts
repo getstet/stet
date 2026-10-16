@@ -121,18 +121,19 @@ function fetchOf(conn: { fetchImpl?: Fetch }): Fetch {
   return conn.fetchImpl ?? ((...args) => globalThis.fetch(...args));
 }
 
-/** `message` with `url` shown as its origin: a user and password the URL carries never reach a store error. */
+/**
+ * `message` with `url` shown as its origin and any userinfo left in it removed:
+ * a user and password the URL carries never reach a store error. A URL that does
+ * not parse is cut to the last `@`, which may take a query with it.
+ */
 function withoutUrl(message: string, url: string): string {
   let origin: string;
-  let secrets: string[] = [];
   try {
-    const parsed = new URL(url);
-    origin = parsed.origin;
-    secrets = [parsed.username, parsed.password].filter((part) => part !== '');
+    origin = new URL(url).origin;
   } catch {
-    origin = url.replace(/\/\/[^/]*@/, '//');
+    origin = url.replace(/\/\/.*@/, '//');
   }
-  return secrets.reduce((text, secret) => text.split(secret).join(''), message.split(url).join(origin));
+  return message.split(url).join(origin).replace(/\/\/[^\s/@]*@/g, '//');
 }
 
 /**

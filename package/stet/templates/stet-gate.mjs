@@ -52,9 +52,13 @@ function localStet(dir) {
   }
 }
 
-/** Whether git tracks anything under `path`, which it asks about literally; an answer it cannot give counts as yes. */
+/**
+ * Whether git tracks anything under `path`, which it asks about literally and
+ * without regard to case (a case-insensitive disk lets the index spell it
+ * differently); an answer it cannot give counts as yes.
+ */
 function tracksAnything(path) {
-  const listed = spawnSync('git', ['ls-files', '-z', '--', `:(literal)${path}`], { cwd: top, encoding: 'utf8' });
+  const listed = spawnSync('git', ['ls-files', '-z', '--', `:(literal,icase)${path}`], { cwd: top, encoding: 'utf8' });
   return listed.status !== 0 || listed.stdout !== '';
 }
 

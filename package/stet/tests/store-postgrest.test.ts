@@ -842,6 +842,19 @@ describe('store-postgrest, the gateway key and the request bound', () => {
       }) as typeof globalThis.fetch,
     });
     expect(JSON.stringify(await malformed.read())).not.toContain('s3cret');
+    // A password with a raw slash does not parse; it is cut to the last `@`.
+    const slashed = createPostgrestStore({
+      url: 'http://neil:pa/ss@postgrest.test/rest/v1',
+      token: 'tok',
+      project: 'site',
+      fetchImpl: (async (input: string | URL | Request) => {
+        throw new TypeError(`Failed to parse URL from ${String(input)}`);
+      }) as typeof globalThis.fetch,
+    });
+    expect(JSON.stringify(await slashed.read())).not.toContain('pa/ss');
+    // A short username never cuts letters out of the rest of the message.
+    const short = createPostgrestStore({ url: 'http://u:pw@postgrest.test/rest/v1', token: 'tok', project: 'site', fetchImpl: refuses });
+    expect((await short.read()) as { message: string }).toMatchObject({ message: expect.stringContaining('Request cannot be constructed') });
   });
 
   it('with no bound given the default applies and a prompt answer still reads', async () => {

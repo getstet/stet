@@ -847,6 +847,43 @@ describe('the connection environment', () => {
     });
   });
 
+  it('keeps stripping the started-in checkout’s names while its config does not load', async () => {
+    const started = makeCliHost({ config: { project: 't', store: pair } });
+    const other = makeCliHost({ config: { project: 't' } });
+    const site = { path: other.cwd, config: loadConfig(other.cwd) };
+    const file = join(started.cwd, 'stet.config.json');
+    const good = readFileSync(file, 'utf8');
+    await withProcessEnv({ FSG_URL: 'http://process.test', FSG_TOKEN: 'secret' }, () => {
+      expect('FSG_TOKEN' in siteChildEnv(site, started.cwd)).toBe(false);
+      // Mid-edit, and then gone: the names it last had are still stripped.
+      writeFileSync(file, '{', 'utf8');
+      expect('FSG_TOKEN' in siteChildEnv(site, started.cwd)).toBe(false);
+      rmSync(file);
+      expect('FSG_TOKEN' in siteChildEnv(site, started.cwd)).toBe(false);
+      writeFileSync(file, good, 'utf8');
+    });
+  });
+
+  it('strips the names of a started-in config that never loaded since the dev server started', async () => {
+    const started = makeCliHost({ config: { project: 't', store: pair } });
+    const other = makeCliHost({ config: { project: 't' } });
+    const site = { path: other.cwd, config: loadConfig(other.cwd) };
+    const handle = await startDevServer({
+      port: 0,
+      workspaceFile: workspaceFile(),
+      io: { cwd: started.cwd, env: {}, stdout: () => {}, stderr: () => {} },
+      launched: started.cwd,
+    });
+    try {
+      writeFileSync(join(started.cwd, 'stet.config.json'), '{', 'utf8');
+      await withProcessEnv({ FSG_TOKEN: 'secret' }, () => {
+        expect('FSG_TOKEN' in siteChildEnv(site, started.cwd)).toBe(false);
+      });
+    } finally {
+      await handle.close();
+    }
+  });
+
   it('hands the started-in checkout’s children no variable the shell holds empty', async () => {
     const host = makeCliHost({ config: { project: 't', store: pair } });
     const site = { path: host.cwd, config: loadConfig(host.cwd) };
@@ -2280,6 +2317,25 @@ describe('POST /api/site/commit and /push', () => {
     const saved = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'hero_headline', value }] });
     await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['written'] as string[], keys: ['hero_headline'] });
   }
+
+  it('runs another checkout’s commit and push hooks without the started-in checkout’s connection variables', async () => {
+    const started = makeCliHost({
+      config: { project: 't', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } },
+    });
+    const host = snapshotHost();
+    git(host.cwd, ['checkout', '-qb', 'develop']);
+    bareRemote(host.cwd, 'origin');
+    mkdirSync(join(host.cwd, '.git', 'hooks'), { recursive: true });
+    for (const name of ['pre-commit', 'pre-push']) {
+      writeFileSync(join(host.cwd, '.git/hooks', name), '#!/bin/sh\necho "${STET_POSTGREST_TOKEN-unset}" >> .git/saw.txt\n', { mode: 0o755 });
+    }
+    await withProcessEnv({ STET_POSTGREST_TOKEN: 'SERVICE-KEY' }, async () => {
+      const { handler } = handlerOver([started.cwd, host.cwd], { launched: realpathSync(started.cwd) });
+      await commitHeadline(handler, host, 'Hooked');
+      expect((await post(handler, `/api/site/push${at(host)}`, {})).status).toBe(200);
+    });
+    expect(readFileSync(join(host.cwd, '.git/saw.txt'), 'utf8')).toBe('unset\nunset\n');
+  });
 
   it('pushes a branch with no upstream with -u to origin, then lands the next commit on it (journey B18)', async () => {
     const host = snapshotHost();

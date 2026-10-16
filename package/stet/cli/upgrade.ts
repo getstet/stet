@@ -287,7 +287,7 @@ async function migrate(
   verify: boolean,
 ): Promise<void> {
   if (verify) {
-    await verifyMoved(io, project, report);
+    await verifyMoved(io, project, report, dryRun);
     return;
   }
   await applyPending(io, project, report, dryRun);
@@ -521,7 +521,7 @@ function printForOutOfBandApply(
   report.line('  stet seed');
 }
 
-async function verifyMoved(io: CliIo, project: LoadedProject, report: Report): Promise<void> {
+async function verifyMoved(io: CliIo, project: LoadedProject, report: Report, dryRun: boolean): Promise<void> {
   const installed = await installedVersion(io, project, report);
   if (installed === null) return;
   const pending = migrations().filter((m) => m.number > installed);
@@ -533,7 +533,7 @@ async function verifyMoved(io: CliIo, project: LoadedProject, report: Report): P
     return;
   }
   report.line(`verified: stet_meta reports schema_version ${installed}`);
-  await stamp(io, project, report);
+  if (!dryRun) await stamp(io, project, report);
 }
 
 /**

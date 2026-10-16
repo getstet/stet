@@ -30,7 +30,7 @@ import { untilInterrupted } from './liveness.js';
 import { disposeStore } from './project.js';
 import type { CliIo } from './main.js';
 import { CliError, UsageError } from './report.js';
-import { addSite, childEnv, workspacePath } from './workspace.js';
+import { addSite, childEnv, launchedConnectionNames, workspacePath } from './workspace.js';
 
 /** The port the dashboard takes when nothing says otherwise. */
 const DEFAULT_PORT = 4400;
@@ -102,6 +102,8 @@ export async function startDevServer(opts: StartDevServerOptions): Promise<DevSe
     ...(opts.launched === undefined ? {} : { launched: opts.launched }),
     ...(opts.storeFor === undefined ? {} : { storeFor: opts.storeFor }),
   };
+  // Read the started-in checkout's connection names now, while its config is whole.
+  if (opts.launched !== undefined) launchedConnectionNames(opts.launched);
   const handler = createDevHandler(ctx);
   const server = createServer((req, res) => {
     void serve(handler, ctx.origin, req, res);

@@ -539,6 +539,29 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(drain(log)).toEqual(['check in s*', 'scan in s*', 'seo check in s*']);
   });
 
+  it('(a8b) a stet the index spells in another case still counts as one the branch committed', async () => {
+    const log = logFile();
+    const main = gitRepo();
+    mkdirSync(join(main, 'site'));
+    writeFileSync(join(main, 'site/stet.config.json'), '{}\n');
+    commit(main, 'base');
+    const installed = linkedWorktree(main, 'inst');
+    standIn(join(installed, 'site'), log);
+    expect(await runHookInstall([], io(join(installed, 'site')))).toBe(0);
+
+    // On disk `site/node_modules/.bin/stet`; in the index `Site/node_modules/.bin/stet`, as a case-insensitive disk records a merge.
+    standIn(join(main, 'site'), log);
+    const blob = execFileSync('git', ['hash-object', '-w', 'site/node_modules/.bin/stet'], { cwd: main, encoding: 'utf8' }).trim();
+    execFileSync('git', ['update-index', '--add', '--cacheinfo', `100755,${blob},Site/node_modules/.bin/stet`], { cwd: main });
+    commit(main, 'a stet the index spells in another case');
+    drain(log);
+
+    writeFileSync(join(main, 'site/stet.config.json'), '{"project":"t"}\n');
+    const landed = commit(main, 'edits the tracked config');
+    expect(landed.code, landed.out).toBe(0);
+    expect(drain(log)).toEqual([]);
+  });
+
   it('(a9) hook remove and eject in the main worktree drop an entry whose folder it does not hold, once its worktree is gone', async () => {
     for (const remove of ['hook remove', 'eject'] as const) {
       const { top: main } = await gatedRepo(['site'], { log: logFile() });
@@ -569,6 +592,51 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
       expect(existsSync(join(main, '.git/stet-gate.mjs')), remove).toBe(false);
       expect(existsSync(join(main, '.git/stet-gate.json')), remove).toBe(false);
     }
+  });
+
+  it('(a9b) a dead entry for another folder is named when it goes, and a folder with no entry is not told it left', async () => {
+    const { top: main } = await gatedRepo(['site'], { log: logFile() });
+    const gone = linkedWorktree(main, 'gone');
+    mkdirSync(join(gone, 'exp-gone'));
+    writeFileSync(join(gone, 'exp-gone/stet.config.json'), '{}\n');
+    expect(await runHookInstall([], io(join(gone, 'exp-gone')))).toBe(0);
+    execFileSync('git', ['worktree', 'remove', '--force', gone], { cwd: main });
+    expect(await runHookInstall([], io(join(main, 'site')))).toBe(0);
+    // A second stet folder of the main worktree, never listed.
+    mkdirSync(join(main, 'other'));
+    writeFileSync(join(main, 'other/stet.config.json'), '{}\n');
+
+    const remove = io(join(main, 'other'));
+    expect(await runHookRemove([], remove)).toBe(0);
+    expect(remove.out).toEqual(['exp-gone/: removed the gate entry a removed worktree left']);
+    expect(readGate(join(main, '.git')).map((entry) => entry.checkout)).toEqual(['site']);
+
+    // The folder's own entry still reads as before.
+    const own = io(join(main, 'site'));
+    expect(await runHookRemove([], own)).toBe(0);
+    expect(own.out).toEqual(['remove the stet pre-commit hook']);
+  });
+
+  it('(a9c) in a bare repository a linked worktree takes out a removed worktree’s entry for its own folder', async () => {
+    const origin = gitRepo();
+    mkdirSync(join(origin, 'site'));
+    writeFileSync(join(origin, 'site/stet.config.json'), '{}\n');
+    commit(origin, 'base');
+    const parent = mkdtempSync(join(tmpdir(), 'stet-gate-bare-'));
+    made.push(parent);
+    const bare = join(parent, 'bare.git');
+    execFileSync('git', ['clone', '-q', '--bare', origin, bare]);
+    const branch = execFileSync('git', ['branch', '--show-current'], { cwd: origin, encoding: 'utf8' }).trim();
+    for (const name of ['bw1', 'bw2']) {
+      execFileSync('git', ['worktree', 'add', '-q', '-b', name, join(parent, name), branch], { cwd: bare });
+      expect(await runHookInstall([], io(join(parent, name, 'site')))).toBe(0);
+    }
+    execFileSync('git', ['worktree', 'remove', '--force', join(parent, 'bw2')], { cwd: bare });
+
+    expect(await runHookRemove([], io(join(parent, 'bw1/site')))).toBe(0);
+    expect(existsSync(join(bare, 'hooks/pre-commit'))).toBe(false);
+    expect(existsSync(join(bare, 'stet-gate.json'))).toBe(false);
+    expect(existsSync(join(bare, 'stet-gate.mjs'))).toBe(false);
   });
 
   it('(a10) an entry a 0.7.0 install wrote, with no id, goes once its worktree is gone and stays while it is there', async () => {

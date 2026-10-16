@@ -258,14 +258,16 @@ export function pushRemoteOf(cwd: string, branch: string): { remote: string } | 
  * Same contract as `git`: never throws on git's own failure, stdout and stderr
  * merged in arrival order, the run token out of the child's environment. The
  * deadline is an argument so a fixture can reach it in a second; the
- * callers take the default.
+ * callers take the default. `without` names further variables the run drops,
+ * for a site whose hooks must not read another site's connection.
  */
 export function gitRun(
   cwd: string,
   args: string[],
   timeoutMs: number = GIT_TIMEOUT_MS,
+  without: readonly string[] = [],
 ): Promise<{ code: number; out: string }> {
-  return runTool('git', cwd, args, timeoutMs);
+  return runTool('git', cwd, args, timeoutMs, without);
 }
 
 /**
@@ -279,7 +281,10 @@ export function runTool(
   cwd: string,
   args: string[],
   timeoutMs: number = GIT_TIMEOUT_MS,
+  without: readonly string[] = [],
 ): Promise<{ code: number; out: string }> {
+  const env: NodeJS.ProcessEnv = { ...childEnv(), GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1' };
+  for (const name of without) delete env[name];
   return new Promise((resolve) => {
     let out = '';
     let settled = false;
@@ -293,7 +298,7 @@ export function runTool(
     };
     const child = spawn(cmd, args, {
       cwd,
-      env: { ...childEnv(), GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1' },
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       // Its own process group, so the deadline can signal the hook git spawned
       // as well as git itself. A hook left running after git is gone holds the

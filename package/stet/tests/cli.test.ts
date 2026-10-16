@@ -1841,6 +1841,8 @@ describe('upgrade', () => {
     expect(await host.run('upgrade', '--dry-run')).toBe(0);
     expect(host.stdout()).toContain('migrations: up to date at 3');
     expect(writes).toEqual([]);
+    expect(await host.run('upgrade', '--dry-run', '--verify')).toBe(0);
+    expect(writes).toEqual([]);
     expect(await host.run('upgrade')).toBe(0);
     expect(writes).toHaveLength(1);
     expect(writes[0]).toMatch(/^PATCH .*stet_meta/);
