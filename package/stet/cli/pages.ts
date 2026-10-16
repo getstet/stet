@@ -805,14 +805,15 @@ export interface AuditablePage {
  * document is the one whose file route is its route (`declaredOnly`), else the
  * managed document its route names on disk (`servableFile`, R7); two documents
  * proposing one name (`about.html` beside `about/index.html`) keep the first
- * in file order.
+ * in file order. A JavaScript host declaring no page answers `home` at `/`.
  */
 export function auditablePages(cwd: string, config: StetConfig, descriptor: Descriptor): AuditablePage[] {
   const pages = descriptor.pages ?? {};
   const declared: AuditablePage[] = Object.keys(pages)
     .sort()
     .map((page) => ({ page, route: pages[page]?.route ?? '/', declared: true }));
-  if (!isHtmlHost(config)) return declared;
+  // A JavaScript host declaring none still has `/`, which every surface calls `home`.
+  if (!isHtmlHost(config)) return declared.length === 0 ? [{ page: 'home', route: '/', declared: false }] : declared;
   const files = filesForGlobs(cwd, config.managedSurfaces).sort();
   const root = realpathSync(cwd); // `servableFile` answers a real path
   const out = declared.map((entry) => {

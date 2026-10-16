@@ -22,8 +22,8 @@ export interface DocumentFix {
   mints: Array<{ key: string; role: 'page_title' | 'meta_description' }>;
 }
 
-/** A doctype at the document's start, after a BOM and any comments; a legacy one counts. */
-const DOCTYPE = /^﻿?\s*(?:<!--[\s\S]*?-->\s*)*<!doctype\s+html\b/i;
+/** A doctype at the document's start, after a BOM, an XML declaration and any comments; a legacy one counts. */
+export const DOCTYPE = /^﻿?\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--[\s\S]*?-->\s*)*<!doctype\s+html\b/i;
 
 const CHARSET = '<meta charset="utf-8">';
 const VIEWPORT = '<meta name="viewport" content="width=device-width, initial-scale=1">';

@@ -7791,7 +7791,7 @@ describe('the page', () => {
     const indexPage = (): Record<string, unknown> =>
       pageOf('home', { accessibility: 89, bestPractices: 96 }, [
         audit('copy', 'label', { at: 'index.html:12', snippet: '<textarea id="notes">', key: 'hero_headline', remedy: 'name the field through a key' }),
-        audit('copy', 'meta-description', { remedy: 'hero_story is empty' }),
+        audit('copy', 'meta-description', { key: 'hero_story', remedy: 'hero_story is empty' }),
         audit('host', 'target-size', { at: 'index.html:30', snippet: '<a href="/c">c</a>', remedy: 'pad the link' }),
         audit('host', 'is-crawlable', { remedy: 'serve a 404' }),
       ], { file: 'index.html' });
@@ -7868,7 +7868,7 @@ describe('the page', () => {
       const held = { reply: done(resultOf([fixed])) };
       const page = await card(htmlSite(), held);
       expect(body(page)).toContain('3 head edits');
-      held.reply = done(resultOf([fixed, pageOf('home', {}, [audit('copy', 'meta-description', { remedy: 'minted_key is empty' })], { file: 'index.html' })]));
+      held.reply = done(resultOf([fixed, pageOf('home', {}, [audit('copy', 'meta-description', { key: 'minted_key', remedy: 'minted_key is empty' })], { file: 'index.html' })]));
       // The write minted the key: the site read after it declares it.
       page.answer('/api/site', 200, siteBody({ host: 'html', descriptor: { ...descriptor, keys: { ...descriptor.keys, minted_key: { shape: 'text', target: 'web' } } } }));
       await page.act('auditFix:home');
@@ -7898,6 +7898,43 @@ describe('the page', () => {
       expect((docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('A draft the fix must not eat');
       // The refresh did read the site: the key the fix minted is in the list.
       expect(page.html()).toContain('<option value="prefix:minted">minted</option>');
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('keeps the drafts a person has open when the SEO tab declares a page', async () => {
+      const page = await paint();
+      await page.act('tab:Content');
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'A draft declaring must not eat');
+      expect(page.html()).toContain('1 unsaved edit');
+      await page.act('tab:SEO');
+      await page.act('seoLoad');
+      await page.act('declare:about');
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/pages/declare')).at(-1)?.body).toEqual({ names: ['about'] });
+      await page.act('tab:Content');
+      expect(page.html()).toContain('1 unsaved edit');
+      expect((docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('A draft declaring must not eat');
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('opens a key only where the audit carries it, never for a remedy word that happens to name a declared key', async () => {
+      const keyed: Descriptor = { ...descriptor, keys: { ...descriptor.keys, label: { shape: 'text', target: 'web' }, alt: { shape: 'text', target: 'web' }, home_meta_description: { shape: 'text', target: 'web' } } };
+      const held = {
+        reply: done(
+          resultOf([
+            pageOf('home', {}, [
+              audit('copy', 'label', { at: 'index.html:12', snippet: '<textarea id="notes">', remedy: 'has no label — give it id="notes" and write a <label for="notes">' }),
+              audit('copy', 'image-alt', { remedy: 'has no alt — write alt text, or alt="" for a decorative image' }),
+              audit('copy', 'meta-description', { key: 'home_meta_description', remedy: 'index.html has no description — in the plan below, bound to home_meta_description' }),
+            ], { file: 'index.html' }),
+          ]),
+        ),
+      };
+      const page = await card(siteBody({ host: 'html', descriptor: keyed }), held);
+      await page.act('auditRun');
+      expect([...docOf(page).querySelectorAll('.card [data-act^="edit:"]')].map((b) => b.getAttribute('data-act'))).toEqual(['edit:home_meta_description']);
       expect(page.errors).toEqual([]);
       page.dom.window.close();
     });
@@ -8172,6 +8209,20 @@ describe('the audit child (D10)', () => {
     const js = auditHost(snapshotHost().cwd, 'argv');
     const refused = await post(js.handler, `/api/site/audit-start${js.query}`, { url: 'ftp://example.com/' });
     expect(refused).toEqual({ status: 400, body: { error: 'url must be an http or https address' } });
+  });
+
+  it('accepts home on a JavaScript site declaring no page, for the audit and its fixes alike', async () => {
+    const js = auditHost(
+      snapshotHost((descriptor) => {
+        delete (descriptor as { pages?: unknown }).pages;
+        for (const def of Object.values(descriptor.keys)) delete (def as { pages?: unknown }).pages;
+      }).cwd,
+      'argv',
+    );
+    const started = await post(js.handler, `/api/site/audit-start${js.query}`, { fix: true, pages: ['home'] });
+    expect(started.status).toBe(200);
+    expect((await settled(js.handler, js.query)).result.argv).toEqual(['audit', 'lighthouse', '--json', '--pages', 'home', '--fix', '--write', '--build']);
+    expect((await post(js.handler, `/api/site/audit-start${js.query}`, { pages: ['pricing'] })).body).toEqual({ error: 'pricing is not a declared page' });
   });
 
   it('refuses --build on a Next site below 16 whose dev server runs, and on one whose version cannot be read', async () => {

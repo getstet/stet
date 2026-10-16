@@ -267,8 +267,17 @@ describe('the lines (D4)', () => {
     };
     const bound = readRun(failing('meta-description'), context({ descriptor, def: descriptor.pages?.['edges'], page: 'edges', snapshot: { default: { edges_meta_description: '' } }, file: 'edges.html' }));
     expect(bound.lines).toEqual(['copy  meta-description  edges_meta_description is empty']);
+    expect(bound.audits[0]?.key).toBe('edges_meta_description');
     const absent = readRun(failing('meta-description'), context({ def: { route: '/edges' }, page: 'edges', file: 'edges.html', fix: true }));
     expect(absent.lines).toEqual(['copy  meta-description  edges.html has no description — in the plan below, bound to edges_meta_description']);
+    expect(absent.audits[0]?.key).toBe('edges_meta_description');
+  });
+
+  it('carries no key on an audit whose line names none, though a remedy word could match a declared key', () => {
+    const descriptor: Descriptor = { version: 1, keys: { label: { shape: 'text', target: 'web' }, alt: { shape: 'text', target: 'web' } }, pages: { home: { route: '/' } } };
+    const read = readRun(failing('image-alt', { node: { snippet: '<img src="/a.png">' } }), context({ descriptor, def: descriptor.pages?.['home'], document: null }));
+    expect(read.lines[0]).toContain('has no alt — write alt text');
+    expect(read.audits[0]?.key).toBeUndefined();
   });
 });
 

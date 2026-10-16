@@ -98,9 +98,26 @@ describe('stet audit lighthouse — the html host (journey C11)', () => {
     expect(fake.runs).toHaveLength(1);
     const next = nextHost(fake);
     write(next.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
-    expect(await next.run('--url', 'http://127.0.0.1:3999/', '--pages', 'home')).toBe(2);
-    expect(next.err.join('\n')).toContain('stet audit lighthouse --pages: home is not a declared page');
+    expect(await next.run('--url', 'http://127.0.0.1:3999/', '--pages', 'nosuch')).toBe(2);
+    expect(next.err.join('\n')).toContain('stet audit lighthouse --pages: nosuch is not a declared page');
     expect(fake.starts).toHaveLength(1);
+  });
+
+  it('takes --pages home on a JavaScript host declaring no page as / audited once, named home on every line', async () => {
+    const fake = fakeLighthouse({ '/': cleanLhr() });
+    const named = nextHost(fake);
+    write(named.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await named.run('--url', 'http://127.0.0.1:3999/', '--pages', 'home')).toBe(0);
+    expect(fake.runs).toHaveLength(1);
+    expect(named.out).not.toContain('no pages declared — audited / alone; run stet pages scan to declare them');
+    expect(named.out.join('\n')).toMatch(/^home {2}\/ {2}Performance 100/m);
+    expect(named.err).toContain('auditing home… 1/1');
+
+    const bare = nextHost(fake);
+    write(bare.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await bare.run('--url', 'http://127.0.0.1:3999/')).toBe(0);
+    expect(bare.out).toContain('no pages declared — audited / alone; run stet pages scan to declare them');
+    expect(bare.out.join('\n')).toMatch(/^home {2}\/ {2}Performance 100/m);
   });
 
   it('prints the median of five, the audit lines from the first run', async () => {
@@ -269,6 +286,42 @@ describe('stet audit lighthouse — no other command loads Lighthouse', () => {
   });
 });
 
+describe('stet audit lighthouse — an install missing its audit packages', () => {
+  /** The built bin run with one package answered as not found by Node's own resolver, as a pruned install leaves it. */
+  for (const name of ['lighthouse', 'chrome-launcher', 'selfsigned']) {
+    it.skipIf(!builtBinExists())(`prints one line and exits 1 where ${name} is missing, leaving no front`, async () => {
+      const h = htmlHost(null);
+      const tools = mkdtempSync(join(tmpdir(), 'stet-lighthouse-tools-'));
+      write(
+        tools,
+        'hide.mjs',
+        [
+          'export async function resolve(specifier, context, next) {',
+          `  if (specifier === '${name}') {`,
+          `    const error = new Error("Cannot find package '${name}' imported from stet");`,
+          "    error.code = 'ERR_MODULE_NOT_FOUND';",
+          '    throw error;',
+          '  }',
+          '  return next(specifier, context);',
+          '}',
+          '',
+        ].join('\n'),
+      );
+      write(tools, 'register.mjs', "import { register } from 'node:module';\nregister('./hide.mjs', import.meta.url);\n");
+      const stet = spawn(process.execPath, ['--import', join(tools, 'register.mjs'), BUILT_BIN, 'audit', 'lighthouse'], {
+        cwd: h.cwd,
+        env: { ...process.env, STET_WORKSPACE: join(h.cwd, '.no-workspace.json') },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      stet.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString('utf8')));
+      const code = await new Promise<number | null>((resolve) => stet.on('exit', (exit) => resolve(exit)));
+      expect(code).toBe(1);
+      expect(stderr).toBe('error: Lighthouse is not installed — reinstall @getstet/stet\n');
+    }, 30_000);
+  }
+});
+
 describe('stet audit lighthouse — the page URL on the html host (D3)', () => {
   const paths = (fake: FakeLighthouse): string[] => fake.runs.map((r) => new URL(r.url).pathname);
 
@@ -402,8 +455,8 @@ describe('stet audit lighthouse --build (D3)', () => {
     return { ...h, workspace };
   }
   /** Whether the preview has ended, given a moment for this process to reap it: an ended child stays a zombie until then. */
-  const previewGone = async (cwd: string): Promise<boolean> => {
-    const pid = Number(readFileSync(join(cwd, 'preview.pid'), 'utf8'));
+  const previewGone = async (cwd: string, pidFile = 'preview.pid'): Promise<boolean> => {
+    const pid = Number(readFileSync(join(cwd, pidFile), 'utf8'));
     const deadline = Date.now() + 2_000;
     for (;;) {
       try {
@@ -515,6 +568,26 @@ describe('stet audit lighthouse --build (D3)', () => {
       expect(await previewGone(h.cwd)).toBe(true);
     }, 30_000);
   }
+
+  it.skipIf(!builtBinExists())('ends a build still running when the command is signalled, and starts nothing after it', async () => {
+    const h = buildHost(fakeLighthouse({}), {
+      build: "node -e \"require('fs').writeFileSync('build.pid', String(process.pid)); setTimeout(() => {}, 8000)\"",
+    });
+    const stet = spawn(process.execPath, [BUILT_BIN, 'audit', 'lighthouse', '--build'], {
+      cwd: h.cwd,
+      env: { ...process.env, STET_WORKSPACE: h.workspace },
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    const exited = new Promise<number | null>((resolve) => stet.on('exit', (exit) => resolve(exit)));
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(join(h.cwd, 'build.pid')) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(existsSync(join(h.cwd, 'build.pid'))).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    stet.kill('SIGTERM');
+    expect(await exited).toBe(143);
+    expect(await previewGone(h.cwd, 'build.pid')).toBe(true);
+    expect(existsSync(join(h.cwd, 'preview.pid'))).toBe(false);
+  }, 30_000);
 
   it('names the bundle before the paint on a Vite build below 100, and nowhere else', async () => {
     const vite = (performance: number): LighthouseResult => {
@@ -681,6 +754,27 @@ describe('stet audit lighthouse --fix --write (D5)', () => {
     expect(await runCli(['check'], { ...h.io, stdout: () => undefined, stderr: () => undefined })).toBe(0);
   });
 
+  it('reports a page once after --fix --write, the re-run replacing the first result, and --strict judges the re-run', async () => {
+    const before = cleanLhr(savedLhr('edges.html'));
+    (before.categories['accessibility'] as { score: number | null }).score = 0.9;
+    const fake = fakeLighthouse({ '/edges.html': (n: number) => (n === 0 ? before : cleanLhr(savedLhr('edges.html'))) });
+    const h = edgesHost(fake);
+    expect(await h.run('--fix', '--write', '--strict', '--json', '--pages', 'edges')).toBe(0);
+    expect(fake.runs).toHaveLength(2);
+    const report = JSON.parse(h.out.join('\n')) as { ok: boolean; findings: unknown[]; pages: Array<{ page: string; scores: Record<string, number> }> };
+    expect(report.pages.map((page) => page.page)).toEqual(['edges']);
+    expect(report.pages[0]?.scores).toEqual({ performance: 100, accessibility: 100, bestPractices: 100, seo: 100 });
+    expect(report.ok).toBe(true);
+    expect(report.findings).toEqual([]);
+
+    // A re-run still below 100 is what --strict reports, once.
+    const after = cleanLhr(savedLhr('edges.html'));
+    (after.categories['seo'] as { score: number | null }).score = 0.9;
+    const stillBelow = edgesHost(fakeLighthouse({ '/edges.html': (n: number) => (n === 0 ? before : after) }));
+    expect(await stillBelow.run('--fix', '--write', '--strict', '--json', '--pages', 'edges')).toBe(1);
+    expect((JSON.parse(stillBelow.out.join('\n')) as { findings: Array<{ message: string }> }).findings.map((f) => f.message)).toEqual(['edges: seo 90 below 100']);
+  });
+
   it('declares a page --pages named before it was declared, and fills it (C12)', async () => {
     const fake = fakeLighthouse({ '/edges.html': cleanLhr(savedLhr('edges.html')) });
     const plan = edgesHost(fake, { declared: false });
@@ -707,6 +801,28 @@ describe('stet audit lighthouse --fix --write (D5)', () => {
     expect(descriptor.keys['edges_meta_description']?.pages).toEqual(['edges']);
     expect(fake2.runs).toHaveLength(2);
     expect(await runCli(['check'], { ...h.io, stdout: () => undefined, stderr: () => undefined })).toBe(0);
+  });
+
+  it('reads / audited alone with no page as home, so the copy lines and the plan name one key', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'stet-lighthouse-fix-'));
+    write(cwd, 'index.html', '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n</head>\n<body><main><p>Hi</p></main></body>\n</html>\n');
+    write(cwd, 'stet.config.json', JSON.stringify({ project: 't', host: 'html', managedSurfaces: ['**/*.html'] }));
+    write(cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    write(cwd, 'content/defaults.json', JSON.stringify({ default: {} }));
+    const lhr = cleanLhr();
+    for (const id of ['document-title', 'meta-description']) {
+      const audit = lhr.audits[id] as { score: number | null; title: string };
+      audit.score = 0;
+      audit.title = `Lighthouse's own words for ${id}`;
+    }
+    (lhr.categories['seo'] as { score: number | null }).score = 0.9;
+    const h = host(cwd, { lighthouse: fakeLighthouse({ '/': lhr }).start });
+    expect(await h.run('--fix')).toBe(0);
+    const out = h.out.join('\n');
+    expect(out).toContain('index.html has no title — in the plan below, bound to home_page_title');
+    expect(out).toContain('index.html has no description — in the plan below, bound to home_meta_description');
+    expect(out).not.toContain("Lighthouse's own words");
+    expect(out).toContain('data-stet-content="home_meta_description"');
   });
 
   it('declares home at / where no page was declared, for the keys minted on index.html', async () => {
@@ -847,6 +963,16 @@ describe('stet audit lighthouse — the exit, the JSON and --raw (D2)', () => {
       [100, 100, 100],
       [100, 100, 100],
     ]);
+  });
+
+  it('reads / alone with no page declared as home, so a description failure gets the Astro line', async () => {
+    const lhr = cleanLhr();
+    (lhr.audits['meta-description'] as { score: number | null }).score = 0;
+    (lhr.categories['seo'] as { score: number | null }).score = 0.9;
+    const h = astroHost(lhr);
+    write(h.cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
+    expect(await h.run('--url', 'http://127.0.0.1:4399/')).toBe(0);
+    expect(h.out.join('\n')).toContain('add <meta name="description" content="" data-stet-content="home_meta_description"> to src/pages/index.astro');
   });
 
   it('gives an image-alt failing in Accessibility and SEO one audits entry, under accessibility', async () => {

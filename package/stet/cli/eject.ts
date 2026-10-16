@@ -201,8 +201,7 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
           extra.push(...exact.edits);
         } else if (isLayout) {
           // 0.6.0's path, for a mount the round trip does not prove.
-          const unwrap = copyProviderUnwrap(ts, source, abs);
-          if (unwrap) extra.push(unwrap);
+          extra.push(...copyProviderUnwrap(ts, source, abs));
           for (const span of result.resolvedMapDeclSpans) extra.push({ pos: span.pos, end: span.end, text: '' });
           for (const span of layoutOrphanImports(ts, source, abs, io.cwd, config)) extra.push({ pos: span.pos, end: span.end, text: '' });
         }
@@ -371,7 +370,7 @@ function buildSnapshot(descriptor: Descriptor, snapshot: Snapshot, rows: StoreRo
  * returned-expression slot — but a lone `{expr}` returned bare becomes an object
  * literal (`return {children}`), so it must be `<>{expr}</>`.
  */
-function copyProviderUnwrap(ts: typeof import('typescript'), source: string, file: string): Edit | null {
+function copyProviderUnwrap(ts: typeof import('typescript'), source: string, file: string): Edit[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
   let found: TS.JsxElement | null = null;
   const visit = (node: TS.Node): void => {
@@ -385,9 +384,8 @@ function copyProviderUnwrap(ts: typeof import('typescript'), source: string, fil
     ts.forEachChild(node, visit);
   };
   visit(sf);
-  if (found === null) return null;
+  if (found === null) return [];
   const element = found as TS.JsxElement;
-  const inner = source.slice(element.openingElement.getEnd(), element.closingElement.getStart(sf));
   const meaningful = element.children.filter((child) => !(ts.isJsxText(child) && child.containsOnlyTriviaWhiteSpaces));
   const parent = element.parent;
   const inJsxContainer = ts.isJsxElement(parent) || ts.isJsxFragment(parent);
@@ -395,8 +393,11 @@ function copyProviderUnwrap(ts: typeof import('typescript'), source: string, fil
   const singleIsElement =
     single !== undefined && (ts.isJsxElement(single) || ts.isJsxSelfClosingElement(single) || ts.isJsxFragment(single));
   const needsFragment = meaningful.length !== 1 || (!inJsxContainer && !singleIsElement);
-  const text = needsFragment ? `<>${inner}</>` : inner;
-  return { pos: element.getStart(sf), end: element.getEnd(), text };
+  // Two edits over the tags alone, so a read inside the element un-rewrites in the same batch.
+  return [
+    { pos: element.openingElement.getStart(sf), end: element.openingElement.getEnd(), text: needsFragment ? '<>' : '' },
+    { pos: element.closingElement.getStart(sf), end: element.closingElement.getEnd(), text: needsFragment ? '</>' : '' },
+  ];
 }
 
 /**

@@ -216,7 +216,6 @@ export function unmountEdits(
   visit(sf);
   if (providers.length !== 1) return null;
   const element = providers[0] as TS.JsxElement;
-  const inner = source.slice(element.openingElement.getEnd(), element.closingElement.getStart(sf));
   const nl = dominantEol(source);
   for (const form of ['resolved', 'resolveAll'] as const) {
     const block = mountBlock(layoutPath, cwd, config, form, nl);
@@ -232,9 +231,12 @@ export function unmountEdits(
         : source.startsWith(nl + nl, at + block.length)
           ? { pos: at - nl.length, end: at + block.length + nl.length }
           : { pos: at, end: at + block.length + nl.length };
+    // The two tags come out alone, so an edit inside the element (the layout's own read, un-rewritten
+    // in the same batch) does not overlap the unwrap.
     const edits: Edit[] = [
       { pos: span.pos, end: span.end, text: '' },
-      { pos: element.getStart(sf), end: element.getEnd(), text: inner },
+      { pos: element.openingElement.getStart(sf), end: element.openingElement.getEnd(), text: '' },
+      { pos: element.closingElement.getStart(sf), end: element.closingElement.getEnd(), text: '' },
     ];
     const candidate = applyFileEdits(source, edits);
     const again = ts.createSourceFile(layoutPath, candidate, ts.ScriptTarget.Latest, true, scriptKindFor(ts, layoutPath));

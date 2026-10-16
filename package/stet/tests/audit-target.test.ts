@@ -4,7 +4,7 @@
  * HTTP/1.1. Every case talks to the front over loopback with `node:http2`'s
  * client (or a raw TLS or TCP socket), and every server it starts it closes.
  */
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import http, { ClientRequest, createServer, type Server } from 'node:http';
 import { connect as h2connect, constants, type ClientHttp2Session } from 'node:http2';
 import { connect as netConnect, type AddressInfo } from 'node:net';
@@ -135,6 +135,32 @@ describe('startFront — the documents', () => {
       }),
     );
     expect(alpn11).toBe('ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL');
+  });
+});
+
+describe('startFront — a reset on the documents', () => {
+  it('a stream the client resets with INTERNAL_ERROR mid-body throws nothing and the front keeps answering', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'stet-front-reset-'));
+    const thrown: Error[] = [];
+    const onThrown = (error: Error): void => void thrown.push(error);
+    process.on('uncaughtException', onThrown);
+    try {
+      writeFileSync(join(root, 'index.html'), '<!doctype html><title>x</title>');
+      // Larger than the stream's flow-control window, so the body is still going when the client resets.
+      writeFileSync(join(root, 'big.bin'), Buffer.alloc(8 * 1024 * 1024, 65));
+      const f = await front({ root });
+      const s = session(f.url);
+      const stream = s.request({ ':path': '/big.bin' });
+      stream.on('error', () => undefined);
+      stream.once('data', () => stream.close(constants.NGHTTP2_INTERNAL_ERROR));
+      await within(2_000, new Promise<void>((resolve) => stream.on('close', () => resolve())));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(thrown.map((error) => error.message)).toEqual([]);
+      expect((await get(session(f.url), '/index.html')).status).toBe(200);
+    } finally {
+      process.off('uncaughtException', onThrown);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

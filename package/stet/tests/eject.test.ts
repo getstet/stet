@@ -901,15 +901,33 @@ export default function RootLayout({ children }: { children: ReactNode }) {
 }
 `;
   /** The layout as 0.6.0's `init` (resolveAll) or 0.7.0's `register` (resolved) mounted it. */
-  async function mounted(form: 'resolved' | 'resolveAll', dir: string): Promise<string> {
+  async function mounted(form: 'resolved' | 'resolveAll', dir: string, before: string = BEFORE): Promise<string> {
     const ts = await loadTypescript();
     const path = join(dir, 'app/layout.tsx');
-    const sf = ts.createSourceFile(path, BEFORE, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    const sf = ts.createSourceFile(path, before, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
     const wrap = locateWrapTarget(ts, sf, 'app', form);
     if (wrap === null) throw new Error('no wrap target');
     const config = { ...BASE_CONFIG, codegen: { ...BASE_CONFIG.codegen, resolved: 'content/resolved.ts' } } as never;
-    return applyFileEdits(BEFORE, providerEdits(ts, sf, BEFORE, path, dir, config, wrap, form));
+    return applyFileEdits(before, providerEdits(ts, sf, before, path, dir, config, wrap, form));
   }
+  /** The layout with a read of its own beside `{children}`: the read lies inside the mount's element. */
+  const BEFORE_READ = BEFORE.replace("import './globals.css';", "import { copy } from '@/lib/content';\nimport './globals.css';").replace(
+    '        {children}\n',
+    "        <p>{copy('brand')}</p>\n        {children}\n",
+  );
+  const AFTER_READ = BEFORE.replace('        {children}\n', '        <p>Northwind Studio</p>\n        {children}\n');
+  const readHost = (): string =>
+    scaffold({
+      config: BASE_CONFIG,
+      descriptor: { version: 1, keys: { hero: { shape: 'text', target: 'web' }, brand: { shape: 'text', target: 'web' } } },
+      defaults: { default: { hero: 'Hello world', brand: 'Northwind Studio' } },
+      files: {
+        'app/globals.css': '',
+        'app/page.tsx': "import { copy } from '@/lib/content';\nexport default function Page() { return <h1>{copy('hero')}</h1>; }\n",
+        'lib/content.ts': READ_PATH,
+        'content/resolved.ts': 'export const RESOLVED = {} as const;\n',
+      },
+    });
   const ejectHost = (): string =>
     scaffold({
       config: BASE_CONFIG,
@@ -936,6 +954,37 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       expect(compiled.ok).toBe(true);
     });
   }
+
+  for (const form of ['resolveAll', 'resolved'] as const) {
+    it(`unwraps the ${form === 'resolveAll' ? '0.6.0' : '0.7.0'} mount around the layout's own copy() read, and the host builds`, async () => {
+      const dir = readHost();
+      write(dir, 'app/layout.tsx', await mounted(form, dir, BEFORE_READ));
+      expect(await runEject(['--write'], io(dir))).toBe(0);
+      expect(read(dir, 'app/layout.tsx')).toBe(AFTER_READ);
+      const compiled = tscClean(dir);
+      expect(compiled.output).toBe('');
+      expect(compiled.ok).toBe(true);
+    });
+  }
+
+  it("unwraps a reformatted mount around the layout's own copy() read through the 0.6.0 path", async () => {
+    const dir = readHost();
+    const layout = (await mounted('resolved', dir, BEFORE_READ)).replace(
+      '<CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={RESOLVED}>',
+      '<CopyProvider\n          descriptor={descriptorJson as unknown as Descriptor}\n          resolved={RESOLVED}>',
+    );
+    expect(layout).toContain('<CopyProvider\n');
+    write(dir, 'app/layout.tsx', layout);
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    const out = read(dir, 'app/layout.tsx');
+    expect(out).not.toContain('CopyProvider');
+    expect(out).not.toContain('@getstet/stet');
+    expect(out).toContain('<p>Northwind Studio</p>');
+    expect(out).toContain('{children}');
+    const compiled = tscClean(dir);
+    expect(compiled.output).toBe('');
+    expect(compiled.ok).toBe(true);
+  });
 
   it('unwraps a reformatted mount through the 0.6.0 path, and the host builds', async () => {
     const dir = ejectHost();

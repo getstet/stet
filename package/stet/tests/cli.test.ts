@@ -1605,6 +1605,21 @@ describe('upgrade', () => {
       expect(host.stdout()).not.toContain('app/layout.tsx:');
     });
 
+    it('keeps the mount, and says nothing of it, where a client reaches the provider module by a namespace import or a require', async () => {
+      const readers: Record<string, string> = {
+        'components/Nav.tsx': "'use client';\nimport * as stet from '@getstet/stet/react';\nexport function Nav() {\n  const copy = stet.useCopy();\n  return <nav>{copy('nav')}</nav>;\n}\n",
+        'components/Foot.tsx': "'use client';\nconst { useCopy } = require('@getstet/stet/react');\nexport function Foot() {\n  const copy = useCopy();\n  return <footer>{copy('foot')}</footer>;\n}\n",
+      };
+      for (const [file, text] of Object.entries(readers)) {
+        const host = adopted060();
+        mkdirSync(join(host.cwd, 'components'), { recursive: true });
+        writeFileSync(join(host.cwd, file), text);
+        expect(await host.run('upgrade')).toBe(0);
+        expect(host.file('app/layout.tsx'), file).toBe(MOUNTED_060);
+        expect(host.stdout(), file).not.toContain('app/layout.tsx:');
+      }
+    });
+
     it('keeps the mount, and says nothing of it, where typescript does not load', async () => {
       vi.resetModules();
       vi.doMock('../cli/source-scan.js', async (importOriginal) => ({

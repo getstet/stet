@@ -129,6 +129,11 @@ describe('planDocumentFix — the doctype and the line endings', () => {
     expect(text).not.toMatch(/(?<!\r)\n/);
   });
 
+  it('counts a doctype behind an XML declaration as present', () => {
+    const fix = plan('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="x"></head></html>\n');
+    expect(fix).toEqual({ file: 'a.html', edits: [], lines: [], mints: [] });
+  });
+
   it('counts a doctype behind a comment as present', () => {
     const fix = plan('<!-- built 2026 -->\n<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="x"></head></html>\n');
     expect(fix).toEqual({ file: 'a.html', edits: [], lines: [], mints: [] });
@@ -170,6 +175,10 @@ describe('planDocumentFix — the documents it leaves', () => {
     expect(plan('<html lang="en"><head><title>x</title>\n<body><p>a</p></body></html>\n')).toEqual({
       skip: 'a.html: no single readable <head> — no head edits',
     });
+  });
+
+  it('skips a document with two <html> elements', () => {
+    expect(plan('<html lang="en"><head></head></html><html><head></head></html>\n')).toEqual({ skip: 'a.html: no single <html> element — no head edits' });
   });
 
   it('skips a document with no single <html>', () => {

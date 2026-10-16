@@ -33,34 +33,45 @@ export function readPathImport(cwd: string, config: StetConfig): ReadPathImport 
   return initLines > 0 || otherImport ? 'other' : 'clean';
 }
 
-/** A `useCopy` import from the provider's module, in import position; eject's `stetImportRegex` shape (eject.ts). */
-const USE_COPY_IMPORT = /\b(?:import|export)\b[^;\n]*\buseCopy\b[^;\n]*\bfrom\b\s*(?:\n\s*)?['"]@getstet\/stet\/react['"]/;
+/**
+ * Any reference to the provider's module in import position: a named, namespace or default import, an
+ * export-from, a side-effect import, a dynamic `import()` or a `require`. A client can reach `useCopy`
+ * through any of them, so the mount stays for each.
+ */
+const PROVIDER_MODULE_REF =
+  /\b(?:import|export)\b[^;'"`]*?\bfrom\b\s*['"]@getstet\/stet\/react['"]|\bimport\s*['"]@getstet\/stet\/react['"]|\b(?:import|require)\s*\(\s*['"]@getstet\/stet\/react['"]\s*\)/;
 
 /** Build and cache output the walk never reads, beside `WALK_SKIP`'s four: a bundle there mentions the import without being a source. */
 const BUILT_OUTPUT = new Set(['out', 'build', 'coverage', '.turbo', '.cache', '.vercel', '.output', '.astro']);
 
 /**
- * Every source file of the checkout that imports `useCopy` from
- * `@getstet/stet/react` — the client reads a provider serves. A text walk over
- * the whole checkout (`walk`, which skips `node_modules`, `.git`, `dist` and
+ * Every source file of the checkout that references `@getstet/stet/react` —
+ * the client reads a provider serves, however a file reaches `useCopy`. The
+ * root layout (its own `CopyProvider` import) and a read path that `upgrade`
+ * rewrites to the server subpath first are not reads. A text walk over the
+ * whole checkout (`walk`, which skips `node_modules`, `.git`, `dist` and
  * `.next`, with `BUILT_OUTPUT` skipped here — `WALK_SKIP`'s other consumers
  * are glob walks), not the managed surfaces alone: a hand-written
  * `components/Nav.tsx` outside `app/**` reads copy too, and an unmount under
  * it fails the next build. Text-level, so a mention in a comment counts — the
  * direction that leaves the mount in place.
  */
-export function clientReadFiles(cwd: string, _config: StetConfig): string[] {
+export function clientReadFiles(cwd: string, config: StetConfig): string[] {
+  const skipped = new Set<string>();
+  if (config.rootLayout !== undefined) skipped.add(config.rootLayout);
+  if (readPathImport(cwd, config) === 'init-line') skipped.add(config.readPath.file);
   const out: string[] = [];
   walk(cwd, (abs) => {
-    if (posixRelative(cwd, abs).split('/').some((segment) => BUILT_OUTPUT.has(segment))) return;
-    if (!/\.(?:[cm]?[jt]sx?)$/.test(abs)) return;
+    const rel = posixRelative(cwd, abs);
+    if (rel.split('/').some((segment) => BUILT_OUTPUT.has(segment))) return;
+    if (!/\.(?:[cm]?[jt]sx?)$/.test(abs) || skipped.has(rel)) return;
     let text: string;
     try {
       text = readFileSync(abs, 'utf8');
     } catch {
       return;
     }
-    if (USE_COPY_IMPORT.test(text)) out.push(posixRelative(cwd, abs));
+    if (PROVIDER_MODULE_REF.test(text)) out.push(rel);
   });
   return out.sort();
 }

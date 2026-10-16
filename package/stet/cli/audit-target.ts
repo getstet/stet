@@ -15,6 +15,7 @@ import {
 } from 'node:http2';
 import type { AddressInfo, Socket } from 'node:net';
 
+import { importAuditPackage } from './lighthouse-run.js';
 import { contentTypeOf, servableFile } from './static-files.js';
 
 /** A served target: the URL Lighthouse loads, and how to stop it. */
@@ -32,7 +33,7 @@ const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-e
  * certificate is minted for this run and never written to disk.
  */
 export async function startFront(target: { root: string } | { upstream: URL }): Promise<Front> {
-  const { generate } = await import('selfsigned');
+  const { generate } = await importAuditPackage(() => import('selfsigned'));
   const pems = await generate([{ name: 'commonName', value: '127.0.0.1' }], {
     keyType: 'ec',
     curve: 'P-256',
@@ -50,6 +51,8 @@ export async function startFront(target: { root: string } | { upstream: URL }): 
     socket.on('close', () => sockets.delete(socket));
   });
   server.on('stream', (stream, headers) => {
+    // A peer's reset (`INTERNAL_ERROR` included) is its own business and the stream is already closed.
+    stream.on('error', () => undefined);
     if ('root' in target) serveFile(target.root, stream, headers);
     else relay(target.upstream, stream, headers);
   });

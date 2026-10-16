@@ -36,14 +36,27 @@ export const CATEGORIES = ['performance', 'accessibility', 'best-practices', 'se
 /** Chrome was not found: what chrome-launcher throws, told apart from any other failure. */
 export class ChromeMissing extends Error {}
 
+/** An audit package that does not load: a broken or pruned install, told apart from any other failure. */
+export class AuditPackageMissing extends Error {}
+
+/** One of the audit's packages imported, a missing one raised as `AuditPackageMissing`. */
+export async function importAuditPackage<T>(load: () => Promise<T>): Promise<T> {
+  try {
+    return await load();
+  } catch (error) {
+    if ((error as { code?: string }).code === 'ERR_MODULE_NOT_FOUND') throw new AuditPackageMissing();
+    throw error;
+  }
+}
+
 /**
  * The real runner over one Chrome, started headless and ended by `close`.
  * `insecure` starts it with `--ignore-certificate-errors`, for the front's
  * run-scoped certificate (`cli/audit-target.ts`).
  */
 export async function chromeRunner(insecure: boolean): Promise<{ run: LighthouseRunner; close: () => Promise<void> }> {
-  const { default: lighthouse, desktopConfig } = await import('lighthouse');
-  const { launch } = await import('chrome-launcher');
+  const { default: lighthouse, desktopConfig } = await importAuditPackage(() => import('lighthouse'));
+  const { launch } = await importAuditPackage(() => import('chrome-launcher'));
   let chrome: Awaited<ReturnType<typeof launch>>;
   try {
     // chrome-launcher's own SIGINT handler calls `process.exit(130)` before any `finally` runs; the command's listener does the cleanup.

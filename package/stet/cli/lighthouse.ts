@@ -36,7 +36,7 @@ import {
   type PageContext,
 } from './lighthouse-audits.js';
 import { astroFixLines, planDocumentFix, planNextLang, planViteShell, type DocumentFix } from './lighthouse-fix.js';
-import { CATEGORIES, ChromeMissing, chromeRunner, type FormFactor, type LighthouseResult, type LighthouseRunner } from './lighthouse-run.js';
+import { AuditPackageMissing, CATEGORIES, ChromeMissing, chromeRunner, type FormFactor, type LighthouseResult, type LighthouseRunner } from './lighthouse-run.js';
 import { answers, endGroup, untilInterrupted } from './liveness.js';
 import type { CliIo } from './main.js';
 import { applyPages, auditablePages, pageOfFile, proposeForHost, servedRoute, type AuditablePage } from './pages.js';
@@ -45,6 +45,7 @@ import { applyFileEdits } from './rewrite.js';
 import { loadTypescript } from './source-scan.js';
 import { childEnv, devDefaults, readWorkspace, routerPreviewCommand, workspacePath, type WorkspaceEntry } from './workspace.js';
 
+const AUDIT_PACKAGE_MISSING = 'Lighthouse is not installed — reinstall @getstet/stet';
 const CHROME_MISSING = 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary';
 const NO_TARGET = 'this host builds before it serves — pass --url <server>, or --build to build and serve the production output here';
 const SET_LANGUAGE = 'set language in stet.config.json (a BCP 47 tag such as en-GB), then run stet audit lighthouse --fix';
@@ -177,7 +178,9 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     if (rootAlone) report.line('no pages declared — audited / alone; run stet pages scan to declare them');
 
     const owners: Owner[] = footprint.entries.map(() => 'stet' as const);
-    const pageReports: unknown[] = [];
+    // One entry and one strict finding per page: a re-run after `--fix --write` replaces the page's first result.
+    const pageReports = new Map<string, unknown>();
+    const judged = new Map<string, LighthouseResult[]>();
     const contextFor = (page: PageTarget): PageContext => pageContext(io.cwd, config, descriptor, snapshot, page, fix);
     const printPages = (list: Array<{ target: PageTarget; results: LighthouseResult[] }>): void => {
       for (const { target: page, results } of list) {
@@ -189,8 +192,8 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         const diag = read.lines.filter((line) => line.startsWith('diag  '));
         for (const line of [...read.lines.filter((line) => !line.startsWith('diag  ')), ...notes.lines, ...diag]) report.line(`  ${line}`);
         owners.push(...read.audits.map((audit) => audit.owner));
-        pageReports.push(pageJson(page, results, chosen, read.audits, read.diagnostics, notes.thirdParty, runsText !== undefined));
-        strictFinding(report, nameOf(page), results, flag(values, 'strict'));
+        pageReports.set(nameOf(page), pageJson(page, results, chosen, read.audits, read.diagnostics, notes.thirdParty, runsText !== undefined));
+        judged.set(nameOf(page), results);
       }
     };
     printPages(measured);
@@ -236,7 +239,8 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         }
       }
     }
-    report.data('pages', pageReports);
+    report.data('pages', [...pageReports.values()]);
+    for (const [name, results] of judged) strictFinding(report, name, results, flag(values, 'strict'));
 
     if (raw !== undefined) {
       const dir = resolve(io.cwd, raw);
@@ -259,16 +263,22 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     const signal = await Promise.race([work.then(() => null), interrupt.interrupted]);
     if (signal !== null) return 128 + (osConstants.signals[signal] ?? 0);
     return await work;
+  } catch (error) {
+    // Raised before any measurement: `startFront` and the runner import the audit's packages.
+    if (!(error instanceof AuditPackageMissing)) throw error;
+    report.error('lighthouse', AUDIT_PACKAGE_MISSING);
+    return report.emit(io, { json });
   } finally {
     await stopTarget(held);
     interrupt.release();
   }
 }
 
-/** What the run has started, held for the one `finally`: the preview from its spawn, before it answers. */
+/** What the run has started, held for the one `finally`: the build and the preview from their spawn, the preview before it answers. */
 interface Held {
   runner?: { run: LighthouseRunner; close: () => Promise<void> };
   target?: Target;
+  build?: number;
   preview?: number;
 }
 
@@ -280,12 +290,14 @@ async function stopTarget(held: Held): Promise<void> {
   await stopServing(held);
 }
 
-/** The front and the preview's group, Chrome left running: `--build`'s re-run serves a new build to the same runner. */
+/** The front, a build still running and the preview's group, Chrome left running: `--build`'s re-run serves a new build to the same runner. */
 async function stopServing(held: Held): Promise<void> {
-  const { target, preview } = held;
+  const { target, build, preview } = held;
   delete held.target;
+  delete held.build;
   delete held.preview;
   if (target?.front !== undefined) await target.front.close();
+  if (build !== undefined) await endGroup(build);
   if (preview !== undefined) await endGroup(preview);
 }
 
@@ -338,7 +350,9 @@ async function startTarget(
 async function startBuild(io: CliIo, config: StetConfig, report: Report, held: Held): Promise<{ pid: number; command: string; port: number } | null> {
   io.stderr('building (npm run build)…');
   const code = await new Promise<number>((resolve) => {
-    const child = spawn('npm run build', { cwd: io.cwd, shell: true, stdio: ['ignore', 'pipe', 'pipe'], env: childEnv() });
+    // Its own group, held from the spawn: a signal to this command alone reaches the build through the `finally`.
+    const child = spawn('npm run build', { cwd: io.cwd, shell: true, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: childEnv() });
+    if (child.pid !== undefined) held.build = child.pid;
     const relay = (chunk: Buffer): void => {
       for (const line of chunk.toString('utf8').split('\n')) if (line.trim() !== '') io.stderr(line);
     };
@@ -347,6 +361,7 @@ async function startBuild(io: CliIo, config: StetConfig, report: Report, held: H
     child.on('error', () => resolve(127));
     child.on('close', (exit) => resolve(exit ?? 1));
   });
+  delete held.build;
   if (code !== 0) {
     report.error('lighthouse', `npm run build exited ${code} — its output is above`);
     return null;
@@ -417,7 +432,7 @@ function pageTargets(cwd: string, config: StetConfig, selected: AuditablePage[] 
   const base = target.front?.url ?? target.base;
   const html = isHtmlHost(config);
   if (selected === null) {
-    if (!html) return { pages: [{ page: '/', label: '/', route: '/', url: new URL('/', base).href }], skips: [] };
+    if (!html) return { pages: [{ page: '/', label: 'home', route: '/', url: new URL('/', base).href }], skips: [] };
     const file = filesForGlobs(cwd, config.managedSurfaces).find((doc) => servedRoute(doc) === '/');
     if (file === undefined) return { pages: [], skips: ['/: no managed document serves / — skipped'] };
     return { pages: [{ page: '/', label: file, route: '/', url: base, file }], skips: [] };
@@ -437,14 +452,16 @@ function pageContext(cwd: string, config: StetConfig, descriptor: Descriptor, sn
   const def = page.page === '/' ? undefined : descriptor.pages?.[page.page];
   const router = isHtmlHost(config) ? 'html' : config.router;
   const document = page.file === undefined ? null : readDocument(page.file, readFileSync(join(cwd, page.file), 'utf8'));
+  // `/` audited alone is the page `planFixes` and `nameOf` call `home`: a document's own name, else `home`.
+  const name = page.page === '/' ? (page.file === undefined ? 'home' : (pageOfFile(cwd, page.file, descriptor.pages, { html: true }) ?? null)) : page.page;
   return {
     router,
-    page: page.page === '/' ? null : page.page,
+    page: name,
     def,
     descriptor,
     snapshot,
     document,
-    file: page.file ?? fileForPage(cwd, config, descriptor.pages, page.page),
+    file: page.file ?? fileForPage(cwd, config, descriptor.pages, name ?? page.page),
     fix,
   };
 }
@@ -452,7 +469,7 @@ function pageContext(cwd: string, config: StetConfig, descriptor: Descriptor, sn
 /** The file a JavaScript host's head line names: Vite's shell, the page's own file, else the root layout. */
 function fileForPage(cwd: string, config: StetConfig, pages: Record<string, PageDef> | undefined, page: string): string | null {
   if (config.router === 'vite') return 'index.html';
-  const own = page === '/' ? undefined : filesForGlobs(cwd, config.managedSurfaces).find((file) => pageOfFile(cwd, file, pages) === page);
+  const own = filesForGlobs(cwd, config.managedSurfaces).find((file) => pageOfFile(cwd, file, pages) === page);
   return own ?? config.rootLayout ?? null;
 }
 

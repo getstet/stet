@@ -1900,11 +1900,10 @@ const AUDIT_TILES = [['performance', 'Performance'], ['accessibility', 'Accessib
 const scoreBand = (n) => (n >= 90 ? 'g' : n >= 50 ? 'd' : 'r');
 const AUDIT_TAGS = { copy: 'b', fix: 'v', stet: 'g', host: '' };
 
-/** The declared key a copy line names: the element's own, or a word of its remedy that is a key. */
+/** The declared key a copy line names: the one the audit's own `key` carries, never a word of its remedy. */
 function auditKey(a) {
   if (a.owner !== 'copy' || !ready()) return null;
-  const words = [a.key].concat(String(a.remedy || '').split(/[^A-Za-z0-9_]+/));
-  return words.find((w) => typeof w === 'string' && keyDef(w) !== null) || null;
+  return typeof a.key === 'string' && keyDef(a.key) !== null ? a.key : null;
 }
 
 /** One failing audit: its tag, id and place, the snippet, the remedy, and the key's editor where it names one. */
@@ -2790,7 +2789,7 @@ async function declare(names) {
   const res = await post('/api/site/pages/declare' + query(), { names: names });
   if (!res.ok) { tst(res.body.error || 'nothing was declared'); return; }
   tst((res.body.lines || []).slice(-1)[0] || 'Declared.');
-  await loadWorkspace();
+  await refreshSite();
   S.tab = 'SEO';
   await loadSeo();
 }

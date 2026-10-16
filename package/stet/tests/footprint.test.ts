@@ -65,7 +65,23 @@ describe('clientReadFiles — the files that read copy on the client (D7)', () =
     write(dir, 'node_modules/x/index.js', "import { useCopy } from '@getstet/stet/react';\n");
     write(dir, 'dist/app.js', "import { useCopy } from '@getstet/stet/react';\n");
     write(dir, 'build/app.js', "import { useCopy } from '@getstet/stet/react';\n");
-    expect(clientReadFiles(dir, config())).toEqual(['app/nav.tsx', 'app/wrapped.tsx', 'components/Nav.tsx', 'lib/client.ts']);
+    expect(clientReadFiles(dir, { ...config(), rootLayout: 'app/layout.tsx' })).toEqual(['app/nav.tsx', 'app/wrapped.tsx', 'components/Nav.tsx', 'lib/client.ts']);
+  });
+
+  it('lists a file reaching the provider module by namespace, default, side-effect, dynamic import or require, and not the root layout nor the read path stet rewrites first', () => {
+    const withLayout = { ...config(), rootLayout: 'app/layout.tsx' };
+    write(dir, 'components/Ns.tsx', "'use client';\nimport * as stet from '@getstet/stet/react';\nexport const A = stet.useCopy;\n");
+    write(dir, 'components/Req.tsx', "'use client';\nconst { useCopy } = require('@getstet/stet/react');\nexport const B = useCopy;\n");
+    write(dir, 'components/Dflt.tsx', "'use client';\nimport stet from '@getstet/stet/react';\nexport const C = stet;\n");
+    write(dir, 'components/Side.tsx', "import '@getstet/stet/react';\n");
+    write(dir, 'components/Lazy.tsx', "export const load = () => import('@getstet/stet/react');\n");
+    write(dir, 'components/Server.tsx', "import { createServerCopy } from '@getstet/stet/react/server';\n");
+    write(dir, 'app/layout.tsx', "import { CopyProvider } from '@getstet/stet/react';\n");
+    write(dir, 'lib/content.ts', `${INIT_READ_IMPORT}${READ_BODY}`);
+    expect(clientReadFiles(dir, withLayout)).toEqual(['components/Dflt.tsx', 'components/Lazy.tsx', 'components/Ns.tsx', 'components/Req.tsx', 'components/Side.tsx']);
+    // A read path `upgrade` leaves for the hand still imports the index: the mount stays.
+    write(dir, 'lib/content.ts', `import { createServerCopy, useCopy } from '@getstet/stet/react';${READ_BODY}`);
+    expect(clientReadFiles(dir, withLayout)).toContain('lib/content.ts');
   });
 
   it('answers the same with typescript absent: the walk is text, no compiler', async () => {

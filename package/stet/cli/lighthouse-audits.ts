@@ -8,6 +8,7 @@ import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor, PageDef } from '../src/types.js';
 import { attrOf, attrValueOf, htmlBaseName, parentsOf, readDocument, sectionWordOf, type Document, type Element } from './html-host.js';
 import { numberNames } from './key-names.js';
+import { DOCTYPE } from './lighthouse-fix.js';
 import { CATEGORIES, type LighthouseResult } from './lighthouse-run.js';
 import { sharedTextIndex } from './register-run.js';
 import { plural } from './report.js';
@@ -211,7 +212,7 @@ function remedyOf(
   el: Element | null,
   key: string | undefined,
   context: PageContext,
-): { text: string; place: boolean; owner?: Owner } {
+): { text: string; place: boolean; owner?: Owner; key?: string } {
   const node = firstNode(audit);
   const snippet = str(node?.['snippet']);
   const file = context.file ?? context.page ?? '/';
@@ -241,11 +242,11 @@ function remedyOf(
     case 'meta-description': {
       const title = id === 'document-title';
       const pageKey = title ? context.def?.seo?.title : context.def?.seo?.description;
-      if (emptyKey(context, pageKey)) return { text: `${pageKey} is empty`, place: false };
+      if (emptyKey(context, pageKey)) return { text: `${pageKey} is empty`, place: false, key: pageKey };
       const tag = title ? 'title' : 'description';
       if (context.router === 'html' && context.page !== null) {
         const [bound] = numberNames([`${context.page}_${title ? 'page_title' : 'meta_description'}`], (n) => Object.hasOwn(context.descriptor.keys, n));
-        return { text: `${file} has no ${tag} ${viaFix}, bound to ${bound as string}`, place: false };
+        return { text: `${file} has no ${tag} ${viaFix}, bound to ${bound as string}`, place: false, key: bound as string };
       }
       if ((context.router === 'app' || context.router === 'pages') && context.file !== null) {
         return { text: `set ${tag} in the metadata export of ${context.file}`, place: false };
@@ -253,7 +254,7 @@ function remedyOf(
       if (context.router === 'astro' && context.file !== null && context.page !== null) {
         const [bound] = numberNames([`${context.page}_${title ? 'page_title' : 'meta_description'}`], (n) => Object.hasOwn(context.descriptor.keys, n));
         const element = title ? `<title data-stet="${bound as string}"></title>` : `<meta name="description" content="" data-stet-content="${bound as string}">`;
-        return { text: `add ${element} to ${context.file}`, place: false };
+        return { text: `add ${element} to ${context.file}`, place: false, key: bound as string };
       }
       return { text: audit.title, place: false };
     }
@@ -272,7 +273,7 @@ function remedyOf(
       return { text: `${file} has no meta charset ${viaFix}`, place: false };
     case 'doctype':
       // A legacy doctype is one `--fix` counts as present: replacing it changes the document's mode, so it is reported.
-      if (context.document !== null && /^﻿?\s*(?:<!--[\s\S]*?-->\s*)*<!doctype\s+html\b/i.test(context.document.source)) {
+      if (context.document !== null && DOCTYPE.test(context.document.source)) {
         return { text: `${file} — replace the legacy doctype with <!DOCTYPE html>`, place: false, owner: 'host' };
       }
       return { text: `${file} has no doctype ${viaFix}`, place: false };
@@ -367,6 +368,8 @@ export function readRun(lhr: LighthouseResult, context: PageContext): PageRead {
       const at = el !== null && context.document !== null ? `${context.document.file}:${context.document.lineAt(el.openStart)}` : undefined;
       const remedy = remedyOf(ref.id, audit, lhr, el, key, context);
       const lineOwner = remedy.owner ?? owner;
+      // The bound key a remedy names beside the element's own: the one the card opens.
+      const bound = remedy.key ?? key;
       const place = remedy.place ? [at, snippet].filter((part) => part !== undefined).join(' ') : '';
       lines.push(`${lineOwner}  ${ref.id}  ${place === '' ? '' : `${place} `}${remedy.text}`);
       audits.push({
@@ -376,7 +379,7 @@ export function readRun(lhr: LighthouseResult, context: PageContext): PageRead {
         score: audit.score,
         owner: lineOwner,
         ...(at === undefined ? {} : { at }),
-        ...(key === undefined ? {} : { key }),
+        ...(bound === undefined ? {} : { key: bound }),
         ...(snippet === undefined ? {} : { snippet }),
         ...(audit.details?.items === undefined ? {} : { items: audit.details.items }),
         remedy: remedy.text,
