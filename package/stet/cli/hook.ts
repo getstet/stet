@@ -59,7 +59,7 @@ export async function runHookInstall(args: string[], io: CliIo): Promise<number>
   // (husky's .husky/), or a pre-commit stet did not write — is never written;
   // the gate joins it through one line.
   const theirs = !inCommon || (held !== null && hookKind(held) === null);
-  if (!shared && theirs && inCommon && held !== null && !held.includes(GATE_LINE)) {
+  if (!shared && theirs && inCommon && held !== null && gateLineIn(held) === undefined) {
     throw new CliError(`${hookPath} already exists and differs from the shipped hook — remove it and re-run, or add this line to it and re-run: ${GATE_LINE}`);
   }
 
@@ -88,7 +88,7 @@ export async function runHookInstall(args: string[], io: CliIo): Promise<number>
   const covers = `it runs stet check, stet scan and stet seo check in ${label(where.checkout)} when a commit touches it`;
   if (theirs) {
     report.line(
-      held !== null && held.includes(GATE_LINE)
+      held !== null && gateLineIn(held) !== undefined
         ? `${hookPath} runs the stet pre-commit gate — ${covers}`
         : theHook.husky
           ? `the stet pre-commit gate is ready; add this line to ${hookPath}, which husky runs from ${dir}: ${GATE_LINE}`
@@ -169,7 +169,7 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
   const kind = text === null ? null : hookKind(text);
   if (text !== null && kind === null) {
     if (listedHere) takeOut();
-    const line = [SHARED_GATE_LINE, GATE_LINE].find((gate) => text.includes(gate));
+    const line = gateLineIn(text);
     report.line(
       line !== undefined
         ? `remove this line from ${hook}: ${line}`
@@ -230,6 +230,16 @@ export const GATE_LINE = 'node "$(git rev-parse --git-common-dir)/stet-gate.mjs"
 /** The gate line for a hooks folder other repositories share: it does nothing in a repository with no gate. */
 export const SHARED_GATE_LINE =
   'f="$(git rev-parse --git-common-dir)/stet-gate.mjs"; [ ! -f "$f" ] || node "$f" "$@" || exit 1';
+
+/**
+ * The gate's line a hook carries — the guarded form a committed hook needs, so
+ * a clone that never ran `stet hook install` keeps committing, or the plain
+ * one; undefined where it carries neither. Install, remove and `doctor` read a
+ * hook through it.
+ */
+export function gateLineIn(text: string): string | undefined {
+  return [SHARED_GATE_LINE, GATE_LINE].find((line) => text.includes(line));
+}
 
 /** The runner the hook executes and the list it reads, both in git's common directory. */
 export const GATE_RUNNER = 'stet-gate.mjs';

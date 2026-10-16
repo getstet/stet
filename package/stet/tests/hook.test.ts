@@ -485,6 +485,43 @@ describe('the gate runs in the checkouts it lists, and never fetches stet', () =
     expect(drain(log)).toEqual(['check in site', 'scan in site', 'seo check in site']);
   });
 
+  it('(f5) accepts a committed hook carrying the guarded line, gates through it, and names it on removal', async () => {
+    const log = logFile();
+    const { top, checkouts } = await gatedRepo(['site'], { log });
+    const checkout = checkouts[0] as string;
+    const hookPath = join(top, '.git/hooks/pre-commit');
+    writeFileSync(hookPath, `#!/bin/sh\necho mine\n${SHARED_GATE_LINE}\n`, { mode: 0o755 });
+
+    const install = io(checkout);
+    expect(await runHookInstall([], install)).toBe(0);
+    expect(install.out.join('\n')).toContain(
+      `${hookPath} runs the stet pre-commit gate — it runs stet check, stet scan and stet seo check in site/ when a commit touches it`,
+    );
+    expect(existsSync(join(top, '.git/stet-gate.mjs'))).toBe(true);
+
+    editDocument(checkout);
+    const landed = commit(top, 'through the committed hook');
+    expect(landed.code, landed.out).toBe(0);
+    expect(drain(log)).toEqual(['check in site', 'scan in site', 'seo check in site']);
+
+    const remove = io(checkout);
+    expect(await runHookRemove([], remove)).toBe(0);
+    expect(remove.out).toContain(`remove this line from ${hookPath}: ${SHARED_GATE_LINE}`);
+  });
+
+  it("(f6) reads the guarded line in a hooks manager's pre-commit as the gate's line", async () => {
+    const { top, checkouts } = await gatedRepo(['site'], { log: logFile() });
+    const checkout = checkouts[0] as string;
+    const husky = join(top, '.husky/pre-commit');
+    mkdirSync(join(top, '.husky'));
+    writeFileSync(husky, `#!/bin/sh\n${SHARED_GATE_LINE}\n`, { mode: 0o755 });
+    execFileSync('git', ['config', 'core.hooksPath', '.husky'], { cwd: top });
+    expect(await runHookInstall([], io(checkout))).toBe(0);
+    const doctor = io(checkout);
+    await runDoctor([], doctor);
+    expect(doctor.out.join('\n')).toContain(`hook: ${husky} runs the stet pre-commit gate`);
+  });
+
   it("(f4) under husky v9 names .husky/pre-commit, where the line runs, and never the generated stub", async () => {
     const log = logFile();
     const { top, checkouts } = await gatedRepo(['site'], { log });

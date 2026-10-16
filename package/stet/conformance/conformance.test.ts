@@ -49,7 +49,7 @@ import { migrations as installedMigrations, packageRoot } from '../cli/installed
 import { mintUnsubscribeToken, verifyUnsubscribeToken } from '../server/unsubscribe-token.js';
 import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { GATE_LINE, HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
+import { GATE_LINE, HOOK_BEFORE_0_3_1, SHARED_GATE_LINE } from '../cli/hook.js';
 import { refuseDanglingReferences } from '../cli/remove.js';
 import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
 import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
@@ -7319,6 +7319,11 @@ describe('adoption', () => {
     expect(await host.run('hook', 'install')).toBe(1);
     expect(host.stderr()).toContain(GATE_LINE);
     expect(host.file('.git/hooks/pre-commit')).toContain('echo custom');
+    // A committed hook carrying the guarded line is accepted: install reads either form as the gate's line.
+    host.write('.git/hooks/pre-commit', `#!/bin/sh\necho custom\n${SHARED_GATE_LINE}\n`);
+    host.out.length = 0;
+    expect(await host.run('hook', 'install')).toBe(0);
+    expect(host.stdout()).toContain(`${hookPath} runs the stet pre-commit gate`);
 
     // A checkout that is a folder of its repository, committed from the top
     // with the registry unreachable: the gate runs the stet installed there,
