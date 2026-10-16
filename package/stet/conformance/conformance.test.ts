@@ -4972,7 +4972,7 @@ describe('cli', () => {
       writeFileSync(join(host.cwd, '.git/stet-gate.json'), `${JSON.stringify({ entries: [{ checkout: '', worktree: '' }] }, null, 2)}\n`);
       // 0.5.1's runner: the shipped one without the SEO run.
       const shipped = readFileSync(join(packageRoot(), 'templates', 'stet-gate.mjs'), 'utf8');
-      const older = shipped.replace("  if (entry.seo === true && !run(stet, ['seo', 'check'], dir)) code = 1;\n", '');
+      const older = shipped.replace("  if (seo && !run(stet, ['seo', 'check'], dir)) code = 1;\n", '');
       expect(older).not.toBe(shipped);
       writeFileSync(join(host.cwd, '.git/stet-gate.mjs'), older);
       git(['add', '-A']);
@@ -7312,7 +7312,7 @@ describe('adoption', () => {
     expect(host.file('.git/hooks/pre-commit')).toContain('stet-gate.mjs');
     expect(host.exists('.git/stet-gate.mjs')).toBe(true);
     // The operator ran the command, so its entry runs stet seo check too.
-    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '', seo: true }] });
+    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '', id: expect.any(Number), seo: true }] });
     expect(host.stdout()).toContain('it runs stet check, stet scan and stet seo check in the repository root when a commit touches it');
     // a differing existing hook is refused, not clobbered, naming the line to add
     host.write('.git/hooks/pre-commit', '#!/bin/sh\necho custom\n');
@@ -7384,6 +7384,41 @@ describe('adoption', () => {
       expect(missing.out).toContain(
         'stet pre-commit gate: stet is not installed in site/ — run npm install there, or take it out of the gate with stet hook remove there',
       );
+
+      // A listed folder is gated in every worktree: installed from a linked
+      // worktree alone, a main-worktree commit still runs the checks there.
+      const merged = mkdtempSync(join(tmpdir(), 'stet-conf-merged-'));
+      try {
+        const main = join(merged, 'main');
+        const linked = join(merged, 'linked');
+        const mergedLog = join(merged, 'log');
+        const git = (cwd: string, ...args: string[]): void => void execFileSync('git', args, { cwd });
+        mkdirSync(main);
+        git(main, 'init', '-q');
+        for (const [key, value] of [['user.email', 'gate@conformance'], ['user.name', 'gate'], ['commit.gpgsign', 'false']]) {
+          git(main, 'config', key as string, value as string);
+        }
+        writeFileSync(join(main, '.gitignore'), 'node_modules\n');
+        mkdirSync(join(main, 'site'));
+        writeFileSync(join(main, 'site/stet.config.json'), '{}\n');
+        git(main, 'add', '-A');
+        git(main, 'commit', '-qm', 'base', '--no-verify');
+        git(main, 'worktree', 'add', '-q', '-b', 'linked', linked);
+        const standIn = `#!/bin/sh\necho "$* in \${PWD##*/}" >> '${mergedLog}'\n`;
+        for (const root of [main, linked]) {
+          mkdirSync(join(root, 'site/node_modules/.bin'), { recursive: true });
+          writeFileSync(join(root, 'site/node_modules/.bin/stet'), standIn, { mode: 0o755 });
+        }
+        const installed = await runCli(['hook', 'install'], { cwd: join(linked, 'site'), env: {}, stdout: () => {}, stderr: () => {} });
+        expect(installed).toBe(0);
+        writeFileSync(join(main, 'site/page.txt'), 'a main commit after the merge\n');
+        git(main, 'add', '-A');
+        const landed = spawnSync('git', ['commit', '-qm', 'main'], { cwd: main, encoding: 'utf8', env: { ...process.env, npm_config_registry: 'http://127.0.0.1:9' } });
+        expect(landed.status, `${landed.stdout}${landed.stderr}`).toBe(0);
+        expect(readFileSync(mergedLog, 'utf8')).toBe('check in site\nscan in site\nseo check in site\n');
+      } finally {
+        rmSync(merged, { recursive: true, force: true });
+      }
 
       // A hooks folder outside the repository may be every repository's: refused.
       const shared = mkdtempSync(join(tmpdir(), 'stet-conf-shared-hooks-'));

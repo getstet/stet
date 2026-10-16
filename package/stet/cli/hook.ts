@@ -9,10 +9,11 @@
  * fixed file that runs `templates/stet-gate.mjs`, copied into git's common
  * directory; the runner reads the checkouts from `stet-gate.json` beside it and
  * runs `stet check` + `stet scan` — and `stet seo check` where the checkout's
- * entry carries `seo` — in each one of the committing worktree that the commit
- * touches, with the stet installed there. Nothing an install records
- * reaches a shell, and the gate never fetches a package. A hook stet did not
- * write joins the gate by one line.
+ * entry carries `seo` — in each listed folder that the commit touches, with
+ * the stet installed there. A listed folder is gated in every worktree where it
+ * is a stet checkout with stet installed, whichever worktree's install listed
+ * it. Nothing an install records reaches a shell, and the gate never fetches a
+ * package. A hook stet did not write joins the gate by one line.
  *
  * Never automatic — only this command writes the gate, and `stet eject` removes
  * it. The hooks dir is resolved via `git rev-parse --git-path hooks`, not a
@@ -70,7 +71,7 @@ export async function runHookInstall(args: string[], io: CliIo): Promise<number>
   const found = withGateLock(where.common, () => {
     const listed = readGate(where.common);
     const entry = listed.find(isSite(where));
-    const armed: GateEntry = { worktree: where.worktree, checkout: where.checkout, seo: true };
+    const armed: GateEntry = { worktree: where.worktree, id: where.id, checkout: where.checkout, seo: true };
     writeGate(where.common, entry === undefined ? [...listed, armed] : listed.map((e) => (e === entry ? armed : e)));
     return entry;
   });
@@ -147,9 +148,24 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
   if (dir === null || where === null) return false;
   const hook = operatorHook(dir).path;
   const listed = readGate(where.common);
-  const here = isSite(where);
+  // This worktree's own entry and, run in the main worktree, every entry for
+  // this folder whose worktree is gone: a merged branch's coverage leaves only
+  // from the checkout it covers, and a live worktree's entry always stays.
+  const here = (entry: GateEntry): boolean =>
+    isSite(where)(entry) ||
+    (where.worktree === '' && entry.checkout === where.checkout && !entryAlive(where.common, entry));
   const rest = listed.filter((entry) => !here(entry));
   const listedHere = rest.length < listed.length;
+  const through = rest.find((entry) => entry.checkout === where.checkout);
+  const stays = (): void => {
+    if (through !== undefined) {
+      report.line(
+        entryAlive(where.common, through)
+          ? `${label(where.checkout)} is still gated here by the entry ${worktreeLabel(through.worktree)} made — run stet hook remove there to take it out`
+          : `${label(where.checkout)} is still gated here by the entry a removed worktree made — run stet hook remove in the main worktree to take it out`,
+      );
+    }
+  };
   const takeOut = (): void => {
     report.line('remove this checkout from the stet pre-commit gate');
     if (!write) return;
@@ -163,7 +179,8 @@ export function removeFromGate(cwd: string, write: boolean, report: Report): boo
   };
   if (rest.length > 0) {
     if (listedHere) takeOut();
-    return listedHere;
+    stays();
+    return listedHere || through !== undefined;
   }
   const text = existsSync(hook) ? readFileSync(hook, 'utf8') : null;
   const kind = text === null ? null : hookKind(text);
@@ -251,37 +268,48 @@ export const GATE_LIST = 'stet-gate.json';
  */
 export interface GateEntry {
   worktree: string;
+  /**
+   * The inode of the worktree's git dir when install wrote the entry: git
+   * reuses `worktrees/<name>` once a worktree is removed, and a new worktree
+   * under the old name is a different worktree. Absent on a 0.7.0 entry.
+   */
+  id?: number;
   checkout: string;
   seo?: true;
 }
 
-/** Whether an entry is the checkout at `where`. */
+/** Whether an entry is the checkout at `where`: its worktree by name and, where the entry records one, by inode. */
 export const isSite =
-  (where: { worktree: string; checkout: string }) =>
+  (where: { worktree: string; id: number; checkout: string }) =>
   (entry: GateEntry): boolean =>
-    entry.worktree === where.worktree && entry.checkout === where.checkout;
+    entry.worktree === where.worktree && entry.checkout === where.checkout && (entry.id === undefined || entry.id === where.id);
+
+/** Whether the worktree an entry names still exists and is the one install ran in. */
+function entryAlive(common: string, entry: GateEntry): boolean {
+  const dir = join(common, entry.worktree);
+  return existsSync(dir) && (entry.id === undefined || statSync(dir).ino === entry.id);
+}
 
 const git = (cwd: string, args: string[]): string =>
   // Only the trailing newline goes: a folder name may begin or end with a space.
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).replace(/\n$/, '');
 
 /** Where the checkout at `cwd` sits: git's common directory, its worktree, and its folder under that worktree's top. */
-export function gateSite(cwd: string): { common: string; worktree: string; checkout: string } | null {
+export function gateSite(cwd: string): { common: string; worktree: string; id: number; checkout: string } | null {
   try {
     const common = realpathSync(resolvePath(cwd, git(cwd, ['rev-parse', '--git-common-dir'])));
     const here = realpathSync(resolvePath(cwd, git(cwd, ['rev-parse', '--git-dir'])));
     const checkout = git(cwd, ['rev-parse', '--show-prefix']).replace(/\/$/, '');
-    return { common, worktree: relative(common, here), checkout };
+    return { common, worktree: relative(common, here), id: statSync(here).ino, checkout };
   } catch {
     return null; // not a git repo
   }
 }
 
 /**
- * The gate's live entries; empty where there is none. An entry whose worktree
- * git has since removed is dropped, so a pruned worktree neither keeps the gate
- * alive nor hands its entry to a new worktree of the same name. A list that
- * does not parse is refused, never overwritten.
+ * The gate's entries; empty where there is none. An entry whose worktree git
+ * has since removed is kept, because it still gates its folder in the worktrees
+ * that remain. A list that does not parse is refused, never overwritten.
  */
 export function readGate(common: string): GateEntry[] {
   const path = join(common, GATE_LIST);
@@ -293,19 +321,21 @@ export function readGate(common: string): GateEntry[] {
   } catch (error) {
     throw new CliError(`${path} does not parse (${(error as Error).message}) — fix or remove it and re-run`);
   }
-  return entries.filter(
-    (entry): entry is GateEntry =>
-      typeof entry?.worktree === 'string' &&
-      typeof entry?.checkout === 'string' &&
-      existsSync(join(common, entry.worktree)),
-  );
+  return entries
+    .filter((entry): entry is GateEntry => typeof entry?.worktree === 'string' && typeof entry?.checkout === 'string')
+    .map(({ worktree, id, checkout, seo }) => ({
+      worktree,
+      ...(typeof id === 'number' ? { id } : {}),
+      checkout,
+      ...(seo === true ? { seo } : {}),
+    }));
 }
 
 /** The list, replaced whole: a commit reading it meanwhile sees the old list or the new one, never half of one. */
 export function writeGate(common: string, entries: GateEntry[]): void {
   writeAtomic(
     join(common, GATE_LIST),
-    `${JSON.stringify({ entries: entries.map(({ checkout, worktree, seo }) => ({ checkout, worktree, ...(seo === true ? { seo } : {}) })) }, null, 2)}\n`,
+    `${JSON.stringify({ entries: entries.map(({ checkout, worktree, id, seo }) => ({ checkout, worktree, ...(id === undefined ? {} : { id }), ...(seo === true ? { seo } : {}) })) }, null, 2)}\n`,
   );
 }
 
@@ -374,6 +404,10 @@ function template(name: string): string {
 }
 
 const label = (checkout: string): string => (checkout === '' ? 'the repository root' : `${checkout}/`);
+
+/** A gate entry's worktree in words: '' is the main worktree, `worktrees/<name>` a linked one. */
+const worktreeLabel = (worktree: string): string =>
+  worktree === '' ? 'the main worktree' : `the worktree ${worktree.replace(/^worktrees\//, '')}`;
 
 export function worktreeTop(cwd: string): string | null {
   try {
