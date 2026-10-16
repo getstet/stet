@@ -59,7 +59,7 @@ import { loadProject, refuseAbsence } from './project.js';
 import { unmountEdits } from './provider-mount.js';
 import { walk } from './pages.js';
 import { CliError, Report, collapseLines, posixRelative } from './report.js';
-import { applyFileEdits, formatDiff, unRewriteFile, type Edit } from './rewrite.js';
+import { applyFileEdits, dominantEol, formatDiff, unRewriteFile, type Edit } from './rewrite.js';
 import { filesForGlobs } from './scan.js';
 import { TS7_REFUSAL, isDialectFile, loadTypescript, matchGlob, scanSource, scriptKindFor } from './source-scan.js';
 import { isStoreBacked } from './store.js';
@@ -192,6 +192,15 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
 
         // The mount stet wrote comes out exactly; its block's imports go with the block.
         const exact = isLayout ? unmountEdits(ts, abs, source, io.cwd, config) : null;
+        if (exact !== null) {
+          // A leaf import a later register run put directly below the block carries the block's trailing newline below it.
+          const nl = dominantEol(source);
+          const leaf = [...result.stetImportSpans, ...result.copyDeclSpans].find((span) => span.pos === exact.block.end);
+          if (leaf !== undefined && !source.startsWith(nl + nl, exact.block.end - 2 * nl.length) && source.startsWith(nl, leaf.end)) {
+            exact.block = { pos: exact.block.pos, end: leaf.end + nl.length };
+            exact.edits[0] = { pos: exact.block.pos, end: exact.block.end, text: '' };
+          }
+        }
         const inBlock = (span: { pos: number; end: number }): boolean => exact !== null && span.pos >= exact.block.pos && span.end <= exact.block.end;
         const spans = [...result.stetImportSpans, ...result.copyDeclSpans].filter((span) => !inBlock(span));
         const un = unRewriteFile(source, result.accessorCalls, values, spans);

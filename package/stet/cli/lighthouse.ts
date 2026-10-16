@@ -40,6 +40,7 @@ import { AuditPackageMissing, CATEGORIES, ChromeMissing, chromeRunner, type Form
 import { answers, endGroup, untilInterrupted } from './liveness.js';
 import type { CliIo } from './main.js';
 import { applyPages, auditablePages, pageOfFile, proposeForHost, servedRoute, type AuditablePage } from './pages.js';
+import { unmountEdits } from './provider-mount.js';
 import { plural, Report, UsageError } from './report.js';
 import { applyFileEdits } from './rewrite.js';
 import { loadTypescript } from './source-scan.js';
@@ -121,7 +122,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
 
   const html = isHtmlHost(config);
   // stet's own footprint, read before any target starts.
-  const footprint = html ? { lines: [], entries: [] } : footprintOf(io.cwd, config);
+  const footprint = html ? { lines: [], entries: [] } : await footprintOf(io.cwd, config);
   if (!html && url === undefined && !build) {
     for (const line of footprint.lines) report.line(line);
     report.error('lighthouse', NO_TARGET);
@@ -230,6 +231,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
           if (target.kind === 'build') {
             // The edit is in source the running build does not carry: build and serve again.
             await stopServing(held);
+            if (stopped) return emit();
             const again = await startTarget(io, config, { url, build }, report, held);
             if (again === null) return emit();
             held.target = again;
@@ -308,7 +310,7 @@ async function stopServing(held: Held): Promise<void> {
 }
 
 /** stet's own footprint on a JavaScript host's page: the read path's provider import, and a mount no client reads. */
-function footprintOf(cwd: string, config: StetConfig): { lines: string[]; entries: Array<{ file: string; kind: 'read-path' | 'provider' }> } {
+async function footprintOf(cwd: string, config: StetConfig): Promise<{ lines: string[]; entries: Array<{ file: string; kind: 'read-path' | 'provider' }> }> {
   const lines: string[] = [];
   const entries: Array<{ file: string; kind: 'read-path' | 'provider' }> = [];
   if (readPathImport(cwd, config) !== 'clean') {
@@ -318,8 +320,18 @@ function footprintOf(cwd: string, config: StetConfig): { lines: string[]; entrie
     entries.push({ file: config.readPath.file, kind: 'read-path' });
   }
   const layout = config.rootLayout === undefined ? undefined : join(cwd, config.rootLayout);
-  if (layout !== undefined && existsSync(layout) && readFileSync(layout, 'utf8').includes('<CopyProvider') && clientReadFiles(cwd, config).length === 0) {
-    lines.push(`stet  ${config.rootLayout as string} mounts CopyProvider and no client component reads copy — stet upgrade unmounts it`);
+  const source = layout !== undefined && existsSync(layout) ? readFileSync(layout, 'utf8') : '';
+  if (layout !== undefined && source.includes('<CopyProvider') && clientReadFiles(cwd, config).length === 0) {
+    // The line promises what upgrade does: it names the unmount only where `unmountEdits` takes the mount out (typescript not loading leaves the mount, as in upgrade).
+    const unmount = await loadTypescript().then(
+      (ts) => unmountEdits(ts, layout, source, cwd, config),
+      () => null,
+    );
+    lines.push(
+      unmount === null
+        ? `stet  ${config.rootLayout as string}: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote`
+        : `stet  ${config.rootLayout as string} mounts CopyProvider and no client component reads copy — stet upgrade unmounts it`,
+    );
     entries.push({ file: config.rootLayout as string, kind: 'provider' });
   }
   return { lines, entries };

@@ -54,16 +54,21 @@ function htmlHost(fake: FakeLighthouse | null, opts: { pages?: Record<string, { 
 }
 
 /** A Next-shaped JavaScript host, 0.6.0's footprint optional: init's read path line and a mount no client reads. */
-function nextHost(fake: FakeLighthouse | null, opts: { footprint?: boolean } = {}): Host {
+function nextHost(fake: FakeLighthouse | null, opts: { footprint?: boolean; reformatted?: boolean } = {}): Host {
   const cwd = mkdtempSync(join(tmpdir(), 'stet-lighthouse-next-'));
   write(cwd, 'stet.config.json', JSON.stringify({ project: 't', managedSurfaces: ['app/**/*.tsx'] }));
   write(cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { home: { route: '/' } } }));
   write(cwd, 'content/defaults.json', JSON.stringify({ default: {} }));
-  const mount = opts.footprint === true ? "import { CopyProvider } from '@getstet/stet/react';\n" : '';
+  // The mount as `register` writes it (the resolved form, at offset 0), the provider tag split over lines where `reformatted`.
+  const mount =
+    opts.footprint === true
+      ? "import { CopyProvider } from '@getstet/stet/react';\nimport type { Descriptor } from '@getstet/stet';\nimport descriptorJson from '../content/descriptor.json';\nimport { RESOLVED } from '../content/resolved';\n\n"
+      : '';
+  const provider = opts.reformatted === true ? '<CopyProvider\n descriptor={descriptorJson as unknown as Descriptor}\n resolved={RESOLVED}>' : '<CopyProvider descriptor={descriptorJson as unknown as Descriptor} resolved={RESOLVED}>';
   write(
     cwd,
     'app/layout.tsx',
-    `${mount}export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <html lang="en"><body>${opts.footprint === true ? '<CopyProvider descriptor={d} resolved={r}>{children}</CopyProvider>' : '{children}'}</body></html>;\n}\n`,
+    `${mount}export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <html lang="en"><body>${opts.footprint === true ? `${provider}{children}</CopyProvider>` : '{children}'}</body></html>;\n}\n`,
   );
   write(cwd, 'lib/content.ts', `${opts.footprint === true ? INIT_READ_IMPORT : "import { createServerCopy } from '@getstet/stet/react/server';"}\nexport const copy = createServerCopy(d, r);\n`);
   const answering = (async () => new Response('', { status: 200 })) as unknown as typeof fetch;
@@ -244,6 +249,16 @@ describe("stet audit lighthouse — stet's own footprint (journey C11)", () => {
     expect(out).toContain('stet  app/layout.tsx mounts CopyProvider and no client component reads copy — stet upgrade unmounts it');
     expect(h.out[h.out.length - 1]).toBe('1 page · 2 failing audits · stet fixes 2 (stet) · the host owns 0');
     expect(fake.starts).toEqual([false]);
+  });
+
+  it('names a mount stet upgrade cannot take out as one to unmount by hand, with the wording upgrade prints when it refuses', async () => {
+    const h = nextHost(fakeLighthouse({ '/': cleanLhr() }), { footprint: true, reformatted: true });
+    expect(await h.run('--url', 'http://127.0.0.1:3999/')).toBe(0);
+    const out = h.out.join('\n');
+    expect(out).toContain(
+      'stet  app/layout.tsx: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote',
+    );
+    expect(out).not.toContain('stet upgrade unmounts it');
   });
 
   it('prints the footprint lines before the no-target refusal', async () => {
