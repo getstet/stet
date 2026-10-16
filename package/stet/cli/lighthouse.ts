@@ -221,7 +221,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         } else {
           if (target.kind === 'build') {
             // The edit is in source the running build does not carry: build and serve again.
-            await stopTarget(held);
+            await stopServing(held);
             const again = await startTarget(io, config, { url, build }, report, held);
             if (again === null) return report.emit(io, { json });
             held.target = again;
@@ -274,11 +274,17 @@ interface Held {
 
 /** The runner's Chrome, then the front, then the preview's group — on every exit path. */
 async function stopTarget(held: Held): Promise<void> {
-  const { runner, target, preview } = held;
+  const runner = held.runner;
   delete held.runner;
+  if (runner !== undefined) await runner.close();
+  await stopServing(held);
+}
+
+/** The front and the preview's group, Chrome left running: `--build`'s re-run serves a new build to the same runner. */
+async function stopServing(held: Held): Promise<void> {
+  const { target, preview } = held;
   delete held.target;
   delete held.preview;
-  if (runner !== undefined) await runner.close();
   if (target?.front !== undefined) await target.front.close();
   if (preview !== undefined) await endGroup(preview);
 }

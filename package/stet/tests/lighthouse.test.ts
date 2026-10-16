@@ -418,6 +418,36 @@ describe('stet audit lighthouse --build (D3)', () => {
     expect(await previewGone(h.cwd)).toBe(true);
   }, 30_000);
 
+  it('builds and serves again for the re-run after --fix --write, to the same Chrome', async () => {
+    const fake = fakeLighthouse({ '/': cleanLhr() });
+    let closed = false;
+    const start: FakeLighthouse['start'] = async (insecure) => {
+      const inner = await fake.start(insecure);
+      return {
+        run: async (url, options) => {
+          if (closed) throw new Error('run after close');
+          return inner.run(url, options);
+        },
+        close: async () => {
+          closed = true;
+          await inner.close();
+        },
+      };
+    };
+    const h = buildHost(fake);
+    h.io.lighthouse = start;
+    write(h.cwd, 'app/layout.tsx', 'export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <html><body>{children}</body></html>;\n}\n');
+    write(h.cwd, 'stet.config.json', JSON.stringify({ project: 't', managedSurfaces: ['app/**/*.tsx'], language: 'en' }));
+    expect(await h.run('--build', '--fix', '--write')).toBe(0);
+    expect(readFileSync(join(h.cwd, 'app/layout.tsx'), 'utf8')).toContain('<html lang="en">');
+    expect(fake.runs).toHaveLength(2);
+    expect(new URL(fake.runs[1]?.url ?? '').port).not.toBe(new URL(fake.runs[0]?.url ?? '').port);
+    expect(h.err.filter((line) => line === 'building (npm run build)…')).toHaveLength(2);
+    expect(fake.starts).toEqual([true]);
+    expect(fake.closed).toBe(1);
+    expect(await previewGone(h.cwd)).toBe(true);
+  }, 30_000);
+
   it('ends the preview when the audit throws', async () => {
     const h = buildHost(fakeLighthouse({}));
     await expect(h.run('--build')).rejects.toThrow('fake lighthouse');
