@@ -3,7 +3,8 @@
  * each failing audit printed with its owner, its place and its remedy, over a
  * target that follows the host: the checkout's own documents on the
  * static-HTML host, `--url` or `--build` on a JavaScript one. Lighthouse,
- * chrome-launcher and selfsigned load only inside this command's run.
+ * chrome-launcher and selfsigned load only inside this command's run. They are
+ * optional peers the host installs, asked for before anything else runs.
  */
 
 import { spawn } from 'node:child_process';
@@ -11,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
 import { constants as osConstants } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 
 import { headLimitsFor } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
@@ -26,6 +27,7 @@ import { filesForGlobs } from './files.js';
 import { clientReadFiles, readPathImport } from './footprint.js';
 import { trackable } from './git.js';
 import { readDocument } from './html-host.js';
+import { packageRoot } from './installed.js';
 import {
   chosenRun,
   closingLine,
@@ -37,7 +39,7 @@ import {
   type PageContext,
 } from './lighthouse-audits.js';
 import { astroFixLines, planDocumentFix, planNextLang, planViteShell, type DocumentFix } from './lighthouse-fix.js';
-import { AuditPackageMissing, CATEGORIES, ChromeMissing, chromeRunner, type FormFactor, type LighthouseResult, type LighthouseRunner } from './lighthouse-run.js';
+import { AuditPackageMissing, auditPackagesPresent, CATEGORIES, ChromeMissing, chromeRunner, type FormFactor, type LighthouseResult, type LighthouseRunner } from './lighthouse-run.js';
 import { answers, endGroup, untilInterrupted } from './liveness.js';
 import type { CliIo } from './main.js';
 import { applyPages, auditablePages, pageOfFile, proposeForHost, servedRoute, type AuditablePage } from './pages.js';
@@ -47,7 +49,7 @@ import { applyFileEdits } from './rewrite.js';
 import { loadTypescript } from './source-scan.js';
 import { childEnv, devDefaults, foregroundEnv, readWorkspace, routerPreviewCommand, workspacePath, type WorkspaceEntry } from './workspace.js';
 
-const AUDIT_PACKAGE_MISSING = 'Lighthouse is not installed — reinstall @getstet/stet';
+const AUDIT_PACKAGE_MISSING = 'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5';
 const CHROME_MISSING = 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary';
 const NO_TARGET = 'this host builds before it serves — pass --url <server>, or --build to build and serve the production output here';
 const SET_LANGUAGE = 'set language in stet.config.json (a BCP 47 tag such as en-GB), then run stet audit lighthouse --fix';
@@ -67,6 +69,19 @@ interface Target {
   base: string;
   kind: 'documents' | 'build' | 'url';
   front?: Front;
+}
+
+/**
+ * The needs-Lighthouse line. Node resolves the three beside the stet that runs,
+ * so where that stet is not the cwd project's own (a dashboard started in
+ * another checkout, an npx or global stet), the line names the folder to
+ * install in.
+ */
+function auditPackageMissing(cwd: string): string {
+  const root = realpathSync(packageRoot());
+  const at = root.indexOf(`${sep}node_modules${sep}`);
+  const project = at === -1 ? root : root.slice(0, at);
+  return project === realpathSync(cwd) ? AUDIT_PACKAGE_MISSING : `${AUDIT_PACKAGE_MISSING} in ${project}`;
 }
 
 export async function runAuditLighthouse(args: string[], io: CliIo): Promise<number> {
@@ -105,6 +120,12 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   const applied = flag(values, 'applied');
 
   const report = new Report();
+  // A plain install carries none of the audit's packages: said before the
+  // config is read, a target starts or a build runs.
+  if (!(await auditPackagesPresent())) {
+    report.error('lighthouse', auditPackageMissing(io.cwd));
+    return report.emit(io, { json });
+  }
   const config = loadConfig(io.cwd);
   const descriptor = descriptorOf(config, io.cwd, report);
   if (descriptor === null) return report.emit(io, { json });
@@ -279,7 +300,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   } catch (error) {
     // Raised before any measurement: `startFront` and the runner import the audit's packages.
     if (!(error instanceof AuditPackageMissing)) throw error;
-    report.error('lighthouse', AUDIT_PACKAGE_MISSING);
+    report.error('lighthouse', auditPackageMissing(io.cwd));
     return report.emit(io, { json });
   } finally {
     await stopTarget(held);

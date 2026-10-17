@@ -407,39 +407,110 @@ describe('stet audit lighthouse — no other command loads Lighthouse', () => {
 });
 
 describe('stet audit lighthouse — an install missing its audit packages', () => {
-  /** The built bin run with one package answered as not found by Node's own resolver, as a pruned install leaves it. */
+  const NEEDS = 'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5';
+  /** The folder the running stet belongs to: the built bin lives in this checkout, outside any node_modules. */
+  const STET_PROJECT = realpathSync(join(dirname(fileURLToPath(import.meta.url)), '..'));
+  /** The line as the run prints it: a stet that is not the cwd project's own names the folder to install in. */
+  const needs = (cwd: string): string => (realpathSync(cwd) === STET_PROJECT ? NEEDS : `${NEEDS} in ${STET_PROJECT}`);
+
+  /**
+   * `--import` arguments under which Node's own resolver answers `name` as not found, as an install without it
+   * leaves it. `code` is what the loader raises: ERR_MODULE_NOT_FOUND on Node's own, MODULE_NOT_FOUND under Yarn
+   * PnP (with `pnpCode`), none for a failure that is not an absence.
+   */
+  const hiding = (name: string, opts: { code?: string | null; pnpCode?: string; message?: string } = {}): string[] => {
+    const code = opts.code === undefined ? 'ERR_MODULE_NOT_FOUND' : opts.code;
+    const tools = mkdtempSync(join(tmpdir(), 'stet-lighthouse-tools-'));
+    write(
+      tools,
+      'hide.mjs',
+      [
+        'export async function resolve(specifier, context, next) {',
+        `  if (specifier === '${name}') {`,
+        `    const error = new Error(${JSON.stringify(opts.message ?? `Cannot find package '${name}' imported from stet`)});`,
+        ...(code === null ? [] : [`    error.code = '${code}';`]),
+        ...(opts.pnpCode === undefined ? [] : [`    error.pnpCode = '${opts.pnpCode}';`]),
+        '    throw error;',
+        '  }',
+        '  return next(specifier, context);',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    write(tools, 'register.mjs', "import { register } from 'node:module';\nregister('./hide.mjs', import.meta.url);\n");
+    return ['--import', join(tools, 'register.mjs')];
+  };
+
+  /** The built bin run once with `node` arguments ahead of it: its exit, stdout and stderr. */
+  const runBuilt = async (cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<{ code: number | null; stdout: string; stderr: string }> => {
+    const at = args.indexOf(BUILT_BIN);
+    const stet = spawn(process.execPath, at === -1 ? [...args.slice(0, 2), BUILT_BIN, ...args.slice(2)] : args, {
+      cwd,
+      env: env ?? { ...process.env, STET_WORKSPACE: join(cwd, '.no-workspace.json') },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    stet.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString('utf8')));
+    stet.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString('utf8')));
+    const code = await new Promise<number | null>((resolve) => stet.on('exit', (exit) => resolve(exit)));
+    return { code, stdout, stderr };
+  };
+
   for (const name of ['lighthouse', 'chrome-launcher', 'selfsigned']) {
-    it.skipIf(!builtBinExists())(`prints one line and exits 1 where ${name} is missing, leaving no front`, async () => {
-      const h = htmlHost(null);
-      const tools = mkdtempSync(join(tmpdir(), 'stet-lighthouse-tools-'));
-      write(
-        tools,
-        'hide.mjs',
-        [
-          'export async function resolve(specifier, context, next) {',
-          `  if (specifier === '${name}') {`,
-          `    const error = new Error("Cannot find package '${name}' imported from stet");`,
-          "    error.code = 'ERR_MODULE_NOT_FOUND';",
-          '    throw error;',
-          '  }',
-          '  return next(specifier, context);',
-          '}',
-          '',
-        ].join('\n'),
-      );
-      write(tools, 'register.mjs', "import { register } from 'node:module';\nregister('./hide.mjs', import.meta.url);\n");
-      const stet = spawn(process.execPath, ['--import', join(tools, 'register.mjs'), BUILT_BIN, 'audit', 'lighthouse'], {
-        cwd: h.cwd,
-        env: { ...process.env, STET_WORKSPACE: join(h.cwd, '.no-workspace.json') },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stderr = '';
-      stet.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString('utf8')));
-      const code = await new Promise<number | null>((resolve) => stet.on('exit', (exit) => resolve(exit)));
-      expect(code).toBe(1);
-      expect(stderr).toBe('error: Lighthouse is not installed — reinstall @getstet/stet\n');
-    }, 30_000);
+    for (const [loader, opts] of [
+      ['Node', {}],
+      ['Yarn PnP', { code: 'MODULE_NOT_FOUND', pnpCode: 'MISSING_PEER_DEPENDENCY' }],
+    ] as const) {
+      it.skipIf(!builtBinExists())(`prints one line and exits 1 where ${name} is missing as ${loader} raises it, leaving no front`, async () => {
+        const h = htmlHost(null);
+        const run = await runBuilt(h.cwd, [...hiding(name, opts), 'audit', 'lighthouse']);
+        expect(run.code).toBe(1);
+        expect(run.stderr).toBe(`error: ${needs(h.cwd)}\n`);
+      }, 30_000);
+    }
   }
+
+  it.skipIf(!builtBinExists())('names the install before a JavaScript host builds, and as the one finding under --json', async () => {
+    const h = nextHost(null);
+    write(h.cwd, 'package.json', JSON.stringify({ name: 'h', private: true, scripts: { build: "node -e \"require('fs').writeFileSync('built.txt','ok')\"" } }));
+    const built = await runBuilt(h.cwd, [...hiding('lighthouse'), 'audit', 'lighthouse', '--build']);
+    expect(built.code).toBe(1);
+    expect(built.stderr).toBe(`error: ${needs(h.cwd)}\n`);
+    expect(existsSync(join(h.cwd, 'built.txt'))).toBe(false);
+    const json = await runBuilt(h.cwd, [...hiding('selfsigned'), 'audit', 'lighthouse', '--build', '--json']);
+    expect(json.code).toBe(1);
+    expect(JSON.parse(json.stdout)).toEqual({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: needs(h.cwd) }] });
+    expect(existsSync(join(h.cwd, 'built.txt'))).toBe(false);
+  }, 30_000);
+
+  it.skipIf(!builtBinExists())('keeps a flag usage error ahead of the line, and gives the line to a --pages the config must settle', async () => {
+    const h = htmlHost(null);
+    const hidden = hiding('lighthouse');
+    const usage = await runBuilt(h.cwd, [...hidden, 'audit', 'lighthouse', '--write']);
+    expect(usage.code).toBe(2);
+    expect(usage.stderr).toContain("--write applies --fix's plan");
+    expect(usage.stderr).not.toContain('needs Lighthouse');
+    const pages = await runBuilt(h.cwd, [...hidden, 'audit', 'lighthouse', '--pages', 'nope']);
+    expect(pages.code).toBe(1);
+    expect(pages.stderr).toBe(`error: ${needs(h.cwd)}\n`);
+  }, 30_000);
+
+  it.skipIf(!builtBinExists())("adds the folder to install in only where the running stet is not the cwd project's own", async () => {
+    const outside = await runBuilt(htmlHost(null).cwd, [...hiding('lighthouse'), 'audit', 'lighthouse']);
+    expect(outside.stderr).toBe(`error: ${NEEDS} in ${STET_PROJECT}\n`);
+    const own = await runBuilt(STET_PROJECT, [...hiding('lighthouse'), 'audit', 'lighthouse']);
+    expect(own.code).toBe(1);
+    expect(own.stderr).toBe(`error: ${NEEDS}\n`);
+  }, 30_000);
+
+  it.skipIf(!builtBinExists())('lets a failure that is not an absence through, as itself and not as the line', async () => {
+    const h = htmlHost(null);
+    const run = await runBuilt(h.cwd, [...hiding('selfsigned', { code: null, message: 'boom' }), 'audit', 'lighthouse']);
+    expect(run.code).not.toBe(0);
+    expect(run.stderr).toContain('boom');
+    expect(run.stderr).not.toContain('needs Lighthouse');
+  }, 30_000);
 });
 
 describe('stet audit lighthouse — the page URL on the html host (D3)', () => {

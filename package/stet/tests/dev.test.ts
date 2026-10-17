@@ -8420,6 +8420,15 @@ describe('the page', () => {
       held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary' }] });
       await page.act('auditRun');
       expect(docOf(page).querySelector('.card .err')?.textContent).toBe('Chrome was not found — install Google Chrome, or set CHROME_PATH in the shell that runs stet dev');
+      // The needs-Lighthouse line reaches the card as written, with the folder it names where the dashboard's stet is another checkout's.
+      for (const line of [
+        'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5',
+        'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5 in /checkouts/a',
+      ]) {
+        held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: line }] });
+        await page.act('auditRun');
+        expect(docOf(page).querySelector('.card .err')?.textContent).toBe(line);
+      }
       held.reply = { state: 'done', elapsed: 9, lines: ['building (npm run build)…', 'boom'], result: { ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: 'npm run build exited 1 — its output is above' }] } };
       await page.act('auditRun');
       expect(docOf(page).querySelector('.card .err')?.textContent).toBe('The build failed — its output is under Setup');
