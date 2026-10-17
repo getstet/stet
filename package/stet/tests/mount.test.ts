@@ -7,6 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { createMemoryStore } from '../adapters/store-memory.js';
 import { createSnapshotStore } from '../adapters/store-snapshot.js';
 import { miniDescriptor } from '../conformance/fixture.js';
 import { bearerMatches, createStetHandler, type PublishEvent } from '../server/mount.js';
@@ -18,6 +19,7 @@ import type {
   StoreAdapter,
   StoreError,
 } from '../src/store.js';
+import type { StoreRow } from '../src/resolve.js';
 
 const TOKEN_ENV = 'STET_MOUNT_TEST_TOKEN';
 const TOKEN = 'sekret-token';
@@ -231,14 +233,62 @@ describe('POST writes', () => {
     expect(events).toEqual([{ key: 'hero_headline', target: descriptor.keys['hero_headline']?.target, versionId: 7 }]);
   });
 
-  it('revert reads key from its body and fires onPublish', async () => {
+  it('revert reads key from its body, checks it against the version, and fires onPublish', async () => {
     const events: PublishEvent[] = [];
-    const { store, calls } = makeStore();
+    const { store, calls } = makeStore({
+      history: async () => ({ rows: [{ id: 3, key: 'hero_headline' }], nextBeforeId: null }) as never,
+    });
     const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (e) => events.push(e) });
     const res = await h.POST(post('/api/stet/revert', { key: 'hero_headline', versionId: 3, editor: 'ada' }));
     expect(res.status).toBe(200);
+    expect(calls.find((c) => c.method === 'history')?.arg).toEqual({ key: 'hero_headline', beforeId: 4, limit: 1 });
     expect(calls.find((c) => c.method === 'revert')?.arg).toEqual({ versionId: 3, editor: 'ada' });
     expect(events).toEqual([{ key: 'hero_headline', target: descriptor.keys['hero_headline']?.target, versionId: 8 }]);
+  });
+
+  it("refuses a revert whose key is not the version's own, writing nothing (F76)", async () => {
+    // Two keys, each published twice, in a real store: the body's key decides
+    // nothing but the event, so a mismatch must never reach the revert write.
+    const store = createMemoryStore({ project: 'test' });
+    const ids: Record<string, number[]> = { hero_headline: [], hero_body: [] };
+    for (const value of ['first', 'second']) {
+      for (const key of ['hero_body', 'hero_headline']) {
+        await store.saveDraft({ key, value: `${key} ${value}`, target: 'web', editor: 'ada' });
+        const published = await store.publish({ key, editor: 'ada' });
+        ids[key]?.push((published as { versionId: number }).versionId);
+      }
+    }
+    const events: PublishEvent[] = [];
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (e) => events.push(e) });
+    const older = ids['hero_headline']?.[0] as number;
+    const before = await store.read();
+    const res = await h.POST(post('/api/stet/revert', { key: 'hero_body', versionId: older, editor: 'ada' }));
+    expect(res.status).toBe(400);
+    expect(await bodyOf(res)).toEqual({ error: `version ${older} is not a published version of hero_body` });
+    expect(await store.read()).toEqual(before);
+    expect(events).toEqual([]);
+    const right = await h.POST(post('/api/stet/revert', { key: 'hero_headline', versionId: older, editor: 'ada' }));
+    expect(right.status).toBe(200);
+    const restored = (await bodyOf(right))['versionId'];
+    expect(events).toEqual([{ key: 'hero_headline', target: 'web', versionId: restored }]);
+    expect(((await store.read()) as StoreRow[]).find((row) => row.key === 'hero_headline')?.value).toBe('hero_headline first');
+  });
+
+  it('refuses a revert naming a draft or a version that does not exist, writing nothing and firing nothing', async () => {
+    const store = createMemoryStore({ project: 'test' });
+    await store.saveDraft({ key: 'hero_headline', value: 'first', target: 'web', editor: 'ada' });
+    await store.publish({ key: 'hero_headline', editor: 'ada' });
+    const draft = (await store.saveDraft({ key: 'hero_headline', value: 'unpublished', target: 'web', editor: 'ada' })) as { draftId: number };
+    const events: PublishEvent[] = [];
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (e) => events.push(e) });
+    const before = await store.read();
+    for (const versionId of [draft.draftId, 999]) {
+      const res = await h.POST(post('/api/stet/revert', { key: 'hero_headline', versionId, editor: 'ada' }));
+      expect({ versionId, status: res.status }).toEqual({ versionId, status: 400 });
+      expect(await bodyOf(res)).toEqual({ error: `version ${versionId} is not a published version of hero_headline` });
+      expect(await store.read()).toEqual(before);
+      expect(events).toEqual([]);
+    }
   });
 
   it('rejects an undeclared key on draft/publish/revert with 400, RPC never called', async () => {
@@ -499,6 +549,19 @@ describe('hooks and store-result mapping', () => {
     const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
     const res = await h.POST(post('/api/stet/publish', { key: 'hero_headline', editor: 'ada' }));
     expect(res.status).toBe(501);
+  });
+
+  it("a StoreError or NotSupported from revert's ownership read maps as it does from a write, and nothing is reverted", async () => {
+    for (const [answer, status] of [
+      [storeErr('unreachable'), 503],
+      [{ notSupported: true, method: 'history' } as NotSupported, 501],
+    ] as const) {
+      const { store, calls } = makeStore({ history: async () => answer as never });
+      const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+      const res = await h.POST(post('/api/stet/revert', { key: 'hero_headline', versionId: 3, editor: 'ada' }));
+      expect(res.status).toBe(status);
+      expect(calls.some((c) => c.method === 'revert')).toBe(false);
+    }
   });
 });
 

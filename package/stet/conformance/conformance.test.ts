@@ -7583,6 +7583,46 @@ describe('mount', () => {
       delete process.env[TOKEN_ENV];
     }
   });
+
+  it("Requirement: revert refuses a key that is not the version's own", async () => {
+    const TOKEN_ENV = 'STET_CONF_REVERT_TOKEN';
+    process.env[TOKEN_ENV] = 'sekret';
+    try {
+      const store = createMemoryStore({ project: 'test' });
+      const ids: Record<string, number[]> = { hero_body: [], hero_headline: [] };
+      for (const value of ['first', 'second']) {
+        for (const key of ['hero_body', 'hero_headline']) {
+          await store.saveDraft({ key, value: `${key} ${value}`, target: 'web', editor: 'ed' });
+          ids[key]?.push(((await store.publish({ key, editor: 'ed' })) as { versionId: number }).versionId);
+        }
+      }
+      const published: PublishEvent[] = [];
+      const handler = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (event) => void published.push(event) });
+      const revert = (key: string, versionId: number): Promise<Response> =>
+        handler.POST(
+          new Request('https://h/api/stet/revert', {
+            method: 'POST',
+            headers: { authorization: 'Bearer sekret', 'content-type': 'application/json' },
+            body: JSON.stringify({ key, versionId, editor: 'ed' }),
+          }),
+        );
+      const first = ids['hero_headline']?.[0] as number;
+      const before = JSON.stringify(await store.read());
+      const mismatch = await revert('hero_body', first);
+      expect(mismatch.status).toBe(400);
+      expect(await mismatch.json()).toEqual({ error: `version ${first} is not a published version of hero_body` });
+      expect(JSON.stringify(await store.read())).toBe(before);
+      expect(published).toEqual([]);
+      const own = await revert('hero_headline', first);
+      expect(own.status).toBe(200);
+      const restored = ((await own.json()) as { versionId: number }).versionId;
+      expect(published).toEqual([{ key: 'hero_headline', target: descriptor.keys['hero_headline']?.target, versionId: restored }]);
+      const rows = (await store.read()) as Array<{ key: string; value: unknown }>;
+      expect(rows.find((row) => row.key === 'hero_headline')?.value).toBe('hero_headline first');
+    } finally {
+      delete process.env[TOKEN_ENV];
+    }
+  });
 });
 
 /**

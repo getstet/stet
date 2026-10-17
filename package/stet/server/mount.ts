@@ -14,8 +14,9 @@
  * and `sendTest` are ADDED to canon §13.5's options (the draft RPC's `target`
  * has no other source; test-send needs a send channel); `renderEmail` is
  * TEMPLATE-based; the `revert` body ADDS `key` (its RPC returns only a version
- * id, and `onPublish` needs the key to source the target); canon's "history
- * drafts included" is the outlier against the published-only store contract.
+ * id, and `onPublish` needs the key to source the target), checked against the
+ * version before the write; canon's "history drafts included" is the outlier
+ * against the published-only store contract.
  */
 
 import { revertChange } from '../adapters/changesets.js';
@@ -226,12 +227,23 @@ export function createStetHandler(opts: StetHandlerOptions): {
         const editor = reqStr(body, 'editor').trim();
         if (!editor) return json({ error: 'editor is required' }, 400);
         // `key` is a surfaced addition beyond canon's {versionId, editor}: the RPC
-        // returns only a version id, so onPublish needs the key to source `target`.
+        // returns only a version id, so onPublish needs the key to source `target`,
+        // and the key is checked against the version before the write.
         const key = reqStr(body, 'key');
         const def = keyDef(key);
         if (def === undefined) return json({ error: `undeclared key: ${key}` }, 400);
         const versionId = numField(body, 'versionId');
         if (versionId === undefined) return json({ error: 'versionId is required' }, 400);
+        // The body's key must be the version's own, checked before the write:
+        // `key`'s newest published row at or below `versionId` is that version
+        // exactly when the version belongs to `key`. A mismatch would restore
+        // another key and fire onPublish under the wrong one.
+        const owner = await opts.store.history({ key, beforeId: versionId + 1, limit: 1 });
+        if (isStoreError(owner)) return storeErrorResponse(owner);
+        if (isNotSupported(owner)) return notSupportedResponse(owner);
+        if (owner.rows[0]?.id !== versionId) {
+          return json({ error: `version ${versionId} is not a published version of ${key}` }, 400);
+        }
         const res = await opts.store.revert({ versionId, editor });
         if (isStoreError(res)) return storeErrorResponse(res);
         if (isNotSupported(res)) return notSupportedResponse(res);
