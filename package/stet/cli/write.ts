@@ -16,6 +16,7 @@ import { isNotSupported, isRefusal, isStoreError } from '../adapters/store-share
 import type { StoreRow } from '../src/resolve.js';
 import { keyDefOf } from '../src/descriptor.js';
 import type { Shape } from '../src/types.js';
+import { scopeKeys, shippedScope } from '../src/value-check.js';
 import { ENV_OPTION, flag, noPositionals, parse, required, text } from './args.js';
 import type { CliIo } from './main.js';
 import { stampDescriptorVersion } from './meta.js';
@@ -148,6 +149,13 @@ export async function runPublish(args: string[], io: CliIo): Promise<number> {
       throw new CliError(`"${key}" is not a key in ${project.config.descriptorPath}`);
     }
 
+    // The gate `draft` runs, run again on the stored draft that is about to
+    // ship: a draft written past it (an earlier release, another client) is
+    // judged as it publishes. A store that does not answer is left to the
+    // publish, which says so in its own words.
+    const held = await project.readRows({ keys: scopeKeys(project.descriptor, [key]), preview: true });
+    if (!held.storeDown && !draftsPass(project, held.rows, [{ key, locale }], report)) return report.emit(io);
+
     const answer = await project.store.publish({ key, editor, locale });
     if (isNotSupported(answer)) report.error('store', snapshotOnly('publish'), key);
     else if (isStoreError(answer)) report.error('store', `${key}: ${answer.message}`, key);
@@ -156,6 +164,30 @@ export async function runPublish(args: string[], io: CliIo): Promise<number> {
   } finally {
     await project.dispose();
   }
+}
+
+/**
+ * Whether every stored draft in `members` passes the content gate, each judged
+ * with the rows as they will stand once `members` publish: the active rows
+ * and only those drafts (`rows`, read for preview). Findings land in the report
+ * at their own level. A
+ * member with no draft row has nothing to ship, and a key that has left the
+ * descriptor has no rules — the publish itself answers both.
+ */
+function draftsPass(
+  project: LoadedProject,
+  rows: StoreRow[],
+  members: Array<{ key: string; locale: string }>,
+  report: Report,
+): boolean {
+  let pass = true;
+  const scope = shippedScope(rows, members);
+  for (const { key, locale } of members) {
+    const row = rows.find((r) => r.status === 'draft' && r.key === key && r.locale === locale);
+    if (row === undefined || !Object.hasOwn(project.descriptor.keys, key)) continue;
+    pass = validateValue(project.descriptor, project.snapshot, key, row.value, locale, report, scope) && pass;
+  }
+  return pass;
 }
 
 /**
@@ -208,6 +240,9 @@ async function publishDue(io: CliIo, editor: string, env: string | undefined): P
         );
         continue;
       }
+      // A draft that fails the gate is held back with the validator's own
+      // words and the run exits non-zero; the rest still publish.
+      if (!draftsPass(project, answer.rows, [row], report)) continue;
       const result = await project.store.publish({ key: row.key, editor, locale: row.locale });
       // One failure does not strand the rest: a clock run publishes what it can
       // and reports what it could not.
@@ -219,7 +254,7 @@ async function publishDue(io: CliIo, editor: string, env: string | undefined): P
       }
     }
 
-    published += await publishDueChanges(project, editor, grouped, report);
+    published += await publishDueChanges(project, editor, grouped, answer.rows, report);
     const demoted = await demoteEmptyChanges(project, due, now, report);
 
     // All three counts, so a run that published nothing but demoted something
@@ -250,6 +285,7 @@ async function publishDueChanges(
   project: LoadedProject,
   editor: string,
   grouped: StoreRow[],
+  rows: StoreRow[],
   report: Report,
 ): Promise<number> {
   let published = 0;
@@ -279,6 +315,10 @@ async function publishDueChanges(
       }
       continue;
     }
+
+    // One member that fails the gate holds the whole change, which stays
+    // scheduled and is judged again on the next run.
+    if (!draftsPass(project, rows, found.members, report)) continue;
 
     const flipped = await project.store.changesets.publishChange({ changeId, editor });
     if (isNotSupported(flipped)) {

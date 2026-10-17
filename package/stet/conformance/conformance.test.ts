@@ -5,6 +5,7 @@
  * second one — a run here is the evidence that an install works.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
+import { get as httpGet, createServer as createHttpServer, type IncomingHttpHeaders } from 'node:http';
 import {
   chmodSync,
   cpSync,
@@ -57,6 +58,7 @@ import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { handlerOver, paintPage, req, TOKEN, type PaintedPage } from '../tests/helpers/dashboard-page.js';
 import { dashboardPage } from '../cli/dev.js';
+import { startPreviewProxy } from '../cli/preview-proxy.js';
 import { siteId, updateSite } from '../cli/workspace.js';
 import { DASHED, closeFrames, frame, located, tick } from '../tests/helpers/preview-frame.js';
 import { installRegistryDts, typecheckHost } from '../tests/helpers/ts-host.js';
@@ -840,8 +842,6 @@ describe('content-read', () => {
     // runtime, webpack has to load: one `node:` specifier in the closure is
     // where a pages-router build stops, naming Node's module and never stet.
     const generatorHalf = /(^|\/)(codegen|preview-token)\.ts$/;
-    // The audit's packages load only under `stet audit lighthouse`, never from a read entry.
-    const auditOnly = ['lighthouse', 'chrome-launcher', 'selfsigned', 'puppeteer-core'];
     for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts']) {
       const closure = runtimeImportClosure(new URL(entry, import.meta.url));
       // The react closure legitimately names `react`; only builtins are the
@@ -851,6 +851,13 @@ describe('content-read', () => {
         entry,
         generator: [],
       });
+    }
+    // The audit's packages are optional peers a production install leaves out,
+    // loaded only under `stet audit lighthouse`: no entry a host runs reaches
+    // them, the read entries, the mount and the four store adapters among them.
+    const auditOnly = ['lighthouse', 'chrome-launcher', 'selfsigned', 'puppeteer-core'];
+    for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts', '../server/index.ts', '../adapters/store-memory.ts', '../adapters/store-snapshot.ts', '../adapters/store-pg.ts', '../adapters/store-postgrest.ts']) {
+      const closure = runtimeImportClosure(new URL(entry, import.meta.url));
       expect({ entry, audit: closure.bare.filter((spec) => auditOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
         entry,
         audit: [],
@@ -7583,6 +7590,46 @@ describe('mount', () => {
       delete process.env[TOKEN_ENV];
     }
   });
+
+  it("Requirement: revert refuses a key that is not the version's own", async () => {
+    const TOKEN_ENV = 'STET_CONF_REVERT_TOKEN';
+    process.env[TOKEN_ENV] = 'sekret';
+    try {
+      const store = createMemoryStore({ project: 'test' });
+      const ids: Record<string, number[]> = { hero_body: [], hero_headline: [] };
+      for (const value of ['first', 'second']) {
+        for (const key of ['hero_body', 'hero_headline']) {
+          await store.saveDraft({ key, value: `${key} ${value}`, target: 'web', editor: 'ed' });
+          ids[key]?.push(((await store.publish({ key, editor: 'ed' })) as { versionId: number }).versionId);
+        }
+      }
+      const published: PublishEvent[] = [];
+      const handler = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (event) => void published.push(event) });
+      const revert = (key: string, versionId: number): Promise<Response> =>
+        handler.POST(
+          new Request('https://h/api/stet/revert', {
+            method: 'POST',
+            headers: { authorization: 'Bearer sekret', 'content-type': 'application/json' },
+            body: JSON.stringify({ key, versionId, editor: 'ed' }),
+          }),
+        );
+      const first = ids['hero_headline']?.[0] as number;
+      const before = JSON.stringify(await store.read());
+      const mismatch = await revert('hero_body', first);
+      expect(mismatch.status).toBe(400);
+      expect(await mismatch.json()).toEqual({ error: `version ${first} is not a published version of hero_body` });
+      expect(JSON.stringify(await store.read())).toBe(before);
+      expect(published).toEqual([]);
+      const own = await revert('hero_headline', first);
+      expect(own.status).toBe(200);
+      const restored = ((await own.json()) as { versionId: number }).versionId;
+      expect(published).toEqual([{ key: 'hero_headline', target: descriptor.keys['hero_headline']?.target, versionId: restored }]);
+      const rows = (await store.read()) as Array<{ key: string; value: unknown }>;
+      expect(rows.find((row) => row.key === 'hero_headline')?.value).toBe('hero_headline first');
+    } finally {
+      delete process.env[TOKEN_ENV];
+    }
+  });
 });
 
 /**
@@ -8317,6 +8364,27 @@ describe('dashboard', () => {
     await tick(1_100);
     expect(located(framed).at(-1)).toMatchObject({ key: 'gone', hidden: true });
   }, 5_000);
+
+  it("Requirement: The preview proxy keeps the dev server's own redirects in the frame", async () => {
+    // A dev server writing its own address as `localhost` and as `127.0.0.1`, the way Next 16 and Auth.js v5 do.
+    const dev = createHttpServer((incoming, res) => {
+      const own = (dev.address() as { port: number }).port;
+      if (incoming.url === '/go') res.writeHead(303, { location: `http://localhost:${own}/a`, 'content-length': 0 });
+      else res.writeHead(200, { 'x-action-redirect': `http://127.0.0.1:${own}/b;push`, 'content-length': 0 });
+      res.end();
+    });
+    await new Promise<void>((done) => dev.listen(0, '127.0.0.1', () => done()));
+    const proxy = await startPreviewProxy(`http://127.0.0.1:${(dev.address() as { port: number }).port}`, 'http://127.0.0.1:1', '', 'c1');
+    const headersOf = (path: string): Promise<IncomingHttpHeaders> =>
+      new Promise((done, fail) => httpGet(`${proxy.origin}${path}`, (res) => (res.resume(), done(res.headers))).on('error', fail));
+    try {
+      expect((await headersOf('/go')).location).toBe(`${proxy.origin}/a`);
+      expect((await headersOf('/act'))['x-action-redirect']).toBe(`${proxy.origin}/b;push`);
+    } finally {
+      await proxy.close();
+      await new Promise<void>((done) => dev.close(() => done()));
+    }
+  });
 });
 
 describe('contacts', () => {

@@ -76,6 +76,32 @@ async function upstream(): Promise<Upstream> {
       res.writeHead(302, { location: `${origin}/page`, 'content-length': 0 });
       return void res.end();
     }
+    // Redirects as Next 16 writes them: its own address under any loopback
+    // spelling, and a server action's `x-action-redirect`.
+    const own = new URL(origin).port;
+    const away: Record<string, Record<string, string>> = {
+      '/go-localhost': { location: `http://localhost:${own}/dashboard?next=%2Fx#top` },
+      '/go-v6': { location: `http://[::1]:${own}/a` },
+      '/go-port': { location: `http://localhost:${Number(own) + 1}/a` },
+      '/go-away': { location: 'https://example.com/a' },
+      '/go-host': { location: `http://example.com:${own}/a` },
+      '/go-https': { location: `https://localhost:${own}/a` },
+      '/go-rel': { location: '/login?next=%2Fdashboard' },
+      '/go-slashes': { location: `http://localhost:${own}//example.com/a` },
+      // A server that writes UTF-8 bytes into the header: Node sends this string's characters as latin1 bytes.
+      '/go-utf8': { location: Buffer.from(`http://localhost:${own}/über`).toString('latin1') },
+      // Bytes that are not UTF-8 stay as the parser reads them.
+      '/go-latin1': { location: `http://localhost:${own}/\xfcber` },
+      '/action': { 'x-action-redirect': `http://127.0.0.1:${own}/dashboard;push` },
+      '/action-semi': { 'x-action-redirect': `http://localhost:${own}/a;b/c;replace` },
+      '/action-away': { 'x-action-redirect': 'https://example.com/a;push' },
+      '/action-bare': { 'x-action-redirect': `http://localhost:${own};replace` },
+    };
+    const moved = away[req.url ?? ''];
+    if (moved !== undefined) {
+      res.writeHead(moved['location'] === undefined ? 200 : 303, { ...moved, 'content-length': 0 });
+      return void res.end();
+    }
     res.writeHead(404, { 'content-length': 0 });
     res.end();
   });
@@ -226,6 +252,26 @@ describe('the preview proxy', () => {
     const moved = await get(proxy.port, '/go', proxy.host);
     expect(moved.status).toBe(302);
     expect(moved.headers['location']).toBe(`${proxy.origin}/page`);
+  });
+
+  it("keeps a redirect to the dev server's own address in the frame, under any loopback spelling", async () => {
+    const up = await upstream();
+    const proxy = await proxyTo(up);
+    const header = async (path: string, name: string): Promise<string | undefined> => (await get(proxy.port, path, proxy.host)).headers[name];
+    expect(await header('/go-localhost', 'location')).toBe(`${proxy.origin}/dashboard?next=%2Fx#top`);
+    expect(await header('/go-v6', 'location')).toBe(`${proxy.origin}/a`);
+    expect(await header('/go-slashes', 'location')).toBe(`${proxy.origin}//example.com/a`);
+    expect(await header('/go-utf8', 'location')).toBe(`${proxy.origin}/%C3%BCber`);
+    expect(await header('/go-latin1', 'location')).toBe(`${proxy.origin}/%C3%BCber`);
+    expect(await header('/go-port', 'location')).toBe(`http://localhost:${up.port + 1}/a`);
+    expect(await header('/go-away', 'location')).toBe('https://example.com/a');
+    expect(await header('/go-host', 'location')).toBe(`http://example.com:${up.port}/a`);
+    expect(await header('/go-https', 'location')).toBe(`https://localhost:${up.port}/a`);
+    expect(await header('/go-rel', 'location')).toBe('/login?next=%2Fdashboard');
+    expect(await header('/action', 'x-action-redirect')).toBe(`${proxy.origin}/dashboard;push`);
+    expect(await header('/action-semi', 'x-action-redirect')).toBe(`${proxy.origin}/a;b/c;replace`);
+    expect(await header('/action-away', 'x-action-redirect')).toBe('https://example.com/a;push');
+    expect(await header('/action-bare', 'x-action-redirect')).toBe(`${proxy.origin}/;replace`);
   });
 
   it('keeps every byte of a page in another charset beside the tag', async () => {

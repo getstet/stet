@@ -57,6 +57,16 @@ describe('the Lighthouse docs', () => {
     expect(atRoot.equals(inPackage)).toBe(true);
   });
 
+  it('says in the READMEs and the SEO doc how a 0.7.1 npm host drops the three', () => {
+    const flatten = (text: string): string => text.replace(/\s+/g, ' ');
+    const upgrade =
+      'Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and selfsigned because the lockfile holds them. To drop them, delete their node_modules/ entries from package-lock.json and run npm i, or install production with npm ci --omit=dev --omit=peer.';
+    const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+    for (const doc of [readme, seoCheck]) {
+      expect(flatten(doc)).toContain(upgrade);
+    }
+  });
+
   it('finds the command, the five rule ids and the footprint figure in the SEO doc', () => {
     expect([...seoCheck.matchAll(/^## (.+)$/gm)].map((m) => m[1])).toEqual(expect.arrayContaining(['`stet audit lighthouse`', 'The footprint']));
     for (const rule of ['missing-label', 'missing-name', 'missing-lang', 'empty-heading', 'redundant-alt']) {

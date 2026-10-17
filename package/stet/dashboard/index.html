@@ -1604,6 +1604,8 @@ function verifyNow() {
     draft: null,
     scroll: false,
     guess: true,
+    // A page that rendered after announcing itself is looked at again once it is quiet.
+    check: true,
   });
 }
 window.addEventListener('message', (event) => {
@@ -2561,6 +2563,10 @@ async function save(anyway) {
   if (check) {
     S.saveCheck = check;
     S.located = null;
+    // The request before the save is stale: a page that re-renders in place
+    // re-applies it to the saved text and answers "not found" under its number,
+    // which would otherwise be read as the answer to the check.
+    locateSeq += 1;
     clearTimeout(verifyTimer);
     // A dev server that updates the page in place sends no new ready.
     verifyTimer = setTimeout(() => { if (S.saveCheck === check) verifyNow(); }, AGENT_WAIT_MS);
