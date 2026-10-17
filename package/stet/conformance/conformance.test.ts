@@ -5,6 +5,7 @@
  * second one — a run here is the evidence that an install works.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
+import { get as httpGet, createServer as createHttpServer, type IncomingHttpHeaders } from 'node:http';
 import {
   chmodSync,
   cpSync,
@@ -57,6 +58,7 @@ import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { handlerOver, paintPage, req, TOKEN, type PaintedPage } from '../tests/helpers/dashboard-page.js';
 import { dashboardPage } from '../cli/dev.js';
+import { startPreviewProxy } from '../cli/preview-proxy.js';
 import { siteId, updateSite } from '../cli/workspace.js';
 import { DASHED, closeFrames, frame, located, tick } from '../tests/helpers/preview-frame.js';
 import { installRegistryDts, typecheckHost } from '../tests/helpers/ts-host.js';
@@ -8357,6 +8359,27 @@ describe('dashboard', () => {
     await tick(1_100);
     expect(located(framed).at(-1)).toMatchObject({ key: 'gone', hidden: true });
   }, 5_000);
+
+  it("Requirement: The preview proxy keeps the dev server's own redirects in the frame", async () => {
+    // A dev server writing its own address as `localhost` and as `127.0.0.1`, the way Next 16 and Auth.js v5 do.
+    const dev = createHttpServer((incoming, res) => {
+      const own = (dev.address() as { port: number }).port;
+      if (incoming.url === '/go') res.writeHead(303, { location: `http://localhost:${own}/a`, 'content-length': 0 });
+      else res.writeHead(200, { 'x-action-redirect': `http://127.0.0.1:${own}/b;push`, 'content-length': 0 });
+      res.end();
+    });
+    await new Promise<void>((done) => dev.listen(0, '127.0.0.1', () => done()));
+    const proxy = await startPreviewProxy(`http://127.0.0.1:${(dev.address() as { port: number }).port}`, 'http://127.0.0.1:1', '', 'c1');
+    const headersOf = (path: string): Promise<IncomingHttpHeaders> =>
+      new Promise((done, fail) => httpGet(`${proxy.origin}${path}`, (res) => (res.resume(), done(res.headers))).on('error', fail));
+    try {
+      expect((await headersOf('/go')).location).toBe(`${proxy.origin}/a`);
+      expect((await headersOf('/act'))['x-action-redirect']).toBe(`${proxy.origin}/b;push`);
+    } finally {
+      await proxy.close();
+      await new Promise<void>((done) => dev.close(() => done()));
+    }
+  });
 });
 
 describe('contacts', () => {

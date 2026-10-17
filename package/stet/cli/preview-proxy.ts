@@ -12,7 +12,9 @@
  * not a path is refused, so it can never be steered at another host. A page
  * the frame loads is requested unencoded and gains one script tag; every other
  * response (a fragment the page fetches among them), and every WebSocket
- * upgrade the dev server accepts (its hot reload), passes byte for byte.
+ * upgrade the dev server accepts (its hot reload), passes byte for byte. A
+ * redirect to the dev server's own address, under any loopback spelling of its
+ * port, is moved onto the proxy, in `Location` and in Next's `x-action-redirect`.
  */
 
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http';
@@ -37,6 +39,43 @@ function framedPage(dest: string | string[] | undefined): boolean | 'by-body' {
 /** An answer read as latin1 that opens an HTML document: a doctype or `<html`, after any BOM and whitespace. */
 const DOCUMENT_START = /^(?:\xef\xbb\xbf)?[\t\n\f\r ]*<(?:!doctype|html)\b/i;
 
+/** The host names a dev server writes its own address with: Next 16 writes `localhost` whatever `Host` it was sent. */
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/** A URL's port, the protocol's default where none is written. */
+function portOf(url: URL): string {
+  return url.port || (url.protocol === 'https:' ? '443' : '80');
+}
+
+/**
+ * A redirect target naming the dev server itself, under any loopback spelling
+ * of its port, moved onto the proxy's origin with its path, query and fragment;
+ * any other value as it came. A relative target already stays on the proxy.
+ * The origin is written out: a bare path beginning `//` would name a host.
+ */
+function onProxy(value: string, upstream: URL, proxy: string): string {
+  let url: URL;
+  try {
+    url = new URL(value, 'http://relative.invalid');
+  } catch {
+    return value;
+  }
+  const own = url.protocol === upstream.protocol && LOOPBACK.has(url.hostname) && portOf(url) === portOf(upstream);
+  return own ? `${proxy}${url.pathname}${url.search}${url.hash}` : value;
+}
+
+/**
+ * Next's server-action redirect, `<url>;push` or `<url>;replace`, which its
+ * client follows in place of a `Location`: its URL moved as `onProxy` moves
+ * one, its kind kept.
+ */
+function onProxyAction(value: string, upstream: URL, proxy: string): string {
+  const at = value.lastIndexOf(';');
+  const kind = at === -1 ? '' : value.slice(at);
+  if (kind !== ';push' && kind !== ';replace') return onProxy(value, upstream, proxy);
+  return onProxy(value.slice(0, at), upstream, proxy) + kind;
+}
+
 export interface PreviewProxy {
   /** `http://127.0.0.1:<port>`, the frame's origin. */
   origin: string;
@@ -53,7 +92,7 @@ export async function startPreviewProxy(
   idleMs = UPSTREAM_IDLE_MS,
 ): Promise<PreviewProxy> {
   const upstream = new URL(target);
-  const port = Number(upstream.port || (upstream.protocol === 'https:' ? 443 : 80));
+  const port = Number(portOf(upstream));
   const host = upstream.hostname;
   let origin = '';
 
@@ -98,9 +137,10 @@ export async function startPreviewProxy(
         up.on('aborted', down);
         up.on('error', down);
         const headers = { ...up.headers };
-        if (typeof headers.location === 'string' && headers.location.startsWith(upstream.origin)) {
-          headers.location = origin + headers.location.slice(upstream.origin.length);
-        }
+        // A redirect to the dev server's own address stays in the frame.
+        if (typeof headers.location === 'string') headers.location = onProxy(headers.location, upstream, origin);
+        const action = headers['x-action-redirect'];
+        if (typeof action === 'string') headers['x-action-redirect'] = onProxyAction(action, upstream, origin);
         const type = String(headers['content-type'] ?? '');
         const encoded = headers['content-encoding'] !== undefined && headers['content-encoding'] !== 'identity';
         if (page === false || !type.startsWith('text/html') || encoded || req.method === 'HEAD') {
