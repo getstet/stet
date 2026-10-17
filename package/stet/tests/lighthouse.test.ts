@@ -359,6 +359,28 @@ describe("stet audit lighthouse — stet's own footprint (journey C11)", () => {
 });
 
 describe('stet audit lighthouse — no other command loads Lighthouse', () => {
+  it('declares the audit packages as optional peers, at the ranges the workspace also develops against', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8')) as {
+      engines: { node: string };
+      dependencies: Record<string, string>;
+      optionalDependencies?: Record<string, string>;
+      peerDependencies: Record<string, string>;
+      peerDependenciesMeta: Record<string, { optional?: boolean }>;
+    };
+    const workspace = JSON.parse(readFileSync(join(here, '..', '..', 'package.json'), 'utf8')) as { devDependencies: Record<string, string> };
+    const ranges = { lighthouse: '^13.5.0', 'chrome-launcher': '^1.2.1', selfsigned: '^5.5.0' };
+    for (const [name, range] of Object.entries(ranges)) {
+      expect(manifest.dependencies[name], name).toBeUndefined();
+      expect(manifest.optionalDependencies?.[name], name).toBeUndefined();
+      expect(manifest.peerDependencies[name], name).toBe(range);
+      expect(manifest.peerDependenciesMeta[name]?.optional, name).toBe(true);
+      expect(workspace.devDependencies[name], name).toBe(range);
+    }
+    // Lighthouse's own install checks its Node floor; stet's other commands run on any Node 22.
+    expect(manifest.engines.node).toBe('>=22');
+  });
+
   it('check, seo check and the dashboard module run with lighthouse, chrome-launcher and selfsigned unimportable', async () => {
     vi.resetModules();
     for (const name of ['lighthouse', 'chrome-launcher', 'selfsigned']) {
