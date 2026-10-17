@@ -6,6 +6,7 @@
  * `src/value-check.ts`, shared with the mounted API.
  */
 
+import type { StoreRow } from '../src/resolve.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
 import { checkValue } from '../src/value-check.js';
@@ -53,7 +54,8 @@ export function validateUnnamed(d: {
  * every save surface shares, land in the report at their own level.
  *
  * Answers whether the value may be saved: warnings are reported and do not
- * block, errors are reported and do.
+ * block, errors are reported and do. `rows` are the store's rows read for
+ * preview, for a stored draft judged with its siblings' drafts in scope.
  */
 export function validateValue(
   descriptor: Descriptor,
@@ -62,8 +64,9 @@ export function validateValue(
   value: unknown,
   locale: string,
   report: Report,
+  rows?: StoreRow[],
 ): boolean {
-  const verdict = checkValue(descriptor, snapshot, key, value, locale);
+  const verdict = checkValue(descriptor, snapshot, key, value, locale, rows);
   for (const finding of verdict.findings) {
     if (finding.level === 'error') report.error(finding.kind, finding.message, finding.key);
     else report.warn(finding.kind, finding.message, finding.key);
