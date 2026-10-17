@@ -7790,6 +7790,20 @@ describe('the page', () => {
       page.dom.window.close();
     });
 
+    it('shows the mount’s content refusal under the field when a store-backed draft is refused', async () => {
+      const refusal = 'welcome__subject: 61 characters exceeds the 60-character limit (default)';
+      const page = await paint({
+        site: siteBody({ mode: 'memory' }),
+        routes: [[`/s/${SITE_ID}/api/stet/draft`, 422, { error: refusal, findings: [{ level: 'error', kind: 'limit', key: 'welcome__subject', message: refusal }] }]],
+      });
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'A changed headline');
+      await page.act('save');
+      expect(docOf(page).querySelector('#refusal .err')?.textContent).toBe(refusal);
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
     /** An html site with two pages, each a document with one marked key. */
     const TWO_PAGES: Descriptor = {
       version: 1,

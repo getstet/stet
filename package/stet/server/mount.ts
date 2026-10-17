@@ -21,7 +21,9 @@
 
 import { revertChange } from '../adapters/changesets.js';
 import type { DraftRefusal, NotSupported, StoreAdapter, StoreError } from '../src/store.js';
+import type { StoreRow } from '../src/resolve.js';
 import type { Descriptor, Target } from '../src/types.js';
+import { checkValue, type ValueFinding } from '../src/value-check.js';
 import { json, readJson, sameSignature } from './http.js';
 
 /** Fired fire-and-forget after a publish or revert. `target` is the descriptor's, never widened to a string. */
@@ -82,6 +84,36 @@ export function createStetHandler(opts: StetHandlerOptions): {
     Object.hasOwn(opts.descriptor.keys, key) ? opts.descriptor.keys[key] : undefined;
   const declaredTemplate = (template: string): boolean =>
     Object.hasOwn(opts.descriptor.templates ?? {}, template);
+
+  // The content gate the CLI's `draft` runs, run here before a draft is saved
+  // and before a stored draft is published: the store records content and
+  // attribution but never judges it. Each candidate is checked against the
+  // store's rows read for preview, so a template slot sees the drafts its
+  // siblings hold, as the publish would. A refusal is a 422 carrying the
+  // validator's own messages, returned before anything is written.
+  type Candidate = { key: string; locale: string; value: unknown };
+  const refuseInvalid = async (pick: (rows: StoreRow[]) => Candidate[]): Promise<Response | null> => {
+    const rows = await opts.store.read({ preview: true });
+    if (isStoreError(rows)) return storeErrorResponse(rows);
+    const findings: ValueFinding[] = [];
+    for (const { key, locale, value } of pick(rows)) {
+      findings.push(...checkValue(opts.descriptor, {}, key, value, locale, rows).findings);
+    }
+    const errors = findings.filter((finding) => finding.level === 'error');
+    if (errors.length === 0) return null;
+    return json({ error: errors.map((finding) => finding.message).join('; '), findings }, 422);
+  };
+
+  // The stored drafts a publish would ship. A key that has left the descriptor
+  // has no rules to check against (the stated orphan edge), and a row that is
+  // not a draft is not what a publish ships.
+  const draftsOf =
+    (members: Array<{ key: string; locale: string }>) =>
+    (rows: StoreRow[]): Candidate[] =>
+      members.flatMap(({ key, locale }) => {
+        const row = rows.find((r) => r.status === 'draft' && r.key === key && r.locale === locale);
+        return row !== undefined && keyDef(key) !== undefined ? [{ key, locale, value: row.value }] : [];
+      });
 
   // One member's event, sourced from the descriptor like every other. A member
   // whose key has since LEFT the descriptor gets no event — there is no
@@ -193,6 +225,9 @@ export function createStetHandler(opts: StetHandlerOptions): {
         // whatever change that number happened to name.
         const change = changeField(body);
         if (change === INVALID) return json({ error: 'change must be a number or null' }, 400);
+        const locale = optStr(body, 'locale');
+        const invalid = await refuseInvalid(() => [{ key, locale: locale ?? 'default', value: body['value'] }]);
+        if (invalid) return invalid;
         // The full canon body — dropping `force` locks a DraftRefusal to the incumbent forever.
         return rpcResult(
           await opts.store.saveDraft({
@@ -200,7 +235,7 @@ export function createStetHandler(opts: StetHandlerOptions): {
             value: body['value'],
             target: def.target,
             editor,
-            locale: optStr(body, 'locale'),
+            locale,
             label: optStr(body, 'label'),
             note: optStr(body, 'note'),
             publishAt: optStr(body, 'publishAt'),
@@ -216,7 +251,12 @@ export function createStetHandler(opts: StetHandlerOptions): {
         const key = reqStr(body, 'key');
         const def = keyDef(key);
         if (def === undefined) return json({ error: `undeclared key: ${key}` }, 400);
-        const res = await opts.store.publish({ key, editor, locale: optStr(body, 'locale') });
+        // A draft written before this gate, or by a client that skipped it, is
+        // judged by the same rules as it publishes.
+        const locale = optStr(body, 'locale');
+        const invalid = await refuseInvalid(draftsOf([{ key, locale: locale ?? 'default' }]));
+        if (invalid) return invalid;
+        const res = await opts.store.publish({ key, editor, locale });
         if (isStoreError(res)) return storeErrorResponse(res);
         if (isNotSupported(res)) return notSupportedResponse(res);
         firePublish({ key, target: def.target, versionId: res.versionId });
@@ -322,6 +362,16 @@ export function createStetHandler(opts: StetHandlerOptions): {
         if (!editor) return json({ error: 'editor is required' }, 400);
         const changeId = numField(body, 'change');
         if (changeId === undefined) return json({ error: 'change is required' }, 400);
+        // Every member draft is judged before any ships, so one invalid member
+        // refuses the whole group and the atomic publish never starts. A change
+        // that is not open or scheduled has no drafts to judge; the store answers it.
+        const found = await opts.store.changesets.get({ changeId });
+        if (isStoreError(found)) return storeErrorResponse(found);
+        // A store without the capability answers `publishChange` itself.
+        if (!isNotSupported(found) && (found.change.status === 'open' || found.change.status === 'scheduled')) {
+          const invalid = await refuseInvalid(draftsOf(found.members));
+          if (invalid) return invalid;
+        }
         const res = await opts.store.changesets.publishChange({ changeId, editor });
         if (isStoreError(res)) return storeErrorResponse(res);
         if (isNotSupported(res)) return notSupportedResponse(res);
