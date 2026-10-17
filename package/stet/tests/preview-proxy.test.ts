@@ -88,6 +88,10 @@ async function upstream(): Promise<Upstream> {
       '/go-https': { location: `https://localhost:${own}/a` },
       '/go-rel': { location: '/login?next=%2Fdashboard' },
       '/go-slashes': { location: `http://localhost:${own}//example.com/a` },
+      // A server that writes UTF-8 bytes into the header: Node sends this string's characters as latin1 bytes.
+      '/go-utf8': { location: Buffer.from(`http://localhost:${own}/über`).toString('latin1') },
+      // Bytes that are not UTF-8 stay as the parser reads them.
+      '/go-latin1': { location: `http://localhost:${own}/\xfcber` },
       '/action': { 'x-action-redirect': `http://127.0.0.1:${own}/dashboard;push` },
       '/action-semi': { 'x-action-redirect': `http://localhost:${own}/a;b/c;replace` },
       '/action-away': { 'x-action-redirect': 'https://example.com/a;push' },
@@ -257,6 +261,8 @@ describe('the preview proxy', () => {
     expect(await header('/go-localhost', 'location')).toBe(`${proxy.origin}/dashboard?next=%2Fx#top`);
     expect(await header('/go-v6', 'location')).toBe(`${proxy.origin}/a`);
     expect(await header('/go-slashes', 'location')).toBe(`${proxy.origin}//example.com/a`);
+    expect(await header('/go-utf8', 'location')).toBe(`${proxy.origin}/%C3%BCber`);
+    expect(await header('/go-latin1', 'location')).toBe(`${proxy.origin}/%C3%BCber`);
     expect(await header('/go-port', 'location')).toBe(`http://localhost:${up.port + 1}/a`);
     expect(await header('/go-away', 'location')).toBe('https://example.com/a');
     expect(await header('/go-host', 'location')).toBe(`http://example.com:${up.port}/a`);

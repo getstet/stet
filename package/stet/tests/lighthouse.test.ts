@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { INIT_READ_IMPORT } from '../cli/footprint.js';
+import { auditPackageLine, installFolder } from '../cli/lighthouse.js';
 import { ChromeMissing, type LighthouseResult } from '../cli/lighthouse-run.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { PREVIEW_COMMANDS, readWorkspace, updateSite } from '../cli/workspace.js';
@@ -403,6 +404,79 @@ describe('stet audit lighthouse — no other command loads Lighthouse', () => {
       for (const name of ['lighthouse', 'chrome-launcher', 'selfsigned']) vi.doUnmock(name);
       vi.resetModules();
     }
+  });
+});
+
+describe('stet audit lighthouse — the folder the needs-Lighthouse line names', () => {
+  const BARE = 'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5';
+  const NO_FOLDER = 'stet audit lighthouse needs Lighthouse — install @getstet/stet in the project, then run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5 there';
+  const real = (dir: string): string => realpathSync(dir);
+  const scratch = (): string => real(mkdtempSync(join(tmpdir(), 'stet-install-folder-')));
+  /** A project folder with a manifest, the stet installed in its node_modules; the stet's root. */
+  const projectWithStet = (dir: string): string => {
+    write(dir, 'package.json', '{"name":"host"}');
+    const root = join(dir, 'node_modules', '@getstet', 'stet');
+    write(root, 'package.json', '{"name":"@getstet/stet"}');
+    return root;
+  };
+  const underPnp = (body: () => void): void => {
+    Object.defineProperty(process.versions, 'pnp', { value: '3', configurable: true });
+    try {
+      body();
+    } finally {
+      delete (process.versions as Record<string, unknown>)['pnp'];
+    }
+  };
+
+  it('names the project the stet is installed in when the cwd belongs to another', () => {
+    const a = scratch();
+    const b = scratch();
+    write(b, 'package.json', '{"name":"other"}');
+    const root = projectWithStet(a);
+    expect(installFolder(root, b)).toBe(a);
+    expect(auditPackageLine(root, b)).toBe(`${BARE} in ${a}`);
+    // A cwd with no manifest anywhere above it is no project of its own.
+    expect(installFolder(root, scratch())).toBe(a);
+  });
+
+  it("gives the bare line where the cwd is the stet's own project, or inside it", () => {
+    const a = scratch();
+    const root = projectWithStet(a);
+    write(a, 'content/pages/x.txt', '');
+    for (const cwd of [a, join(a, 'content'), join(a, 'content', 'pages')]) {
+      expect(installFolder(root, cwd), cwd).toBeNull();
+      expect(auditPackageLine(root, cwd), cwd).toBe(BARE);
+    }
+  });
+
+  it('names no folder for a global stet, whose prefix lib folder holds no manifest', () => {
+    const prefix = scratch();
+    const root = join(prefix, 'lib', 'node_modules', '@getstet', 'stet');
+    write(root, 'package.json', '{"name":"@getstet/stet"}');
+    const cwd = scratch();
+    expect(installFolder(root, cwd)).toBeNull();
+    const line = auditPackageLine(root, cwd);
+    expect(line).toBe(NO_FOLDER);
+    expect(line).not.toContain(join(prefix, 'lib'));
+  });
+
+  it('names no folder under Yarn PnP, where the stet sits inside a cache zip', () => {
+    const host = scratch();
+    const root = join(host, '.yarn', 'cache', 'x.zip', 'node_modules', '@getstet', 'stet');
+    underPnp(() => {
+      expect(installFolder(root, host)).toBeNull();
+      expect(auditPackageLine(root, host)).toBe(NO_FOLDER);
+      // A real project folder does not lift the PnP floor.
+      const a = scratch();
+      expect(installFolder(projectWithStet(a), host)).toBeNull();
+    });
+  });
+
+  it('names the stet checkout itself when it runs outside any node_modules', () => {
+    const checkout = scratch();
+    write(checkout, 'package.json', '{"name":"@getstet/stet"}');
+    expect(installFolder(checkout, scratch())).toBe(checkout);
+    expect(auditPackageLine(checkout, checkout)).toBe(BARE);
   });
 });
 

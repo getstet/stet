@@ -48,6 +48,16 @@ function portOf(url: URL): string {
 }
 
 /**
+ * A header value Node decoded as latin1 that carries UTF-8 bytes, read as the
+ * UTF-8 it is where the bytes round-trip; any other value as it came.
+ */
+function utf8Carried(value: string): string {
+  const bytes = Buffer.from(value, 'latin1');
+  const text = bytes.toString('utf8');
+  return Buffer.from(text, 'utf8').equals(bytes) ? text : value;
+}
+
+/**
  * A redirect target naming the dev server itself, under any loopback spelling
  * of its port, moved onto the proxy's origin with its path, query and fragment;
  * any other value as it came. A relative target already stays on the proxy.
@@ -56,7 +66,7 @@ function portOf(url: URL): string {
 function onProxy(value: string, upstream: URL, proxy: string): string {
   let url: URL;
   try {
-    url = new URL(value, 'http://relative.invalid');
+    url = new URL(utf8Carried(value), 'http://relative.invalid');
   } catch {
     return value;
   }

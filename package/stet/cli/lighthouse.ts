@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
 import { constants as osConstants } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 
 import { headLimitsFor } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
@@ -50,6 +50,7 @@ import { loadTypescript } from './source-scan.js';
 import { childEnv, devDefaults, foregroundEnv, readWorkspace, routerPreviewCommand, workspacePath, type WorkspaceEntry } from './workspace.js';
 
 const AUDIT_PACKAGE_MISSING = 'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5';
+const AUDIT_PACKAGE_MISSING_ELSEWHERE = 'stet audit lighthouse needs Lighthouse — install @getstet/stet in the project, then run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5 there';
 const CHROME_MISSING = 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary';
 const NO_TARGET = 'this host builds before it serves — pass --url <server>, or --build to build and serve the production output here';
 const SET_LANGUAGE = 'set language in stet.config.json (a BCP 47 tag such as en-GB), then run stet audit lighthouse --fix';
@@ -71,17 +72,52 @@ interface Target {
   front?: Front;
 }
 
+const realOr = (path: string): string => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+};
+
+/** The folder holding the nearest package.json at or above `dir`, or null where none does. */
+function projectOf(dir: string): string | null {
+  for (let at = realOr(dir); ; at = dirname(at)) {
+    if (existsSync(join(at, 'package.json'))) return at;
+    if (dirname(at) === at) return null;
+  }
+}
+
 /**
- * The needs-Lighthouse line. Node resolves the three beside the stet that runs,
- * so where that stet is not the cwd project's own (a dashboard started in
- * another checkout, an npx or global stet), the line names the folder to
- * install in.
+ * The project folder holding the stet at `root`, where there is one to name:
+ * the folder above its node_modules, only if it has a package.json (a global
+ * install's lib folder has none) and the loader is not Yarn PnP (the stet then
+ * sits inside a cache zip).
  */
-function auditPackageMissing(cwd: string): string {
-  const root = realpathSync(packageRoot());
-  const at = root.indexOf(`${sep}node_modules${sep}`);
-  const project = at === -1 ? root : root.slice(0, at);
-  return project === realpathSync(cwd) ? AUDIT_PACKAGE_MISSING : `${AUDIT_PACKAGE_MISSING} in ${project}`;
+function stetProject(root: string): string | null {
+  if (process.versions.pnp !== undefined) return null;
+  const real = realOr(root);
+  const at = real.indexOf(`${sep}node_modules${sep}`);
+  const project = at === -1 ? real : real.slice(0, at);
+  return existsSync(join(project, 'package.json')) ? project : null;
+}
+
+/**
+ * The folder to install the audit packages in: the stet's project, where there
+ * is one to name and the cwd belongs to another project. Node resolves the
+ * three beside the stet that runs, so a dashboard started in another checkout
+ * needs them there.
+ */
+export function installFolder(root: string, cwd: string): string | null {
+  const project = stetProject(root);
+  return project !== null && project !== projectOf(cwd) ? project : null;
+}
+
+/** The needs-Lighthouse line for the stet at `root` run from `cwd`. */
+export function auditPackageLine(root: string, cwd: string): string {
+  const folder = installFolder(root, cwd);
+  if (folder !== null) return `${AUDIT_PACKAGE_MISSING} in ${folder}`;
+  return stetProject(root) === null ? AUDIT_PACKAGE_MISSING_ELSEWHERE : AUDIT_PACKAGE_MISSING;
 }
 
 export async function runAuditLighthouse(args: string[], io: CliIo): Promise<number> {
@@ -123,7 +159,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   // A plain install carries none of the audit's packages: said before the
   // config is read, a target starts or a build runs.
   if (!(await auditPackagesPresent())) {
-    report.error('lighthouse', auditPackageMissing(io.cwd));
+    report.error('lighthouse', auditPackageLine(packageRoot(), io.cwd));
     return report.emit(io, { json });
   }
   const config = loadConfig(io.cwd);
@@ -300,7 +336,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   } catch (error) {
     // Raised before any measurement: `startFront` and the runner import the audit's packages.
     if (!(error instanceof AuditPackageMissing)) throw error;
-    report.error('lighthouse', auditPackageMissing(io.cwd));
+    report.error('lighthouse', auditPackageLine(packageRoot(), io.cwd));
     return report.emit(io, { json });
   } finally {
     await stopTarget(held);

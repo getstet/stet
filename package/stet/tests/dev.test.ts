@@ -8424,6 +8424,7 @@ describe('the page', () => {
       for (const line of [
         'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5',
         'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5 in /checkouts/a',
+        'stet audit lighthouse needs Lighthouse — install @getstet/stet in the project, then run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5 there',
       ]) {
         held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: line }] });
         await page.act('auditRun');

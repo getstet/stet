@@ -193,6 +193,13 @@ project that already depends on another major of one of them moves to the major
 stet declares, or installs with `--legacy-peer-deps`. The dashboard's SEO tab
 runs the same command from its Lighthouse card.
 
+A global or npx stet, or one under Yarn PnP, has no project folder of its own:
+install @getstet/stet in the project that runs the audit, and add the three
+there. Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
+selfsigned because the lockfile holds them. To drop them, delete their
+node_modules/ entries from package-lock.json and run npm i, or install
+production with npm ci --omit=dev --omit=peer.
+
 ## The footprint
 
 On a static-HTML site the marks stet adds to a page are `data-stet-*`
