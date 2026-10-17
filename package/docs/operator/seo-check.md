@@ -186,7 +186,12 @@ stet reports and leaves alone. `--json` prints the same result as one object;
 
 The command needs Google Chrome (or `CHROME_PATH`) and Node 22.19 or later;
 every other command runs on Node 22. It loads Lighthouse only inside its own
-run. The dashboard's SEO tab runs the same command from its Lighthouse card.
+run. Lighthouse, chrome-launcher and selfsigned are optional peer dependencies,
+so installing stet brings none of them; install them as dev dependencies where
+the audit runs: `npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. A
+project that already depends on another major of one of them moves to the major
+stet declares, or installs with `--legacy-peer-deps`. The dashboard's SEO tab
+runs the same command from its Lighthouse card.
 
 ## The footprint
 

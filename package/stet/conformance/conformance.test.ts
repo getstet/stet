@@ -842,8 +842,6 @@ describe('content-read', () => {
     // runtime, webpack has to load: one `node:` specifier in the closure is
     // where a pages-router build stops, naming Node's module and never stet.
     const generatorHalf = /(^|\/)(codegen|preview-token)\.ts$/;
-    // The audit's packages load only under `stet audit lighthouse`, never from a read entry.
-    const auditOnly = ['lighthouse', 'chrome-launcher', 'selfsigned', 'puppeteer-core'];
     for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts']) {
       const closure = runtimeImportClosure(new URL(entry, import.meta.url));
       // The react closure legitimately names `react`; only builtins are the
@@ -853,6 +851,13 @@ describe('content-read', () => {
         entry,
         generator: [],
       });
+    }
+    // The audit's packages are optional peers a production install leaves out,
+    // loaded only under `stet audit lighthouse`: no entry a host runs reaches
+    // them, the read entries, the mount and the four store adapters among them.
+    const auditOnly = ['lighthouse', 'chrome-launcher', 'selfsigned', 'puppeteer-core'];
+    for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts', '../server/index.ts', '../adapters/store-memory.ts', '../adapters/store-snapshot.ts', '../adapters/store-pg.ts', '../adapters/store-postgrest.ts']) {
+      const closure = runtimeImportClosure(new URL(entry, import.meta.url));
       expect({ entry, audit: closure.bare.filter((spec) => auditOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
         entry,
         audit: [],
