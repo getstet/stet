@@ -1733,13 +1733,50 @@ describe('upgrade', () => {
     const output = host.stdout();
     // The readdir walks the shipped files, so a new migration joins the pending
     // list with no count to maintain — and it applies in number order.
-    expect(output).toContain('installed 0, pending 1, 2');
-    expect(output).toContain('would apply 001_content_cms.sql');
-    expect(output).toContain('would apply 002_changesets.sql');
+    expect(output).toContain('installed 0, pending 1, 2, 3');
+    expect(output.indexOf('001_content_cms.sql')).toBeGreaterThan(output.indexOf('cannot apply DDL'));
     expect(output.indexOf('001_content_cms.sql')).toBeLessThan(output.indexOf('002_changesets.sql'));
+    expect(output.indexOf('002_changesets.sql')).toBeLessThan(output.indexOf('003_contacts.sql'));
     expect(output).not.toContain('up to date');
+    // The adapter applies nothing, so the dry run says no migration "would apply".
+    expect(output).not.toContain('would apply');
     // A dry run writes nothing, the registry included.
     expect(output).toContain('content/keys.ts: unchanged');
+  });
+
+  it('a dry run on an adapter that cannot apply DDL prints the SQL and the apply paths, and writes nothing (journey I2)', async () => {
+    const host = postgrestHost();
+    const before = host.exists('stet/migrations/001_content_cms.sql');
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    const output = host.stdout();
+    expect(output).toContain('installed 0, pending 1, 2, 3');
+    expect(output).toContain('this adapter cannot apply DDL (canApplyDDL: false) — apply it out of band:');
+    expect(output).toContain('create table content_versions');
+    expect(output).toContain("notify pgrst, 'reload schema';");
+    expect(output).toContain(
+      "select has_table_privilege('<your anon role>', 'content_versions', 'SELECT');  -- expected: f",
+    );
+    expect(output).toContain('stet upgrade --verify');
+    expect(output).not.toContain('would apply');
+    // The migration copies are still not in the repo: a dry run adds no file.
+    expect(host.exists('stet/migrations/001_content_cms.sql')).toBe(before);
+    expect(before).toBe(false);
+  });
+
+  it('a dry run on an adapter that can apply DDL lists each migration and prints no out-of-band block', async () => {
+    const host = makeHost({
+      config: { store: { adapter: 'postgrest' } },
+      env: { STET_POSTGREST_URL: 'http://postgrest.test', STET_POSTGREST_TOKEN: 'test' },
+      store: { ...createMemoryStore({ project: 'default' }), canApplyDDL: true },
+      fetchImpl: noMeta,
+    });
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    const output = host.stdout();
+    expect(output).toContain('installed 0, pending 1, 2, 3');
+    for (const file of ['001_content_cms.sql', '002_changesets.sql', '003_contacts.sql']) {
+      expect(output).toContain(`would apply ${file}`);
+    }
+    expect(output).not.toContain('cannot apply DDL');
   });
 
   it('the print path carries the apply paths and the post-apply access check', async () => {
@@ -1783,6 +1820,32 @@ describe('upgrade', () => {
     expect(host.stdout()).toContain('verified: stet_meta reports schema_version 3');
     expect(host.stdout()).toContain('descriptor_version: stamped (1)');
     expect(patched).toContain('"descriptor_version":"1"');
+  });
+
+  it('a dry run on an up-to-date database stamps nothing, and a real run stamps it', async () => {
+    const current = fakeFetch(JSON.stringify([{ schema_version: 3, descriptor_version: 'old' }]));
+    const writes: string[] = [];
+    const host = makeHost({
+      config: { store: { adapter: 'postgrest' } },
+      env: { STET_POSTGREST_URL: 'http://postgrest.test', STET_POSTGREST_TOKEN: 'test' },
+      store: createMemoryStore({ project: 'default' }),
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method !== undefined && init.method !== 'GET') {
+          writes.push(`${init.method} ${String(input)}`);
+          return new Response(JSON.stringify([{ id: 1 }]));
+        }
+        return current(input as never, init as never);
+      }) as typeof globalThis.fetch,
+    });
+
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    expect(host.stdout()).toContain('migrations: up to date at 3');
+    expect(writes).toEqual([]);
+    expect(await host.run('upgrade', '--dry-run', '--verify')).toBe(0);
+    expect(writes).toEqual([]);
+    expect(await host.run('upgrade')).toBe(0);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatch(/^PATCH .*stet_meta/);
   });
 
   it('--verify refuses a database that has only walked as far as 001', async () => {

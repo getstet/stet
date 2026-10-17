@@ -7,6 +7,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
 import { constants as osConstants } from 'node:os';
@@ -44,7 +45,7 @@ import { unmountEdits } from './provider-mount.js';
 import { plural, Report, UsageError } from './report.js';
 import { applyFileEdits } from './rewrite.js';
 import { loadTypescript } from './source-scan.js';
-import { childEnv, devDefaults, readWorkspace, routerPreviewCommand, workspacePath, type WorkspaceEntry } from './workspace.js';
+import { childEnv, devDefaults, foregroundEnv, readWorkspace, routerPreviewCommand, workspacePath, type WorkspaceEntry } from './workspace.js';
 
 const AUDIT_PACKAGE_MISSING = 'Lighthouse is not installed — reinstall @getstet/stet';
 const CHROME_MISSING = 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary';
@@ -92,9 +93,13 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
   const raw = text(values, 'raw');
   const runsText = text(values, 'runs');
   if (url !== undefined && build) throw new UsageError('stet audit lighthouse takes --url or --build, not both');
+  if (url !== undefined && !URL.canParse(url)) throw new UsageError('stet audit lighthouse --url must be a full URL, such as http://localhost:3000/');
   if (runsText !== undefined && !/^[1-9]$/.test(runsText)) throw new UsageError('stet audit lighthouse --runs takes a whole number from 1 to 9');
   if (write && !fix) throw new UsageError("stet audit lighthouse --write applies --fix's plan — pass both");
   if (raw !== undefined && !json) throw new UsageError('stet audit lighthouse --raw writes beside --json — pass both');
+  if (url !== undefined && urlPathOf(url) !== '/' && text(values, 'pages') !== undefined) {
+    throw new UsageError('stet audit lighthouse --url with a path audits that one page — drop --pages, or give --url the origin');
+  }
   const runs = runsText === undefined ? 1 : Number(runsText);
   const formFactor: FormFactor = flag(values, 'desktop') ? 'desktop' : 'mobile';
   const applied = flag(values, 'applied');
@@ -136,7 +141,9 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     const target = await startTarget(io, config, { url, build }, report, held);
     if (target === null) return emit();
     held.target = target;
-    const { pages, skips } = pageTargets(io.cwd, config, rootAlone ? null : selected, target);
+    // A --url that names a page of its own is audited as exactly that URL, whatever pages are declared.
+    const ownUrl = !html && url !== undefined && pagesText === undefined && urlPathOf(url) !== '/';
+    const { pages, skips } = pageTargets(io.cwd, config, rootAlone || ownUrl ? null : selected, target, selected);
     try {
       held.runner = await (io.lighthouse ?? chromeRunner)(target.kind !== 'url');
     } catch (error) {
@@ -177,7 +184,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
     for (const line of skips) report.line(line);
     for (const line of footprint.lines) report.line(line);
     if (devServer) report.line('note  Performance is measured on the dev server — run with --build for the production number');
-    if (rootAlone) report.line('no pages declared — audited / alone; run stet pages scan to declare them');
+    if (rootAlone && !ownUrl) report.line('no pages declared — audited / alone; run stet pages scan to declare them');
 
     const owners: Owner[] = footprint.entries.map(() => 'stet' as const);
     // One entry and one strict finding per page: a re-run after `--fix --write` replaces the page's first result.
@@ -255,7 +262,7 @@ export async function runAuditLighthouse(args: string[], io: CliIo): Promise<num
         if (made !== undefined) rmSync(made, { recursive: true });
         report.error('lighthouse', `--raw ${raw}: git would track it — name a directory git ignores`);
       } else {
-        for (const [name, chosen] of chosenOf) writeJsonDeterministic(join(dir, `${name}.json`), chosen);
+        for (const [name, chosen] of chosenOf) writeJsonDeterministic(join(dir, `${rawFileName(name)}.json`), chosen);
       }
     }
     return emit();
@@ -388,7 +395,7 @@ async function startBuild(io: CliIo, config: StetConfig, report: Report, held: H
   // A signal during the port probe has already ended the run: no preview is spawned after the `finally`.
   if (held.stopped === true) return null;
   const command = previewCommandOf(io, config).replaceAll('{port}', String(port));
-  const child = spawn(command, { cwd: io.cwd, shell: true, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...childEnv(), PORT: String(port) } });
+  const child = spawn(command, { cwd: io.cwd, shell: true, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...childEnv(), ...foregroundEnv(config, 'preview'), PORT: String(port) } });
   const lines: string[] = [];
   const keep = (chunk: Buffer): void => {
     for (const line of chunk.toString('utf8').split('\n')) if (line.trim() !== '') lines.push(line);
@@ -448,11 +455,30 @@ function freePort(): Promise<number> {
  * (`auditablePages` found the document), the page skipped where none serves
  * its route; elsewhere the base joined with the route. Null is `/` alone.
  */
-function pageTargets(cwd: string, config: StetConfig, selected: AuditablePage[] | null, target: Target): { pages: PageTarget[]; skips: string[] } {
+function pageTargets(
+  cwd: string,
+  config: StetConfig,
+  selected: AuditablePage[] | null,
+  target: Target,
+  declared: AuditablePage[],
+): { pages: PageTarget[]; skips: string[] } {
   const base = target.front?.url ?? target.base;
   const html = isHtmlHost(config);
   if (selected === null) {
-    if (!html) return { pages: [{ page: '/', label: 'home', route: '/', url: new URL('/', base).href }], skips: [] };
+    if (!html) {
+      // A URL to a page of its own is that page, named by the declared page at its route, else by its path; `home` is `/` alone.
+      const path = target.kind === 'url' ? urlPathOf(base) : '/';
+      if (path === '/') return { pages: [{ page: '/', label: 'home', route: '/', url: new URL(base).href }], skips: [] };
+      // Both sides as the URL parser writes them, so a declared `/café` meets the URL's `/caf%C3%A9`.
+      const trimmed = (route: string): string => {
+        const at = new URL(base);
+        at.pathname = route;
+        return at.pathname.replace(/\/+$/, '');
+      };
+      const own = declared.find((entry) => trimmed(entry.route) === trimmed(path));
+      const name = own?.page ?? path;
+      return { pages: [{ page: name, label: name, route: own?.route ?? path, url: new URL(base).href }], skips: [] };
+    }
     const file = filesForGlobs(cwd, config.managedSurfaces).find((doc) => servedRoute(doc) === '/');
     if (file === undefined) return { pages: [], skips: ['/: no managed document serves / — skipped'] };
     return { pages: [{ page: '/', label: file, route: '/', url: base, file }], skips: [] };
@@ -467,16 +493,34 @@ function pageTargets(cwd: string, config: StetConfig, selected: AuditablePage[] 
   return { pages, skips };
 }
 
+/** A URL's path, `/` where it does not parse. */
+function urlPathOf(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return '/';
+  }
+}
+
 /** What one page's run is read against. */
 function pageContext(cwd: string, config: StetConfig, descriptor: Descriptor, snapshot: Snapshot, page: PageTarget, fix: boolean): PageContext {
-  const def = page.page === '/' ? undefined : descriptor.pages?.[page.page];
   const router = isHtmlHost(config) ? 'html' : config.router;
   const document = page.file === undefined ? null : readDocument(page.file, readFileSync(join(cwd, page.file), 'utf8'));
   // `/` audited alone is the page `planFixes` and `nameOf` call `home`: a document's own name, else `home`.
-  const name = page.page === '/' ? (page.file === undefined ? 'home' : (pageOfFile(cwd, page.file, descriptor.pages, { html: true }) ?? null)) : page.page;
+  const name =
+    page.page === '/'
+      ? page.file === undefined
+        ? 'home'
+        : (pageOfFile(cwd, page.file, descriptor.pages, { html: true }) ?? null)
+      : page.page.startsWith('/')
+        ? null
+        : page.page;
+  // Its declaration is read as it stands, so a re-run after `--fix --write` sees the page the write declared.
+  const def = name === null ? undefined : descriptor.pages?.[name];
   return {
     router,
     page: name,
+    label: page.label,
     def,
     descriptor,
     snapshot,
@@ -607,6 +651,22 @@ function pageJson(
 /** A page's name in the output: `/` audited alone is `home`, the name `pages scan` gives it. */
 function nameOf(page: PageTarget): string {
   return page.page === '/' ? 'home' : page.page;
+}
+
+/**
+ * A page's `--raw` file name, without the extension: its slashes folded to `_`,
+ * `root` where nothing is left, and past 200 bytes its first 100 and 12 hex of
+ * the full name's hash, so a long path stays under the file system's limit.
+ */
+function rawFileName(name: string): string {
+  const slug = name.replace(/^\/+|\/+$/g, '').replace(/\//g, '_') || 'root';
+  if (Buffer.byteLength(slug) <= 200) return slug;
+  let head = '';
+  for (const char of slug) {
+    if (Buffer.byteLength(head + char) > 100) break;
+    head += char;
+  }
+  return `${head}-${createHash('sha256').update(slug).digest('hex').slice(0, 12)}`;
 }
 
 /** `--strict`: one error per page with a category below 100. */

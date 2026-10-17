@@ -24,7 +24,7 @@ import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { check } from './check.js';
 import { CONFIG_FILE, formsSecretEnvOf, isHtmlHost, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
-import { GATE_LINE, gateSite, hookKind, hooksDir, insideDir, isSite, operatorHook, readGate, worktreeTop, type GateEntry } from './hook.js';
+import { GATE_LINE, gateLineIn, gateSite, hookKind, hooksDir, insideDir, isSite, operatorHook, readGate, worktreeTop, type GateEntry } from './hook.js';
 import { packageVersion } from './installed.js';
 import type { CliIo } from './main.js';
 import { readProjectMeta } from './meta.js';
@@ -248,7 +248,7 @@ function hookSection(cwd: string, report: Report): void {
     // A hooks manager's folder in the worktree: the gate joins its pre-commit by
     // one line, in the file that actually runs (husky v9's `.husky/pre-commit`).
     const theirs = operatorHook(dir);
-    const runs = existsSync(theirs.path) && readFileSync(theirs.path, 'utf8').includes(GATE_LINE);
+    const runs = existsSync(theirs.path) && gateLineIn(readFileSync(theirs.path, 'utf8')) !== undefined;
     report.line(
       runs
         ? `hook: ${theirs.path} runs the stet pre-commit gate`

@@ -81,6 +81,8 @@ export function isFailing(audit: Audit | undefined): boolean {
 export interface PageContext {
   router: 'app' | 'pages' | 'astro' | 'vite' | 'html';
   page: string | null;
+  /** The page's name in the output, which a head line names where no file or page name does. */
+  label: string;
   def: PageDef | undefined;
   descriptor: Descriptor;
   snapshot: Snapshot;
@@ -215,7 +217,7 @@ function remedyOf(
 ): { text: string; place: boolean; owner?: Owner; key?: string } {
   const node = firstNode(audit);
   const snippet = str(node?.['snippet']);
-  const file = context.file ?? context.page ?? '/';
+  const file = context.file ?? context.page ?? context.label;
   const viaFix = context.fix ? '— in the plan below' : '— stet audit lighthouse --fix plans it';
   const shaped = el ?? (snippet === undefined ? null : snippetElement(snippet));
   switch (id) {
@@ -445,7 +447,7 @@ export function scoreLine(label: string, route: string, runs: LighthouseResult[]
     const suffix = runs.length > 1 ? ` (median of ${runs.length}: ${values.join(' · ')})` : options.devServer ? ' (dev server)' : '';
     return `${LABELS[category]} ${shown}${suffix}`;
   });
-  return `${label}  ${route}  ${parts.join(' · ')}`;
+  return `${label === route ? label : `${label}  ${route}`}  ${parts.join(' · ')}`;
 }
 
 /** Each category's median score, 0–100 or null. */

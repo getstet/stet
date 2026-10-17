@@ -30,7 +30,7 @@ import { untilInterrupted } from './liveness.js';
 import { disposeStore } from './project.js';
 import type { CliIo } from './main.js';
 import { CliError, UsageError } from './report.js';
-import { addSite, childEnv, workspacePath } from './workspace.js';
+import { addSite, childEnv, launchedConnectionNames, workspacePath } from './workspace.js';
 
 /** The port the dashboard takes when nothing says otherwise. */
 const DEFAULT_PORT = 4400;
@@ -55,6 +55,8 @@ export interface StartDevServerOptions {
   /** The run token. Minted here when absent; a fixture passes its own. */
   token?: string;
   fetchImpl?: typeof globalThis.fetch;
+  /** The checkout `stet dev` was started in, which the process environment supplies connection variables to. */
+  launched?: string;
   /** Test seam: an adapter to use in place of the one a site's config would build. */
   storeFor?: (path: string, env: string | undefined) => StoreAdapter | undefined;
   /** The page's html. Defaults to the copy shipped inside the package. */
@@ -97,8 +99,11 @@ export async function startDevServer(opts: StartDevServerOptions): Promise<DevSe
     children,
     stores,
     queues: new Map(),
+    ...(opts.launched === undefined ? {} : { launched: opts.launched }),
     ...(opts.storeFor === undefined ? {} : { storeFor: opts.storeFor }),
   };
+  // Read the started-in checkout's connection names now, while its config is whole.
+  if (opts.launched !== undefined) launchedConnectionNames(opts.launched);
   const handler = createDevHandler(ctx);
   const server = createServer((req, res) => {
     void serve(handler, ctx.origin, req, res);
@@ -282,7 +287,7 @@ export async function runDev(args: string[], io: CliIo, hooks: RunDevHooks = {})
   const adding = text(values, 'add') ?? (existsSync(join(io.cwd, CONFIG_FILE)) ? io.cwd : undefined);
   const opened = adding === undefined ? undefined : addSite(workspaceFile, adding).path;
 
-  const handle = await startDevServer({ port, workspaceFile, io });
+  const handle = await startDevServer({ port, workspaceFile, io, ...(opened === undefined ? {} : { launched: opened }) });
   const run = untilInterrupted();
   try {
     const url = opened === undefined ? handle.url : `${handle.url}&site=${encodeURIComponent(opened)}`;

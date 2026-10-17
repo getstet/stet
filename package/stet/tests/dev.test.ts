@@ -29,7 +29,7 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
 import { cleanupCliHosts, fakeFetch, htmlFixture, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
@@ -66,12 +66,15 @@ import {
   addSite,
   baseEnv,
   childEnv,
+  connectionEnv,
+  connectionNames,
   devDefaults,
   loadSite,
   parseEnvText,
   readWorkspace,
   removeSite,
   routerPreviewCommand,
+  siteChildEnv,
   siteEnv,
   siteId,
   siteIo,
@@ -707,7 +710,7 @@ describe('the per-site environment', () => {
   it('never lets a checkout’s .env decide where the tools it runs are found', () => {
     const dir = tempDir();
     write(dir, '.env', 'PATH=/nope\nHOME=/nowhere\nDATABASE_URL=postgres://u:p@h/db\n');
-    const io = siteIo(dir, { out: [], err: [] });
+    const io = siteIo(dir, siteEnv(dir), { out: [], err: [] });
     expect(io.env?.['PATH']).toBe(process.env['PATH']);
     expect(io.env?.['HOME']).toBe(process.env['HOME']);
     expect(io.env?.['DATABASE_URL']).toBe('postgres://u:p@h/db');
@@ -720,7 +723,7 @@ describe('the per-site environment', () => {
     const heldTmp = process.env['TMPDIR'];
     delete process.env['TMPDIR'];
     try {
-      const io = siteIo(dir, { out: [], err: [] });
+      const io = siteIo(dir, siteEnv(dir), { out: [], err: [] });
       expect(io.cwd).toBe(dir);
       expect(io.env['PATH']).toBe(process.env['PATH']);
       expect(io.env['HOME']).toBe(process.env['HOME']);
@@ -736,6 +739,183 @@ describe('the per-site environment', () => {
       delete process.env['DASHTEST_SECRET'];
       if (heldTmp !== undefined) process.env['TMPDIR'] = heldTmp;
     }
+  });
+});
+
+/** Runs `fn` with these variables set in this process, restored after. */
+async function withProcessEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
+  const held = Object.fromEntries(Object.keys(vars).map((name) => [name, process.env[name]]));
+  for (const [name, value] of Object.entries(vars)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    await fn();
+  } finally {
+    for (const [name, value] of Object.entries(held)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+describe('the connection environment', () => {
+  const pair = { adapter: 'postgrest', urlEnv: 'FSG_URL', tokenEnv: 'FSG_TOKEN' };
+
+  it('lists every connection variable a config names, once, in block order', () => {
+    const host = makeCliHost({
+      config: {
+        project: 't',
+        store: pair,
+        environments: {
+          staging: { adapter: 'pg', urlEnv: 'FSG_STAGING_DB', tokenEnv: 'FSG_UNUSED' },
+          local: { adapter: 'memory' },
+          mirror: { adapter: 'postgrest', urlEnv: 'FSG_URL', tokenEnv: 'FSG_MIRROR_TOKEN' },
+        },
+        contacts: {
+          store: { adapter: 'postgrest', urlEnv: 'FSG_CONTACTS_URL', tokenEnv: 'FSG_CONTACTS_TOKEN' },
+          environments: { staging: { adapter: 'pg', urlEnv: 'FSG_CONTACTS_DB', tokenEnv: 'FSG_UNUSED' } },
+        },
+      },
+    });
+    expect(connectionNames(loadConfig(host.cwd))).toEqual([
+      'FSG_URL',
+      'FSG_TOKEN',
+      'FSG_STAGING_DB',
+      'FSG_MIRROR_TOKEN',
+      'FSG_CONTACTS_URL',
+      'FSG_CONTACTS_TOKEN',
+      'FSG_CONTACTS_DB',
+    ]);
+    expect(connectionNames(loadConfig(makeCliHost({ config: { project: 't' } }).cwd))).toEqual([]);
+  });
+
+  it('lays the launched checkout’s process values over its files, and no other checkout’s', async () => {
+    const host = makeCliHost({
+      config: { project: 't', store: { adapter: 'postgrest', urlEnv: 'FSG_URL', tokenEnv: 'STET_DEV_TOKEN' } },
+    });
+    write(host.cwd, '.env', 'FSG_URL=http://file.test\nFSG_OTHER=from-the-file\n');
+    const site = { path: host.cwd, config: loadConfig(host.cwd) };
+    await withProcessEnv({ FSG_URL: 'http://process.test', FSG_OTHER: 'from-the-process', STET_DEV_TOKEN: 'the-run-token' }, () => {
+      const env = connectionEnv(site, host.cwd);
+      expect(env['FSG_URL']).toBe('http://process.test');
+      // Only the variables the config names cross, and the run token is never one.
+      expect(env['FSG_OTHER']).toBe('from-the-file');
+      expect('STET_DEV_TOKEN' in env).toBe(false);
+      // Any other checkout, and a run started in none, reads its files alone.
+      expect(connectionEnv(site, join(host.cwd, 'elsewhere'))).toEqual(siteEnv(host.cwd));
+      expect(connectionEnv(site, undefined)).toEqual(siteEnv(host.cwd));
+    });
+    // A value the process holds empty is unset, so the file's stays.
+    await withProcessEnv({ FSG_URL: '' }, () => {
+      expect(connectionEnv(site, host.cwd)['FSG_URL']).toBe('http://file.test');
+    });
+  });
+
+  it('hands another checkout’s children none of the variables its config names', async () => {
+    const host = makeCliHost({ config: { project: 't', store: pair } });
+    const site = { path: host.cwd, config: loadConfig(host.cwd) };
+    await withProcessEnv({ FSG_URL: 'http://process.test', FSG_TOKEN: 'secret', FSG_UNNAMED: 'kept', STET_DEV_TOKEN: 'run' }, () => {
+      const launched = siteChildEnv(site, host.cwd);
+      expect(launched['FSG_URL']).toBe('http://process.test');
+      expect(launched['FSG_TOKEN']).toBe('secret');
+      const other = siteChildEnv(site, join(host.cwd, 'elsewhere'));
+      expect('FSG_URL' in other).toBe(false);
+      expect('FSG_TOKEN' in other).toBe(false);
+      expect(other['FSG_UNNAMED']).toBe('kept');
+      expect(other['PATH']).toBe(process.env['PATH']);
+      expect('STET_DEV_TOKEN' in other).toBe(false);
+      expect('FSG_URL' in siteChildEnv(site, undefined)).toBe(false);
+    });
+  });
+
+  it('hands another checkout’s children none of the started-in checkout’s variables either, whatever names its own config uses', async () => {
+    const started = makeCliHost({ config: { project: 't', store: pair } });
+    const names = [
+      makeCliHost({ config: { project: 't' } }),
+      makeCliHost({ config: { project: 't', store: { adapter: 'pg', urlEnv: 'FSG_DATABASE_URL' } } }),
+    ];
+    await withProcessEnv({ FSG_URL: 'http://process.test', FSG_TOKEN: 'secret', FSG_DATABASE_URL: 'own', FSG_UNNAMED: 'kept' }, () => {
+      for (const host of names) {
+        const other = siteChildEnv({ path: host.cwd, config: loadConfig(host.cwd) }, started.cwd);
+        expect('FSG_URL' in other).toBe(false);
+        expect('FSG_TOKEN' in other).toBe(false);
+        expect(other['FSG_UNNAMED']).toBe('kept');
+      }
+      // Its own names still go.
+      expect('FSG_DATABASE_URL' in siteChildEnv({ path: names[1]!.cwd, config: loadConfig(names[1]!.cwd) }, started.cwd)).toBe(false);
+    });
+  });
+
+  it('keeps stripping the started-in checkout’s names while its config does not load', async () => {
+    const started = makeCliHost({ config: { project: 't', store: pair } });
+    const other = makeCliHost({ config: { project: 't' } });
+    const site = { path: other.cwd, config: loadConfig(other.cwd) };
+    const file = join(started.cwd, 'stet.config.json');
+    const good = readFileSync(file, 'utf8');
+    await withProcessEnv({ FSG_URL: 'http://process.test', FSG_TOKEN: 'secret' }, () => {
+      expect('FSG_TOKEN' in siteChildEnv(site, started.cwd)).toBe(false);
+      // Mid-edit, and then gone: the names it last had are still stripped.
+      writeFileSync(file, '{', 'utf8');
+      expect('FSG_TOKEN' in siteChildEnv(site, started.cwd)).toBe(false);
+      rmSync(file);
+      expect('FSG_TOKEN' in siteChildEnv(site, started.cwd)).toBe(false);
+      writeFileSync(file, good, 'utf8');
+    });
+  });
+
+  it('strips the names of a started-in config that never loaded since the dev server started', async () => {
+    const started = makeCliHost({ config: { project: 't', store: pair } });
+    const other = makeCliHost({ config: { project: 't' } });
+    const site = { path: other.cwd, config: loadConfig(other.cwd) };
+    const handle = await startDevServer({
+      port: 0,
+      workspaceFile: workspaceFile(),
+      io: { cwd: started.cwd, env: {}, stdout: () => {}, stderr: () => {} },
+      launched: started.cwd,
+    });
+    try {
+      writeFileSync(join(started.cwd, 'stet.config.json'), '{', 'utf8');
+      await withProcessEnv({ FSG_TOKEN: 'secret' }, () => {
+        expect('FSG_TOKEN' in siteChildEnv(site, started.cwd)).toBe(false);
+      });
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it('strips the adapters’ default names when the started-in config was already broken at start', async () => {
+    const started = makeCliHost({ config: { project: 't', store: pair } });
+    const other = makeCliHost({ config: { project: 't' } });
+    const site = { path: other.cwd, config: loadConfig(other.cwd) };
+    writeFileSync(join(started.cwd, 'stet.config.json'), '{"store":{"adapter":"postgrest"},', 'utf8');
+    const handle = await startDevServer({
+      port: 0,
+      workspaceFile: workspaceFile(),
+      io: { cwd: started.cwd, env: {}, stdout: () => {}, stderr: () => {} },
+      launched: started.cwd,
+    });
+    try {
+      await withProcessEnv({ STET_POSTGREST_TOKEN: 'secret', STET_POSTGREST_URL: 'http://process.test', STET_DATABASE_URL: 'postgres://x', FSG_UNNAMED: 'kept' }, () => {
+        const env = siteChildEnv(site, started.cwd);
+        for (const name of ['STET_POSTGREST_TOKEN', 'STET_POSTGREST_URL', 'STET_DATABASE_URL']) expect(name in env, name).toBe(false);
+        expect(env['FSG_UNNAMED']).toBe('kept');
+      });
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it('hands the started-in checkout’s children no variable the shell holds empty', async () => {
+    const host = makeCliHost({ config: { project: 't', store: pair } });
+    const site = { path: host.cwd, config: loadConfig(host.cwd) };
+    await withProcessEnv({ FSG_URL: 'http://process.test', FSG_TOKEN: '', FSG_UNNAMED: '' }, () => {
+      const launched = siteChildEnv(site, host.cwd);
+      expect(launched['FSG_URL']).toBe('http://process.test');
+      expect('FSG_TOKEN' in launched).toBe(false);
+      // Only the variables the config names: another empty variable passes as it was.
+      expect(launched['FSG_UNNAMED']).toBe('');
+    });
   });
 });
 
@@ -942,16 +1122,17 @@ describe('captured — a command run in the dashboard’s own process', () => {
   it('gives back the terminal’s own exit code and channels', async () => {
     const host = gitHost();
     const { ctx } = handlerOver([host.cwd]);
-    const usage = await captured(ctx, ['check', '--env', 'prod'], { path: host.cwd });
+    const site = { path: host.cwd, config: loadConfig(host.cwd) };
+    const usage = await captured(ctx, ['check', '--env', 'prod'], site);
     expect(usage.code).toBe(2);
     expect(usage.err.join('\n')).toContain('usage:');
     expect(usage.json).toBeUndefined();
 
-    const plain = await captured(ctx, ['check'], { path: host.cwd });
+    const plain = await captured(ctx, ['check'], site);
     expect(plain.json).toBeUndefined();
     expect(plain.out.join('\n')).toContain('snapshot: 25 keys declared');
 
-    const asJson = await captured(ctx, ['check', '--json'], { path: host.cwd });
+    const asJson = await captured(ctx, ['check', '--json'], site);
     expect(asJson.json).toMatchObject({ ok: expect.any(Boolean) });
   });
 });
@@ -964,7 +1145,7 @@ describe('withEnvFilesHint', () => {
       ),
     ).toBe(
       "store adapter 'pg' is configured but DATABASE_URL is unset — " +
-        "stet dev reads it from the checkout's .env and .env.local",
+        "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
     );
     const driver =
       "store adapter 'pg' needs the optional peer dependency `pg`, which is not installed — " +
@@ -2158,6 +2339,25 @@ describe('POST /api/site/commit and /push', () => {
     const saved = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'hero_headline', value }] });
     await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['written'] as string[], keys: ['hero_headline'] });
   }
+
+  it('runs another checkout’s commit and push hooks without the started-in checkout’s connection variables', async () => {
+    const started = makeCliHost({
+      config: { project: 't', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } },
+    });
+    const host = snapshotHost();
+    git(host.cwd, ['checkout', '-qb', 'develop']);
+    bareRemote(host.cwd, 'origin');
+    mkdirSync(join(host.cwd, '.git', 'hooks'), { recursive: true });
+    for (const name of ['pre-commit', 'pre-push']) {
+      writeFileSync(join(host.cwd, '.git/hooks', name), '#!/bin/sh\necho "${STET_POSTGREST_TOKEN-unset}" >> .git/saw.txt\n', { mode: 0o755 });
+    }
+    await withProcessEnv({ STET_POSTGREST_TOKEN: 'SERVICE-KEY' }, async () => {
+      const { handler } = handlerOver([started.cwd, host.cwd], { launched: realpathSync(started.cwd) });
+      await commitHeadline(handler, host, 'Hooked');
+      expect((await post(handler, `/api/site/push${at(host)}`, {})).status).toBe(200);
+    });
+    expect(readFileSync(join(host.cwd, '.git/saw.txt'), 'utf8')).toBe('unset\nunset\n');
+  });
 
   it('pushes a branch with no upstream with -u to origin, then lands the next commit on it (journey B18)', async () => {
     const host = snapshotHost();
@@ -3958,7 +4158,7 @@ describe('the mounted API under /s/<id>/api/stet', () => {
       expect(unset.status).toBe(409);
       expect(((await unset.json()) as { error: string }).error).toBe(
         "store adapter 'pg' is configured but DATABASE_URL is unset — " +
-          "stet dev reads it from the checkout's .env and .env.local",
+          "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
       );
     }),
   );
@@ -4062,6 +4262,126 @@ describe('the mounted API under /s/<id>/api/stet', () => {
       ]);
     }),
   );
+
+  describe('the checkout stet dev was started in takes its pair from the shell', () => {
+    const PAIR = { project: 't', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } };
+    const UNSET =
+      "store adapter 'postgrest' is configured but STET_POSTGREST_URL is unset — " +
+      "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in";
+
+    /** Two checkouts declaring the pair; the first's `.env.local` holds an older URL. */
+    function twoCheckouts(): { a: CliHost; b: CliHost } {
+      const a = makeCliHost({ config: PAIR });
+      const b = makeCliHost({ config: PAIR });
+      writeFileSync(join(a.cwd, '.env.local'), 'STET_POSTGREST_URL=http://stale.test/rest/v1\n');
+      return { a, b };
+    }
+
+    /** Records each store request's URL and apikey, answering no rows. */
+    function recordingFetch(): { calls: Array<{ url: string; apikey: string | undefined }> } {
+      const calls: Array<{ url: string; apikey: string | undefined }> = [];
+      vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(input), apikey: (init?.headers as Record<string, string> | undefined)?.['apikey'] });
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      });
+      return { calls };
+    }
+
+    const vars = async (handler: (r: Request) => Promise<Response>, host: CliHost): Promise<unknown[]> => {
+      const body = (await (await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.cwd))}`))).json()) as {
+        environments: Array<{ vars: unknown[] }>;
+      };
+      return body.environments[0]!.vars;
+    };
+
+    it(
+      'reads the process pair over the files for the started-in site, and the files alone for any other',
+      withToken(async () => {
+        const { a, b } = twoCheckouts();
+        const { calls } = recordingFetch();
+        try {
+          await withProcessEnv({ STET_POSTGREST_URL: 'http://store.test/rest/v1', STET_POSTGREST_TOKEN: 'proc-token' }, async () => {
+            const { handler } = handlerOver([a.cwd, b.cwd], { launched: realpathSync(a.cwd) });
+            expect(await vars(handler, a)).toEqual([
+              { name: 'STET_POSTGREST_URL', set: true },
+              { name: 'STET_POSTGREST_TOKEN', set: true },
+            ]);
+            expect(await vars(handler, b)).toEqual([
+              { name: 'STET_POSTGREST_URL', set: false },
+              { name: 'STET_POSTGREST_TOKEN', set: false },
+            ]);
+
+            const mounted = await handler(req(mount(a, 'keys')));
+            expect(mounted.status).toBe(200);
+            expect(calls[0]?.url).toMatch(/^http:\/\/store\.test\/rest\/v1\/content_versions/);
+            expect(calls[0]?.apikey).toBe('proc-token');
+
+            const refused = await handler(req(mount(b, 'keys')));
+            expect(refused.status).toBe(409);
+            expect(((await refused.json()) as { error: string }).error).toBe(UNSET);
+            expect(calls).toHaveLength(1);
+          });
+
+          // A value the process holds empty is unset: the file's older URL stays.
+          calls.length = 0;
+          await withProcessEnv({ STET_POSTGREST_URL: '', STET_POSTGREST_TOKEN: 'proc-token' }, async () => {
+            const { handler } = handlerOver([a.cwd, b.cwd], { launched: realpathSync(a.cwd) });
+            expect((await handler(req(mount(a, 'keys')))).status).toBe(200);
+            expect(calls[0]?.url).toMatch(/^http:\/\/stale\.test\/rest\/v1\/content_versions/);
+          });
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      }),
+    );
+
+    it(
+      'runs a command the page starts with the same pair, and another checkout’s without it',
+      withToken(async () => {
+        const { a, b } = twoCheckouts();
+        recordingFetch();
+        try {
+          await withProcessEnv({ STET_POSTGREST_URL: 'http://store.test/rest/v1', STET_POSTGREST_TOKEN: 'proc-token' }, async () => {
+            const { ctx } = handlerOver([a.cwd, b.cwd], { launched: realpathSync(a.cwd) });
+            const text = async (host: CliHost): Promise<string> => {
+              const run = await captured(ctx, ['doctor'], { path: realpathSync(host.cwd), config: loadConfig(host.cwd) });
+              return `${run.out.join('\n')}\n${run.err.join('\n')}`;
+            };
+            expect(await text(a)).not.toContain('is unset');
+            expect(await text(b)).toContain('STET_POSTGREST_URL is unset');
+          });
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      }),
+    );
+
+    it('takes the shell pair for the checkout it was RUN in, through runDev', async () => {
+      const host = gitHost({ config: PAIR });
+      const file = workspaceFile();
+      const io: CliIo = { cwd: host.cwd, env: { STET_WORKSPACE: file }, stdout: () => {}, stderr: () => {} };
+      const held = process.env['STET_DEV_TOKEN'];
+      let seen = '';
+      try {
+        await withProcessEnv({ STET_POSTGREST_URL: 'http://store.test/rest/v1', STET_POSTGREST_TOKEN: 'proc-token' }, async () => {
+          await runDev(['--no-open', '--port', '0'], io, {
+            onListening: async (handle) => {
+              seen = await raw(
+                handle.port,
+                `GET /api/site?site=${encodeURIComponent(realpathSync(host.cwd))} HTTP/1.1\r\nHost: 127.0.0.1:${handle.port}\r\n` +
+                  `Authorization: Bearer ${handle.token}\r\nConnection: close\r\n\r\n`,
+              );
+            },
+          });
+        });
+      } finally {
+        if (held === undefined) delete process.env['STET_DEV_TOKEN'];
+        else process.env['STET_DEV_TOKEN'] = held;
+      }
+      expect(seen).toContain('{"name":"STET_POSTGREST_URL","set":true}');
+      expect(seen).toContain('{"name":"STET_POSTGREST_TOKEN","set":true}');
+    });
+  });
 
   it('ends every adapter it opened when the server closes', async () => {
     let ended = 0;
@@ -4746,6 +5066,122 @@ describe('the dev child', () => {
       if (held === undefined) delete process.env['STET_DEV_TOKEN'];
       else process.env['STET_DEV_TOKEN'] = held;
     }
+  });
+
+  it('starts an Astro site’s dev command in the foreground, whatever agent environment runs stet', async () => {
+    const SHOW = `node -e "console.log('bg:'+String(process.env.ASTRO_DEV_BACKGROUND))"; true`;
+    for (const [router, expected] of [['astro', 'bg:1'], ['app', 'bg:undefined']] as const) {
+      const host = makeCliHost({ config: { project: 't', router } });
+      const file = workspaceFile();
+      addSite(file, host.cwd);
+      const path = realpathSync(host.cwd);
+      updateSite(file, path, { devCommand: SHOW });
+      const { handler } = { handler: createDevHandler(contextOver(file, { fetchImpl: fakeFetch('') })) };
+      const query = `?site=${encodeURIComponent(path)}`;
+      // The command prints and exits, so there is nothing to stop.
+      await post(handler, `/api/site/dev-start${query}`, {});
+      const logged = await until(handler, `/api/site/dev-log${query}`, (b) => (b.lines as string[]).length > 0);
+      expect(logged.lines).toContain(expected);
+    }
+  });
+
+  describe('under a shell that supplies the store', () => {
+    const PAIR = { project: 't', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } };
+    const SHELL = { STET_POSTGREST_URL: 'http://store.test/rest/v1', STET_POSTGREST_TOKEN: 'proc-token' };
+    const SHOW_TOKEN = `node -e "console.log('tok:'+(process.env.STET_POSTGREST_TOKEN??'unset'))"`;
+
+    /** Two checkouts declaring the pair in one workspace, `launched` the first. */
+    function pairHosts(
+      over: (index: number) => Partial<WorkspaceEntry>,
+      second: Record<string, unknown> = PAIR,
+    ): {
+      handler: (r: Request) => Promise<Response>;
+      paths: [string, string];
+    } {
+      const hosts = [makeCliHost({ config: PAIR }), makeCliHost({ config: second })];
+      const file = workspaceFile();
+      const paths = hosts.map((host) => realpathSync(host.cwd)) as [string, string];
+      for (const [index, host] of hosts.entries()) {
+        addSite(file, host.cwd);
+        updateSite(file, paths[index] as string, over(index));
+      }
+      // The dev URL of a site answers until its stop command has run.
+      const alive = (async (input: RequestInfo | URL) => {
+        const index = Number(new URL(String(input)).port) - 3_001;
+        if (existsSync(join(paths[index] as string, 'stop.out'))) throw new Error('connection refused');
+        return new Response('');
+      }) as typeof fetch;
+      const ctx = contextOver(file, { fetchImpl: alive, launched: paths[0] });
+      return { handler: createDevHandler(ctx), paths };
+    }
+
+    const query = (path: string): string => `?site=${encodeURIComponent(path)}`;
+
+    it('starts the started-in checkout’s dev command with the pair and another checkout’s without it', async () => {
+      await withProcessEnv(SHELL, async () => {
+        const { handler, paths } = pairHosts(() => ({ devCommand: SHOW_TOKEN }));
+        try {
+          for (const [index, expected] of [[0, 'tok:proc-token'], [1, 'tok:unset']] as const) {
+            const path = paths[index];
+            expect((await post(handler, `/api/site/dev-start${query(path)}`, {})).status).toBe(200);
+            const logged = await until(handler, `/api/site/dev-log${query(path)}`, (b) => (b.lines as string[]).length > 0);
+            expect(logged.lines).toContain(expected);
+          }
+        } finally {
+          for (const path of paths) await post(handler, `/api/site/dev-stop${query(path)}`, {});
+        }
+      });
+    });
+
+    it('starts another checkout’s dev command without the started-in checkout’s variables, whatever names its config uses', async () => {
+      const others = {
+        'no store': { project: 't' },
+        'other names': { project: 't', store: { adapter: 'pg', urlEnv: 'FSG_DATABASE_URL' } },
+      };
+      for (const [name, config] of Object.entries(others)) {
+        await withProcessEnv(SHELL, async () => {
+          const { handler, paths } = pairHosts(() => ({ devCommand: SHOW_TOKEN }), config);
+          try {
+            expect((await post(handler, `/api/site/dev-start${query(paths[1])}`, {})).status, name).toBe(200);
+            const logged = await until(handler, `/api/site/dev-log${query(paths[1])}`, (b) => (b.lines as string[]).length > 0);
+            expect(logged.lines, name).toContain('tok:unset');
+          } finally {
+            await post(handler, `/api/site/dev-stop${query(paths[1])}`, {});
+          }
+        });
+      }
+    });
+
+    it('starts the started-in checkout’s dev command without a variable the shell holds empty', async () => {
+      await withProcessEnv({ ...SHELL, STET_POSTGREST_TOKEN: '' }, async () => {
+        const { handler, paths } = pairHosts(() => ({ devCommand: SHOW_TOKEN }));
+        try {
+          expect((await post(handler, `/api/site/dev-start${query(paths[0])}`, {})).status).toBe(200);
+          const logged = await until(handler, `/api/site/dev-log${query(paths[0])}`, (b) => (b.lines as string[]).length > 0);
+          expect(logged.lines).toContain('tok:unset');
+        } finally {
+          await post(handler, `/api/site/dev-stop${query(paths[0])}`, {});
+        }
+      });
+    });
+
+    it('runs each checkout’s stop command in the environment its dev command started in', async () => {
+      const writeToken = `node -e "require('fs').writeFileSync('stop.out', process.env.STET_POSTGREST_TOKEN ?? 'unset')"`;
+      await withProcessEnv(SHELL, async () => {
+        const { handler, paths } = pairHosts((index) => ({
+          devCommand: SHOW_TOKEN,
+          dev: `http://localhost:${3_001 + index}`,
+          devStopCommand: writeToken,
+        }));
+        for (const path of paths) {
+          await post(handler, `/api/site/dev-start${query(path)}`, {});
+          await until(handler, `/api/site/dev-log${query(path)}`, (b) => b.state !== 'running');
+          expect((await post(handler, `/api/site/dev-stop${query(path)}`, {})).status).toBe(200);
+        }
+        expect(readFileSync(join(paths[0], 'stop.out'), 'utf8')).toBe('proc-token');
+        expect(readFileSync(join(paths[1], 'stop.out'), 'utf8')).toBe('unset');
+      });
+    }, 20_000);
   });
 
   it('refuses Start on a site with no dev command and no router default', async () => {
@@ -8137,6 +8573,7 @@ describe('the audit child (D10)', () => {
       "process.on('SIGTERM', () => { process.stderr.write('stopped by SIGTERM\\n'); process.exit(143); });\n" +
       "process.stderr.write('auditing home… 1/1\\n');\nsetInterval(() => {}, 1000);\n",
     slow: "setTimeout(() => process.stdout.write('{}'), 1100);\n",
+    pair: "process.stdout.write(JSON.stringify({ token: process.env.STET_POSTGREST_TOKEN ?? null }));\n",
   } as const;
 
   function stub(kind: keyof typeof STUBS): string {
@@ -8145,7 +8582,12 @@ describe('the audit child (D10)', () => {
     return path;
   }
 
-  function auditHost(cwd: string, kind: keyof typeof STUBS, over: Partial<WorkspaceEntry> = {}): {
+  function auditHost(
+    cwd: string,
+    kind: keyof typeof STUBS,
+    over: Partial<WorkspaceEntry> = {},
+    ctxOver: Partial<DevContext> = {},
+  ): {
     handler: (r: Request) => Promise<Response>;
     ctx: DevContext;
     query: string;
@@ -8159,7 +8601,7 @@ describe('the audit child (D10)', () => {
     const refused = (async () => {
       throw new Error('connection refused');
     }) as unknown as typeof fetch;
-    const ctx = contextOver(file, { fetchImpl: refused, auditCli: stub(kind) });
+    const ctx = contextOver(file, { fetchImpl: refused, auditCli: stub(kind), ...ctxOver });
     return { handler: createDevHandler(ctx), ctx, query: `?site=${encodeURIComponent(path)}`, path };
   }
 
@@ -8196,6 +8638,19 @@ describe('the audit child (D10)', () => {
     const url = auditHost(snapshotHost().cwd, 'argv');
     await post(url.handler, `/api/site/audit-start${url.query}`, { url: 'https://preview.example.dev/' });
     expect((await settled(url.handler, url.query)).result.argv).toEqual(['audit', 'lighthouse', '--json', '--url', 'https://preview.example.dev/']);
+  });
+
+  it('runs the started-in checkout’s audit with the shell’s pair and another checkout’s without it', async () => {
+    const PAIR = { project: 't', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } };
+    const hosts = [makeCliHost({ config: PAIR }), makeCliHost({ config: PAIR })];
+    const launched = realpathSync((hosts[0] as CliHost).cwd);
+    await withProcessEnv({ STET_POSTGREST_URL: 'http://store.test/rest/v1', STET_POSTGREST_TOKEN: 'proc-token' }, async () => {
+      for (const [index, expected] of [[0, 'proc-token'], [1, null]] as const) {
+        const h = auditHost((hosts[index] as CliHost).cwd, 'pair', {}, { launched });
+        expect((await post(h.handler, `/api/site/audit-start${h.query}`, {})).status).toBe(200);
+        expect((await settled(h.handler, h.query)).result).toEqual({ token: expected });
+      }
+    });
   });
 
   it('accepts a page an html document proposes, and answers 400 for an unknown page or a non-http url', async () => {

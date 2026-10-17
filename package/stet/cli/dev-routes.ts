@@ -31,7 +31,7 @@ import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
-import type { StetConfig } from './config.js';
+import type { StetConfig, StoreBlock } from './config.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, type GitState } from './git.js';
 import {
@@ -66,13 +66,16 @@ import { CliError, plural, Report, UsageError } from './report.js';
 import { validateValue } from './validate.js';
 import {
   addSite,
-  childEnv,
+  blockVariables,
+  connectionEnv,
   devDefaults,
+  foreignConnectionNames,
+  foregroundEnv,
   loadSite,
   readWorkspace,
   removeSite,
   routerPreviewCommand,
-  siteEnv,
+  siteChildEnv,
   siteId,
   siteIo,
   updateSite,
@@ -91,8 +94,8 @@ export interface DevChild {
   lines: string[];
   state: 'running' | 'exited' | 'detached';
   code: number | null;
-  /** The entry's stop command, for a server that outlived its launcher. */
-  stop?: string;
+  /** The entry's stop command and the environment it runs in, for a server that outlived its launcher. */
+  stop?: { command: string; env: NodeJS.ProcessEnv };
   /** The dev URL at Start, which the stop path polls until the server lets go of it. */
   dev?: string;
   /** Whether the exited-or-detached question has been answered once. */
@@ -119,6 +122,8 @@ export interface DevContext {
   stores: Map<string, StoreAdapter>;
   /** One promise chain per checkout, so this server's requests never interleave on one site. */
   queues: Map<string, Promise<unknown>>;
+  /** The checkout `stet dev` was started in: the one site the process environment supplies connection variables to. */
+  launched?: string;
   /** Test seam: an adapter to use in place of the one the config would build. */
   storeFor?: (path: string, env: string | undefined) => StoreAdapter | undefined;
   /** One preview proxy per JavaScript site, keyed by checkout, started on its first answering probe. */
@@ -194,7 +199,7 @@ function crossOrigin(req: Request, origin: string): boolean {
 export function withEnvFilesHint(message: string): string {
   const clause = ' is unset — set it or remove the store block';
   return message.endsWith(clause)
-    ? `${message.slice(0, -clause.length)} is unset — stet dev reads it from the checkout's .env and .env.local`
+    ? `${message.slice(0, -clause.length)} is unset — stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in`
     : message;
 }
 
@@ -289,11 +294,11 @@ export interface Captured {
 export async function captured(
   ctx: DevContext,
   argv: string[],
-  site: { path: string },
+  site: { path: string; config: StetConfig },
   env?: string,
 ): Promise<Captured> {
   const sink: { out: string[]; err: string[] } = { out: [], err: [] };
-  const io = siteIo(site.path, sink, {
+  const io = siteIo(site.path, connectionEnv(site, ctx.launched), sink, {
     ...(ctx.fetchImpl === undefined ? {} : { fetchImpl: ctx.fetchImpl }),
   });
   const full = env === undefined ? argv : [...argv, '--env', env];
@@ -420,15 +425,15 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
   return withSite(ctx, url, async (site, entry) => {
     switch (`${req.method} ${route}`) {
       case 'GET site':
-        return siteReply(site, entry);
+        return siteReply(site, entry, ctx.launched);
       case 'POST site/save':
         return await save(ctx, req, site);
       case 'POST site/commit':
         return await commit(ctx, req, site);
       case 'POST site/push':
-        return await push(site);
+        return await push(ctx, site);
       case 'POST site/publish-live':
-        return await publishLive(site);
+        return await publishLive(ctx, site);
       case 'GET site/preview-link':
         return await previewLink(site);
       case 'POST site/merge':
@@ -440,7 +445,7 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
       case 'GET site/removed':
         return removed(url, site);
       case 'POST site/restore':
-        return await restore(req, site);
+        return await restore(ctx, req, site);
       case 'GET site/health':
         return await health(ctx, url, site);
       case 'GET site/seo':
@@ -492,27 +497,24 @@ function requireReady(site: SiteState): Extract<SiteState, { state: 'ready' }> {
  * DIALING: a listing that opened a connection per environment would hang on
  * the first unreachable one, and `doctor` is where a live check belongs.
  */
-function siteReply(site: SiteState, entry: WorkspaceEntry): Response {
+function siteReply(site: SiteState, entry: WorkspaceEntry, launched: string | undefined): Response {
   if (site.state !== 'ready') return json(summary(site));
   const { config } = site;
-  const env = siteEnv(site.path);
+  const env = connectionEnv(site, launched);
   // `requireEnv`'s own rule: an empty value is unset. A `DATABASE_URL=` line
   // reads as unset here exactly as it does at the mount.
-  const vars = (block: { urlEnv: string; tokenEnv: string } | undefined, adapter: string): Array<{ name: string; set: boolean }> => {
-    if (block === undefined) return [];
-    const names = adapter === 'postgrest' ? [block.urlEnv, block.tokenEnv] : adapter === 'pg' ? [block.urlEnv] : [];
-    return names.filter((name) => name !== '').map((name) => ({ name, set: (env[name] ?? '') !== '' }));
-  };
+  const vars = (block: StoreBlock | undefined): Array<{ name: string; set: boolean }> =>
+    block === undefined ? [] : blockVariables(block).map((name) => ({ name, set: (env[name] ?? '') !== '' }));
   const environments = [
     {
       name: 'default',
       adapter: config.store?.adapter ?? 'snapshot',
-      vars: vars(config.store, config.store?.adapter ?? 'snapshot'),
+      vars: vars(config.store),
     },
     ...Object.entries(config.environments ?? {}).map(([name, block]) => ({
       name,
       adapter: block.adapter,
-      vars: vars(block, block.adapter),
+      vars: vars(block),
     })),
   ];
   return json({
@@ -723,6 +725,15 @@ function touchReadPath(site: Extract<SiteState, { state: 'ready' }>): string | n
 type Ready = Extract<SiteState, { state: 'ready' }>;
 
 /**
+ * `gitRun` in a site's checkout, without the connection variables another
+ * site's children lose: the operator's hooks there (husky, lint-staged, a
+ * pre-push build) are children of that site too.
+ */
+function siteGitRun(ctx: DevContext, site: { path: string; config: StetConfig }, args: string[]): Promise<{ code: number; out: string }> {
+  return gitRun(site.path, args, undefined, foreignConnectionNames(site, ctx.launched));
+}
+
+/**
  * The stet-written forms git reports as uncommitted, staged and committed —
  * and nothing else in the working tree.
  *
@@ -792,9 +803,9 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
   // limited to paths builds its own index. A hook that refuses the commit then
   // leaves the forms unstaged, and the operator's next commit never carries them.
   const literal = named.map((file) => `:(literal)${file}`);
-  const intent = await gitRun(ready.path, ['add', '-N', '--', ...literal]);
+  const intent = await siteGitRun(ctx, ready, ['add', '-N', '--', ...literal]);
   if (intent.code !== 0) return refuse('git commit failed', 409, intent.out);
-  const made = await gitRun(ready.path, ['commit', '-m', message, '--', ...literal]);
+  const made = await siteGitRun(ctx, ready, ['commit', '-m', message, '--', ...literal]);
   if (made.code !== 0) return refuse('git commit failed', 409, made.out);
 
   return json({
@@ -1017,7 +1028,7 @@ function clipTo72(text: string): string {
  * one whose ref is gone) is pushed with `-u` to the remote git's own order
  * chooses; a detached HEAD pushes nothing.
  */
-async function push(site: SiteState): Promise<Response> {
+async function push(ctx: DevContext, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
   const at = gitState(ready.path);
   if (at.branch === null) return json({ error: 'HEAD is detached — check out a branch to push', at }, 409);
@@ -1030,7 +1041,7 @@ async function push(site: SiteState): Promise<Response> {
     args = ['push', '-u', chosen.remote, '--', at.branch];
     upstream = chosen.remote;
   }
-  const pushed = await gitRun(ready.path, args);
+  const pushed = await siteGitRun(ctx, ready, args);
   if (pushed.code !== 0) return json({ error: 'git push failed', output: pushed.out, at: gitState(ready.path) }, 409);
   return json({ output: pushed.out, at: gitState(ready.path), ...(upstream === null ? {} : { upstream, branch: at.branch }) });
 }
@@ -1041,7 +1052,7 @@ async function push(site: SiteState): Promise<Response> {
  * live branch's existence, its tip, and — where the local symref is missing —
  * its default branch.
  */
-async function publishLive(site: SiteState): Promise<Response> {
+async function publishLive(ctx: DevContext, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
   const at = gitState(ready.path);
   if (at.branch === null) return json({ error: 'HEAD is detached — check out a branch to publish', at }, 409);
@@ -1061,22 +1072,22 @@ async function publishLive(site: SiteState): Promise<Response> {
     return json({ error: `push ${at.branch} first — it is not level with ${upstream}`, at }, 409);
   }
   // The full ref: a bare `main` would also match `refs/heads/feature/main`.
-  const exists = await gitRun(ready.path, ['ls-remote', '--exit-code', '--heads', remote, `refs/heads/${live}`]);
+  const exists = await siteGitRun(ctx, ready, ['ls-remote', '--exit-code', '--heads', remote, `refs/heads/${live}`]);
   if (exists.code === 2) return json({ error: `${live} does not exist on ${remote}`, at }, 409);
   if (exists.code !== 0) return json({ error: 'git ls-remote failed', output: exists.out, at }, 409);
   const tracking = `refs/remotes/${remote}/${live}`;
   // An explicit refspec: a single-branch clone's configured one would leave
   // `<remote>/<live>` unwritten.
-  const fetched = await gitRun(ready.path, ['fetch', remote, '--', `+refs/heads/${live}:${tracking}`]);
+  const fetched = await siteGitRun(ctx, ready, ['fetch', remote, '--', `+refs/heads/${live}:${tracking}`]);
   if (fetched.code !== 0) return json({ error: 'git fetch failed', output: fetched.out, at }, 409);
   const tip = git(ready.path, ['rev-parse', tracking]).out.trim();
   if (tip === head) {
     return json({ output: '', live, already: true, at: gitState(ready.path) });
   }
-  const behind = await gitRun(ready.path, ['merge-base', '--is-ancestor', tracking, 'HEAD']);
+  const behind = await siteGitRun(ctx, ready, ['merge-base', '--is-ancestor', tracking, 'HEAD']);
   if (behind.code === 1) return json({ error: `${live} has commits ${at.branch} lacks — bring them into ${at.branch} first`, at }, 409);
   if (behind.code !== 0) return json({ error: 'git merge-base failed', output: behind.out, at }, 409);
-  const pushed = await gitRun(ready.path, ['push', remote, `HEAD:refs/heads/${live}`]);
+  const pushed = await siteGitRun(ctx, ready, ['push', remote, `HEAD:refs/heads/${live}`]);
   if (pushed.code !== 0) return json({ error: 'git push failed', output: pushed.out, at: gitState(ready.path) }, 409);
   return json({ output: pushed.out, live, at: gitState(ready.path) });
 }
@@ -1430,7 +1441,7 @@ function changedAmong(cwd: string, files: readonly string[]): string[] {
  * operator to paste. Nothing runs over uncommitted stet files, staged changes,
  * uncommitted changes to a file the commit touched, or a git operation.
  */
-async function restore(req: Request, site: SiteState): Promise<Response> {
+async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
   if (ready.mode !== 'snapshot') return json({ error: "restore works on a snapshot-only site's commits" }, 409);
   const body = await readJson(req);
@@ -1462,12 +1473,12 @@ async function restore(req: Request, site: SiteState): Promise<Response> {
     });
   const report = new Report();
 
-  const reverted = await gitRun(ready.path, ['revert', '--no-commit', '--', sha]);
+  const reverted = await siteGitRun(ctx, ready, ['revert', '--no-commit', '--', sha]);
   if (reverted.code === 0) {
     // The revert holds the commit undone; a key a later commit moved the same
     // entries around is still missing, and is added back into the same index.
     const abort = async (error: string, output?: string): Promise<Response> => {
-      const aborted = await gitRun(ready.path, ['revert', '--abort']);
+      const aborted = await siteGitRun(ctx, ready, ['revert', '--abort']);
       // An abort git refuses (an edit made to a reverted file since) leaves the revert in progress: say so.
       if (aborted.code !== 0) {
         return refuse('git revert --abort failed — finish it in the terminal', [output, aborted.out].filter(Boolean).join('\n'));
@@ -1486,10 +1497,10 @@ async function restore(req: Request, site: SiteState): Promise<Response> {
     if (keys.some((key) => !Object.hasOwn(now.descriptor.keys, key))) {
       const next = withRemovedKeys(now, before, keys);
       const { written } = applyForms(ready.path, ready.config, next.descriptor, next.snapshot, report, 'dashboard restore');
-      const staged = await gitRun(ready.path, ['add', '--', ...written.map((file) => `:(literal)${file}`)]);
+      const staged = await siteGitRun(ctx, ready, ['add', '--', ...written.map((file) => `:(literal)${file}`)]);
       if (staged.code !== 0) return abort('git add failed', staged.out);
     }
-    const made = await gitRun(ready.path, ['commit', '-m', message]);
+    const made = await siteGitRun(ctx, ready, ['commit', '-m', message]);
     if (made.code !== 0) return abort('git commit failed', made.out);
     return done({ skipped: [], markup: null });
   }
@@ -1497,7 +1508,7 @@ async function restore(req: Request, site: SiteState): Promise<Response> {
   // nothing; only a conflict leaves REVERT_HEAD, and only a conflict takes the
   // keys-alone path.
   if (gitData(ready.path, ['rev-parse', '-q', '--verify', 'REVERT_HEAD']).code !== 0) return refuse('git revert failed', reverted.out);
-  const aborted = await gitRun(ready.path, ['revert', '--abort']);
+  const aborted = await siteGitRun(ctx, ready, ['revert', '--abort']);
   if (aborted.code !== 0) return refuse('git revert --abort failed — finish it in the terminal', aborted.out);
 
   const next = withRemovedKeys({ descriptor: ready.descriptor, snapshot: ready.snapshot }, before, keys);
@@ -1514,9 +1525,9 @@ async function restore(req: Request, site: SiteState): Promise<Response> {
   const { written } = applyForms(ready.path, ready.config, next.descriptor, next.snapshot, report, 'dashboard restore');
   // The commit route's own pair: intent to add, then a commit limited to the forms.
   const literal = written.map((file) => `:(literal)${file}`);
-  const intent = await gitRun(ready.path, ['add', '-N', '--', ...literal]);
+  const intent = await siteGitRun(ctx, ready, ['add', '-N', '--', ...literal]);
   if (intent.code !== 0) return refuse('git commit failed', intent.out);
-  const made = await gitRun(ready.path, ['commit', '-m', message, '--', ...literal]);
+  const made = await siteGitRun(ctx, ready, ['commit', '-m', message, '--', ...literal]);
   if (made.code !== 0) return json({ error: 'git commit failed', output: made.out, markup, at: gitState(ready.path), pending: pendingForms(ready) }, 409);
   return done({ skipped: next.skipped, markup });
 }
@@ -1564,7 +1575,7 @@ async function storeOf(
   const key = JSON.stringify([site.path, env ?? null]);
   const held = ctx.stores.get(key);
   if (held !== undefined) return held;
-  const store = await resolveStore(site.config, siteEnv(site.path), ctx.storeFor?.(site.path, env), env);
+  const store = await resolveStore(site.config, connectionEnv(site, ctx.launched), ctx.storeFor?.(site.path, env), env);
   ctx.stores.set(key, store);
   return store;
 }
@@ -1963,12 +1974,13 @@ async function devStart(ctx: DevContext, site: SiteState, entry: WorkspaceEntry)
   if (command === undefined) {
     return json({ error: 'the workspace entry has no dev command — set it in Setup' }, 400);
   }
+  const env = { ...siteChildEnv(ready, ctx.launched), ...foregroundEnv(ready.config, 'dev') };
   const spawned = spawn(command, {
     cwd: ready.path,
     shell: true,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv(),
+    env,
   });
   const stop = entry.devStopCommand ?? defaults?.devStopCommand;
   const child: DevChild = {
@@ -1977,7 +1989,7 @@ async function devStart(ctx: DevContext, site: SiteState, entry: WorkspaceEntry)
     lines: [],
     state: 'running',
     code: null,
-    ...(stop === undefined ? {} : { stop }),
+    ...(stop === undefined ? {} : { stop: { command: stop, env } }),
     ...(defaults === null ? {} : { dev: defaults.dev }),
     handle: spawned,
   };
@@ -2108,7 +2120,7 @@ async function auditStart(ctx: DevContext, req: Request, site: SiteState): Promi
     cwd: ready.path,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv(),
+    env: siteChildEnv(ready, ctx.launched),
   });
   const child: DevChild = {
     pid: spawned.pid ?? 0,
@@ -2220,13 +2232,13 @@ async function launcherExit(child: DevChild, ms: number): Promise<void> {
 }
 
 /** The entry's stop command, in the checkout, in a group of its own that is killed at the deadline. */
-function runStop(command: string, cwd: string, ms: number): Promise<void> {
+function runStop(stop: { command: string; env: NodeJS.ProcessEnv }, cwd: string, ms: number): Promise<void> {
   return new Promise((resolve) => {
     if (ms <= 0) {
       resolve();
       return;
     }
-    const run = spawn(command, { cwd, shell: true, detached: true, stdio: 'ignore', env: childEnv() });
+    const run = spawn(stop.command, { cwd, shell: true, detached: true, stdio: 'ignore', env: stop.env });
     const timer = setTimeout(() => {
       // Never `kill(-0)`: a spawn that failed has no pid, and -0 is this
       // process's own group.

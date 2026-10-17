@@ -287,7 +287,7 @@ async function migrate(
   verify: boolean,
 ): Promise<void> {
   if (verify) {
-    await verifyMoved(io, project, report);
+    await verifyMoved(io, project, report, dryRun);
     return;
   }
   await applyPending(io, project, report, dryRun);
@@ -325,7 +325,8 @@ async function applyPending(
     report.line(`migrations: up to date at ${installed}`);
     // The schema has not moved and the descriptor still may have: the stamp is
     // "where a store answers and the value moved", not "where a migration ran".
-    await stamp(io, project, report);
+    // A dry run writes nothing, the stamp included.
+    if (!dryRun) await stamp(io, project, report);
     return;
   }
   report.line(
@@ -333,7 +334,13 @@ async function applyPending(
   );
 
   if (dryRun) {
-    for (const migration of pending) report.line(`would apply ${migration.name}`);
+    // An adapter that cannot apply DDL prints the same out-of-band instructions
+    // a real run prints, since a real run applies nothing there either.
+    if (project.store.canApplyDDL) {
+      for (const migration of pending) report.line(`would apply ${migration.name}`);
+    } else {
+      printForOutOfBandApply(io, project, pending, report);
+    }
     return;
   }
 
@@ -514,7 +521,7 @@ function printForOutOfBandApply(
   report.line('  stet seed');
 }
 
-async function verifyMoved(io: CliIo, project: LoadedProject, report: Report): Promise<void> {
+async function verifyMoved(io: CliIo, project: LoadedProject, report: Report, dryRun: boolean): Promise<void> {
   const installed = await installedVersion(io, project, report);
   if (installed === null) return;
   const pending = migrations().filter((m) => m.number > installed);
@@ -526,7 +533,7 @@ async function verifyMoved(io: CliIo, project: LoadedProject, report: Report): P
     return;
   }
   report.line(`verified: stet_meta reports schema_version ${installed}`);
-  await stamp(io, project, report);
+  if (!dryRun) await stamp(io, project, report);
 }
 
 /**

@@ -82,7 +82,9 @@ npx stet hook install                    # the pre-commit gate
   committed copy — no network, no database, so it runs on a fork PR before
   anything deploys. The pre-commit gate `stet hook install` writes runs `stet
   check`, `stet scan` and `stet seo check` on each commit that touches the
-  checkout.
+  checkout. A hook committed to the repository carries the guarded line,
+  `f="$(git rev-parse --git-common-dir)/stet-gate.mjs"; [ ! -f "$f" ] || node "$f" "$@" || exit 1`,
+  so a clone that has not run stet hook install still commits.
 - **Lighthouse, with the owner of each failure.** `stet audit lighthouse` runs
   Lighthouse over your declared pages and tags every failing audit as copy to
   write through a key, a head edit `--fix --write` applies, or the site's own
@@ -113,6 +115,10 @@ dashboard: http://127.0.0.1:4400/?t=<run token>
 The page edits the checkouts listed in `~/.stet/projects.json`. Running `stet
 dev` inside a checkout adds that checkout to the list; `--add <path>` adds one
 from anywhere else.
+A store-backed checkout reads its connection variables from its `.env` and
+`.env.local`; the checkout stet dev was started in also reads them from the
+shell, ahead of the files, so `sops exec-env .env.enc 'npx stet dev'` supplies
+them without writing them to disk.
 
 On a snapshot-only project the page saves through the same gate and the same
 all-or-nothing write batch the terminal uses, then commits the stet files the

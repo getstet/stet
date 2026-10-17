@@ -37,6 +37,7 @@ function context(over: Partial<PageContext> = {}): PageContext {
   return {
     router: 'html',
     page: 'home',
+    label: 'home',
     def: descriptor.pages?.['home'],
     descriptor,
     snapshot: { default: {} },

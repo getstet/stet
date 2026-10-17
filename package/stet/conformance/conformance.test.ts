@@ -49,7 +49,7 @@ import { migrations as installedMigrations, packageRoot } from '../cli/installed
 import { mintUnsubscribeToken, verifyUnsubscribeToken } from '../server/unsubscribe-token.js';
 import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { GATE_LINE, HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
+import { GATE_LINE, HOOK_BEFORE_0_3_1, SHARED_GATE_LINE } from '../cli/hook.js';
 import { refuseDanglingReferences } from '../cli/remove.js';
 import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
 import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
@@ -57,6 +57,7 @@ import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { handlerOver, paintPage, req, TOKEN, type PaintedPage } from '../tests/helpers/dashboard-page.js';
 import { dashboardPage } from '../cli/dev.js';
+import { siteId, updateSite } from '../cli/workspace.js';
 import { DASHED, closeFrames, frame, located, tick } from '../tests/helpers/preview-frame.js';
 import { installRegistryDts, typecheckHost } from '../tests/helpers/ts-host.js';
 import { generateDefaultsModule, generateRegistry, generatedBody } from '../src/codegen.js';
@@ -2157,6 +2158,61 @@ describe('store', () => {
       notSupported: true,
     });
     await (adapters[2] as ReturnType<typeof createPgStore>).end();
+  });
+
+  it('Requirement: store-postgrest carries the gateway key and bounds every request', async () => {
+    // Every request carries both headers and a deadline signal.
+    const sent: { url: string; headers: Record<string, string>; signal: unknown }[] = [];
+    const recording = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      sent.push({ url, headers: (init?.headers ?? {}) as Record<string, string>, signal: init?.signal });
+      const body = url.includes('/stet_meta?id=eq.1&select')
+        ? [{ schema_version: 3, descriptor_version: '' }]
+        : url.includes('/stet_meta?id=eq.1')
+          ? [{ id: 1 }]
+          : [];
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as typeof globalThis.fetch;
+    const conn = { url: 'http://postgrest.test/rest/v1', token: 'tok', fetchImpl: recording };
+    const recorded = createPostgrestStore({ ...conn, project: 'walk' });
+    await recorded.read({ preview: true });
+    await recorded.saveDraft({ key: 'hero_headline', value: 'v', target: 'web', editor: 'neil' });
+    await recorded.changesets.list();
+    await readPostgrestMeta(conn);
+    await writePostgrestDescriptorVersion(conn, '3');
+    expect(sent).toHaveLength(5);
+    for (const request of sent) {
+      expect(request.headers['apikey']).toBe('tok');
+      expect(request.headers['Authorization']).toBe('Bearer tok');
+      expect(request.signal).toBeInstanceOf(AbortSignal);
+    }
+
+    // A store that never answers is an absence on the render path: every key
+    // still resolves from the committed snapshot. A write is never retried.
+    let calls = 0;
+    const hung = ((_input: string | URL | Request, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        calls += 1;
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+      })) as typeof globalThis.fetch;
+    const silent = createPostgrestStore({ ...conn, project: 'walk', fetchImpl: hung, requestTimeoutMillis: 20 });
+    const down = await silent.read();
+    expect(down).toEqual({
+      storeError: true,
+      code: 'unreachable',
+      message: 'no answer from http://postgrest.test within 20 ms',
+    });
+    for (const key of keys) {
+      const resolution = resolve(descriptor, snapshot, null, { key });
+      expect(resolution.value).toBeDefined();
+      expect(resolution.value).not.toBe('');
+    }
+    calls = 0;
+    expect(await silent.saveDraft({ key: 'hero_headline', value: 'v', target: 'web', editor: 'neil' })).toMatchObject({
+      storeError: true,
+      code: 'unreachable',
+    });
+    expect(calls).toBe(1);
   });
 
   it('Requirement: Writes are never retried through the store transport', async () => {
@@ -4823,6 +4879,25 @@ describe('cli', () => {
     expect(neither.stdout()).not.toContain('contacts:');
   });
 
+  it('Requirement: upgrade --dry-run prints what a store that cannot apply DDL needs', async () => {
+    const host = makeCliHost({
+      config: { store: { adapter: 'postgrest' } },
+      env: { STET_POSTGREST_URL: 'http://postgrest.test', STET_POSTGREST_TOKEN: 'test' },
+      store: createMemoryStore({ project: 'default' }),
+      fetchImpl: (async () => new Response(JSON.stringify({ code: 'PGRST205', message: 'not found' }), { status: 404 })) as typeof fetch,
+    });
+    expect(await host.run('upgrade', '--dry-run')).toBe(0);
+    const output = host.stdout();
+    expect(output).toContain('installed 0, pending 1, 2, 3');
+    expect(output).toContain('this adapter cannot apply DDL (canApplyDDL: false) — apply it out of band:');
+    expect(output).toContain('create table content_versions');
+    expect(output).toContain("notify pgrst, 'reload schema';");
+    expect(output).toContain('stet upgrade --verify');
+    expect(output).not.toContain('would apply');
+    // A dry run writes no migration copy.
+    expect(existsSync(join(host.cwd, 'stet/migrations'))).toBe(false);
+  });
+
   it('Requirement: upgrade knows what it upgrades from', async () => {
     // stet_meta absent: an unversioned database, reported as migration 1
     // pending — never "up to date".
@@ -4917,7 +4992,7 @@ describe('cli', () => {
       writeFileSync(join(host.cwd, '.git/stet-gate.json'), `${JSON.stringify({ entries: [{ checkout: '', worktree: '' }] }, null, 2)}\n`);
       // 0.5.1's runner: the shipped one without the SEO run.
       const shipped = readFileSync(join(packageRoot(), 'templates', 'stet-gate.mjs'), 'utf8');
-      const older = shipped.replace("  if (entry.seo === true && !run(stet, ['seo', 'check'], dir)) code = 1;\n", '');
+      const older = shipped.replace("  if (seo && !run(stet, ['seo', 'check'], dir)) code = 1;\n", '');
       expect(older).not.toBe(shipped);
       writeFileSync(join(host.cwd, '.git/stet-gate.mjs'), older);
       git(['add', '-A']);
@@ -7257,13 +7332,18 @@ describe('adoption', () => {
     expect(host.file('.git/hooks/pre-commit')).toContain('stet-gate.mjs');
     expect(host.exists('.git/stet-gate.mjs')).toBe(true);
     // The operator ran the command, so its entry runs stet seo check too.
-    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '', seo: true }] });
+    expect(JSON.parse(host.file('.git/stet-gate.json'))).toEqual({ entries: [{ checkout: '', worktree: '', id: expect.any(String), seo: true }] });
     expect(host.stdout()).toContain('it runs stet check, stet scan and stet seo check in the repository root when a commit touches it');
     // a differing existing hook is refused, not clobbered, naming the line to add
     host.write('.git/hooks/pre-commit', '#!/bin/sh\necho custom\n');
     expect(await host.run('hook', 'install')).toBe(1);
     expect(host.stderr()).toContain(GATE_LINE);
     expect(host.file('.git/hooks/pre-commit')).toContain('echo custom');
+    // A committed hook carrying the guarded line is accepted: install reads either form as the gate's line.
+    host.write('.git/hooks/pre-commit', `#!/bin/sh\necho custom\n${SHARED_GATE_LINE}\n`);
+    host.out.length = 0;
+    expect(await host.run('hook', 'install')).toBe(0);
+    expect(host.stdout()).toContain(`${hookPath} runs the stet pre-commit gate`);
 
     // A checkout that is a folder of its repository, committed from the top
     // with the registry unreachable: the gate runs the stet installed there,
@@ -7324,6 +7404,41 @@ describe('adoption', () => {
       expect(missing.out).toContain(
         'stet pre-commit gate: stet is not installed in site/ — run npm install there, or take it out of the gate with stet hook remove there',
       );
+
+      // A listed folder is gated in every worktree: installed from a linked
+      // worktree alone, a main-worktree commit still runs the checks there.
+      const merged = mkdtempSync(join(tmpdir(), 'stet-conf-merged-'));
+      try {
+        const main = join(merged, 'main');
+        const linked = join(merged, 'linked');
+        const mergedLog = join(merged, 'log');
+        const git = (cwd: string, ...args: string[]): void => void execFileSync('git', args, { cwd });
+        mkdirSync(main);
+        git(main, 'init', '-q');
+        for (const [key, value] of [['user.email', 'gate@conformance'], ['user.name', 'gate'], ['commit.gpgsign', 'false']]) {
+          git(main, 'config', key as string, value as string);
+        }
+        writeFileSync(join(main, '.gitignore'), 'node_modules\n');
+        mkdirSync(join(main, 'site'));
+        writeFileSync(join(main, 'site/stet.config.json'), '{}\n');
+        git(main, 'add', '-A');
+        git(main, 'commit', '-qm', 'base', '--no-verify');
+        git(main, 'worktree', 'add', '-q', '-b', 'linked', linked);
+        const standIn = `#!/bin/sh\necho "$* in \${PWD##*/}" >> '${mergedLog}'\n`;
+        for (const root of [main, linked]) {
+          mkdirSync(join(root, 'site/node_modules/.bin'), { recursive: true });
+          writeFileSync(join(root, 'site/node_modules/.bin/stet'), standIn, { mode: 0o755 });
+        }
+        const installed = await runCli(['hook', 'install'], { cwd: join(linked, 'site'), env: {}, stdout: () => {}, stderr: () => {} });
+        expect(installed).toBe(0);
+        writeFileSync(join(main, 'site/page.txt'), 'a main commit after the merge\n');
+        git(main, 'add', '-A');
+        const landed = spawnSync('git', ['commit', '-qm', 'main'], { cwd: main, encoding: 'utf8', env: { ...process.env, npm_config_registry: 'http://127.0.0.1:9' } });
+        expect(landed.status, `${landed.stdout}${landed.stderr}`).toBe(0);
+        expect(readFileSync(mergedLog, 'utf8')).toBe('check in site\nscan in site\nseo check in site\n');
+      } finally {
+        rmSync(merged, { recursive: true, force: true });
+      }
 
       // A hooks folder outside the repository may be every repository's: refused.
       const shared = mkdtempSync(join(tmpdir(), 'stet-conf-shared-hooks-'));
@@ -7944,6 +8059,68 @@ describe('dashboard', () => {
     const pushed = await call(handler, `/api/site/push${siteOf(host.cwd)}`, {});
     expect(pushed.status).toBe(200);
     expect(pushed.body).toMatchObject({ upstream: 'origin', branch: 'develop', at: { branch: 'develop', upstream: 'origin/develop', ahead: 0 } });
+  });
+
+  it('Requirement: A store-backed site is served by the mounted API handler', async () => {
+    const pair = { project: 'walk', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } };
+    const a = makeCliHost({ config: pair });
+    const b = makeCliHost({ config: pair });
+    writeFileSync(join(a.cwd, '.env.local'), 'STET_POSTGREST_URL=http://stale.test/rest/v1\n');
+    const mounted = (host: { cwd: string }): string => `/s/${siteId(realpathSync(host.cwd))}/api/stet/keys`;
+    const shell = { STET_POSTGREST_URL: 'http://store.test/rest/v1', STET_POSTGREST_TOKEN: 'proc-token', STET_DEV_TOKEN: TOKEN };
+    const held = Object.fromEntries(Object.keys(shell).map((name) => [name, process.env[name]]));
+    const heldFetch = globalThis.fetch;
+    const calls: Array<{ url: string; apikey: string | undefined }> = [];
+    Object.assign(process.env, shell);
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), apikey: (init?.headers as Record<string, string> | undefined)?.['apikey'] });
+      return new Response('[]', { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { handler, file } = handlerOver([a.cwd, b.cwd], { launched: realpathSync(a.cwd) });
+      const setFlags = async (host: { cwd: string }): Promise<boolean[]> =>
+        (await call(handler, `/api/site${siteOf(host.cwd)}`)).body['environments'][0].vars.map((v: { set: boolean }) => v.set);
+      // The started-in site reads the shell's pair over its files; the other reads its files alone.
+      expect(await setFlags(a)).toEqual([true, true]);
+      expect(await setFlags(b)).toEqual([false, false]);
+      expect((await call(handler, mounted(a))).status).toBe(200);
+      expect(calls[0]?.url).toMatch(/^http:\/\/store\.test\/rest\/v1\/content_versions/);
+      expect(calls[0]?.apikey).toBe('proc-token');
+      const refused = await call(handler, mounted(b));
+      expect(refused.status).toBe(409);
+      expect(refused.body['error']).toBe(
+        "store adapter 'postgrest' is configured but STET_POSTGREST_URL is unset — " +
+          "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
+      );
+
+      // The dev command of each site: the started-in one holds the token, the other does not.
+      for (const host of [a, b]) {
+        updateSite(file, realpathSync(host.cwd), {
+          devCommand: `node -e "console.log('tok:'+(process.env.STET_POSTGREST_TOKEN??'unset'))"`,
+        });
+      }
+      const logged = async (host: { cwd: string }): Promise<string[]> => {
+        expect((await call(handler, `/api/site/dev-start${siteOf(host.cwd)}`, {})).status).toBe(200);
+        const deadline = Date.now() + 4_000;
+        for (;;) {
+          const lines = (await call(handler, `/api/site/dev-log${siteOf(host.cwd)}`)).body['lines'] as string[];
+          if (lines.length > 0 || Date.now() > deadline) return lines;
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+      };
+      try {
+        expect(await logged(a)).toEqual(['tok:proc-token']);
+        expect(await logged(b)).toEqual(['tok:unset']);
+      } finally {
+        for (const host of [a, b]) await call(handler, `/api/site/dev-stop${siteOf(host.cwd)}`, {});
+      }
+    } finally {
+      globalThis.fetch = heldFetch;
+      for (const [name, value] of Object.entries(held)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   it('Requirement: The key list and the preview open on one page', async () => {
