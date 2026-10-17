@@ -7325,6 +7325,31 @@ describe('the page', () => {
       page.dom.window.close();
     });
 
+    it('ignores the pre-save request’s reply once the save is made, so a page re-rendered in place is not read as missing the key (F89)', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+      const agent = agentOf(page, (message) =>
+        message['stet'] === 'locate' ? LOCATED({ seq: message['seq'], found: 1 }) : null,
+      );
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      await page.settle();
+      await page.type('text:hero_headline', 'Saved words');
+      await wait(150);
+      await page.settle();
+      const earlier = agent.locates().at(-1)?.['seq'];
+      await page.act('save');
+      const before = agent.locates().length;
+      // The dev server re-rendered the page in place: its agent re-applies the request from before the save
+      // against the saved text, and finds nothing.
+      agent.say(LOCATED({ seq: earlier, found: 0, by: 'contained' }));
+      await page.settle();
+      expect(agent.locates()).toHaveLength(before);
+      expect(note(page).textContent).not.toContain('was not found');
+      page.dom.window.close();
+    }, 10_000);
+
     it('runs the save’s check after 3 s where the page sends no new ready', async () => {
       const page = await paint({ preview: DEV_PREVIEW });
       page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
@@ -7340,7 +7365,9 @@ describe('the page', () => {
       await page.act('save');
       const before = agent.locates().length;
       await wait(3_200);
-      expect(agent.locates().slice(before).some((m) => JSON.stringify(m['texts']) === JSON.stringify(['In place']))).toBe(true);
+      const check = agent.locates().slice(before).find((m) => JSON.stringify(m['texts']) === JSON.stringify(['In place']));
+      // The check is flagged, so the agent looks again once a page that rendered late has gone quiet (F90).
+      expect(check).toMatchObject({ draft: null, check: true });
       page.dom.window.close();
     }, 10_000);
 

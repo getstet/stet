@@ -228,6 +228,95 @@ describe('the preview agent', () => {
     expect(fresh.textContent).toBe('New words');
   });
 
+  describe('a page that re-rendered after a save', () => {
+    it('keeps the words the page wrote over a swapped node, even the very words the swap had put there (F89)', async () => {
+      const framed = await frame(PAGE);
+      await framed.locate({ key: 'k_title', texts: ['Ship the copy'], draft: 'Fresh' });
+      const h1 = framed.doc.querySelector('h1') as HTMLElement;
+      // React updates the node in place to the saved text, which is the draft's text too.
+      (h1.firstChild as Text).data = '  Fresh  ';
+      await tick();
+      // The save check runs: it restores what it swapped, and must not touch the page's text.
+      const reply = await framed.locate({ key: 'k_title', texts: ['Fresh'], check: true });
+      expect(h1.textContent).toBe('  Fresh  ');
+      expect(reply).toMatchObject({ found: 1, by: 'text' });
+      framed.send({ stet: 'clear' });
+      await tick();
+      expect(h1.textContent).toBe('  Fresh  ');
+    });
+
+    it('keeps the page’s words when the write has not reached the observer before the next request', async () => {
+      const framed = await frame(PAGE);
+      await framed.locate({ key: 'k_title', texts: ['Ship the copy'], draft: 'Fresh' });
+      const h1 = framed.doc.querySelector('h1') as HTMLElement;
+      (h1.firstChild as Text).data = '  Fresh  ';
+      // No tick between the write and the request: the record is still queued.
+      await framed.locate({ key: 'k_price', texts: ['Price {{n}}'] });
+      expect(h1.textContent).toBe('  Fresh  ');
+    });
+
+    it('keeps the page’s attribute, and still restores a node the page left alone', async () => {
+      const framed = await frame(PAGE, 'c1', '<meta name="description" data-stet-content="k_meta" content="Old words">');
+      await framed.locate({ key: 'k_meta', texts: ['Old words'], draft: 'New words' });
+      framed.doc.querySelector('meta')?.setAttribute('content', 'Saved words');
+      await framed.locate({ key: 'k_title', texts: ['Ship the copy'], draft: 'Other draft' });
+      expect(framed.doc.querySelector('meta')?.getAttribute('content')).toBe('Saved words');
+      // The heading was swapped and never touched by the page: it comes back.
+      await framed.locate({ key: 'k_price', texts: ['Price {{n}}'] });
+      expect((framed.doc.querySelector('h1') as HTMLElement).textContent).toBe('  Ship the copy  ');
+    });
+  });
+
+  describe('a save check on a page that renders after it announces itself', () => {
+    const SPA = '<div id="root"></div>';
+    const asked = async (framed: Framed, request: Message): Promise<number> => {
+      const before = located(framed).length;
+      framed.send({ stet: 'locate', seq: 1, texts: [], draft: null, scroll: false, ...request });
+      return before;
+    };
+
+    it('waits for the page to go quiet, then answers with what rendered (F90)', async () => {
+      const framed = await frame(SPA);
+      const before = await asked(framed, { key: 'k_link', texts: ['Sign in here'], check: true, guess: true });
+      await tick(100);
+      expect(located(framed)).toHaveLength(before);
+      // The app draws, in several bursts.
+      const root = framed.doc.getElementById('root') as HTMLElement;
+      root.innerHTML = '<main></main>';
+      await tick(150);
+      (root.firstChild as HTMLElement).innerHTML = '<a>Sign in here</a>';
+      await tick(150);
+      expect(located(framed)).toHaveLength(before);
+      await tick(500);
+      expect(located(framed).slice(before)).toEqual([expect.objectContaining({ key: 'k_link', found: 1, by: 'text' })]);
+    });
+
+    it('answers not found once, after the quiet window, when nothing ever renders', async () => {
+      const framed = await frame(SPA);
+      const before = await asked(framed, { key: 'k_link', texts: ['Sign in here'], check: true });
+      await tick(150);
+      expect(located(framed)).toHaveLength(before);
+      await tick(500);
+      expect(located(framed).slice(before)).toEqual([expect.objectContaining({ found: 0 })]);
+    });
+
+    it('answers a request that is not a save check at once, as before', async () => {
+      const framed = await frame(SPA);
+      const reply = await framed.locate({ key: 'k_link', texts: ['Sign in here'] });
+      expect(reply).toMatchObject({ found: 0 });
+    });
+
+    it('a new request ends the wait', async () => {
+      const framed = await frame(PAGE);
+      const before = await asked(framed, { key: 'k_none', texts: ['Nowhere text'], check: true });
+      await tick(50);
+      const reply = await framed.locate({ key: 'k_title', texts: ['Ship the copy'] });
+      expect(reply).toMatchObject({ key: 'k_title', found: 1 });
+      await tick(600);
+      expect(located(framed).slice(before).map((m) => m['key'])).toEqual(['k_title']);
+    });
+  });
+
   it('sends nothing but site copy and its own bookkeeping', async () => {
     const framed = await frame(PAGE);
     await framed.locate({ key: 'k_title', texts: ['Ship the copy'], draft: 'New words', scroll: true });
