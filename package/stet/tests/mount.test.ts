@@ -1139,4 +1139,71 @@ describe('the content gate on the draft and publish routes', () => {
     expect(ok.status).toBe(200);
     expect(events.map((e) => e.key).sort()).toEqual(['hero_headline', 'welcome__subject']);
   });
+
+  // The template's subject also declares the unsubscribe variable, so either
+  // slot can carry it for the other.
+  const carrying = {
+    ...descriptor,
+    keys: {
+      ...descriptor.keys,
+      newsletter__subject: { ...descriptor.keys['newsletter__subject']!, vars: ['unsubscribe_url'] },
+    },
+  };
+
+  /** Live: a body that carries the variable and a plain subject. */
+  async function liveNewsletter(): Promise<StoreAdapter> {
+    const store = await seeded();
+    for (const [key, value] of [['newsletter__body', 'Bye: {{unsubscribe_url}}'], ['newsletter__subject', 'News']] as const) {
+      await store.saveDraft({ key, value, target: 'html-email', editor: 'ada' });
+      await store.publish({ key, editor: 'ada' });
+    }
+    return store;
+  }
+
+  it('publish judges a slot without the drafts it does not ship', async () => {
+    const store = await liveNewsletter();
+    const h = createStetHandler({ store, descriptor: carrying, auth: TOKEN_ENV });
+    // Each draft passes at the draft route, the subject carrying the variable
+    // for the body; only the body is published, so the subject never goes live.
+    expect((await h.POST(post('/api/stet/draft', { key: 'newsletter__subject', value: 'News {{unsubscribe_url}}', editor: 'ada' }))).status).toBe(200);
+    expect((await h.POST(post('/api/stet/draft', { key: 'newsletter__body', value: 'Hello again.', editor: 'ada' }))).status).toBe(200);
+    const res = await h.POST(post('/api/stet/publish', { key: 'newsletter__body', editor: 'ada' }));
+    expect(res.status).toBe(422);
+    expect(String((await bodyOf(res))['error'])).toContain('unsubscribe_url');
+    const live = ((await store.read()) as StoreRow[]).find((r) => r.key === 'newsletter__body');
+    expect(live?.value).toBe('Bye: {{unsubscribe_url}}');
+  });
+
+  it('publish-change judges the group without a draft outside it', async () => {
+    const store = await liveNewsletter();
+    const h = createStetHandler({ store, descriptor: carrying, auth: TOKEN_ENV });
+    const opened = (await store.changesets.open({ name: 'body only' })) as { changeId: number };
+    await store.saveDraft({ key: 'newsletter__subject', value: 'News {{unsubscribe_url}}', target: 'html-email', editor: 'ada' });
+    await store.saveDraft({ key: 'newsletter__body', value: 'Hello again.', target: 'html-email', editor: 'ada', change: opened.changeId });
+    const res = await h.POST(post('/api/stet/publish-change', { change: opened.changeId, editor: 'ada' }));
+    expect(res.status).toBe(422);
+    expect(String((await bodyOf(res))['error'])).toContain('unsubscribe_url');
+  });
+
+  it('publish passes a slot whose sibling ships with it in the same change', async () => {
+    const store = await liveNewsletter();
+    const h = createStetHandler({ store, descriptor: carrying, auth: TOKEN_ENV });
+    const opened = (await store.changesets.open({ name: 'both' })) as { changeId: number };
+    await store.saveDraft({ key: 'newsletter__subject', value: 'News {{unsubscribe_url}}', target: 'html-email', editor: 'ada', change: opened.changeId });
+    await store.saveDraft({ key: 'newsletter__body', value: 'Hello again.', target: 'html-email', editor: 'ada', change: opened.changeId });
+    expect((await h.POST(post('/api/stet/publish-change', { change: opened.changeId, editor: 'ada' }))).status).toBe(200);
+  });
+
+  it('reads only the keys a check uses, and nothing for a key with no template', async () => {
+    const { store, calls } = makeStore();
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    await h.POST(post('/api/stet/draft', { key: 'hero_headline', value: 'Hi', editor: 'ada' }));
+    expect(calls.filter((c) => c.method === 'read')).toHaveLength(0);
+    await h.POST(post('/api/stet/draft', { key: 'newsletter__body', value: 'Bye {{unsubscribe_url}}', editor: 'ada' }));
+    expect(calls.filter((c) => c.method === 'read').map((c) => c.arg)).toEqual([
+      { keys: ['newsletter__body', 'newsletter__subject', 'brand__footer_address'], preview: true },
+    ]);
+    await h.POST(post('/api/stet/publish', { key: 'hero_headline', editor: 'ada' }));
+    expect(calls.filter((c) => c.method === 'read').at(-1)?.arg).toEqual({ keys: ['hero_headline'], preview: true });
+  });
 });

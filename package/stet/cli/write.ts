@@ -16,6 +16,7 @@ import { isNotSupported, isRefusal, isStoreError } from '../adapters/store-share
 import type { StoreRow } from '../src/resolve.js';
 import { keyDefOf } from '../src/descriptor.js';
 import type { Shape } from '../src/types.js';
+import { scopeKeys, shippedScope } from '../src/value-check.js';
 import { ENV_OPTION, flag, noPositionals, parse, required, text } from './args.js';
 import type { CliIo } from './main.js';
 import { stampDescriptorVersion } from './meta.js';
@@ -152,7 +153,7 @@ export async function runPublish(args: string[], io: CliIo): Promise<number> {
     // ship: a draft written past it (an earlier release, another client) is
     // judged as it publishes. A store that does not answer is left to the
     // publish, which says so in its own words.
-    const held = await project.readRows({ preview: true });
+    const held = await project.readRows({ keys: scopeKeys(project.descriptor, [key]), preview: true });
     if (!held.storeDown && !draftsPass(project, held.rows, [{ key, locale }], report)) return report.emit(io);
 
     const answer = await project.store.publish({ key, editor, locale });
@@ -167,8 +168,9 @@ export async function runPublish(args: string[], io: CliIo): Promise<number> {
 
 /**
  * Whether every stored draft in `members` passes the content gate, each judged
- * with the store's other drafts in scope (`rows`, read for preview) as the
- * publish would see them. Findings land in the report at their own level. A
+ * with the rows as they will stand once `members` publish: the active rows
+ * and only those drafts (`rows`, read for preview). Findings land in the report
+ * at their own level. A
  * member with no draft row has nothing to ship, and a key that has left the
  * descriptor has no rules — the publish itself answers both.
  */
@@ -179,10 +181,11 @@ function draftsPass(
   report: Report,
 ): boolean {
   let pass = true;
+  const scope = shippedScope(rows, members);
   for (const { key, locale } of members) {
     const row = rows.find((r) => r.status === 'draft' && r.key === key && r.locale === locale);
     if (row === undefined || !Object.hasOwn(project.descriptor.keys, key)) continue;
-    pass = validateValue(project.descriptor, project.snapshot, key, row.value, locale, report, rows) && pass;
+    pass = validateValue(project.descriptor, project.snapshot, key, row.value, locale, report, scope) && pass;
   }
   return pass;
 }

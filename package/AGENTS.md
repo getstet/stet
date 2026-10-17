@@ -35,7 +35,7 @@ Nothing else lists what the package exports.
 | `src/bundle.ts` | the read bundle's format and its read semantics (both forms), and `resolveAll` — every declared key resolved once into the map an accessor takes |
 | `src/access.ts` | the framework-free ambient-access contract |
 | `src/validate.ts` | save-time checks: shapes, limits, variables, class rules, fit budgets |
-| `src/value-check.ts` | one value against its key's rules as findings: the shape check, then the save checks with the template's slots in scope — the gate the CLI, the dashboard and the mounted API's draft and publish routes share |
+| `src/value-check.ts` | one value against its key's rules as findings: the shape check, then the save checks with the template's slots in scope — the gate the CLI, the dashboard and the mounted API's draft and publish routes share, with the store keys a check reads and the rows as they stand once a set of drafts ships |
 | `src/seo.ts` | the offline SEO audit: the fourteen rules, the one severity table, the two word lists |
 | `src/targets/adapter.ts` | the target seam: the adapter contract, and the one registry a consumer looks up by a key's declared target |
 | `src/targets/html-email.ts` | the html-email target — the same HTML escaping, the line metrics derived from the email-safe content width, and the element list behind the markup-in-content construct rule |

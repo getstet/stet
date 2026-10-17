@@ -106,3 +106,32 @@ function siblingsOf(
   siblings['brand__footer_address'] = read('brand__footer_address');
   return siblings;
 }
+
+/**
+ * The store keys a check of `keys` reads: the keys themselves, and for a
+ * template slot the template's other slots and the brand's postal line, which
+ * `siblingsOf` resolves. A read narrowed to these answers the check exactly.
+ * A key that belongs to no template needs no rows beyond its own.
+ */
+export function scopeKeys(descriptor: Descriptor, keys: string[]): string[] {
+  const scope = new Set(keys);
+  for (const key of keys) {
+    const template = templateOf(descriptor, key);
+    if (template === null) continue;
+    for (const slot of descriptor.templates?.[template]?.slots ?? []) scope.add(`${template}__${slot}`);
+    scope.add('brand__footer_address');
+  }
+  return [...scope];
+}
+
+/**
+ * The rows as they will stand once `ships` have published: every active row,
+ * and of the drafts only those being shipped. A publish judged against drafts
+ * it does not ship would pass a slot on the strength of a sibling that never
+ * goes live.
+ */
+export function shippedScope(rows: StoreRow[], ships: Array<{ key: string; locale: string }>): StoreRow[] {
+  return rows.filter(
+    (row) => row.status !== 'draft' || ships.some((s) => s.key === row.key && s.locale === row.locale),
+  );
+}
