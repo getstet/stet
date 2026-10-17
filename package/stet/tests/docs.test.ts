@@ -57,15 +57,13 @@ describe('the Lighthouse docs', () => {
     expect(atRoot.equals(inPackage)).toBe(true);
   });
 
-  it('says in the READMEs and the SEO doc how a 0.7.1 npm host drops the three, and where a global or npx stet takes them', () => {
+  it('says in the READMEs and the SEO doc how a 0.7.1 npm host drops the three', () => {
     const flatten = (text: string): string => text.replace(/\s+/g, ' ');
     const upgrade =
       'Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and selfsigned because the lockfile holds them. To drop them, delete their node_modules/ entries from package-lock.json and run npm i, or install production with npm ci --omit=dev --omit=peer.';
-    const elsewhere = 'A global or npx stet, or one under Yarn PnP, has no project folder of its own: install @getstet/stet in the project that runs the audit, and add the three there.';
     const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
     for (const doc of [readme, seoCheck]) {
       expect(flatten(doc)).toContain(upgrade);
-      expect(flatten(doc)).toContain(elsewhere);
     }
   });
 

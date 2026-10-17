@@ -173,8 +173,7 @@ Node.js 22 or later; `stet audit lighthouse` needs 22.19 or later, Google Chrome
 `npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. Scanning and adoption use the TypeScript compiler API, so
 projects using those commands need `typescript` 5 or 6 as a dev dependency.
 
-A global or npx stet, or one under Yarn PnP, has no project folder of its own: install @getstet/stet in the project
-that runs the audit, and add the three there. Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
+Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
 selfsigned because the lockfile holds them. To drop them, delete their node_modules/ entries from package-lock.json
 and run npm i, or install production with npm ci --omit=dev --omit=peer.
 

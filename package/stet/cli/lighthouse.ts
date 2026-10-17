@@ -88,17 +88,21 @@ function projectOf(dir: string): string | null {
   }
 }
 
+/** Path segments of an npx cache and of the pnpm, Yarn 1 and Bun global folders: none is a project to install in. */
+const SHARED_FOLDERS = [['_npx'], ['pnpm', 'global'], ['yarn', 'global'], ['.bun', 'install', 'global']];
+
 /**
  * The project folder holding the stet at `root`, where there is one to name:
  * the folder above its node_modules, only if it has a package.json (a global
  * install's lib folder has none) and the loader is not Yarn PnP (the stet then
- * sits inside a cache zip).
+ * sits inside a cache zip), and the folder is no npx cache or pnpm, Yarn 1 or Bun global folder.
  */
 function stetProject(root: string): string | null {
   if (process.versions.pnp !== undefined) return null;
   const real = realOr(root);
   const at = real.indexOf(`${sep}node_modules${sep}`);
-  const project = at === -1 ? real : real.slice(0, at);
+  const project = at === -1 ? real : real.slice(0, at) || sep;
+  if (SHARED_FOLDERS.some((folder) => `${sep}${project}${sep}`.includes(`${sep}${folder.join(sep)}${sep}`))) return null;
   return existsSync(join(project, 'package.json')) ? project : null;
 }
 

@@ -439,6 +439,22 @@ describe('stet audit lighthouse — the folder the needs-Lighthouse line names',
     expect(installFolder(root, scratch())).toBe(a);
   });
 
+  it('names no folder for a stet in an npx cache or a pnpm, Yarn 1 or Bun global folder', () => {
+    for (const layout of ['.npm/_npx/abc', 'Library/pnpm/global/5', '.config/yarn/global', '.local/share/pnpm/global/5', '.bun/install/global']) {
+      const dir = join(scratch(), layout);
+      const root = projectWithStet(dir);
+      const host = scratch();
+      write(host, 'package.json', '{"name":"host"}');
+      expect(installFolder(root, host), layout).toBeNull();
+      expect(auditPackageLine(root, host), layout).toBe(NO_FOLDER);
+    }
+  });
+
+  it('gives a stet at the filesystem root the project / and a line that does not end in "in "', () => {
+    expect(installFolder('/node_modules/@getstet/stet', '/')).not.toBe('');
+    expect(auditPackageLine('/node_modules/@getstet/stet', '/')).not.toMatch(/ in $/);
+  });
+
   it("gives the bare line where the cwd is the stet's own project, or inside it", () => {
     const a = scratch();
     const root = projectWithStet(a);
