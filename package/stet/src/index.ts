@@ -76,6 +76,7 @@ export {
   checkBudget,
   checkClassRules,
   checkLimits,
+  checkRequires,
   checkTags,
   checkVars,
   plainOf,

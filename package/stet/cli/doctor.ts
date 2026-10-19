@@ -13,24 +13,25 @@
  * issue, and each costs half an hour of triage without one.
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { dirname, join, resolve as resolvePath, sep } from 'node:path';
-
-import type * as TS from 'typescript';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { isNotSupported, isStoreError } from '../adapters/store-shared.js';
 import { resolve } from '../src/resolve.js';
+import type { RenderPointer } from '../src/types.js';
 import { ENV_OPTION, flag, noPositionals, parse, text } from './args.js';
 import { check } from './check.js';
 import { CONFIG_FILE, formsSecretEnvOf, isHtmlHost, type StetConfig } from './config.js';
+import { containedPointer, outsideLine } from './email-render.js';
 import { filesForGlobs } from './files.js';
 import { GATE_LINE, gateLineIn, gateSite, hookKind, hooksDir, insideDir, isSite, operatorHook, readGate, worktreeTop, type GateEntry } from './hook.js';
+import { importClosure, type Chain } from './import-closure.js';
 import { packageVersion } from './installed.js';
 import type { CliIo } from './main.js';
 import { readProjectMeta } from './meta.js';
 import { loadProject, openContactsStore, type LoadedProject, type OpenedContactsStore } from './project.js';
-import { Report, UsageError, formatFinding, plural, posixRelative, shapeOf } from './report.js';
-import { TS7_REFUSAL, carriesToken, dialectOf, loadTypescript, mentionsToken, scriptKindFor } from './source-scan.js';
+import { Report, UsageError, formatFinding, plural, shapeOf } from './report.js';
+import { TS7_REFUSAL, carriesToken, dialectOf, loadTypescript, mentionsToken } from './source-scan.js';
 import { contactsConfig, isStoreBacked } from './store.js';
 
 /** Whether a `process.version` string (`v22.19.0`) is at least `major.minor`. */
@@ -141,8 +142,8 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
  * its weakness: nothing at save time can see whether the wrapper really emits
  * the token. The render pointer makes the check cheap, because it names the
  * root of the chain. So each declared token is looked for across the pointer's
- * file and its relative-import closure, and a token found nowhere is reported
- * with the files that were searched.
+ * file, its frame's file and their relative-import closure, and a token found
+ * nowhere is reported with the files that were searched.
  *
  * It warns and never fails: stet can see that a token is absent from the source
  * it can reach, and cannot know that a wrapper three layers of indirection away
@@ -163,7 +164,14 @@ async function wrapperChainSection(io: CliIo, project: LoadedProject, report: Re
     if (entry === undefined || pointer === undefined) continue;
     const declared = entry.wrapperProvides ?? [];
 
-    const chain = ts === null ? pointerOnly(io.cwd, pointer.file) : importClosure(ts, io.cwd, pointer.file);
+    // A pointer whose files escape the project is never read: what lies outside
+    // is not the host's source to vouch for.
+    const outside = containedPointer(io.cwd, pointer);
+    if (outside !== null) {
+      report.line(`wrapper chain (${name}): ${outsideLine(outside)}`);
+      continue;
+    }
+    const chain = ts === null ? pointerOnly(io.cwd, pointer.file) : importClosure(ts, io.cwd, pointerFiles(pointer));
     if (chain.files.length === 0) {
       report.line(`wrapper chain (${name}): ${pointer.file} could not be read`);
       continue;
@@ -281,12 +289,6 @@ const POSTAL_TOKEN = 'postal_address';
 /** The descriptor key that carries the address where no wrapper does. */
 const FOOTER_ADDRESS_KEY = 'brand__footer_address';
 
-/** How deep the relative-import walk goes before it stops following. */
-const CHAIN_DEPTH = 10;
-
-/** The extensions a relative specifier may resolve to, in resolution order. */
-const CHAIN_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
-
 /**
  * The compiler the chain walk needs, or `null` with the degradation stated.
  *
@@ -350,11 +352,9 @@ function compilerCause(error: unknown): typeof TS7_REFUSAL | null {
   return error instanceof Error && error.message === TS7_REFUSAL ? TS7_REFUSAL : null;
 }
 
-/** The files a wrapper claim was searched in, and whether that was all of them. */
-interface Chain {
-  files: Array<{ rel: string; text: string }>;
-  /** The walk met an import it does not follow — a package, or an unreadable file. */
-  boundary: boolean;
+/** The files a render pointer runs: its own and, where it declares one, its frame's. */
+function pointerFiles(pointer: RenderPointer): string[] {
+  return pointer.frame === undefined || pointer.frame.file === pointer.file ? [pointer.file] : [pointer.file, pointer.frame.file];
 }
 
 /** The pointer's own file — the whole chain a run without the compiler can reach. */
@@ -364,97 +364,6 @@ function pointerOnly(cwd: string, entryFile: string): Chain {
   } catch {
     return { files: [], boundary: true };
   }
-}
-
-/**
- * A file and everything it reaches by RELATIVE import or re-export,
- * depth-bounded, plus whether the walk stopped somewhere it could not follow.
- *
- * Package imports are never followed: a wrapper that lives in `node_modules` is
- * not the host's source, and walking into one would turn a bounded read into a
- * dependency-tree crawl. But a chain that met one is INCOMPLETE, and the caller
- * has to know: the frame carrying the token may be exactly the file behind that
- * import, so "not found here" is not "not there" — the same distinction the
- * compiler-less degradation draws.
- *
- * Re-exports are followed because a component directory's barrel
- * (`export { Footer } from './footer'`) is how most host code reaches its
- * frame, and a walk that stopped at the barrel would report every token the
- * frame carries as missing from a chain that never opened the frame.
- */
-function importClosure(
-  ts: typeof import('typescript'),
-  cwd: string,
-  entryFile: string,
-): Chain {
-  const files: Array<{ rel: string; text: string }> = [];
-  const seen = new Set<string>();
-  let boundary = false;
-
-  const visit = (rel: string, depth: number): void => {
-    if (seen.has(rel)) return;
-    if (depth > CHAIN_DEPTH) {
-      boundary = true;
-      return;
-    }
-    seen.add(rel);
-    const abs = join(cwd, rel);
-    let text: string;
-    try {
-      text = readFileSync(abs, 'utf8');
-    } catch {
-      boundary = true;
-      return;
-    }
-    files.push({ rel, text });
-
-    const sf = ts.createSourceFile(abs, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, abs));
-    for (const stmt of sf.statements) {
-      const spec = moduleSpecifier(ts, stmt);
-      if (spec === undefined) continue;
-      if (!spec.startsWith('./') && !spec.startsWith('../')) {
-        boundary = true;
-        continue;
-      }
-      const target = resolveRelative(cwd, rel, spec);
-      if (target === null) boundary = true;
-      else visit(target, depth + 1);
-    }
-  };
-
-  visit(entryFile, 0);
-  return { files, boundary };
-}
-
-/** The module an import or a re-export names, where it names one. */
-function moduleSpecifier(ts: typeof import('typescript'), stmt: TS.Statement): string | undefined {
-  if (ts.isImportDeclaration(stmt) && ts.isStringLiteral(stmt.moduleSpecifier)) return stmt.moduleSpecifier.text;
-  if (
-    ts.isExportDeclaration(stmt) &&
-    stmt.moduleSpecifier !== undefined &&
-    ts.isStringLiteral(stmt.moduleSpecifier)
-  ) {
-    return stmt.moduleSpecifier.text;
-  }
-  return undefined;
-}
-
-/** A relative specifier as a repo-relative path, extension probed. */
-function resolveRelative(cwd: string, fromRel: string, spec: string): string | null {
-  const base = resolvePath(dirname(join(cwd, fromRel)), spec);
-  const candidates = [
-    base,
-    ...CHAIN_EXTENSIONS.map((ext) => `${base}${ext}`),
-    ...CHAIN_EXTENSIONS.map((ext) => join(base, `index${ext}`)),
-  ];
-  for (const candidate of candidates) {
-    // `node_modules` is never entered, even by a specifier that reaches it the
-    // long way round (`../../node_modules/x`).
-    if (candidate.split(sep).includes('node_modules')) continue;
-    if (!existsSync(candidate) || !statSync(candidate).isFile()) continue;
-    return posixRelative(cwd, candidate);
-  }
-  return null;
 }
 
 /**

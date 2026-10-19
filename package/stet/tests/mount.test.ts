@@ -1072,6 +1072,18 @@ describe('the content gate on the draft and publish routes', () => {
     expect(String(body['error'])).toBe(printed.join('; '));
   });
 
+  it('draft refuses a value that dropped a required variable with 422, its line ending in the locale (journey B4)', async () => {
+    const store = await seeded();
+    const required = miniDescriptor();
+    required.keys['welcome__body'] = { ...required.keys['welcome__body']!, requires: ['handle'] };
+    const h = createStetHandler({ store, descriptor: required, auth: TOKEN_ENV });
+    const before = await store.read({ preview: true });
+    const res = await h.POST(post('/api/stet/draft', { key: 'welcome__body', value: 'Welcome aboard.', editor: 'ada' }));
+    expect(res.status).toBe(422);
+    expect(String((await bodyOf(res))['error'])).toBe('welcome__body: {{handle}} is required and the value no longer carries it (default)');
+    expect(await store.read({ preview: true })).toEqual(before);
+  });
+
   it('draft saves a valid value with 200', async () => {
     const store = await seeded();
     const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });

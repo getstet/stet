@@ -54,6 +54,8 @@ export interface KeyDef {
   /** Required if and only if `shape` is `enum`. */
   values?: string[];
   vars?: string[];
+  /** An email slot's variables a value must keep; each one also in `vars`. */
+  requires?: string[];
   /**
    * The number of numbered placeholder tags (`<1>…</1>`) a value carries, one per
    * descendant element of the marked element, numbered depth-first. The save gate
@@ -109,6 +111,21 @@ export interface RenderPointer {
   file: string;
   export: string;
   sampleProps: Record<string, unknown>;
+  /** Wraps the export's markup (a string map's `html` member) in a host function. */
+  frame?: RenderFrame;
+  /** Fills each `{{var}}` of the final markup from the props; a variable the props lack stays. */
+  fill?: boolean;
+}
+
+/**
+ * A host function the rendered markup is passed through: the markup first,
+ * then what `args` declares — named props in order, the whole props object
+ * (`'$all'`), or nothing more where `args` is absent.
+ */
+export interface RenderFrame {
+  file: string;
+  export: string;
+  args?: string[] | '$all';
 }
 
 export interface TemplateDef {

@@ -255,6 +255,21 @@ describe('the preview agent', () => {
       expect(h1.textContent).toBe('  Fresh  ');
     });
 
+    it('leaves the page’s words on a node the page rewrote after it left the document, where no observer sees the write', async () => {
+      const framed = await frame(PAGE);
+      await framed.locate({ key: 'k_title', texts: ['Ship the copy'], draft: 'Fresh' });
+      const h1 = framed.doc.querySelector('h1') as HTMLElement;
+      const text = h1.firstChild as Text;
+      h1.remove();
+      await tick();
+      // The page keeps the detached node and rewrites it: nothing observes a node outside the document.
+      text.data = 'Saved.';
+      await tick();
+      framed.send({ stet: 'clear' });
+      await tick();
+      expect(text.data).toBe('Saved.');
+    });
+
     it('keeps the page’s attribute, and still restores a node the page left alone', async () => {
       const framed = await frame(PAGE, 'c1', '<meta name="description" data-stet-content="k_meta" content="Old words">');
       await framed.locate({ key: 'k_meta', texts: ['Old words'], draft: 'New words' });

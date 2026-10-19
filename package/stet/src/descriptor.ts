@@ -89,6 +89,10 @@ export function checkDescriptorStructure(d: Descriptor): DescriptorWarning[] {
         `key "${key}" declares shape: enum and must declare its value set`,
       );
     }
+    for (const name of def.requires ?? []) {
+      if (def.vars?.includes(name) === true) continue;
+      throw new DescriptorError(`keys/${key}/requires`, `${key}: requires names {{${name}}}, which vars does not declare`);
+    }
     def.pages?.forEach((page, i) => {
       if (!pageNames.has(page)) {
         throw new DescriptorError(

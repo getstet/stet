@@ -12,9 +12,9 @@
  * status list or a file's bytes at HEAD is corrupted by a merged stream. The
  * dashboard's two reads over it — the uncommitted forms and the sequencer
  * check — are its first consumers, and `trackable`, the `check-ignore` probe,
- * reads through it. The three ad hoc `execFileSync` calls elsewhere (`email
- * verify`'s `show`, `email extract`'s `ls-files -z` and `hooksDir`) still wait
- * to move onto it.
+ * reads through it. `gitFiles` is the file-list read `email extract` and the
+ * unread-key scan share. The two ad hoc `execFileSync` calls elsewhere (`email
+ * verify`'s `show` and `hooksDir`) still wait to move onto it.
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -75,6 +75,24 @@ export function gitData(cwd: string, args: string[]): { code: number; stdout: st
   });
   if (result.error !== undefined) return { code: 1, stdout: '' };
   return { code: result.status ?? 1, stdout: result.stdout ?? '' };
+}
+
+/**
+ * `git ls-files -z <args>` in `cwd`, split on NUL: the paths git keeps, relative
+ * to `cwd`. Null where git cannot be spawned or exits non-zero (no repository),
+ * so a caller can tell "git answered nothing" from "git did not answer". Run
+ * under `LC_ALL=C` with the caller's environment, as `email extract` and the
+ * unread-key scan read it.
+ */
+export function gitFiles(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env): string[] | null {
+  const result = spawnSync('git', ['ls-files', '-z', ...args], {
+    cwd,
+    env: { ...env, LC_ALL: 'C' },
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.error !== undefined || result.status !== 0) return null;
+  return result.stdout.split('\0').filter((path) => path !== '');
 }
 
 /**

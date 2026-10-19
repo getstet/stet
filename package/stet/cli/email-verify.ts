@@ -34,12 +34,17 @@ import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { asUpdate, planJson, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { loadConfig, type StetConfig } from './config.js';
-import { MAX_OUTPUT, renderTemplate, type RenderResult } from './email-render.js';
+import {
+  MAX_OUTPUT,
+  containedPointer,
+  outsideLine,
+  renderTemplate,
+  templateProps,
+  type RenderRequest,
+  type RenderResult,
+} from './email-render.js';
 import type { CliIo } from './main.js';
-import { clip, plural, Report, shapeOf } from './report.js';
-
-/** `src/validate.ts`'s own placeholder form — one spelling of what a `{{var}}` is. */
-const VARIABLE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+import { clip, plural, Report } from './report.js';
 
 /** Where a captured baseline lives. Project data, and meant to be committed. */
 const FIXTURE_DIR = join('.stet', 'email-fixtures');
@@ -155,7 +160,16 @@ function verifyTemplate(ctx: VerifyContext): Outcome {
   const pointer = entry.render;
   if (pointer === undefined) return { state: 'FAIL', detail: 'no render pointer' };
 
-  const props = mergedProps(ctx);
+  // Before anything is read or run: a pointer, or its frame, that names a file
+  // outside the project is never executed.
+  const outside = containedPointer(io.cwd, pointer);
+  if (outside !== null) return { state: 'FAIL', detail: outsideLine(outside) };
+
+  const props = templateProps(
+    ctx.name,
+    entry,
+    (key) => resolveKey(ctx.descriptor, ctx.snapshot, null, { key, locale: ctx.config.locales.default }).value,
+  );
   if ('missing' in props) return { state: 'FAIL', detail: props.missing };
 
   const workingFile = join(io.cwd, pointer.file);
@@ -163,14 +177,22 @@ function verifyTemplate(ctx: VerifyContext): Outcome {
     return { state: 'FAIL', detail: `${pointer.file} is not in the working tree — the render pointer names a file that is not there` };
   }
 
-  // The AFTER render is needed either way: it is what a pass compares against,
-  // and what `--capture` records as the baseline.
-  const after = renderTemplate(io, {
+  // The pointer's frame and fill ride every render, the working tree's, its
+  // repeat and HEAD's: only the pointer's own file is materialized from HEAD,
+  // and the frame is read from the working tree on both sides, so the two
+  // agree on it whatever it was at HEAD.
+  const request: RenderRequest = {
     hostDir: io.cwd,
     file: workingFile,
     exportName: pointer.export,
     props: props.values,
-  });
+    ...(pointer.frame === undefined ? {} : { frame: pointer.frame }),
+    ...(pointer.fill === true ? { fill: true } : {}),
+  };
+
+  // The AFTER render is needed either way: it is what a pass compares against,
+  // and what `--capture` records as the baseline.
+  const after = renderTemplate(io, request);
   if (!after.ok) {
     return { state: 'FAIL', detail: `the working tree's ${pointer.file} did not render (${after.reason}) — ${clip(after.detail, GIT_EXCERPT)}` };
   }
@@ -181,10 +203,10 @@ function verifyTemplate(ctx: VerifyContext): Outcome {
     return { state: 'FAIL', detail: `could not read ${pointer.file} at HEAD — ${source.detail}` };
   }
 
-  const again = (): string | null => secondRender(ctx, workingFile, pointer.export, props.values, after.result);
+  const again = (): string | null => secondRender(ctx, request, after.result);
 
   if (source.kind === 'tracked') {
-    const before = renderBefore(ctx, source.bytes, pointer.file, pointer.export, props.values);
+    const before = renderBefore(ctx, source.bytes, pointer.file, request);
     if (before.kind === 'collision') {
       // NOT capturable: HEAD holds a usable before and the only blocker is the
       // file on the reserved path.
@@ -352,14 +374,8 @@ function excerpt(text: string, at: number): string {
  * the first — the signature of a template whose output is not a function of its
  * input. `null` means the render is stable and the mismatch is real drift.
  */
-function secondRender(
-  ctx: VerifyContext,
-  file: string,
-  exportName: string,
-  props: Record<string, unknown>,
-  first: string,
-): string | null {
-  const repeat = renderTemplate(ctx.io, { hostDir: ctx.io.cwd, file, exportName, props });
+function secondRender(ctx: VerifyContext, request: RenderRequest, first: string): string | null {
+  const repeat = renderTemplate(ctx.io, request);
   if (!repeat.ok || repeat.result === first) return null;
   return repeat.result;
 }
@@ -386,20 +402,14 @@ type BeforeRender =
  * the host chose. The question here is whether anything occupies the path, and
  * a broken link occupies it.
  */
-function renderBefore(
-  ctx: VerifyContext,
-  bytes: Buffer,
-  relFile: string,
-  exportName: string,
-  props: Record<string, unknown>,
-): BeforeRender {
+function renderBefore(ctx: VerifyContext, bytes: Buffer, relFile: string, request: RenderRequest): BeforeRender {
   const abs = join(ctx.io.cwd, relFile);
   const name = `.stet-before-${basename(abs)}`;
   const temp = join(dirname(abs), name);
   if (lstatSync(temp, { throwIfNoEntry: false }) !== undefined) return { kind: 'collision', path: name };
   try {
     writeFileSync(temp, bytes);
-    return { kind: 'rendered', render: renderTemplate(ctx.io, { hostDir: ctx.io.cwd, file: temp, exportName, props }) };
+    return { kind: 'rendered', render: renderTemplate(ctx.io, { ...request, file: temp }) };
   } finally {
     rmSync(temp, { force: true });
   }
@@ -480,58 +490,4 @@ function readFixture(cwd: string, name: string): Fixture {
   const held = (raw as { result: unknown }).result;
   if (typeof held !== 'string') return { kind: 'unreadable', detail: `its result is ${typeof held}, not a string` };
   return { kind: 'baseline', result: held };
-}
-
-/**
- * The ONE argument the export is called with: the sample props the pointer
- * declares, plus every slot's resolved value under its flattened name, with
- * each `{{var}}` substituted from those same sample props.
- *
- * The substitution is what reproduces the before: the original file
- * interpolated `props.name` into its markup, so the seeded `{{name}}` has to
- * become the same characters before the shell renders it.
- */
-function mergedProps(ctx: VerifyContext): { values: Record<string, unknown> } | { missing: string } {
-  const { descriptor, snapshot, config, name, entry } = ctx;
-  const pointer = entry.render;
-  const sample = pointer?.sampleProps ?? {};
-  const values: Record<string, unknown> = { ...sample };
-
-  for (const slot of entry.slots) {
-    const key = `${name}__${slot}`;
-    const resolved = resolveKey(descriptor, snapshot, null, { key, locale: config.locales.default });
-    if (resolved.value === undefined) {
-      return { missing: `the slot ${JSON.stringify(slot)} resolves to no value (${key}) — seed it before verifying` };
-    }
-    if (typeof resolved.value !== 'string') {
-      // A slot value is text. Passing a number or an object through renders
-      // whatever it stringifies to, and the comparison then reports a byte
-      // difference — a true sentence about the wrong problem, which sends the
-      // reader looking for a copy edit nobody made.
-      return {
-        missing:
-          `${key} resolved to ${shapeOf(resolved.value)}, not a string — fix the snapshot value; ` +
-          'a slot that is not text cannot be compared as copy',
-      };
-    }
-    let unresolved: string | null = null;
-    const substituted = resolved.value.replace(VARIABLE, (whole: string, variable: string) => {
-      // `Object.hasOwn`: `sampleProps` is JSON-parsed, so a bare lookup would
-      // answer for `constructor` and hand the renderer a function.
-      if (!Object.hasOwn(sample, variable)) {
-        unresolved ??= variable;
-        return whole;
-      }
-      return String((sample as Record<string, unknown>)[variable]);
-    });
-    if (unresolved !== null) {
-      return {
-        missing:
-          `${key} seeds {{${unresolved}}}, which is not a member of this template's sampleProps — ` +
-          'add it to the render pointer, or fix the placeholder',
-      };
-    }
-    values[key] = substituted;
-  }
-  return { values };
 }

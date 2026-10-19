@@ -12,7 +12,7 @@ import type { Descriptor, Target } from './types.js';
 const HEX_COLOR = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
 /** `{{name}}`, with whitespace tolerated inside the braces. */
-const VARIABLE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+export const VARIABLE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 
 /** No bare `off` — "turn off notifications" is not a promotion. */
 const PROMOTIONAL = /(\d+\s*%|\bdiscount\b|\bsale\b)/i;
@@ -24,7 +24,7 @@ const PROMOTIONAL = /(\d+\s*%|\bdiscount\b|\bsale\b)/i;
  */
 export const PLACEHOLDER = /<(\/?)(\d+)(\/?)>/g;
 
-export type FindingRule = 'limit' | 'vars' | 'class' | 'budget' | 'construct' | 'tags';
+export type FindingRule = 'limit' | 'vars' | 'requires' | 'class' | 'budget' | 'construct' | 'tags';
 
 export interface Finding {
   rule: FindingRule;
@@ -219,6 +219,33 @@ export function checkVars(d: Descriptor, key: string, value: unknown): Verdict {
         .map((v) => `{{${v}}}`)
         .join(', ')} — declare them on the key or fix the placeholder`,
     });
+  }
+  return { ok: findings.length === 0, findings };
+}
+
+/**
+ * The variables an email slot declares it must keep, each one checked present
+ * in every string of the value — a value that drops the reset link breaks the
+ * email it is sent in. The message carries no locale: every save path reaches
+ * this through `checkValue`, which suffixes each finding with its locale.
+ */
+export function checkRequires(d: Descriptor, key: string, value: unknown): Verdict {
+  const required = d.keys[key]?.requires ?? [];
+  const findings: Finding[] = [];
+  if (required.length === 0) return { ok: true, findings };
+  for (const { path, text } of stringsOf(d, key, value)) {
+    const carried = new Set<string>();
+    for (const found of text.matchAll(VARIABLE)) if (found[1] !== undefined) carried.add(found[1]);
+    for (const name of required) {
+      if (carried.has(name)) continue;
+      findings.push({
+        rule: 'requires',
+        severity: 'error',
+        key: path,
+        vars: [name],
+        message: `${path}: {{${name}}} is required and the value no longer carries it`,
+      });
+    }
   }
   return { ok: findings.length === 0, findings };
 }
@@ -462,7 +489,7 @@ export function checkBudget(d: Descriptor, key: string, value: unknown): Advisor
 }
 
 /**
- * The one entry a save path calls: limits, variables, class rules, constructs,
+ * The one entry a save path calls: limits, variables, required variables, class rules, constructs,
  * budget — in that order, errors before warnings. Siblings carry the template's
  * other slot values where the candidate is a slot, plus `brand__footer_address`
  * where the caller can resolve it — the class rules' scope, not the slot list;
@@ -476,6 +503,7 @@ export function validateSave(
   const findings: Finding[] = [
     ...checkLimits(d, candidate.key, candidate.value).findings,
     ...checkVars(d, candidate.key, candidate.value).findings,
+    ...checkRequires(d, candidate.key, candidate.value).findings,
     ...checkTags(d, candidate.key, candidate.value).findings,
   ];
 

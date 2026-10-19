@@ -13,11 +13,14 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path';
 
+import type { Descriptor, RenderFrame, RenderPointer, TemplateDef } from '../src/types.js';
+import { VARIABLE } from '../src/validate.js';
 import { packageRoot } from './installed.js';
 import type { CliIo } from './main.js';
-import { clip } from './report.js';
+import { clip, shapeOf } from './report.js';
 
 /** Enough of a stray stdout write to recognize the line that produced it. */
 const STRAY_EXCERPT = 200;
@@ -28,7 +31,8 @@ export type RenderFailure =
   | 'ts7-unsupported'
   | 'missing-dependency'
   | 'render-threw'
-  | 'not-renderable';
+  | 'not-renderable'
+  | 'send-failed';
 
 export interface RenderRequest {
   /** The app package root — every import resolves from ITS `node_modules`. */
@@ -38,6 +42,19 @@ export interface RenderRequest {
   exportName: string;
   /** The one argument the export is called with. */
   props: Record<string, unknown>;
+  /** The pointer's frame, its file resolvable from `hostDir` as `file` is. */
+  frame?: RenderFrame;
+  /** The pointer's `fill`. */
+  fill?: boolean;
+  /** `stet email test`: the host send function the rendered email is handed to, and the message around it. */
+  send?: { file: string; export: string; message: SendMessage };
+}
+
+/** What `stet email test` hands the host's send function; the runner adds `html`. */
+export interface SendMessage {
+  to: string;
+  subject: string | null;
+  template: string;
 }
 
 export type RenderResult =
@@ -64,6 +81,7 @@ const REASONS: Record<number, RenderFailure> = {
   4: 'missing-dependency',
   5: 'render-threw',
   6: 'not-renderable',
+  7: 'send-failed',
 };
 
 /**
@@ -122,7 +140,7 @@ export function renderTemplate(io: CliIo, request: RenderRequest): RenderResult 
   const runner = join(packageRoot(), 'templates', 'email-runner.cjs');
   const child = spawnSync(
     process.execPath,
-    [runner, request.hostDir, request.file, request.exportName, JSON.stringify(request.props)],
+    [runner, request.hostDir, request.file, request.exportName, JSON.stringify(request.props), ...runnerOptions(request)],
     {
       cwd: io.cwd,
       env: io.env,
@@ -174,4 +192,135 @@ export function renderTemplate(io: CliIo, request: RenderRequest): RenderResult 
     reason,
     detail: stderr === '' ? `the renderer exited ${status === null ? 'on a signal' : String(status)}` : stderr,
   };
+}
+
+/**
+ * The runner's fifth argument, present only where the pointer shapes the
+ * output or a send follows: a plain pointer keeps the four-argument call every
+ * earlier render made.
+ */
+function runnerOptions(request: RenderRequest): string[] {
+  if (request.frame === undefined && request.fill !== true && request.send === undefined) return [];
+  return [
+    JSON.stringify({
+      ...(request.frame === undefined ? {} : { frame: request.frame }),
+      ...(request.fill === true ? { fill: true } : {}),
+      ...(request.send === undefined ? {} : { send: request.send }),
+    }),
+  ];
+}
+
+/**
+ * The ONE props object a declared template is rendered with, for `email
+ * verify`, `email render`, `email test` and `stet dev`'s email preview and
+ * mount: the sample props the pointer declares, plus every slot's value under
+ * its flattened name, with each `{{var}}` substituted from those same sample
+ * props. `valueOf` answers a slot key's value: the snapshot's, a store's, or a
+ * draft laid over either.
+ *
+ * The substitution is what reproduces the before: the original file
+ * interpolated `props.name` into its markup, so the seeded `{{name}}` has to
+ * become the same characters before the shell renders it.
+ */
+export function templateProps(
+  name: string,
+  entry: TemplateDef,
+  valueOf: (key: string) => unknown,
+): { values: Record<string, unknown> } | { missing: string } {
+  const sample = entry.render?.sampleProps ?? {};
+  const values: Record<string, unknown> = { ...sample };
+
+  for (const slot of entry.slots) {
+    const key = `${name}__${slot}`;
+    const value = valueOf(key);
+    if (value === undefined) {
+      return { missing: `the slot ${JSON.stringify(slot)} resolves to no value (${key}) — seed it before verifying` };
+    }
+    if (typeof value !== 'string') {
+      // A slot value is text. Passing a number or an object through renders
+      // whatever it stringifies to, and the comparison then reports a byte
+      // difference — a true sentence about the wrong problem, which sends the
+      // reader looking for a copy edit nobody made.
+      return {
+        missing:
+          `${key} resolved to ${shapeOf(value)}, not a string — fix the snapshot value; ` +
+          'a slot that is not text cannot be compared as copy',
+      };
+    }
+    let unresolved: string | null = null;
+    const substituted = value.replace(VARIABLE, (whole: string, variable: string) => {
+      // `Object.hasOwn`: `sampleProps` is JSON-parsed, so a bare lookup would
+      // answer for `constructor` and hand the renderer a function.
+      if (!Object.hasOwn(sample, variable)) {
+        unresolved ??= variable;
+        return whole;
+      }
+      return String((sample as Record<string, unknown>)[variable]);
+    });
+    if (unresolved !== null) {
+      return {
+        missing:
+          `${key} seeds {{${unresolved}}}, which is not a member of this template's sampleProps — ` +
+          'add it to the render pointer, or fix the placeholder',
+      };
+    }
+    values[key] = substituted;
+  }
+  return { values };
+}
+
+/** The render request a declared template's pointer makes, props supplied by the caller; null without a pointer. */
+export function pointerRequest(
+  hostDir: string,
+  descriptor: Descriptor,
+  name: string,
+  props: Record<string, unknown>,
+): RenderRequest | null {
+  const templates = descriptor.templates ?? {};
+  const pointer = Object.hasOwn(templates, name) ? templates[name]?.render : undefined;
+  if (pointer === undefined) return null;
+  return {
+    hostDir,
+    file: pointer.file,
+    exportName: pointer.export,
+    props,
+    ...(pointer.frame === undefined ? {} : { frame: pointer.frame }),
+    ...(pointer.fill === true ? { fill: true } : {}),
+  };
+}
+
+/**
+ * The first of a pointer's file, its frame's file and the send file that
+ * resolves outside the project, or null. An existing file is judged on its real
+ * path, so a symlink out of the project is outside; a missing one by where its
+ * path points. Every caller that renders a pointer asks first, and runs
+ * nothing of a pointer that escapes.
+ */
+export function containedPointer(cwd: string, pointer: RenderPointer, send?: { file: string }): string | null {
+  const files = [pointer.file, ...(pointer.frame === undefined ? [] : [pointer.frame.file]), ...(send === undefined ? [] : [send.file])];
+  for (const rel of files) {
+    const abs = resolvePath(cwd, rel);
+    if (existsSync(abs) ? realPathLeaves(cwd, abs) : leaves(cwd, abs)) return rel;
+  }
+  return null;
+}
+
+/** Whether `to` lies outside `from`: a path above it, or on another drive. */
+function leaves(from: string, to: string): boolean {
+  const rel = relative(from, to);
+  return rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel);
+}
+
+/** `leaves` on real paths, so a symlink out of the project counts; a path that cannot be resolved is left to the caller's own read. */
+function realPathLeaves(root: string, target: string): boolean {
+  try {
+    return leaves(realpathSync(root), realpathSync(target));
+  } catch {
+    return false;
+  }
+}
+
+/** The line every surface refusing an escaping pointer file prints. */
+export function outsideLine(file: string): string {
+  return `${file} is outside the project — a render pointer names a file inside it`;
 }

@@ -80,19 +80,24 @@
     swapped.push({ node: node, text: held, wrote: node.data });
   }
 
-  /** Put back every outline and swapped text the page has not rewritten since; the <details> this script opened close too, unless `keepOpen` (a new request settles them). */
-  function clear(keepOpen) {
-    endSettle();
-    endQuiet();
-    adopt(observer.takeRecords());
-    marked.forEach(function (m) { m.el.style.outline = m.outline; m.el.style.outlineOffset = m.offset; });
-    swapped.forEach(function (s) {
+  /** Give each swapped node or attribute in `list` its text back, only while it still holds what this script wrote. */
+  function restoreOwn(list) {
+    list.forEach(function (s) {
       if (s.node) {
         if (s.node.data === s.wrote) s.node.data = s.text;
       } else if (s.el.getAttribute(s.attr) === s.wrote) {
         s.el.setAttribute(s.attr, s.text);
       }
     });
+  }
+
+  /** Put back every outline and swapped text the page has not rewritten since; the <details> this script opened close too, unless `keepOpen` (a new request settles them). */
+  function clear(keepOpen) {
+    endSettle();
+    endQuiet();
+    adopt(observer.takeRecords());
+    marked.forEach(function (m) { m.el.style.outline = m.outline; m.el.style.outlineOffset = m.offset; });
+    restoreOwn(swapped);
     marked = [];
     swapped = [];
     if (!keepOpen) closeOpened([]);

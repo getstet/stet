@@ -8,15 +8,18 @@
  * `typescript` and `react-dom/server` from the HOST, which is the whole point of
  * the design, so a fixture that faked either would prove nothing.
  */
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
-import { renderTemplate } from '../cli/email-render.js';
+import { containedPointer, renderTemplate, templateProps, type RenderRequest } from '../cli/email-render.js';
 import { packageRoot } from '../cli/installed.js';
 import type { CliIo } from '../cli/main.js';
 import { TS7_REFUSAL } from '../cli/source-scan.js';
+import type { TemplateDef } from '../src/types.js';
 import { cleanupEmailHosts, makeEmailHost, type EmailHost } from './helpers/email-host.js';
 
 afterAll(cleanupEmailHosts);
@@ -41,8 +44,20 @@ const JSX_TEMPLATE =
   '  return <html><body><h1>Your weekly digest</h1><p>{props.count} updates.</p></body></html>;\n' +
   '}\n';
 
-function render(host: EmailHost, rel: string, exportName: string, props: Record<string, unknown> = {}) {
-  return renderTemplate(io(host.dir), { hostDir: host.dir, file: host.path(rel), exportName, props });
+function render(
+  host: EmailHost,
+  rel: string,
+  exportName: string,
+  props: Record<string, unknown> = {},
+  shape: Pick<RenderRequest, 'frame' | 'fill' | 'send'> = {},
+) {
+  return renderTemplate(io(host.dir), { hostDir: host.dir, file: host.path(rel), exportName, props, ...shape });
+}
+
+/** The rendered value, parsed; throws on a failed render so a case names what it got. */
+function rendered(result: ReturnType<typeof render>): unknown {
+  if (!result.ok) throw new Error(`${result.reason}: ${result.detail}`);
+  return JSON.parse(result.result);
 }
 
 describe('renderTemplate — the two canonical shapes', () => {
@@ -313,5 +328,294 @@ describe('the runner asset', () => {
     // string lives twice by necessity — this is what keeps the two copies equal.
     const runner = readFileSync(join(packageRoot(), 'templates', 'email-runner.cjs'), 'utf8');
     expect(runner).toContain(TS7_REFUSAL);
+  });
+});
+
+describe('templateProps — the one props object every render of a declared template uses', () => {
+  const ENTRY: TemplateDef = {
+    class: 'transactional',
+    trigger: 'manual',
+    slots: ['headline'],
+    render: { file: 'lib/email/welcome.ts', export: 'welcome', sampleProps: { name: 'Ada' } },
+  };
+  const valueOf = (value: unknown) => (key: string) => (key === 'welcome__headline' ? value : undefined);
+
+  it('carries the sample props and each slot with its variables filled from them', () => {
+    expect(templateProps('welcome', ENTRY, valueOf('Good to see you, {{ name }}'))).toEqual({
+      values: { name: 'Ada', welcome__headline: 'Good to see you, Ada' },
+    });
+  });
+
+  it('says a slot resolves to no value in the words email verify has always used', () => {
+    expect(templateProps('welcome', ENTRY, valueOf(undefined))).toEqual({
+      missing: 'the slot "headline" resolves to no value (welcome__headline) — seed it before verifying',
+    });
+  });
+
+  it('names the shape of a slot that is not text', () => {
+    expect(templateProps('welcome', ENTRY, valueOf(42))).toEqual({
+      missing:
+        'welcome__headline resolved to a number, not a string — fix the snapshot value; ' +
+        'a slot that is not text cannot be compared as copy',
+    });
+    expect(templateProps('welcome', ENTRY, valueOf({ subject: 'Hi' }))).toEqual({
+      missing:
+        'welcome__headline resolved to an object, not a string — fix the snapshot value; ' +
+        'a slot that is not text cannot be compared as copy',
+    });
+  });
+
+  it('refuses a seeded variable the sample props lack, a prototype member included', () => {
+    expect(templateProps('welcome', ENTRY, valueOf('Hi {{constructor}}'))).toEqual({
+      missing:
+        "welcome__headline seeds {{constructor}}, which is not a member of this template's sampleProps — " +
+        'add it to the render pointer, or fix the placeholder',
+    });
+  });
+});
+
+describe('renderTemplate — the runner\'s argv', () => {
+  // A runner that answers with how many arguments it was started with: the
+  // plain pointer must keep the four-argument call every earlier render made.
+  it('passes the fifth argument only where the pointer frames, fills or sends', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'stet-argv-'));
+    mkdirSync(join(root, 'templates'));
+    writeFileSync(join(root, 'templates', 'email-runner.cjs'), 'process.stdout.write(JSON.stringify(process.argv.length));\n');
+    vi.resetModules();
+    vi.doMock('../cli/installed.js', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../cli/installed.js')>()),
+      packageRoot: () => root,
+    }));
+    try {
+      const fresh = await import('../cli/email-render.js');
+      const plain = { hostDir: root, file: join(root, 'x.ts'), exportName: 'x', props: {} };
+      // node, the runner, then hostDir, file, export and props.
+      expect(fresh.renderTemplate(io(root), plain)).toEqual({ ok: true, result: '6' });
+      expect(fresh.renderTemplate(io(root), { ...plain, fill: true })).toEqual({ ok: true, result: '7' });
+      expect(fresh.renderTemplate(io(root), { ...plain, frame: { file: 'f.ts', export: 'f' } })).toEqual({ ok: true, result: '7' });
+    } finally {
+      vi.doUnmock('../cli/installed.js');
+      vi.resetModules();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the runner — one render path (D2)', () => {
+  it('awaits an async template, and a log after the await reaches stderr (F6c)', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/later.ts', "export const later = async () => { await 0; console.log('x'); return '<p/>'; };\n");
+    expect(render(host, 'lib/email/later.ts', 'later')).toEqual({ ok: true, result: JSON.stringify('<p/>') });
+    const runner = join(packageRoot(), 'templates', 'email-runner.cjs');
+    const child = spawnSync(process.execPath, [runner, host.dir, host.path('lib/email/later.ts'), 'later', '{}'], { encoding: 'utf8' });
+    expect(child.status).toBe(0);
+    expect(child.stdout).toBe(JSON.stringify('<p/>'));
+    expect(child.stderr).toBe('x\n');
+  });
+
+  it('renders a markup string export as it stands', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', "export const plain = '<p>{{name}}</p>';\n");
+    expect(rendered(render(host, 'lib/email/plain.ts', 'plain', { name: 'Ada' }))).toBe('<p>{{name}}</p>');
+  });
+
+  it('renders a string map export as it stands', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/map.ts', "export const map = { subject: 'Hi', html: '<p>Hi</p>' };\n");
+    expect(rendered(render(host, 'lib/email/map.ts', 'map'))).toEqual({ subject: 'Hi', html: '<p>Hi</p>' });
+  });
+
+  it('fills each variable the props hold as plain text, keeping one they lack and a $ pattern literal', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', "export const plain = '<a href=\"{{url}}\">{{ name }}</a> $& {{missing}}';\n");
+    expect(rendered(render(host, 'lib/email/plain.ts', 'plain', { url: 'https://x', name: "$&Ada$'" }, { fill: true }))).toBe(
+      "<a href=\"https://x\">$&Ada$'</a> $& {{missing}}",
+    );
+  });
+
+  it('passes the markup through the frame with the named props, the whole props, or nothing more', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', "export const plain = '<p>{{name}}</p>';\n");
+    host.put(
+      'lib/email/base.ts',
+      "export const named = (c: string, pre?: string) => `<html>${pre}|${c}</html>`;\n" +
+        'export const all = (c: string, props: { name: string }) => `<b>${props.name}</b>${c}`;\n' +
+        "export const bare = (c: string, extra?: unknown) => `<f>${c}${typeof extra}</f>`;\n",
+    );
+    const props = { name: 'Ada', preheader: 'pre' };
+    expect(
+      rendered(render(host, 'lib/email/plain.ts', 'plain', props, { frame: { file: 'lib/email/base.ts', export: 'named', args: ['preheader'] }, fill: true })),
+    ).toBe('<html>pre|<p>Ada</p></html>');
+    expect(rendered(render(host, 'lib/email/plain.ts', 'plain', props, { frame: { file: 'lib/email/base.ts', export: 'all', args: '$all' } }))).toBe(
+      '<b>Ada</b><p>{{name}}</p>',
+    );
+    expect(rendered(render(host, 'lib/email/plain.ts', 'plain', props, { frame: { file: 'lib/email/base.ts', export: 'bare' } }))).toBe(
+      '<f><p>{{name}}</p>undefined</f>',
+    );
+  });
+
+  it('frames a string map\'s html member and keeps the others', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/map.ts', "export const map = { subject: 'Hi {{name}}', html: '<p>{{name}}</p>' };\n");
+    host.put('lib/email/base.ts', 'export const all = (c: string, props: { name: string }) => `<b>${props.name}</b>${c}`;\n');
+    expect(
+      rendered(render(host, 'lib/email/map.ts', 'map', { name: 'Ada' }, { frame: { file: 'lib/email/base.ts', export: 'all', args: '$all' }, fill: true })),
+    ).toEqual({ subject: 'Hi Ada', html: '<b>Ada</b><p>Ada</p>' });
+  });
+
+  it('fills a variable the frame writes into its shell: the fill runs after the frame', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', "export const plain = '<p>{{name}}</p>';\n");
+    host.put('lib/email/base.ts', "export const shell = (c: string) => `<html>{{preheader}}${c}</html>`;\n");
+    expect(
+      rendered(render(host, 'lib/email/plain.ts', 'plain', { name: 'Ada', preheader: 'pre' }, { frame: { file: 'lib/email/base.ts', export: 'shell' }, fill: true })),
+    ).toBe('<html>pre<p>Ada</p></html>');
+  });
+
+  it('passes a frame argument only from the props\' own members, never a prototype member', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', "export const plain = '<p/>';\n");
+    host.put('lib/email/base.ts', 'export const kind = (c: string, x?: unknown) => `${c}${typeof x}`;\n');
+    expect(
+      rendered(render(host, 'lib/email/plain.ts', 'plain', {}, { frame: { file: 'lib/email/base.ts', export: 'kind', args: ['constructor'] } })),
+    ).toBe('<p/>undefined');
+  });
+
+  it('refuses a framed map with no html member as not-renderable, naming the template', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/map.ts', "export const map = { subject: 'Hi', text: 'Hi' };\n");
+    host.put('lib/email/base.ts', 'export const shell = (c: string) => `<html>${c}</html>`;\n');
+    const result = render(host, 'lib/email/map.ts', 'map', {}, { frame: { file: 'lib/email/base.ts', export: 'shell' } });
+    expect(!result.ok && result.reason).toBe('not-renderable');
+    expect(!result.ok && result.detail).toBe(`${host.path('lib/email/map.ts')} map: the frame wraps the html member, and this map has none`);
+  });
+
+  it('refuses a frame export that is not a function, naming the frame file', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', "export const plain = '<p/>';\n");
+    host.put('lib/email/base.ts', "export const shell = '<html></html>';\n");
+    const result = render(host, 'lib/email/plain.ts', 'plain', {}, { frame: { file: 'lib/email/base.ts', export: 'shell' } });
+    expect(!result.ok && result.reason).toBe('export-not-function');
+    expect(!result.ok && result.detail).toBe('lib/email/base.ts: export "shell" is not a function');
+  });
+
+  it('never reports a frame that returns anything but a string as the email', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', "export const plain = '<p/>';\n");
+    host.put(
+      'lib/email/base.ts',
+      'export const boxed = (c: string) => ({ wrapped: c });\n' + 'export const forgot = (c: string): void => { void c; };\n',
+    );
+    const frame = (name: string) => ({ file: 'lib/email/base.ts', export: name });
+    const object = render(host, 'lib/email/plain.ts', 'plain', {}, { frame: frame('boxed') });
+    expect(!object.ok && object.reason).toBe('not-renderable');
+    expect(!object.ok && object.detail).toBe('lib/email/base.ts boxed: the frame returned an object — a frame returns a string');
+    for (const fill of [false, true]) {
+      const none = render(host, 'lib/email/plain.ts', 'plain', {}, { frame: frame('forgot'), fill });
+      expect(!none.ok && none.reason).toBe('not-renderable');
+      expect(!none.ok && none.detail).toBe('lib/email/base.ts forgot: the frame returned undefined — a frame returns a string');
+    }
+  });
+
+  it('falls back to a default string export under a wrong export name, and says so', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', "export default '<p/>';\n");
+    expect(render(host, 'lib/email/plain.ts', 'welcome')).toEqual({
+      ok: true,
+      result: JSON.stringify('<p/>'),
+      note: 'export "welcome" is not on the module; rendered its default export',
+    });
+  });
+
+  it('leaves a React element\'s {{x}} alone where the pointer does not ask for the fill', () => {
+    const host = makeEmailHost();
+    host.put('lib/email/jsx.tsx', "export function Jsx(): JSX.Element {\n  return <p>{'{{x}}'}</p>;\n}\n");
+    expect(rendered(render(host, 'lib/email/jsx.tsx', 'Jsx', { x: 'X' }))).toBe('<p>{{x}}</p>');
+  });
+});
+
+describe('the runner — the send path (D5, stage 5)', () => {
+  const SEND = "import { writeFileSync } from 'node:fs';\nexport function sendTest(message: unknown): void {\n  writeFileSync(process.env.SENT_TO as string, JSON.stringify(message));\n}\n";
+
+  function sendHost(template: string): { host: EmailHost; sent: string } {
+    const host = makeEmailHost();
+    host.put('lib/email/plain.ts', template);
+    host.put('lib/email/send.ts', SEND);
+    return { host, sent: host.path('sent.json') };
+  }
+
+  const sendRender = (host: EmailHost, sent: string, exportName: string, props: Record<string, unknown>, send: RenderRequest['send'], fill = true) =>
+    renderTemplate(
+      { ...io(host.dir), env: { ...process.env, SENT_TO: sent } },
+      { hostDir: host.dir, file: host.path('lib/email/plain.ts'), exportName, props, fill, send },
+    );
+
+  it('hands the host function the filled email with the recipient, the subject and the template', () => {
+    const { host, sent } = sendHost("export const plain = '<p>{{name}}</p>';\n");
+    const result = sendRender(host, sent, 'plain', { name: 'Ada' }, {
+      file: 'lib/email/send.ts',
+      export: 'sendTest',
+      message: { to: 'a@b.c', subject: 'Hello', template: 'welcome' },
+    });
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(readFileSync(sent, 'utf8'))).toEqual({ to: 'a@b.c', subject: 'Hello', template: 'welcome', html: '<p>Ada</p>' });
+  });
+
+  it('takes a string map\'s subject over the message\'s', () => {
+    const { host, sent } = sendHost("export const plain = { subject: 'Hi {{name}}', html: '<p>{{name}}</p>' };\n");
+    sendRender(host, sent, 'plain', { name: 'Ada' }, {
+      file: 'lib/email/send.ts',
+      export: 'sendTest',
+      message: { to: 'a@b.c', subject: null, template: 'map' },
+    });
+    expect(JSON.parse(readFileSync(sent, 'utf8'))).toEqual({ to: 'a@b.c', subject: 'Hi Ada', template: 'map', html: '<p>Ada</p>' });
+  });
+
+  it('answers send-failed with the stack where the host function throws', () => {
+    const { host, sent } = sendHost("export const plain = '<p/>';\n");
+    host.put('lib/email/send.ts', "export async function sendTest(): Promise<void> {\n  throw new Error('provider said no');\n}\n");
+    const result = sendRender(host, sent, 'plain', {}, { file: 'lib/email/send.ts', export: 'sendTest', message: { to: 'a@b.c', subject: 'x', template: 't' } });
+    expect(!result.ok && result.reason).toBe('send-failed');
+    expect(!result.ok && result.detail).toContain('Error: provider said no');
+    expect(!result.ok && result.detail).toContain('send.ts');
+  });
+
+  it('answers send-failed where the send export is not a function', () => {
+    const { host, sent } = sendHost("export const plain = '<p/>';\n");
+    const result = sendRender(host, sent, 'plain', {}, { file: 'lib/email/send.ts', export: 'nope', message: { to: 'a@b.c', subject: 'x', template: 't' } });
+    expect(!result.ok && result.reason).toBe('send-failed');
+    expect(!result.ok && result.detail).toBe('lib/email/send.ts: export "nope" is not a function');
+  });
+});
+
+describe('containedPointer — which pointer file lies outside the project', () => {
+  const pointer = (file: string) => ({ file, export: 'welcome', sampleProps: {} });
+
+  it('names a pointer file that points out of the project, whether it exists or not', () => {
+    const outside = makeEmailHost({ deps: [] });
+    outside.put('tpl.ts', 'export const welcome = 1;\n');
+    const host = makeEmailHost({ deps: [] });
+    const rel = `../${outside.dir.split('/').pop()}/tpl.ts`;
+    expect(containedPointer(host.dir, pointer(rel))).toBe(rel);
+    expect(containedPointer(host.dir, pointer('../nowhere/tpl.ts'))).toBe('../nowhere/tpl.ts');
+  });
+
+  it('names a symlink inside the project that leads out of it', () => {
+    const outside = makeEmailHost({ deps: [] });
+    outside.put('tpl.ts', 'export const welcome = 1;\n');
+    const host = makeEmailHost({ deps: [] });
+    symlinkSync(outside.path('tpl.ts'), host.path('link.ts'));
+    expect(containedPointer(host.dir, pointer('link.ts'))).toBe('link.ts');
+  });
+
+  it('does not call a missing file inside the project outside because its name starts with two dots', () => {
+    const host = makeEmailHost({ deps: [] });
+    expect(containedPointer(host.dir, pointer('..x/tpl.ts'))).toBeNull();
+  });
+
+  it('leaves a directory inside the project to the caller’s own read', () => {
+    const host = makeEmailHost({ deps: [] });
+    host.put('lib/email/tpl.ts', 'export const welcome = 1;\n');
+    expect(containedPointer(host.dir, pointer('lib/email'))).toBeNull();
   });
 });

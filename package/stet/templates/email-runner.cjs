@@ -10,7 +10,9 @@
  * React element result renders through the host's `react-dom/server`. stet adds
  * no dependency of its own and forks no resolver.
  *
- * Usage: node email-runner.cjs <hostDir> <file> <exportName> <propsJson>
+ * Usage: node email-runner.cjs <hostDir> <file> <exportName> <propsJson> [<optsJson>]
+ * `optsJson` is `{ frame?, fill?, send? }`: the pointer's frame and fill, and
+ * `stet email test`'s send function, each applied after the render in that order.
  * Stdout is the JSON-serialized render and nothing else; diagnostics go to
  * stderr, and the exit code names the failure — `cli/email-render.ts` maps the
  * table one-to-one.
@@ -33,6 +35,7 @@ const TS7_UNSUPPORTED = 3;
 const MISSING_DEPENDENCY = 4;
 const RENDER_THREW = 5;
 const NOT_RENDERABLE = 6;
+const SEND_FAILED = 7;
 
 /**
  * The same refusal `loadTypescript` gives (`cli/source-scan.ts`'s `TS7_REFUSAL`,
@@ -64,25 +67,28 @@ const NOTE = 'stet-note: ';
 const ALIAS_REMEDY =
   'stet renders through Node\'s own resolver plus one alias form: a single-wildcard "paths" entry declared in the app root\'s own tsconfig.json ("@/*": ["./src/*"]). Rewrite this import as a relative path, or declare the template without a render pointer.';
 
-const [hostDirArg, fileArg, exportName, propsJson] = process.argv.slice(2);
+const [hostDirArg, fileArg, exportName, propsJson, optsJson] = process.argv.slice(2);
 if (hostDirArg === undefined || fileArg === undefined || exportName === undefined || propsJson === undefined) {
-  process.stderr.write('usage: email-runner.cjs <hostDir> <file> <exportName> <propsJson>');
+  process.stderr.write('usage: email-runner.cjs <hostDir> <file> <exportName> <propsJson> [<optsJson>]');
   process.exitCode = 1;
 } else {
   // Both paths absolute before anything uses them: a relative hostDir makes
   // `createRequire` throw ERR_INVALID_ARG_VALUE rather than resolve the host.
   const hostDir = path.resolve(hostDirArg);
   const file = path.resolve(fileArg);
-  const outcome = run(hostDir, file, exportName, propsJson);
-  // One writer, and no `process.exit` anywhere: stdout is a pipe here, so an
-  // immediate exit would truncate the render mid-write.
-  if (outcome.out !== undefined) process.stdout.write(outcome.out);
-  if (outcome.err !== undefined) process.stderr.write(outcome.err);
-  process.exitCode = outcome.code;
+  // The exit is set after the promise settles: a render that awaits is still
+  // running when this line is reached.
+  void run(hostDir, file, exportName, propsJson, optsJson === undefined ? {} : JSON.parse(optsJson)).then((outcome) => {
+    // One writer, and no `process.exit` anywhere: stdout is a pipe here, so an
+    // immediate exit would truncate the render mid-write.
+    if (outcome.out !== undefined) process.stdout.write(outcome.out);
+    if (outcome.err !== undefined) process.stderr.write(outcome.err);
+    process.exitCode = outcome.code;
+  });
 }
 
 /** The whole render, with every failure mapped to its exit rather than thrown. */
-function run(hostDir, file, exportName, propsJson) {
+async function run(hostDir, file, exportName, propsJson, opts) {
   try {
     const hostRequire = createRequire(path.join(hostDir, 'package.json'));
     const ts = hostRequire('typescript');
@@ -93,47 +99,137 @@ function run(hostDir, file, exportName, propsJson) {
     installAliasResolver(aliasMappings(ts, hostDir));
     installTranspileHooks(ts);
 
+    const props = JSON.parse(propsJson);
     // Host code writes to stderr for the duration, so "nothing but the render on
     // stdout" holds by construction: a template with a `console.log` in it would
     // otherwise interleave its own line into the JSON the seam parses.
-    const mod = offStdout(() => require(file));
+    const mod = await offStdout(() => require(file));
     // `Object.hasOwn`, not a bare index: `exportName` comes from the descriptor,
     // and a bare `mod['constructor']` would resolve Object.prototype's — a
     // function, which the check below would then CALL.
-    let fn = Object.hasOwn(mod, exportName) ? mod[exportName] : undefined;
+    let value = Object.hasOwn(mod, exportName) ? mod[exportName] : undefined;
     let note;
     // A hand-written pointer may name the SOURCE name of a default-exported
     // template (`export default function Digest`), which this transpile puts on
     // `exports.default` and nowhere else. Where the named export is simply
-    // absent and the default is a function, that is the template — and where the
+    // absent and the default is a template, that is the template — and where the
     // named export exists, it wins, so this can never redirect a real export.
     //
     // It says so when it fires: the other reason a pointer names an export the
     // module does not have is a typo, and a render that quietly succeeds is
     // exactly what would hide one.
-    if (fn === undefined && Object.hasOwn(mod, 'default') && typeof mod.default === 'function') {
-      fn = mod.default;
+    if (
+      value === undefined &&
+      Object.hasOwn(mod, 'default') &&
+      (typeof mod.default === 'function' || typeof mod.default === 'string' || isStringMap(mod.default))
+    ) {
+      value = mod.default;
       note = `${NOTE}export ${JSON.stringify(exportName)} is not on the module; rendered its default export\n`;
     }
-    if (typeof fn !== 'function') {
-      return { code: EXPORT_NOT_FUNCTION, err: `${file}: export ${JSON.stringify(exportName)} is not a function` };
-    }
+    // A function is called with the props and its result awaited; a markup
+    // string or a map of strings is the template as it stands.
+    let result;
+    if (typeof value === 'function') result = await offStdout(() => value(props));
+    else if (typeof value === 'string' || isStringMap(value)) result = value;
+    else return { code: EXPORT_NOT_FUNCTION, err: `${file}: export ${JSON.stringify(exportName)} is not a function` };
 
-    const result = offStdout(() => fn(JSON.parse(propsJson)));
-    if (typeof result === 'string') return { code: OK, out: JSON.stringify(result), err: note };
     if (isElement(result)) {
       const { renderToStaticMarkup } = hostRequire('react-dom/server');
-      return { code: OK, out: JSON.stringify(offStdout(() => renderToStaticMarkup(result))), err: note };
+      result = await offStdout(() => renderToStaticMarkup(result));
+    } else if (typeof result !== 'string' && !isStringMap(result)) {
+      return {
+        code: NOT_RENDERABLE,
+        err:
+          `${file}: the ${exportName} export returned ${describe(result)} — a template returns a string, ` +
+          'an object whose values are all strings, or a React element',
+      };
     }
-    if (isStringMap(result)) return { code: OK, out: JSON.stringify(result), err: note };
-    return {
-      code: NOT_RENDERABLE,
-      err:
-        `${file}: the ${exportName} export returned ${describe(result)} — a template returns a string, ` +
-        'an object whose values are all strings, or a React element',
-    };
+
+    // The order is fixed: the markup, then the frame, then the fill, then the
+    // send — so a variable the frame writes into its shell is filled, and the
+    // send receives the email a recipient would.
+    if (opts.frame !== undefined) {
+      const framed = await frameOf(hostDir, opts.frame, result, props, file, exportName);
+      if (framed.code !== undefined) return framed;
+      result = framed.result;
+    }
+    if (opts.fill === true) result = fill(result, props);
+
+    if (opts.send !== undefined) {
+      const sent = await sendOf(hostDir, opts.send, result);
+      if (sent !== null) return sent;
+    }
+    return { code: OK, out: JSON.stringify(result), err: note };
   } catch (error) {
     return classify(error);
+  }
+}
+
+/**
+ * The markup passed through the host's frame: the frame's export called with
+ * the markup first, then what `args` declares — each named prop in order (an
+ * own member of the props, else `undefined`, as a left-off argument), the
+ * whole props object for `"$all"`, nothing more where `args` is absent. On a
+ * map of strings the frame wraps the `html` member and the others stay.
+ */
+async function frameOf(hostDir, frame, result, props, file, exportName) {
+  const mod = await offStdout(() => require(path.resolve(hostDir, frame.file)));
+  const fn = Object.hasOwn(mod, frame.export) ? mod[frame.export] : undefined;
+  if (typeof fn !== 'function') {
+    return { code: EXPORT_NOT_FUNCTION, err: `${frame.file}: export ${JSON.stringify(frame.export)} is not a function` };
+  }
+  const rest =
+    frame.args === '$all' ? [props] : Array.isArray(frame.args) ? frame.args.map((n) => (Object.hasOwn(props, n) ? props[n] : undefined)) : [];
+  if (typeof result === 'string') {
+    const framed = await offStdout(() => fn(result, ...rest));
+    return typeof framed === 'string' ? { result: framed } : notString(frame, framed);
+  }
+  if (!Object.hasOwn(result, 'html')) {
+    return { code: NOT_RENDERABLE, err: `${file} ${exportName}: the frame wraps the html member, and this map has none` };
+  }
+  const html = await offStdout(() => fn(result.html, ...rest));
+  return typeof html === 'string' ? { result: { ...result, html } } : notString(frame, html);
+}
+
+/** A frame that returns anything but a string is never reported as a render. */
+function notString(frame, framed) {
+  return { code: NOT_RENDERABLE, err: `${frame.file} ${frame.export}: the frame returned ${describe(framed)} — a frame returns a string` };
+}
+
+/** Each `{{var}}` the props hold, filled; a variable they lack stays. A function replacement, so `$` stays literal. */
+function fill(result, props) {
+  const one = (text) =>
+    text.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (whole, name) => {
+      if (!Object.hasOwn(props, name)) return whole;
+      const v = props[name];
+      return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' ? String(v) : whole;
+    });
+  if (typeof result === 'string') return one(result);
+  const out = {};
+  for (const name of Object.keys(result)) out[name] = one(result[name]);
+  return out;
+}
+
+/**
+ * `stet email test`: the rendered email handed to the host's send function as
+ * `{ to, subject, html, template }`, a string map's own `subject` winning over
+ * the message's; null when it returned. A throw or a rejection is `send-failed`
+ * with the host's stack.
+ */
+async function sendOf(hostDir, send, result) {
+  const html = typeof result === 'string' ? result : result.html;
+  const subject = typeof result === 'string' || typeof result.subject !== 'string' ? send.message.subject : result.subject;
+  try {
+    const mod = await offStdout(() => require(path.resolve(hostDir, send.file)));
+    const fn = Object.hasOwn(mod, send.export) ? mod[send.export] : undefined;
+    if (typeof fn !== 'function') {
+      return { code: SEND_FAILED, err: `${send.file}: export ${JSON.stringify(send.export)} is not a function` };
+    }
+    await offStdout(() => fn({ ...send.message, subject, html }));
+    return null;
+  } catch (error) {
+    const stack = error !== null && typeof error === 'object' ? error.stack : undefined;
+    return { code: SEND_FAILED, err: typeof stack === 'string' ? stack : messageOf(error) };
   }
 }
 
@@ -160,13 +256,15 @@ function classify(error) {
  * with the seam is that stdout carries the render and nothing else; a host
  * template is free to log, and this is what keeps both true at once.
  */
-function offStdout(fn) {
+async function offStdout(fn) {
   const original = process.stdout.write;
   process.stdout.write = function (...args) {
     return process.stderr.write(...args);
   };
   try {
-    return fn();
+    // Awaited inside the try, so a template that logs after an `await` still
+    // writes to stderr: the mute spans the whole settled render.
+    return await fn();
   } finally {
     process.stdout.write = original;
   }

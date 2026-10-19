@@ -24,7 +24,6 @@
  * whose shell was never rewritten renders `undefined` into a real send.
  */
 
-import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
@@ -38,6 +37,7 @@ import { flag, parse, positionalsAround, refuseEnv } from './args.js';
 import { asUpdate, planJson, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { CONFIG_FILE, defaultConfig, loadConfig, type StetConfig } from './config.js';
+import { gitFiles } from './git.js';
 import type { CliIo } from './main.js';
 import { normalize } from './pages.js';
 import { clip, plural, CliError, Report, UsageError } from './report.js';
@@ -361,14 +361,11 @@ function applyProposals(
  */
 function untrackedAmong(io: CliIo, files: string[]): string[] {
   if (files.length === 0) return [];
-  const child = spawnSync('git', ['ls-files', '-z', '--', ...files], {
-    cwd: io.cwd,
-    // `git ls-files` prints paths relative to the cwd it is run in, which is
-    // the same app root these paths are relative to.
-    env: { ...io.env, LC_ALL: 'C' },
-  });
-  if (child.error !== undefined || child.status !== 0) return [];
-  const tracked = new Set(child.stdout.toString('utf8').split('\0').filter((path) => path !== ''));
+  // `git ls-files` prints paths relative to the cwd it is run in, which is the
+  // same app root these paths are relative to.
+  const listed = gitFiles(io.cwd, ['--', ...files], io.env);
+  if (listed === null) return [];
+  const tracked = new Set(listed);
   return files.filter((file) => !tracked.has(file));
 }
 

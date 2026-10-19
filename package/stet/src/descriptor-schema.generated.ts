@@ -161,6 +161,14 @@ export const DESCRIPTOR_SCHEMA = {
             "type": "string"
           }
         },
+        "requires": {
+          "description": "An email slot's {{variables}} every value must keep; each one is also in vars.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
         "tags": {
           "description": "The number of numbered placeholder tags (<1>…</1>) a value of this key carries, one per descendant element of the marked element, numbered depth-first; the save gate keeps them whole.",
           "type": "integer",
@@ -366,6 +374,46 @@ export const DESCRIPTOR_SCHEMA = {
             "sampleProps": {
               "description": "One props object sufficient to invoke the export. Descriptor data like every other proposal — reviewable and hand-editable.",
               "type": "object"
+            },
+            "frame": {
+              "description": "A host function the export's markup (a string map's html member) is passed through: the markup first, then the props args names in order, the whole props for \"$all\", or nothing more where args is absent.",
+              "type": "object",
+              "required": [
+                "file",
+                "export"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "file": {
+                  "description": "The module holding the frame, relative to the app package root.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "export": {
+                  "description": "The exported function the markup is passed to.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "args": {
+                  "oneOf": [
+                    {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    {
+                      "const": "$all"
+                    }
+                  ]
+                }
+              }
+            },
+            "fill": {
+              "description": "Fills each {{variable}} of the final markup from the props; a variable the props lack stays.",
+              "type": "boolean"
             }
           }
         }

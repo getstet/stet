@@ -1,8 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
+import { cleanupCliHosts, makeCliHost } from '../conformance/cli-host.js';
 import { miniDescriptor, mutable, readFixture } from '../conformance/fixture.js';
+import { generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import {
   DESCRIPTOR_SCHEMA,
   DescriptorError,
@@ -10,8 +13,11 @@ import {
   deriveLabel,
   loadDescriptor,
   loadDescriptorWithWarnings,
+  loadSnapshot,
 } from '../src/index.js';
 import type { Descriptor } from '../src/index.js';
+
+afterAll(cleanupCliHosts);
 
 const raw = () => mutable(readFixture('descriptor.json') as Record<string, never>);
 
@@ -180,5 +186,101 @@ describe('deriveLabel', () => {
 
   it('capitalizes the first word only', () => {
     expect(deriveLabel('seo_home_title')).toBe('Seo home title');
+  });
+});
+
+/** A project whose descriptor is `document`, its generated files current, run through `stet check`. */
+async function check(document: unknown): Promise<{ code: number; err: string }> {
+  const host = makeCliHost({ config: {} });
+  writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(document, null, 2));
+  try {
+    const descriptor = loadDescriptor(document);
+    const snapshot = loadSnapshot(JSON.parse(host.file('content/defaults.json')));
+    const registry = generateRegistry(descriptor);
+    writeFileSync(join(host.cwd, 'content/keys.ts'), registry.keysTs);
+    writeFileSync(join(host.cwd, 'content/stet-env.d.ts'), registry.dts);
+    writeFileSync(join(host.cwd, 'content/defaults.ts'), generateDefaultsModule(snapshot));
+    writeFileSync(join(host.cwd, 'content/resolved.ts'), generateResolvedModule(descriptor, snapshot));
+  } catch {
+    // A descriptor the loader refuses has no generated files to bring current.
+  }
+  const code = await host.run('check');
+  return { code, err: host.stderr() };
+}
+
+describe('a render pointer may frame and fill its markup (journey E19)', () => {
+  const MIRRA_POINTER = {
+    file: 'lib/email/templates/welcome.ts',
+    export: 'welcomeContent',
+    sampleProps: {},
+    fill: true,
+    frame: { file: 'lib/email/templates/base.ts', export: 'baseTemplate', args: ['preheader'] },
+  };
+
+  /** The fixture with the welcome template's pointer set to `render`. */
+  const withRender = (render: unknown): Record<string, any> => {
+    const document = raw() as Record<string, any>;
+    document['templates']['welcome']['render'] = render;
+    return document;
+  };
+
+  it("loads Mirra's pointer, with stet check passing", async () => {
+    expect(loadDescriptor(withRender(MIRRA_POINTER)).templates?.['welcome']?.render).toEqual(MIRRA_POINTER);
+    expect((await check(withRender(MIRRA_POINTER))).code).toBe(0);
+    for (const args of ['$all', undefined]) {
+      const frame = args === undefined ? { file: 'b.ts', export: 'f' } : { file: 'b.ts', export: 'f', args };
+      expect(() => loadDescriptor(withRender({ ...MIRRA_POINTER, frame }))).not.toThrow();
+    }
+  });
+
+  it('refuses a frame with no export, a member render does not declare, and one frame does not', async () => {
+    const noExport = rejects(withRender({ ...MIRRA_POINTER, frame: { file: 'x.ts' } }));
+    expect(noExport.path).toBe('templates/welcome/render/frame/export');
+    expect(rejects(withRender({ ...MIRRA_POINTER, wrap: true })).path).toBe('templates/welcome/render/wrap');
+    expect(rejects(withRender({ ...MIRRA_POINTER, frame: { ...MIRRA_POINTER.frame, wrap: true } })).path).toBe(
+      'templates/welcome/render/frame/wrap',
+    );
+    expect((await check(withRender({ ...MIRRA_POINTER, frame: { file: 'x.ts' } }))).code).toBe(1);
+  });
+
+  it('refuses args that are neither a list of names nor "$all", and a fill that is not a boolean', () => {
+    for (const args of ['all', ['a', 'a'], [''], [1]]) {
+      expect(() => loadDescriptor(withRender({ ...MIRRA_POINTER, frame: { ...MIRRA_POINTER.frame, args } })), JSON.stringify(args)).toThrow(
+        DescriptorError,
+      );
+    }
+    expect(() => loadDescriptor(withRender({ ...MIRRA_POINTER, fill: 'yes' }))).toThrow(DescriptorError);
+  });
+});
+
+describe('an email slot declares the variables it requires (journey E19)', () => {
+  it('accepts requires inside vars', () => {
+    const document = raw() as Record<string, any>;
+    document['keys']['welcome__body']['requires'] = ['handle'];
+    expect(loadDescriptor(document).keys['welcome__body']?.requires).toEqual(['handle']);
+  });
+
+  it('refuses requires naming a variable vars does not declare, at the key\'s requires', () => {
+    const document = raw() as Record<string, any>;
+    document['keys']['welcome__body']['requires'] = ['handle', 'name'];
+    const error = rejects(document);
+    expect(error.path).toBe('keys/welcome__body/requires');
+    expect(error.message).toBe('welcome__body: requires names {{name}}, which vars does not declare');
+  });
+
+  it('fails stet check on it, naming the variable', async () => {
+    const document = raw() as Record<string, any>;
+    document['keys']['welcome__body']['requires'] = ['handle', 'name'];
+    const run = await check(document);
+    expect(run.code).toBe(1);
+    expect(run.err).toContain('welcome__body: requires names {{name}}, which vars does not declare');
+  });
+
+  it('refuses it in a hand-built descriptor, which never meets the schema', () => {
+    const handBuilt: Descriptor = {
+      version: 1,
+      keys: { password_reset__body: { shape: 'text', target: 'html-email', vars: ['reset_url'], requires: ['reset_url', 'name'] } },
+    };
+    expect(() => checkDescriptorStructure(handBuilt)).toThrowError('password_reset__body: requires names {{name}}, which vars does not declare');
   });
 });

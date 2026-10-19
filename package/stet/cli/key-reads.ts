@@ -27,8 +27,11 @@
  * nested element inside it included.
  */
 
+import { join } from 'node:path';
+
 import type * as TS from 'typescript';
 
+import { normalizeNoExt, pathAliasMappings, resolveSpecifier } from './config.js';
 import { lineIndex } from './html-host.js';
 import {
   BOGUS_COMMENT,
@@ -451,6 +454,59 @@ export function readFormAt(source: string, at: number, key: string): string | nu
 
 const TS_FAMILY = /\.(?:[cm]?[jt]sx?)$/;
 
+/** Where code is in one file, as every reader of a key's name in source reads it. */
+export interface FileCode {
+  /** Where code is: the whole file for the TypeScript family, the scripts and expressions of a dialect. */
+  code: Span[];
+  /** The TypeScript regions bindings live in, with their text. */
+  regions: Array<Span & { text: string }>;
+  /** Comments and JSX text inside `code`. */
+  nonCode: Span[];
+  braces: Span[];
+}
+
+/**
+ * One file's code: the whole file for the TypeScript family, its comments and
+ * JSX text excepted; a template dialect's scripts and expressions, with the
+ * comments of each script and brace, which the markup walk keeps whole. Null
+ * where the file is neither the TypeScript family nor a dialect.
+ */
+export function codeOf(ts: typeof import('typescript'), file: string, source: string, dialect: Dialect | null): FileCode | null {
+  if (dialect === null) {
+    if (!TS_FAMILY.test(file)) return null;
+    return {
+      code: [{ start: 0, end: source.length }],
+      regions: [{ start: 0, end: source.length, text: source }],
+      nonCode: nonCodeOf(ts, file, source),
+      braces: [],
+    };
+  }
+  const found = dialectCode(source, dialect);
+  const regions = found.scripts.map((s) => ({ ...s, text: source.slice(s.start, s.end) }));
+  return {
+    code: [...found.scripts, ...found.expressions],
+    regions,
+    nonCode: [
+      ...regions.flatMap((r) => nonCodeOf(ts, `${file}.ts`, r.text, r.start)),
+      ...found.expressions
+        .filter((e) => source[e.start] === '{')
+        .flatMap((e) => nonCodeOf(ts, `${file}.tsx`, source.slice(e.start + 1, e.end - 1), e.start + 1)),
+    ],
+    braces: found.braces,
+  };
+}
+
+/**
+ * `(rel) => (spec) => boolean`: whether `spec`, imported from `rel`, resolves
+ * to one of `targets` (repo-relative files) under the host's own resolution
+ * rules — relative to the importer, or through its path aliases.
+ */
+export function stetModuleTest(cwd: string, targets: readonly string[]): (rel: string) => (spec: string) => boolean {
+  const mappings = pathAliasMappings(cwd);
+  const wanted = new Set(targets.map((rel) => normalizeNoExt(join(cwd, rel))));
+  return (rel) => (spec) => resolveSpecifier(spec, rel, cwd, mappings).some((target) => wanted.has(target));
+}
+
 /**
  * Every occurrence of the leaving keys in one host file, sorted into the three
  * classes. `ts` is the lazily loaded compiler; `isStetModule` answers whether a
@@ -471,28 +527,9 @@ export function planReadRenames(input: {
   if (renames.size === 0) return out;
 
   // The code of this file, and the TypeScript regions its bindings live in.
-  let code: Span[];
-  let regions: Array<{ start: number; end: number; own?: true; text: string }>;
-  let nonCode: Span[];
-  let braces: Span[] = [];
-  if (dialect === null) {
-    if (!TS_FAMILY.test(file)) return out;
-    code = [{ start: 0, end: source.length }];
-    regions = [{ start: 0, end: source.length, text: source }];
-    nonCode = nonCodeOf(ts, file, source);
-  } else {
-    const found = dialectCode(source, dialect);
-    code = [...found.scripts, ...found.expressions];
-    braces = found.braces;
-    regions = found.scripts.map((s) => ({ ...s, text: source.slice(s.start, s.end) }));
-    // The comments of the scripts and of each brace, which the markup walk keeps whole.
-    nonCode = [
-      ...regions.flatMap((r) => nonCodeOf(ts, `${file}.ts`, r.text, r.start)),
-      ...found.expressions
-        .filter((e) => source[e.start] === '{')
-        .flatMap((e) => nonCodeOf(ts, `${file}.tsx`, source.slice(e.start + 1, e.end - 1), e.start + 1)),
-    ];
-  }
+  const found = codeOf(ts, file, source, dialect);
+  if (found === null) return out;
+  const { code, regions, nonCode, braces } = found;
   // The component's bindings, which its markup reads, and each client script's own.
   const scriptFile = dialect === null ? file : `${file}.ts`;
   const bindings = bindingsOf(
