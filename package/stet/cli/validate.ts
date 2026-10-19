@@ -1,16 +1,15 @@
 /**
  * One value against its key's declared rules, reported.
  *
- * Two consumers, so it lives in one place: `check` runs it over every
- * committed value, and `draft` runs it over the incoming one before any store
- * call. Both need the same two steps in the same order, and both would get the
- * class gate wrong the same way without the sibling slots.
+ * `check` runs it over every committed value, and `draft` runs it over the
+ * incoming one before any store call. The rules themselves are
+ * `src/value-check.ts`, shared with the mounted API.
  */
 
-import { resolve } from '../src/resolve.js';
+import type { StoreRow } from '../src/resolve.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
-import { shapeSchema, templateOf, validateSave } from '../src/validate.js';
+import { checkValue } from '../src/value-check.js';
 import { Report, type FindingLocation } from './report.js';
 
 /**
@@ -51,15 +50,12 @@ export function validateUnnamed(d: {
 }
 
 /**
- * The shape check FIRST and separately: `validateSave`'s rules read a value
- * through the key's DECLARED shape, so a value of the wrong shape offers them
- * nothing to check. A list stored where text was declared yields no strings to
- * limit and no string to estimate, passes every save rule, and would save
- * cleanly to quarantine at read time — on the page, days later, instead of
- * here.
+ * One value checked and reported: the findings of `checkValue`, the one gate
+ * every save surface shares, land in the report at their own level.
  *
  * Answers whether the value may be saved: warnings are reported and do not
- * block, errors are reported and do.
+ * block, errors are reported and do. `rows` are the store's rows read for
+ * preview, for a stored draft judged with its siblings' drafts in scope.
  */
 export function validateValue(
   descriptor: Descriptor,
@@ -68,57 +64,12 @@ export function validateValue(
   value: unknown,
   locale: string,
   report: Report,
+  rows?: StoreRow[],
 ): boolean {
-  const shape = shapeSchema(descriptor, key).safeParse(value);
-  if (!shape.success) {
-    report.error(
-      'shape',
-      `${key} (${locale}): fails the declared ${descriptor.keys[key]?.shape} shape — ${
-        shape.error.issues[0]?.message ?? 'invalid'
-      }`,
-      key,
-    );
-    return false;
-  }
-
-  const verdict = validateSave(
-    descriptor,
-    { key, value, locale },
-    siblingsOf(descriptor, snapshot, key, locale),
-  );
+  const verdict = checkValue(descriptor, snapshot, key, value, locale, rows);
   for (const finding of verdict.findings) {
-    const message = `${finding.message} (${locale})`;
-    if (finding.severity === 'error') report.error(finding.rule, message, finding.key);
-    else report.warn(finding.rule, message, finding.key);
+    if (finding.level === 'error') report.error(finding.kind, finding.message, finding.key);
+    else report.warn(finding.kind, finding.message, finding.key);
   }
   return verdict.ok;
-}
-
-/**
- * The scope the class gate sees: the template's other slot values, so a subject
- * checked alone does not report a missing `{{unsubscribe_url}}` that the body
- * is carrying, plus the brand's postal line, which the marketing class rule
- * reads the same way. Both are resolved through the same read rule.
- *
- * A key that belongs to no template has no siblings, and `validateSave` merges
- * the candidate in itself.
- */
-function siblingsOf(
-  descriptor: Descriptor,
-  snapshot: Snapshot,
-  key: string,
-  locale: string,
-): Record<string, unknown> {
-  const template = templateOf(descriptor, key);
-  if (template === null) return {};
-  const siblings: Record<string, unknown> = {};
-  for (const slot of descriptor.templates?.[template]?.slots ?? []) {
-    const slotKey = `${template}__${slot}`;
-    siblings[slotKey] = resolve(descriptor, snapshot, null, { key: slotKey, locale }).value;
-  }
-  siblings['brand__footer_address'] = resolve(descriptor, snapshot, null, {
-    key: 'brand__footer_address',
-    locale,
-  }).value;
-  return siblings;
 }

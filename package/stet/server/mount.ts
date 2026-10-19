@@ -14,13 +14,16 @@
  * and `sendTest` are ADDED to canon §13.5's options (the draft RPC's `target`
  * has no other source; test-send needs a send channel); `renderEmail` is
  * TEMPLATE-based; the `revert` body ADDS `key` (its RPC returns only a version
- * id, and `onPublish` needs the key to source the target); canon's "history
- * drafts included" is the outlier against the published-only store contract.
+ * id, and `onPublish` needs the key to source the target), checked against the
+ * version before the write; canon's "history drafts included" is the outlier
+ * against the published-only store contract.
  */
 
 import { revertChange } from '../adapters/changesets.js';
 import type { DraftRefusal, NotSupported, StoreAdapter, StoreError } from '../src/store.js';
+import type { StoreRow } from '../src/resolve.js';
 import type { Descriptor, Target } from '../src/types.js';
+import { checkValue, scopeKeys, shippedScope, type ValueFinding } from '../src/value-check.js';
 import { json, readJson, sameSignature } from './http.js';
 
 /** Fired fire-and-forget after a publish or revert. `target` is the descriptor's, never widened to a string. */
@@ -81,6 +84,47 @@ export function createStetHandler(opts: StetHandlerOptions): {
     Object.hasOwn(opts.descriptor.keys, key) ? opts.descriptor.keys[key] : undefined;
   const declaredTemplate = (template: string): boolean =>
     Object.hasOwn(opts.descriptor.templates ?? {}, template);
+
+  // The content gate the CLI's `draft` runs, run here before a draft is saved
+  // and before stored drafts are published: the store records content and
+  // attribution but never judges it. A refusal is a 422 carrying the
+  // validator's own messages, returned before anything is written.
+  const refusal = (findings: ValueFinding[]): Response | null => {
+    const errors = findings.filter((finding) => finding.level === 'error');
+    if (errors.length === 0) return null;
+    return json({ error: errors.map((finding) => finding.message).join('; '), findings }, 422);
+  };
+
+  // A draft is judged with the store's drafts in scope: they are the intended
+  // next state, and the publish gate below is the backstop. A key that is no
+  // template slot has no siblings, so it reads nothing.
+  const refuseDraft = async (key: string, locale: string, value: unknown): Promise<Response | null> => {
+    const keys = scopeKeys(opts.descriptor, [key]);
+    let rows: StoreRow[] | undefined;
+    if (keys.length > 1) {
+      const read = await opts.store.read({ keys, preview: true });
+      if (isStoreError(read)) return storeErrorResponse(read);
+      rows = read;
+    }
+    return refusal(checkValue(opts.descriptor, {}, key, value, locale, rows).findings);
+  };
+
+  // The stored drafts a publish would ship, each judged with the rows as they
+  // will stand after it: active rows and only the drafts being shipped. A key
+  // that has left the descriptor has no rules to check against (the stated
+  // orphan edge), and a member with no draft has nothing to ship.
+  const refuseShipping = async (ships: Array<{ key: string; locale: string }>): Promise<Response | null> => {
+    const read = await opts.store.read({ keys: scopeKeys(opts.descriptor, ships.map((s) => s.key)), preview: true });
+    if (isStoreError(read)) return storeErrorResponse(read);
+    const scope = shippedScope(read, ships);
+    const findings: ValueFinding[] = [];
+    for (const { key, locale } of ships) {
+      const row = read.find((r) => r.status === 'draft' && r.key === key && r.locale === locale);
+      if (row === undefined || keyDef(key) === undefined) continue;
+      findings.push(...checkValue(opts.descriptor, {}, key, row.value, locale, scope).findings);
+    }
+    return refusal(findings);
+  };
 
   // One member's event, sourced from the descriptor like every other. A member
   // whose key has since LEFT the descriptor gets no event — there is no
@@ -192,6 +236,9 @@ export function createStetHandler(opts: StetHandlerOptions): {
         // whatever change that number happened to name.
         const change = changeField(body);
         if (change === INVALID) return json({ error: 'change must be a number or null' }, 400);
+        const locale = optStr(body, 'locale');
+        const invalid = await refuseDraft(key, locale ?? 'default', body['value']);
+        if (invalid) return invalid;
         // The full canon body — dropping `force` locks a DraftRefusal to the incumbent forever.
         return rpcResult(
           await opts.store.saveDraft({
@@ -199,7 +246,7 @@ export function createStetHandler(opts: StetHandlerOptions): {
             value: body['value'],
             target: def.target,
             editor,
-            locale: optStr(body, 'locale'),
+            locale,
             label: optStr(body, 'label'),
             note: optStr(body, 'note'),
             publishAt: optStr(body, 'publishAt'),
@@ -215,7 +262,12 @@ export function createStetHandler(opts: StetHandlerOptions): {
         const key = reqStr(body, 'key');
         const def = keyDef(key);
         if (def === undefined) return json({ error: `undeclared key: ${key}` }, 400);
-        const res = await opts.store.publish({ key, editor, locale: optStr(body, 'locale') });
+        // A draft written before this gate, or by a client that skipped it, is
+        // judged by the same rules as it publishes.
+        const locale = optStr(body, 'locale');
+        const invalid = await refuseShipping([{ key, locale: locale ?? 'default' }]);
+        if (invalid) return invalid;
+        const res = await opts.store.publish({ key, editor, locale });
         if (isStoreError(res)) return storeErrorResponse(res);
         if (isNotSupported(res)) return notSupportedResponse(res);
         firePublish({ key, target: def.target, versionId: res.versionId });
@@ -226,12 +278,23 @@ export function createStetHandler(opts: StetHandlerOptions): {
         const editor = reqStr(body, 'editor').trim();
         if (!editor) return json({ error: 'editor is required' }, 400);
         // `key` is a surfaced addition beyond canon's {versionId, editor}: the RPC
-        // returns only a version id, so onPublish needs the key to source `target`.
+        // returns only a version id, so onPublish needs the key to source `target`,
+        // and the key is checked against the version before the write.
         const key = reqStr(body, 'key');
         const def = keyDef(key);
         if (def === undefined) return json({ error: `undeclared key: ${key}` }, 400);
         const versionId = numField(body, 'versionId');
         if (versionId === undefined) return json({ error: 'versionId is required' }, 400);
+        // The body's key must be the version's own, checked before the write:
+        // `key`'s newest published row at or below `versionId` is that version
+        // exactly when the version belongs to `key`. A mismatch would restore
+        // another key and fire onPublish under the wrong one.
+        const owner = await opts.store.history({ key, beforeId: versionId + 1, limit: 1 });
+        if (isStoreError(owner)) return storeErrorResponse(owner);
+        if (isNotSupported(owner)) return notSupportedResponse(owner);
+        if (owner.rows[0]?.id !== versionId) {
+          return json({ error: `version ${versionId} is not a published version of ${key}` }, 400);
+        }
         const res = await opts.store.revert({ versionId, editor });
         if (isStoreError(res)) return storeErrorResponse(res);
         if (isNotSupported(res)) return notSupportedResponse(res);
@@ -310,6 +373,16 @@ export function createStetHandler(opts: StetHandlerOptions): {
         if (!editor) return json({ error: 'editor is required' }, 400);
         const changeId = numField(body, 'change');
         if (changeId === undefined) return json({ error: 'change is required' }, 400);
+        // Every member draft is judged before any ships, so one invalid member
+        // refuses the whole group and the atomic publish never starts. A change
+        // that is not open or scheduled has no drafts to judge; the store answers it.
+        const found = await opts.store.changesets.get({ changeId });
+        if (isStoreError(found)) return storeErrorResponse(found);
+        // A store without the capability answers `publishChange` itself.
+        if (!isNotSupported(found) && (found.change.status === 'open' || found.change.status === 'scheduled')) {
+          const invalid = await refuseShipping(found.members);
+          if (invalid) return invalid;
+        }
         const res = await opts.store.changesets.publishChange({ changeId, editor });
         if (isStoreError(res)) return storeErrorResponse(res);
         if (isNotSupported(res)) return notSupportedResponse(res);

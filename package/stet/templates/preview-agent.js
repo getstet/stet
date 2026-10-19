@@ -23,7 +23,7 @@
   var DASHED = '2px dashed hsl(38 92% 50%)';
   var SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1, TEXTAREA: 1 };
   var marked = [];   // [{ el, outline, offset }]
-  var swapped = [];  // [{ node, text }] or [{ el, attr, text }]
+  var swapped = [];  // [{ node, text, wrote }] or [{ el, attr, text, wrote }]: `text` is what the page held, `wrote` what this script put there
   var last = null;   // the last locate request, re-applied after the page re-renders
   var opened = [];   // the closed <details> this script opened; a visitor's own are never in it
   var declined = []; // ones it opened that another hand closed again, left closed until the key is picked anew
@@ -61,13 +61,37 @@
     };
   }
 
-  /** Put back every outline and swapped text; the <details> this script opened close too, unless `keepOpen` (a new request settles them). */
+  /**
+   * Forget the swap on every text node the page has written to since: its text
+   * is the page's now (a save the dev server re-rendered in place), so it is
+   * never put back, even where the page wrote the very words this script had.
+   */
+  function adopt(records) {
+    records.forEach(function (record) {
+      if (record.type !== 'characterData') return;
+      swapped = swapped.filter(function (s) { return s.node !== record.target; });
+    });
+  }
+
+  /** Swap `text` into a text node, remembering what the page held and what this script put there. */
+  function swapText(node, text) {
+    var held = node.data;
+    node.data = text;
+    swapped.push({ node: node, text: held, wrote: node.data });
+  }
+
+  /** Put back every outline and swapped text the page has not rewritten since; the <details> this script opened close too, unless `keepOpen` (a new request settles them). */
   function clear(keepOpen) {
     endSettle();
+    endQuiet();
+    adopt(observer.takeRecords());
     marked.forEach(function (m) { m.el.style.outline = m.outline; m.el.style.outlineOffset = m.offset; });
     swapped.forEach(function (s) {
-      if (s.node) s.node.data = s.text;
-      else s.el.setAttribute(s.attr, s.text);
+      if (s.node) {
+        if (s.node.data === s.wrote) s.node.data = s.text;
+      } else if (s.el.getAttribute(s.attr) === s.wrote) {
+        s.el.setAttribute(s.attr, s.text);
+      }
     });
     marked = [];
     swapped = [];
@@ -149,6 +173,34 @@
   function endSettle() {
     if (unsettle !== null) unsettle();
     unsettle = null;
+  }
+
+  /**
+   * A save check that finds nothing may have come before the page rendered: a
+   * single-page app announces itself first and draws after, and a dev server
+   * that reloads the page after a save does the same. The answer waits until
+   * the page's mutations have been quiet for QUIET_MS (at most QUIET_MAX in
+   * all), then the lookup runs once more. Every mutation but this script's
+   * own, which never reach the observer, starts the quiet window over.
+   */
+  var QUIET_MS = 300;
+  var QUIET_MAX = 5000;
+  var quiet = null;
+  function awaitQuiet(run) {
+    endQuiet();
+    var deadline = Date.now() + QUIET_MAX;
+    var fire = function () { quiet = null; run(); };
+    quiet = {
+      timer: setTimeout(fire, QUIET_MS),
+      again: function () {
+        clearTimeout(quiet.timer);
+        quiet.timer = setTimeout(fire, Math.max(0, Math.min(QUIET_MS, deadline - Date.now())));
+      },
+    };
+  }
+  function endQuiet() {
+    if (quiet !== null) clearTimeout(quiet.timer);
+    quiet = null;
   }
 
   /**
@@ -261,8 +313,7 @@
   /** Swap the draft in for every contained occurrence in one node at once, keeping the node's other text. */
   function draftContained(hit, draft) {
     if (swapped.some(function (s) { return s.node === hit.node; })) return true;
-    swapped.push({ node: hit.node, text: hit.node.data });
-    hit.node.data = hit.node.data.replace(hit.pattern, function () { return draft; });
+    swapText(hit.node, hit.node.data.replace(hit.pattern, function () { return draft; }));
     return true;
   }
 
@@ -270,22 +321,20 @@
   function draftInto(hit, draft) {
     if (hit.node) {
       var edges = /^(\s*)[\s\S]*?(\s*)$/.exec(hit.node.data);
-      swapped.push({ node: hit.node, text: hit.node.data });
-      hit.node.data = edges[1] + draft + edges[2];
+      swapText(hit.node, edges[1] + draft + edges[2]);
       return true;
     }
     if (hit.attr) {
-      swapped.push({ el: hit.el, attr: hit.attr, text: hit.el.getAttribute(hit.attr) });
+      var held = hit.el.getAttribute(hit.attr);
       hit.el.setAttribute(hit.attr, draft);
+      swapped.push({ el: hit.el, attr: hit.attr, text: held, wrote: hit.el.getAttribute(hit.attr) });
       return true;
     }
     var nodes = hit.el.childNodes;
     for (var i = 0; i < nodes.length; i += 1) if (nodes[i].nodeType !== 3) return false;
     if (nodes.length === 0) return false;
-    swapped.push({ node: nodes[0], text: nodes[0].data });
-    for (var j = 1; j < nodes.length; j += 1) swapped.push({ node: nodes[j], text: nodes[j].data });
-    nodes[0].data = draft;
-    for (var k = 1; k < nodes.length; k += 1) nodes[k].data = '';
+    swapText(nodes[0], draft);
+    for (var k = 1; k < nodes.length; k += 1) swapText(nodes[k], '');
     return true;
   }
 
@@ -334,14 +383,13 @@
       var lead = k === 0 ? /^\s*/.exec(text)[0] : '';
       var trail = k === slots.length - 1 ? /\s*$/.exec(text)[0] : '';
       nodes.forEach(function (node, j) {
-        swapped.push({ node: node, text: node.data });
-        node.data = j === 0 ? lead + runs[k] + trail : '';
+        swapText(node, j === 0 ? lead + runs[k] + trail : '');
       });
     });
     return true;
   }
 
-  function locate(request, scroll) {
+  function locate(request, scroll, retried) {
     // A key picked anew may open again what another hand closed.
     if (last === null || request.key !== last.key || scroll) declined = [];
     clear(true);
@@ -404,6 +452,11 @@
           : draftInto(hit, piece);
       if (!done) mapped = false;
     });
+    // A save check that found nothing waits for the page to settle and looks once more.
+    if (hits.length === 0 && request.check === true && retried !== true) {
+      awaitQuiet(function () { locate(request, scroll, true); });
+      return;
+    }
     // A key inside a closed <details> opens it; one opened for an earlier key closes.
     var needed = [];
     hits.forEach(function (hit) { disclose(hit.el, needed); });
@@ -461,7 +514,9 @@
   // and the draft on it. This script's own changes are taken off the
   // observer's queue as they are made, so they never re-trigger it.
   var again = null;
-  var observer = new MutationObserver(function () {
+  var observer = new MutationObserver(function (records) {
+    adopt(records);
+    if (quiet !== null) { quiet.again(); return; }
     if (last === null) return;
     clearTimeout(again);
     again = setTimeout(function () { if (last !== null) locate(last, false); }, 200);

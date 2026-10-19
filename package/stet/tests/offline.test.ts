@@ -67,6 +67,7 @@ describe('the core is pure by construction', () => {
       'targets/web.ts',
       'types.ts',
       'validate.ts',
+      'value-check.ts',
     ]);
   });
 

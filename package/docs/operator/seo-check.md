@@ -186,7 +186,17 @@ stet reports and leaves alone. `--json` prints the same result as one object;
 
 The command needs Google Chrome (or `CHROME_PATH`) and Node 22.19 or later;
 every other command runs on Node 22. It loads Lighthouse only inside its own
-run. The dashboard's SEO tab runs the same command from its Lighthouse card.
+run. Lighthouse, chrome-launcher and selfsigned are optional peer dependencies,
+so installing stet brings none of them; install them as dev dependencies where
+the audit runs: `npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. A
+project that already depends on another major of one of them moves to the major
+stet declares, or installs with `--legacy-peer-deps`. The dashboard's SEO tab
+runs the same command from its Lighthouse card.
+
+Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
+selfsigned because the lockfile holds them. To drop them, delete their
+node_modules/ entries from package-lock.json and run npm i, or install
+production with npm ci --omit=dev --omit=peer.
 
 ## The footprint
 

@@ -7,7 +7,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { createMemoryStore } from '../adapters/store-memory.js';
 import { createSnapshotStore } from '../adapters/store-snapshot.js';
+import { validateValue } from '../cli/validate.js';
+import { Report } from '../cli/report.js';
 import { miniDescriptor } from '../conformance/fixture.js';
 import { bearerMatches, createStetHandler, type PublishEvent } from '../server/mount.js';
 import type {
@@ -18,6 +21,7 @@ import type {
   StoreAdapter,
   StoreError,
 } from '../src/store.js';
+import type { StoreRow } from '../src/resolve.js';
 
 const TOKEN_ENV = 'STET_MOUNT_TEST_TOKEN';
 const TOKEN = 'sekret-token';
@@ -45,6 +49,9 @@ const A_CHANGE: ChangesetRow = {
   createdAt: '2026-01-01T00:00:00.000Z',
   revertedAt: null,
 };
+
+/** The saveDraft calls among the recorded ones: the draft route reads the store for its content gate first. */
+const saves = (calls: Recorded[]): Recorded[] => calls.filter((c) => c.method === 'saveDraft');
 
 function makeStore(
   over: Partial<StoreAdapter> = {},
@@ -231,14 +238,62 @@ describe('POST writes', () => {
     expect(events).toEqual([{ key: 'hero_headline', target: descriptor.keys['hero_headline']?.target, versionId: 7 }]);
   });
 
-  it('revert reads key from its body and fires onPublish', async () => {
+  it('revert reads key from its body, checks it against the version, and fires onPublish', async () => {
     const events: PublishEvent[] = [];
-    const { store, calls } = makeStore();
+    const { store, calls } = makeStore({
+      history: async () => ({ rows: [{ id: 3, key: 'hero_headline' }], nextBeforeId: null }) as never,
+    });
     const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (e) => events.push(e) });
     const res = await h.POST(post('/api/stet/revert', { key: 'hero_headline', versionId: 3, editor: 'ada' }));
     expect(res.status).toBe(200);
+    expect(calls.find((c) => c.method === 'history')?.arg).toEqual({ key: 'hero_headline', beforeId: 4, limit: 1 });
     expect(calls.find((c) => c.method === 'revert')?.arg).toEqual({ versionId: 3, editor: 'ada' });
     expect(events).toEqual([{ key: 'hero_headline', target: descriptor.keys['hero_headline']?.target, versionId: 8 }]);
+  });
+
+  it("refuses a revert whose key is not the version's own, writing nothing (F76)", async () => {
+    // Two keys, each published twice, in a real store: the body's key decides
+    // nothing but the event, so a mismatch must never reach the revert write.
+    const store = createMemoryStore({ project: 'test' });
+    const ids: Record<string, number[]> = { hero_headline: [], hero_body: [] };
+    for (const value of ['first', 'second']) {
+      for (const key of ['hero_body', 'hero_headline']) {
+        await store.saveDraft({ key, value: `${key} ${value}`, target: 'web', editor: 'ada' });
+        const published = await store.publish({ key, editor: 'ada' });
+        ids[key]?.push((published as { versionId: number }).versionId);
+      }
+    }
+    const events: PublishEvent[] = [];
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (e) => events.push(e) });
+    const older = ids['hero_headline']?.[0] as number;
+    const before = await store.read();
+    const res = await h.POST(post('/api/stet/revert', { key: 'hero_body', versionId: older, editor: 'ada' }));
+    expect(res.status).toBe(400);
+    expect(await bodyOf(res)).toEqual({ error: `version ${older} is not a published version of hero_body` });
+    expect(await store.read()).toEqual(before);
+    expect(events).toEqual([]);
+    const right = await h.POST(post('/api/stet/revert', { key: 'hero_headline', versionId: older, editor: 'ada' }));
+    expect(right.status).toBe(200);
+    const restored = (await bodyOf(right))['versionId'];
+    expect(events).toEqual([{ key: 'hero_headline', target: 'web', versionId: restored }]);
+    expect(((await store.read()) as StoreRow[]).find((row) => row.key === 'hero_headline')?.value).toBe('hero_headline first');
+  });
+
+  it('refuses a revert naming a draft or a version that does not exist, writing nothing and firing nothing', async () => {
+    const store = createMemoryStore({ project: 'test' });
+    await store.saveDraft({ key: 'hero_headline', value: 'first', target: 'web', editor: 'ada' });
+    await store.publish({ key: 'hero_headline', editor: 'ada' });
+    const draft = (await store.saveDraft({ key: 'hero_headline', value: 'unpublished', target: 'web', editor: 'ada' })) as { draftId: number };
+    const events: PublishEvent[] = [];
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (e) => events.push(e) });
+    const before = await store.read();
+    for (const versionId of [draft.draftId, 999]) {
+      const res = await h.POST(post('/api/stet/revert', { key: 'hero_headline', versionId, editor: 'ada' }));
+      expect({ versionId, status: res.status }).toEqual({ versionId, status: 400 });
+      expect(await bodyOf(res)).toEqual({ error: `version ${versionId} is not a published version of hero_headline` });
+      expect(await store.read()).toEqual(before);
+      expect(events).toEqual([]);
+    }
   });
 
   it('rejects an undeclared key on draft/publish/revert with 400, RPC never called', async () => {
@@ -500,6 +555,19 @@ describe('hooks and store-result mapping', () => {
     const res = await h.POST(post('/api/stet/publish', { key: 'hero_headline', editor: 'ada' }));
     expect(res.status).toBe(501);
   });
+
+  it("a StoreError or NotSupported from revert's ownership read maps as it does from a write, and nothing is reverted", async () => {
+    for (const [answer, status] of [
+      [storeErr('unreachable'), 503],
+      [{ notSupported: true, method: 'history' } as NotSupported, 501],
+    ] as const) {
+      const { store, calls } = makeStore({ history: async () => answer as never });
+      const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+      const res = await h.POST(post('/api/stet/revert', { key: 'hero_headline', versionId: 3, editor: 'ada' }));
+      expect(res.status).toBe(status);
+      expect(calls.some((c) => c.method === 'revert')).toBe(false);
+    }
+  });
 });
 
 describe('the changeset routes', () => {
@@ -528,6 +596,7 @@ describe('the changeset routes', () => {
       'changesets.list',
       'changesets.open',
       'changesets.schedule',
+      'changesets.get',
       'changesets.publishChange',
       'changesets.abandon',
       'changesets.discardDraft',
@@ -535,8 +604,8 @@ describe('the changeset routes', () => {
     expect(calls[0]?.arg).toEqual({ status: 'open', beforeId: undefined, limit: 2 });
     expect(calls[1]?.arg).toEqual({ name: 'spring', note: undefined, authorKind: 'human' });
     expect(calls[2]?.arg).toEqual({ changeId: 3, publishAt: null });
-    expect(calls[3]?.arg).toEqual({ changeId: 3, editor: 'ada' });
-    expect(calls[5]?.arg).toEqual({ key: 'hero_headline', locale: undefined });
+    expect(calls[4]?.arg).toEqual({ changeId: 3, editor: 'ada' });
+    expect(calls[6]?.arg).toEqual({ key: 'hero_headline', locale: undefined });
   });
 
   it('schedule-change treats an absent publishAt and an explicit null differently', async () => {
@@ -853,7 +922,7 @@ describe('the descriptor guards are own-property lookups', () => {
     const h = createStetHandler({ store, descriptor: withOwn, auth: TOKEN_ENV });
     const res = await h.POST(post('/api/stet/draft', { key: 'constructor', value: 'x', editor: 'ada' }));
     expect(res.status).toBe(200);
-    expect((calls[0]?.arg as Record<string, unknown>)['target']).toBe(descriptor.keys['hero_headline']?.target);
+    expect((saves(calls)[0]?.arg as Record<string, unknown>)['target']).toBe(descriptor.keys['hero_headline']?.target);
   });
 
   it('an orphaned member fires no event at all, never one with an undefined target', async () => {
@@ -904,7 +973,7 @@ describe('id fields are integers, not merely finite', () => {
     const { store, calls } = makeStore();
     const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
     await h.POST(post('/api/stet/draft', { key: 'hero_headline', value: 'x', editor: 'ada', change: 0 }));
-    expect((calls[0]?.arg as Record<string, unknown>)['change']).toBe(0);
+    expect((saves(calls)[0]?.arg as Record<string, unknown>)['change']).toBe(0);
   });
 });
 
@@ -935,13 +1004,13 @@ describe('the draft route’s change forwarding', () => {
     await handler.POST(post('/api/stet/draft', { key: 'hero_headline', value: 'x', editor: 'ada' }));
     // ABSENT must not travel as null: null detaches, and a save that silently
     // detached on every autosave would empty a change key by key.
-    expect('change' in (calls[0]?.arg as Record<string, unknown>)).toBe(false);
+    expect('change' in (saves(calls)[0]?.arg as Record<string, unknown>)).toBe(false);
 
     await handler.POST(post('/api/stet/draft', { key: 'hero_headline', value: 'x', editor: 'ada', change: null }));
-    expect((calls[1]?.arg as Record<string, unknown>)['change']).toBeNull();
+    expect((saves(calls)[1]?.arg as Record<string, unknown>)['change']).toBeNull();
 
     await handler.POST(post('/api/stet/draft', { key: 'hero_headline', value: 'x', editor: 'ada', change: 4 }));
-    expect((calls[2]?.arg as Record<string, unknown>)['change']).toBe(4);
+    expect((saves(calls)[2]?.arg as Record<string, unknown>)['change']).toBe(4);
   });
 
   it('rejects a string-typed change rather than coercing it', async () => {
@@ -964,5 +1033,177 @@ describe('unknown paths', () => {
     expect((await h.GET(get('/api/stet/preview'))).status).toBe(404);
     expect((await h.GET(get('/api/stet/media'))).status).toBe(404);
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('the content gate on the draft and publish routes', () => {
+  const ADDRESS = '1 Main Street, Springfield';
+  // Each case breaks one rule `stet draft` enforces: a hard limit, a variable a
+  // marketing template must carry, and markup an email slot may not hold.
+  const INVALID: Array<[string, string, string, RegExp]> = [
+    ['over a hard limit', 'welcome__subject', 'x'.repeat(61), /60-character limit/],
+    ['a required {{var}} dropped', 'newsletter__body', 'No way out of this list.', /unsubscribe_url/],
+    ['<script> in an html-email slot', 'welcome__body', 'Hi <script>alert(1)</script>', /HTML element open in html-email content/],
+  ];
+
+  /** A memory store with the brand's postal line published, so only the case's own rule can fail. */
+  async function seeded(): Promise<StoreAdapter> {
+    const store = createMemoryStore({ project: 'test' });
+    await store.saveDraft({ key: 'brand__footer_address', value: ADDRESS, target: 'html-email', editor: 'ada' });
+    await store.publish({ key: 'brand__footer_address', editor: 'ada' });
+    return store;
+  }
+
+  it.each(INVALID)('draft refuses %s with 422, the validator’s message, and writes nothing', async (_name, key, value, message) => {
+    const store = await seeded();
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    const before = await store.read({ preview: true });
+    const res = await h.POST(post('/api/stet/draft', { key, value, editor: 'ada' }));
+    expect(res.status).toBe(422);
+    const body = await bodyOf(res);
+    expect(String(body['error'])).toMatch(message);
+    expect(await store.read({ preview: true })).toEqual(before);
+
+    // The same words `stet draft` prints: one function, one rule set.
+    const report = new Report();
+    validateValue(descriptor, { default: { brand__footer_address: ADDRESS } }, key, value, 'default', report);
+    const printed = report.findings.filter((f) => f.level === 'error').map((f) => f.message);
+    expect(printed.length).toBeGreaterThan(0);
+    expect(String(body['error'])).toBe(printed.join('; '));
+  });
+
+  it('draft saves a valid value with 200', async () => {
+    const store = await seeded();
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    const res = await h.POST(post('/api/stet/draft', { key: 'newsletter__body', value: 'Leave any time: {{unsubscribe_url}}', editor: 'ada' }));
+    expect(res.status).toBe(200);
+    const rows = (await store.read({ preview: true })) as StoreRow[];
+    expect(rows.find((r) => r.key === 'newsletter__body')?.value).toBe('Leave any time: {{unsubscribe_url}}');
+  });
+
+  it('draft judges a slot with its siblings’ drafts in scope', async () => {
+    const store = await seeded();
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    // The body alone lacks the unsubscribe variable; the drafted subject carries it.
+    await store.saveDraft({ key: 'newsletter__subject', value: '{{unsubscribe_url}}', target: 'html-email', editor: 'ada' });
+    const res = await h.POST(post('/api/stet/draft', { key: 'newsletter__body', value: 'Hello again.', editor: 'ada' }));
+    expect(res.status).toBe(200);
+  });
+
+  it('a warning alone does not refuse a draft', async () => {
+    const store = await seeded();
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    // hero_headline's limit is advisory: over it is a warning.
+    const res = await h.POST(post('/api/stet/draft', { key: 'hero_headline', value: 'x'.repeat(80), editor: 'ada' }));
+    expect(res.status).toBe(200);
+  });
+
+  it.each(INVALID)('publish refuses a stored draft with %s, publishing nothing', async (_name, key, value, message) => {
+    const store = await seeded();
+    // Written past the route, as an earlier release or another client could.
+    await store.saveDraft({ key, value, target: 'html-email', editor: 'ada' });
+    const events: PublishEvent[] = [];
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (e) => events.push(e) });
+    const before = await store.read({ preview: true });
+    const res = await h.POST(post('/api/stet/publish', { key, editor: 'ada' }));
+    expect(res.status).toBe(422);
+    expect(String((await bodyOf(res))['error'])).toMatch(message);
+    expect(await store.read({ preview: true })).toEqual(before);
+    expect(events).toEqual([]);
+  });
+
+  it('publish still ships a valid stored draft', async () => {
+    const store = await seeded();
+    await store.saveDraft({ key: 'hero_headline', value: 'Ship it', target: 'web', editor: 'ada' });
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    expect((await h.POST(post('/api/stet/publish', { key: 'hero_headline', editor: 'ada' }))).status).toBe(200);
+  });
+
+  it('publish-change refuses the whole group when one member draft is invalid, publishing none', async () => {
+    const store = await seeded();
+    const opened = (await store.changesets.open({ name: 'spring' })) as { changeId: number };
+    await store.saveDraft({ key: 'hero_headline', value: 'Fine', target: 'web', editor: 'ada', change: opened.changeId });
+    await store.saveDraft({ key: 'welcome__subject', value: 'x'.repeat(61), target: 'html-email', editor: 'ada', change: opened.changeId });
+    const events: PublishEvent[] = [];
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV, onPublish: (e) => events.push(e) });
+    const before = await store.read({ preview: true });
+    const res = await h.POST(post('/api/stet/publish-change', { change: opened.changeId, editor: 'ada' }));
+    expect(res.status).toBe(422);
+    expect(String((await bodyOf(res))['error'])).toMatch(/60-character limit/);
+    expect(await store.read({ preview: true })).toEqual(before);
+    expect(events).toEqual([]);
+
+    // Corrected, the same group publishes whole.
+    await store.saveDraft({ key: 'welcome__subject', value: 'Welcome', target: 'html-email', editor: 'ada', change: opened.changeId, force: true });
+    const ok = await h.POST(post('/api/stet/publish-change', { change: opened.changeId, editor: 'ada' }));
+    expect(ok.status).toBe(200);
+    expect(events.map((e) => e.key).sort()).toEqual(['hero_headline', 'welcome__subject']);
+  });
+
+  // The template's subject also declares the unsubscribe variable, so either
+  // slot can carry it for the other.
+  const carrying = {
+    ...descriptor,
+    keys: {
+      ...descriptor.keys,
+      newsletter__subject: { ...descriptor.keys['newsletter__subject']!, vars: ['unsubscribe_url'] },
+    },
+  };
+
+  /** Live: a body that carries the variable and a plain subject. */
+  async function liveNewsletter(): Promise<StoreAdapter> {
+    const store = await seeded();
+    for (const [key, value] of [['newsletter__body', 'Bye: {{unsubscribe_url}}'], ['newsletter__subject', 'News']] as const) {
+      await store.saveDraft({ key, value, target: 'html-email', editor: 'ada' });
+      await store.publish({ key, editor: 'ada' });
+    }
+    return store;
+  }
+
+  it('publish judges a slot without the drafts it does not ship', async () => {
+    const store = await liveNewsletter();
+    const h = createStetHandler({ store, descriptor: carrying, auth: TOKEN_ENV });
+    // Each draft passes at the draft route, the subject carrying the variable
+    // for the body; only the body is published, so the subject never goes live.
+    expect((await h.POST(post('/api/stet/draft', { key: 'newsletter__subject', value: 'News {{unsubscribe_url}}', editor: 'ada' }))).status).toBe(200);
+    expect((await h.POST(post('/api/stet/draft', { key: 'newsletter__body', value: 'Hello again.', editor: 'ada' }))).status).toBe(200);
+    const res = await h.POST(post('/api/stet/publish', { key: 'newsletter__body', editor: 'ada' }));
+    expect(res.status).toBe(422);
+    expect(String((await bodyOf(res))['error'])).toContain('unsubscribe_url');
+    const live = ((await store.read()) as StoreRow[]).find((r) => r.key === 'newsletter__body');
+    expect(live?.value).toBe('Bye: {{unsubscribe_url}}');
+  });
+
+  it('publish-change judges the group without a draft outside it', async () => {
+    const store = await liveNewsletter();
+    const h = createStetHandler({ store, descriptor: carrying, auth: TOKEN_ENV });
+    const opened = (await store.changesets.open({ name: 'body only' })) as { changeId: number };
+    await store.saveDraft({ key: 'newsletter__subject', value: 'News {{unsubscribe_url}}', target: 'html-email', editor: 'ada' });
+    await store.saveDraft({ key: 'newsletter__body', value: 'Hello again.', target: 'html-email', editor: 'ada', change: opened.changeId });
+    const res = await h.POST(post('/api/stet/publish-change', { change: opened.changeId, editor: 'ada' }));
+    expect(res.status).toBe(422);
+    expect(String((await bodyOf(res))['error'])).toContain('unsubscribe_url');
+  });
+
+  it('publish passes a slot whose sibling ships with it in the same change', async () => {
+    const store = await liveNewsletter();
+    const h = createStetHandler({ store, descriptor: carrying, auth: TOKEN_ENV });
+    const opened = (await store.changesets.open({ name: 'both' })) as { changeId: number };
+    await store.saveDraft({ key: 'newsletter__subject', value: 'News {{unsubscribe_url}}', target: 'html-email', editor: 'ada', change: opened.changeId });
+    await store.saveDraft({ key: 'newsletter__body', value: 'Hello again.', target: 'html-email', editor: 'ada', change: opened.changeId });
+    expect((await h.POST(post('/api/stet/publish-change', { change: opened.changeId, editor: 'ada' }))).status).toBe(200);
+  });
+
+  it('reads only the keys a check uses, and nothing for a key with no template', async () => {
+    const { store, calls } = makeStore();
+    const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+    await h.POST(post('/api/stet/draft', { key: 'hero_headline', value: 'Hi', editor: 'ada' }));
+    expect(calls.filter((c) => c.method === 'read')).toHaveLength(0);
+    await h.POST(post('/api/stet/draft', { key: 'newsletter__body', value: 'Bye {{unsubscribe_url}}', editor: 'ada' }));
+    expect(calls.filter((c) => c.method === 'read').map((c) => c.arg)).toEqual([
+      { keys: ['newsletter__body', 'newsletter__subject', 'brand__footer_address'], preview: true },
+    ]);
+    await h.POST(post('/api/stet/publish', { key: 'hero_headline', editor: 'ada' }));
+    expect(calls.filter((c) => c.method === 'read').at(-1)?.arg).toEqual({ keys: ['hero_headline'], preview: true });
   });
 });

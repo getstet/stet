@@ -39,12 +39,35 @@ export class ChromeMissing extends Error {}
 /** An audit package that does not load: a broken or pruned install, told apart from any other failure. */
 export class AuditPackageMissing extends Error {}
 
-/** One of the audit's packages imported, a missing one raised as `AuditPackageMissing`. */
+/**
+ * One of the audit's packages imported, a missing one raised as `AuditPackageMissing`.
+ * Yarn PnP raises an absent optional peer with the CommonJS code, `MODULE_NOT_FOUND`.
+ */
 export async function importAuditPackage<T>(load: () => Promise<T>): Promise<T> {
   try {
     return await load();
   } catch (error) {
-    if ((error as { code?: string }).code === 'ERR_MODULE_NOT_FOUND') throw new AuditPackageMissing();
+    const code = (error as { code?: string }).code;
+    if (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') throw new AuditPackageMissing();
+    throw error;
+  }
+}
+
+/**
+ * Whether Lighthouse, chrome-launcher and selfsigned all load. They are
+ * optional peers a plain install leaves out, so the command asks before it
+ * reads the config, starts a target or runs a build.
+ */
+export async function auditPackagesPresent(): Promise<boolean> {
+  try {
+    await Promise.all([
+      importAuditPackage(() => import('lighthouse')),
+      importAuditPackage(() => import('chrome-launcher')),
+      importAuditPackage(() => import('selfsigned')),
+    ]);
+    return true;
+  } catch (error) {
+    if (error instanceof AuditPackageMissing) return false;
     throw error;
   }
 }

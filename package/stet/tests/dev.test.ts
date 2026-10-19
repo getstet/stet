@@ -7325,6 +7325,31 @@ describe('the page', () => {
       page.dom.window.close();
     });
 
+    it('ignores the pre-save request’s reply once the save is made, so a page re-rendered in place is not read as missing the key (F89)', async () => {
+      const page = await paint({ preview: DEV_PREVIEW });
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+      const agent = agentOf(page, (message) =>
+        message['stet'] === 'locate' ? LOCATED({ seq: message['seq'], found: 1 }) : null,
+      );
+      await agent.load();
+      await agent.ready();
+      await page.act('key:hero_headline');
+      await page.settle();
+      await page.type('text:hero_headline', 'Saved words');
+      await wait(150);
+      await page.settle();
+      const earlier = agent.locates().at(-1)?.['seq'];
+      await page.act('save');
+      const before = agent.locates().length;
+      // The dev server re-rendered the page in place: its agent re-applies the request from before the save
+      // against the saved text, and finds nothing.
+      agent.say(LOCATED({ seq: earlier, found: 0, by: 'contained' }));
+      await page.settle();
+      expect(agent.locates()).toHaveLength(before);
+      expect(note(page).textContent).not.toContain('was not found');
+      page.dom.window.close();
+    }, 10_000);
+
     it('runs the save’s check after 3 s where the page sends no new ready', async () => {
       const page = await paint({ preview: DEV_PREVIEW });
       page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
@@ -7340,7 +7365,9 @@ describe('the page', () => {
       await page.act('save');
       const before = agent.locates().length;
       await wait(3_200);
-      expect(agent.locates().slice(before).some((m) => JSON.stringify(m['texts']) === JSON.stringify(['In place']))).toBe(true);
+      const check = agent.locates().slice(before).find((m) => JSON.stringify(m['texts']) === JSON.stringify(['In place']));
+      // The check is flagged, so the agent looks again once a page that rendered late has gone quiet (F90).
+      expect(check).toMatchObject({ draft: null, check: true });
       page.dom.window.close();
     }, 10_000);
 
@@ -7787,6 +7814,20 @@ describe('the page', () => {
       await page.act('key:hero_headline');
       expect(saveState(page)).toEqual({ label: 'Save draft', blue: true, grey: false });
       expect(saveButton(page).getAttribute('title')).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('shows the mount’s content refusal under the field when a store-backed draft is refused', async () => {
+      const refusal = 'welcome__subject: 61 characters exceeds the 60-character limit (default)';
+      const page = await paint({
+        site: siteBody({ mode: 'memory' }),
+        routes: [[`/s/${SITE_ID}/api/stet/draft`, 422, { error: refusal, findings: [{ level: 'error', kind: 'limit', key: 'welcome__subject', message: refusal }] }]],
+      });
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'A changed headline');
+      await page.act('save');
+      expect(docOf(page).querySelector('#refusal .err')?.textContent).toBe(refusal);
+      expect(page.errors).toEqual([]);
       page.dom.window.close();
     });
 
@@ -8420,6 +8461,16 @@ describe('the page', () => {
       held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: 'Chrome was not found — Lighthouse needs it; install Google Chrome, or set CHROME_PATH to a Chrome or Chromium binary' }] });
       await page.act('auditRun');
       expect(docOf(page).querySelector('.card .err')?.textContent).toBe('Chrome was not found — install Google Chrome, or set CHROME_PATH in the shell that runs stet dev');
+      // The needs-Lighthouse line reaches the card as written, with the folder it names where the dashboard's stet is another checkout's.
+      for (const line of [
+        'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5',
+        'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5 in /checkouts/a',
+        'stet audit lighthouse needs Lighthouse — install @getstet/stet in the project, then run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5 there',
+      ]) {
+        held.reply = done({ ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: line }] });
+        await page.act('auditRun');
+        expect(docOf(page).querySelector('.card .err')?.textContent).toBe(line);
+      }
       held.reply = { state: 'done', elapsed: 9, lines: ['building (npm run build)…', 'boom'], result: { ok: false, findings: [{ kind: 'lighthouse', level: 'error', message: 'npm run build exited 1 — its output is above' }] } };
       await page.act('auditRun');
       expect(docOf(page).querySelector('.card .err')?.textContent).toBe('The build failed — its output is under Setup');

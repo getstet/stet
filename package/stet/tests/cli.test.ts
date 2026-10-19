@@ -656,6 +656,103 @@ describe('the schedule stamp', () => {
   });
 });
 
+describe('publish checks the stored draft the way draft does', () => {
+  const OVER = 'x'.repeat(61);
+  const DUE = '2020-01-01T00:00:00.000Z';
+
+  /** A draft written past the CLI's gate, as an earlier release or another client could. */
+  async function written(store: ReturnType<typeof createMemoryStore>, key: string, value: unknown, extra: object = {}): Promise<void> {
+    ok(await store.saveDraft({ key, value, target: key.startsWith('welcome__') ? 'html-email' : 'web', editor: 'neil', ...extra }));
+  }
+
+  it('publish <key> refuses a draft over a hard limit, exits 1 and publishes nothing', async () => {
+    const store = createMemoryStore({ project: 'default' });
+    await written(store, 'welcome__subject', OVER);
+    const host = makeHost({ store });
+    expect(await host.run('publish', 'welcome__subject', '--editor', 'neil')).toBe(1);
+    expect(host.stderr()).toContain('60-character limit');
+    expect(host.stdout()).not.toContain('published');
+    expect(store.dump().filter((r) => r.is_active)).toHaveLength(0);
+    expect(store.dump().find((r) => r.key === 'welcome__subject')?.state).toBe('draft');
+  });
+
+  it('publish <key> refuses a draft that dropped a required variable', async () => {
+    const store = createMemoryStore({ project: 'default' });
+    await written(store, 'newsletter__body', 'No way out of this list.');
+    const host = makeHost({ store });
+    expect(await host.run('publish', 'newsletter__body', '--editor', 'neil')).toBe(1);
+    expect(host.stderr()).toContain('unsubscribe_url');
+    expect(store.dump().filter((r) => r.is_active)).toHaveLength(0);
+  });
+
+  /** The V1 state: live body carries the variable, the subject draft carries it too, the body draft drops it. */
+  async function bodyOnlyHost(extra: object = {}): Promise<{ host: Host; store: ReturnType<typeof createMemoryStore> }> {
+    const store = createMemoryStore({ project: 'default' });
+    const host = makeHost({ store });
+    const path = join(host.cwd, 'content/descriptor.json');
+    const descriptor = JSON.parse(readFileSync(path, 'utf8'));
+    descriptor.keys['newsletter__subject'].vars = ['unsubscribe_url'];
+    writeFileSync(path, JSON.stringify(descriptor));
+    for (const [key, value] of [['newsletter__body', 'Bye: {{unsubscribe_url}}'], ['newsletter__subject', 'News']] as const) {
+      await written(store, key, value);
+      ok(await store.publish({ key, editor: 'neil' }));
+    }
+    await written(store, 'newsletter__subject', 'News {{unsubscribe_url}}');
+    await written(store, 'newsletter__body', 'Hello again.', extra);
+    return { host, store };
+  }
+
+  it('publish <key> judges a slot without the sibling drafts it does not ship', async () => {
+    const { host, store } = await bodyOnlyHost();
+    expect(await host.run('publish', 'newsletter__body', '--editor', 'neil')).toBe(1);
+    expect(host.stderr()).toContain('unsubscribe_url');
+    expect(store.dump().find((r) => r.key === 'newsletter__body' && r.is_active)?.value).toBe('Bye: {{unsubscribe_url}}');
+  });
+
+  it('publish <key> reads only the key and the slots and postal line its check uses', async () => {
+    const { host, store } = await bodyOnlyHost();
+    const reads: unknown[] = [];
+    const watched = { ...store, read: async (q?: Parameters<typeof store.read>[0]) => (reads.push(q), store.read(q)) };
+    const watching = makeHost({ store: watched });
+    writeFileSync(join(watching.cwd, 'content/descriptor.json'), readFileSync(join(host.cwd, 'content/descriptor.json')));
+    await watching.run('publish', 'newsletter__body', '--editor', 'neil');
+    expect(reads).toEqual([{ keys: ['newsletter__body', 'newsletter__subject', 'brand__footer_address'], preview: true }]);
+  });
+
+  it('publish --due judges a due slot without a sibling draft that is not due', async () => {
+    const { host, store } = await bodyOnlyHost({ publishAt: DUE });
+    expect(await host.run('publish', '--due', '--editor', 'clock')).toBe(1);
+    expect(host.stderr()).toContain('unsubscribe_url');
+    expect(store.dump().find((r) => r.key === 'newsletter__body' && r.is_active)?.value).toBe('Bye: {{unsubscribe_url}}');
+  });
+
+  it('publish --due holds back a due draft that fails and still publishes the rest', async () => {
+    const store = createMemoryStore({ project: 'default' });
+    await written(store, 'welcome__subject', OVER, { publishAt: DUE });
+    await written(store, 'hero_headline', 'Fine', { publishAt: DUE });
+    const host = makeHost({ store });
+    expect(await host.run('publish', '--due', '--editor', 'clock')).toBe(1);
+    expect(host.stderr()).toContain('60-character limit');
+    expect(host.stdout()).toContain('1 published from 2 due draft(s)');
+    expect(store.dump().filter((r) => r.is_active).map((r) => r.key)).toEqual(['hero_headline']);
+    expect(store.dump().find((r) => r.key === 'welcome__subject')?.state).toBe('draft');
+  });
+
+  it('publish --due refuses a due change whole when one member fails, leaving it scheduled', async () => {
+    const store = createMemoryStore({ project: 'default' });
+    const { changeId } = ok(await store.changesets.open({ name: 'spring refresh' }));
+    await written(store, 'hero_headline', 'Fine', { change: changeId });
+    await written(store, 'welcome__subject', OVER, { change: changeId });
+    ok(await store.changesets.schedule({ changeId, publishAt: DUE }));
+    const host = makeHost({ store });
+    expect(await host.run('publish', '--due', '--editor', 'clock')).toBe(1);
+    expect(host.stderr()).toContain('60-character limit');
+    expect(host.stdout()).toContain('0 published from 2 due draft(s)');
+    expect(store.dump().filter((r) => r.is_active)).toHaveLength(0);
+    expect(ok(await store.changesets.get({ changeId })).change.status).toBe('scheduled');
+  });
+});
+
 describe('publish --due', () => {
   it('publishes what is due, leaves what is not, and reports zero as zero', async () => {
     const store = createMemoryStore({ project: 'default' });

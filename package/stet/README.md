@@ -88,7 +88,7 @@ npx stet hook install                    # the pre-commit gate
 - **Lighthouse, with the owner of each failure.** `stet audit lighthouse` runs
   Lighthouse over your declared pages and tags every failing audit as copy to
   write through a key, a head edit `--fix --write` applies, or the site's own
-  markup. It needs Google Chrome.
+  markup. It needs Google Chrome, and Lighthouse installed as a dev dependency.
 - **Page declaration from your routes.** `stet pages scan` reads your
   file-based routing convention, proposes page records with scaffolded SEO
   keys, and writes nothing without `--apply`.
@@ -169,8 +169,13 @@ stdlib-only Python helper ships in the package.
 
 ## Requirements
 
-Node.js 22 or later; `stet audit lighthouse` needs 22.19 or later and Google Chrome. Scanning and adoption use the TypeScript compiler API, so
+Node.js 22 or later; `stet audit lighthouse` needs 22.19 or later, Google Chrome, and three dev dependencies a plain install leaves out:
+`npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. Scanning and adoption use the TypeScript compiler API, so
 projects using those commands need `typescript` 5 or 6 as a dev dependency.
+
+Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
+selfsigned because the lockfile holds them. To drop them, delete their node_modules/ entries from package-lock.json
+and run npm i, or install production with npm ci --omit=dev --omit=peer.
 
 ## Documentation
 
