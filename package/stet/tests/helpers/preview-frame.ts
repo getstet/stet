@@ -9,6 +9,7 @@
  * `display: none` or a closed <details> (outside its summary) has none. The
  * frame's `scrollTo` is recorded. `tests/preview-agent.test.ts` and the
  * conformance walk's `dashboard` section both frame pages through here.
+ * The window pretends to be visual, so animation frames run.
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -34,6 +35,19 @@ export interface Framed {
   send(data: unknown, origin?: string, source?: unknown): void;
   locate(request: Message): Promise<Message | undefined>;
   close(): void;
+}
+
+export interface FrameOptions {
+  /** The tag carries `data-hold`, as the preview proxy writes it on a JavaScript host's page. */
+  hold?: boolean;
+  /** The document is still being parsed: `readyState` reads `loading` and the case dispatches `DOMContentLoaded` and `load` itself. */
+  loading?: boolean;
+  /**
+   * A top-level window at this address under a stand-in parent that records
+   * what is posted to it, at once: a frame's `about:blank` document cannot
+   * push a URL onto its history.
+   */
+  url?: string;
 }
 
 const open: Framed[] = [];
@@ -70,15 +84,36 @@ export const centred = (el: Element): { top: number; behavior: string } => ({ to
  * and, unless null, channel `c1`; `agent` is the script's text, the shipped
  * template's by default.
  */
-export async function frame(body: string, channel: string | null = 'c1', head = '', agent = AGENT): Promise<Framed> {
-  const outer = new JSDOM('<!DOCTYPE html><iframe></iframe>', { url: `${DASHBOARD}/`, runScripts: 'dangerously' });
-  const iframe = outer.window.document.querySelector('iframe') as HTMLIFrameElement;
-  const win = iframe.contentWindow as Window & typeof globalThis;
+export async function frame(
+  body: string,
+  channel: string | null = 'c1',
+  head = '',
+  agent = AGENT,
+  options: FrameOptions = {},
+): Promise<Framed> {
+  const sent: Message[] = [];
+  let win: Window & typeof globalThis;
+  let parent: unknown;
+  let close: () => void;
+  if (options.url === undefined) {
+    const outer = new JSDOM('<!DOCTYPE html><iframe></iframe>', { url: `${DASHBOARD}/`, runScripts: 'dangerously', pretendToBeVisual: true });
+    const iframe = outer.window.document.querySelector('iframe') as HTMLIFrameElement;
+    win = iframe.contentWindow as Window & typeof globalThis;
+    parent = outer.window;
+    outer.window.addEventListener('message', (event) => sent.push(event.data as Message));
+    close = () => outer.window.close();
+  } else {
+    const top = new JSDOM('<!DOCTYPE html>', { url: options.url, runScripts: 'dangerously', pretendToBeVisual: true });
+    win = top.window as unknown as Window & typeof globalThis;
+    parent = { postMessage: (message: Message) => sent.push(message) };
+    Object.defineProperty(win, 'parent', { value: parent, configurable: true });
+    close = () => top.window.close();
+  }
+  // jsdom has no window focus to move; the agent's in-place edit asks for it.
+  win.focus = () => {};
   const doc = win.document;
   doc.head.innerHTML = head;
   doc.body.innerHTML = body;
-  const sent: Message[] = [];
-  outer.window.addEventListener('message', (event) => sent.push(event.data as Message));
   const scrolls: Array<{ top: number; behavior: unknown }> = [];
   win.scrollTo = ((options: { top: number; behavior: unknown }) => {
     scrolls.push({ top: options.top, behavior: options.behavior });
@@ -93,14 +128,18 @@ export async function frame(body: string, channel: string | null = 'c1', head = 
   proto.getClientRects = function (this: Element) {
     return unrendered(this) ? [] : [boxOf(this)];
   };
+  if (options.loading === true) Object.defineProperty(doc, 'readyState', { value: 'loading', configurable: true });
   const script = doc.createElement('script');
   script.setAttribute('data-parent', DASHBOARD);
   if (channel !== null) script.setAttribute('data-channel', channel);
+  if (options.hold === true) script.setAttribute('data-hold', '');
   script.textContent = agent;
   doc.head.appendChild(script);
-  doc.dispatchEvent(new win.Event('DOMContentLoaded'));
-  await tick();
-  const send = (data: unknown, origin = DASHBOARD, source: unknown = outer.window): void => {
+  if (options.loading !== true) {
+    doc.dispatchEvent(new win.Event('DOMContentLoaded'));
+    await tick();
+  }
+  const send = (data: unknown, origin = DASHBOARD, source: unknown = parent): void => {
     win.dispatchEvent(new win.MessageEvent('message', { data, origin, source: source as Window }));
   };
   let seq = 0;
@@ -117,7 +156,13 @@ export async function frame(body: string, channel: string | null = 'c1', head = 
       await tick();
       return sent.slice(before).find((m) => m['stet'] === 'located');
     },
-    close: () => outer.window.close(),
+    // Focus leaves the page while the dashboard window still stands: an edit
+    // the agent ends on the way out posts to a live parent, once its microtask
+    // (the agent looks again after a blur) has run.
+    close: () => {
+      (doc.activeElement as HTMLElement | null)?.blur?.();
+      queueMicrotask(close);
+    },
   };
   open.push(framed);
   return framed;

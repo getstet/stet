@@ -1620,7 +1620,7 @@ async function staticRoute(ctx: DevContext, req: Request, url: URL): Promise<Res
     // disk is never written.
     const read = readFileSync(file);
     const body = file.endsWith('.html')
-      ? Buffer.from(injectAgent(read.toString('latin1'), ctx.origin, previewChannel(ctx), PREVIEW_AGENT_ROUTE), 'latin1')
+      ? Buffer.from(injectAgent(read.toString('latin1'), ctx.origin, previewChannel(ctx), PREVIEW_AGENT_ROUTE, false), 'latin1')
       : read;
     return new Response(req.method === 'HEAD' ? null : new Uint8Array(body), {
       status: 200,

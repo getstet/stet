@@ -5482,6 +5482,13 @@ describe('the static-HTML site’s own files', () => {
     expect(ctx.previewChannel).toBe(preview.channel);
   });
 
+  it('writes no hydration hold on the tag of a static page, which has no hydration to wait for (6.1)', async () => {
+    const { host, handler } = await htmlServerWithContext();
+    const text = await (await handler(req(at(host, ''), { token: null }))).text();
+    expect(text).toMatch(AGENT_TAG);
+    expect(text).not.toContain('data-hold');
+  });
+
   it('serves every other file byte for byte, under the same sandbox', async () => {
     const { host, handler } = await htmlServerWithContext({ 'site.css': 'body { color: #123; } /* é */\n' });
     const css = await handler(req(at(host, 'site.css'), { token: null }));
