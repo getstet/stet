@@ -9,7 +9,7 @@
  * the design, so a fixture that faked either would prove nothing.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -578,6 +578,17 @@ describe('the runner — the send path (D5, stage 5)', () => {
     expect(!result.ok && result.reason).toBe('send-failed');
     expect(!result.ok && result.detail).toContain('Error: provider said no');
     expect(!result.ok && result.detail).toContain('send.ts');
+  });
+
+  it('answers not-renderable for a map with no html member, and loads no send file (D29)', () => {
+    const { host, sent } = sendHost("export const plain = { subject: 'S', body: '<p/>' };\n");
+    const loaded = host.path('send-loaded');
+    host.put('lib/email/send.ts', `require('node:fs').writeFileSync(${JSON.stringify(loaded)}, 'x');\nexport function sendTest(): void {}\n`);
+    const result = sendRender(host, sent, 'plain', {}, { file: 'lib/email/send.ts', export: 'sendTest', message: { to: 'a@b.c', subject: null, template: 't' } });
+    expect(!result.ok && result.reason).toBe('not-renderable');
+    expect(!result.ok && result.detail).toContain('no html member');
+    expect(existsSync(loaded)).toBe(false);
+    expect(existsSync(sent)).toBe(false);
   });
 
   it('answers send-failed where the send export is not a function', () => {

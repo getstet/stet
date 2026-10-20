@@ -7633,7 +7633,7 @@ describe('mount', () => {
 });
 
 /**
- * email-custody: the bulk-adoption pair. Every case drives `runCli`, so the
+ * email-custody: `email extract` and `email verify`. Every case drives `runCli`, so the
  * two-token dispatch, the argument split and the exit codes are part of what is
  * being proven — and the verify cases run against a real git repository,
  * because the before comes from HEAD or it does not come at all.

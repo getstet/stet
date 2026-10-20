@@ -155,6 +155,11 @@ async function run(hostDir, file, exportName, propsJson, opts) {
     }
     if (opts.fill === true) result = fill(result, props);
 
+    // A host function never receives an email the CLI would then call unrenderable:
+    // a map's html member is the email, so a map without one sends nothing.
+    if (opts.send !== undefined && typeof (typeof result === 'string' ? result : result.html) !== 'string') {
+      return { code: NOT_RENDERABLE, err: `${file} ${exportName}: the render is a map with no html member — the email is its html` };
+    }
     if (opts.send !== undefined) {
       const sent = await sendOf(hostDir, opts.send, result);
       if (sent !== null) return sent;

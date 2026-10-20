@@ -24,6 +24,7 @@ import { runDev } from './dev.js';
 import { runDoctor } from './doctor.js';
 import { runEject } from './eject.js';
 import { runEmailExtract } from './email-extract.js';
+import { runEmailRender, runEmailTest } from './email-send.js';
 import { runEmailVerify } from './email-verify.js';
 import { runHookInstall, runHookRemove } from './hook.js';
 import { runInit } from './init.js';
@@ -147,15 +148,17 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return await runPagesScan(rest.slice(1), io);
       }
       case 'email': {
-        // Two-token, like `hook` and `seo`. Both subcommands exist, so a bare
+        // Two-token, like `hook` and `seo`. The subcommands exist, so a bare
         // or misspelled `stet email` lists them rather than guessing at one.
         const sub = rest[0];
         if (sub === 'extract') return await runEmailExtract(rest.slice(1), io);
         if (sub === 'verify') return await runEmailVerify(rest.slice(1), io);
+        if (sub === 'render') return await runEmailRender(rest.slice(1), io);
+        if (sub === 'test') return await runEmailTest(rest.slice(1), io);
         throw new UsageError(
           sub === undefined
-            ? 'stet email extract | stet email verify'
-            : `stet email has two subcommands, extract and verify — got "${sub}"`,
+            ? 'stet email extract | stet email verify | stet email render | stet email test'
+            : `stet email has four subcommands, extract, verify, render and test — got "${sub}"`,
         );
       }
       case 'import':
@@ -282,10 +285,12 @@ export function usage(): string {
     '  hook remove                take this checkout out of the pre-commit gate; the last one out removes it',
     '  agents install             write the agent-routing guidance (AGENTS.md / CLAUDE.md)',
     '',
-    'Email templates (the bulk adoption pair):',
+    'Email templates:',
     '  email extract [paths…] [--apply [names…]]   declare templates: entry, slots, render pointer, shell',
     '      --frame FILE#EXPORT   the host function every proposed template is wrapped in',
     '  email verify [--capture] [--recapture]   render each declared template before and after, and compare the bytes',
+    '  email render <template> [--draft] [--locale L] [--out FILE] [--env E]   the email as it would be sent, drafts applied with --draft',
+    '  email test <template> --to ADDR [--draft] [--locale L] [--env E]   send it to ADDR through the host\'s emailSend function',
     '',
     'Reading (work in every mode):',
     '  check                      descriptor, snapshot and generated files — offline, no store',
@@ -323,7 +328,7 @@ export function usage(): string {
     'Dashboard:',
     '  dev [--port N] [--no-open] [--add PATH]   the local dashboard on 127.0.0.1:4400 over your workspace of checkouts',
     '',
-    'Options: --json on check, scan, seo check, pages scan, list, get, audit, audit lighthouse, doctor, both email commands, and contacts groups, list and get.',
+    'Options: --json on check, scan, seo check, pages scan, list, get, audit, audit lighthouse, doctor, email extract, email verify, and contacts groups, list and get.',
     '  --env <name>             the environments-map connection to run against; check and seo check take none',
     '',
     'Global flags:',

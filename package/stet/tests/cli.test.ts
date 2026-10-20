@@ -2037,7 +2037,7 @@ describe('dispatch', () => {
     const host = makeHost();
     expect(await host.run('help')).toBe(0);
     expect(host.stdout()).toContain(
-      'Options: --json on check, scan, seo check, pages scan, list, get, audit, audit lighthouse, doctor, both email commands, and contacts groups, list and get.',
+      'Options: --json on check, scan, seo check, pages scan, list, get, audit, audit lighthouse, doctor, email extract, email verify, and contacts groups, list and get.',
     );
   });
 
@@ -3335,7 +3335,7 @@ describe('per-command help', () => {
   it('reads every command word out of the usage', () => {
     expect(commands).toEqual([
       'init', 'scan', 'register', 'remove', 'rename', 'merge', 'split', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
-      'email extract', 'email verify', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
+      'email extract', 'email verify', 'email render', 'email test', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
       'seed', 'pull', 'audit', 'audit lighthouse', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
       'contacts export', 'contacts erase', 'contacts suppress', 'contacts import', 'contacts group add',
       'contacts group open', 'contacts group close', 'dev',
@@ -3428,7 +3428,7 @@ describe('per-command help', () => {
   it('guesses nothing: an unlisted word falls to the dispatch, and --help after -- is an argument', async () => {
     const nope = makeHost();
     expect(await nope.run('email', 'nope', '--help')).toBe(2);
-    expect(nope.stderr()).toContain('stet email has two subcommands');
+    expect(nope.stderr()).toContain('stet email has four subcommands');
 
     const get = makeHost({ config: { project: 't' } });
     expect(await get.run('get', '--', '--help')).toBe(1);
