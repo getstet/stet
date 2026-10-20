@@ -211,6 +211,20 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
 .lhi code{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;color:hsl(var(--mf))}
 .lhmsg{white-space:pre-wrap;overflow-wrap:anywhere}
 @media(max-width:760px){.lhbar .btn,.lhbar .tg button,.lhi .btn{min-height:36px;padding:6px 12px}}
+.bdg.wr{white-space:normal;overflow-wrap:anywhere}
+.cnt.amb{color:hsl(var(--am));font-weight:600}
+#panenote>div+div{margin-top:3px}
+#panepick,#paneinfo{padding:6px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px}
+#panepick .btn{margin:5px 5px 0 0}
+#paneinfo .hl{margin-bottom:3px}
+#paneinfo .cards{padding:6px 0 0;border-bottom:0}
+#hoverlabel,#counter{position:fixed;z-index:20;pointer-events:none;border-radius:5px;padding:2px 7px;font-size:11px;white-space:nowrap}
+#hoverlabel{background:hsl(var(--pri));color:hsl(var(--pf))}
+#counter{background:hsl(var(--card));border:1px solid hsl(var(--bd))}
+#popover{position:fixed;z-index:21;width:320px;max-width:calc(100vw - 16px);background:hsl(var(--card));border:1px solid hsl(var(--bd));
+ border-radius:var(--r);box-shadow:0 6px 24px hsl(0 0% 0% / .18);padding:8px}
+#popover .ph{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;margin-bottom:5px;overflow-wrap:anywhere}
+#popover .muted{font-size:11px;margin-top:4px}
 </style>
 </head>
 <body data-theme="light">
@@ -244,10 +258,15 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
     <div class="tabs" id="tabs"></div>
     <div class="wrap" id="work"><div id="main"></div>
       <div id="grip" role="separator" aria-orientation="vertical" aria-controls="main" tabindex="0" aria-label="Resize the key column" title="Drag to resize the key column. Double-click to restore its width."></div>
-      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
+      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panepick" hidden></div><div id="paneinfo" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
   </main>
 </div>
 <div id="tst"></div>
+<div id="hoverlabel" hidden></div>
+<div id="counter" class="cnt" hidden></div>
+<div id="popover" hidden><div class="ph"><span class="mono" id="popkey"></span><span class="cnt" id="popcount"></span></div>
+  <textarea class="in" id="poptext" rows="2"></textarea>
+  <div class="muted">Enter keeps it · Esc puts it back</div></div>
 <script nonce="__STET_NONCE__">
 // The local dashboard. Everything on this page is a call to a route on the
 // server that served it, and every route is a call the CLI already makes.
@@ -360,7 +379,31 @@ const S = {
   located: null,
   confirmed: new Set(),
   saveCheck: null,
+  // Who owns the frame: Edit on the Content tab, else Use.
+  mode: 'edit',
+  // The open in-place edit, { key, locale, entry, form, before, rect }: the
+  // locale is the selector's when it started, and every proposal is pinned to it.
+  edit: null,
+  // Per '<locale> <key>', the stored value the first keystroke of a draft started from.
+  base: {},
+  // The agent's last census, and what every census of this site has found in this tab (`seen`).
+  census: null,
+  seen: { keys: new Set(), routes: new Set(), read: new Set() },
+  // The frame's hover, an ambiguous pick's keys, the dashboard's field over the frame.
+  hover: null,
+  choose: null,
+  popover: null,
+  // The unread-key scan, the open route's reads, a click on text no key matches,
+  // the key a pick warned about, the route the app moved to, and Page info's panel.
+  usage: null,
+  routeReads: null,
+  unmanaged: null,
+  warn: null,
+  moved: null,
+  pageInfo: false,
 };
+// What each site's censuses found, for the life of the tab.
+const SEEN = new Map();
 
 /** The page's one own-property test, for every map it did not build itself. */
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
@@ -406,13 +449,11 @@ const storeBacked = () => !!(ready() && S.site.mode !== 'snapshot');
 const keyDef = (id) => (ready() && Object.prototype.hasOwnProperty.call(S.site.descriptor.keys, id))
   ? S.site.descriptor.keys[id] : null;
 
-/** The value shown for a key: the unsaved edit, else the snapshot's. */
+/** The value shown for a key: the unsaved edit, else the stored one. */
 function valueOf(id, locale) {
   const loc = locale || S.locale;
   const held = S.draft[loc + ' ' + id];
-  if (held !== undefined) return held;
-  const block = (S.site && S.site.snapshot && S.site.snapshot[loc]) || {};
-  return Object.prototype.hasOwnProperty.call(block, id) ? block[id] : undefined;
+  return held !== undefined ? held : storedValue(id, loc);
 }
 /** The default locale's value, for the fallback line a translated key shows. */
 function defaultValue(id) {
@@ -470,19 +511,40 @@ const edited = (id) => S.draft[S.locale + ' ' + id] !== undefined || own(S.tmpl,
 const edits = () => Object.keys(S.draft).length + Object.keys(S.tmpl).length;
 const dirty = () => edits() > 0;
 /** The value a locale's snapshot holds for a key, or undefined. */
-function savedValue(id, locale) {
-  const block = (S.site && S.site.snapshot && own(S.site.snapshot, locale)) ? S.site.snapshot[locale] : {};
+function storedValue(id, loc) {
+  const block = (S.site && S.site.snapshot && own(S.site.snapshot, loc)) ? S.site.snapshot[loc] : {};
   return own(block, id) ? block[id] : undefined;
 }
-/** A draft typed back to the saved value is no draft: it leaves the map, so Save greys again. */
-function setDraft(id, value) {
-  const k = S.locale + ' ' + id;
-  const saved = savedValue(id, S.locale);
-  // A locale with no saved value reads as empty: typing and then clearing leaves no draft.
+/**
+ * A key's draft in one locale. A draft typed back to the stored value is no
+ * draft: it leaves the map with its base, so Save greys again. A locale with no
+ * stored value reads as empty: typing and then clearing leaves no draft.
+ */
+function setDraftIn(loc, id, value) {
+  const k = loc + ' ' + id;
+  const saved = storedValue(id, loc);
   const same = saved === undefined ? value === '' : JSON.stringify(value) === JSON.stringify(saved);
-  if (same) delete S.draft[k];
-  else S.draft[k] = value;
+  if (same) { delete S.draft[k]; delete S.base[k]; }
+  else {
+    // The base is the stored value the first keystroke of this edit started from (§4.7).
+    if (!own(S.base, k)) S.base[k] = saved === undefined ? null : saved;
+    S.draft[k] = value;
+  }
   draftChanged();
+}
+function setDraft(id, value) { setDraftIn(S.locale, id, value); }
+/** A key's value with one list entry or record field replaced by `text`; the text itself for a plain value. */
+function withEntry(id, loc, entry, text) {
+  const held = S.draft[loc + ' ' + id];
+  const value = held !== undefined ? held : storedValue(id, loc);
+  if (Array.isArray(value) && typeof entry === 'number') { const next = value.slice(); next[entry] = text; return next; }
+  if (value && typeof value === 'object' && typeof entry === 'string') return Object.assign({}, value, { [entry]: text });
+  return text;
+}
+/** Every draft dropped, and each base with it. */
+function dropDrafts() {
+  S.draft = {};
+  S.base = {};
 }
 
 // --- loading ----------------------------------------------------------------
@@ -500,9 +562,12 @@ async function loadWorkspace() {
 }
 
 async function loadSite(path) {
+  // An edit open in the last project ends kept, as a locale switch ends one.
+  endEdit();
+  closePopover();
   S.path = path;
   history.replaceState(null, '', siteUrl(path));
-  S.draft = {};
+  dropDrafts();
   S.findings = [];
   S.pending = [];
   S.message = '';
@@ -521,6 +586,8 @@ async function loadSite(path) {
   S.located = null;
   S.saveCheck = null;
   S.confirmed = new Set();
+  S.census = null; S.hover = null; S.choose = null; S.usage = null; S.routeReads = null; routeReadsFor = null;
+  S.unmanaged = null; S.warn = null; S.moved = null; S.pageInfo = false;
   // A new checkout is a new route field and a new frame, and ends any start
   // wait still running for the last one.
   paneGen += 1;
@@ -530,6 +597,7 @@ async function loadSite(path) {
   S.site = res.body;
   S.env = 'default';
   S.pending = Array.isArray(S.site.pending) ? S.site.pending : [];
+  S.seen = seenOf(S.site.id);
   if (ready()) {
     // Awaited before the first group is chosen: the marks decide the groups,
     // and a group chosen before they arrive would be one they dissolve.
@@ -550,8 +618,25 @@ async function loadSite(path) {
   }
   render();
   if (ready()) void guard(loadPreview());
+  if (ready()) void guard(loadUsage());
   if (previewBranch() && S.site.git.upstream) void guard(loadPreviewLink());
   if (S.tab === 'SEO' && ready()) void guard(pollAudit());
+}
+
+/** What this tab's censuses of one site have found: the keys, the routes visited, and the routes whose reads answered complete. */
+function seenOf(id) {
+  if (!SEEN.has(id)) SEEN.set(id, { keys: new Set(), routes: new Set(), read: new Set() });
+  return SEEN.get(id);
+}
+
+/** The unread-key scan, read after the site and after every save; a site without the compiler answers none. */
+async function loadUsage() {
+  const path = S.path;
+  const res = await api('/api/site/usage' + query());
+  if (path !== S.path) return;
+  S.usage = res.ok && res.body && typeof res.body.keys === 'object' ? res.body : null;
+  // The site line above the list comes and goes with the scan: the column is painted whole.
+  render();
 }
 
 async function loadMarks() {
@@ -947,28 +1032,44 @@ function keyList() {
     ? chooser('group', all.map((g) => g.id), S.group, 'gsel', undefined, all.map((g) => g.label))
     : '';
   const localeSelector = locales.length > 1 ? chooser('locale', locales, S.locale, 'lsel') : '';
+  const line = siteLine();
   return '<div class="card"><div class="ch" style="display:block">' +
     '<div style="display:flex;justify-content:space-between;align-items:center"><h3>Keys</h3>' +
     '<span class="bdg">' + items.length + '</span></div>' + selector + localeSelector +
     '<input class="in sm" id="ksearch" style="margin-top:6px" placeholder="Search…" value="' + esc(S.q) + '" data-act-input="search"></div>' +
-    '<div class="scroll">' + (items.length === 0
-      ? '<div class="cb muted">No keys.</div>'
-      : items.map((id) => {
-        const def = keyDef(id) || {};
-        const value = shownValue(id);
-        const kinds = kindsOf(id);
-        const badge = edited(id) ? '<span class="bdg d">edited</span>'
-          : def.shape === 'media' ? '<span class="bdg">img</span>'
-            : def.shape === 'richtext' ? '<span class="bdg">rich</span>'
-              : def.shape === 'list' ? '<span class="bdg b">list</span>'
-                : def.shape === 'record' ? '<span class="bdg b">record</span>'
-                  : '';
-        const group = S.q ? '<span class="bdg">' + esc((all.find((g) => g.keys.indexOf(id) !== -1) || {}).label || '') + '</span>' : '';
-        return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
-          '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + healthBadge(id) + group + '</span>' +
-          '<span class="s">' + (kinds.length === 0 ? '' : '<span class="kd">' + esc(kinds.join(' · ')) + '</span>') +
-          '<span class="v">' + esc(rowPreview(value)) + '</span></span></button>';
-      }).join('')) + '</div></div>';
+    (line === '' ? '' : '<p class="note" id="siteline" style="margin:8px 12px">' + esc(line) + '</p>') +
+    '<div class="scroll" id="keyrows">' + keyRows(items) + '</div></div>';
+}
+/** The key list's rows, each with its badges; repainted on its own as a census or the scan answers. */
+function keyRows(items) {
+  const all = groups();
+  if (items.length === 0) return '<div class="cb muted">No keys.</div>';
+  return items.map((id) => {
+    const def = keyDef(id) || {};
+    const value = shownValue(id);
+    const kinds = kindsOf(id);
+    const badge = edited(id) ? '<span class="bdg d">edited</span>'
+      : def.shape === 'media' ? '<span class="bdg">img</span>'
+        : def.shape === 'richtext' ? '<span class="bdg">rich</span>'
+          : def.shape === 'list' ? '<span class="bdg b">list</span>'
+            : def.shape === 'record' ? '<span class="bdg b">record</span>'
+              : '';
+    const group = S.q ? '<span class="bdg">' + esc((all.find((g) => g.keys.indexOf(id) !== -1) || {}).label || '') + '</span>' : '';
+    return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
+      '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + healthBadge(id) + usageBadges(id) + group + '</span>' +
+      '<span class="s">' + (kinds.length === 0 ? '' : '<span class="kd">' + esc(kinds.join(' · ')) + '</span>') +
+      '<span class="v">' + esc(rowPreview(value)) + '</span></span></button>';
+  }).join('');
+}
+// The rows last painted, and where: a render builds a fresh list, which is painted anew.
+let keyRowsShown = { box: null, html: '' };
+function paintKeyRows() {
+  const box = document.getElementById('keyrows');
+  if (!box || !ready()) return;
+  const html = keyRows(listedKeys());
+  if (box === keyRowsShown.box && html === keyRowsShown.html) return;
+  box.innerHTML = html;
+  keyRowsShown = { box: box, html: html };
 }
 
 /**
@@ -995,6 +1096,59 @@ function healthBadge(id) {
 function unreadSlots() {
   const findings = (S.health && S.health.scan && S.health.scan.findings) || [];
   return findings.filter((f) => f.slot !== undefined);
+}
+
+// --- the unread-key badge -------------------------------------------------------
+// The scan (`GET /api/site/usage`) says which keys no source file names; the
+// censuses of the pages the preview visited say whether any page shows them.
+/** A route as the page list and the census compare it: no query, no trailing slash but the root's. */
+const routePath = (route) => {
+  const path = String(route).replace(/[?#].*$/, '');
+  return path.length > 1 ? path.replace(/\/+$/, '') : path;
+};
+/** The pages a leftover must be missing from: the declared pages at a static route, or each marked document. */
+function pageList() {
+  const routes = htmlHost()
+    ? S.marks.documents.map((d) => d.route)
+    : Object.values(S.site.descriptor.pages || {}).map((p) => p.route).filter((r) => typeof r === 'string' && STATIC_ROUTE.test(r));
+  return [...new Set(routes.map(routePath))];
+}
+/** A page counts as checked once a census came from it and its reads answered complete. */
+const checked = (route) => S.seen.routes.has(route) && S.seen.read.has(route);
+/** The line above the key list while a read stet cannot follow stands: up to three, then the rest as a count. */
+function siteLine() {
+  const causes = (S.usage && Array.isArray(S.usage.causes)) ? S.usage.causes : [];
+  if (causes.length === 0) return '';
+  return 'This site reads some keys in ways stet cannot follow, so it cannot say which keys are unread: ' +
+    causes.slice(0, 3).map((c) => c.text + ' at ' + c.file + ':' + c.line).join(', ') +
+    (causes.length > 3 ? ' and ' + (causes.length - 3) + ' more' : '');
+}
+/** A key's badge, `{ row, note: [lines] }`, or null for a key read, excluded, or not yet judged. */
+function badgeOf(id) {
+  const usage = S.usage;
+  if (!usage || !usage.keys || !own(usage.keys, id)) return null;
+  const judged = usage.keys[id];
+  if (judged.state === 'unknown') {
+    const at = judged.prefix;
+    return { row: 'unknown', note: [at ? id + ' starts with ' + at.prefix + ', which ' + at.file + ':' + at.line +
+      ' reads without naming each key, so whether it is read is unknown.' : siteLine()] };
+  }
+  if (judged.state !== 'not_found') return null;
+  const scope = 'not found in any file stet searched (' + plural(usage.files, 'file') + ' in ' + usage.root + ')';
+  // A key an email or only server code reads never shows on a page, so no visit can tell it is a leftover.
+  const upgradable = (keyDef(id) || {}).target !== 'html-email' && (usage.serverOnly || []).indexOf(id) === -1;
+  const pages = pageList();
+  const left = pages.filter((route) => !checked(route)).length;
+  if (upgradable && pages.length > 0 && left === 0 && !S.seen.keys.has(id)) return { row: 'may be a leftover', note: ['may be a leftover'] };
+  return { row: scope, note: upgradable && left > 0 ? [scope, left + ' of ' + pages.length + ' pages not yet checked'] : [scope] };
+}
+/** A row's scan badge, and `not shown on this page` for a key of the open route the last census did not find. */
+function usageBadges(id) {
+  const badge = badgeOf(id);
+  const route = keyRoute(id);
+  const missing = S.census !== null && route !== null && routePath(route) === routePath(shownRoute(S.census.route)) && !own(S.census.found, id);
+  return (badge === null ? '' : '<span class="bdg wr">' + esc(badge.row) + '</span>') +
+    (missing ? '<span class="bdg wr">not shown on this page</span>' : '');
 }
 const healthStamp = () => (S.health && S.health.at && S.health.at.head) ? S.health.at.head : null;
 
@@ -1048,7 +1202,7 @@ function editorCard() {
     '<span class="bdg">' + esc(def.shape || 'text') + '</span>' +
     (edited(id) ? '<span class="bdg d">edited</span>' : '') +
     (S.locale !== 'default' ? '<span class="bdg b">' + esc(S.locale) + '</span>' : '') +
-    '</span></div>' + kindLine(id) + placeList(id);
+    '</span></div>' + kindLine(id) + sharedBlock(id) + placeList(id);
 
   const fallback = (S.locale !== 'default' && value === undefined && defaultValue(id) !== undefined)
     ? '<div class="inf">falls back to default — ' + esc(String(shown(defaultValue(id))).slice(0, 90)) + '</div>'
@@ -1072,6 +1226,26 @@ function kindLine(id) {
   if (def.derivesFrom !== undefined) lines.push('derived from: ' + named(def.derivesFrom));
   for (const dep of dependents(id)) lines.push('feeds: ' + named(dep));
   return lines.length === 0 ? '' : '<div class="kline">' + lines.map((line) => '<div>' + line + '</div>').join('') + '</div>';
+}
+/**
+ * A key shown more than once on this page, said before the first keystroke:
+ * the count the census matched, else the marks route's, and the marks route's places.
+ */
+function sharedLine(id) {
+  const places = placesOf(id);
+  const found = S.census !== null && own(S.census.found, id) ? S.census.found[id] : 0;
+  const n = found > 0 ? found : places.length;
+  if (n < 2) return '';
+  return 'Shown in ' + n + ' places on this page' + places.map((p) => ' · ' + p.file + ':' + p.line).join('');
+}
+function sharedBlock(id) {
+  const line = sharedLine(id);
+  return '<div id="shared"' + (line === '' ? '>' : ' class="kline">' + esc(line)) + '</div>';
+}
+/** The shared-spots line, repainted on its own as a census answers. */
+function paintShared() {
+  const box = document.getElementById('shared');
+  if (box && S.sel !== null) box.outerHTML = sharedBlock(S.sel);
 }
 /** A key shown in several places, each place listed with the offer to give it its own key. */
 function placeList(id) {
@@ -1338,6 +1512,8 @@ function paintPane() {
   if (!content) return;
   paintPaneHead();
   paintPaneNote();
+  paintPanePick();
+  paintPageInfo();
   paintPaneCards();
   const state = paneState();
   // A frame is rebuilt only when its sandbox must change; a new route is a navigation of the same frame.
@@ -1374,13 +1550,16 @@ function paintPaneHead() {
     document.getElementById('panehead').innerHTML =
       '<div class="ch"><div style="display:flex;gap:6px;align-items:center"><span id="panelead"></span>' +
       '<label class="muted" style="font-size:11px;display:flex;gap:6px;align-items:center">Route' +
-      '<input class="in sm mono" id="route" aria-label="Route" style="width:160px;flex:none" data-act-change="route"></label></div>' +
+      '<input class="in sm mono" id="route" aria-label="Route" style="width:160px;flex:none" data-act-change="route"></label>' +
+      '<span class="muted mono" id="panemoved" style="font-size:11px"></span></div>' +
       '<div id="panetools" style="display:flex;gap:6px;align-items:center"></div></div>';
     paneLeadShown = null;
     paneToolsShown = null;
   }
   const field = document.getElementById('route');
   if (document.activeElement !== field && field.value !== S.route) field.value = S.route;
+  // The app's own navigation is named beside the field; the field keeps the route typed.
+  document.getElementById('panemoved').textContent = S.moved === null ? '' : 'The app moved to ' + S.moved;
   const lead = '<button class="btn sm" data-act="keys">' + (S.keysOpen ? 'Hide keys' : 'Show keys') + '</button>';
   if (lead !== paneLeadShown) { document.getElementById('panelead').innerHTML = lead; paneLeadShown = lead; }
   const tools = paneTools();
@@ -1392,7 +1571,10 @@ function paneTools() {
   const dev = S.site.host !== 'html';
   const log = S.devlog || {};
   const running = log.state === 'running' || log.state === 'detached';
-  return '<div class="tg">' + PRESETS.map((preset) => '<button class="' + (S.width === preset[0] ? 'on' : '') +
+  return '<div class="tg">' + [['edit', 'Edit'], ['use', 'Use']].map((m) => '<button class="' + (S.mode === m[0] ? 'on' : '') +
+      '" data-act="mode:' + m[0] + '">' + m[1] + '</button>').join('') + '</div>' +
+    '<button class="btn sm' + (S.pageInfo ? ' pri' : '') + '" data-act="pageInfo">Page info</button>' +
+    '<div class="tg">' + PRESETS.map((preset) => '<button class="' + (S.width === preset[0] ? 'on' : '') +
       '" data-act="width:' + preset[0] + '">' + preset[1] + '</button>').join('') + '</div>' +
     '<span class="muted mono" style="font-size:11px" id="panewidth"></span>' +
     '<button class="btn sm" data-act="previewLoad">Reload</button>' +
@@ -1444,6 +1626,7 @@ function paneBody(state) {
  * pages the server regenerated; a dev server reloads its own page after a save.
  */
 async function loadPreview(opts) {
+  if (opts && opts.reload) S.moved = null;
   S.preview = (await api('/api/site/preview' + query() + '&route=' + encodeURIComponent(S.route))).body;
   const kept = paneShown;
   render();
@@ -1455,6 +1638,28 @@ async function loadPreview(opts) {
       frame.setAttribute('src', S.preview.url);
     }
   }
+  await loadRouteReads(S.route);
+}
+
+/**
+ * The keys the files of one route read (`GET /api/site/route-reads`), read on
+ * every route change. A route whose reads are incomplete or failed never counts
+ * as checked for the badge, and never warns that no file reads a key.
+ */
+let routeReadsFor = null; // the route the last reads were asked for, so a census asks once per route
+async function loadRouteReads(route) {
+  const path = S.path;
+  routeReadsFor = routePath(route);
+  const res = await api('/api/site/route-reads' + query() + '&route=' + encodeURIComponent(route));
+  if (path !== S.path) return;
+  const reads = res.ok && res.body && Array.isArray(res.body.keys) ? res.body : null;
+  S.routeReads = reads === null ? null : { route: routePath(route), keys: reads.keys, complete: reads.complete === true };
+  if (reads !== null) {
+    if (reads.complete === true) S.seen.read.add(routePath(route));
+    else S.seen.read.delete(routePath(route));
+  }
+  paintKeyRows();
+  paintPaneNote();
 }
 
 const STATIC_ROUTE = /^\/[^\[\]:*]*$/;
@@ -1491,6 +1696,7 @@ function groupRoute(id) {
 function moveTo(known) {
   if (known === null || known === S.route) return;
   S.route = known;
+  S.moved = null;
   void guard(loadPreview());
 }
 
@@ -1527,12 +1733,16 @@ function postToPreview(message) {
   // that reaches it; the dev pane's is its proxy's origin.
   win.postMessage(message, S.preview.static ? '*' : new URL(S.preview.url).origin);
 }
-/** Every string a key renders as saved: a text value, each list entry, each string field. */
-function renderedTexts(id) {
+/** A key's saved value as the selected locale renders it: its own, else the default locale's. */
+function renderedValue(id) {
   const snapshot = S.site.snapshot || {};
   const block = own(snapshot, S.locale) ? snapshot[S.locale] : {};
   const fallback = own(snapshot, S.site.config.locales.default) ? snapshot[S.site.config.locales.default] : {};
-  const value = own(block, id) ? block[id] : own(fallback, id) ? fallback[id] : undefined;
+  return own(block, id) ? block[id] : own(fallback, id) ? fallback[id] : undefined;
+}
+/** Every string a key renders as saved: a text value, each list entry, each string field. */
+function renderedTexts(id) {
+  const value = renderedValue(id);
   if (typeof value === 'string') return [value];
   if (Array.isArray(value)) return value.filter((v) => typeof v === 'string');
   if (value && typeof value === 'object') return Object.values(value).filter((v) => typeof v === 'string');
@@ -1562,7 +1772,8 @@ function locateKey(scroll) {
     texts: renderedTexts(S.sel),
     draft: typeof held === 'string' ? held : null,
     scroll: scroll,
-    guess: !S.confirmed.has(S.sel),
+    // Dashed where a match is a guess, and where no file of the route reads the key.
+    guess: !S.confirmed.has(S.sel) || S.warn === S.sel,
     ...(def.tags === undefined ? {} : { tags: def.tags }),
   });
 }
@@ -1574,6 +1785,13 @@ function draftChanged() {
 /** A document loaded in the frame: it is asked to announce itself, and one that stays silent cannot be highlighted. */
 function previewLoaded() {
   agentReady = false;
+  // A new document: the last census, the hover, an open edit and the field over the frame were the last page's.
+  S.census = null;
+  S.hover = null;
+  S.edit = null;
+  closePopover();
+  paintPopover();
+  paintHover();
   postToPreview({ stet: 'hello' });
   clearTimeout(agentTimer);
   agentTimer = setTimeout(() => {
@@ -1618,6 +1836,8 @@ window.addEventListener('message', (event) => {
   } else if (data.stet === 'ready') {
     agentReady = true;
     clearTimeout(agentTimer);
+    postToPreview({ stet: 'mode', mode: S.mode });
+    postCensus();
     if (S.located && S.located.unavailable) S.located = null;
     if (S.saveCheck) verifyNow();
     else locateKey(scrollNext);
@@ -1644,21 +1864,94 @@ window.addEventListener('message', (event) => {
     const hardcoded = (check && data.found > 0) || (S.located && S.located.key === data.key && S.located.hardcoded === true);
     S.located = Object.assign({}, data, hardcoded ? { hardcoded: true } : {}, structuredDraft() ? { draft: 'after-save' } : {});
     paintPaneNote();
+  } else if (data.stet === 'typed') {
+    // A proposal for the open edit only: its key, its locale, its entry.
+    const e = S.edit;
+    if (!e || data.key !== e.key || data.locale !== e.locale || data.entry !== e.entry || typeof data.value !== 'string') return;
+    setDraftIn(e.locale, e.key, e.entry === undefined ? data.value : withEntry(e.key, e.locale, e.entry, data.value));
+    paintPopover();
+    paintDraft(e.key);
+  } else if (data.stet === 'edited') {
+    const e = S.edit;
+    if (!e || data.key !== e.key || data.locale !== e.locale) return;
+    S.edit = null;
+    if (data.how === 'cancel') {
+      if (e.before === undefined) { delete S.draft[e.locale + ' ' + e.key]; delete S.base[e.locale + ' ' + e.key]; }
+      else S.draft[e.locale + ' ' + e.key] = e.before;
+      draftChanged();
+    } else if (data.how === 'lost') {
+      if (data.proposed !== true && e.before === undefined) { delete S.draft[e.locale + ' ' + e.key]; delete S.base[e.locale + ' ' + e.key]; }
+      S.located = Object.assign({}, S.located, { key: e.key, redrawn: true });
+      openPopover(e.key, e.locale, e.entry, e.rect);
+      if (S.popover !== null) S.popover.redrawn = true;
+    }
+    paintPopover();
+    render();
+  } else if (data.stet === 'key' && data.which === 'save') {
+    // The frame's Cmd/Ctrl-S moves focus to Save. It never saves: a press of the button does.
+    // A frame that does not hold focus has no key to answer, so a forged message cannot take the next keypress.
+    if (document.activeElement !== document.querySelector('#devwrap iframe')) return;
+    focusSave();
+  } else if (data.stet === 'key' && data.which === 'mode') {
+    setMode(S.mode === 'edit' ? 'use' : 'edit');
+  } else if (data.stet === 'key' && data.which === 'escape') {
+    endSelection();
+  } else if (data.stet === 'pick') {
+    onPick(data);
+  } else if (data.stet === 'hover') {
+    onHover(data);
+  } else if (data.stet === 'rect') {
+    onRect(data);
+  } else if (data.stet === 'unmanaged') {
+    onUnmanaged(data);
+  } else if (data.stet === 'census') {
+    onCensus(data);
+  } else if (data.stet === 'moved') {
+    onMoved(data);
   }
 });
-/** One line under the pane header: the key is not on this page or hidden on it, its draft waits for Save, or the page cannot be highlighted. */
+
+/**
+ * The lines under the pane header: the page cannot be highlighted; or a click
+ * found no key, and what the route reads that the census did not find; or, for
+ * the selected key, that an edit moved to a field, where it shows or that it is
+ * not on this page, hidden or shown after Save, that no file of the route reads
+ * it, and what the unread-key scan says of it.
+ */
 function paintPaneNote() {
   const note = document.getElementById('panenote');
   const at = S.located;
-  let line = '';
-  if (at && at.unavailable) line = 'Highlighting is not available on this page.';
-  else if (S.sel !== null && whereLine(S.sel) !== '') line = whereLine(S.sel);
-  else if (at && at.key === S.sel && at.hardcoded) line = "The outlined text does not come from stet — the page's template writes it out itself, so saving " + S.sel + ' does not change it.';
-  else if (at && at.key === S.sel && at.found === 0) line = S.sel + ' was not found on ' + shownRoute(at.route) + '.';
-  else if (at && at.key === S.sel && at.hidden === true) line = S.sel + ' is on this page but hidden, so the preview cannot show it.';
-  else if (at && at.key === S.sel && at.draft === 'after-save') line = 'This draft is shown after Save.';
-  note.hidden = line === '';
-  note.textContent = line;
+  const lines = [];
+  // While the key is typed in place its element no longer holds the saved text, so a look finds nothing there.
+  const typing = S.edit !== null && S.edit.key === S.sel;
+  if (at && at.unavailable) lines.push('Highlighting is not available on this page.');
+  else if (S.unmanaged !== null) {
+    lines.push('No key matches this text.');
+    const unfound = unfoundKeys();
+    if (unfound.length > 0) lines.push('Keys this page reads that were not found: ' + unfound.join(', ') + '.');
+  } else if (S.sel !== null) {
+    if ((at && at.key === S.sel && at.redrawn) || (S.popover !== null && S.popover.key === S.sel && S.popover.redrawn)) {
+      lines.push('The page redrew this text, so the edit moved to a field.');
+    }
+    let line = '';
+    if (whereLine(S.sel) !== '') line = whereLine(S.sel);
+    else if (at && at.key === S.sel && at.hardcoded) line = "The outlined text does not come from stet — the page's template writes it out itself, so saving " + S.sel + ' does not change it.';
+    else if (at && at.key === S.sel && at.found === 0 && !typing) line = S.sel + ' was not found on ' + shownRoute(at.route) + '.';
+    else if (at && at.key === S.sel && at.hidden === true) line = S.sel + ' is on this page but hidden, so the preview cannot show it.';
+    else if (at && at.key === S.sel && at.draft === 'after-save') line = 'This draft is shown after Save.';
+    if (line !== '') lines.push(line);
+    if (S.warn === S.sel) lines.push('This text matches ' + S.sel + ', but no file on this page reads that key — saving may not change it.');
+    const badge = badgeOf(S.sel);
+    if (badge !== null) {
+      lines.push(...badge.note);
+    }
+    const prefixes = S.usage && Array.isArray(S.usage.prefixes) ? S.usage.prefixes : [];
+    if (prefixes.length > 0) {
+      lines.push('Key prefixes read without naming each key: ' + prefixes.map((p) => p.prefix + ' (' + p.file + ':' + p.line + ')').join(', '));
+    }
+  }
+  note.hidden = lines.length === 0;
+  note.innerHTML = lines.map((line) => '<div>' + esc(line) + '</div>').join('');
 }
 const WHERE = {
   'page title': 'as the page title, in the browser tab and in search results',
@@ -1683,6 +1976,8 @@ function whereLine(id) {
   const sourceKind = def.derivesFrom === undefined ? undefined : kindsOf(def.derivesFrom)[0];
   const follows = def.derivesFrom === undefined ? ''
     : 'It follows ' + def.derivesFrom + (sourceKind === undefined ? '' : ' (' + sourceKind + ')') + ', outlined dashed on the page.';
+  const head = headOnly(id);
+  if (!unseen(id) && head.length > 0 && follows === '') return id + ' appears ' + head.map((kind) => WHERE[kind]).join(', and ') + '. It is not part of the page’s visible text.';
   if (!unseen(id)) return follows === '' ? '' : id + ' is derived. ' + follows;
   const where = kindsOf(id).map((kind) => WHERE[kind]);
   return id + ' appears ' + where.join(', and ') + '. ' + (follows || 'It is not part of the page’s visible text.');
@@ -1738,22 +2033,26 @@ function headOf(id) {
   }
   return null;
 }
-/** The search result and the share card beside the pane, from each key's shown value — a draft as it is typed. */
-function paintPaneCards() {
-  const box = document.getElementById('panecards');
-  if (!box) return;
-  const head = ready() && S.sel !== null ? headOf(S.sel) : null;
+/** The search result and the share card for a page's head keys, from each key's shown value — a draft as it is typed. */
+function cardsHtml(head) {
   const text = (key) => {
     // A key with no value in this locale shows the default locale's, as the site renders it.
     let value = key === null ? undefined : shownValue(key);
     if (value === undefined && key !== null) value = shownValue(key, S.site.config.locales.default);
     return value === undefined || value === '' ? '<span class="muted">—</span>' : esc(shown(value));
   };
-  const html = head === null ? '' : '<div class="cards">' +
+  return '<div class="cards">' +
     '<div class="serp"><div class="lb">Search result</div><div class="u mono">' + esc(head.route) + '</div>' +
     '<div class="tt">' + text(head.title) + '</div><div class="ds">' + text(head.description) + '</div></div>' +
     '<div class="share"><div class="lb">Share card</div><div class="u mono">' + esc(head.route) + '</div>' +
     '<div class="tt">' + text(head.shareTitle) + '</div><div class="ds">' + text(head.shareDescription) + '</div></div></div>';
+}
+/** The search result and the share card beside the pane, for the selected key's page. */
+function paintPaneCards() {
+  const box = document.getElementById('panecards');
+  if (!box) return;
+  const head = ready() && S.sel !== null ? headOf(S.sel) : null;
+  const html = head === null ? '' : cardsHtml(head);
   if (box.innerHTML === html) return;
   box.hidden = head === null;
   box.innerHTML = html;
@@ -1765,6 +2064,467 @@ function shownRoute(route) {
   const prefix = '/s/' + S.site.id + '/site';
   return typeof route !== 'string' ? S.route : S.preview && S.preview.static && route.startsWith(prefix) ? route.slice(prefix.length) || '/' : route;
 }
+/** The route the frame shows: where the app moved to, else the route field's. */
+const currentRoute = () => (S.moved === null ? S.route : S.moved);
+
+// --- editing from the preview (D8) ------------------------------------------------
+// The agent reports what the editor points at, clicks and types in the page;
+// each message changes what the page shows, or the open edit's unsaved value,
+// and nothing more. No message from the frame starts a write: Cmd/Ctrl-S there
+// moves focus to Save, and a press of Save is what saves. Every field is
+// checked: a key the descriptor declares (own property), the open edit's own
+// locale and entry, an entry the key's value holds.
+const NARROW_PX = 760;
+const narrow = () => window.innerWidth < NARROW_PX;
+const declared = (key) => typeof key === 'string' && ready() && own(S.site.descriptor.keys, key);
+/** A list entry's index or a record field's name, or none. */
+const isEntry = (value) => value === undefined || typeof value === 'string' || (Number.isInteger(value) && value >= 0);
+/** The kinds of the head texts the census matches, by where it matched them. */
+const HEAD_WHERE = {
+  title: 'page title', description: 'meta description', 'og:title': 'share title', 'twitter:title': 'share title',
+  'og:description': 'share description', 'twitter:description': 'share description',
+};
+/** The element a hover or a pick names, in the marks route's words (cli/key-names.ts `kindOf`). */
+const ELEMENT_KINDS = {
+  attr: { alt: 'image alt text', 'aria-label': 'aria label', title: 'tooltip', placeholder: 'placeholder' },
+  tag: { p: 'paragraph', a: 'link text', button: 'button text', label: 'label', li: 'list item', title: 'page title', summary: 'headline' },
+};
+function elementKind(tag, attr) {
+  const has = (map, name) => Object.prototype.hasOwnProperty.call(map, name);
+  if (attr !== null) return has(ELEMENT_KINDS.attr, attr) ? ELEMENT_KINDS.attr[attr] : attr + ' attribute';
+  if (/^h[1-6]$/.test(tag)) return 'headline';
+  return has(ELEMENT_KINDS.tag, tag) ? ELEMENT_KINDS.tag[tag] : 'text in <' + tag + '>';
+}
+
+/** A box from a frame message: four finite numbers, or null. */
+function rectOf(rect) {
+  if (!rect || typeof rect !== 'object') return null;
+  const out = {};
+  for (const name of ['left', 'top', 'width', 'height']) {
+    if (typeof rect[name] !== 'number' || !Number.isFinite(rect[name])) return null;
+    out[name] = rect[name];
+  }
+  return out;
+}
+/** A pick's or a hover's hits, each read into a fresh record; one naming an undeclared key, or of the wrong shape, is dropped. */
+function hitsOf(keys) {
+  if (!Array.isArray(keys)) return [];
+  const out = [];
+  for (const k of keys) {
+    if (!k || typeof k !== 'object' || !declared(k.key) || !isEntry(k.entry)) continue;
+    if (k.attr !== null && k.attr !== undefined && typeof k.attr !== 'string') continue;
+    out.push({ key: k.key, attr: typeof k.attr === 'string' ? k.attr : null, by: typeof k.by === 'string' ? k.by : '', entry: k.entry, inplace: k.inplace === true });
+  }
+  return out;
+}
+/**
+ * Whether a hit's entry is one the key's value holds: an index below a list's
+ * length, an own field of a record, and no entry on a plain value. A list or a
+ * record named with no entry holds none, since typing would replace it whole.
+ */
+function entryHeld(key, entry) {
+  const value = valueOf(key);
+  if (entry === undefined) return value === undefined || value === null || typeof value !== 'object';
+  if (Array.isArray(value)) return typeof entry === 'number' && entry < value.length;
+  if (value && typeof value === 'object') return typeof entry === 'string' && own(value, entry);
+  return false;
+}
+/** The text one entry of a key's value holds, or the value's own, as a string. */
+function entryText(key, loc, entry) {
+  const value = valueOf(key, loc);
+  const part = entry === undefined ? value : Array.isArray(value) ? value[entry] : value && typeof value === 'object' && own(value, entry) ? value[entry] : undefined;
+  return typeof part === 'string' ? part : part === undefined || part === null ? '' : shown(part);
+}
+
+/**
+ * A click on copy in Edit. An edit open on another key or entry ends kept
+ * first, whatever order the agent's own end and this pick arrive in. Words two
+ * keys share open the chooser; one key is selected, and a second click on it
+ * starts typing in place where its hit allows, else opens the field over the frame.
+ */
+function onPick(data) {
+  const hits = hitsOf(data.keys);
+  if (hits.length === 0) return;
+  const e = S.edit;
+  if (e !== null && !hits.some((h) => h.key === e.key && h.entry === e.entry)) postToPreview({ stet: 'end', how: 'keep' });
+  const rect = rectOf(data.rect);
+  const again = data.again === true;
+  S.unmanaged = null;
+  closePopover();
+  const keys = hits.map((h) => h.key).filter((key, i, all) => all.indexOf(key) === i);
+  S.choose = keys.length > 1 ? { keys: keys, hits: hits, again: again, rect: rect } : null;
+  paintPanePick();
+  if (S.choose !== null) { paintPaneNote(); return; }
+  choosePick(hits.find((h) => h.inplace && h.attr === null) || hits[0], again, rect);
+}
+function choosePick(hit, again, rect) {
+  const key = hit.key;
+  // A key found by its text on a route whose files are all read, and none names it.
+  const reads = S.routeReads;
+  S.warn = hit.by !== 'mark' && reads !== null && reads.complete && reads.route === routePath(currentRoute()) &&
+    reads.keys.indexOf(key) === -1 ? key : null;
+  selectFromFrame(key, hit.entry);
+  if (!again) return;
+  if (narrow()) { focusField(key, hit.entry); return; }
+  if (!entryHeld(key, hit.entry)) return;
+  if (hit.attr === null && hit.inplace) {
+    const form = hit.by === 'mark' ? 'runs' : 'inplace';
+    postToPreview(Object.assign({ stet: 'edit', key: key, locale: S.locale }, hit.entry === undefined ? {} : { entry: hit.entry },
+      { form: form, oneLine: entryText(key, S.locale, hit.entry).indexOf('\n') === -1 }));
+    S.edit = { key: key, locale: S.locale, entry: hit.entry, form: form, before: S.draft[S.locale + ' ' + key], rect: rect };
+    paintPopover();
+  } else {
+    openPopover(key, S.locale, hit.entry, rect);
+  }
+}
+/** The key a frame click named, selected as a pick from the list is, its field scrolled into view; the pane stays where it is. */
+function selectFromFrame(id, entry) {
+  if (S.sel !== id) {
+    S.sel = id;
+    S.message = '';
+    S.findings = [];
+    S.located = null;
+    if (!S.q && keysInGroup(S.group).indexOf(id) === -1) S.group = groupOf(id);
+    showKeys();
+    render();
+    locateKey(false);
+  } else {
+    paintPaneNote();
+  }
+  const field = fieldOf(id, entry);
+  if (field !== null && typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
+}
+/** A key's field in the column: its entry's, else its own. */
+function fieldOf(id, entry) {
+  const names = entry === undefined ? ['text:' + id, 'number:' + id, 'color:' + id, 'list:' + id + ' 0']
+    : ['list:' + id + ' ' + entry, 'record:' + id + ' ' + entry];
+  for (const el of document.querySelectorAll('#main [data-act-input]')) {
+    if (names.indexOf(el.getAttribute('data-act-input')) !== -1) return el;
+  }
+  for (const el of document.querySelectorAll('#main [data-act-change]')) {
+    if (el.getAttribute('data-act-change') === 'enum:' + id) return el;
+  }
+  return null;
+}
+/** The field focused where it stands once scrolled the least distance into view, so the tapped element stays on screen too. */
+function focusField(id, entry) {
+  const field = fieldOf(id, entry);
+  if (field === null) return;
+  if (typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
+  field.focus({ preventScroll: true });
+}
+/** The column's field for a key whose value changed from the frame or the field over it, written without repainting the column. */
+function paintField(id) {
+  if (S.sel !== id) return;
+  const value = valueOf(id);
+  const want = {};
+  if (Array.isArray(value)) value.forEach((entry, i) => { want['list:' + id + ' ' + i] = String(entry); });
+  else if (value && typeof value === 'object') Object.keys(value).forEach((name) => { want['record:' + id + ' ' + name] = String(value[name]); });
+  else want['text:' + id] = value === undefined ? '' : String(value);
+  for (const el of document.querySelectorAll('#main [data-act-input]')) {
+    const act = el.getAttribute('data-act-input');
+    if (!own(want, act) || el === document.activeElement || el.value === want[act]) continue;
+    el.value = want[act];
+    if (act === 'text:' + id) { paintMirror(el); softCount(el, id); }
+  }
+}
+/** Everything that shows a key's unsaved value, but the field typed in. */
+function paintDraft(id) {
+  paintRow(id);
+  paintField(id);
+  paintDirty();
+}
+
+/** An open edit ended from the dashboard, kept under its own locale; the agent's `edited` that follows finds no open edit. */
+function endEdit() {
+  if (S.edit === null) return;
+  postToPreview({ stet: 'end', how: 'keep' });
+  S.edit = null;
+  paintPopover();
+}
+/** Edit or Use: in Use the page has its clicks back, and an open edit ends kept. */
+function setMode(next) {
+  if (next === 'use') { endEdit(); closePopover(); S.hover = null; paintHover(); }
+  S.mode = next;
+  postToPreview({ stet: 'mode', mode: next });
+  if (ready() && S.tab === 'Content') paintPaneHead();
+}
+/** The frame's Escape with no edit open: the selection ends. */
+function endSelection() {
+  S.sel = null;
+  S.choose = null;
+  S.unmanaged = null;
+  S.warn = null;
+  closePopover();
+  render();
+  locateKey(false);
+}
+function focusSave() {
+  const button = document.querySelector('#main [data-act="save"]');
+  if (button) button.focus();
+}
+/** Every declared key's saved texts as the selected locale renders them, so the agent can say which the page shows. */
+function postCensus() {
+  if (!ready()) return;
+  const keys = [];
+  for (const id of Object.keys(S.site.descriptor.keys).sort()) {
+    const def = S.site.descriptor.keys[id];
+    // A derived key shows as its source, and an email's key on no page.
+    if (def.derivesFrom !== undefined || def.target === 'html-email') continue;
+    const value = renderedValue(id);
+    if (typeof value === 'string') keys.push({ key: id, texts: [value] });
+    else if (Array.isArray(value)) {
+      keys.push({ key: id, texts: [], parts: value.map((v, i) => ({ entry: i, texts: [v] })).filter((p) => typeof p.texts[0] === 'string') });
+    } else if (value && typeof value === 'object') {
+      keys.push({ key: id, texts: [], parts: Object.keys(value).filter((n) => typeof value[n] === 'string').map((n) => ({ entry: n, texts: [value[n]] })) });
+    }
+  }
+  postToPreview({ stet: 'census', keys: keys });
+}
+
+function onHover(data) {
+  const hits = hitsOf(data.keys);
+  S.hover = hits.length === 0 ? null : { hits: hits, tag: typeof data.tag === 'string' ? data.tag : '', rect: rectOf(data.rect) };
+  paintHover();
+}
+/** Where else a key shows: the marks route's other place for it, else the census's count less this one. */
+function alsoLine(key, kind) {
+  const places = placesOf(key);
+  if (places.length > 1) {
+    // The hovered element is the first place of its kind; the line names another.
+    const here = places.find((p) => p.kind === kind);
+    const rest = places.filter((p) => p !== here);
+    const other = rest.find((p) => p.kind !== kind) || rest[0];
+    return 'also in ' + other.file + ':' + other.line;
+  }
+  const found = S.census !== null && own(S.census.found, key) ? S.census.found[key] : 0;
+  return found > 1 ? 'also on ' + plural(found - 1, 'other spot') : '';
+}
+/** The label `<kind> · <key>` over the copy under the pointer, with where else the key shows. */
+function paintHover() {
+  const label = document.getElementById('hoverlabel');
+  const h = S.hover;
+  if (h === null || h.rect === null || S.mode !== 'edit' || S.tab !== 'Content' || !ready()) { label.hidden = true; return; }
+  const lines = [];
+  const seen = [];
+  for (const hit of h.hits) {
+    if (seen.indexOf(hit.key) !== -1) continue;
+    seen.push(hit.key);
+    const kind = elementKind(h.tag, hit.attr);
+    lines.push(kind + ' · ' + hit.key);
+    const also = alsoLine(hit.key, kind);
+    if (also !== '') lines.push(also);
+  }
+  label.innerHTML = lines.map((line) => '<div>' + esc(line) + '</div>').join('');
+  label.hidden = false;
+  placeAt(label, h.rect, 'above');
+}
+function onRect(data) {
+  const rect = rectOf(data.rect);
+  if (rect === null) return;
+  if (S.edit !== null) S.edit.rect = rect;
+  if (S.popover !== null) S.popover.rect = rect;
+  paintPopover();
+}
+function onUnmanaged(data) {
+  if (typeof data.text !== 'string') return;
+  S.unmanaged = { text: data.text.slice(0, 120) };
+  S.choose = null;
+  paintPanePick();
+  paintPaneNote();
+}
+/** The keys the open route's files read that the last census did not find on the page, in the descriptor's order. */
+function unfoundKeys() {
+  const reads = S.routeReads;
+  if (reads === null || reads.route !== routePath(currentRoute())) return [];
+  const found = S.census !== null ? S.census.found : {};
+  return Object.keys(S.site.descriptor.keys).filter((key) => reads.keys.indexOf(key) !== -1 && !own(found, key));
+}
+/**
+ * A census reply: what this page shows. Every key it found and its route join
+ * what this tab has seen of the site, and a route the frame reached on its own
+ * has its reads read.
+ */
+function onCensus(data) {
+  if (!data.found || typeof data.found !== 'object' || typeof data.route !== 'string') return;
+  const found = {};
+  for (const key of Object.keys(data.found)) {
+    if (declared(key) && typeof data.found[key] === 'number' && data.found[key] > 0) found[key] = data.found[key];
+  }
+  const head = (Array.isArray(data.head) ? data.head : [])
+    .filter((h) => h && typeof h === 'object' && declared(h.key) && typeof h.where === 'string' && own(HEAD_WHERE, h.where))
+    .map((h) => ({ key: h.key, where: h.where }));
+  S.census = { found: found, head: head, route: data.route };
+  const route = routePath(shownRoute(data.route));
+  for (const key of Object.keys(found)) S.seen.keys.add(key);
+  S.seen.routes.add(route);
+  if (routeReadsFor !== route) void guard(loadRouteReads(route));
+  paintKeyRows();
+  paintShared();
+  paintPaneNote();
+  paintPageInfo();
+}
+function onMoved(data) {
+  if (typeof data.route !== 'string') return;
+  S.moved = shownRoute(data.route);
+  if (ready() && S.tab === 'Content') paintPaneHead();
+  void guard(loadRouteReads(routePath(S.moved)));
+}
+/** The kinds a key the last census found only in the page's head shows as; none where it shows anywhere else too. */
+function headOnly(id) {
+  if (S.census === null || !own(S.census.found, id)) return [];
+  const at = S.census.head.filter((h) => h.key === id);
+  if (at.length < S.census.found[id]) return [];
+  return at.map((h) => HEAD_WHERE[h.where]).filter((kind, i, all) => all.indexOf(kind) === i);
+}
+
+/** Two keys show the clicked words: each a button. */
+function paintPanePick() {
+  const box = document.getElementById('panepick');
+  const c = S.choose;
+  box.hidden = c === null;
+  box.innerHTML = c === null ? '' : '<div>Two keys show these words. Which one?</div>' +
+    c.keys.map((key) => '<button class="btn sm mono" data-act="choose:' + esc(key) + '">' + esc(key) + '</button>').join('');
+}
+
+/** The open page's head copy as keys: the marks of its document on the html host, the census's head matches elsewhere. */
+function headEntries() {
+  const out = [];
+  const add = (key, kind) => { if (!out.some((e) => e.key === key && e.kind === kind)) out.push({ key: key, kind: kind }); };
+  if (htmlHost()) {
+    const doc = S.marks.documents.find((d) => routePath(d.route) === routePath(currentRoute()));
+    if (doc) {
+      for (const key of Object.keys(S.marks.places).sort()) {
+        for (const p of S.marks.places[key]) if (p.file === doc.file && HEAD_KINDS.indexOf(p.kind) !== -1) add(key, p.kind);
+      }
+    }
+  } else if (S.census !== null) {
+    for (const h of S.census.head) add(h.key, HEAD_WHERE[h.where]);
+  }
+  return out;
+}
+/** Page info: the title, the description and the share texts the page carries out of sight, with the two cards. */
+function paintPageInfo() {
+  const box = document.getElementById('paneinfo');
+  if (!S.pageInfo || !ready()) { box.hidden = true; box.innerHTML = ''; return; }
+  const entries = headEntries();
+  const keyOf = (kind) => { const e = entries.find((x) => x.kind === kind); return e ? e.key : null; };
+  const title = keyOf('page title');
+  const description = keyOf('meta description');
+  const head = entries.length === 0 ? null : htmlHost() ? headOf(entries[0].key) : {
+    route: currentRoute(), title: title, description: description,
+    shareTitle: keyOf('share title') || title, shareDescription: keyOf('share description') || description,
+  };
+  const html = (entries.length === 0 ? '<div class="muted">No head text on this page matches a key.</div>'
+    : entries.map((e) => '<div class="hl">' + esc(e.kind + ' · ' + e.key) + '</div>').join('')) + (head === null ? '' : cardsHtml(head));
+  box.hidden = false;
+  if (box.innerHTML !== html) box.innerHTML = html;
+}
+
+/**
+ * The page's text box over the frame (fork 2): the raw value of the key, its
+ * entry or its attribute, `{{name}}` tokens as written. Under 760 px the
+ * column's own field takes the edit instead (fork 15).
+ */
+function openPopover(key, loc, entry, rect) {
+  if (narrow()) { focusField(key, entry); return; }
+  S.popover = { key: key, locale: loc, entry: entry, rect: rect, before: S.draft[loc + ' ' + key], redrawn: false };
+  // The field over the frame holds the caret: no repaint puts it back on a column field.
+  focusKey = null;
+  const text = document.getElementById('poptext');
+  text.value = entryText(key, loc, entry);
+  text.setAttribute('aria-label', key);
+  paintPopover();
+  text.focus();
+}
+function closePopover() {
+  if (S.popover === null) return;
+  S.popover = null;
+  paintPopover();
+}
+/** The field over the frame and the counter by an element typed in place, each at its element's box. */
+function paintPopover() {
+  const pop = document.getElementById('popover');
+  const p = S.popover;
+  pop.hidden = p === null;
+  if (p !== null) {
+    document.getElementById('popkey').textContent = p.key + (p.entry === undefined ? '' : '[' + p.entry + ']');
+    paintCount(document.getElementById('popcount'), p.key, entryText(p.key, p.locale, p.entry));
+    placeAt(pop, p.rect, 'below');
+  }
+  const counter = document.getElementById('counter');
+  const e = S.edit;
+  counter.hidden = e === null;
+  if (e !== null) {
+    paintCount(counter, e.key, entryText(e.key, e.locale, e.entry));
+    placeAt(counter, e.rect, 'end');
+  }
+}
+/**
+ * The counter: the length the column's field counts, a tagged value's plain
+ * text, an entry's own. Grey, amber from 90 % of the limit, and past it red,
+ * saying what Save does with it.
+ */
+function paintCount(el, id, text) {
+  const def = keyDef(id) || {};
+  const max = def.limits ? def.limits.max : null;
+  const n = def.tags !== undefined ? deriveText('{v}', text, true).length : text.length;
+  const over = max !== null && n > max;
+  el.textContent = max === null ? String(n)
+    : n + ' / ' + max + (!over ? '' : def.limits.severity === 'hard' ? ' · Save refuses this' : ' · Save asks first');
+  el.className = 'cnt' + (over ? ' bad' : max !== null && n >= Math.ceil(0.9 * max) ? ' amb' : '');
+}
+/** A frame element's box as the dashboard shows it, through the frame's own scale. */
+function projected(rect) {
+  const frame = document.querySelector('#devwrap iframe');
+  const box = frame.getBoundingClientRect();
+  const k = frame.offsetWidth === 0 ? 1 : box.width / frame.offsetWidth;
+  return { left: box.left + rect.left * k, top: box.top + rect.top * k, width: rect.width * k, height: rect.height * k };
+}
+/**
+ * A fixed element put at a frame element's box: under it (`below`), at its
+ * lower right (`end`) or over it (`above`), flipped where it would leave the
+ * window, and 8 px in from each edge.
+ */
+function placeAt(el, rect, where) {
+  if (!document.querySelector('#devwrap iframe')) return;
+  const box = projected(rect || { left: 0, top: 0, width: 0, height: 0 });
+  const w = el.offsetWidth;
+  const h = el.offsetHeight;
+  let left = where === 'end' ? box.left + box.width - w : box.left;
+  let top = where === 'above' ? box.top - h - 4 : box.top + box.height + 6;
+  if (where === 'above' && top < 8) top = box.top + box.height + 4;
+  else if (where !== 'above' && top + h > window.innerHeight - 8) top = box.top - h - 6;
+  el.style.left = Math.max(8, Math.min(left, window.innerWidth - 8 - w)) + 'px';
+  el.style.top = Math.max(8, top) + 'px';
+}
+const popText = document.getElementById('poptext');
+popText.addEventListener('input', () => {
+  const p = S.popover;
+  if (p === null) return;
+  clearRefusal();
+  setDraftIn(p.locale, p.key, p.entry === undefined ? popText.value : withEntry(p.key, p.locale, p.entry, popText.value));
+  paintPopover();
+  paintDraft(p.key);
+});
+popText.addEventListener('keydown', (event) => {
+  const p = S.popover;
+  if (p === null || event.isComposing) return;
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    closePopover();
+    render();
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    const k = p.locale + ' ' + p.key;
+    if (p.before === undefined) { delete S.draft[k]; delete S.base[k]; }
+    else S.draft[k] = p.before;
+    draftChanged();
+    closePopover();
+    render();
+  }
+});
+document.getElementById('popover').addEventListener('focusin', () => { focusKey = null; });
 
 const START_POLL_MS = 1000;
 const START_WAIT_MS = 60000;
@@ -2193,6 +2953,9 @@ const ACTIONS = {
     document.body.dataset.theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
   },
   tab: (el, name) => {
+    // Away from Content an open edit ends kept; Content opens in Edit.
+    if (name !== 'Content') { endEdit(); closePopover(); S.hover = null; paintHover(); }
+    else if (S.tab !== 'Content') setMode('edit');
     S.tab = name;
     render();
     if (name === 'SEO' && ready() && S.audit === null) void guard(pollAudit());
@@ -2239,6 +3002,10 @@ const ACTIONS = {
     S.message = '';
     S.findings = [];
     S.located = null;
+    S.warn = null;
+    S.unmanaged = null;
+    S.choose = null;
+    closePopover();
     showKeys();
     render();
     // A key on another page moves the pane first, and is located once that
@@ -2264,6 +3031,22 @@ const ACTIONS = {
     paintPane();
   },
   gitErrorDismiss: () => { clearGitError(); },
+  mode: (el, next) => { setMode(next === 'use' ? 'use' : 'edit'); },
+  pageInfo: () => {
+    S.pageInfo = !S.pageInfo;
+    paintPaneHead();
+    paintPageInfo();
+    fitFrame();
+  },
+  choose: (el, key) => {
+    const c = S.choose;
+    const hit = c === null ? undefined : c.hits.find((h) => h.key === key);
+    if (hit === undefined) return;
+    S.choose = null;
+    paintPanePick();
+    // Words two keys share are never typed in place: the chosen key opens in the field.
+    choosePick(Object.assign({}, hit, { inplace: false }), c.again, c.rect);
+  },
   cycleEnv: () => {
     const names = ((ready() && S.site.environments) || []).map((e) => e.name);
     if (names.length < 2) return;
@@ -2426,11 +3209,13 @@ const ACTIONS_CHANGE = {
   route: (el) => {
     const v = pastedPath(el.value.trim());
     S.route = v.startsWith('/') ? v : '/' + v;
+    S.moved = null;
     el.value = S.route;
     writeStore('stet.route.' + S.site.id, S.route);
     void guard(loadPreview());
   },
-  locale: (el) => { S.locale = el.value; render(); },
+  // An open edit ends kept under its own locale before the selector moves (F3).
+  locale: (el) => { endEdit(); closePopover(); S.locale = el.value; render(); postCensus(); },
   enum: (el, id) => { setDraft(id, el.value); render(); },
   entryDev: (el) => { void guard(updateEntry({ dev: el.value })); },
   entryCommand: (el) => { void guard(updateEntry({ devCommand: el.value })); },
@@ -2543,7 +3328,7 @@ async function save(anyway) {
       });
       if (!res.ok) { S.message = res.body.error || 'the store refused that draft'; render(); return; }
     }
-    S.draft = {};
+    dropDrafts();
     S.message = '';
     tst(plural(values.length, 'draft') + ' saved');
     render();
@@ -2572,7 +3357,7 @@ async function save(anyway) {
     verifyTimer = setTimeout(() => { if (S.saveCheck === check) verifyNow(); }, AGENT_WAIT_MS);
   }
   S.message = '';
-  S.draft = {};
+  dropDrafts();
   for (const template of templates) S.site.descriptor.keys[template.key].tmpl = template.tmpl;
   S.tmpl = {};
   // The server reads the committable files from the checkout, so a save that
@@ -2581,6 +3366,8 @@ async function save(anyway) {
   if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
   takeGit(res.body.at);
   S.site.snapshot = mergedSnapshot(values);
+  postCensus();
+  void guard(loadUsage());
   S.same = sameQuestion(res.body.same);
   tst(wrote.length === 0 ? 'Nothing changed.' : 'Wrote ' + wrote.join(', '));
   render();
@@ -3001,6 +3788,12 @@ function captureFocus() {
   focusAt = el.selectionStart === undefined || el.selectionStart === null ? 0 : el.selectionStart;
 }
 
+// Condition 1: the frame taking focus lets go of the remembered field, so no
+// repaint pulls the caret back out of the page being typed in (F93).
+window.addEventListener('blur', () => {
+  const frame = document.querySelector('#devwrap iframe');
+  if (frame && document.activeElement === frame) { focusKey = null; focusAt = null; }
+});
 shell.addEventListener('focusin', (event) => {
   const el = event.target;
   const act = el.getAttribute === undefined ? null : (el.getAttribute('data-act-input') || el.getAttribute('data-act-change'));

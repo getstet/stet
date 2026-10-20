@@ -40,7 +40,7 @@ import { writeJsonDeterministic } from '../cli/artifacts.js';
 import { check } from '../cli/check.js';
 import { loadConfig } from '../cli/config.js';
 import { planDocuments } from '../cli/html-host.js';
-import { HEAD_KINDS } from '../cli/key-names.js';
+import { HEAD_KINDS, kindOf } from '../cli/key-names.js';
 import { Report } from '../cli/report.js';
 import {
   captured,
@@ -6567,11 +6567,29 @@ describe('the page', () => {
         };
       };
       spy();
+      /** One message from the frame's agent, carrying the channel, then the page settled. */
+      const tell = async (message: Record<string, unknown>): Promise<void> => {
+        say({ channel: CHANNEL, ...message });
+        await page.settle();
+      };
       return {
         posts,
         say,
         spy,
         frame,
+        tell,
+        /** The messages of one kind the page posted to the frame. */
+        sent: (stet: string): Array<Record<string, unknown>> => posts.map((p) => p.message).filter((m) => m['stet'] === stet),
+        pick: (keys: Array<Record<string, unknown>>, over: Record<string, unknown> = {}): Promise<void> =>
+          tell({ stet: 'pick', keys: keys.map((k) => ({ attr: null, by: 'whole', inplace: true, ...k })), tag: 'h1', rect: { left: 100, top: 50, width: 200, height: 20 }, again: false, ...over }),
+        typed: (key: string, value: unknown, over: Record<string, unknown> = {}): Promise<void> =>
+          tell({ stet: 'typed', key, locale: 'default', value, ...over }),
+        edited: (key: string, how: string, over: Record<string, unknown> = {}): Promise<void> =>
+          tell({ stet: 'edited', key, locale: 'default', how, proposed: true, ...over }),
+        census: (over: Record<string, unknown> = {}): Promise<void> =>
+          tell({ stet: 'census', found: {}, entries: {}, ambiguous: [], weak: [], head: [], route: '/', ...over }),
+        moved: (route: string): Promise<void> => tell({ stet: 'moved', how: 'pushState', route }),
+        key: (which: string): Promise<void> => tell({ stet: 'key', which }),
         /** The frame's `load`, as a navigation ends. */
         load: async (): Promise<void> => {
           spy();
@@ -7394,6 +7412,885 @@ describe('the page', () => {
       await page.settle();
       expect(note(page).textContent).toBe('This draft is shown after Save.');
       page.dom.window.close();
+    });
+
+    // --- add-preview-editing D8: the frame's messages, the pinned locale, the popover, the badge ---
+    describe('the bridge (D8)', () => {
+      const RECT = { left: 100, top: 50, width: 200, height: 20 };
+      type State = {
+        draft: Record<string, unknown>;
+        base: Record<string, unknown> | null;
+        edit: Record<string, unknown> | null;
+        snapshot: Record<string, Record<string, unknown>>;
+      };
+      /** The page's own state, read in its global scope: the drafts, their bases, the open edit and the snapshot it holds. */
+      const stateOf = (page: Painted): State =>
+        JSON.parse(
+          (page.dom.window as unknown as { eval: (code: string) => string }).eval(
+            'JSON.stringify({ draft: S.draft, base: S.base === undefined ? null : S.base, edit: S.edit === undefined ? null : S.edit, snapshot: S.site.snapshot })',
+          ),
+        ) as State;
+      /** The page over the dev pane, its agent announced. */
+      async function bridged(over: Parameters<typeof paint>[0] = {}) {
+        const page = await paint({ preview: DEV_PREVIEW, ...over });
+        const agent = agentOf(page);
+        await agent.load();
+        await agent.ready();
+        return { page, agent };
+      }
+      const byId = (page: Painted, id: string): HTMLElement => docOf(page).getElementById(id) as HTMLElement;
+      const popover = (page: Painted): HTMLElement => byId(page, 'popover');
+      const poptext = (page: Painted): HTMLTextAreaElement => byId(page, 'poptext') as HTMLTextAreaElement;
+      const lines = (page: Painted): string[] => [...note(page).children].map((line) => line.textContent ?? '');
+      const selected = (page: Painted): string => docOf(page).querySelector('#main .ch h3 .mono')?.textContent ?? '';
+      const typeInto = async (page: Painted, field: HTMLTextAreaElement, value: string): Promise<void> => {
+        field.value = value;
+        field.dispatchEvent(new page.dom.window.Event('input', { bubbles: true }));
+        await page.settle();
+      };
+      const press = async (page: Painted, field: HTMLElement, key: string): Promise<void> => {
+        field.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+        await page.settle();
+      };
+      const THREE = siteBody({ snapshot: { ...snapshot, default: { ...snapshot.default, hero_bullets: ['one', 'two', 'three'] } } });
+      /** The fixture with a 40-character advisory key whose value holds a `{{name}}` token. */
+      const GREETING = siteBody({
+        descriptor: {
+          ...descriptor,
+          keys: {
+            ...descriptor.keys,
+            lab_greeting: { shape: 'text', target: 'web', limits: { max: 40, severity: 'advisory' } },
+            lab_tagged: { shape: 'text', target: 'web', tags: 1, limits: { max: 20, severity: 'hard' } },
+          },
+        },
+        snapshot: {
+          ...snapshot,
+          default: { ...snapshot.default, hero_bullets: ['one', 'two', 'three'], lab_greeting: 'Welcome back, {{name}}.', lab_tagged: 'Ship <1>it</1> now' },
+        },
+      });
+
+      // 7.1 — the values
+      it('writes a typed list entry into that entry alone (7.1)', async () => {
+        const { page, agent } = await bridged({ site: THREE });
+        await agent.pick([{ key: 'hero_bullets', entry: 2 }], { again: true, tag: 'li' });
+        expect(agent.sent('edit').at(-1)).toEqual({ stet: 'edit', key: 'hero_bullets', locale: 'default', entry: 2, form: 'inplace', oneLine: true });
+        await agent.typed('hero_bullets', 'tres', { entry: 2 });
+        expect(stateOf(page).draft).toEqual({ 'default hero_bullets': ['one', 'two', 'tres'] });
+        expect(page.html()).toContain('1 unsaved edit');
+        page.dom.window.close();
+      });
+
+      it('keeps no draft and no base for a value typed back to the stored one (7.1)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Ship it');
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Ship it' });
+        expect(stateOf(page).base).toEqual({ 'default hero_headline': 'Ship the copy' });
+        await agent.typed('hero_headline', 'Ship the copy');
+        expect(stateOf(page).draft).toEqual({});
+        expect(stateOf(page).base).toEqual({});
+        page.dom.window.close();
+      });
+
+      it('drops the bases with the drafts a save writes (7.1: every draft removal clears its base)', async () => {
+        const page = await paint();
+        page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+        await page.act('key:hero_headline');
+        await page.type('text:hero_headline', 'Saved words');
+        expect(stateOf(page).base).toEqual({ 'default hero_headline': 'Ship the copy' });
+        await page.act('save');
+        expect(stateOf(page).draft).toEqual({});
+        expect(stateOf(page).base).toEqual({});
+        page.dom.window.close();
+      });
+
+      // 7.2 — the frame message arms
+      it('takes a typed value only for the open edit’s key, locale and entry (7.2)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Mine');
+        await agent.typed('loose_key', 'Forged');
+        await agent.typed('hero_headline', 'Forged in de', { locale: 'de' });
+        await agent.typed('hero_headline', 'Forged entry', { entry: 0 });
+        await agent.typed('hero_headline', 7);
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Mine' });
+        // An end for another key or another locale is not this edit's.
+        await agent.edited('loose_key', 'cancel');
+        await agent.edited('hero_headline', 'lost', { locale: 'de', proposed: false });
+        expect(stateOf(page).edit).toMatchObject({ key: 'hero_headline', locale: 'default' });
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Mine' });
+        page.dom.window.close();
+      });
+
+      it('puts back the value from before the edit on cancel, and keeps no draft for an edit lost before any proposal (7.2)', async () => {
+        const { page, agent } = await bridged();
+        await page.act('key:hero_headline');
+        await page.type('text:hero_headline', 'Before');
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'During');
+        await agent.edited('hero_headline', 'cancel');
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Before' });
+        expect(stateOf(page).edit).toBeNull();
+
+        await agent.pick([{ key: 'loose_key' }], { again: true, tag: 'p' });
+        await agent.typed('loose_key', 'Typed');
+        await agent.edited('loose_key', 'lost', { proposed: false });
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Before' });
+        expect(stateOf(page).edit).toBeNull();
+        expect(popover(page).hidden).toBe(false);
+        expect(poptext(page).value).toBe('loose');
+        expect(lines(page)).toContain('The page redrew this text, so the edit moved to a field.');
+        page.dom.window.close();
+      });
+
+      it('starts an in-place edit on a second pick under the selector’s locale, and ends an open edit before a pick of another key (7.2)', async () => {
+        const { page, agent } = await bridged();
+        await page.change('locale', 'de');
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        expect(agent.sent('edit').at(-1)).toEqual({ stet: 'edit', key: 'hero_headline', locale: 'de', form: 'inplace', oneLine: true });
+        expect(stateOf(page).edit).toMatchObject({ key: 'hero_headline', locale: 'de' });
+        const at = agent.posts.length;
+        await agent.pick([{ key: 'loose_key' }], { tag: 'p' });
+        expect(agent.posts[at]?.message).toEqual({ stet: 'end', how: 'keep' });
+        expect(selected(page)).toBe('loose_key');
+        page.dom.window.close();
+      });
+
+      it('starts no edit and no popover for an entry the key’s value lacks (7.2)', async () => {
+        const { page, agent } = await bridged({ site: THREE });
+        const cases: Array<[string, number | string]> = [
+          ['hero_bullets', 5], ['hero_bullets', 1.5], ['hero_bullets', -1], ['hero_bullets', '1'],
+          ['hero_card', 'constructor'], ['hero_headline', 0], ['hero_headline', 'title'],
+        ];
+        for (const [key, entry] of cases) {
+          await agent.pick([{ key, entry }], { again: true });
+          await agent.pick([{ key, entry, attr: 'alt', by: 'attr', inplace: false }], { again: true });
+          expect(agent.sent('edit'), `${key} ${entry}`).toEqual([]);
+          expect(popover(page).hidden, `${key} ${entry}`).toBe(true);
+          expect(selected(page), `${key} ${entry}`).toBe(key);
+        }
+        page.dom.window.close();
+      });
+
+      // 7.3 — the pinned locale
+      it('F3: keeps an edit’s draft under its own locale across a locale switch, and ends the edit (7.3)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Ship it');
+        const at = agent.posts.length;
+        await page.change('locale', 'de');
+        await agent.typed('hero_headline', 'Ship it now');
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Ship it' });
+        expect(stateOf(page).edit).toBeNull();
+        expect(agent.posts.slice(at).map((p) => p.message)).toContainEqual({ stet: 'end', how: 'keep' });
+        page.dom.window.close();
+      });
+
+      // 7.4 — condition 1
+      it('lets go of the remembered field when the frame takes focus, so a repaint leaves focus in the frame (7.4)', async () => {
+        const { page, agent } = await bridged();
+        const route = byId(page, 'route') as HTMLInputElement;
+        route.focus();
+        // Focus moving into a frame fires no focusin on the dashboard's side, as in a browser.
+        const frame = agent.frame();
+        page.dom.window.addEventListener('focusin', (event) => { if (event.target === frame) event.stopImmediatePropagation(); }, true);
+        frame.focus();
+        expect(docOf(page).activeElement).toBe(frame);
+        page.dom.window.dispatchEvent(new page.dom.window.FocusEvent('blur'));
+        let pulled = 0;
+        route.addEventListener('focus', () => { pulled += 1; });
+        await page.act('keys');
+        await page.act('keys');
+        expect(pulled).toBe(0);
+        page.dom.window.close();
+      });
+
+      // 7.5 — the popover and the counter
+      it('opens the popover under the element’s box at the dashboard’s scale with the raw value; Enter keeps it, Esc puts it back (7.5)', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const frame = agent.frame();
+        // The frame renders at 1280 px, scaled to 640 in a pane that starts 500 px from the left.
+        Object.defineProperty(frame, 'offsetWidth', { configurable: true, get: () => 1280 });
+        frame.getBoundingClientRect = () => ({ left: 500, top: 100, width: 640, height: 400, right: 1140, bottom: 500, x: 500, y: 100, toJSON: () => ({}) }) as DOMRect;
+        const greeting = { key: 'lab_greeting', by: 'pattern', inplace: false };
+        await agent.pick([greeting], { again: true, rect: { left: 100, top: 60, width: 300, height: 20 } });
+        expect(agent.sent('edit')).toEqual([]);
+        expect(popover(page).hidden).toBe(false);
+        expect(poptext(page).value).toBe('Welcome back, {{name}}.');
+        expect(byId(page, 'popkey').textContent).toBe('lab_greeting');
+        expect(byId(page, 'popcount').textContent).toBe('23 / 40');
+        expect(popover(page).textContent).toContain('Enter keeps it · Esc puts it back');
+        expect([popover(page).style.left, popover(page).style.top]).toEqual(['550px', '146px']);
+        await typeInto(page, poptext(page), 'Welcome, {{name}}.');
+        expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+        await press(page, poptext(page), 'Enter');
+        expect(popover(page).hidden).toBe(true);
+        expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+
+        // Kept inside the window: clamped at the right edge, flipped above a box near the bottom.
+        await agent.pick([greeting], { again: true, rect: { left: 1200, top: 1300, width: 300, height: 20 } });
+        expect([popover(page).style.left, popover(page).style.top]).toEqual(['1016px', '744px']);
+        expect(poptext(page).value).toBe('Welcome, {{name}}.');
+        await typeInto(page, poptext(page), 'Gone');
+        await press(page, poptext(page), 'Escape');
+        expect(popover(page).hidden).toBe(true);
+        expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+        page.dom.window.close();
+      });
+
+      it('colours the counter grey, amber from 90 % and red past the limit saying what Save does, and counts a list entry alone (7.5)', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const count = (id = 'popcount'): [string, string] => [byId(page, id).textContent ?? '', byId(page, id).className];
+        await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+        await typeInto(page, poptext(page), 'x'.repeat(32));
+        expect(count()).toEqual(['32 / 40', 'cnt']);
+        await typeInto(page, poptext(page), 'x'.repeat(35));
+        expect(count()).toEqual(['35 / 40', 'cnt']);
+        await typeInto(page, poptext(page), 'x'.repeat(36));
+        expect(count()).toEqual(['36 / 40', 'cnt amb']);
+        await typeInto(page, poptext(page), 'x'.repeat(40));
+        expect(count()).toEqual(['40 / 40', 'cnt amb']);
+        await typeInto(page, poptext(page), 'x'.repeat(41));
+        expect(count()).toEqual(['41 / 40 · Save asks first', 'cnt bad']);
+        await press(page, poptext(page), 'Enter');
+
+        await agent.pick([{ key: 'hero_bullets', entry: 2, by: 'contained', inplace: false }], { again: true, tag: 'li' });
+        expect(byId(page, 'popkey').textContent).toBe('hero_bullets[2]');
+        expect(poptext(page).value).toBe('three');
+        expect(count()).toEqual(['5 / 40', 'cnt']);
+        await typeInto(page, poptext(page), 'y'.repeat(41));
+        expect(count()).toEqual(['41 / 40 · Save refuses this', 'cnt bad']);
+        expect(stateOf(page).draft['default hero_bullets']).toEqual(['one', 'two', 'y'.repeat(41)]);
+        await press(page, poptext(page), 'Enter');
+
+        // A tagged value counts its plain text.
+        await agent.pick([{ key: 'lab_tagged', by: 'element', inplace: false }], { again: true });
+        expect(poptext(page).value).toBe('Ship <1>it</1> now');
+        expect(count()).toEqual(['11 / 20', 'cnt']);
+        await press(page, poptext(page), 'Enter');
+
+        // Typing in place: the counter sits by the element.
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'x'.repeat(54));
+        expect(byId(page, 'counter').hidden).toBe(false);
+        expect(count('counter')).toEqual(['54 / 60', 'cnt amb']);
+        await agent.edited('hero_headline', 'keep');
+        expect(byId(page, 'counter').hidden).toBe(true);
+        page.dom.window.close();
+      });
+
+      it('opens no popover under 760 px: a pick selects and scrolls the field into view, and a second pick focuses it (7.5)', async () => {
+        const scrolled: string[] = [];
+        const { page, agent } = await bridged({
+          site: GREETING,
+          prepare: (window) => {
+            Object.defineProperty(window, 'innerWidth', { configurable: true, get: () => 500 });
+            (window.HTMLElement.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = function (this: HTMLElement) {
+              scrolled.push(this.getAttribute('data-act-input') ?? '');
+            };
+          },
+        });
+        await agent.pick([{ key: 'hero_headline' }]);
+        expect(selected(page)).toBe('hero_headline');
+        expect(scrolled).toContain('text:hero_headline');
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        expect(agent.sent('edit')).toEqual([]);
+        expect(popover(page).hidden).toBe(true);
+        expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:hero_headline');
+        await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+        expect(popover(page).hidden).toBe(true);
+        expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_greeting');
+        page.dom.window.close();
+      });
+
+      // 7.6 — the hover label, the chooser, unmanaged text, shared spots, the route warning, Page info, moved
+      it('answers text no key matches with the keys the route reads that the census did not find (7.6, journey B23)', async () => {
+        const nav = {
+          ...descriptor,
+          keys: { ...descriptor.keys, nav_link: { shape: 'text', target: 'web' }, nav_button_text: { shape: 'text', target: 'web' } },
+        } as Descriptor;
+        const { page, agent } = await bridged({
+          site: siteBody({ descriptor: nav, snapshot: { ...snapshot, default: { ...snapshot.default, nav_link: 'Docs', nav_button_text: 'Start' } } }),
+          routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['hero_headline', 'nav_button_text', 'nav_link'], complete: true }]],
+        });
+        await agent.census({ found: { hero_headline: 1 } });
+        await agent.tell({ stet: 'unmanaged', text: 'Docs Start', tag: 'a' });
+        expect(lines(page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: nav_link, nav_button_text.']);
+        expect(note(page).textContent).not.toContain('unmanaged');
+        // Every key the route reads was found: the first line alone.
+        await agent.census({ found: { hero_headline: 1, nav_link: 1, nav_button_text: 1 } });
+        expect(lines(page)).toEqual(['No key matches this text.']);
+        page.dom.window.close();
+      });
+
+      it('shows a chooser for words two keys share, and selects the key chosen (7.6, journey B23)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }]);
+        const box = byId(page, 'panepick');
+        expect(box.hidden).toBe(false);
+        expect(box.textContent).toContain('Two keys show these words. Which one?');
+        expect([...box.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['hero_headline', 'loose_key']);
+        await page.act('choose:loose_key');
+        expect(selected(page)).toBe('loose_key');
+        expect(box.hidden).toBe(true);
+        page.dom.window.close();
+      });
+
+      it('names a key’s other spots on hover and in the editor header (7.6, journey B23)', async () => {
+        const { page, agent } = await bridged({
+          routes: [['/api/site/marks', 200, {
+            documents: [],
+            keys: {},
+            places: {
+              hero_headline: [
+                { file: 'app/(app)/inbox/page.tsx', line: 9, kind: 'headline', tag: 'h1' },
+                { file: 'components/AppShell.tsx', line: 12, kind: 'text in components/AppShell.tsx' },
+              ],
+            },
+          }]],
+        });
+        await agent.census({ found: { hero_headline: 2, loose_key: 2 } });
+        const label = byId(page, 'hoverlabel');
+        await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: null, by: 'whole' }], tag: 'a', rect: RECT, inplace: true });
+        expect(label.hidden).toBe(false);
+        expect([...label.children].map((line) => line.textContent)).toEqual(['link text · hero_headline', 'also in app/(app)/inbox/page.tsx:9']);
+        await agent.tell({ stet: 'hover', keys: [{ key: 'loose_key', attr: 'aria-label', by: 'attr' }], tag: 'button', rect: RECT, inplace: false });
+        expect([...label.children].map((line) => line.textContent)).toEqual(['aria label · loose_key', 'also on 1 other spot']);
+        await agent.tell({ stet: 'hover', keys: [] });
+        expect(label.hidden).toBe(true);
+        await agent.pick([{ key: 'hero_headline' }]);
+        expect(byId(page, 'shared').textContent).toBe('Shown in 2 places on this page · app/(app)/inbox/page.tsx:9 · components/AppShell.tsx:12');
+        await agent.pick([{ key: 'seo_home_title' }]);
+        expect(byId(page, 'shared').textContent).toBe('');
+        page.dom.window.close();
+      });
+
+      it('F7: names the other place of a key on hover when both places are the same kind, never the hovered one (7.6)', async () => {
+        const { page, agent } = await bridged({
+          routes: [['/api/site/marks', 200, {
+            documents: [],
+            keys: {},
+            places: {
+              hero_headline: [
+                { file: 'app/a/page.tsx', line: 3, kind: 'headline', tag: 'h1' },
+                { file: 'app/b/page.tsx', line: 8, kind: 'headline', tag: 'h1' },
+              ],
+            },
+          }]],
+        });
+        const label = byId(page, 'hoverlabel');
+        await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: null, by: 'whole' }], tag: 'h1', rect: RECT, inplace: true });
+        const shown = [...label.children].map((line) => line.textContent);
+        expect(shown).toEqual(['headline · hero_headline', 'also in app/b/page.tsx:8']);
+        page.dom.window.close();
+      });
+
+      it('warns where a key found by its text is read by no file of a fully read route, and nowhere else (7.6, journey B23)', async () => {
+        const WARN = 'This text matches hero_headline, but no file on this page reads that key — saving may not change it.';
+        const { page, agent } = await bridged({
+          routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: true }]],
+        });
+        await agent.pick([{ key: 'hero_headline', by: 'whole' }]);
+        expect(lines(page)).toContain(WARN);
+        expect(agent.locates().at(-1)).toMatchObject({ key: 'hero_headline', guess: true });
+        await agent.pick([{ key: 'hero_headline', by: 'mark' }]);
+        expect(lines(page)).not.toContain(WARN);
+        await agent.pick([{ key: 'loose_key', by: 'contained', inplace: false }]);
+        expect(lines(page).join(' ')).not.toContain('but no file on this page reads');
+        // A route whose reads are incomplete never warns.
+        page.answer('/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: false });
+        await page.act('previewLoad');
+        await agent.load();
+        await agent.ready();
+        await agent.pick([{ key: 'hero_headline', by: 'whole' }]);
+        expect(lines(page)).not.toContain(WARN);
+        page.dom.window.close();
+      });
+
+      it('lists the census’s head keys under Page info, with the search result and the share card (7.6, journey B26)', async () => {
+        const { page, agent } = await bridged();
+        await agent.census({ found: { seo_home_title: 1, loose_key: 1 }, head: [{ key: 'seo_home_title', where: 'title' }, { key: 'loose_key', where: 'description' }] });
+        await page.act('pageInfo');
+        const info = byId(page, 'paneinfo');
+        expect(info.hidden).toBe(false);
+        expect([...info.querySelectorAll('.hl')].map((line) => line.textContent)).toEqual(['page title · seo_home_title', 'meta description · loose_key']);
+        expect([...info.querySelectorAll('.serp > div')].map((part) => part.textContent)).toEqual(['Search result', '/', 'Home', 'loose']);
+        await page.act('pageInfo');
+        expect(info.hidden).toBe(true);
+        page.dom.window.close();
+      });
+
+      it('names the app’s own navigation beside the route field, keeps the route, and reads the new route’s files (7.6)', async () => {
+        const { page, agent } = await bridged();
+        await agent.moved('/pricing?plan=pro');
+        expect(byId(page, 'panemoved').textContent).toBe('The app moved to /pricing?plan=pro');
+        expect((byId(page, 'route') as HTMLInputElement).value).toBe('/');
+        expect(page.requested('/api/site/route-reads').at(-1)).toContain('route=%2Fpricing');
+        page.dom.window.close();
+      });
+
+      it('names a hovered element’s kind as the marks route does (the kind parity table, an addition)', () => {
+        const source = /const ELEMENT_KINDS = [\s\S]*?\nfunction elementKind\([\s\S]*?\n\}/.exec(dashboardPage())?.[0];
+        expect(source).toBeDefined();
+        const elementKind = new Function(`${source as string}; return elementKind;`)() as (tag: string, attr: string | null) => string;
+        const rows: Array<[string, string | undefined]> = [
+          ['h1', undefined], ['h6', undefined], ['p', undefined], ['a', undefined], ['button', undefined], ['label', undefined],
+          ['li', undefined], ['summary', undefined], ['span', undefined], ['constructor', undefined], ['img', 'alt'],
+          ['button', 'aria-label'], ['div', 'title'], ['input', 'placeholder'], ['div', 'data-x'],
+        ];
+        const mismatches = rows
+          .map(([tag, attr]) => [tag, attr, elementKind(tag, attr ?? null), kindOf({ file: 'x', line: 1, tag, ...(attr === undefined ? {} : { attr }) })])
+          .filter(([, , page, core]) => page !== core);
+        expect(mismatches).toEqual([]);
+      });
+
+      it('says nothing of a key missing from the page while it is typed in place (the C5 flag, an addition)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Typed in place');
+        await wait(150);
+        agent.say(LOCATED({ found: 0, seq: agent.locates().at(-1)?.['seq'] }));
+        await page.settle();
+        expect(note(page).textContent).not.toContain('was not found');
+        await agent.edited('hero_headline', 'keep');
+        agent.say(LOCATED({ found: 0, seq: agent.locates().at(-1)?.['seq'] }));
+        await page.settle();
+        expect(note(page).textContent).toContain('hero_headline was not found on /.');
+        page.dom.window.close();
+      });
+
+      it('says where a key the census found only in the head sits (the C5 flag, an addition)', async () => {
+        const { page, agent } = await bridged();
+        await agent.census({ found: { loose_key: 1 }, head: [{ key: 'loose_key', where: 'description' }] });
+        await page.change('group', 'prefix:loose');
+        await page.act('key:loose_key');
+        expect(note(page).textContent).toBe('loose_key appears as the meta description, under the title in search results. It is not part of the page’s visible text.');
+        page.dom.window.close();
+      });
+
+      // 7.7 — the badge
+      describe('the unread-key badge (7.7)', () => {
+        const PAGES = { home: { route: '/' }, a: { route: '/a' }, b: { route: '/b/' }, c: { route: '/c' }, d: { route: '/d' }, post: { route: '/blog/[slug]' } };
+        const BADGED: Descriptor = {
+          version: 1,
+          keys: {
+            lone_key: { shape: 'text', target: 'web' },
+            mail_key: { shape: 'text', target: 'html-email' },
+            server_key: { shape: 'text', target: 'web' },
+            home_key: { shape: 'text', target: 'web', pages: ['home'] },
+            tier_solo_name: { shape: 'text', target: 'web' },
+            blind_key: { shape: 'text', target: 'web' },
+          },
+          pages: PAGES,
+        };
+        const VALUES = { lone_key: 'Lone words', mail_key: 'Mail words', server_key: 'Server words', home_key: 'Home words', tier_solo_name: 'Solo', blind_key: 'Blind' };
+        const usageOf = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+          keys: { lone_key: { state: 'not_found' }, mail_key: { state: 'not_found' }, server_key: { state: 'not_found' }, home_key: { state: 'read' } },
+          prefixes: [],
+          causes: [],
+          serverOnly: ['server_key'],
+          files: 55,
+          root: 'site/',
+          ...over,
+        });
+        const COMPLETE = { route: '/', files: [], keys: [], complete: true };
+        /** Every route's reads answer complete unless `routes` says otherwise. */
+        const badged = (usage: Record<string, unknown>, d: Descriptor = BADGED, routes: Array<[string, number, unknown]> = []) =>
+          bridged({
+            site: siteBody({ descriptor: d, snapshot: { default: VALUES } }),
+            routes: [['/api/site/usage', 200, usage], ['/api/site/route-reads', 200, COMPLETE], ...routes],
+          });
+        const SCOPE = 'not found in any file stet searched (55 files in site/)';
+        const badges = async (page: Painted, id: string): Promise<string[]> => {
+          await page.type('search', '_');
+          return [...(docOf(page).querySelector(`[data-act="key:${id}"]`)?.querySelectorAll('.bdg') ?? [])].map((b) => b.textContent ?? '');
+        };
+        const noteOf = async (page: Painted, id: string): Promise<string[]> => {
+          await page.type('search', '_');
+          await page.act(`key:${id}`);
+          return lines(page);
+        };
+        const visit = async (agent: ReturnType<typeof agentOf>, routes: string[], found: Record<string, number> = {}): Promise<void> => {
+          for (const route of routes) {
+            await agent.moved(route);
+            await agent.census({ route, found });
+          }
+        };
+
+        it('says how many pages are not yet checked (key-usage: pages not yet checked)', async () => {
+          const { page, agent } = await badged(usageOf());
+          await visit(agent, ['/', '/a']);
+          expect(await badges(page, 'lone_key')).toContain(SCOPE);
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '3 of 5 pages not yet checked']);
+          page.dom.window.close();
+        });
+
+        it('upgrades to may be a leftover once every page is visited, never for an email or server-only key (key-usage: the upgrade)', async () => {
+          const { page, agent } = await badged(usageOf());
+          await visit(agent, ['/', '/a', '/b/', '/c', '/d']);
+          expect(await badges(page, 'lone_key')).toContain('may be a leftover');
+          expect(await noteOf(page, 'lone_key')).toEqual(['may be a leftover']);
+          expect(await badges(page, 'mail_key')).toContain(SCOPE);
+          expect(await noteOf(page, 'mail_key')).toEqual([SCOPE]);
+          expect(await noteOf(page, 'server_key')).toEqual([SCOPE]);
+          page.dom.window.close();
+        });
+
+        it('keeps the scan’s wording for a key a visited page showed, and before any page is visited (key-usage: a sibling package’s read)', async () => {
+          const { page, agent } = await badged(usageOf());
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '5 of 5 pages not yet checked']);
+          await visit(agent, ['/', '/a', '/b', '/c'], {});
+          await visit(agent, ['/d'], { lone_key: 1 });
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE]);
+          expect(await badges(page, 'lone_key')).not.toContain('may be a leftover');
+          page.dom.window.close();
+        });
+
+        it('never upgrades on a site with no page list', async () => {
+          const { page } = await badged(usageOf(), { ...BADGED, pages: {} });
+          expect(await badges(page, 'lone_key')).toContain(SCOPE);
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE]);
+          page.dom.window.close();
+        });
+
+        it('counts a page whose route reads are incomplete as not yet checked', async () => {
+          const { page, agent } = await badged(usageOf(), BADGED, [['/api/site/route-reads', 200, { route: '/a', files: [], keys: [], complete: false }]]);
+          await visit(agent, ['/', '/a', '/b/', '/c', '/d']);
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '5 of 5 pages not yet checked']);
+          page.dom.window.close();
+        });
+
+        it('reads unknown under a learnt prefix or the site line, the line naming three causes and the rest as a count', async () => {
+          const causes = [
+            { text: 'copy(a)', file: 'a.ts', line: 1 },
+            { text: 'copy(b)', file: 'b.ts', line: 2 },
+            { text: 'copy(c)', file: 'c.ts', line: 3 },
+            { text: 'fn(copy)', file: 'd.ts', line: 4 },
+          ];
+          const LINE = 'This site reads some keys in ways stet cannot follow, so it cannot say which keys are unread: ' +
+            'copy(a) at a.ts:1, copy(b) at b.ts:2, copy(c) at c.ts:3 and 1 more';
+          const { page } = await badged(usageOf({
+            keys: { tier_solo_name: { state: 'unknown', prefix: { prefix: 'tier_', file: 'src/pricing.ts', line: 4 } }, blind_key: { state: 'unknown' } },
+            prefixes: [{ prefix: 'tier_', file: 'src/pricing.ts', line: 4 }],
+            causes,
+          }));
+          expect(byId(page, 'siteline').textContent).toBe(LINE);
+          expect(await badges(page, 'tier_solo_name')).toContain('unknown');
+          expect(await noteOf(page, 'tier_solo_name')).toEqual([
+            'tier_solo_name starts with tier_, which src/pricing.ts:4 reads without naming each key, so whether it is read is unknown.',
+            'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)',
+          ]);
+          expect(await noteOf(page, 'blind_key')).toEqual([LINE, 'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)']);
+          expect(page.html()).not.toContain('can’t tell');
+          expect(page.html()).not.toContain("can't tell");
+          page.dom.window.close();
+        });
+
+        /** A visit as the frame reports it: the app moves, the route's reads answer as `reads` says, the census follows. */
+        const visitWith = async (
+          page: Painted,
+          agent: ReturnType<typeof agentOf>,
+          route: string,
+          reads: { status?: number; complete?: boolean; delay?: number } = {},
+          shown = route,
+        ): Promise<void> => {
+          const status = reads.status ?? 200;
+          page.answer('/api/site/route-reads', status, status >= 400 ? { error: 'x' } : { route, files: [], keys: [], complete: reads.complete ?? true }, reads.delay);
+          await agent.moved(route);
+          await agent.census({ route: shown, found: {} });
+        };
+        const AMONG_FIVE = [SCOPE, '1 of 5 pages not yet checked'];
+
+        it('P8a: one incomplete route among five holds the upgrade until it is read again complete (key-usage: the upgrade)', async () => {
+          const { page, agent } = await badged(usageOf());
+          await visitWith(page, agent, '/');
+          await visitWith(page, agent, '/a');
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '3 of 5 pages not yet checked']);
+          await visitWith(page, agent, '/b/');
+          await visitWith(page, agent, '/c', { complete: false });
+          await visitWith(page, agent, '/d');
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          expect(await badges(page, 'lone_key')).not.toContain('may be a leftover');
+          await visitWith(page, agent, '/c', { complete: true });
+          expect(await noteOf(page, 'lone_key')).toEqual(['may be a leftover']);
+          expect(await badges(page, 'lone_key')).toContain('may be a leftover');
+          expect(await noteOf(page, 'mail_key')).toEqual([SCOPE]);
+          expect(await noteOf(page, 'server_key')).toEqual([SCOPE]);
+          page.dom.window.close();
+        });
+
+        it('P8b: a query, a trailing slash and a route outside the list count the page they belong to, or none', async () => {
+          const { page, agent } = await badged(usageOf());
+          await visitWith(page, agent, '/');
+          await visitWith(page, agent, '/a', {}, '/a?x=1');
+          await visitWith(page, agent, '/b', {}, '/b');
+          await visitWith(page, agent, '/c');
+          await visitWith(page, agent, '/zzz');
+          await visitWith(page, agent, '/blog/hello');
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          page.dom.window.close();
+        });
+
+        it('P8c: a route whose reads fail (500) is not checked, and the badge never upgrades on it (D42)', async () => {
+          const { page, agent } = await badged(usageOf());
+          for (const route of ['/', '/a', '/b/', '/c']) await visitWith(page, agent, route);
+          await visitWith(page, agent, '/d', { status: 500 });
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          expect(await badges(page, 'lone_key')).not.toContain('may be a leftover');
+          page.dom.window.close();
+        });
+
+        it('P8d: a census that lands before its page’s reads leaves the page unchecked until they answer complete (D42)', async () => {
+          const { page, agent } = await badged(usageOf());
+          for (const route of ['/', '/a', '/b/', '/c']) await visitWith(page, agent, route);
+          // The last page's reads answer incomplete after 300 ms; its census arrives first.
+          page.answer('/api/site/route-reads', 200, { route: '/d', files: [], keys: [], complete: false }, 300);
+          await agent.census({ route: '/d', found: {} });
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          await wait(500);
+          await page.settle();
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+
+          // The same page, its reads slow but complete: unchecked until they answer, then the upgrade.
+          const second = await badged(usageOf());
+          for (const route of ['/', '/a', '/b/', '/c']) await visitWith(second.page, second.agent, route);
+          second.page.answer('/api/site/route-reads', 200, { route: '/d', files: [], keys: [], complete: true }, 300);
+          await second.agent.census({ route: '/d', found: {} });
+          expect(await noteOf(second.page, 'lone_key')).toEqual(AMONG_FIVE);
+          await wait(500);
+          await second.page.settle();
+          expect(await noteOf(second.page, 'lone_key')).toEqual(['may be a leftover']);
+          page.dom.window.close();
+          second.page.dom.window.close();
+        });
+
+        it('a page whose reads answered complete and later answer incomplete is unchecked again (D42)', async () => {
+          const { page, agent } = await badged(usageOf());
+          for (const route of ['/', '/a', '/b/', '/c', '/d']) await visitWith(page, agent, route);
+          expect(await noteOf(page, 'lone_key')).toEqual(['may be a leftover']);
+          await visitWith(page, agent, '/c', { complete: false });
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          page.dom.window.close();
+        });
+
+        it('lists the learnt prefixes in the pane for any selected key, a key the scan found read among them (key-usage: the pane lists the learnt prefixes)', async () => {
+          const { page } = await badged(usageOf({ prefixes: [{ prefix: 'tier_', file: 'src/pricing.ts', line: 4 }] }));
+          expect(await noteOf(page, 'home_key')).toEqual(['Key prefixes read without naming each key: tier_ (src/pricing.ts:4)']);
+          page.dom.window.close();
+        });
+
+        it('marks a key of the open route the census did not find as not shown on this page', async () => {
+          const { page, agent } = await badged(usageOf());
+          await agent.census({ route: '/', found: {} });
+          expect(await badges(page, 'home_key')).toContain('not shown on this page');
+          await agent.census({ route: '/', found: { home_key: 1 } });
+          expect(await badges(page, 'home_key')).not.toContain('not shown on this page');
+          page.dom.window.close();
+        });
+      });
+
+      // 7.8 — the frame message boundary
+      it('stage 5: a forged pick, typed and save from the frame writes nothing and moves focus to Save (7.8)', async () => {
+        let saves = 0;
+        const { page, agent } = await bridged({
+          routes: [['/api/site/save', 200, () => { saves += 1; return { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] }; }]],
+        });
+        // A pick naming a key the descriptor does not declare changes nothing.
+        for (const key of ['constructor', 'nope']) {
+          await agent.pick([{ key }], { again: true });
+          expect(selected(page), key).toBe('');
+          expect(agent.sent('edit'), key).toEqual([]);
+          expect(popover(page).hidden, key).toBe(true);
+        }
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Forged words');
+        await agent.typed('loose_key', 'Forged into another key');
+        await agent.typed('hero_headline', 'Forged into another locale', { locale: 'de' });
+        // Cmd/Ctrl-S pressed in the page: the frame holds focus.
+        agent.frame().focus();
+        await agent.key('save');
+        await wait(150);
+        expect(saves).toBe(0);
+        expect(page.requested('/api/site/save')).toEqual([]);
+        expect(docOf(page).activeElement).toBe(docOf(page).querySelector('#main [data-act="save"]'));
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Forged words' });
+        expect(stateOf(page).snapshot['default']?.['hero_headline']).toBe('Ship the copy');
+        page.dom.window.close();
+      });
+
+      // 7.8 — what the frame cannot do (D41), and the boundary probed from the other side
+      it('D41: a forged key:save with a column field focused leaves the focus there, and the next Space saves nothing (7.8)', async () => {
+        const { page, agent } = await bridged();
+        await page.act('key:hero_headline');
+        await page.type('text:hero_headline', 'Drafted');
+        const field = docOf(page).querySelector('#main [data-act-input="text:hero_headline"]') as HTMLElement;
+        const focused = (): string | null => docOf(page).activeElement?.getAttribute('data-act-input') ?? docOf(page).activeElement?.getAttribute('data-act') ?? null;
+        field.focus();
+        expect(focused()).toBe('text:hero_headline');
+        await agent.key('save');
+        expect(focused()).toBe('text:hero_headline');
+        // A Space on a focused button presses it, as in a browser.
+        const active = docOf(page).activeElement as HTMLElement;
+        active.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+        if (active.tagName === 'BUTTON') active.click();
+        await page.settle();
+        await wait(100);
+        expect(page.requested('/api/site/save')).toEqual([]);
+        page.dom.window.close();
+      });
+
+      describe('the frame message boundary, probed', () => {
+        const dump = (page: Painted): string =>
+          (page.dom.window as unknown as { eval: (code: string) => string }).eval(
+            'JSON.stringify({draft:S.draft,base:S.base,edit:S.edit,sel:S.sel,mode:S.mode,moved:S.moved,census:S.census,hover:S.hover,popover:S.popover,unmanaged:S.unmanaged,choose:S.choose,warn:S.warn,locale:S.locale,seenKeys:[...S.seen.keys],seenRoutes:[...S.seen.routes],tmpl:S.tmpl})',
+          );
+        const writesOf = (page: Painted): string[] => page.sent.filter((r) => r.body !== undefined).map((r) => r.path);
+
+        it('P2: prototype-chain keys and an empty key select nothing and edit nothing, in a pick, a hover, typed, edited and a census', async () => {
+          const { page, agent } = await bridged({ site: THREE });
+          const before = dump(page);
+          for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf', 'prototype', '']) {
+            await agent.pick([{ key }], { again: true });
+            await agent.tell({ stet: 'hover', keys: [{ key, attr: null, by: 'whole' }], tag: 'p', rect: RECT, inplace: true });
+            await agent.typed(key, 'X');
+            await agent.edited(key, 'cancel');
+          }
+          const found = JSON.parse('{"__proto__":1,"constructor":2,"toString":3,"hero_headline":1}') as Record<string, number>;
+          await agent.census({
+            found,
+            head: [{ key: 'constructor', where: 'title' }, { key: '__proto__', where: 'title' }, { key: 'hero_headline', where: '__proto__' }, { key: 'hero_headline', where: 'constructor' }],
+          });
+          const after = JSON.parse(dump(page)) as { census: { found: Record<string, number>; head: unknown[] }; seenKeys: string[] };
+          expect(Object.keys(after.census.found)).toEqual(['hero_headline']);
+          expect(after.census.head).toEqual([]);
+          expect(after.seenKeys).toEqual(['hero_headline']);
+          const was = JSON.parse(before) as Record<string, unknown>;
+          const now = JSON.parse(dump(page)) as Record<string, unknown>;
+          for (const field of ['draft', 'base', 'edit', 'sel', 'popover', 'choose', 'hover']) expect(now[field], field).toEqual(was[field]);
+          expect(agent.sent('edit')).toEqual([]);
+          expect(writesOf(page)).toEqual([]);
+          expect(page.errors).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('P7: nothing from a frame message is written as HTML', async () => {
+          const { page, agent } = await bridged({
+            routes: [['/api/site/route-reads', 200, { route: '/', files: [], keys: ['hero_headline'], complete: true }]],
+          });
+          const evil = '<img src=x onerror="window.__pwn=1"><svg onload="window.__pwn=2">';
+          await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: evil, by: 'whole' }], tag: evil, rect: RECT, inplace: true });
+          await agent.tell({ stet: 'unmanaged', text: evil, tag: evil });
+          await agent.moved(evil);
+          await agent.census({ route: evil, found: { hero_headline: 1 }, head: [{ key: 'hero_headline', where: 'title' }] });
+          await agent.tell({ stet: 'pick', keys: [{ key: 'hero_headline', attr: null, by: evil, inplace: true }, { key: 'loose_key', attr: evil, by: evil }], tag: evil, rect: RECT, again: true });
+          await page.act('pageInfo');
+          await agent.pick([{ key: 'hero_headline', attr: evil, by: 'whole', inplace: false }], { again: true, tag: evil });
+          await agent.tell({ stet: 'located', key: 'hero_headline', found: 0, by: evil, route: evil, hardcoded: false, redrawn: true });
+          await agent.tell({ stet: 'edited', key: 'hero_headline', locale: 'default', how: 'lost', proposed: true });
+          expect((page.dom.window as unknown as { __pwn?: number }).__pwn).toBeUndefined();
+          for (const id of ['hoverlabel', 'panenote', 'panemoved', 'paneinfo', 'panepick', 'popover', 'counter', 'panehead']) {
+            expect(byId(page, id).querySelectorAll('img, svg, script').length, id).toBe(0);
+          }
+          expect(docOf(page).querySelectorAll('[onerror], [onload]').length).toBe(0);
+          page.dom.window.close();
+        });
+
+        it('P9: no message arm of the frame, and no Enter in the popover, requests a write', async () => {
+          const { page, agent } = await bridged({ site: GREETING });
+          const arms: Array<Record<string, unknown>> = [
+            { stet: 'pick', keys: [{ key: 'hero_headline', attr: null, by: 'whole', inplace: true }], tag: 'h1', rect: RECT, again: true },
+            { stet: 'typed', key: 'hero_headline', locale: 'default', value: 'x', force: true },
+            { stet: 'hover', keys: [{ key: 'hero_headline', attr: null, by: 'whole' }], tag: 'h1', rect: RECT, inplace: true },
+            { stet: 'rect', rect: RECT },
+            { stet: 'unmanaged', text: 't', tag: 'p' },
+            { stet: 'census', found: { hero_headline: 1 }, head: [], route: '/' },
+            { stet: 'moved', how: 'pushState', route: '/x' },
+            { stet: 'key', which: 'mode' },
+            { stet: 'key', which: 'mode' },
+            { stet: 'key', which: 'escape' },
+            { stet: 'key', which: 'save' },
+            { stet: 'edited', key: 'hero_headline', locale: 'default', how: 'lost', proposed: true },
+            { stet: 'edited', key: 'hero_headline', locale: 'default', how: 'cancel' },
+            { stet: 'edited', key: 'hero_headline', locale: 'default', how: 'keep' },
+          ];
+          for (const arm of arms) await agent.tell(arm);
+          expect(writesOf(page)).toEqual([]);
+          await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+          await typeInto(page, poptext(page), 'Hello');
+          await press(page, poptext(page), 'Enter');
+          expect(writesOf(page)).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('P10: every draft removal clears its base: cancel, lost without a proposal, the popover’s Esc, a project switch', async () => {
+          const { page, agent } = await bridged({ site: GREETING });
+          await agent.pick([{ key: 'hero_headline' }], { again: true });
+          await agent.typed('hero_headline', 'During');
+          expect(stateOf(page).base).toEqual({ 'default hero_headline': 'Ship the copy' });
+          await agent.edited('hero_headline', 'cancel');
+          expect(stateOf(page).draft).toEqual({});
+          expect(stateOf(page).base).toEqual({});
+
+          await agent.pick([{ key: 'loose_key' }], { again: true, tag: 'p' });
+          await agent.typed('loose_key', 'Typed');
+          await agent.edited('loose_key', 'lost', { proposed: false });
+          expect(stateOf(page).draft).toEqual({});
+          expect(stateOf(page).base).toEqual({});
+
+          await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+          await typeInto(page, poptext(page), 'Gone');
+          expect(Object.keys(stateOf(page).base ?? {})).toEqual(['default lab_greeting']);
+          await press(page, poptext(page), 'Escape');
+          expect(stateOf(page).draft).toEqual({});
+          expect(stateOf(page).base).toEqual({});
+
+          await agent.pick([{ key: 'hero_headline' }]);
+          await page.type('text:hero_headline', 'Before the switch');
+          expect(Object.keys(stateOf(page).base ?? {})).toEqual(['default hero_headline']);
+          await page.act('site:/checkouts/other');
+          expect(stateOf(page).draft).toEqual({});
+          expect(stateOf(page).base).toEqual({});
+          page.dom.window.close();
+        });
+
+        it('P11: markup in a frame string stays text in the hover label and the pane note', async () => {
+          const { page, agent } = await bridged();
+          const evil = '<b id="pwn">x</b>';
+          await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: evil, by: 'whole' }], tag: evil, rect: RECT, inplace: true });
+          expect(byId(page, 'hoverlabel').querySelector('#pwn')).toBeNull();
+          expect(byId(page, 'hoverlabel').textContent).toContain(evil);
+          await agent.pick([{ key: 'hero_headline' }]);
+          await agent.tell({ stet: 'located', key: 'hero_headline', found: 0, by: 'text', route: evil, seq: agent.locates().at(-1)?.['seq'] });
+          expect(byId(page, 'panenote').querySelector('#pwn')).toBeNull();
+          expect(byId(page, 'panenote').textContent).toContain(evil);
+          page.dom.window.close();
+        });
+
+        it('P12: a pick of another entry of the same key ends the open edit first', async () => {
+          const { page, agent } = await bridged({ site: THREE });
+          await agent.pick([{ key: 'hero_bullets', entry: 0 }], { again: true, tag: 'li' });
+          expect(stateOf(page).edit).toMatchObject({ key: 'hero_bullets', entry: 0 });
+          const at = agent.posts.length;
+          await agent.pick([{ key: 'hero_bullets', entry: 1 }], { tag: 'li' });
+          expect(agent.posts[at]?.message).toEqual({ stet: 'end', how: 'keep' });
+          page.dom.window.close();
+        });
+
+        it('P13: a click right after the app moved lists no not-found keys until the new route’s reads arrive (F8)', async () => {
+          const { page, agent } = await bridged({
+            routes: [['/api/site/route-reads', 200, { route: '/', files: ['index.html'], keys: ['hero_headline', 'loose_key'], complete: true }]],
+          });
+          await agent.census({ found: {} });
+          page.answer('/api/site/route-reads', 200, { route: '/pricing', files: [], keys: ['seo_home_title'], complete: true }, 300);
+          await agent.moved('/pricing');
+          await agent.tell({ stet: 'unmanaged', text: 'x', tag: 'p' });
+          expect(lines(page)).toEqual(['No key matches this text.']);
+          await wait(500);
+          await page.settle();
+          expect(lines(page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: seo_home_title.']);
+          page.dom.window.close();
+        });
+      });
     });
   });
 
