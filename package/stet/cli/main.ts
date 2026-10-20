@@ -284,6 +284,7 @@ export function usage(): string {
     '',
     'Email templates (the bulk adoption pair):',
     '  email extract [paths…] [--apply [names…]]   declare templates: entry, slots, render pointer, shell',
+    '      --frame FILE#EXPORT   the host function every proposed template is wrapped in',
     '  email verify [--capture] [--recapture]   render each declared template before and after, and compare the bytes',
     '',
     'Reading (work in every mode):',

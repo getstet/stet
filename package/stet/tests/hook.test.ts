@@ -28,7 +28,7 @@ import { basename, join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { cleanupCliHosts, htmlFixture, makeHtmlHost } from '../conformance/cli-host.js';
+import { cleanupCliHosts, htmlFixture, makeCliHost, makeHtmlHost } from '../conformance/cli-host.js';
 import { runDoctor } from '../cli/doctor.js';
 import { runEject } from '../cli/eject.js';
 import { GATE_LINE, HOOK_BEFORE_0_3_1, readGate, runHookInstall, runHookRemove, SHARED_GATE_LINE } from '../cli/hook.js';
@@ -1411,4 +1411,35 @@ describe('the gate runs stet seo check where the entry opted in', () => {
     expect(await runHookInstall([], again)).toBe(0);
     expect(again.out).toEqual([`${hookPath}: the stet pre-commit gate is already installed for site/ — no change`]);
   });
+});
+
+describe('the gate prints scan’s warns and lands the commit', () => {
+  it.skipIf(!builtBinExists()).each(['warn', 'fail'] as const)(
+    'names a new template no entry manages, and the commit lands under severity %s (journey E25)',
+    async (severity) => {
+      const top = gitRepo();
+      const host = makeCliHost({
+        config: { emailSurfaces: ['lib/email/templates/*.ts'], scan: { severity, baseline: '.stet/scan-baseline.json' } },
+      });
+      cpSync(host.cwd, top, { recursive: true });
+      installStetShim(top);
+      commit(top, 'base');
+      expect(await runHookInstall([], io(top))).toBe(0);
+
+      mkdirSync(join(top, 'lib/email/templates'), { recursive: true });
+      writeFileSync(
+        join(top, 'lib/email/templates/invoice-paid.ts'),
+        "export const invoicePaidContent = '<h1>Your invoice is paid</h1><p>Thanks for staying with us.</p>';\n",
+      );
+      const landed = commit(top, 'an invoice template');
+      expect(landed.code, landed.out).toBe(0);
+      expect(landed.out).toContain(
+        'lib/email/templates/invoice-paid.ts exports a template stet does not manage — run stet email extract lib/email/templates/invoice-paid.ts',
+      );
+      expect(execFileSync('git', ['log', '-1', '--format=%s'], { cwd: top, encoding: 'utf8' }).trim()).toBe(
+        'an invoice template',
+      );
+    },
+    60_000,
+  );
 });

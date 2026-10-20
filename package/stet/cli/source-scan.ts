@@ -676,7 +676,7 @@ export function templateText(
 }
 
 /** A property's name where it is written as one — an identifier or a string. Computed and numeric names answer `undefined`. */
-function propName(ts: typeof import('typescript'), name: TS.PropertyName): string | undefined {
+export function propName(ts: typeof import('typescript'), name: TS.PropertyName): string | undefined {
   if (ts.isIdentifier(name) || ts.isStringLiteral(name)) return name.text;
   return undefined;
 }

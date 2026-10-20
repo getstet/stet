@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { runEmailExtract } from '../cli/email-extract.js';
 import { runScan } from '../cli/scan.js';
@@ -1904,6 +1904,118 @@ describe('scan names only from validated forms (F54)', () => {
       writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(raw));
       expect(await host.run('scan')).toBe(0);
       expect(proposedKeys(host.err)).toEqual(['home_page_paragraph', 'home_page_paragraph']);
+    }
+  });
+});
+
+/**
+ * An email template no entry manages (D4, R4). A developer who adds a template
+ * file and commits hears about it at the commit, through the hook's scan, and
+ * the commit lands: the warn names the command that declares it.
+ */
+describe('runScan — an email template no entry manages', () => {
+  const UNDECLARED = 'exports a template stet does not manage';
+
+  function emailProject(): string {
+    const dir = project({ managedSurfaces: [], emailSurfaces: ['lib/email/**/*.ts'] });
+    write(
+      dir,
+      'content/descriptor.json',
+      JSON.stringify({
+        version: 1,
+        keys: {},
+        templates: {
+          welcome: {
+            class: 'transactional',
+            trigger: 'manual',
+            slots: ['body'],
+            render: {
+              file: 'lib/email/templates/welcome.ts',
+              export: 'welcome',
+              sampleProps: {},
+              frame: { file: 'lib/email/templates/base.ts', export: 'baseTemplate' },
+            },
+          },
+        },
+      }),
+    );
+    write(
+      dir,
+      'lib/email/templates/welcome.ts',
+      'export function welcome(props: { welcome__body: string }): string {\n  return `<p>${props.welcome__body}</p>`;\n}\n',
+    );
+    // The frame and the registry both export functions that return markup.
+    write(dir, 'lib/email/templates/base.ts', 'export function baseTemplate(content: string): string {\n  return `<html>${content}</html>`;\n}\n');
+    write(dir, 'lib/email/registry.ts', 'export const renderNamed = (name: string): string => `<p>${name}</p>`;\n');
+    write(dir, 'lib/email/templates/invoice-paid.ts', "export const invoicePaidContent = '<h1>Your invoice is paid</h1>';\n");
+    return dir;
+  }
+
+  it('warns for the undeclared template alone — never the declared one, its frame or the registry', async () => {
+    const cap = io(emailProject());
+    expect(await runScan([], cap)).toBe(0);
+    expect(cap.err.filter((line) => line.includes(UNDECLARED))).toEqual([
+      expect.stringContaining(
+        'lib/email/templates/invoice-paid.ts exports a template stet does not manage — run stet email extract lib/email/templates/invoice-paid.ts',
+      ),
+    ]);
+  });
+
+  it('advises extract only for a file extract would propose, and says to declare the rest by hand', async () => {
+    const dir = emailProject();
+    // Shaped like Mirra's join-welcome: the template constant and an exported function returning markup, no default.
+    write(
+      dir,
+      'lib/email/templates/join-welcome.ts',
+      "export const joinWelcomeContent = '<h1>Welcome to the channel</h1>';\n" +
+        'export function joinChannelLine(name: string): string {\n  return `<p>${name} joined</p>`;\n}\n',
+    );
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    expect(cap.err.filter((line) => line.includes(UNDECLARED))).toEqual([
+      'warn: lib/email/templates/invoice-paid.ts exports a template stet does not manage — run stet email extract lib/email/templates/invoice-paid.ts',
+      'warn: lib/email/templates/join-welcome.ts exports a template stet does not manage — stet email extract skips it ' +
+        '(several exports return markup (joinWelcomeContent, joinChannelLine) and none is the default), ' +
+        'so declare it in the descriptor by hand',
+    ]);
+  });
+
+  it('warns and never fails under severity fail, with or without --baseline', async () => {
+    const dir = project({
+      managedSurfaces: [],
+      emailSurfaces: ['lib/email/**/*.ts'],
+      scan: { severity: 'fail', baseline: '.stet/scan-baseline.json' },
+    });
+    write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, templates: {} }));
+    write(dir, 'lib/email/templates/invoice-paid.ts', "export const invoicePaidContent = '<h1>Your invoice is paid</h1>';\n");
+    const line =
+      'warn: lib/email/templates/invoice-paid.ts exports a template stet does not manage — run stet email extract lib/email/templates/invoice-paid.ts';
+    const plain = io(dir);
+    expect(await runScan([], plain)).toBe(0);
+    expect(plain.err.join('\n')).toContain(line);
+    const baseline = io(dir);
+    expect(await runScan(['--baseline'], baseline)).toBe(0);
+    expect(baseline.err.join('\n')).toContain(line);
+  });
+
+  it('reports nothing where the compiler does not load', async () => {
+    vi.resetModules();
+    vi.doMock('../cli/source-scan.js', async (importOriginal) => {
+      // The refusal `loadTypescript` raises, from the module instance the fresh scan reads.
+      const { CliError } = await import('../cli/report.js');
+      return {
+        ...(await importOriginal<typeof import('../cli/source-scan.js')>()),
+        loadTypescript: () => Promise.reject(new CliError("stet needs 'typescript' to read your source")),
+      };
+    });
+    try {
+      const fresh = await import('../cli/scan.js');
+      const cap = io(emailProject());
+      await fresh.runScan([], cap);
+      expect(cap.err.join('\n')).not.toContain(UNDECLARED);
+    } finally {
+      vi.doUnmock('../cli/source-scan.js');
+      vi.resetModules();
     }
   });
 });

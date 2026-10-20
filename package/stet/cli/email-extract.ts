@@ -25,29 +25,38 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, join, posix } from 'node:path';
 
 import type * as TS from 'typescript';
 
 import type { Snapshot } from '../src/snapshot.js';
 import { opensMarkupTag } from '../src/targets/html-email.js';
-import { EMAIL_TARGET, type Descriptor, type KeyDef, type TemplateDef } from '../src/types.js';
-import { validateSave } from '../src/validate.js';
-import { flag, parse, positionalsAround, refuseEnv } from './args.js';
+import {
+  EMAIL_TARGET,
+  type Descriptor,
+  type KeyDef,
+  type RenderFrame,
+  type RenderPointer,
+  type TemplateDef,
+} from '../src/types.js';
+import { validateSave, VARIABLE } from '../src/validate.js';
+import { flag, parse, positionalsAround, refuseEnv, text } from './args.js';
 import { asUpdate, planJson, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { CONFIG_FILE, defaultConfig, loadConfig, type StetConfig } from './config.js';
+import { containedPointer, outsideLine } from './email-render.js';
+import { filesForGlobs } from './files.js';
 import { gitFiles } from './git.js';
 import type { CliIo } from './main.js';
 import { normalize } from './pages.js';
 import { clip, plural, CliError, Report, UsageError } from './report.js';
 import { applyFileEdits, dominantEol, formatDiff, type Edit } from './rewrite.js';
-import { filesForGlobs } from './scan.js';
 import {
   decodeEntities,
   isI18nCall,
   jsxTextSuppression,
   loadTypescript,
+  propName,
   scriptKindFor,
   undecodedEntity,
   type JsxTextSuppression,
@@ -109,6 +118,8 @@ export interface TemplateProposal {
   keys: Record<string, KeyDef>;
   source: string;
   edited: string;
+  /** A string constant the rewrite turned into a function, rather than a function whose props type it widened. */
+  constant: boolean;
   /** Runs left as shell, with the reason — reported, never silently dropped. */
   notes: string[];
 }
@@ -172,7 +183,7 @@ const HELD_EXCERPT = 80;
 
 export async function runEmailExtract(args: string[], io: CliIo): Promise<number> {
   refuseEnv(args, 'email extract');
-  const parsed = parse(args, { apply: 'boolean', json: 'boolean' });
+  const parsed = parse(args, { apply: 'boolean', json: 'boolean', frame: 'string' });
   const json = flag(parsed.values, 'json');
   const apply = flag(parsed.values, 'apply');
   // `--apply` is optional-variadic: the positionals before it are the paths to
@@ -202,7 +213,11 @@ export async function runEmailExtract(args: string[], io: CliIo): Promise<number
     return report.emit(io, { json });
   }
 
-  const set = await proposeTemplates(io, config, descriptor, walk, globs);
+  // The frame is read before anything is proposed: a run that cannot wrap its
+  // templates the way the command line says proposes none of them.
+  const frameSpec = text(parsed.values, 'frame');
+  const frame = frameSpec === undefined ? undefined : await readFrame(io.cwd, frameSpec);
+  const set = await proposeTemplates(io, config, descriptor, walk, globs, frame);
   printProposals(report, set);
 
   if (!apply) {
@@ -339,10 +354,20 @@ function applyProposals(
   // no CALL SITE, so every caller stops typechecking — and the lab found an
   // adopter can finish the printed recipe with a red build, because the next
   // step that was printed passes.
-  report.line(
-    'the rewrite added the slot props to each template’s props type and changed no call site: every caller of ' +
-      'these exports fails to typecheck until it passes the resolved slot values',
-  );
+  if (landed.some((p) => !p.constant)) {
+    report.line(
+      'the rewrite added the slot props to each template’s props type and changed no call site: every caller of ' +
+        'these exports fails to typecheck until it passes the resolved slot values',
+    );
+  }
+  // A constant has no props type to widen: it became a function of one props object.
+  for (const proposal of landed) {
+    if (!proposal.constant) continue;
+    report.line(
+      `rewrote ${proposal.entry.render?.export ?? proposal.name} from a string into a function of its props — ` +
+        'callers that use it as a string must call it',
+    );
+  }
   // The migration recipe's own next steps, printed rather than remembered: the
   // custody proof is what says the rewrite changed nothing, and the callers are
   // what makes the host build again.
@@ -441,6 +466,7 @@ export async function proposeTemplates(
   descriptor: Descriptor,
   walk: string[],
   globs: string[] = [],
+  frame?: RenderFrame,
 ): Promise<ProposalSet> {
   const ts = await loadTypescript();
   const aliases = aliasPrefixes(ts, io.cwd);
@@ -451,9 +477,12 @@ export async function proposeTemplates(
   // what it tells the reader to do about it.
   const taken = new Map<string, string | null>(Object.keys(descriptor.templates ?? {}).map((name) => [name, null]));
 
+  // The frame the run names wraps the templates; it is never one of them.
+  const frameFile = frame === undefined ? undefined : posix.normalize(frame.file);
   for (const file of filesForGlobs(io.cwd, walk)) {
+    if (file === frameFile) continue;
     const source = readFileSync(join(io.cwd, file), 'utf8');
-    const outcome = proposeFile(ts, { config, descriptor, file, source, aliases, taken });
+    const outcome = proposeFile(ts, { cwd: io.cwd, config, descriptor, file, source, aliases, taken, frame });
     if ('reason' in outcome) {
       skips.push(outcome);
       continue;
@@ -466,6 +495,7 @@ export async function proposeTemplates(
 }
 
 interface FileContext {
+  cwd: string;
   config: StetConfig;
   descriptor: Descriptor;
   file: string;
@@ -473,6 +503,8 @@ interface FileContext {
   aliases: AliasPrefix[];
   /** Template names already spoken for — declared, or proposed earlier in this walk. */
   taken: Map<string, string | null>;
+  /** The `--frame` every proposal of the run carries. */
+  frame?: RenderFrame;
 }
 
 function proposeFile(ts: typeof import('typescript'), ctx: FileContext): TemplateProposal | ExtractSkip {
@@ -536,13 +568,25 @@ function proposeFile(ts: typeof import('typescript'), ctx: FileContext): Templat
         );
   }
 
-  const props = propsOf(ts, sf, chosen.fn, typed);
+  // A string constant takes no props: its contract is the slot keys the rewrite
+  // gives it, and its samples are the variables its text and its subject carry.
+  const subject = chosen.kind === 'constant' ? registrySubject(ts, ctx.cwd, file, name) : null;
+  if (chosen.kind === 'constant' && declaredType(ts, chosen.yields)) {
+    return skip(
+      'unwritable-props-type',
+      `${chosen.name} is declared with a type, and the rewrite turns it into a function that type does not allow`,
+    );
+  }
+  const props =
+    chosen.kind === 'constant'
+      ? constantProps(ts, chosen.yields, subject === null ? [] : variablesIn(subject.value))
+      : propsOf(ts, sf, chosen.fn, typed);
   if (props === null) {
     // The reason splits three ways and each has a different fix. A frame taking
     // `(content: string, …)` is not a template whose props stet can widen at
     // all — telling its author their members "cannot be read to primitives"
     // sends them looking at members they never wrote.
-    const param = chosen.fn.parameters[0];
+    const param = chosen.kind === 'function' ? chosen.fn.parameters[0] : undefined;
     const declared = param?.type;
     const positional =
       declared !== undefined && !ts.isTypeLiteralNode(declared) && !ts.isTypeReferenceNode(declared);
@@ -576,6 +620,12 @@ function proposeFile(ts: typeof import('typescript'), ctx: FileContext): Templat
   const edits: Edit[] = [];
   const used = new Map<string, number>();
 
+  // The registry's subject claims its slot name ahead of the runs, so a
+  // `<title>` run in the markup is the one that gets numbered.
+  const subjectSlot = subject === null ? null : seedSubject(subject, name, freeSlot('subject', used), ctx.descriptor);
+  if (subjectSlot !== null && 'collision' in subjectSlot) return skip('name-collision', subjectSlot.collision);
+  if (subjectSlot !== null && 'rejected' in subjectSlot) used.set('subject', 0);
+
   for (const run of grouped.runs) {
     // An interpolation with no copy around it — a between-tags segment holding
     // only `${…}` — stays shell, and skips nothing: the lifting rule applies to
@@ -605,6 +655,14 @@ function proposeFile(ts: typeof import('typescript'), ctx: FileContext): Templat
       );
       continue;
     }
+    // A string template's `${…}` names a module constant, never a prop, so
+    // there is nothing a slot value could carry in its place.
+    if (chosen.kind === 'constant' && run.pieces.some((p) => p.kind === 'var')) {
+      notes.push(
+        `the run at offset ${run.pos} interpolates \${…}, which a string template cannot pass as a prop — left as shell`,
+      );
+      continue;
+    }
     const seeded = seedRun(run, props);
     if (seeded === null) {
       return skip('unliftable-interpolation', 'a text run interpolates something that is not a prop of the export’s first parameter');
@@ -627,9 +685,10 @@ function proposeFile(ts: typeof import('typescript'), ctx: FileContext): Templat
       return skip('name-collision', `the flattened key ${JSON.stringify(key)} is already a descriptor key or a prop of this export`);
     }
 
-    const def: KeyDef = seeded.vars.length === 0
-      ? { shape: 'text', target: EMAIL_TARGET }
-      : { shape: 'text', target: EMAIL_TARGET, vars: seeded.vars };
+    // A string template's placeholders stay in its runs as written: they ARE
+    // the seeded value's variables, where a function's are the props it lifted.
+    const vars = chosen.kind === 'constant' ? variablesIn(seeded.value) : seeded.vars;
+    const def = slotDef(vars);
     // The save gate, at proposal time. Extract must never print a seed its own
     // offline check would reject — a run carrying markup the construct rule
     // blocks, or a `{{token}}` the host already had and this key never declared,
@@ -642,7 +701,7 @@ function proposeFile(ts: typeof import('typescript'), ctx: FileContext): Templat
       continue;
     }
 
-    slots.push({ slot, key, value: seeded.value, vars: seeded.vars });
+    slots.push({ slot, key, value: seeded.value, vars });
     keys[key] = def;
     // ONE expression per gap. Adjacent text children render with comment-node
     // separators under the host's hydrating paths, and the static render this
@@ -658,19 +717,63 @@ function proposeFile(ts: typeof import('typescript'), ctx: FileContext): Templat
     return skip(...noSlotReason(chunks.suppressions, notes, grouped.runs.some((run) => run.interleaved)));
   }
 
-  edits.push(...widenProps(sf, props, slots, typed));
+  edits.push(
+    ...(chosen.kind === 'constant'
+      ? constantRewrite(ts, sf, chosen.yields, slots, typed)
+      : widenProps(sf, props, slots, typed)),
+  );
 
+  // The subject is never rendered by the template, so it joins the proposal
+  // only once a run has lifted: first among the slots, as a `subject` member is.
+  if (subjectSlot !== null) {
+    if ('slot' in subjectSlot) {
+      slots.unshift(subjectSlot.slot);
+      keys[subjectSlot.slot.key] = subjectSlot.def;
+    }
+    notes.push(subjectSlot.note);
+  }
+  const render: RenderPointer =
+    chosen.kind === 'constant'
+      ? { file, export: chosen.name, sampleProps: props.sample, fill: true }
+      : // The MODULE's export name, which is `default` for a default export whatever
+        // the function is called in source: `export default function Digest` becomes
+        // `exports.default` under the CommonJS transpile the runner loads through, so
+        // a pointer naming `Digest` would fail every render.
+        { file, export: chosen.isDefault ? 'default' : chosen.name, sampleProps: props.sample };
   const entry: TemplateDef = {
     ...DEFAULTED_ENTRY,
     slots: slots.map((s) => s.slot),
-    // The MODULE's export name, which is `default` for a default export whatever
-    // the function is called in source: `export default function Digest` becomes
-    // `exports.default` under the CommonJS transpile the runner loads through, so
-    // a pointer naming `Digest` would fail every render.
-    render: { file, export: chosen.isDefault ? 'default' : chosen.name, sampleProps: props.sample },
+    render: ctx.frame === undefined ? render : { ...render, frame: { ...ctx.frame } },
   };
 
-  return { name, file, entry, slots, keys, source, edited: applyFileEdits(source, edits), notes };
+  return {
+    name,
+    file,
+    entry,
+    slots,
+    keys,
+    source,
+    edited: applyFileEdits(source, edits),
+    constant: chosen.kind === 'constant',
+    notes,
+  };
+}
+
+/** A slot's key definition: email text whose variables are each allowed and required (D3). */
+function slotDef(vars: string[]): KeyDef {
+  return vars.length === 0
+    ? { shape: 'text', target: EMAIL_TARGET }
+    : { shape: 'text', target: EMAIL_TARGET, vars, requires: [...vars] };
+}
+
+/** The `{{name}}` variables a text carries, in first-seen order — the save gate's own grammar. */
+function variablesIn(text: string): string[] {
+  const names: string[] = [];
+  for (const found of text.matchAll(VARIABLE)) {
+    const name = found[1];
+    if (name !== undefined && !names.includes(name)) names.push(name);
+  }
+  return names;
 }
 
 /**
@@ -723,22 +826,34 @@ function noSlotReason(
 
 // --- The export finder ------------------------------------------------------
 
-interface Candidate {
+interface CandidateBase {
   name: string;
   isDefault: boolean;
-  fn: TS.SignatureDeclaration & { body?: TS.Node };
-  /** The expression the body yields: a template literal, an object of them, or JSX. */
-  yields: TS.Expression;
   /** How many of the body's returns yield markup — more than one is ambiguous. */
   branches: number;
 }
 
 /**
- * Every exported function whose body yields markup. An object of FUNCTIONS is
- * not one: the template literals inside it belong to nested functions, and the
- * search below never descends into those.
+ * A template export: a function whose body yields markup, or a string constant
+ * carrying markup. For a function, `yields` is what the body returns — a
+ * template literal, an object of them, or JSX; for a constant, the literal.
  */
-function templateExports(ts: typeof import('typescript'), sf: TS.SourceFile): Candidate[] {
+export type Candidate =
+  | (CandidateBase & { kind: 'function'; fn: TS.SignatureDeclaration & { body?: TS.Node }; yields: TS.Expression })
+  | (CandidateBase & { kind: 'constant'; yields: TemplateText });
+
+/** The literal a string-constant template is. */
+type TemplateText = TS.StringLiteral | TS.NoSubstitutionTemplateLiteral | TS.TemplateExpression;
+
+/**
+ * Every exported function whose body yields markup, and every exported `const`
+ * whose initializer is a string or template literal carrying markup. An object
+ * of FUNCTIONS is not one: the template literals inside it belong to nested
+ * functions, and the search below never descends into those. A string with no
+ * markup in it is an id or a line of copy beside the template, never the
+ * template itself.
+ */
+export function templateExports(ts: typeof import('typescript'), sf: TS.SourceFile): Candidate[] {
   const found: Candidate[] = [];
   const isExported = (node: TS.Node): boolean =>
     ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
@@ -750,15 +865,21 @@ function templateExports(ts: typeof import('typescript'), sf: TS.SourceFile): Ca
     const yielded = markupReturns(ts, fn);
     const first = yielded[0];
     if (first === undefined) return;
-    found.push({ name, isDefault: defaulted, fn, yields: first, branches: yielded.length });
+    found.push({ kind: 'function', name, isDefault: defaulted, fn, yields: first, branches: yielded.length });
   };
 
   for (const stmt of sf.statements) {
     if (ts.isFunctionDeclaration(stmt) && isExported(stmt)) {
       consider(stmt.name?.text ?? 'default', stmt, isDefault(stmt));
     } else if (ts.isVariableStatement(stmt) && isExported(stmt)) {
+      const constant = (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0;
       for (const decl of stmt.declarationList.declarations) {
         if (!ts.isIdentifier(decl.name) || decl.initializer === undefined) continue;
+        const literal = constant ? markupLiteral(ts, decl.initializer) : null;
+        if (literal !== null) {
+          found.push({ kind: 'constant', name: decl.name.text, isDefault: false, yields: literal, branches: 1 });
+          continue;
+        }
         consider(decl.name.text, decl.initializer, false);
       }
     } else if (ts.isExportAssignment(stmt) && stmt.isExportEquals !== true) {
@@ -798,6 +919,26 @@ function markupReturns(ts: typeof import('typescript'), fn: TS.Node): TS.Express
   };
   ts.forEachChild(body, look);
   return found;
+}
+
+/** A string or template literal whose text carries markup; null for anything else. */
+function markupLiteral(ts: typeof import('typescript'), expr: TS.Expression): TemplateText | null {
+  const literal = unwrap(ts, expr);
+  if (!ts.isStringLiteral(literal) && !ts.isNoSubstitutionTemplateLiteral(literal) && !ts.isTemplateExpression(literal)) {
+    return null;
+  }
+  return /<[a-zA-Z]/.test(literalText(ts, literal)) ? literal : null;
+}
+
+/**
+ * A literal's text, a template's parts joined by a space: a `${…}` is a module
+ * constant, never markup or a placeholder, and the space keeps a `<` or a `{{`
+ * on one side of it from pairing with the text on the other.
+ */
+function literalText(ts: typeof import('typescript'), literal: TemplateText): string {
+  return ts.isTemplateExpression(literal)
+    ? [literal.head.text, ...literal.templateSpans.map((span) => span.literal.text)].join(' ')
+    : literal.text;
 }
 
 function unwrap(ts: typeof import('typescript'), expr: TS.Expression): TS.Expression {
@@ -860,8 +1001,26 @@ function chunksOf(
 ): { chunks: Chunk[]; suppressions: JsxTextSuppression[] } | null {
   const chunks: Chunk[] = [];
   const suppressions: JsxTextSuppression[] = [];
-  const yields = candidate.yields;
 
+  if (candidate.kind === 'constant') {
+    const yields = candidate.yields;
+    // A quoted string becomes a template literal in the rewrite, and there a
+    // backtick ends it and a `${` opens a substitution: the same characters
+    // would render differently, so the whole string stays as it is.
+    if (ts.isStringLiteral(yields) && /`|\$\{/.test(source.slice(yields.getStart(sf) + 1, yields.end - 1))) {
+      notes.push(
+        `the string at offset ${yields.getStart(sf)} holds a backtick or \${, which reads differently once it is a ` +
+          'template literal — left as shell',
+      );
+      return { chunks, suppressions };
+    }
+    const emitted = emitTemplate(ts, sf, source, yields, notes, undefined);
+    if (emitted === null) return null;
+    chunks.push(...emitted);
+    return { chunks, suppressions };
+  }
+
+  const yields = candidate.yields;
   if (isJsx(ts, yields)) {
     emitJsx(ts, sf, yields, chunks, notes, suppressions);
     return { chunks, suppressions };
@@ -941,7 +1100,8 @@ function i18nTemplates(ts: typeof import('typescript'), expr: TS.Node): TS.Templ
 }
 
 /**
- * One template literal, scanned into tags and content.
+ * One template literal (or a string-constant template's quoted string), scanned
+ * into tags and content.
  *
  * The scan runs over the RAW source of each literal part, and a part whose raw
  * text differs from its cooked text — an escape sequence — contributes no slots:
@@ -953,7 +1113,7 @@ function emitTemplate(
   ts: typeof import('typescript'),
   sf: TS.SourceFile,
   source: string,
-  node: TS.TemplateExpression | TS.NoSubstitutionTemplateLiteral,
+  node: TemplateText,
   notes: string[],
   memberName: string | undefined,
 ): Chunk[] | null {
@@ -978,7 +1138,7 @@ function emitTemplate(
     parts.push({ kind: 'text', text: raw, pos: start, end });
   };
 
-  if (ts.isNoSubstitutionTemplateLiteral(node)) {
+  if (!ts.isTemplateExpression(node)) {
     textPart(node, 1);
   } else {
     textPart(node.head, 2);
@@ -1622,11 +1782,263 @@ function widenProps(sf: TS.SourceFile, props: PropsShape, slots: SlotProposal[],
   return edits;
 }
 
+// --- String-constant templates ----------------------------------------------
+
+/**
+ * A string constant's props: none to read, so every member reference is
+ * unliftable and the shell reads each slot through the `props` the rewrite
+ * gives it. The samples are every `{{var}}` the literal carries — in its runs
+ * and in its shell — and the subject's, each sampled as a string, so the
+ * render substitutes every slot variable and fills every shell one.
+ */
+function constantProps(ts: typeof import('typescript'), literal: TemplateText, subjectVars: string[]): PropsShape {
+  const string = ts.factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword);
+  const names = [...new Set([...variablesIn(literalText(ts, literal)), ...subjectVars])];
+  return {
+    members: new Set(),
+    // `fromEntries`, for the reason `propsOf` uses it: a `{{__proto__}}` stays a member.
+    sample: Object.fromEntries(names.map((name) => [name, sampleFor(ts, name, string)])),
+    insertPos: null,
+    paramsPos: null,
+    patternPos: null,
+    beforeRest: false,
+    indent: '',
+    unwritable: false,
+    readMember: () => null,
+    reference: (key) => `props.${key}`,
+  };
+}
+
+/** Whether the constant's declaration carries a type annotation, which a function would no longer satisfy. */
+function declaredType(ts: typeof import('typescript'), literal: TemplateText): boolean {
+  let node: TS.Node = literal;
+  while (ts.isParenthesizedExpression(node.parent)) node = node.parent;
+  return ts.isVariableDeclaration(node.parent) && node.parent.type !== undefined;
+}
+
+/**
+ * The constant made a function of one props object of the slot keys, in slot
+ * order — typed in a TypeScript file, bare in a JavaScript one. A quoted
+ * string's quotes become backticks, so the runs' `${props.…}` interpolate.
+ */
+function constantRewrite(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+  literal: TemplateText,
+  slots: SlotProposal[],
+  typed: boolean,
+): Edit[] {
+  const start = literal.getStart(sf);
+  const head = typed ? `(props: { ${slots.map((s) => `${s.key}: string`).join('; ')} }) => ` : '(props) => ';
+  if (!ts.isStringLiteral(literal)) return [{ pos: start, end: start, text: head }];
+  return [
+    { pos: start, end: start + 1, text: `${head}\`` },
+    { pos: literal.end - 1, end: literal.end, text: '`' },
+  ];
+}
+
+// --- The registry subject ---------------------------------------------------
+
+/** The files a template's subject is looked up in, in its directory and then its parent. */
+const REGISTRY_FILES = ['registry.ts', 'registry.js'];
+
+/** Whether a file is a registry by name — what `scan` passes over as no template of its own. */
+export function isRegistryFile(file: string): boolean {
+  return REGISTRY_FILES.includes(posix.basename(file));
+}
+
+interface RegistrySubject {
+  value: string;
+  /** `<file>:<line>` of the `subject` member, for the review line. */
+  at: string;
+}
+
+/**
+ * A string template's subject, read from the first registry that exists beside
+ * it or in its parent directory: in the registry's first exported `const`
+ * object, the member named by the template file's stem as written, else by the
+ * template name, and in it a `subject` given as a plain literal. Null where any
+ * step finds nothing — a subject stet would have to evaluate is none at all.
+ * The registry is read and never rewritten.
+ */
+function registrySubject(
+  ts: typeof import('typescript'),
+  cwd: string,
+  file: string,
+  name: string,
+): RegistrySubject | null {
+  const dir = posix.dirname(file);
+  for (const base of [dir, posix.dirname(dir)]) {
+    for (const leaf of REGISTRY_FILES) {
+      const rel = posix.join(base, leaf);
+      let source: string;
+      try {
+        source = readFileSync(join(cwd, rel), 'utf8');
+      } catch {
+        continue;
+      }
+      const sf = ts.createSourceFile(rel, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
+      const registry = firstExportedObject(ts, sf);
+      if (registry === null) return null;
+      const entry = objectMember(ts, registry, stemOf(file)) ?? objectMember(ts, registry, name);
+      const own = entry === null ? null : unwrapValue(ts, entry.initializer);
+      if (own === null || !ts.isObjectLiteralExpression(own)) return null;
+      const subject = objectMember(ts, own, 'subject');
+      const literal = subject === null ? null : unwrapValue(ts, subject.initializer);
+      if (literal === null || (!ts.isStringLiteral(literal) && !ts.isNoSubstitutionTemplateLiteral(literal))) return null;
+      const line = sf.getLineAndCharacterOfPosition((subject as TS.PropertyAssignment).getStart(sf)).line + 1;
+      return { value: literal.text, at: `${rel}:${line}` };
+    }
+  }
+  return null;
+}
+
+/** The first exported `const` whose initializer is an object literal. */
+function firstExportedObject(ts: typeof import('typescript'), sf: TS.SourceFile): TS.ObjectLiteralExpression | null {
+  for (const stmt of sf.statements) {
+    if (!ts.isVariableStatement(stmt) || (stmt.declarationList.flags & ts.NodeFlags.Const) === 0) continue;
+    if (!(ts.getModifiers(stmt) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) continue;
+    for (const decl of stmt.declarationList.declarations) {
+      const value = decl.initializer === undefined ? null : unwrapValue(ts, decl.initializer);
+      if (value !== null && ts.isObjectLiteralExpression(value)) return value;
+    }
+  }
+  return null;
+}
+
+/** An object literal's own `name: value` member, by its written name. */
+function objectMember(ts: typeof import('typescript'), object: TS.ObjectLiteralExpression, name: string): TS.PropertyAssignment | null {
+  for (const prop of object.properties) {
+    if (!ts.isPropertyAssignment(prop)) continue;
+    if (propName(ts, prop.name) === name) return prop;
+  }
+  return null;
+}
+
+/** A value with its parentheses, `as` and `satisfies` taken off — none of them changes what it holds. */
+function unwrapValue(ts: typeof import('typescript'), expr: TS.Expression): TS.Expression {
+  let cur = unwrap(ts, expr);
+  while (ts.isAsExpression(cur) || ts.isSatisfiesExpression(cur)) cur = unwrap(ts, cur.expression);
+  return cur;
+}
+
+type SeededSubject =
+  | { collision: string }
+  | { rejected: true; note: string }
+  | { slot: SlotProposal; def: KeyDef; note: string };
+
+/**
+ * The registry subject as a slot: its value the literal, its `vars` and
+ * `requires` the literal's variables, and a review note naming where it came
+ * from — the host's send path still reads the registry until it reads the
+ * slot. A subject the save gate refuses is left out, with the gate's words.
+ */
+function seedSubject(subject: RegistrySubject, name: string, slot: string, descriptor: Descriptor): SeededSubject {
+  const key = `${name}__${slot}`;
+  if (Object.hasOwn(descriptor.keys, key)) {
+    return { collision: `the flattened key ${JSON.stringify(key)} is already a descriptor key or a prop of this export` };
+  }
+  const vars = variablesIn(subject.value);
+  const def = slotDef(vars);
+  const rejection = firstRejection(key, def, subject.value);
+  if (rejection !== null) return { rejected: true, note: `${key} is not proposed — ${rejection}` };
+  return {
+    slot: { slot, key, value: subject.value, vars },
+    def,
+    note:
+      `${key} is seeded from ${subject.at}, which stet leaves as it is — ` +
+      `the host’s send path must read ${key} in its place`,
+  };
+}
+
+// --- The frame --------------------------------------------------------------
+
+/**
+ * `--frame <file>#<export>`: the host function every proposal of the run is
+ * wrapped in, with its `args` read off its parameters. A file extract cannot
+ * read, or an export it cannot find, refuses the run.
+ */
+async function readFrame(cwd: string, spec: string): Promise<RenderFrame> {
+  const at = spec.lastIndexOf('#');
+  if (at <= 0 || at === spec.length - 1) throw new UsageError('--frame takes FILE#EXPORT');
+  const file = posix.normalize(spec.slice(0, at));
+  const exportName = spec.slice(at + 1);
+  const missing = new CliError(`${file}: no exported function ${exportName} to frame the templates with`);
+  const outside = containedPointer(cwd, { file, export: exportName, sampleProps: {} });
+  if (outside !== null) throw new CliError(outsideLine(outside));
+  let source: string;
+  try {
+    source = readFileSync(join(cwd, file), 'utf8');
+  } catch {
+    throw missing;
+  }
+  const ts = await loadTypescript();
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
+  const fn = exportedFunction(ts, sf, exportName);
+  if (fn === null) throw missing;
+  const args = frameArgs(ts, fn);
+  if (args === null) {
+    throw new CliError(
+      `${file}: ${exportName} takes a parameter stet cannot pass by name — declare the frame and its args by hand`,
+    );
+  }
+  return args === undefined ? { file, export: exportName } : { file, export: exportName, args };
+}
+
+/** The exported function, or `const` function, of this name — `default` for a default export. */
+function exportedFunction(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+  name: string,
+): TS.SignatureDeclaration | null {
+  const modifiers = (node: TS.Node): TS.SyntaxKind[] =>
+    ts.canHaveModifiers(node) ? (ts.getModifiers(node) ?? []).map((m) => m.kind) : [];
+  const isFunction = (node: TS.Expression): node is TS.ArrowFunction | TS.FunctionExpression =>
+    ts.isArrowFunction(node) || ts.isFunctionExpression(node);
+  for (const stmt of sf.statements) {
+    const kinds = modifiers(stmt);
+    if (ts.isFunctionDeclaration(stmt) && kinds.includes(ts.SyntaxKind.ExportKeyword)) {
+      const own = kinds.includes(ts.SyntaxKind.DefaultKeyword) ? 'default' : stmt.name?.text;
+      if (own === name) return stmt;
+    } else if (ts.isVariableStatement(stmt) && kinds.includes(ts.SyntaxKind.ExportKeyword)) {
+      for (const decl of stmt.declarationList.declarations) {
+        if (!ts.isIdentifier(decl.name) || decl.name.text !== name || decl.initializer === undefined) continue;
+        const value = unwrap(ts, decl.initializer);
+        if (isFunction(value)) return value;
+      }
+    } else if (ts.isExportAssignment(stmt) && stmt.isExportEquals !== true && name === 'default') {
+      const value = unwrap(ts, stmt.expression);
+      if (isFunction(value)) return value;
+    }
+  }
+  return null;
+}
+
+/**
+ * A frame's `args`, from its parameters after the content: each identifier in
+ * order, a lone destructured object as `"$all"` (the whole props), none where
+ * it takes nothing more. Null where a parameter cannot be passed either way —
+ * a rest or array pattern, or an object pattern beside named parameters —
+ * because seeding a guess would wrap every render differently from the host.
+ */
+function frameArgs(ts: typeof import('typescript'), fn: TS.SignatureDeclaration): string[] | '$all' | undefined | null {
+  const after = fn.parameters.slice(1);
+  if (after.length === 0) return undefined;
+  if (after.some((p) => p.dotDotDotToken !== undefined || ts.isArrayBindingPattern(p.name))) return null;
+  if (after.some((p) => ts.isObjectBindingPattern(p.name))) return after.length === 1 ? '$all' : null;
+  return after.map((p) => (p.name as TS.Identifier).text);
+}
+
 // --- Names ------------------------------------------------------------------
+
+/** A file's name without its directory and script extension. */
+function stemOf(file: string): string {
+  return basename(file).replace(/\.(tsx|ts|jsx|js)$/, '');
+}
 
 /** A template's name — the file's stem, or the export where the stem says nothing. */
 function templateName(file: string, exportName: string): string | null {
-  const stem = normalize(basename(file).replace(/\.(tsx|ts|jsx|js)$/, ''));
+  const stem = normalize(stemOf(file));
   if (stem !== null && stem !== 'index') return stem;
   return normalize(exportName);
 }

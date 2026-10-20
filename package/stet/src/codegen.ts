@@ -56,9 +56,9 @@ export function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value !== null && typeof value === 'object') {
     const source = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(source).sort()) out[key] = canonicalize(source[key]);
-    return out;
+    // `fromEntries`, never `out[key] = …`: a member named `__proto__` is an own
+    // property of the parsed JSON, and assignment would drop it.
+    return Object.fromEntries(Object.keys(source).sort().map((key) => [key, canonicalize(source[key])]));
   }
   return value;
 }
