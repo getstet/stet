@@ -1270,6 +1270,29 @@ live('the integrity story, settled by the database', () => {
   });
 });
 
+live('a draft row names its author (8.1)', () => {
+  it('the read names the draft’s author and its birth time, and the active row carries neither', async () => {
+    const s = store('proof_author');
+    await s.saveDraft({ key: 'lab_link', value: 'Read the docs', target: 'web', editor: 'neil' });
+    await s.publish({ key: 'lab_link', editor: 'neil' });
+    await s.saveDraft({ key: 'lab_link', value: 'Read the guide', target: 'web', editor: 'agent:claude' });
+    const rows = await s.read({ preview: true });
+    if (!Array.isArray(rows)) throw new Error(`read failed: ${JSON.stringify(rows)}`);
+    const active = rows.find((r) => r.is_active === true);
+    const draft = rows.find((r) => r.status === 'draft');
+    expect(active).not.toHaveProperty('editor');
+    expect(active).not.toHaveProperty('createdAt');
+    expect(draft).toMatchObject({ editor: 'agent:claude', value: 'Read the guide' });
+    const c = await client();
+    const born = await c.query<{ created_at: Date }>(
+      `select created_at from content_versions where project = $1 and state = 'draft'`,
+      ['proof_author'],
+    );
+    expect(draft?.createdAt).toBe(born.rows[0]?.created_at.toISOString());
+    await c.end();
+  });
+});
+
 live('the access posture, settled by the database', () => {
   it('a role the migration never heard of is denied by row level security', async () => {
     const seeded = store('proof_rls');

@@ -180,6 +180,13 @@ export function createStetHandler(opts: StetHandlerOptions): {
       case 'recent':
         return rpcResult(await opts.store.recent({ beforeId: intParam(url, 'beforeId'), limit: intParam(url, 'limit') }));
       case 'changes': {
+        // One change with its members — the before values a preview-then-revert
+        // shows come from the same read the group revert enumerates.
+        const id = url.searchParams.get('id');
+        if (id !== null) {
+          if (!/^\d+$/.test(id) || !Number.isSafeInteger(Number(id))) return json({ error: 'id must be an integer' }, 400);
+          return rpcResult(await opts.store.changesets.get({ changeId: Number(id) }));
+        }
         const status = url.searchParams.get('status');
         if (status !== null && status !== 'open' && status !== 'scheduled' && status !== 'published') {
           return json({ error: 'status must be open, scheduled or published' }, 400);

@@ -29,9 +29,12 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
+import { createStetHandler } from '../server/mount.js';
+import type { StoreAdapter } from '../src/store.js';
+import { closeFrames, frame as frameAgent, tick, type Framed } from './helpers/preview-frame.js';
 import { cleanupCliHosts, fakeFetch, htmlFixture, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
 import { cleanupEmailHosts, makeEmailHost } from './helpers/email-host.js';
 import { handlerOver, NONCE, paintPage, req, TOKEN, type PaintedPage } from './helpers/dashboard-page.js';
@@ -62,6 +65,7 @@ import { loadTypescript } from '../cli/source-scan.js';
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptor, loadSnapshot, resolve } from '../src/index.js';
 import { derivedText } from '../src/resolve.js';
+import { pageSpan } from '../src/preview.js';
 import { PLACEHOLDER } from '../src/validate.js';
 import type { Descriptor } from '../src/types.js';
 import {
@@ -5765,6 +5769,8 @@ describe('the page', () => {
       session?: Record<string, string>;
       /** Run on the page's window before its script. */
       prepare?: (window: Painted['dom']['window']) => void;
+      /** Answers every request to the site's mount (`/s/<id>/api/stet/…`) in place of the table. */
+      mount?: (path: string, body: unknown) => Promise<{ status: number; body: unknown }>;
     } = {},
   ): Promise<Painted> {
     const site = opts.site ?? siteBody();
@@ -5783,7 +5789,8 @@ describe('the page', () => {
       ...(opts.storage === undefined ? {} : { storage: opts.storage }),
       ...(opts.session === undefined ? {} : { session: opts.session }),
       ...(opts.prepare === undefined ? {} : { prepare: opts.prepare }),
-      serve: async (path) => {
+      serve: async (path, body) => {
+        if (opts.mount !== undefined && path.startsWith(`/s/${SITE_ID}/api/stet/`)) return opts.mount(path, body);
         const found = table.get(path.split('?')[0] ?? '');
         if (found === undefined) return { status: 404, body: { error: 'not found' } };
         if (found[2] !== undefined) await new Promise((resolve) => setTimeout(resolve, found[2]));
@@ -8290,6 +8297,1054 @@ describe('the page', () => {
           expect(lines(page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: seo_home_title.']);
           page.dom.window.close();
         });
+      });
+    });
+
+    // --- add-preview-editing D9: store-backed sites --------------------------------
+    // The page over a real mount: one memory store per environment behind
+    // `createStetHandler`, as `stet dev` builds it, so a draft saved by one
+    // page is the row the next page reads.
+    describe('store-backed sites (D9)', () => {
+      const MOUNT_ENV = 'STET_D9_MOUNT_TOKEN';
+      beforeAll(() => { process.env[MOUNT_ENV] = 'd9-token'; });
+      afterAll(() => { delete process.env[MOUNT_ENV]; });
+      afterEach(() => { closeFrames(); });
+
+      const D9: Descriptor = {
+        version: 1,
+        keys: {
+          lab_headline: { shape: 'text', target: 'web', limits: { max: 60, severity: 'advisory' }, pages: ['home'] },
+          lab_button: { shape: 'text', target: 'web', pages: ['pricing'] },
+          lab_link: { shape: 'text', target: 'web', pages: ['home'] },
+          lab_alt: { shape: 'text', target: 'web', pages: ['home'] },
+          lab_note: { shape: 'text', target: 'web', limits: { max: 40, severity: 'hard' }, pages: ['home'] },
+        },
+        pages: { home: { route: '/' }, pricing: { route: '/pricing' } },
+      };
+      const D9_SNAPSHOT = {
+        default: { lab_headline: 'Copy that ships', lab_button: 'Buy', lab_link: 'Read the docs', lab_alt: 'A lab photo', lab_note: 'Small print' },
+      };
+      const D9_SITE = siteBody({
+        mode: 'memory',
+        descriptor: D9,
+        snapshot: D9_SNAPSHOT,
+        keys: 5,
+        environments: [
+          { name: 'default', adapter: 'memory', vars: [] },
+          { name: 'staging', adapter: 'memory', vars: [] },
+        ],
+      });
+      /** The framed page the agent edits: each lab key once, the alt text an attribute. */
+      const D9_PAGE = '<h1>Copy that ships</h1><p id="link">Read the docs</p><img alt="A lab photo"><p id="note">Small print</p>';
+
+      type Stores = Record<string, ReturnType<typeof createMemoryStore>>;
+      const storesOf = (): Stores => ({ default: createMemoryStore({ project: 'd9' }), staging: createMemoryStore({ project: 'd9' }) });
+      /** The mount over one store per environment, answering the page's `/s/<id>/api/stet/…` requests by its `env`. */
+      function storeMount(stores: Stores, d: () => Descriptor = () => D9) {
+        return async (path: string, body: unknown): Promise<{ status: number; body: unknown }> => {
+          const url = new URL(`http://127.0.0.1:4400${path}`);
+          const store = stores[url.searchParams.get('env') ?? 'default'] as StoreAdapter;
+          const handler = createStetHandler({ store, descriptor: d(), auth: MOUNT_ENV });
+          const init = {
+            method: body === undefined ? 'GET' : 'POST',
+            headers: { authorization: 'Bearer d9-token', 'content-type': 'application/json' },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          };
+          const res = body === undefined ? await handler.GET(new Request(url, init)) : await handler.POST(new Request(url, init));
+          return { status: res.status, body: await res.json() };
+        };
+      }
+      /** Every page this describe painted, with where in its requests each Take over was pressed. */
+      const audits: Array<{ page: Painted; presses: number[] }> = [];
+      /** The page over the stores, the dev pane's agent announced; `framed` plays the agent for real. */
+      async function d9Page(stores: Stores, over: Parameters<typeof paint>[0] & { framed?: Framed } = {}) {
+        const { framed, ...rest } = over;
+        const page = await paint({ site: D9_SITE, preview: DEV_PREVIEW, storage: { 'stet.editor': 'dashboard:neil' }, mount: storeMount(stores), ...rest });
+        const presses: number[] = [];
+        const act = page.act.bind(page);
+        page.act = async (name: string): Promise<void> => {
+          if (name === 'takeOver') presses.push(page.sent.length);
+          await act(name);
+        };
+        audits.push({ page, presses });
+        const agent = agentOf(page, framed === undefined ? undefined : (message) => {
+          framed.send(JSON.parse(JSON.stringify(message)));
+          return null;
+        });
+        await agent.load();
+        await agent.ready();
+        return { page, agent };
+      }
+      /** The draft POSTs the page sent, their bodies in order. */
+      const draftPosts = (page: Painted): Array<Record<string, unknown>> =>
+        page.sent.filter((r) => r.path.split('?')[0] === `/s/${SITE_ID}/api/stet/draft`).map((r) => r.body as Record<string, unknown>);
+      /** A store's rows for one key, as the dashboard's read gets them. */
+      const rowsOf = async (store: StoreAdapter, key: string) => {
+        const rows = await store.read({ preview: true });
+        if (!Array.isArray(rows)) throw new Error('read failed');
+        return rows.filter((r) => r.key === key);
+      };
+      /** `HH:MM` of an ISO stamp on this machine's clock, as the page shows a stamp of today. */
+      const clockOf = (at: string): string => {
+        const d = new Date(at);
+        return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+      };
+      const fieldOf = (page: Painted, key: string): HTMLTextAreaElement =>
+        docOf(page).querySelector(`[data-act-input="text:${key}"]`) as HTMLTextAreaElement;
+      const rowText = (page: Painted, key: string): string => docOf(page).querySelector(`[data-act="key:${key}"]`)?.textContent ?? '';
+
+      describe('the value model (8.3)', () => {
+        it('a draft survives a reload: the field, the row and the preview show it (journey B16)', async () => {
+          const stores = storesOf();
+          const first = await d9Page(stores);
+          await first.page.act('key:lab_headline');
+          await first.page.type('text:lab_headline', 'Copy changes without a deploy');
+          await first.page.act('save');
+          expect(draftPosts(first.page)).toHaveLength(1);
+          first.page.dom.window.close();
+
+          const [draft] = (await rowsOf(stores['default'] as StoreAdapter, 'lab_headline')).filter((r) => r.status === 'draft');
+          const { page, agent } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Copy changes without a deploy');
+          expect(rowText(page, 'lab_headline')).toContain(`draft · dashboard:neil · ${clockOf(draft?.createdAt as string)}`);
+          const located = agent.locates().at(-1) as Record<string, unknown>;
+          expect(located['draft']).toBe('Copy changes without a deploy');
+          expect(located['texts']).toEqual(['Copy that ships', 'Copy changes without a deploy']);
+          page.dom.window.close();
+        });
+
+        it('an environment switch reads that environment’s rows', async () => {
+          const stores = storesOf();
+          await stores['staging']?.saveDraft({ key: 'lab_headline', value: 'Staging words', target: 'web', editor: 'agent:claude' });
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Copy that ships');
+          await page.act('cycleEnv');
+          expect(page.requested(`/s/${SITE_ID}/api/stet/keys?env=staging`)).toHaveLength(1);
+          expect(fieldOf(page, 'lab_headline').value).toBe('Staging words');
+          expect(rowText(page, 'lab_headline')).toContain('draft · agent:claude · ');
+          await page.act('cycleEnv');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Copy that ships');
+          page.dom.window.close();
+        });
+
+        it('the census offers the snapshot’s, the active row’s and the draft’s words, each once (fork 20)', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([
+            { key: 'lab_headline', value: 'Copy that shipped' },
+            { key: 'lab_headline', value: 'Copy changes without a deploy', state: 'draft', editor: 'agent:claude' },
+            { key: 'lab_link', value: 'Read the docs' },
+          ]);
+          const { agent } = await d9Page(stores);
+          const census = agent.sent('census').at(-1) as { keys: Array<{ key: string; texts: string[] }> };
+          expect(census.keys.find((k) => k.key === 'lab_headline')?.texts).toEqual(['Copy that ships', 'Copy that shipped', 'Copy changes without a deploy']);
+          expect(census.keys.find((k) => k.key === 'lab_link')?.texts).toEqual(['Read the docs']);
+        });
+
+        it('several drafts show together: three unsaved edits, an attribute among them, and a fourth key’s saved draft (journey B23, D44)', async () => {
+          const stores = storesOf();
+          await stores['default']?.saveDraft({ key: 'lab_note', value: 'Fine print', target: 'web', editor: 'agent:claude' });
+          const framed = await frameAgent(D9_PAGE, CHANNEL);
+          const { page } = await d9Page(stores, { framed });
+          for (const [key, value] of [['lab_headline', 'Copy that sells'], ['lab_link', 'Read the guide'], ['lab_alt', 'A lab at night']] as const) {
+            await page.act(`key:${key}`);
+            await page.type(`text:${key}`, value);
+          }
+          await page.act('key:lab_note');
+          await wait(150);
+          await tick();
+          const doc = framed.doc;
+          expect(doc.querySelector('h1')?.textContent).toBe('Copy that sells');
+          expect(doc.getElementById('link')?.textContent).toBe('Read the guide');
+          expect(doc.querySelector('img')?.getAttribute('alt')).toBe('A lab at night');
+          expect(doc.getElementById('note')?.textContent).toBe('Fine print');
+          page.dom.window.close();
+        });
+
+        it('a finished in-place draft stays on the page when another key is picked (D44, a snapshot site)', async () => {
+          const framed = await frameAgent('<h1>Ship the copy</h1><p>loose</p>', CHANNEL);
+          const page = await paint({ preview: DEV_PREVIEW });
+          const agent = agentOf(page, (message) => { framed.send(JSON.parse(JSON.stringify(message))); return null; });
+          await agent.load();
+          await agent.ready();
+          await page.act('key:hero_headline');
+          await page.type('text:hero_headline', 'Ship the words');
+          await page.change('group', 'prefix:loose');
+          await page.act('key:loose_key');
+          await wait(150);
+          await tick();
+          expect(framed.doc.querySelector('h1')?.textContent).toBe('Ship the words');
+          expect(agent.sent('layer').at(-1)).toEqual({ stet: 'layer', drafts: [{ key: 'hero_headline', texts: ['Ship the copy'], draft: 'Ship the words' }] });
+          page.dom.window.close();
+        });
+      });
+
+      describe('Save and the takeover (8.4, stage 5)', () => {
+        const confirmText = (page: Painted): string => docOf(page).querySelector('#takeover .term')?.textContent ?? '';
+        /** An agent's draft of `key`, saved before the page loads. */
+        const agentHolds = async (stores: Stores, key: string, value: string, env = 'default'): Promise<string> => {
+          await stores[env]?.saveDraft({ key, value, target: 'web', editor: 'agent:claude' });
+          const [row] = (await rowsOf(stores[env] as StoreAdapter, key)).filter((r) => r.status === 'draft');
+          return row?.createdAt as string;
+        };
+
+        it('an agent’s draft is taken over: the confirm names it and its time; Keep theirs keeps both, Take over makes the draft the dashboard’s (journey B16)', async () => {
+          const stores = storesOf();
+          const since = await agentHolds(stores, 'lab_headline', 'The agent’s words');
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'The editor’s words');
+          await page.act('save');
+          expect(confirmText(page)).toBe(`agent:claude has a draft of lab_headline from ${clockOf(since)}. Save yours over it? Their wording is replaced and the draft becomes yours.`);
+          expect([...docOf(page).querySelectorAll('#takeover button')].map((b) => b.textContent)).toEqual(['Take over', 'Keep theirs']);
+
+          await page.act('keepTheirs');
+          expect(confirmText(page)).toBe('');
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_headline')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'agent:claude', value: 'The agent’s words' });
+          expect(fieldOf(page, 'lab_headline').value).toBe('The editor’s words');
+          expect(docOf(page).getElementById('dc')?.textContent).toBe('1 unsaved edit');
+
+          await page.act('save');
+          await page.act('takeOver');
+          const posts = draftPosts(page);
+          expect(posts.at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_headline', locale: 'default', value: 'The editor’s words', force: true });
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_headline')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'dashboard:neil', value: 'The editor’s words' });
+          expect(confirmText(page)).toBe('');
+          expect(docOf(page).getElementById('dc')?.hidden).toBe(true);
+          expect(rowText(page, 'lab_headline')).toContain('draft · dashboard:neil · ');
+          page.dom.window.close();
+        });
+
+        it('a 409 store conflict without refused shows the error line, stops the loop and queues nothing', async () => {
+          const stores = storesOf();
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => (path.split('?')[0]?.endsWith('/draft')
+              ? { status: 409, body: { error: 'concurrent_save:lab_headline', code: 'conflict' } }
+              : mount(path, body)),
+          });
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Read the guide');
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Another headline');
+          await page.act('save');
+          expect(draftPosts(page)).toHaveLength(1);
+          expect(docOf(page).querySelector('#refusal .err')?.textContent).toBe('concurrent_save:lab_headline');
+          expect(docOf(page).getElementById('takeover')).toBeNull();
+          expect(docOf(page).getElementById('dc')?.textContent).toBe('2 unsaved edits');
+          page.dom.window.close();
+        });
+
+        it('Keep theirs writes nothing, and the next held draft follows', async () => {
+          const stores = storesOf();
+          await agentHolds(stores, 'lab_headline', 'Agent headline');
+          await agentHolds(stores, 'lab_link', 'Agent link');
+          const { page } = await d9Page(stores);
+          for (const [key, value] of [['lab_headline', 'Mine'], ['lab_link', 'Mine too']] as const) {
+            await page.act(`key:${key}`);
+            await page.type(`text:${key}`, value);
+          }
+          await page.act('save');
+          const sent = page.sent.length;
+          expect(confirmText(page)).toContain('agent:claude has a draft of lab_headline from ');
+          await page.act('keepTheirs');
+          expect(confirmText(page)).toContain('agent:claude has a draft of lab_link from ');
+          await page.act('keepTheirs');
+          expect(confirmText(page)).toBe('');
+          expect(page.sent.slice(sent).filter((r) => r.body !== undefined)).toEqual([]);
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_headline')).find((r) => r.status === 'draft')?.value).toBe('Agent headline');
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_link')).find((r) => r.status === 'draft')?.value).toBe('Agent link');
+          expect(docOf(page).getElementById('dc')?.textContent).toBe('2 unsaved edits');
+          page.dom.window.close();
+        });
+
+        it('Take over inside an active change resends with force and the change, and the draft joins it', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+          await agentHolds(stores, 'lab_headline', 'Agent headline');
+          const { page } = await d9Page(stores, { session: { [`stet.change ${SITE_ID} default`]: String(opened.changeId) } });
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          expect(draftPosts(page).at(-1)).toMatchObject({ key: 'lab_headline', change: opened.changeId });
+          await page.act('takeOver');
+          expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_headline', locale: 'default', value: 'Mine', change: opened.changeId, force: true });
+          expect((await rowsOf(store, 'lab_headline')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'dashboard:neil', changesetId: opened.changeId });
+          page.dom.window.close();
+        });
+
+        it('a Take over over a hard limit tightened since answers 422, shows the gate’s line, and the other draft stands (journey B16, an addition)', async () => {
+          const stores = storesOf();
+          await agentHolds(stores, 'lab_note', 'Fine print');
+          let descriptor = D9;
+          const { page } = await d9Page(stores, { mount: storeMount(stores, () => descriptor) });
+          await page.act('key:lab_note');
+          await page.type('text:lab_note', 'Small print, said at more length');
+          await page.act('save');
+          expect(confirmText(page)).toContain('agent:claude has a draft of lab_note from ');
+          descriptor = { ...D9, keys: { ...D9.keys, lab_note: { shape: 'text', target: 'web', limits: { max: 10, severity: 'hard' }, pages: ['home'] } } };
+          await page.act('takeOver');
+          const refusal = docOf(page).querySelector('#refusal .err')?.textContent ?? '';
+          expect(refusal).toMatch(/^lab_note: .*10/);
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_note')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'agent:claude', value: 'Fine print' });
+          expect(docOf(page).getElementById('dc')?.textContent).toBe('1 unsaved edit');
+          page.dom.window.close();
+        });
+      });
+
+      describe('the change bar (8.5)', () => {
+        const barText = (page: Painted): string => docOf(page).getElementById('changebar')?.textContent ?? '';
+        const barLines = (page: Painted): string[] => [...docOf(page).querySelectorAll('#changebar .cline')].map((el) => el.textContent ?? '');
+        const slot = (env = 'default'): string => `stet.change ${SITE_ID} ${env}`;
+        const typeIn = async (page: Painted, name: string, value: string): Promise<void> => page.type(name, value);
+        /** A change opened in one store, with drafts of the given keys in it. */
+        const changeWith = async (store: ReturnType<typeof createMemoryStore>, name: string, drafts: Array<[string, string, string?]>, note?: string): Promise<number> => {
+          const opened = (await store.changesets.open({ name, ...(note === undefined ? {} : { note }) })) as { changeId: number };
+          for (const [key, value, editor] of drafts) {
+            await store.saveDraft({ key, value, target: 'web', editor: editor ?? 'dashboard:neil', change: opened.changeId });
+          }
+          return opened.changeId;
+        };
+
+        it('groups three edits and publishes them together (journey B24)', async () => {
+          const stores = storesOf();
+          const staging = stores['staging'] as ReturnType<typeof createMemoryStore>;
+          const { page } = await d9Page(stores);
+          await page.act('cycleEnv');
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.']);
+          await page.act('changeNew');
+          await typeIn(page, 'changeName', 'Spring pricing');
+          await typeIn(page, 'changeNote', 'New plan names');
+          await page.act('changeCreate');
+          expect(page.sent.find((r) => r.path.startsWith(`/s/${SITE_ID}/api/stet/changes?env=staging`) && r.body !== undefined)?.body).toEqual({ name: 'Spring pricing', note: 'New plan names', editor: 'dashboard:neil' });
+          const id = Number(page.dom.window.sessionStorage.getItem(slot('staging')));
+          expect(id).toBeGreaterThan(0);
+
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Spring headline');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Spring link');
+          await page.change('group', 'page:pricing');
+          await page.act('key:lab_button');
+          await page.type('text:lab_button', 'Buy the spring plan');
+          await page.act('save');
+          expect(draftPosts(page).map((b) => b['change'])).toEqual([id, id, id]);
+          expect((await staging.read({ preview: true }) as Array<{ status: string; changesetId?: number | null }>).filter((r) => r.status === 'draft').map((r) => r.changesetId)).toEqual([id, id, id]);
+
+          expect(docOf(page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · staging · 3 keys · home, pricing');
+          expect(barLines(page)).toEqual([
+            'lab_headline  Copy that ships → Spring headline',
+            'lab_link  Read the docs → Spring link',
+            'lab_button  Buy → Buy the spring plan',
+            'Note: New plan names',
+          ]);
+          // A member's own Publish stays, and says what it does to the change.
+          expect(docOf(page).getElementById('alone')?.textContent).toBe('Publishing lab_button alone takes it out of Spring pricing.');
+
+          await page.act('publishChange');
+          const live = (await staging.read()) as Array<{ key: string; value: unknown }>;
+          expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({ lab_button: 'Buy the spring plan', lab_headline: 'Spring headline', lab_link: 'Spring link' });
+          expect(page.dom.window.sessionStorage.getItem(slot('staging'))).toBeNull();
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.']);
+          page.dom.window.close();
+        });
+
+        it('adds an agent’s draft: the confirm names the agent; Take over makes it a member and the dashboard’s, Cancel leaves it loose (journey B24)', async () => {
+          for (const answer of ['takeOver', 'keepTheirs'] as const) {
+            const stores = storesOf();
+            const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+            const id = await changeWith(store, 'Spring pricing', [['lab_headline', 'Spring headline']]);
+            await store.saveDraft({ key: 'lab_link', value: 'Agent link', target: 'web', editor: 'agent:claude' });
+            const since = (await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft')?.createdAt as string;
+            const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+            expect(barText(page)).toContain('1 saved draft(s) is not in this change.');
+            await page.act('addToChange');
+            expect(docOf(page).querySelector('#takeover .term')?.textContent).toBe(`agent:claude has a draft of lab_link from ${clockOf(since)}. Add it to Spring pricing? The draft becomes yours.`);
+            expect([...docOf(page).querySelectorAll('#takeover button')].map((b) => b.textContent)).toEqual(['Take over', 'Cancel']);
+            expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_link', locale: 'default', value: 'Agent link', change: id });
+            await page.act(answer);
+            const row = (await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft');
+            if (answer === 'takeOver') {
+              expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_link', locale: 'default', value: 'Agent link', change: id, force: true });
+              expect(row).toMatchObject({ editor: 'dashboard:neil', changesetId: id });
+              expect(barLines(page)).toContain('lab_link  Read the docs → Agent link');
+            } else {
+              expect(row).toMatchObject({ editor: 'agent:claude', changesetId: null });
+              expect(barText(page)).toContain('1 saved draft(s) is not in this change.');
+            }
+            page.dom.window.close();
+          }
+        });
+
+        it('a reload keeps the open change; after it is published elsewhere the bar says it is closed and Save carries no change (journey B24)', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = await changeWith(store, 'Spring pricing', [['lab_headline', 'Spring headline']]);
+          const first = await d9Page(stores, { session: { [slot()]: String(id) } });
+          expect(docOf(first.page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · default · 1 key · home');
+          await first.page.act('key:lab_link');
+          await first.page.type('text:lab_link', 'Spring link');
+          await first.page.act('save');
+          expect(draftPosts(first.page).at(-1)).toMatchObject({ key: 'lab_link', change: id });
+          const session = { [slot()]: first.page.dom.window.sessionStorage.getItem(slot()) as string };
+          first.page.dom.window.close();
+
+          await store.changesets.publishChange({ changeId: id, editor: 'sam' });
+          const { page } = await d9Page(stores, { session });
+          expect(barLines(page)).toEqual([
+            'Spring pricing is closed. Edits now save on their own, outside any change.',
+            'No open change. Edits save and publish key by key.',
+          ]);
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          await page.act('key:lab_note');
+          await page.type('text:lab_note', 'Fine print');
+          await page.act('save');
+          expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_note', locale: 'default', value: 'Fine print' });
+          page.dom.window.close();
+        });
+
+        it('a remembered change that is gone is named by its id', async () => {
+          const { page } = await d9Page(storesOf(), { session: { [slot()]: '41' } });
+          expect(barLines(page)[0]).toBe('change 41 is closed. Edits now save on their own, outside any change.');
+          page.dom.window.close();
+        });
+
+        it('a sessionStorage that throws loads the page with no active change', async () => {
+          const stores = storesOf();
+          await changeWith(stores['default'] as ReturnType<typeof createMemoryStore>, 'Spring pricing', [['lab_headline', 'Spring headline']]);
+          const { page } = await d9Page(stores, {
+            prepare: (window) => {
+              Object.defineProperty(window, 'sessionStorage', { configurable: true, get: () => { throw new Error('denied'); } });
+            },
+          });
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.', 'Open changes in default: Spring pricing · 1 key']);
+          await page.act('changeResume:1');
+          expect(docOf(page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · default · 1 key · home');
+          expect(page.errors).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('a refused Remove shows its confirm, and Take over takes the draft out of the change', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = await changeWith(store, 'Spring pricing', [['lab_headline', 'Spring headline'], ['lab_link', 'Agent link', 'agent:claude']]);
+          const since = (await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft')?.createdAt as string;
+          const version = (await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft')?.version as number;
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await page.act(`removeMember:${version}`);
+          expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_link', locale: 'default', value: 'Agent link', change: null });
+          expect(docOf(page).querySelector('#takeover .term')?.textContent).toBe(`agent:claude has a draft of lab_link from ${clockOf(since)}. Take it out of Spring pricing? The draft becomes yours.`);
+          await page.act('takeOver');
+          expect((await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'dashboard:neil', changesetId: null });
+          expect(barText(page)).toContain('1 saved draft(s) is not in this change.');
+          page.dom.window.close();
+        });
+
+        it('discards a change: the confirm names its drafts, the change and its drafts go, the keys keep their live values (journey B24)', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([{ key: 'lab_headline', value: 'Live headline' }]);
+          const id = await changeWith(store, 'Spring pricing', [['lab_headline', 'A'], ['lab_link', 'B'], ['lab_note', 'C']]);
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await page.act('discardAsk');
+          expect(docOf(page).querySelector('#changebar .term')?.textContent).toBe('Discard Spring pricing? Its 3 drafts are dropped. Nothing was published, so the keys keep their live values.');
+          await page.act('discardChange');
+          expect(await store.changesets.list({ status: 'open' })).toEqual({ changes: [], nextBeforeId: null });
+          expect((await store.read({ preview: true }) as Array<{ status: string }>).filter((r) => r.status === 'draft')).toEqual([]);
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          await page.act('key:lab_headline');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Live headline');
+          page.dom.window.close();
+        });
+
+        it('each environment lists and remembers its own change', async () => {
+          const stores = storesOf();
+          const id = await changeWith(stores['default'] as ReturnType<typeof createMemoryStore>, 'Spring pricing', []);
+          await changeWith(stores['staging'] as ReturnType<typeof createMemoryStore>, 'Staging copy', []);
+          await changeWith(stores['staging'] as ReturnType<typeof createMemoryStore>, 'Staging extra', []);
+          const { page } = await d9Page(stores);
+          await page.act(`changeResume:${id}`);
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBe(String(id));
+          await page.act('cycleEnv');
+          // The store lists the newest first.
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.', 'Open changes in staging: Staging extra · 0 keys', 'Open changes in staging: Staging copy · 0 keys']);
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Staging link');
+          await page.act('save');
+          expect(draftPosts(page).at(-1)).not.toHaveProperty('change');
+          await page.act('cycleEnv');
+          expect(docOf(page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · default · 0 keys');
+          page.dom.window.close();
+        });
+
+        it('Set aside keeps the change open and stops attaching new drafts', async () => {
+          const stores = storesOf();
+          const id = await changeWith(stores['default'] as ReturnType<typeof createMemoryStore>, 'Spring pricing', []);
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await page.act('setAside');
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.', 'Open changes in default: Spring pricing · 0 keys']);
+          page.dom.window.close();
+        });
+
+        it('Preview layers only the change’s drafts, with a tab per page of its span; Exit preview restores the ordinary layer (an addition)', async () => {
+          const stores = storesOf();
+          const id = await changeWith(stores['default'] as ReturnType<typeof createMemoryStore>, 'Spring pricing', [['lab_headline', 'Spring headline'], ['lab_button', 'Buy spring']]);
+          const { page, agent } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Loose link');
+          await page.act('key:lab_note');
+          const keysOf = (m: Record<string, unknown> | undefined): string[] => ((m?.['drafts'] as Array<{ key: string }>) ?? []).map((d) => d.key);
+          expect(keysOf(agent.sent('layer').at(-1))).toEqual(['lab_link', 'lab_headline', 'lab_button']);
+          await page.act('changePreview');
+          expect(keysOf(agent.sent('layer').at(-1))).toEqual(['lab_headline', 'lab_button']);
+          expect([...docOf(page).querySelectorAll('#paneshow [data-act^="spanPage:"]')].map((b) => b.textContent)).toEqual(['home', 'pricing']);
+          await page.act('spanPage:pricing');
+          expect(page.requested('/api/site/preview').at(-1)).toContain('route=%2Fpricing');
+          await page.act('exitPreview');
+          expect(keysOf(agent.sent('layer').at(-1))).toEqual(['lab_link', 'lab_headline', 'lab_button']);
+          page.dom.window.close();
+        });
+
+        it('the page span is src/preview.ts’s, entry for entry (the parity case)', () => {
+          const source = /function pageSpan\(descriptor, keys\) \{[\s\S]*?\n\}/.exec(dashboardPage())?.[0];
+          expect(source).toBeDefined();
+          const mirror = new Function(`const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k); ${source as string}; return pageSpan;`)() as (d: Descriptor, keys: string[]) => string[];
+          const d: Descriptor = {
+            version: 1,
+            keys: {
+              a: { shape: 'text', target: 'web', pages: ['pricing', 'home'] },
+              b: { shape: 'text', target: 'web', pages: ['home', 'about'] },
+              c: { shape: 'text', target: 'html-email' },
+              d: { shape: 'text', target: 'web', pages: [] },
+            },
+            pages: { home: { route: '/' }, pricing: { route: '/pricing' }, about: { route: '/about' } },
+          };
+          const inputs: string[][] = [[], ['a'], ['b', 'a'], ['a', 'b', 'c', 'd'], ['gone', 'constructor', 'toString', '__proto__'], ['c', 'a', 'a']];
+          for (const keys of inputs) expect({ keys, span: mirror(d, keys) }).toEqual({ keys, span: pageSpan(d, keys) });
+        });
+      });
+
+      describe('undo of a published change (8.6)', () => {
+        /** `Spring pricing` published over three live keys, then `lab_link` published again since. */
+        const published = async (stores: Stores): Promise<number> => {
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([
+            { key: 'lab_headline', value: 'Old headline' },
+            { key: 'lab_button', value: 'Old button' },
+            { key: 'lab_link', value: 'Old link' },
+          ]);
+          const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+          for (const [key, value] of [['lab_headline', 'New headline'], ['lab_button', 'New button'], ['lab_link', 'New link'], ['lab_alt', 'First alt']]) {
+            await store.saveDraft({ key: key as string, value, target: 'web', editor: 'dashboard:neil', change: opened.changeId });
+          }
+          await store.changesets.publishChange({ changeId: opened.changeId, editor: 'dashboard:neil' });
+          await store.saveDraft({ key: 'lab_link', value: 'Newer link', target: 'web', editor: 'sam' });
+          await store.publish({ key: 'lab_link', editor: 'sam' });
+          return opened.changeId;
+        };
+        const strip = (page: Painted): HTMLElement => docOf(page).getElementById('paneshow') as HTMLElement;
+
+        it('previews a change before and current from Recent, then reverts it, naming the key published since (journey B24)', async () => {
+          const stores = storesOf();
+          const id = await published(stores);
+          const framed = await frameAgent('<h1>New headline</h1><button>New button</button><p id="link">Newer link</p><img alt="First alt">', CHANNEL);
+          const { page, agent } = await d9Page(stores, { framed });
+          await page.act('tab:Recent');
+          await page.act('recentLoad');
+          const row = [...docOf(page).querySelectorAll('#main tbody tr')].find((tr) => tr.textContent?.includes('lab_headline'));
+          expect(row?.textContent).toContain('New headline · Spring pricing');
+          await page.act(`previewChange:${id}`);
+          expect(page.requested(`/s/${SITE_ID}/api/stet/changes?id=${id}`)).toHaveLength(1);
+          expect(strip(page).querySelector('b')?.textContent).toBe('Previewing the change Spring pricing');
+          expect([...strip(page).querySelectorAll('[data-act^="spanPage:"]')].map((b) => b.textContent)).toEqual(['home', 'pricing']);
+          await wait(50);
+          await tick();
+          // Before: each member's before value swapped in where the page shows its snapshot or live words.
+          expect(framed.doc.querySelector('h1')?.textContent).toBe('Old headline');
+          expect(framed.doc.querySelector('button')?.textContent).toBe('Old button');
+          expect(framed.doc.getElementById('link')?.textContent).toBe('Old link');
+          expect(framed.doc.querySelector('img')?.getAttribute('alt')).toBe('First alt');
+          // Current: the live value over the snapshot's words (F96).
+          await page.act('showView:current');
+          const current = agent.sent('layer').at(-1) as { drafts: Array<Record<string, unknown>> };
+          expect(current.drafts.find((d) => d['key'] === 'lab_headline')).toEqual({ key: 'lab_headline', texts: ['Copy that ships'], draft: 'New headline' });
+
+          await page.act('revertAsk');
+          expect(strip(page).querySelector('.term')?.textContent).toBe('Revert Spring pricing? Restores 4 keys on home, pricing to the before values shown here, written forward as a new publish. Drafts are left alone, and a key published again since is skipped and named.');
+          await page.act('revertChange');
+          expect(page.sent.find((r) => r.path.startsWith(`/s/${SITE_ID}/api/stet/revert-change`))?.body).toEqual({ change: id, editor: 'dashboard:neil' });
+          expect([...strip(page).querySelectorAll('.skip')].map((el) => el.textContent)).toEqual([
+            'lab_link was published again since — kept as it is',
+            'lab_alt had no earlier published value — left as it is',
+          ]);
+          const live = (await (stores['default'] as StoreAdapter).read()) as Array<{ key: string; value: unknown }>;
+          expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({ lab_headline: 'Old headline', lab_button: 'Old button', lab_link: 'Newer link', lab_alt: 'First alt' });
+          await page.act('exitPreview');
+          expect(strip(page).hidden).toBe(true);
+          page.dom.window.close();
+        });
+      });
+
+      describe('the store history card (8.7)', () => {
+        it('restores one past value of a key forward and leaves the other members of its change alone (journey B6)', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([{ key: 'lab_button', value: 'Buy' }, { key: 'lab_link', value: 'Read the docs' }]);
+          const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+          await store.saveDraft({ key: 'lab_button', value: 'Buy now', target: 'web', editor: 'agent:claude', change: opened.changeId });
+          await store.saveDraft({ key: 'lab_link', value: 'Read now', target: 'web', editor: 'agent:claude', change: opened.changeId });
+          const minted = (await store.changesets.publishChange({ changeId: opened.changeId, editor: 'dashboard:neil' })) as { published: Array<{ key: string; versionId: number }> };
+          const v = minted.published.find((m) => m.key === 'lab_button')?.versionId as number;
+          for (const [key, value] of [['lab_button', 'Buy today'], ['lab_link', 'Read later']]) {
+            await store.saveDraft({ key: key as string, value: value as string, target: 'web', editor: 'sam' });
+            await store.publish({ key: key as string, editor: 'sam' });
+          }
+          const at = (await store.history({ key: 'lab_button' }) as { rows: Array<{ id: number; publishedAt: string }> }).rows.find((r) => r.id === v)?.publishedAt as string;
+
+          const { page, agent } = await d9Page(stores);
+          await page.change('group', 'page:pricing');
+          await page.act('key:lab_button');
+          expect(page.requested(`/s/${SITE_ID}/api/stet/history?key=lab_button&locale=default`).length).toBeGreaterThan(0);
+          const lines = [...docOf(page).querySelectorAll('#keyhistory .hline')].map((el) => el.textContent);
+          const d = new Date(at);
+          const when = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${clockOf(at)}`;
+          expect(lines).toContain(`v${v} · ${when} · Buy now · agent:claude · Spring pricing`);
+          expect(lines[0]).toMatch(/^v\d+ · .* · Buy today · sam$/);
+          expect(docOf(page).querySelector(`#keyhistory [data-act="previewChange:${opened.changeId}"]`)?.textContent).toBe('Preview change');
+
+          await page.act(`historyPreview:${v}`);
+          expect(agent.sent('layer').at(-1)).toEqual({ stet: 'layer', drafts: [{ key: 'lab_button', texts: ['Buy', 'Buy today'], draft: 'Buy now' }] });
+          await page.act('exitPreview');
+
+          await page.act(`historyRestore:${v}`);
+          expect(page.sent.find((r) => r.path.startsWith(`/s/${SITE_ID}/api/stet/revert`))?.body).toEqual({ key: 'lab_button', versionId: v, editor: 'dashboard:neil' });
+          const live = (await store.read()) as Array<{ key: string; value: unknown; version?: number }>;
+          expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({ lab_button: 'Buy now', lab_link: 'Read later' });
+          expect((live.find((r) => r.key === 'lab_button')?.version as number) > v).toBe(true);
+          expect([...docOf(page).querySelectorAll('#keyhistory .hline')][0]?.textContent).toMatch(/^v\d+ · .* · Buy now · /);
+          page.dom.window.close();
+        });
+      });
+
+      describe('the review round (D45 to D47, F1 to F7)', () => {
+        const confirmOf = (page: Painted): string => docOf(page).querySelector('#takeover .term')?.textContent ?? '';
+        const slot = (env = 'default'): string => `stet.change ${SITE_ID} ${env}`;
+        const draftOf = async (store: StoreAdapter, key: string) => (await rowsOf(store, key)).find((r) => r.status === 'draft');
+        const heldBy = async (stores: Stores, key: string) =>
+          (stores['default'] as StoreAdapter).saveDraft({ key, value: 'Agent ' + key, target: 'web', editor: 'agent:claude' });
+        const barOf = (page: Painted): string => docOf(page).getElementById('changebar')?.textContent ?? '';
+        const dcOf = (page: Painted): string => docOf(page).getElementById('dc')?.textContent ?? '';
+        const isDraftPath = (path: string): boolean => path.split('?')[0]?.endsWith('/draft') === true;
+
+        it('P1 a plain Save after a Take over carries no force', async () => {
+          const stores = storesOf();
+          await heldBy(stores, 'lab_headline');
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          await page.act('takeOver');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Next');
+          await page.act('save');
+          expect(draftPosts(page).map((b) => 'force' in b)).toEqual([false, true, false]);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine again');
+          await page.act('save');
+          expect(draftPosts(page).map((b) => 'force' in b)).toEqual([false, true, false, false]);
+          page.dom.window.close();
+        });
+
+        it('P2 a Take over the gate refuses (422) leaves no force for the next Save', async () => {
+          const stores = storesOf();
+          await heldBy(stores, 'lab_headline');
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => (isDraftPath(path) && (body as { force?: boolean } | undefined)?.force === true
+              ? { status: 422, body: { error: 'over the hard limit', findings: [] } }
+              : mount(path, body)),
+          });
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          await page.act('takeOver');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Next');
+          await page.act('save');
+          // The refused Take over leaves the headline unsaved, so this Save sends it again, and the agent's draft still holds it.
+          expect(draftPosts(page).map((b) => 'force' in b)).toEqual([false, true, false, false]);
+          expect((await draftOf(stores['default'] as StoreAdapter, 'lab_link'))?.value).toBe('Next');
+          expect(confirmOf(page)).toContain('agent:claude');
+          page.dom.window.close();
+        });
+
+        it('P3 a value typed after the refused save stays unsaved through Take over', async () => {
+          const stores = storesOf();
+          await heldBy(stores, 'lab_headline');
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          expect(confirmOf(page)).toContain('agent:claude');
+          await page.type('text:lab_headline', 'Mine, newer');
+          await page.act('takeOver');
+          expect((await draftOf(stores['default'] as StoreAdapter, 'lab_headline'))?.value).toBe('Mine');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Mine, newer');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          page.dom.window.close();
+        });
+
+        it('P4 Revert change posts the previewed change, not the active one', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([{ key: 'lab_headline', value: 'Old headline' }]);
+          const done = (await store.changesets.open({ name: 'Done' })) as { changeId: number };
+          await store.saveDraft({ key: 'lab_headline', value: 'New headline', target: 'web', editor: 'dashboard:neil', change: done.changeId });
+          await store.changesets.publishChange({ changeId: done.changeId, editor: 'dashboard:neil' });
+          const live = (await store.changesets.open({ name: 'Live one' })) as { changeId: number };
+          const { page } = await d9Page(stores, { session: { [slot()]: String(live.changeId) } });
+          await page.act('tab:Recent');
+          await page.act('recentLoad');
+          await page.act(`previewChange:${done.changeId}`);
+          await page.act('revertAsk');
+          await page.act('revertChange');
+          expect(page.sent.find((r) => r.path.includes('/revert-change'))?.body).toEqual({ change: done.changeId, editor: 'dashboard:neil' });
+          page.dom.window.close();
+        });
+
+        it('P5 a slow answer from the environment left behind does not replace the new environment’s rows', async () => {
+          const stores = storesOf();
+          await (stores['default'] as StoreAdapter).saveDraft({ key: 'lab_headline', value: 'Default only', target: 'web', editor: 'agent:claude' });
+          await (stores['staging'] as StoreAdapter).saveDraft({ key: 'lab_link', value: 'Staging only', target: 'web', editor: 'agent:claude' });
+          const mount = storeMount(stores);
+          let slow = false;
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => {
+              const res = await mount(path, body);
+              if (slow && path.split('?')[0]?.endsWith('/keys') && !path.includes('env=staging')) await new Promise((r) => setTimeout(r, 400));
+              return res;
+            },
+          });
+          slow = true;
+          // A read of the default environment is in flight when the switch happens, and answers last.
+          void page.dom.window.eval('loadRows()');
+          await page.act('cycleEnv');
+          await page.settle();
+          await new Promise((r) => setTimeout(r, 700));
+          await page.settle();
+          const drafts = (await page.dom.window.eval('JSON.stringify(S.rows.filter((r)=>r.status==="draft").map((r)=>r.key))')) as string;
+          expect(drafts).toBe('["lab_link"]');
+          page.dom.window.close();
+        });
+
+        it('P5b until the new environment answers, the rows of the one left behind are not shown', async () => {
+          const stores = storesOf();
+          await (stores['default'] as StoreAdapter).saveDraft({ key: 'lab_headline', value: 'Default only', target: 'web', editor: 'agent:claude' });
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => {
+              if (path.split('?')[0]?.endsWith('/keys') && path.includes('env=staging')) await new Promise((r) => setTimeout(r, 400));
+              return mount(path, body);
+            },
+          });
+          await page.act('cycleEnv');
+          expect(await page.dom.window.eval('S.rows')).toBeNull();
+          await new Promise((r) => setTimeout(r, 700));
+          await page.settle();
+          expect(await page.dom.window.eval('S.rows.some((r) => r.status === "draft")')).toBe(false);
+          page.dom.window.close();
+        });
+
+        it('P6 a save refused for a closed change says the change is closed, and the next Save goes outside any change', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const { page } = await d9Page(stores);
+          await page.act('changeNew');
+          await page.type('changeName', 'Held');
+          await page.act('changeCreate');
+          const id = Number(page.dom.window.sessionStorage.getItem(slot()));
+          await store.saveDraft({ key: 'lab_headline', value: 'In', target: 'web', editor: 'dashboard:neil', change: id });
+          await store.changesets.publishChange({ changeId: id, editor: 'agent:claude' });
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'After close');
+          await page.act('save');
+          expect(barOf(page)).toContain('Held is closed. Edits now save on their own, outside any change.');
+          expect(barOf(page)).not.toContain('change_closed');
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          expect(docOf(page).getElementById('refusal')?.textContent ?? '').not.toContain('change_closed');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          await page.act('save');
+          expect(draftPosts(page).at(-1)).not.toHaveProperty('change');
+          expect(await draftOf(store, 'lab_link')).toMatchObject({ value: 'After close', changesetId: null });
+          page.dom.window.close();
+        });
+
+        it('P6b a refresh that finds the active change gone from the open list drops it and says it is closed', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await store.changesets.open({ name: 'Away' }) as { changeId: number }).changeId;
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          expect(barOf(page)).toContain('change · Away');
+          await store.changesets.abandon({ changeId: id });
+          await page.dom.window.eval('loadChanges(false)');
+          await page.settle();
+          expect(barOf(page)).toContain('Away is closed. Edits now save on their own, outside any change.');
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          expect(await page.dom.window.eval('S.change')).toBeNull();
+          page.dom.window.close();
+        });
+
+        it('P6c Add and Take over refused for a closed change say so too', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await store.changesets.open({ name: 'Gone' }) as { changeId: number }).changeId;
+          await store.saveDraft({ key: 'lab_link', value: 'loose', target: 'web', editor: 'dashboard:neil' });
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await store.changesets.abandon({ changeId: id });
+          await page.act('addToChange');
+          expect(barOf(page)).toContain('Gone is closed. Edits now save on their own, outside any change.');
+          expect(barOf(page)).not.toContain('no_change');
+          expect(barOf(page)).not.toContain('change_closed');
+          page.dom.window.close();
+        });
+
+        it('P7 a failed Remove shows its error in the change bar with no key selected', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await store.changesets.open({ name: 'C' }) as { changeId: number }).changeId;
+          await store.saveDraft({ key: 'lab_headline', value: 'm', target: 'web', editor: 'dashboard:neil', change: id });
+          const mount = storeMount(stores);
+          let failing = false;
+          const { page } = await d9Page(stores, {
+            session: { [slot()]: String(id) },
+            mount: async (path, body) => (failing && isDraftPath(path) ? { status: 500, body: { error: 'the store is unreachable' } } : mount(path, body)),
+          });
+          failing = true;
+          const remove = [...docOf(page).querySelectorAll('[data-act^="removeMember:"]')][0]?.getAttribute('data-act') as string;
+          await page.act(remove);
+          expect(barOf(page)).toContain('the store is unreachable');
+          failing = false;
+          await page.act(remove);
+          expect(barOf(page)).not.toContain('the store is unreachable');
+          page.dom.window.close();
+        });
+
+        it('P7b a failed Add shows its error in the change bar', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await store.changesets.open({ name: 'C' }) as { changeId: number }).changeId;
+          await store.saveDraft({ key: 'lab_link', value: 'loose', target: 'web', editor: 'dashboard:neil' });
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            session: { [slot()]: String(id) },
+            mount: async (path, body) => (isDraftPath(path) ? { status: 500, body: { error: 'the store is unreachable' } } : mount(path, body)),
+          });
+          await page.act('addToChange');
+          expect(barOf(page)).toContain('the store is unreachable');
+          page.dom.window.close();
+        });
+
+        it('P7c a failed Create keeps the form and shows its error', async () => {
+          const stores = storesOf();
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => (path.split('?')[0]?.endsWith('/changes') && body !== undefined ? { status: 500, body: { error: 'the store is unreachable' } } : mount(path, body)),
+          });
+          await page.act('changeNew');
+          await page.type('changeName', 'Spring');
+          await page.act('changeCreate');
+          expect(barOf(page)).toContain('the store is unreachable');
+          expect((docOf(page).querySelector('[data-act-input="changeName"]') as HTMLInputElement | null)?.value).toBe('Spring');
+          await page.act('changeFormCancel');
+          expect(barOf(page)).not.toContain('the store is unreachable');
+          page.dom.window.close();
+        });
+
+        it('P7d a failed Restore shows its error in the History card', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([{ key: 'lab_button', value: 'Buy' }]);
+          await store.saveDraft({ key: 'lab_button', value: 'Buy now', target: 'web', editor: 'dashboard:neil' });
+          await store.publish({ key: 'lab_button', editor: 'dashboard:neil' });
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => (path.split('?')[0]?.endsWith('/revert') ? { status: 500, body: { error: 'the store is unreachable' } } : mount(path, body)),
+          });
+          await page.change('group', 'page:pricing');
+          await page.act('key:lab_button');
+          const restore = docOf(page).querySelector('#keyhistory [data-act^="historyRestore:"]')?.getAttribute('data-act') as string;
+          await page.act(restore);
+          expect(docOf(page).getElementById('keyhistory')?.textContent).toContain('the store is unreachable');
+          page.dom.window.close();
+        });
+
+        it('P8 Save pressed twice over a held draft queues one confirm', async () => {
+          const stores = storesOf();
+          await heldBy(stores, 'lab_headline');
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          await page.act('save');
+          expect(await page.dom.window.eval('S.held.length')).toBe(1);
+          page.dom.window.close();
+        });
+
+        it('P9 Remove, Add and Take over in staging write to staging', async () => {
+          const stores = storesOf();
+          const staging = stores['staging'] as ReturnType<typeof createMemoryStore>;
+          const dflt = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await staging.changesets.open({ name: 'S' }) as { changeId: number }).changeId;
+          await staging.saveDraft({ key: 'lab_headline', value: 'member', target: 'web', editor: 'dashboard:neil', change: id });
+          await staging.saveDraft({ key: 'lab_link', value: 'agent loose', target: 'web', editor: 'agent:claude' });
+          const { page } = await d9Page(stores, { session: { [slot('staging')]: String(id) } });
+          await page.act('cycleEnv');
+          const remove = [...docOf(page).querySelectorAll('[data-act^="removeMember:"]')][0]?.getAttribute('data-act') as string;
+          await page.act(remove);
+          await page.act('addToChange');
+          await page.act('takeOver');
+          const paths = page.sent.filter((r) => r.path.split('?')[0] === `/s/${SITE_ID}/api/stet/draft`).map((r) => r.path);
+          expect(paths.length).toBeGreaterThanOrEqual(3);
+          for (const p of paths) expect(p).toContain('env=staging');
+          expect((await rowsOf(staging, 'lab_link')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'dashboard:neil', changesetId: id });
+          expect((await rowsOf(dflt, 'lab_link')).length).toBe(0);
+          page.dom.window.close();
+        });
+
+        it('D45 unsaved edits belong to their environment: a switch shows that environment’s own, Save writes only those, and switching back restores the first', async () => {
+          const stores = storesOf();
+          const dflt = stores['default'] as StoreAdapter;
+          const staging = stores['staging'] as StoreAdapter;
+          const { page, agent } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Typed on default');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Link on default');
+          expect(dcOf(page)).toBe('2 unsaved edits');
+          await page.act('key:lab_headline');
+
+          await page.act('cycleEnv');
+          expect(dcOf(page)).toBe('');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Copy that ships');
+          expect((agent.sent('layer').at(-1) as { drafts: unknown[] }).drafts).toEqual([]);
+          await page.act('save');
+          expect(draftPosts(page)).toEqual([]);
+          expect(await draftOf(staging, 'lab_headline')).toBeUndefined();
+          expect(await draftOf(dflt, 'lab_headline')).toBeUndefined();
+
+          await page.type('text:lab_headline', 'Typed on staging');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          await page.act('cycleEnv');
+          expect(dcOf(page)).toBe('2 unsaved edits');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Typed on default');
+          expect(JSON.stringify(agent.sent('layer').at(-1))).toContain('Link on default');
+          await page.act('cycleEnv');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Typed on staging');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          await page.act('cycleEnv');
+
+          await page.act('save');
+          expect(draftPosts(page).map((b) => b['value'])).toEqual(['Typed on default', 'Link on default']);
+          for (const r of page.sent.filter((s) => isDraftPath(s.path))) expect(r.path).not.toContain('env=');
+          expect((await draftOf(dflt, 'lab_headline'))?.value).toBe('Typed on default');
+          expect((await draftOf(dflt, 'lab_link'))?.value).toBe('Link on default');
+          expect(await draftOf(staging, 'lab_headline')).toBeUndefined();
+          expect(dcOf(page)).toBe('');
+          await page.act('cycleEnv');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Typed on staging');
+          page.dom.window.close();
+        });
+
+        it('D45 an edit open in the field ends kept before the environment changes, so it stays with the environment it was typed in', async () => {
+          const stores = storesOf();
+          const { page, agent } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Typed on default');
+          await page.dom.window.eval(`S.edit = { key: 'lab_headline', locale: 'default', entry: undefined, form: 'text', before: undefined, rect: { left: 0, top: 0, width: 1, height: 1 } }`);
+          await page.act('cycleEnv');
+          expect(await page.dom.window.eval('S.edit')).toBeNull();
+          expect(agent.sent('end').at(-1)).toEqual({ stet: 'end', how: 'keep' });
+          await page.act('cycleEnv');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Typed on default');
+          page.dom.window.close();
+        });
+
+        it('D47 a Save that is running stays in the environment it started in: every key goes there, with its change', async () => {
+          const stores = storesOf();
+          const dflt = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const staging = stores['staging'] as StoreAdapter;
+          const id = (await dflt.changesets.open({ name: 'Mid' }) as { changeId: number }).changeId;
+          const mount = storeMount(stores);
+          let flip: () => void = () => undefined;
+          let flipped = false;
+          const { page } = await d9Page(stores, {
+            session: { [slot()]: String(id) },
+            mount: async (path, body) => {
+              const res = await mount(path, body);
+              if (!flipped && isDraftPath(path)) { flipped = true; flip(); }
+              return res;
+            },
+          });
+          flip = () => (docOf(page).querySelector('[data-act="cycleEnv"]') as HTMLElement).click();
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'First');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Second');
+          await page.act('save');
+          expect(await page.dom.window.eval('S.env')).toBe('staging');
+          const posts = page.sent.filter((r) => isDraftPath(r.path));
+          expect(posts).toHaveLength(2);
+          for (const r of posts) expect(r.path).not.toContain('env=');
+          expect(posts.map((r) => (r.body as { change?: number }).change)).toEqual([id, id]);
+          expect(await draftOf(dflt, 'lab_headline')).toMatchObject({ value: 'First', changesetId: id });
+          expect(await draftOf(dflt, 'lab_link')).toMatchObject({ value: 'Second', changesetId: id });
+          expect(await draftOf(staging, 'lab_headline')).toBeUndefined();
+          expect(await draftOf(staging, 'lab_link')).toBeUndefined();
+          await page.act('cycleEnv');
+          expect(dcOf(page)).toBe('');
+          page.dom.window.close();
+        });
+
+        it('D46 two tabs of one profile are one editor: the second tab’s Save replaces the first tab’s draft with no confirm', async () => {
+          const stores = storesOf();
+          const one = await d9Page(stores);
+          const two = await d9Page(stores);
+          await one.page.act('key:lab_headline');
+          await one.page.type('text:lab_headline', 'Tab one');
+          await one.page.act('save');
+          await two.page.act('key:lab_headline');
+          await two.page.type('text:lab_headline', 'Tab two');
+          await two.page.act('save');
+          expect(confirmOf(two.page)).toBe('');
+          expect((await draftOf(stores['default'] as StoreAdapter, 'lab_headline'))?.value).toBe('Tab two');
+          one.page.dom.window.close();
+          two.page.dom.window.close();
+        });
+      });
+
+      // D9 marker: later describes go above this line.
+      it('force is never sent without the press: every draft POST across these cases carries it only after a Take over (8.4, stage 5)', () => {
+        let forced = 0;
+        for (const { page, presses } of audits) {
+          const drafts = page.sent
+            .map((r, i) => ({ i, path: r.path.split('?')[0], body: r.body as Record<string, unknown> | undefined }))
+            .filter((r) => r.path === `/s/${SITE_ID}/api/stet/draft`);
+          // The first draft POST each press answers: the one write a Take over makes.
+          const answers = presses.map((p) => drafts.find((r) => r.i >= p)?.i);
+          for (const r of drafts.filter((d) => d.body !== undefined && 'force' in d.body)) {
+            expect(r.body?.['force']).toBe(true);
+            expect(answers).toContain(r.i);
+          }
+          forced += drafts.filter((d) => d.body !== undefined && 'force' in d.body).length;
+        }
+        expect(audits.length).toBeGreaterThan(5);
+        expect(forced).toBeGreaterThan(0);
       });
     });
   });

@@ -258,7 +258,7 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
     <div class="tabs" id="tabs"></div>
     <div class="wrap" id="work"><div id="main"></div>
       <div id="grip" role="separator" aria-orientation="vertical" aria-controls="main" tabindex="0" aria-label="Resize the key column" title="Drag to resize the key column. Double-click to restore its width."></div>
-      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panepick" hidden></div><div id="paneinfo" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
+      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="paneshow" hidden></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panepick" hidden></div><div id="paneinfo" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
   </main>
 </div>
 <div id="tst"></div>
@@ -350,8 +350,25 @@ const S = {
   recent: null,
   preview: null,
   devlog: null,
+  // The mount's rows of the selected environment (`GET …/keys`), on a store-backed site.
   rows: null,
+  // The Scheduled tab's scheduled changes.
+  scheduled: null,
+  // The selected environment's open changes, the active one, and the name of every change seen, by id.
   changes: null,
+  change: null,
+  changeNames: {},
+  // A remembered change no longer open, by name; the New change form; Discard change's question; Publish change's refusal.
+  closed: null,
+  changeForm: null,
+  discardAsk: false,
+  changeError: '',
+  // What the preview shows in place of the ordinary layer: { kind: 'change' | 'published' | 'version', … } or null.
+  showing: null,
+  // The selected key's published versions in the selected environment: { key, locale, rows }.
+  keyHistory: null,
+  // Saves another editor's draft refused, each waiting for Take over or its no: { kind, key, locale, value, editor, since, change?, name? }.
+  held: [],
   removal: null,
   // The same-words question a save asked, Save anyway's question, Publish's,
   // a History row opened with the keys its commit removed, Restore's question
@@ -386,6 +403,8 @@ const S = {
   edit: null,
   // Per '<locale> <key>', the stored value the first keystroke of a draft started from.
   base: {},
+  // The unsaved edits of each environment not selected, { draft, base } by name (D45).
+  stashed: {},
   // The agent's last census, and what every census of this site has found in this tab (`seen`).
   census: null,
   seen: { keys: new Set(), routes: new Set(), read: new Set() },
@@ -510,8 +529,19 @@ function shownValue(id, locale, seen) {
 const edited = (id) => S.draft[S.locale + ' ' + id] !== undefined || own(S.tmpl, id);
 const edits = () => Object.keys(S.draft).length + Object.keys(S.tmpl).length;
 const dirty = () => edits() > 0;
-/** The value a locale's snapshot holds for a key, or undefined. */
+/** A key's draft row, or its active row, in one locale of the selected environment's rows. */
+function rowOf(id, loc, status) {
+  const rows = S.rows || [];
+  return rows.find((r) => r.key === id && r.locale === loc && (status === 'draft' ? r.status === 'draft' : r.is_active === true));
+}
+/** The saved value of a key: on a store-backed site its draft, else its active row; else the locale's snapshot. */
 function storedValue(id, loc) {
+  if (storeBacked()) {
+    const draft = rowOf(id, loc, 'draft');
+    if (draft) return draft.value;
+    const active = rowOf(id, loc, 'active');
+    if (active) return active.value;
+  }
   const block = (S.site && S.site.snapshot && own(S.site.snapshot, loc)) ? S.site.snapshot[loc] : {};
   return own(block, id) ? block[id] : undefined;
 }
@@ -545,6 +575,7 @@ function withEntry(id, loc, entry, text) {
 function dropDrafts() {
   S.draft = {};
   S.base = {};
+  S.stashed = {};
 }
 
 // --- loading ----------------------------------------------------------------
@@ -576,7 +607,9 @@ async function loadSite(path) {
   S.opened = null; S.restoreAsk = false; S.markup = null; S.split = null;
   S.health = null; S.seo = null; S.audit = null; auditGen += 1; S.setup = null; S.verify = null;
   S.history = null; S.recent = null; S.preview = null; S.devlog = null;
-  S.rows = null; S.changes = null;
+  S.rows = null; S.scheduled = null; S.held = []; S.keyHistory = null;
+  dropChanges();
+  S.changeNames = {};
   S.marks = { documents: [], keys: {}, places: {} };
   S.tmpl = {};
   S.gitError = null;
@@ -617,6 +650,8 @@ async function loadSite(path) {
     }
   }
   render();
+  if (storeBacked()) void guard(loadRows());
+  if (storeBacked()) void guard(loadChanges(true));
   if (ready()) void guard(loadPreview());
   if (ready()) void guard(loadUsage());
   if (previewBranch() && S.site.git.upstream) void guard(loadPreviewLink());
@@ -637,6 +672,275 @@ async function loadUsage() {
   S.usage = res.ok && res.body && typeof res.body.keys === 'object' ? res.body : null;
   // The site line above the list comes and goes with the scan: the column is painted whole.
   render();
+}
+
+/**
+ * The selected environment's rows, read on site load, on an environment switch
+ * and after every store write: the field, the row, the census and the layer
+ * show what the store holds.
+ */
+async function loadRows() {
+  if (!storeBacked()) return;
+  const path = S.path;
+  const env = S.env;
+  const res = await api(mountPath('keys'));
+  if (path !== S.path || env !== S.env) return;
+  S.rows = res.ok && Array.isArray(res.body.rows) ? res.body.rows : null;
+  render();
+  postCensus();
+  locateKey(false);
+  await loadKeyHistory();
+}
+/** The selected key's published versions, newest first, from the mount's `history`. */
+async function loadKeyHistory() {
+  if (!storeBacked() || S.sel === null) { S.keyHistory = null; return; }
+  const want = { path: S.path, env: S.env, key: S.sel, locale: S.locale };
+  const res = await api(mountPath('history', 'key=' + encodeURIComponent(want.key) + '&locale=' + encodeURIComponent(want.locale)));
+  if (want.path !== S.path || want.env !== S.env || want.key !== S.sel || want.locale !== S.locale) return;
+  S.keyHistory = { key: want.key, locale: want.locale, rows: res.ok && Array.isArray(res.body.rows) ? res.body.rows : [] };
+  render();
+}
+
+/** Another environment selected: its rows read, and what the last one showed dropped. */
+function switchEnv(name) {
+  // An edit open in the field ends kept first, so it is part of the edits that stay behind.
+  endEdit();
+  closePopover();
+  // Unsaved edits belong to the environment they were typed in: the new one shows its own (D45).
+  S.stashed[S.env] = { draft: S.draft, base: S.base };
+  const there = own(S.stashed, name) ? S.stashed[name] : { draft: {}, base: {} };
+  S.draft = there.draft;
+  S.base = there.base;
+  S.env = name;
+  S.rows = null;
+  S.scheduled = null;
+  S.held = [];
+  S.recent = null;
+  S.keyHistory = null;
+  dropChanges();
+  render();
+  void guard(loadRows());
+  void guard(loadChanges(true));
+}
+
+// --- the change bar ------------------------------------------------------------
+// A change groups drafts so they publish together. The active change is kept
+// for the tab, per project and environment, in sessionStorage (D16).
+/** What the last environment's changes showed, dropped. */
+function dropChanges() {
+  S.changes = null;
+  S.change = null;
+  S.closed = null;
+  S.changeForm = null;
+  S.discardAsk = false;
+  S.changeError = '';
+  S.showing = null;
+}
+const changeSlot = () => 'stet.change ' + S.site.id + ' ' + S.env;
+function recallChange() {
+  try {
+    const held = sessionStorage.getItem(changeSlot());
+    return held !== null && /^\d+$/.test(held) ? Number(held) : null;
+  } catch (e) { return null; }
+}
+function rememberChange(id) {
+  try { sessionStorage.setItem(changeSlot(), String(id)); } catch (e) { /* private window */ }
+}
+function forgetChange() {
+  try { sessionStorage.removeItem(changeSlot()); } catch (e) { /* private window */ }
+}
+/**
+ * The selected environment's open changes, and the names of its published
+ * ones. `recall` (site load, environment switch) makes the remembered change
+ * active when it is still open, and says it is closed when it is not.
+ */
+async function loadChanges(recall) {
+  if (!storeBacked()) return;
+  const path = S.path;
+  const env = S.env;
+  const open = await api(mountPath('changes', 'status=open'));
+  const published = await api(mountPath('changes', 'status=published'));
+  if (path !== S.path || env !== S.env) return;
+  S.changes = open.ok && Array.isArray(open.body.changes) ? open.body.changes : null;
+  for (const c of (S.changes || []).concat(published.ok && Array.isArray(published.body.changes) ? published.body.changes : [])) {
+    S.changeNames[c.id] = c.name;
+  }
+  if (S.changes !== null && S.change !== null) {
+    const gone = S.change;
+    const still = S.changes.find((c) => c.id === gone.id);
+    if (still) S.change = still;
+    else {
+      // Published or discarded elsewhere: the bar says so, and the next Save carries no change.
+      deactivate();
+      S.closed = gone.name;
+    }
+  }
+  if (recall && S.changes !== null) {
+    const id = recallChange();
+    const found = id === null ? undefined : S.changes.find((c) => c.id === id);
+    if (found) S.change = found;
+    else if (id !== null) {
+      forgetChange();
+      S.closed = own(S.changeNames, id) ? S.changeNames[id] : 'change ' + id;
+    }
+  }
+  render();
+}
+/** One change's drafts in the selected environment's rows, every locale. */
+const membersOf = (id) => (S.rows || []).filter((r) => r.status === 'draft' && r.changesetId === id);
+const looseDrafts = () => (S.rows || []).filter((r) => r.status === 'draft' && (r.changesetId === null || r.changesetId === undefined));
+/** src/preview.ts's pageSpan: the deduped union of the keys' declared pages, first seen first. */
+function pageSpan(descriptor, keys) {
+  const span = [];
+  for (const key of keys) {
+    const def = own(descriptor.keys, key) ? descriptor.keys[key] : undefined;
+    for (const page of (def && def.pages) || []) if (span.indexOf(page) === -1) span.push(page);
+  }
+  return span;
+}
+/** A key's live value: its active row, else the snapshot's. */
+function liveValue(id, loc) {
+  const active = storeBacked() ? rowOf(id, loc, 'active') : undefined;
+  if (active) return active.value;
+  const block = (S.site.snapshot && own(S.site.snapshot, loc)) ? S.site.snapshot[loc] : {};
+  return own(block, id) ? block[id] : undefined;
+}
+/** Above the editor on a store-backed site: the open changes, or the active one with its members. */
+function changeBar() {
+  if (!storeBacked() || S.changes === null) return '';
+  const line = (text) => '<div class="cline">' + esc(text) + '</div>';
+  const c = S.change;
+  if (c === null) {
+    const form = S.changeForm === null ? '' :
+      '<div style="margin-top:8px"><label class="muted" style="font-size:11px">Name</label>' +
+      '<input class="in sm" value="' + esc(S.changeForm.name) + '" data-act-input="changeName">' +
+      '<label class="muted" style="font-size:11px">Note</label>' +
+      '<input class="in sm" value="' + esc(S.changeForm.note) + '" data-act-input="changeNote">' +
+      '<div style="margin-top:6px"><button class="btn pri sm" data-act="changeCreate">Create</button>' +
+      '<button class="btn sm" data-act="changeFormCancel">Cancel</button></div></div>';
+    return '<div class="card" id="changebar"><div class="ch"><h3 style="font-size:12.5px">Change</h3>' +
+      '<button class="btn sm" data-act="changeNew">New change</button></div><div class="cb">' +
+      (S.closed === null ? '' : line(S.closed + ' is closed. Edits now save on their own, outside any change.')) +
+      line('No open change. Edits save and publish key by key.') +
+      (S.changeError === '' ? '' : '<div class="err" style="white-space:pre-wrap">' + esc(S.changeError) + '</div>') +
+      S.changes.map((o) => '<div style="display:flex;gap:6px;align-items:center">' +
+        line('Open changes in ' + S.env + ': ' + o.name + ' · ' + plural(membersOf(o.id).length, 'key')) +
+        '<button class="btn sm" data-act="changeResume:' + esc(o.id) + '">Resume</button></div>').join('') +
+      form + '</div></div>';
+  }
+  // In the store's order, first saved first, as the span reads them.
+  const members = membersOf(c.id);
+  const span = pageSpan(S.site.descriptor, members.map((m) => m.key));
+  const loose = looseDrafts();
+  const head = 'change · ' + c.name + ' · ' + S.env + ' · ' + plural(members.length, 'key') + (span.length === 0 ? '' : ' · ' + span.join(', '));
+  const discard = S.discardAsk
+    ? '<div class="term" style="margin-top:8px">' + esc('Discard ' + c.name + '? Its ' + members.length +
+      ' drafts are dropped. Nothing was published, so the keys keep their live values.') + '</div>' +
+      '<div style="margin-top:6px"><button class="btn dg sm" data-act="discardChange">Discard</button>' +
+      '<button class="btn sm" data-act="discardCancel">Cancel</button></div>'
+    : '';
+  return '<div class="card" id="changebar"><div class="ch"><h3 style="font-size:12.5px">' + esc(head) + '</h3></div><div class="cb">' +
+    members.map((m) => '<div style="display:flex;gap:6px;align-items:center;justify-content:space-between">' +
+      line(m.key + '  ' + shown(liveValue(m.key, m.locale)) + ' → ' + shown(m.value)) +
+      '<button class="btn sm" data-act="removeMember:' + esc(m.version) + '">Remove</button></div>').join('') +
+    (loose.length === 0 ? '' : '<div style="display:flex;gap:6px;align-items:center">' +
+      '<div class="muted">' + esc(loose.length + ' saved draft(s) is not in this change.') + '</div>' +
+      '<button class="btn sm" data-act="addToChange">Add to this change</button></div>') +
+    (c.note ? line('Note: ' + c.note) : '') +
+    (S.changeError === '' ? '' : '<div class="err" style="white-space:pre-wrap">' + esc(S.changeError) + '</div>') +
+    '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' +
+    '<button class="btn env sm" data-act="publishChange">' + esc('Publish change to ' + S.env) + '</button>' +
+    '<button class="btn sm" data-act="changePreview">Preview</button>' +
+    '<button class="btn sm" data-act="setAside">Set aside</button>' +
+    '<button class="btn dg sm" data-act="discardAsk">Discard change…</button></div>' + discard + '</div></div>';
+}
+/** A change made the active one, and remembered for the tab. */
+function activate(change) {
+  S.change = change;
+  S.closed = null;
+  S.changeError = '';
+  rememberChange(change.id);
+}
+/** The active change no longer active; it stays open unless the caller closed it. */
+function deactivate() {
+  forgetChange();
+  S.change = null;
+  S.discardAsk = false;
+  S.changeError = '';
+  if (S.showing !== null && S.showing.kind === 'change') S.showing = null;
+}
+/**
+ * A write the store refused for a closed or missing change: the open list is
+ * read again, and when the active change has left it the bar says it is
+ * closed. Whether it did, so the caller does not show the raw error.
+ */
+async function changeLost(error) {
+  const change = S.change;
+  if (change === null || !/^(change_closed|no_change):/.test(error)) return false;
+  await loadChanges(false);
+  return S.change === null || S.change.id !== change.id;
+}
+/** A draft queued for Take over; one for the same kind, key and locale is replaced, so a second press asks once. */
+function hold(entry) {
+  const at = S.held.findIndex((h) => h.kind === entry.kind && h.key === entry.key && h.locale === entry.locale);
+  if (at === -1) S.held.push(entry);
+  else S.held[at] = entry;
+}
+async function createChange() {
+  const form = S.changeForm;
+  if (form === null || form.name.trim() === '') return;
+  const res = await post(mountPath('changes'), Object.assign({ name: form.name.trim() }, form.note.trim() === '' ? {} : { note: form.note.trim() }, { editor: S.editor }));
+  if (!res.ok) { S.changeError = res.body.error || 'the store refused that change'; render(); return; }
+  S.changeForm = null;
+  activate({ id: res.body.changeId, name: form.name.trim(), note: form.note.trim() || null });
+  await loadChanges(false);
+}
+/**
+ * Drafts re-saved with a change, or with none (`null`), never with `force`:
+ * a draft another editor holds waits for Take over, queued as `kind`.
+ */
+async function moveDrafts(rows, change, kind) {
+  // Every write stays in the environment and the change the move started in (D47).
+  const env = S.env;
+  const active = S.change;
+  S.changeError = '';
+  for (const row of rows) {
+    const res = await post(mountPath('draft', undefined, env), { editor: S.editor, key: row.key, locale: row.locale, value: row.value, change: change });
+    if (res.ok) continue;
+    if (S.env !== env) break;
+    if (res.status === 409 && res.body.refused === true) {
+      hold({ kind: kind, key: row.key, locale: row.locale, value: row.value, editor: res.body.incumbentEditor, since: res.body.heldSince, change: change, name: active.name });
+      continue;
+    }
+    const error = res.body.error || 'the store refused that draft';
+    if (!(await changeLost(error))) S.changeError = error;
+    break;
+  }
+  render();
+  await loadRows();
+}
+async function publishChange() {
+  const c = S.change;
+  if (c === null) return;
+  const res = await post(mountPath('publish-change'), { change: c.id, editor: S.editor });
+  if (!res.ok) {
+    S.changeError = [res.body.error || 'the store refused that publish'].concat((res.body.findings || []).map((f) => f.message)).join('\n');
+    render();
+    return;
+  }
+  deactivate();
+  tst('Published ' + c.name);
+  await loadRows();
+  await loadChanges(false);
+}
+async function discardChange() {
+  const c = S.change;
+  if (c === null) return;
+  const res = await post(mountPath('abandon-change'), { change: c.id, editor: S.editor });
+  if (!res.ok) { S.changeError = res.body.error || 'the store refused that discard'; S.discardAsk = false; render(); return; }
+  deactivate();
+  await loadRows();
+  await loadChanges(false);
 }
 
 async function loadMarks() {
@@ -1056,10 +1360,15 @@ function keyRows(items) {
               : '';
     const group = S.q ? '<span class="bdg">' + esc((all.find((g) => g.keys.indexOf(id) !== -1) || {}).label || '') + '</span>' : '';
     return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
-      '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + healthBadge(id) + usageBadges(id) + group + '</span>' +
+      '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + draftBadge(id) + healthBadge(id) + usageBadges(id) + group + '</span>' +
       '<span class="s">' + (kinds.length === 0 ? '' : '<span class="kd">' + esc(kinds.join(' · ')) + '</span>') +
       '<span class="v">' + esc(rowPreview(value)) + '</span></span></button>';
   }).join('');
+}
+/** A saved draft's author and when it was first saved, on a store-backed site's row. */
+function draftBadge(id) {
+  const row = storeBacked() ? rowOf(id, S.locale, 'draft') : undefined;
+  return row ? '<span class="bdg">' + esc('draft · ' + (row.editor || '') + ' · ' + clockShort(row.createdAt)) + '</span>' : '';
 }
 // The rows last painted, and where: a render builds a fresh list, which is painted anew.
 let keyRowsShown = { box: null, html: '' };
@@ -1184,9 +1493,19 @@ function whenShort(at) {
   return m === null ? esc(at) : esc(m[1]) + '<br>' + esc(m[2]);
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+/** A stamp on this machine's clock: `HH:MM` today, else `D Mon HH:MM`; anything unparseable as it is. */
+function clockShort(at) {
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return String(at === undefined || at === null ? '' : at);
+  const pad = (n) => String(n).padStart(2, '0');
+  const time = pad(d.getHours()) + ':' + pad(d.getMinutes());
+  return d.toDateString() === new Date().toDateString() ? time : d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + time;
+}
+
 function editorColumn() {
-  return '<div style="display:flex;flex-direction:column;gap:11px;min-width:0">' +
-    '<div class="card">' + editorCard() + '</div>' +
+  return '<div style="display:flex;flex-direction:column;gap:11px;min-width:0">' + changeBar() + takeoverCard() +
+    '<div class="card">' + editorCard() + '</div>' + storeHistoryCard() +
     historyCard() + '</div>';
 }
 
@@ -1413,7 +1732,53 @@ function bar(id) {
     (storeBacked()
       ? '<button class="btn env" data-act="publish">Publish</button><button class="btn" data-act="discard">Discard</button>'
       : '') +
-    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button></div>' + removal + same + over + split;
+    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button></div>' + aloneLine(id) + removal + same + over + split;
+}
+
+/** A stamp as `YYYY-MM-DD HH:MM` on this machine's clock. */
+function stampShort(at) {
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return String(at === undefined || at === null ? '' : at);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+/** Below the editor on a store-backed site: the selected key's published versions, each with Preview and Restore. */
+function storeHistoryCard() {
+  const h = S.keyHistory;
+  if (!storeBacked() || h === null || h.key !== S.sel) return '';
+  const rows = h.rows.map((r) => {
+    const name = r.changesetId === null || r.changesetId === undefined ? null
+      : own(S.changeNames, r.changesetId) ? S.changeNames[r.changesetId] : 'change ' + r.changesetId;
+    return '<div style="margin-bottom:6px"><div class="hline">' +
+      esc('v' + r.id + ' · ' + stampShort(r.publishedAt) + ' · ' + rowPreview(r.value) + ' · ' + (r.editor || '') + (name === null ? '' : ' · ' + name)) + '</div>' +
+      '<button class="btn sm" data-act="historyPreview:' + esc(r.id) + '">Preview</button>' +
+      '<button class="btn sm" data-act="historyRestore:' + esc(r.id) + '">Restore</button>' +
+      (name === null ? '' : '<button class="btn sm" data-act="previewChange:' + esc(r.changesetId) + '">Preview change</button>') + '</div>';
+  }).join('');
+  return '<div class="card" id="keyhistory"><div class="ch"><h3 style="font-size:12.5px">History</h3></div>' +
+    '<div class="cb">' + (h.error ? '<div class="err">' + esc(h.error) + '</div>' : '') + rows + '</div></div>';
+}
+/** Restore: one past version published again, forward, its key checked against the version by the mount. */
+async function restoreVersion(id) {
+  const h = S.keyHistory;
+  const row = h === null ? undefined : h.rows.find((r) => String(r.id) === id);
+  if (!row) return;
+  const res = await post(mountPath('revert'), { key: h.key, versionId: row.id, editor: S.editor });
+  if (!res.ok) {
+    if (S.keyHistory === h) h.error = res.body.error || 'the store refused that restore';
+    render();
+    return;
+  }
+  h.error = '';
+  if (S.showing !== null && S.showing.kind === 'version') S.showing = null;
+  await loadRows();
+}
+
+/** Under a change member's own Publish: what publishing it alone does to the change. */
+function aloneLine(id) {
+  const row = storeBacked() && S.change !== null ? rowOf(id, S.locale, 'draft') : undefined;
+  return row && row.changesetId === S.change.id
+    ? '<p class="note" id="alone">' + esc('Publishing ' + id + ' alone takes it out of ' + S.change.name + '.') + '</p>' : '';
 }
 
 function historyCard() {
@@ -1511,6 +1876,7 @@ function paintPane() {
   document.getElementById('pane').hidden = !content;
   if (!content) return;
   paintPaneHead();
+  paintPaneShow();
   paintPaneNote();
   paintPanePick();
   paintPageInfo();
@@ -1535,6 +1901,44 @@ function paintPane() {
     }
   }
   fitFrame();
+}
+
+/** Under the pane's header while a preview stands: what it shows, its page tabs, and the way out. */
+function paintPaneShow() {
+  const box = document.getElementById('paneshow');
+  const v = S.showing;
+  if (v === null || !ready()) { box.hidden = true; box.innerHTML = ''; return; }
+  const keys = v.kind === 'change' ? membersOf(v.id).map((r) => r.key) : v.kind === 'published' ? v.members.map((m) => m.key) : [];
+  const span = pageSpan(S.site.descriptor, keys);
+  const tabs = span.map((name) => '<button class="btn sm' + (groupRoute('page:' + name) === S.route ? ' pri' : '') +
+    '" data-act="spanPage:' + esc(name) + '">' + esc(name) + '</button>').join('');
+  const html = '<div class="ch" style="flex-wrap:wrap;gap:6px">' +
+    (v.kind === 'version' ? '' : '<b style="font-size:12px">' + esc('Previewing the change ' + v.name) + '</b>') +
+    showSwitch(v) + tabs + showActions(v) +
+    '<button class="btn sm" data-act="exitPreview">Exit preview</button></div>' + showBody(v);
+  box.hidden = false;
+  if (box.innerHTML !== html) box.innerHTML = html;
+}
+/** A published change's before | current switch. */
+function showSwitch(v) {
+  if (v.kind !== 'published') return '';
+  return '<div class="tg">' + ['before', 'current'].map((view) => '<button class="' + (v.view === view ? 'on' : '') +
+    '" data-act="showView:' + view + '">' + view + '</button>').join('') + '</div>';
+}
+const showActions = (v) => (v.kind === 'published' ? '<button class="btn sm" data-act="revertAsk">Revert change…</button>' : '');
+/** Revert change's question, its refusal, and the members it could not restore. */
+function showBody(v) {
+  if (v.kind !== 'published') return '';
+  const span = pageSpan(S.site.descriptor, v.members.map((m) => m.key));
+  const ask = v.ask
+    ? '<div class="term">' + esc('Revert ' + v.name + '? Restores ' + plural(v.members.length, 'key') + ' on ' + span.join(', ') +
+      ' to the before values shown here, written forward as a new publish. Drafts are left alone, and a key published again since is skipped and named.') + '</div>' +
+      '<div style="margin-top:6px"><button class="btn pri sm" data-act="revertChange">Revert</button>' +
+      '<button class="btn sm" data-act="revertCancel">Cancel</button></div>'
+    : '';
+  const skipped = (v.skipped || []).map((line) => '<div class="skip">' + esc(line) + '</div>').join('');
+  const error = v.error ? '<div class="err">' + esc(v.error) + '</div>' : '';
+  return ask + skipped + error === '' ? '' : '<div class="cb">' + ask + error + skipped + '</div>';
 }
 
 let paneLeadShown = null;
@@ -1740,13 +2144,120 @@ function renderedValue(id) {
   const fallback = own(snapshot, S.site.config.locales.default) ? snapshot[S.site.config.locales.default] : {};
   return own(block, id) ? block[id] : own(fallback, id) ? fallback[id] : undefined;
 }
+/**
+ * The values a key may render as in the selected locale, each once: the
+ * snapshot's and, on a store-backed site, the active row's and the draft
+ * row's (fork 20) — the page shows whichever its read path reads.
+ */
+function renderedValues(id) {
+  const out = [];
+  const add = (value) => {
+    if (value !== undefined && !out.some((v) => JSON.stringify(v) === JSON.stringify(value))) out.push(value);
+  };
+  add(renderedValue(id));
+  if (storeBacked()) {
+    const loc = rowOf(id, S.locale, 'active') || rowOf(id, S.locale, 'draft') ? S.locale : S.site.config.locales.default;
+    const active = rowOf(id, loc, 'active');
+    const draft = rowOf(id, loc, 'draft');
+    if (active) add(active.value);
+    if (draft) add(draft.value);
+  }
+  return out;
+}
+/** The distinct strings of a list of texts, in order. */
+const distinct = (texts) => texts.filter((t, i) => typeof t === 'string' && texts.indexOf(t) === i);
 /** Every string a key renders as saved: a text value, each list entry, each string field. */
 function renderedTexts(id) {
-  const value = renderedValue(id);
-  if (typeof value === 'string') return [value];
-  if (Array.isArray(value)) return value.filter((v) => typeof v === 'string');
-  if (value && typeof value === 'object') return Object.values(value).filter((v) => typeof v === 'string');
-  return [];
+  const texts = [];
+  for (const value of renderedValues(id)) {
+    if (typeof value === 'string') texts.push(value);
+    else if (Array.isArray(value)) texts.push(...value);
+    else if (value && typeof value === 'object') texts.push(...Object.values(value));
+  }
+  return distinct(texts);
+}
+/** The strings one list entry or record field renders as saved. */
+function entryTexts(id, entry) {
+  return distinct(renderedValues(id).map((value) => (value && typeof value === 'object' && own(value, entry) ? value[entry] : undefined)));
+}
+/** A key's saved draft in the selected locale of a store-backed site, else undefined. */
+function savedDraft(id) {
+  const row = storeBacked() ? rowOf(id, S.locale, 'draft') : undefined;
+  return row ? row.value : undefined;
+}
+/**
+ * Every shown draft but the selected key's, as the agent's layer takes them:
+ * this locale's unsaved edits, then the selected environment's saved drafts
+ * an unsaved edit does not cover. A list or record shows entry by entry.
+ */
+function layerDrafts() {
+  if (!ready()) return [];
+  if (S.showing !== null) return showingDrafts();
+  const out = [];
+  const taken = new Set();
+  const push = (id, value) => {
+    if (id === S.sel || taken.has(id)) return;
+    taken.add(id);
+    out.push(...layerItems(id, value));
+  };
+  for (const held of Object.keys(S.draft)) {
+    const cut = held.indexOf(' ');
+    if (held.slice(0, cut) === S.locale) push(held.slice(cut + 1), S.draft[held]);
+  }
+  for (const row of S.rows || []) if (storeBacked() && row.status === 'draft' && row.locale === S.locale) push(row.key, row.value);
+  return out;
+}
+/**
+ * One key's value as layer entries, matched against `from`, the values the
+ * page may show for it (the key's rendered values unless given). A list or a
+ * record is one entry per changed string.
+ */
+function layerItems(id, value, from) {
+  const def = keyDef(id);
+  if (!def || def.derivesFrom !== undefined || def.target === 'html-email') return [];
+  const candidates = from || renderedValues(id);
+  if (typeof value === 'string') {
+    const texts = distinct(candidates);
+    return texts.length === 0 ? [] : [Object.assign({ key: id, texts: texts, draft: value }, def.tags === undefined ? {} : { tags: def.tags })];
+  }
+  if (!value || typeof value !== 'object') return [];
+  const out = [];
+  for (const name of Object.keys(value)) {
+    const entry = Array.isArray(value) ? Number(name) : name;
+    const texts = distinct(candidates.map((v) => (v && typeof v === 'object' && own(v, entry) ? v[entry] : undefined)));
+    const text = value[name];
+    if (typeof text === 'string' && texts.length > 0 && !(texts.length === 1 && texts[0] === text)) out.push({ key: id, texts: texts, draft: text, entry: entry });
+  }
+  return out;
+}
+/**
+ * What a preview shows in place of the ordinary layer: an open change's
+ * drafts alone; a published change's before values, or its current ones over
+ * the snapshot's words (F96); one past value of one key.
+ */
+function showingDrafts() {
+  const v = S.showing;
+  const out = [];
+  if (v.kind === 'change') {
+    for (const row of membersOf(v.id)) if (row.locale === S.locale) out.push(...layerItems(row.key, row.value));
+  } else if (v.kind === 'published') {
+    for (const m of v.members) {
+      if (m.locale !== S.locale) continue;
+      const active = rowOf(m.key, m.locale, 'active');
+      const snapshot = renderedValue(m.key);
+      if (v.view === 'before') {
+        if (own(m, 'beforeValue')) out.push(...layerItems(m.key, m.beforeValue, [snapshot, active ? active.value : undefined]));
+      } else if (active) {
+        out.push(...layerItems(m.key, active.value, [snapshot]));
+      }
+    }
+  } else if (v.kind === 'version' && v.locale === S.locale) {
+    out.push(...layerItems(v.key, v.value));
+  }
+  return out;
+}
+function postLayer() {
+  postToPreview({ stet: 'layer', drafts: layerDrafts() });
 }
 /** Whether the selected key's draft is a list or a record, which the page shows only after Save. */
 function structuredDraft() {
@@ -1755,14 +2266,18 @@ function structuredDraft() {
 }
 /** Outline the selected key in the preview, with its draft in place where it maps onto the page's text. */
 function locateKey(scroll) {
-  if (!ready() || S.sel === null) { postToPreview({ stet: 'clear' }); return; }
+  if (!ready() || S.sel === null) { postToPreview({ stet: 'clear' }); postLayer(); return; }
   const def = keyDef(S.sel) || {};
   if (def.derivesFrom !== undefined) {
     // A derived key is shown where its source renders, outlined dashed; the whole message names the key picked.
     postLocate({ key: S.sel, mark: def.derivesFrom, texts: renderedTexts(def.derivesFrom), draft: null, scroll: scroll, guess: true, dashed: true });
+    postLayer();
     return;
   }
-  const held = S.draft[S.locale + ' ' + S.sel];
+  // The unsaved edit, else the saved draft: the preview shows what Publish would ship.
+  // A preview of a change or a past value shows only what it names.
+  const unsaved = S.draft[S.locale + ' ' + S.sel];
+  const held = S.showing !== null ? undefined : unsaved !== undefined ? unsaved : savedDraft(S.sel);
   if (structuredDraft()) {
     S.located = Object.assign({}, S.located, { key: S.sel, draft: 'after-save' });
     paintPaneNote();
@@ -1776,6 +2291,7 @@ function locateKey(scroll) {
     guess: !S.confirmed.has(S.sel) || S.warn === S.sel,
     ...(def.tags === undefined ? {} : { tags: def.tags }),
   });
+  postLayer();
 }
 function draftChanged() {
   clearTimeout(draftTimer);
@@ -2271,13 +2787,21 @@ function postCensus() {
     const def = S.site.descriptor.keys[id];
     // A derived key shows as its source, and an email's key on no page.
     if (def.derivesFrom !== undefined || def.target === 'html-email') continue;
-    const value = renderedValue(id);
-    if (typeof value === 'string') keys.push({ key: id, texts: [value] });
-    else if (Array.isArray(value)) {
-      keys.push({ key: id, texts: [], parts: value.map((v, i) => ({ entry: i, texts: [v] })).filter((p) => typeof p.texts[0] === 'string') });
-    } else if (value && typeof value === 'object') {
-      keys.push({ key: id, texts: [], parts: Object.keys(value).filter((n) => typeof value[n] === 'string').map((n) => ({ entry: n, texts: [value[n]] })) });
+    const values = renderedValues(id);
+    const texts = distinct(values);
+    const parts = [];
+    for (const value of values) {
+      if (!value || typeof value !== 'object') continue;
+      const entries = Array.isArray(value) ? value.map((v, i) => i) : Object.keys(value);
+      for (const entry of entries) {
+        if (typeof value[entry] !== 'string') continue;
+        const part = parts.find((p) => p.entry === entry);
+        if (!part) parts.push({ entry: entry, texts: [value[entry]] });
+        else if (part.texts.indexOf(value[entry]) === -1) part.texts.push(value[entry]);
+      }
     }
+    if (parts.length > 0 || values.some((v) => v && typeof v === 'object')) keys.push({ key: id, texts: texts, parts: parts });
+    else if (texts.length > 0) keys.push({ key: id, texts: texts });
   }
   postToPreview({ stet: 'census', keys: keys });
 }
@@ -2759,15 +3283,15 @@ function vLighthouse() {
 
 // --- Scheduled, Environments, Recent ----------------------------------------
 function vScheduled() {
-  const rows = (S.rows && S.rows.rows) || [];
+  const rows = S.rows || [];
   const scheduled = rows.filter((r) => r.publishAt);
-  const changes = (S.changes && S.changes.changes) || [];
+  const changes = (S.scheduled && S.scheduled.changes) || [];
   const grouped = '<div class="card"><div class="ch"><h3>Scheduled changes</h3>' +
     '<span class="bdg">a change publishes as one unit</span></div>' +
     '<table><thead><tr><th style="width:200px">When</th><th style="width:200px">Change</th>' +
     '<th>Note</th><th style="width:90px">Opened</th></tr></thead><tbody>' +
     (changes.length === 0
-      ? '<tr><td colspan="4" class="muted">' + (S.changes === null ? 'Not loaded.' : 'No change is scheduled.') + '</td></tr>'
+      ? '<tr><td colspan="4" class="muted">' + (S.scheduled === null ? 'Not loaded.' : 'No change is scheduled.') + '</td></tr>'
       : changes.map((c) => '<tr><td>' + esc(c.publishAt) + '</td><td><b>' + esc(c.name) + '</b></td>' +
         '<td class="muted">' + esc(c.note || '') + '</td>' +
         '<td class="muted">' + esc(c.authorKind) + '</td></tr>').join('')) + '</tbody></table></div>';
@@ -2813,7 +3337,7 @@ function vRecent() {
       (rows.length === 0
         ? '<tr><td colspan="4" class="muted">' + (S.recent === null ? 'Not loaded.' : 'Nothing published yet.') + '</td></tr>'
         : rows.map((r) => '<tr><td class="mono">v' + esc(r.id) + '</td><td class="muted">' + esc(r.publishedAt) +
-          '</td><td class="mono">' + esc(r.key) + '</td><td>' + esc(String(shown(r.value)).slice(0, 60)) +
+          '</td><td class="mono">' + esc(r.key) + '</td><td>' + esc(String(shown(r.value)).slice(0, 60)) + changeOf(r) +
           '</td></tr>').join('')) + '</tbody></table></div>';
   }
   const rows = (S.history && S.history.commits) || [];
@@ -2824,6 +3348,39 @@ function vRecent() {
     (htmlHost()
       ? 'A publish here is a commit, so this is the log of the snapshot and the pages.'
       : 'On a snapshot site a publish is a commit, so this is the snapshot file&rsquo;s own log.') + '</span></div></div>';
+}
+
+/** A published row's change: its name and Preview change, or nothing for a row published on its own. */
+function changeOf(row) {
+  if (row.changesetId === null || row.changesetId === undefined) return '';
+  const name = own(S.changeNames, row.changesetId) ? S.changeNames[row.changesetId] : 'change ' + row.changesetId;
+  return esc(' · ' + name) + ' <button class="btn sm" data-act="previewChange:' + esc(row.changesetId) + '">Preview change</button>';
+}
+/** A published change opened before and current over its pages, from `GET …/changes?id=`. */
+async function openChangePreview(id) {
+  const res = await api(mountPath('changes', 'id=' + id));
+  if (!res.ok) { tst(res.body.error || 'that change could not be read'); return; }
+  S.changeNames[id] = res.body.change.name;
+  S.showing = { kind: 'published', id: id, name: res.body.change.name, members: res.body.members || [], view: 'before', ask: false, skipped: null, error: '' };
+  // The preview is the Content tab's pane.
+  if (S.tab !== 'Content') setMode('edit');
+  S.tab = 'Content';
+  render();
+  locateKey(false);
+}
+/** Revert change: every member back to its before value, written forward; a member that cannot be is named. */
+async function revertChange() {
+  const v = S.showing;
+  if (v === null || v.kind !== 'published') return;
+  v.ask = false;
+  const res = await post(mountPath('revert-change'), { change: v.id, editor: S.editor });
+  if (!res.ok) { v.error = res.body.error || 'the store refused that revert'; render(); return; }
+  v.skipped = (res.body.skipped || []).map((m) => m.reason === 'stale_active'
+    ? m.key + ' was published again since — kept as it is'
+    : m.key + ' had no earlier published value — left as it is');
+  v.error = '';
+  render();
+  await loadRows();
 }
 
 // --- Health ------------------------------------------------------------------
@@ -2999,6 +3556,8 @@ const ACTIONS = {
   },
   key: (el, id) => {
     S.sel = id;
+    if (S.showing !== null && S.showing.kind === 'version') S.showing = null;
+    void guard(loadKeyHistory());
     S.message = '';
     S.findings = [];
     S.located = null;
@@ -3050,13 +3609,9 @@ const ACTIONS = {
   cycleEnv: () => {
     const names = ((ready() && S.site.environments) || []).map((e) => e.name);
     if (names.length < 2) return;
-    S.env = names[(names.indexOf(S.env) + 1) % names.length];
-    S.rows = null;
-    S.changes = null;
-    S.recent = null;
-    render();
+    switchEnv(names[(names.indexOf(S.env) + 1) % names.length]);
   },
-  env: (el, name) => { S.env = name; S.rows = null; S.changes = null; S.recent = null; render(); },
+  env: (el, name) => { switchEnv(name); },
   'list-add': (el, arg) => {
     const id = arg;
     const held = valueOf(id);
@@ -3081,6 +3636,49 @@ const ACTIONS = {
     });
   },
   save: () => { void guard(save()); },
+  takeOver: () => { void guard(takeOver()); },
+  changeNew: () => { S.changeForm = { name: '', note: '' }; S.changeError = ''; render(); },
+  changeFormCancel: () => { S.changeForm = null; S.changeError = ''; render(); },
+  changeCreate: () => { void guard(createChange()); },
+  changeResume: (el, id) => {
+    const found = (S.changes || []).find((c) => String(c.id) === id);
+    if (!found) return;
+    activate(found);
+    render();
+  },
+  setAside: () => { deactivate(); render(); locateKey(false); },
+  removeMember: (el, version) => {
+    const row = (S.rows || []).find((r) => r.status === 'draft' && String(r.version) === version);
+    if (row && S.change !== null) void guard(moveDrafts([row], null, 'remove'));
+  },
+  addToChange: () => { if (S.change !== null) void guard(moveDrafts(looseDrafts(), S.change.id, 'add')); },
+  publishChange: () => { void guard(publishChange()); },
+  discardAsk: () => { S.discardAsk = true; render(); },
+  discardCancel: () => { S.discardAsk = false; render(); },
+  discardChange: () => { void guard(discardChange()); },
+  changePreview: () => { if (S.change !== null) { S.showing = { kind: 'change', id: S.change.id, name: S.change.name }; render(); locateKey(false); } },
+  exitPreview: () => { S.showing = null; render(); locateKey(false); },
+  spanPage: (el, name) => { moveTo(groupRoute('page:' + name)); },
+  previewChange: (el, id) => { void guard(openChangePreview(Number(id))); },
+  historyPreview: (el, id) => {
+    const h = S.keyHistory;
+    const row = h === null ? undefined : h.rows.find((r) => String(r.id) === id);
+    if (!row) return;
+    S.showing = { kind: 'version', key: h.key, locale: h.locale, value: row.value, id: row.id };
+    render();
+    locateKey(false);
+  },
+  historyRestore: (el, id) => { void guard(restoreVersion(id)); },
+  showView: (el, view) => {
+    if (S.showing === null || S.showing.kind !== 'published') return;
+    S.showing.view = view === 'current' ? 'current' : 'before';
+    paintPaneShow();
+    locateKey(false);
+  },
+  revertAsk: () => { if (S.showing !== null) { S.showing.ask = true; paintPaneShow(); fitFrame(); } },
+  revertCancel: () => { if (S.showing !== null) { S.showing.ask = false; paintPaneShow(); fitFrame(); } },
+  revertChange: () => { void guard(revertChange()); },
+  keepTheirs: () => { keepTheirs(); },
   publish: () => { void guard(mountWrite('publish')); },
   discard: () => { void guard(mountWrite('discard')); },
   commit: () => { void guard(commit()); },
@@ -3118,8 +3716,8 @@ const ACTIONS = {
   },
   rowsLoad: () => {
     void guard((async () => {
-      S.rows = (await api(mountPath('keys'))).body;
-      S.changes = (await api(mountPath('changes', 'status=scheduled'))).body;
+      await loadRows();
+      S.scheduled = (await api(mountPath('changes', 'status=scheduled'))).body;
       render();
     })());
   },
@@ -3215,7 +3813,7 @@ const ACTIONS_CHANGE = {
     void guard(loadPreview());
   },
   // An open edit ends kept under its own locale before the selector moves (F3).
-  locale: (el) => { endEdit(); closePopover(); S.locale = el.value; render(); postCensus(); },
+  locale: (el) => { endEdit(); closePopover(); S.locale = el.value; render(); postCensus(); void guard(loadKeyHistory()); },
   enum: (el, id) => { setDraft(id, el.value); render(); },
   entryDev: (el) => { void guard(updateEntry({ dev: el.value })); },
   entryCommand: (el) => { void guard(updateEntry({ devCommand: el.value })); },
@@ -3230,6 +3828,8 @@ const ACTIONS_INPUT = {
   tmplBefore: (el, id) => { tmplEdit(id, { before: el.value }); },
   tmplAfter: (el, id) => { tmplEdit(id, { after: el.value }); },
   splitName: (el) => { if (S.split) S.split.name = el.value; },
+  changeName: (el) => { if (S.changeForm) S.changeForm.name = el.value; },
+  changeNote: (el) => { if (S.changeForm) S.changeForm.note = el.value; },
   number: (el, id) => { clearRefusal(); setDraft(id, el.value === '' ? '' : Number(el.value)); paintRow(id); paintDirty(); },
   color: (el, id) => { clearRefusal(); setDraft(id, el.value); paintRow(id); paintDirty(); },
   list: (el, arg) => { listEdit(arg, (entries, i) => { entries[i] = el.value; }); },
@@ -3322,16 +3922,35 @@ async function save(anyway) {
   const over = anyway ? [] : overLimits(values);
   if (over.length > 0) { S.overLimit = over; render(); return; }
   if (storeBacked()) {
+    // Each value on its own: a draft another editor holds waits for the
+    // editor's Take over; any other refusal stops the loop with its line.
+    // The environment, its change and its edits are those the Save started
+    // in, whatever is selected by the time a write answers (D47).
+    const env = S.env;
+    const into = S.change;
+    const { draft, base } = S;
+    let saved = 0;
+    let refused = '';
     for (const value of values) {
-      const res = await post(mountPath('draft'), {
-        editor: S.editor, key: value.key, locale: value.locale, value: value.value,
-      });
-      if (!res.ok) { S.message = res.body.error || 'the store refused that draft'; render(); return; }
+      const k = value.locale + ' ' + value.key;
+      const res = await post(mountPath('draft', undefined, env), Object.assign(
+        { editor: S.editor, key: value.key, locale: value.locale, value: value.value },
+        into ? { change: into.id } : {},
+      ));
+      if (res.ok) { delete draft[k]; delete base[k]; saved += 1; continue; }
+      if (S.env !== env) break;
+      if (res.status === 409 && res.body.refused === true) {
+        hold({ kind: 'save', key: value.key, locale: value.locale, value: value.value, editor: res.body.incumbentEditor, since: res.body.heldSince });
+        continue;
+      }
+      refused = res.body.error || 'the store refused that draft';
+      break;
     }
-    dropDrafts();
-    S.message = '';
-    tst(plural(values.length, 'draft') + ' saved');
+    if (refused !== '' && S.env === env && await changeLost(refused)) refused = '';
+    if (S.env === env) S.message = refused;
+    if (saved > 0) tst(plural(saved, 'draft') + ' saved');
     render();
+    await loadRows();
     return;
   }
   const res = await post('/api/site/save' + query(), Object.assign({ values: values }, templates.length === 0 ? {} : { templates: templates }));
@@ -3558,6 +4177,52 @@ async function split() {
 }
 
 
+/**
+ * The first held draft, taken over: its value sent again with `force` — the
+ * one path that sends it — and the change it was meant for. A refusal (the
+ * content gate's) shows its line, and the other editor's draft stands.
+ */
+async function takeOver() {
+  const held = S.held.shift();
+  if (!held) return;
+  const env = S.env;
+  const { draft, base } = S;
+  const change = held.kind === 'save' ? (S.change ? { change: S.change.id } : {}) : { change: held.change };
+  const res = await post(mountPath('draft', undefined, env), Object.assign(
+    { editor: S.editor, key: held.key, locale: held.locale, value: held.value }, change, { force: true },
+  ));
+  const k = held.locale + ' ' + held.key;
+  if (res.ok) {
+    // A value typed on since the save stays an unsaved edit.
+    if (held.kind === 'save' && JSON.stringify(draft[k]) === JSON.stringify(held.value)) { delete draft[k]; delete base[k]; }
+    if (S.env === env) S.message = '';
+  } else if (S.env === env) {
+    const error = res.body.error || 'the store refused that draft';
+    if (await changeLost(error)) S.message = '';
+    else S.message = error;
+  }
+  render();
+  await loadRows();
+}
+/** The first held draft left as it is: nothing is written. */
+function keepTheirs() {
+  S.held.shift();
+  render();
+}
+/** The confirm for the first held draft, one at a time. */
+function takeoverCard() {
+  const held = S.held[0];
+  if (!held) return '';
+  const ask = held.kind === 'save' ? 'Save yours over it? Their wording is replaced and the draft becomes yours.'
+    : held.kind === 'add' ? 'Add it to ' + held.name + '? The draft becomes yours.'
+      : 'Take it out of ' + held.name + '? The draft becomes yours.';
+  return '<div class="card" id="takeover"><div class="cb"><div class="term">' +
+    esc(held.editor + ' has a draft of ' + held.key + ' from ' + clockShort(held.since) + '. ' + ask) + '</div>' +
+    '<div style="margin-top:8px"><button class="btn pri sm" data-act="takeOver">Take over</button>' +
+    (held.kind === 'save' ? '<button class="btn sm" data-act="keepTheirs">Keep theirs</button>'
+      : '<button class="btn sm" data-act="keepTheirs">Cancel</button>') + '</div></div></div>';
+}
+
 async function mountWrite(route) {
   if (S.sel === null) return;
   const res = await post(mountPath(route), { editor: S.editor, key: S.sel, locale: S.locale });
@@ -3567,12 +4232,13 @@ async function mountWrite(route) {
   render();
   // The discarded draft leaves the preview too.
   if (route === 'discard') draftChanged();
+  await loadRows();
 }
 
-function mountPath(route, search) {
+function mountPath(route, search, env = S.env) {
   const query = [
     ...(search === undefined ? [] : [search]),
-    ...(S.env === 'default' ? [] : ['env=' + encodeURIComponent(S.env)]),
+    ...(env === 'default' ? [] : ['env=' + encodeURIComponent(env)]),
   ];
   return '/s/' + encodeURIComponent(S.site.id) + '/api/stet/' + route +
     (query.length === 0 ? '' : '?' + query.join('&'));

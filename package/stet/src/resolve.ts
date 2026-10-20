@@ -25,6 +25,10 @@ export interface StoreRow {
    * a review surface derives its grouped card from it — carried on this same
    * read, not newly queried. */
   changesetId?: number | null;
+  /** A draft row's author and when it was first saved; a published row carries
+   * neither on this read. Both are already in every adapter's select. */
+  editor?: string | null;
+  createdAt?: string;
 }
 
 export type ResolutionSource = 'draft' | 'active' | 'derived' | 'snapshot';
