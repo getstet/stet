@@ -310,10 +310,17 @@ export function within(spans: Span[], at: number): boolean {
 /**
  * The comments and JSX text of a TypeScript region — the parts of it that are
  * not code. Every token's leading trivia is read, so a comment before a closing
- * brace, which starts no node, is found too.
+ * brace, which starts no node, is found too. `parsed` is the region's parse
+ * where the caller already holds it.
  */
-export function nonCodeOf(ts: typeof import('typescript'), file: string, text: string, base = 0): Span[] {
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
+export function nonCodeOf(
+  ts: typeof import('typescript'),
+  file: string,
+  text: string,
+  base = 0,
+  parsed?: TS.SourceFile,
+): Span[] {
+  const sf = parsed ?? ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
   const out: Span[] = [];
   const seen = new Set<number>();
   const visit = (node: TS.Node): void => {
@@ -470,14 +477,26 @@ export interface FileCode {
  * JSX text excepted; a template dialect's scripts and expressions, with the
  * comments of each script and brace, which the markup walk keeps whole. Null
  * where the file is neither the TypeScript family nor a dialect.
+ *
+ * `parse`, where given, makes each parse this reads — the whole file, each
+ * script region and each brace's inside, named and based as here — so a caller
+ * that walks the same trees afterwards parses each once.
  */
-export function codeOf(ts: typeof import('typescript'), file: string, source: string, dialect: Dialect | null): FileCode | null {
+export function codeOf(
+  ts: typeof import('typescript'),
+  file: string,
+  source: string,
+  dialect: Dialect | null,
+  parse?: (file: string, text: string, base: number) => TS.SourceFile,
+): FileCode | null {
+  const nonCode = (name: string, text: string, base: number): Span[] =>
+    nonCodeOf(ts, name, text, base, parse?.(name, text, base));
   if (dialect === null) {
     if (!TS_FAMILY.test(file)) return null;
     return {
       code: [{ start: 0, end: source.length }],
       regions: [{ start: 0, end: source.length, text: source }],
-      nonCode: nonCodeOf(ts, file, source),
+      nonCode: nonCode(file, source, 0),
       braces: [],
     };
   }
@@ -487,10 +506,10 @@ export function codeOf(ts: typeof import('typescript'), file: string, source: st
     code: [...found.scripts, ...found.expressions],
     regions,
     nonCode: [
-      ...regions.flatMap((r) => nonCodeOf(ts, `${file}.ts`, r.text, r.start)),
+      ...regions.flatMap((r) => nonCode(`${file}.ts`, r.text, r.start)),
       ...found.expressions
         .filter((e) => source[e.start] === '{')
-        .flatMap((e) => nonCodeOf(ts, `${file}.tsx`, source.slice(e.start + 1, e.end - 1), e.start + 1)),
+        .flatMap((e) => nonCode(`${file}.tsx`, source.slice(e.start + 1, e.end - 1), e.start + 1)),
     ],
     braces: found.braces,
   };

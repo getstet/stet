@@ -20,6 +20,10 @@
  * hosts `eject` serves, and its answers do not change under TypeScript 7.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+import { builtinModules } from 'node:module';
+import { dirname, join } from 'node:path';
+
 import type * as TS from 'typescript';
 
 import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
@@ -2101,4 +2105,33 @@ export function carriesToken(
   token: string,
 ): boolean {
   return tokenInCode(ts, file, source, token, true);
+}
+
+/**
+ * Whether a bare specifier names a package of the project at `cwd`: its name
+ * (`react`, `@scope/name`) is among the `package.json` dependencies of any
+ * kind, a folder of `node_modules` here or in a folder above (a hoisted
+ * install), or a built-in module of Node.
+ */
+export function packageNames(cwd: string): (spec: string) => boolean {
+  const declared = new Set<string>();
+  try {
+    const manifest = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8')) as Record<string, unknown>;
+    for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+      const table = manifest[field];
+      if (typeof table === 'object' && table !== null) for (const name of Object.keys(table)) declared.add(name);
+    }
+  } catch {
+    // no manifest, or one that is not JSON: only the installed packages count
+  }
+  return (spec) => {
+    if (spec.startsWith('node:')) return true;
+    const segments = spec.split('/');
+    const name = segments.slice(0, spec.startsWith('@') ? 2 : 1).join('/');
+    if (declared.has(name) || builtinModules.includes(name)) return true;
+    for (let at = cwd; ; at = dirname(at)) {
+      if (existsSync(join(at, 'node_modules', name))) return true;
+      if (dirname(at) === at) return false;
+    }
+  };
 }

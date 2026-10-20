@@ -1,0 +1,7 @@
+{
+  "live": [
+    "home_faq_1_question",
+    "home_faq_2_question"
+  ],
+  "note": "string concatenation around a loop index"
+}

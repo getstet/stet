@@ -1,0 +1,16 @@
+{
+  "keys": {
+    "home_title": {
+      "shape": "text"
+    },
+    "home_lead": {
+      "shape": "text"
+    },
+    "pricing_title": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

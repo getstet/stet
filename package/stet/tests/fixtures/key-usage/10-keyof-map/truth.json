@@ -1,0 +1,7 @@
+{
+  "live": [
+    "status_open",
+    "status_closed"
+  ],
+  "note": "a lookup map from a union to key names"
+}

@@ -1,0 +1,7 @@
+---
+import { copy } from '@/lib/content';
+const title = copy('hero_title');
+---
+<h1>{title}</h1>
+<p>{copy.get('hero_sub')}</p>
+<!-- copy('footer_note') is only mentioned here -->

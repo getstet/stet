@@ -1,0 +1,7 @@
+{
+  "live": [
+    "hero_title",
+    "footer_note"
+  ],
+  "note": "same table, but the map is copied into a local object first and indexed there"
+}

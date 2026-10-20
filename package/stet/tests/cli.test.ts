@@ -8,8 +8,9 @@
  * that walk (`conformance/cli-host.ts`), so both drive an identical project.
  */
 import { spawnSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
@@ -3633,5 +3634,142 @@ describe('upgrade arms the commit gate’s SEO run only where seo check passes',
     writeFileSync(join(passing.cwd, RUNNER), shippedRunner());
     expect(await passing.run('upgrade')).toBe(0);
     expect(passing.stdout()).not.toMatch(/hook|seo check/);
+  });
+});
+
+describe('list --json: the unread-key badge (D6, 5.6)', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Fixture 07 of the badge review as a stet project: its descriptor made loadable, made a git repository. */
+  function templateLiteralHost(): { cwd: string; run: (runner: typeof import('../cli/main.js')['runCli'], ...argv: string[]) => Promise<{ code: number; out: string[]; err: string[] }> } {
+    const cwd = mkdtempSync(join(tmpdir(), 'stet-list-usage-'));
+    made.push(cwd);
+    cpSync(join(packageRoot(), 'tests', 'fixtures', 'key-usage', '07-template-literal'), cwd, { recursive: true });
+    rmSync(join(cwd, 'truth.json'));
+    const descriptor = JSON.parse(readFileSync(join(cwd, 'content/descriptor.json'), 'utf8')) as { keys: Record<string, Record<string, unknown>> };
+    for (const def of Object.values(descriptor.keys)) def['target'] = 'web';
+    writeFileSync(join(cwd, 'content/descriptor.json'), JSON.stringify({ version: 1, ...descriptor }));
+    spawnSync('git', ['init', '-q'], { cwd });
+    spawnSync('git', ['add', '-A'], { cwd });
+    return {
+      cwd,
+      run: async (runner, ...argv) => {
+        const out: string[] = [];
+        const err: string[] = [];
+        const code = await runner(argv, { cwd, env: {}, stdout: (l) => out.push(l), stderr: (l) => err.push(l) });
+        return { code, out, err };
+      },
+    };
+  }
+
+  it('gives each judged row its badge and the reply the usage (the CLI scenario)', async () => {
+    const host = templateLiteralHost();
+    const { runCli } = await import('../cli/main.js');
+    const { code, out } = await host.run(runCli, 'list', '--json');
+    expect(code).toBe(0);
+    const answer = JSON.parse(out[out.length - 1] as string) as {
+      rows: Array<{ key: string; badge?: string }>;
+      usage: { prefixes: unknown[]; causes: unknown[]; files: number; root: string };
+      findings: unknown[];
+    };
+    expect(answer.rows.map((r) => [r.key, r.badge])).toEqual([
+      ['footer_note', 'not_found'],
+      ['tier_solo_name', 'unknown'],
+      ['tier_solo_price', 'unknown'],
+      ['tier_team_name', 'unknown'],
+    ]);
+    expect(answer.usage).toEqual({
+      prefixes: [{ prefix: 'tier_', file: 'lib/pricing.ts', line: 2 }],
+      causes: [],
+      files: 1,
+      root: `${basename(host.cwd)}/`,
+    });
+    expect(answer.findings).toEqual([]);
+  });
+
+  it('F2: a file nested past the compiler’s recursion is one cause, and the command still exits 0', async () => {
+    const host = templateLiteralHost();
+    writeFileSync(join(host.cwd, 'lib/deep.ts'), `export const c = x${'.m()'.repeat(1000)};\n`);
+    spawnSync('git', ['add', '-A'], { cwd: host.cwd });
+    const { runCli } = await import('../cli/main.js');
+    const { code, out } = await host.run(runCli, 'list', '--json');
+    expect(code).toBe(0);
+    const answer = JSON.parse(out[out.length - 1] as string) as {
+      rows: Array<{ key: string; badge?: string }>;
+      usage: { causes: Array<{ text: string; file: string; line: number }> };
+    };
+    expect(answer.usage.causes).toEqual([{ text: 'too deeply nested to read', file: 'lib/deep.ts', line: 1 }]);
+    expect(answer.rows.map((r) => [r.key, r.badge])).toEqual([
+      ['footer_note', 'unknown'],
+      ['tier_solo_name', 'unknown'],
+      ['tier_solo_price', 'unknown'],
+      ['tier_team_name', 'unknown'],
+    ]);
+  });
+
+  it('RF11: a key named like an Object.prototype member gets its own badge, an excluded one none', async () => {
+    const host = templateLiteralHost();
+    const at = (rel: string): string => join(host.cwd, rel);
+    const descriptor = JSON.parse(readFileSync(at('content/descriptor.json'), 'utf8')) as { keys: Record<string, Record<string, unknown>> };
+    descriptor.keys['constructor'] = { shape: 'text', target: 'web' };
+    descriptor.keys['brand__valueof'] = { shape: 'text', target: 'web' };
+    writeFileSync(at('content/descriptor.json'), JSON.stringify(descriptor));
+    const snapshot = JSON.parse(readFileSync(at('content/defaults.json'), 'utf8')) as { default: Record<string, string> };
+    snapshot.default['constructor'] = 'x';
+    snapshot.default['brand__valueof'] = 'y';
+    writeFileSync(at('content/defaults.json'), JSON.stringify(snapshot));
+    writeFileSync(at('lib/own.ts'), "export const c = 'constructor';\n");
+    spawnSync('git', ['add', '-A'], { cwd: host.cwd });
+    const { runCli } = await import('../cli/main.js');
+    const { code, out } = await host.run(runCli, 'list', '--json');
+    expect(code).toBe(0);
+    const answer = JSON.parse(out[out.length - 1] as string) as { rows: Array<{ key: string; badge?: string }> };
+    expect(Object.fromEntries(answer.rows.map((r) => [r.key, r.badge]))).toMatchObject({ constructor: 'read', brand__valueof: undefined });
+    expect(answer.rows.find((r) => r.key === 'brand__valueof')).not.toHaveProperty('badge');
+  });
+
+  it('leaves the text output as it was', async () => {
+    const host = templateLiteralHost();
+    const { runCli } = await import('../cli/main.js');
+    const { code, out } = await host.run(runCli, 'list');
+    expect(code).toBe(0);
+    expect(out.join('\n')).toBe(
+      [
+        'key              source    version  draft',
+        'footer_note      snapshot        —  —',
+        'tier_solo_name   snapshot        —  —',
+        'tier_solo_price  snapshot        —  —',
+        'tier_team_name   snapshot        —  —',
+      ].join('\n'),
+    );
+  });
+
+  it('without typescript: no badge, usage null, the install line among the findings', async () => {
+    const host = templateLiteralHost();
+    vi.resetModules();
+    vi.doMock('typescript', () =>
+      Promise.reject(Object.assign(new Error("Cannot find package 'typescript'"), { code: 'ERR_MODULE_NOT_FOUND' })),
+    );
+    try {
+      const { runCli } = await import('../cli/main.js');
+      const { code, out } = await host.run(runCli, 'list', '--json');
+      expect(code).toBe(0);
+      const answer = JSON.parse(out[out.length - 1] as string) as {
+        rows: Array<{ key: string; badge?: string }>;
+        usage: unknown;
+        findings: Array<{ level: string; message: string }>;
+      };
+      expect(answer.rows.every((r) => !('badge' in r))).toBe(true);
+      expect(answer.usage).toBeNull();
+      expect(answer.findings).toEqual([
+        expect.objectContaining({ level: 'warn', message: "stet needs 'typescript' to read your source — install it as a dev dependency: npm i -D typescript" }),
+      ]);
+    } finally {
+      vi.doUnmock('typescript');
+      vi.resetModules();
+    }
   });
 });

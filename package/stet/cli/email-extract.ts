@@ -2105,7 +2105,7 @@ function isRelative(spec: string): boolean {
 }
 
 /** `react`, `node:fs`, `@scope/name` — but not `@/lib/x`, whose scope is empty. */
-function isBarePackage(spec: string): boolean {
+export function isBarePackage(spec: string): boolean {
   return spec.startsWith('@') ? /^@[^/\s]+\/[^/\s]/.test(spec) : /^[A-Za-z0-9_]/.test(spec);
 }
 

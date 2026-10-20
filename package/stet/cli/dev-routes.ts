@@ -17,8 +17,10 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { closeSync, openSync, readFileSync, utimesSync } from 'node:fs';
-import { join, posix } from 'node:path';
+import { closeSync, existsSync, openSync, readFileSync, utimesSync } from 'node:fs';
+import { dirname, join, posix } from 'node:path';
+
+import type * as TS from 'typescript';
 
 import { json, readJson } from '../server/http.js';
 import { bearerMatches, createStetHandler } from '../server/mount.js';
@@ -31,7 +33,8 @@ import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
-import type { StetConfig, StoreBlock } from './config.js';
+import { pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
+import { isBarePackage } from './email-extract.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, type GitState } from './git.js';
 import {
@@ -51,15 +54,17 @@ import {
   type HtmlProposalSet,
 } from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
+import { importClosure, probeFile, type Chain } from './import-closure.js';
 import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
+import { isGenerated, keyUsage, namedKeys, ownFiles, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
-import { applyPages, auditablePages, fileRoute, proposeForHost, servedRoute } from './pages.js';
+import { applyPages, auditablePages, fileRoute, proposeForHost, routeFiles, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
-import { blankNonMarkup, dialectOf, matchGlob, type Dialect } from './source-scan.js';
+import { blankNonMarkup, dialectOf, loadTypescript, matchGlob, packageNames, scriptKindFor, type Dialect } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -132,6 +137,8 @@ export interface DevContext {
   previewChannel?: string;
   /** Test seam: the script the audit child runs in place of the installed CLI. */
   auditCli?: string;
+  /** Each site's unread-key facts, per file, kept between `usage` requests. */
+  usage?: Map<string, UsageCache>;
 }
 
 /**
@@ -462,6 +469,10 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await preview(ctx, url, site, entry);
       case 'GET site/marks':
         return marks(site);
+      case 'GET site/usage':
+        return await usage(ctx, site);
+      case 'GET site/route-reads':
+        return await routeReads(url, site);
       case 'POST site/dev-start':
         return await devStart(ctx, site, entry);
       case 'POST site/dev-stop':
@@ -1767,6 +1778,96 @@ function marks(site: SiteState): Response {
     ]);
   }
   return json({ documents, keys: Object.fromEntries(keys), places: Object.fromEntries(places) });
+}
+
+/**
+ * Which declared keys the site's source reads (`keyUsage`): the dashboard's
+ * unread-key badge. Each file's facts stay in `ctx` between requests and are
+ * read again only when the file's size or mtime moves.
+ */
+async function usage(ctx: DevContext, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const caches = (ctx.usage ??= new Map());
+  const cache = caches.get(ready.path) ?? usageCache();
+  caches.set(ready.path, cache);
+  return json(await keyUsage(ready.path, ready.config, ready.descriptor, cache));
+}
+
+/**
+ * The keys one route's files read: on the static-HTML host the marks of the
+ * document served at the route; on a JavaScript host the keys named in the
+ * route's page files (`routeFiles`) and everything they import, through the
+ * host's path aliases. `complete` is false where the walk met a file it could
+ * not follow or the route maps to no file.
+ */
+async function routeReads(url: URL, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const route = url.searchParams.get('route');
+  if (route === null) throw new UsageError('route is required');
+  const unmapped = { route, files: [], keys: [], complete: false };
+  if (ready.host === 'html') {
+    const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
+    const document = set.documents.find((d) => normalizeRoute(servedRoute(d.file)) === normalizeRoute(route));
+    if (document === undefined) return json(unmapped);
+    const keys = [...new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key))].sort();
+    return json({ route, files: [document.file], keys, complete: true });
+  }
+  const files = routeFiles(ready.path, route, ready.config);
+  if (files === null) return json(unmapped);
+  const ts = await loadTypescript();
+  const mappings = pathAliasMappings(ready.path);
+  const packages = packageNames(ready.path);
+  // The host's own resolution first, `baseUrl` and `paths` included; only a
+  // bare name that is a package of the project (declared, installed or built
+  // in) is not the host's source. A bare name that is none is an alias the
+  // walk does not know.
+  const alias = (fromRel: string, spec: string): string | null | undefined => {
+    for (const candidate of resolveSpecifier(spec, fromRel, ready.path, mappings)) {
+      const found = probeFile(ready.path, candidate);
+      if (found !== null) return found;
+    }
+    return isBarePackage(spec) && packages(spec) ? undefined : null;
+  };
+  // A file nested past the compiler's recursion cannot be walked: the route
+  // is answered incomplete, with the keys read before it.
+  let chain: Chain;
+  try {
+    chain = importClosure(ts, ready.path, files, alias, (rel) => insideCheckout(ready.path, join(ready.path, rel)) !== null);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    return json({ route, files, keys: [], complete: false });
+  }
+  const declared = new Set(Object.keys(ready.descriptor.keys));
+  const own = ownFiles(ready.config);
+  const keys = new Set<string>();
+  let complete = !chain.boundary;
+  for (const file of chain.files) {
+    // The files stet writes name every key, and read none.
+    if (own.has(file.rel) || isGenerated(file.text)) continue;
+    try {
+      for (const key of namedKeys(ts, file.rel, file.text, declared)) keys.add(key);
+      if (importsLazily(ts, file.rel, file.text)) complete = false;
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      complete = false;
+    }
+  }
+  return json({ route, files, keys: [...keys].sort(), complete });
+}
+
+/** Whether a file holds a dynamic `import()` or a `require()` call: a module the walk would not see. */
+export function importsLazily(ts: typeof import('typescript'), rel: string, text: string): boolean {
+  if (!/\b(?:import|require)\s*\(/.test(text)) return false;
+  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
+  const found = (node: TS.Node): boolean =>
+    (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) ||
+    ts.forEachChild(node, found) === true;
+  try {
+    return found(sf);
+  } catch (error) {
+    if (error instanceof RangeError) return true; // too deeply nested to read: not known to be free of one
+    throw error;
+  }
 }
 
 /**

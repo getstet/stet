@@ -1,0 +1,6 @@
+{
+  "live": [
+    "hero_title"
+  ],
+  "note": "re-export through a barrel"
+}

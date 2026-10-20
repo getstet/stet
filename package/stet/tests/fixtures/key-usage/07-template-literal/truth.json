@@ -1,0 +1,7 @@
+{
+  "live": [
+    "tier_solo_name",
+    "tier_team_name"
+  ],
+  "note": "F5 case: template literal with a static head"
+}

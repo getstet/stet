@@ -1,0 +1,7 @@
+{
+  "live": [
+    "hero_title",
+    "footer_note"
+  ],
+  "note": "footer_note is read by a sibling package outside this checkout (not in the scan root): see the runner, which adds the sibling only to truth"
+}

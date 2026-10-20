@@ -43,6 +43,10 @@ export interface Chain {
  * package: not followed, and no boundary). Without it, every non-relative
  * specifier is a boundary.
  *
+ * Where `contained` is given, a file it refuses is a boundary, not followed:
+ * the route reads use it to keep a symlink out of the checkout from being
+ * walked.
+ *
  * Re-exports are followed because a component directory's barrel
  * (`export { Footer } from './footer'`) is how most host code reaches its
  * frame, and a walk that stopped at the barrel would report every token the
@@ -53,6 +57,7 @@ export function importClosure(
   cwd: string,
   entries: readonly string[],
   alias?: (fromRel: string, spec: string) => string | null | undefined,
+  contained?: (rel: string) => boolean,
 ): Chain {
   const files: Array<{ rel: string; text: string }> = [];
   const seen = new Set<string>();
@@ -60,7 +65,7 @@ export function importClosure(
 
   const visit = (rel: string, depth: number): void => {
     if (seen.has(rel)) return;
-    if (depth > CHAIN_DEPTH) {
+    if (depth > CHAIN_DEPTH || (contained !== undefined && !contained(rel))) {
       boundary = true;
       return;
     }

@@ -1,0 +1,6 @@
+{
+  "live": [
+    "hero_title"
+  ],
+  "note": "a key read only by a test: dead in the product but named in code"
+}

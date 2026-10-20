@@ -1,0 +1,6 @@
+{
+  "live": [
+    "hero_title"
+  ],
+  "note": "the whole map passed down as a prop and read by name in the child"
+}

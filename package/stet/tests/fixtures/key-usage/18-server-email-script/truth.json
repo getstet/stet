@@ -1,0 +1,9 @@
+{
+  "live": [
+    "hero_title",
+    "api_error",
+    "welcome_subject",
+    "og_title"
+  ],
+  "note": "keys read only in server code, an email module and a build script"
+}

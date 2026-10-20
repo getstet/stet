@@ -1,0 +1,16 @@
+{
+  "keys": {
+    "home_live_kicker": {
+      "shape": "text"
+    },
+    "home_live_lead": {
+      "shape": "text"
+    },
+    "pricing_title": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

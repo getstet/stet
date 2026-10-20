@@ -1,0 +1,13 @@
+{
+  "keys": {
+    "hero_title": {
+      "shape": "text"
+    },
+    "hero_sub": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

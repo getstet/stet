@@ -45,6 +45,7 @@ import { Report } from '../cli/report.js';
 import {
   captured,
   createDevHandler,
+  importsLazily,
   githubRepoOf,
   previewOfSummary,
   stopEveryChild,
@@ -57,6 +58,7 @@ import { git, gitData, gitRun, gitState, operationInProgress, pushRemoteOf, unco
 import { runHookInstall } from '../cli/hook.js';
 import { gone } from '../cli/liveness.js';
 import { runCli, type CliIo } from '../cli/main.js';
+import { loadTypescript } from '../cli/source-scan.js';
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptor, loadSnapshot, resolve } from '../src/index.js';
 import { derivedText } from '../src/resolve.js';
@@ -8830,5 +8832,352 @@ describe('the audit child (D10)', () => {
     const second = await pidFile(other.cwd);
     await stopEveryChild(closing.ctx);
     expect(await waitGone(second)).toBe(true);
+  });
+});
+
+describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
+  /** The mini project with a Next App tree: a page, a layout importing `@/components/Nav`, a second route importing a missing alias. */
+  function nextSite(): CliHost {
+    const host = snapshotHost();
+    write(host.cwd, 'package.json', JSON.stringify({ name: 'site', dependencies: { react: '^19' } }));
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } }));
+    write(
+      host.cwd,
+      'app/layout.tsx',
+      "import { Nav } from '@/components/Nav';\nexport default function Layout({ children }: { children: unknown }) { return <html><body><Nav />{children}</body></html>; }\n",
+    );
+    write(
+      host.cwd,
+      'app/page.tsx',
+      "import { useState } from 'react';\nimport { copy } from '@/lib/content';\nexport default function Page() { useState(0); return <h1>{copy('hero_headline')}</h1>; }\n",
+    );
+    write(host.cwd, 'components/Nav.tsx', "import { copy } from '@/lib/content';\nexport const Nav = () => <nav>{copy('footer_links')}</nav>;\n");
+    write(
+      host.cwd,
+      'app/pricing/page.tsx',
+      "import { Table } from '@/missing';\nimport { copy } from '@/lib/content';\nexport default function Pricing() { return <Table>{copy('pricing_price')}</Table>; }\n",
+    );
+    return host;
+  }
+
+  it('answers each judged key with its state, the file count and the root', async () => {
+    const host = nextSite();
+    const { handler } = handlerOver([host.cwd]);
+    const body = await get(handler, `/api/site/usage${site(host)}`);
+    expect(body.keys).toEqual({
+      hero_headline: { state: 'read' },
+      hero_body: { state: 'not_found' },
+      footer_links: { state: 'read' },
+      contact_form_labels: { state: 'not_found' },
+      theme_mode: { state: 'not_found' },
+      blog_intro: { state: 'not_found' },
+      pricing_tier_name: { state: 'not_found' },
+      pricing_price: { state: 'read' },
+      farewell_notice: { state: 'not_found' },
+    });
+    expect(body).toMatchObject({ prefixes: [], causes: [], serverOnly: [], files: 4 });
+    expect(body.root).toMatch(/^stet-cli-[^/]+\/$/);
+  });
+
+  it('a second request after one file is touched re-reads that file alone, and answers its new read', async () => {
+    const host = nextSite();
+    vi.resetModules();
+    const calls: string[] = [];
+    vi.doMock('../cli/key-reads.js', async (importOriginal) => {
+      const real = await importOriginal<typeof import('../cli/key-reads.js')>();
+      return {
+        ...real,
+        codeOf: (...args: Parameters<typeof real.codeOf>) => {
+          calls.push(args[1]);
+          return real.codeOf(...args);
+        },
+      };
+    });
+    try {
+      const fresh = await import('./helpers/dashboard-page.js');
+      const { handler } = fresh.handlerOver([host.cwd]);
+      const first = await get(handler, `/api/site/usage${site(host)}`);
+      expect(first.keys.footer_links).toEqual({ state: 'read' });
+      expect(calls.sort()).toEqual(['app/layout.tsx', 'app/page.tsx', 'app/pricing/page.tsx', 'components/Nav.tsx']);
+
+      // The same size, a later mtime: only the stamp's mtime tells it moved.
+      const nav = join(host.cwd, 'components/Nav.tsx');
+      const before = readFileSync(nav, 'utf8');
+      writeFileSync(nav, before.replace("copy('footer_links')", "copy('blog_intro'  )"));
+      expect(readFileSync(nav, 'utf8').length).toBe(before.length);
+      const later = new Date(Date.now() + 60_000);
+      utimesSync(nav, later, later);
+      calls.length = 0;
+      const second = await get(handler, `/api/site/usage${site(host)}`);
+      expect(calls).toEqual(['components/Nav.tsx']);
+      expect(second.keys.blog_intro).toEqual({ state: 'read' });
+      expect(second.keys.footer_links).toEqual({ state: 'not_found' });
+    } finally {
+      vi.doUnmock('../cli/key-reads.js');
+      vi.resetModules();
+    }
+  });
+
+  it('lists a Next route’s page, its layout and what they import through the alias, complete', async () => {
+    const host = nextSite();
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+      route: '/',
+      files: ['app/layout.tsx', 'app/page.tsx'],
+      keys: ['footer_links', 'hero_headline'],
+      complete: true,
+    });
+  });
+
+  it('an alias that resolves nowhere makes the route incomplete', async () => {
+    const host = nextSite();
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/pricing')}`)).toEqual({
+      route: '/pricing',
+      files: ['app/layout.tsx', 'app/pricing/page.tsx'],
+      keys: ['footer_links', 'pricing_price'],
+      complete: false,
+    });
+  });
+
+  const routeReadsOf = (handler: (r: Request) => Promise<Response>, host: CliHost, route = '/'): Promise<any> =>
+    get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent(route)}`);
+
+  it('F3a: a specifier resolved through baseUrl alone is followed', async () => {
+    const host = nextSite();
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.' } }));
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children}</body></html>; }\n');
+    write(host.cwd, 'app/page.tsx', "import { Nav } from 'components/Nav';\nexport default function Page() { return <Nav />; }\n");
+    write(host.cwd, 'components/Nav.tsx', "export const Nav = () => <nav>{'hero_headline'}</nav>;\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: ['hero_headline'], complete: true });
+  });
+
+  it('F3a: a specifier resolved through paths alone is followed, a package that resolves nowhere is not a boundary', async () => {
+    const host = nextSite();
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { 'ui/*': ['./components/*'] } } }));
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children}</body></html>; }\n');
+    write(host.cwd, 'components/Nav.tsx', "export const Nav = () => <nav>{'footer_links'}</nav>;\n");
+    write(host.cwd, 'app/page.tsx', "import { Nav } from 'ui/Nav';\nimport { useState } from 'react';\nexport default function Page() { useState(0); return <Nav />; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: ['footer_links'], complete: true });
+  });
+
+  it('F3b: a lazy import or a require in the closure makes the route incomplete', async () => {
+    for (const body of [
+      "import dynamic from 'next/dynamic';\nconst Nav = dynamic(() => import('@/components/Nav'));\nexport default function Page() { return <Nav />; }\n",
+      "const Nav = require('@/components/Nav').Nav;\nexport default function Page() { return <Nav />; }\n",
+    ]) {
+      const host = nextSite();
+      write(host.cwd, 'app/page.tsx', `${body}`);
+      const { handler } = handlerOver([host.cwd]);
+      expect((await routeReadsOf(handler, host)).complete, body).toBe(false);
+    }
+  });
+
+  it('F3b: the lazy import is found in a file the page reaches, not only the page', async () => {
+    const host = nextSite();
+    write(host.cwd, 'components/Nav.tsx', "export const Nav = () => { void import('./Menu'); return <nav />; };\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host)).complete).toBe(false);
+  });
+
+  it('F4: an import through a symlinked directory out of the checkout is a boundary, its keys unread', async () => {
+    const host = nextSite();
+    const outside = tempDir('stet-route-out-');
+    write(outside, 'Secret.tsx', "export const Secret = () => <p>{'hero_body'}</p>;\n");
+    symlinkSync(outside, join(host.cwd, 'linked'));
+    write(host.cwd, 'app/page.tsx', "import { Secret } from '../linked/Secret';\nexport default function Page() { return <Secret />; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.keys).not.toContain('hero_body');
+    expect(body.complete).toBe(false);
+  });
+
+  it('F4: a symlinked directory inside the checkout is followed', async () => {
+    const host = nextSite();
+    write(host.cwd, 'shared/Banner.tsx', "export const Banner = () => <p>{'hero_body'}</p>;\n");
+    symlinkSync(join(host.cwd, 'shared'), join(host.cwd, 'linked'));
+    write(host.cwd, 'app/page.tsx', "import { Banner } from '../linked/Banner';\nexport default function Page() { return <Banner />; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: expect.arrayContaining(['hero_body']) });
+  });
+
+  it('F5: the generated modules the read path imports name no key of the route', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', "import { DEFAULTS } from '../content/defaults';\nexport const copy = (k: string) => (DEFAULTS.default as Record<string, string>)[k];\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.keys).toEqual(['footer_links', 'hero_headline']);
+    expect(body.complete).toBe(true);
+  });
+
+  it('F5: the read path, the descriptor, the snapshot and every codegen file are skipped, whatever header they carry', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', "import './labels';\nexport const copy = (k: string) => k;\nexport const own = 'blog_intro';\n");
+    write(host.cwd, 'lib/labels.ts', "export const L = 'theme_mode';\n");
+    write(host.cwd, 'content/keys.ts', "export const K = 'blog_intro';\n");
+    write(host.cwd, 'lib/gen.ts', "// generated by stet — source-hash: x\nexport const G = 'farewell_notice';\n");
+    write(host.cwd, 'app/page.tsx', "import { copy } from '@/lib/content';\nimport '../content/keys';\nimport '../lib/gen';\nexport default function Page() { return <h1>{copy('hero_headline')}</h1>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.keys).toEqual(['footer_links', 'hero_headline', 'theme_mode']);
+  });
+
+  it('F13 (r09): a file nested past the compiler recursion makes the route incomplete, and is answered', async () => {
+    const host = nextSite();
+    write(host.cwd, 'components/Deep.tsx', `export const d = ${'['.repeat(40000)}1${']'.repeat(40000)};\nexport const Deep = () => <b>{'hero_body'}</b>;\n`);
+    write(host.cwd, 'app/page.tsx', "import { Deep } from '@/components/Deep';\nexport default function Page() { return <Deep />; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toEqual({ route: '/', files: ['app/layout.tsx', 'app/page.tsx'], keys: [], complete: false });
+  });
+
+  it('F13: a file the walk reads but the key scan cannot walk makes the route incomplete, the other files’ keys kept', async () => {
+    const host = nextSite();
+    write(host.cwd, 'components/Deep.ts', `export const c = x${'.m()'.repeat(20000)};\nexport const named = 'hero_body';\n`);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      "import '@/components/Deep';\nimport { copy } from '@/lib/content';\nexport default function Page() { return <h1>{copy('hero_headline')}</h1>; }\n",
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.keys).toEqual(['footer_links', 'hero_headline']);
+    expect(body.complete).toBe(false);
+  });
+
+  it('D07: a file too deeply nested to search for a lazy import is taken to hold one', async () => {
+    const ts = await loadTypescript();
+    const deep = `export const c = x${'.m()'.repeat(20000)};\n// import('./later')\n`;
+    expect(importsLazily(ts, 'deep.ts', deep)).toBe(true);
+    expect(importsLazily(ts, 'plain.ts', "// import('./later')\nexport const a = 1;\n")).toBe(false);
+  });
+
+  it.each([
+    [
+      'r08: a scoped alias nothing declares',
+      {},
+      "import { Nav } from '@components/Nav';\nexport default function Page() { return <Nav />; }\n",
+    ],
+    [
+      'r07: an alias the tsconfig reaches through extends, which the route walk does not read',
+      {
+        'tsconfig.json': JSON.stringify({ extends: './tsconfig.base.json' }),
+        'tsconfig.base.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@components/*': ['./components/*'] } } }),
+      },
+      "import { Nav } from '@components/Nav';\nexport default function Page() { return <Nav />; }\n",
+    ],
+    ['a bare name that is no package of the project', {}, "import { Nav } from 'ui/Nav';\nexport default function Page() { return <Nav />; }\n"],
+  ])('F14 %s: the route is incomplete', async (_name, extra, page) => {
+    const host = nextSite();
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { paths: {} } }));
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children}</body></html>; }\n');
+    write(host.cwd, 'components/Nav.tsx', "export const Nav = () => <nav>{'footer_links'}</nav>;\n");
+    for (const [rel, text] of Object.entries(extra)) write(host.cwd, rel, text);
+    write(host.cwd, 'app/page.tsx', page);
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.complete).toBe(false);
+  });
+
+  it('F14: a package the project declares, has installed or gets from Node is no boundary', async () => {
+    const host = nextSite();
+    write(
+      host.cwd,
+      'package.json',
+      JSON.stringify({ name: 'site', dependencies: { react: '^19' }, devDependencies: { '@acme/ui': '1' }, peerDependencies: { zod: '3' }, optionalDependencies: { sharp: '1' } }),
+    );
+    write(host.cwd, 'node_modules/left-pad/index.js', 'module.exports = 1;\n');
+    write(host.cwd, 'node_modules/@scope/kit/index.js', 'module.exports = 1;\n');
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children}</body></html>; }\n');
+    write(
+      host.cwd,
+      'app/page.tsx',
+      [
+        "import { useState } from 'react';",
+        "import { Button } from '@acme/ui/button';",
+        "import { z } from 'zod';",
+        "import sharp from 'sharp';",
+        "import pad from 'left-pad';",
+        "import kit from '@scope/kit/deep/path';",
+        "import { readFileSync } from 'node:fs';",
+        "import { join } from 'path';",
+        "export default function Page() { void [useState, Button, z, sharp, pad, kit, readFileSync, join]; return <h1>{'hero_headline'}</h1>; }",
+        '',
+      ].join('\n'),
+    );
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: ['hero_headline'], complete: true });
+  });
+
+  it('PG01: a layout of another route group is not a frame of this route', async () => {
+    const host = nextSite();
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html>{children}</html>; }\n');
+    write(host.cwd, 'app/(marketing)/layout.tsx', "export default function Layout({ children }: { children: unknown }) { return <div>{'footer_links'}{children}</div>; }\n");
+    write(host.cwd, 'app/(shop)/layout.tsx', "export default function Layout({ children }: { children: unknown }) { return <div>{'theme_mode'}{children}</div>; }\n");
+    write(host.cwd, 'app/(marketing)/about/page.tsx', "export default function Page() { return <p>{'hero_headline'}</p>; }\n");
+    write(host.cwd, 'app/(shop)/cart/page.tsx', "export default function Page() { return <p>{'blog_intro'}</p>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host, '/about')).toEqual({
+      route: '/about',
+      files: ['app/(marketing)/about/page.tsx', 'app/(marketing)/layout.tsx', 'app/layout.tsx'],
+      keys: ['footer_links', 'hero_headline'],
+      complete: true,
+    });
+  });
+
+  it('PG02: a template.tsx is a frame of the pages under it', async () => {
+    const host = nextSite();
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html>{children}</html>; }\n');
+    write(host.cwd, 'app/template.tsx', "export default function Template({ children }: { children: unknown }) { return <div>{'footer_links'}{children}</div>; }\n");
+    write(host.cwd, 'app/page.tsx', "export default function Page() { return <p>{'hero_headline'}</p>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ files: ['app/layout.tsx', 'app/page.tsx', 'app/template.tsx'], keys: ['footer_links', 'hero_headline'] });
+  });
+
+  it('PG03: a Pages Router _document.tsx is a frame of every page', async () => {
+    const host = nextSite();
+    rmSync(join(host.cwd, 'app'), { recursive: true });
+    write(host.cwd, 'pages/_document.tsx', "export default function Document() { return <html>{'footer_links'}</html>; }\n");
+    write(host.cwd, 'pages/index.tsx', "export default function Page() { return <p>{'hero_headline'}</p>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ files: ['pages/_document.tsx', 'pages/index.tsx'], keys: ['footer_links', 'hero_headline'] });
+  });
+
+  it('N18: route-reads without a route is a usage error', async () => {
+    const host = nextSite();
+    const { handler } = handlerOver([host.cwd]);
+    const res = await handler(req(`/api/site/route-reads${site(host)}`));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'route is required' });
+  });
+
+  it('a Vite site answers no files', async () => {
+    const host = snapshotHost();
+    write(host.cwd, 'src/main.tsx', "import { copy } from '../lib/content';\ndocument.title = copy('hero_headline');\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+      route: '/',
+      files: [],
+      keys: [],
+      complete: false,
+    });
+  });
+
+  it('the html host answers the document’s marks', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const { handler } = handlerOver([host.cwd]);
+    const marks = await get(handler, `/api/site/marks${site(host)}`);
+    const expected = Object.entries(marks.keys as Record<string, string[]>)
+      .filter(([, files]) => files.includes('index.html'))
+      .map(([key]) => key)
+      .sort();
+    expect(expected.length).toBeGreaterThan(0);
+    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+      route: '/',
+      files: ['index.html'],
+      keys: expected,
+      complete: true,
+    });
   });
 });
