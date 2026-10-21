@@ -597,6 +597,24 @@ describe('the workspace file', () => {
     expect(readWorkspace(file).sites).toEqual([]);
   });
 
+  it('stores a trimmed display name, and an empty one clears it (journey A22)', () => {
+    const file = workspaceFile();
+    const dir = tempDir();
+    addSite(file, dir);
+    const path = readWorkspace(file).sites[0]?.path as string;
+
+    updateSite(file, path, { name: '  Taskboard ' });
+    expect(readWorkspace(file).sites[0]).toEqual({ path, name: 'Taskboard' });
+    // Another field's update leaves the name where it is.
+    updateSite(file, path, { devCommand: 'npm run dev' });
+    expect(readWorkspace(file).sites[0]).toMatchObject({ name: 'Taskboard', devCommand: 'npm run dev' });
+    updateSite(file, path, { name: '' });
+    expect('name' in (readWorkspace(file).sites[0] as object)).toBe(false);
+    updateSite(file, path, { name: 'Again' });
+    updateSite(file, path, { name: '   ' });
+    expect('name' in (readWorkspace(file).sites[0] as object)).toBe(false);
+  });
+
   it('derives a stable twelve-hex id from the path', () => {
     expect(siteId('/abs/one')).toMatch(/^[0-9a-f]{12}$/);
     expect(siteId('/abs/one')).toBe(siteId('/abs/one'));
@@ -645,6 +663,43 @@ describe('loadSite', () => {
     expect(site.git.head).toMatch(/^[0-9a-f]{7,}$/);
     expect(site.project).toBe('t');
     expect(site.router).toBe(loadConfig(host.cwd).router);
+  });
+
+  it('shows an entry’s display name with its folder, and the folder name alone where none is set (journey A22)', () => {
+    const host = gitHost({ config: { project: 't' } });
+    const folder = host.cwd.split('/').pop() as string;
+    const plain = loadSite({ path: host.cwd });
+    expect(plain).toMatchObject({ state: 'ready', name: folder });
+    expect('folder' in plain).toBe(false);
+    const named = loadSite({ path: host.cwd, name: 'Taskboard' });
+    expect(named).toMatchObject({ state: 'ready', name: 'Taskboard', folder });
+
+    const blank = tempDir();
+    expect(loadSite({ path: blank, name: 'Soon' })).toMatchObject({ state: 'not-adopted', name: 'Soon', folder: blank.split('/').pop() });
+    write(blank, 'stet.config.json', JSON.stringify({ project: 't', host: 'static' }));
+    expect(loadSite({ path: blank, name: 'Soon' })).toMatchObject({ state: 'broken', name: 'Soon', folder: blank.split('/').pop() });
+  });
+
+  it('renames through workspace/update, lists the name, and leaves the folder alone (journey A22)', async () => {
+    const host = gitHost({ config: { project: 't' } });
+    const { handler, file } = handlerOver([host.cwd]);
+    const path = readWorkspace(file).sites[0]?.path as string;
+    const listed = async (): Promise<Array<Record<string, unknown>>> =>
+      ((await (await handler(req('/api/workspace'))).json()) as { sites: Array<Record<string, unknown>> }).sites;
+
+    const renamed = await handler(req('/api/workspace/update', { method: 'POST', body: { path, name: ' Taskboard ' } }));
+    expect(renamed.status).toBe(200);
+    expect(((await renamed.json()) as { sites: Array<Record<string, unknown>> }).sites[0]).toMatchObject({ name: 'Taskboard', folder: path.split('/').pop() });
+    expect((await listed())[0]).toMatchObject({ name: 'Taskboard' });
+    const site = (await (await handler(req(`/api/site?site=${encodeURIComponent(path)}`))).json()) as Record<string, unknown>;
+    expect(site).toMatchObject({ name: 'Taskboard', folder: path.split('/').pop() });
+    expect(existsSync(path)).toBe(true);
+
+    await handler(req('/api/workspace/update', { method: 'POST', body: { path, name: '' } }));
+    expect(readWorkspace(file).sites).toEqual([{ path }]);
+    const cleared = (await listed())[0] as Record<string, unknown>;
+    expect(cleared['name']).toBe(path.split('/').pop());
+    expect('folder' in cleared).toBe(false);
   });
 
   it('carries the project id and the router into the workspace listing', async () => {
@@ -1151,7 +1206,7 @@ describe('withEnvFilesHint', () => {
       ),
     ).toBe(
       "store adapter 'pg' is configured but DATABASE_URL is unset — " +
-        "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
+        "stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in",
     );
     const driver =
       "store adapter 'pg' needs the optional peer dependency `pg`, which is not installed — " +
@@ -1516,6 +1571,110 @@ describe('GET /api/site', () => {
     expect((await ask()).environments[0].vars).toEqual([{ name: 'DATABASE_URL', set: true }]);
     // The offline guard is the proof nothing was dialed: a real pg connection
     // would have to open a socket, and this suite refuses one.
+  });
+
+  describe('previewReads, where the preview’s words come from (journey B8)', () => {
+    const STAGING = 'postgres://staging.example/db';
+    const PROD = 'postgres://prod.example/db';
+    /** A store site with a staging and a prod environment, its read path as the caller writes it, and `.env` lines. */
+    function storeSite(read: string, envFile: string): CliHost {
+      const host = snapshotHost();
+      writeFileSync(
+        join(host.cwd, 'stet.config.json'),
+        JSON.stringify(
+          {
+            project: 't',
+            store: { adapter: 'pg', urlEnv: 'DATABASE_URL' },
+            environments: {
+              staging: { adapter: 'pg', urlEnv: 'STAGING_DATABASE_URL' },
+              prod: { adapter: 'pg', urlEnv: 'PROD_DATABASE_URL' },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      writeFileSync(join(host.cwd, 'lib/content.ts'), read);
+      writeFileSync(join(host.cwd, '.env'), envFile);
+      return host;
+    }
+    const ask = async (host: CliHost, over: Partial<Parameters<typeof handlerOver>[1] & object> = {}): Promise<{ text: string; body: any }> => {
+      const { handler } = handlerOver([host.cwd], over);
+      const text = await (await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.cwd))}`))).text();
+      return { text, body: JSON.parse(text) };
+    };
+
+    it('names no source of words for an html host, whose preview is its documents (F3)', async () => {
+      const html = await makeHtmlHost();
+      expect((await ask(html)).body.previewReads).toBeNull();
+    });
+
+    it('reads the stores where the snapshot’s path appears only in comments (D56)', async () => {
+      const read = [
+        "// const READ_FROM = join(process.cwd(), 'content/defaults.json');",
+        '/* the old path: "content/defaults.json"',
+        '   `content/defaults.json` */',
+        'export const live = 1;',
+        '',
+      ].join('\n');
+      const host = storeSite(read, `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\nPROD_DATABASE_URL=${PROD}\n`);
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: true, staging: true, prod: false } });
+    });
+
+    it('names the snapshot for a live literal beside a commented one, and past a URL string holding // (D56)', async () => {
+      const beside = storeSite("// const OLD = 'content/defaults.json';\nconst READ_FROM = join(cwd, 'content/defaults.json');\n", `DATABASE_URL=${STAGING}\n`);
+      expect((await ask(beside)).body.previewReads).toEqual({ snapshot: 'content/defaults.json' });
+      const url = storeSite("const A = 'http://example.test/x', READ_FROM = join(cwd, 'content/defaults.json'); // trailing\n", `DATABASE_URL=${STAGING}\n`);
+      expect((await ask(url)).body.previewReads).toEqual({ snapshot: 'content/defaults.json' });
+    });
+
+    it('names the snapshot where the read path holds its path as a string literal', async () => {
+      for (const quote of ["'", '"', '`']) {
+        const host = storeSite(`import { join } from 'node:path';\nconst READ_FROM = join(process.cwd(), ${quote}content/defaults.json${quote});\n`, `DATABASE_URL=${STAGING}\n`);
+        expect((await ask(host)).body.previewReads).toEqual({ snapshot: 'content/defaults.json' });
+      }
+    });
+
+    it('reads the stores where the read path names another file', async () => {
+      const host = storeSite("const READ_FROM = 'content/other.json';\n", `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\n`);
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: true, staging: true, prod: false } });
+    });
+
+    it('says per environment whether the dev server’s connection variable holds that environment’s value', async () => {
+      const host = storeSite("export const x = 1;\n", `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\nPROD_DATABASE_URL=${PROD}\n`);
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: true, staging: true, prod: false } });
+      // Nothing set: no environment is the dev server's own.
+      writeFileSync(join(host.cwd, '.env'), `STAGING_DATABASE_URL=${STAGING}\n`);
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: false, staging: false, prod: false } });
+      // Two unset variables are not equal values.
+      writeFileSync(join(host.cwd, '.env'), 'DATABASE_URL=\nPROD_DATABASE_URL=\n');
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: false, staging: false, prod: false } });
+    });
+
+    it('reads the shell’s value for the started-in project, as the dev command receives it', async () => {
+      const host = storeSite("export const x = 1;\n", `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\nPROD_DATABASE_URL=${PROD}\n`);
+      const prior = process.env['DATABASE_URL'];
+      process.env['DATABASE_URL'] = PROD;
+      try {
+        const started = await ask(host, { launched: realpathSync(host.cwd) });
+        expect(started.body.previewReads).toEqual({ stores: { default: true, staging: false, prod: true } });
+        expect((await ask(host)).body.previewReads).toEqual({ stores: { default: true, staging: true, prod: false } });
+      } finally {
+        if (prior === undefined) delete process.env['DATABASE_URL'];
+        else process.env['DATABASE_URL'] = prior;
+      }
+    });
+
+    it('never carries a connection value in the reply', async () => {
+      const host = storeSite("export const x = 1;\n", `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\nPROD_DATABASE_URL=${PROD}\n`);
+      const { text, body } = await ask(host);
+      expect(body.previewReads.stores).toEqual({ default: true, staging: true, prod: false });
+      expect(text).not.toContain(STAGING);
+      expect(text).not.toContain(PROD);
+      expect(text).not.toContain('staging.example');
+      const snapshot = storeSite("const R = 'content/defaults.json';\n", `DATABASE_URL=${STAGING}\n`);
+      expect((await ask(snapshot)).text).not.toContain('staging.example');
+    });
   });
 
   it('answers a not-adopted and a broken site with what they are, and no forms', async () => {
@@ -3938,6 +4097,14 @@ describe('GET /api/site/removed and POST /api/site/restore (D12)', () => {
   });
 
   describe('refuses, writing nothing', () => {
+    it('for a hash that is not a commit, saying project', async () => {
+      const host = await restoreHost();
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/restore${at(host)}`, { sha: 'deadbeef' });
+      expect(refused.status).toBe(400);
+      expect(refused.body['error']).toBe('deadbeef is not a commit of this project');
+    });
+
     it('while a stet file is uncommitted', async () => {
       const host = await restoreHost();
       const sha = removeOperating(host);
@@ -4551,7 +4718,7 @@ describe('the mounted API under /s/<id>/api/stet', () => {
       expect(unset.status).toBe(409);
       expect(((await unset.json()) as { error: string }).error).toBe(
         "store adapter 'pg' is configured but DATABASE_URL is unset — " +
-          "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
+          "stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in",
       );
     }),
   );
@@ -4660,7 +4827,7 @@ describe('the mounted API under /s/<id>/api/stet', () => {
     const PAIR = { project: 't', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } };
     const UNSET =
       "store adapter 'postgrest' is configured but STET_POSTGREST_URL is unset — " +
-      "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in";
+      "stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in";
 
     /** Two checkouts declaring the pair; the first's `.env.local` holds an older URL. */
     function twoCheckouts(): { a: CliHost; b: CliHost } {
@@ -6812,7 +6979,7 @@ describe('the page', () => {
     const reload = await paint({ url: '?site=%2Fcheckouts%2Fmini', session });
     expect(reload.requested('/api/site?')[0]).toBe('/api/site?site=%2Fcheckouts%2Fmini');
     expect(painted(reload)).not.toContain('token is from an earlier run');
-    expect(painted(reload)).toContain('project other-site');
+    expect(painted(reload)).toContain('store id other-site');
     expect(reload.errors).toEqual([]);
     reload.dom.window.close();
   });
@@ -6924,7 +7091,7 @@ describe('the page', () => {
   });
 
   // 5.3 — the sidebar
-  it('tells two checkouts named alike apart, and names each ready row’s host and project (journey A19)', async () => {
+  it('tells two projects named alike apart, and names each ready row’s host and store id (journey A19)', async () => {
     const row = (path: string, host: string, router: string, project: string): Record<string, unknown> => ({
       state: 'ready',
       name: path.split('/').pop(),
@@ -6950,9 +7117,9 @@ describe('the page', () => {
       ],
     });
     expect(rows(first)).toEqual([
-      ['stet-website-v1/site', 'js host · astro', 'project default'],
-      ['stet-planning/site', 'js host · astro', 'project default'],
-      ['psyon-site', 'html host', 'project psyon'],
+      ['stet-website-v1/site', 'js host · astro'],
+      ['stet-planning/site', 'js host · astro'],
+      ['psyon-site', 'html host', 'store id psyon'],
     ]);
     first.dom.window.close();
 
@@ -6961,6 +7128,653 @@ describe('the page', () => {
     });
     expect(rows(second).map((r) => r[0])).toEqual(['a/x/site', 'b/x/site', 'y/site']);
     second.dom.window.close();
+  });
+
+  // 10.1 — Rename
+  describe('Rename (journey A22)', () => {
+    const miniRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      state: 'ready', name: 'mini', path: '/checkouts/mini', id: SITE_ID, mode: 'snapshot', keys: 11, host: 'js', router: 'astro', project: 'default', ...over,
+    });
+    const labels = (page: Painted): string[][] =>
+      [...docOf(page).querySelectorAll('#projs .it')].map((button) => [
+        button.childNodes[0]?.textContent ?? '',
+        ...[...button.querySelectorAll('.u')].map((line) => line.textContent ?? ''),
+      ]);
+    const updates = (page: Painted): unknown[] =>
+      page.sent.filter((r) => r.path.startsWith('/api/workspace/update')).map((r) => r.body);
+
+    it('renames a project, shows the name with the folder line under it, and clears it', async () => {
+      const page = await paint();
+      expect(labels(page)[0]).toEqual(['mini', 'snapshot-only · 11 keys', 'js host · astro']);
+      expect(docOf(page).querySelectorAll('#projs [data-act^="renameOpen:"]')).toHaveLength(4);
+
+      await page.act('renameOpen:/checkouts/mini');
+      const field = docOf(page).querySelector('[data-act-input="renameName"]') as HTMLInputElement;
+      expect(field.value).toBe('mini');
+      page.answer('/api/workspace/update', 200, { sites: [miniRow({ name: 'Taskboard', folder: 'mini' })] });
+      await page.type('renameName', 'Taskboard');
+      await page.act('renameSave');
+      expect(updates(page)).toEqual([{ path: '/checkouts/mini', name: 'Taskboard' }]);
+      expect(labels(page)[0]).toEqual(['Taskboard', 'mini', 'snapshot-only · 11 keys', 'js host · astro']);
+      expect(docOf(page).getElementById('crumb')?.textContent).toContain('Taskboard');
+      expect(docOf(page).querySelector('[data-act-input="renameName"]')).toBeNull();
+
+      await page.act('renameOpen:/checkouts/mini');
+      expect((docOf(page).querySelector('[data-act-input="renameName"]') as HTMLInputElement).value).toBe('Taskboard');
+      page.answer('/api/workspace/update', 200, { sites: [miniRow()] });
+      await page.type('renameName', '');
+      await page.act('renameSave');
+      expect(updates(page).at(-1)).toEqual({ path: '/checkouts/mini', name: '' });
+      expect(labels(page)[0]).toEqual(['mini', 'snapshot-only · 11 keys', 'js host · astro']);
+      expect(docOf(page).getElementById('crumb')?.textContent).toContain('mini');
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('keeps a name the server refused open with its line, and ends on Escape with nothing sent', async () => {
+      const page = await paint();
+      await page.act('renameOpen:/checkouts/mini');
+      page.answer('/api/workspace/update', 409, { error: 'no such project' });
+      await page.type('renameName', 'Taskboard');
+      await page.act('renameSave');
+      expect(page.toast()).toBe('no such project');
+      expect(docOf(page).querySelector('[data-act-input="renameName"]')).not.toBeNull();
+      const field = docOf(page).querySelector('[data-act-input="renameName"]') as HTMLInputElement;
+      field.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await page.settle();
+      expect(docOf(page).querySelector('[data-act-input="renameName"]')).toBeNull();
+      expect(updates(page)).toHaveLength(1);
+      page.dom.window.close();
+    });
+
+    it('saves on Enter in the field', async () => {
+      const page = await paint();
+      await page.act('renameOpen:/checkouts/mini');
+      page.answer('/api/workspace/update', 200, { sites: [miniRow({ name: 'Taskboard', folder: 'mini' })] });
+      await page.type('renameName', 'Taskboard');
+      const field = docOf(page).querySelector('[data-act-input="renameName"]') as HTMLInputElement;
+      field.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await page.settle();
+      expect(updates(page)).toEqual([{ path: '/checkouts/mini', name: 'Taskboard' }]);
+      page.dom.window.close();
+    });
+
+    it('tells two unnamed twins apart by folder, and never extends a name', async () => {
+      const page = await paint({
+        sites: [
+          miniRow({ path: '/a/x/site', name: 'site' }),
+          miniRow({ path: '/b/x/site', name: 'Taskboard', folder: 'site' }),
+          miniRow({ path: '/c/y/site', name: 'site' }),
+          // A name that spells another row's folder is still the name, never extended.
+          miniRow({ path: '/d/q/proj', name: 'site', folder: 'proj' }),
+        ],
+      });
+      expect(labels(page).map((row) => row[0])).toEqual(['a/x/site', 'Taskboard', 'y/site', 'site']);
+      page.dom.window.close();
+    });
+  });
+
+  // 10.2 — "project" for a workspace entry
+  describe('the word project (journey A19)', () => {
+    // The fixture's own path is /checkouts/mini: only the page's words are read.
+    const noCheckout = (text: string): void => expect(text.replace(/\/checkouts\//g, '/').replace(/\s+/g, ' ')).not.toMatch(/checkout/i);
+
+    it('heads the sidebar Projects and asks for a project path', async () => {
+      const page = await paint({ sites: [] });
+      const doc = docOf(page);
+      expect(doc.querySelector('.side .lbl')?.textContent).toBe('Projects');
+      expect(doc.getElementById('addpath')?.getAttribute('placeholder')).toBe('/absolute/path/to/project');
+      expect(doc.querySelector('[data-act="addSite"]')?.textContent).toBe('Add a project');
+      expect(doc.getElementById('pjnote')?.textContent).toBe('no projects yet — add one below');
+      expect(doc.getElementById('work')?.textContent ?? '').toContain('Add a project to begin. The path must be absolute and hold a stet project.');
+      noCheckout(doc.querySelector('.side')?.textContent ?? '');
+      noCheckout(doc.getElementById('main')?.textContent ?? '');
+      page.dom.window.close();
+    });
+
+    it('says project on the Health tab with no project and after a run with no head', async () => {
+      const empty = await paint({ sites: [] });
+      await empty.act('tab:Health');
+      expect(docOf(empty).getElementById('main')?.textContent).toContain('Add a project to run Health against it.');
+      noCheckout(docOf(empty).getElementById('main')?.textContent ?? '');
+      empty.dom.window.close();
+
+      const page = await paint();
+      await page.act('tab:Health');
+      page.answer('/api/site/health', 200, {
+        at: { head: null, branch: null, dirty: false },
+        doctor: { code: 0, out: [], err: [] }, check: [], unseeded: [], drift: [], scan: { findings: [] }, audit: { orphans: [], unseeded: [], drift: [], findings: [] },
+      });
+      await page.act('health');
+      expect(page.toast()).toBe('Health ran against this project');
+      page.dom.window.close();
+    });
+
+    it('offers Remove this project in Setup, and says the static pane is served from the project', async () => {
+      const page = await paint();
+      await page.act('tab:Setup');
+      expect(docOf(page).querySelector('[data-act="removeSite"]')?.textContent).toBe('Remove this project');
+      noCheckout(docOf(page).getElementById('main')?.textContent ?? '');
+      page.dom.window.close();
+
+      const stat = await paint({
+        site: siteBody({ host: 'html' }),
+        preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+      });
+      expect(docOf(stat).getElementById('pane')?.textContent).toContain('Served read-only from the project by this server.');
+      noCheckout(docOf(stat).getElementById('pane')?.textContent ?? '');
+      stat.dom.window.close();
+    });
+  });
+
+  // 10.3 — the environment line
+  describe('the environment line (journey B8)', () => {
+    const UP = { url: 'http://localhost:4321/', up: true, start: 'npx astro dev', source: 'astro' };
+    const line = (page: Painted): string => {
+      const el = docOf(page).getElementById('paneenv') as HTMLElement | null;
+      return el === null || el.hidden ? '' : el.textContent ?? '';
+    };
+    const store = (previewReads: unknown, over: Record<string, unknown> = {}): Record<string, unknown> =>
+      siteBody({ mode: 'memory', previewReads, ...over });
+    const SNAPSHOT_LINE = 'The preview shows content/defaults.json as this project holds it. Store drafts and publishes appear only as the dashboard layers them.';
+
+    it('says the preview shows the snapshot where the read path reads it, in any environment', async () => {
+      const page = await paint({ site: store({ snapshot: 'content/defaults.json' }), preview: UP });
+      expect(line(page)).toBe(SNAPSHOT_LINE);
+      await page.act('cycleEnv');
+      expect(docOf(page).querySelector('.envchip')?.textContent).toContain('staging');
+      expect(line(page)).toBe(SNAPSHOT_LINE);
+      page.dom.window.close();
+    });
+
+    it('says the preview reads the selected environment’s store where the dev server’s own holds it', async () => {
+      const page = await paint({ site: store({ stores: { default: true, staging: true } }), preview: UP });
+      await page.act('cycleEnv');
+      expect(line(page)).toBe('The preview reads the staging store, the one this tab edits.');
+      page.dom.window.close();
+    });
+
+    it('says the preview reads the dev server’s own store where it does not, and follows the environment switch', async () => {
+      const page = await paint({ site: store({ stores: { default: true, staging: false } }), preview: UP });
+      expect(line(page)).toBe('The preview reads the default store, the one this tab edits.');
+      await page.act('cycleEnv');
+      expect(line(page)).toBe("The preview reads the dev server's own store, not staging.");
+      await page.act('cycleEnv');
+      expect(line(page)).toBe('The preview reads the default store, the one this tab edits.');
+      page.dom.window.close();
+    });
+
+    it('shows no line on a snapshot site, with no dev-server pane, or on a reply that names none', async () => {
+      const snap = await paint({ site: siteBody({ previewReads: { snapshot: 'content/defaults.json' } }), preview: UP });
+      expect(line(snap)).toBe('');
+      snap.dom.window.close();
+      const stat = await paint({
+        site: store({ snapshot: 'content/defaults.json' }, { host: 'html' }),
+        preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+      });
+      expect(line(stat)).toBe('');
+      stat.dom.window.close();
+      const down = await paint({ site: store({ snapshot: 'content/defaults.json' }), preview: { ...UP, up: false } });
+      expect(line(down)).toBe('');
+      down.dom.window.close();
+      const none = await paint({ site: store(undefined), preview: UP });
+      expect(line(none)).toBe('');
+      none.dom.window.close();
+    });
+
+    it('reads an environment the reply does not list as the dev server’s own store', async () => {
+      const page = await paint({ site: store({ stores: {} }), preview: UP });
+      expect(line(page)).toBe("The preview reads the dev server's own store, not default.");
+      page.dom.window.close();
+    });
+  });
+
+  // 10.4 — the unsaved list, Undo, Show, Discard all, the project-switch ask and beforeunload
+  describe('unsaved edits (journey B23)', () => {
+    const run = (page: Painted, code: string): unknown => (page.dom.window as unknown as { eval: (code: string) => unknown }).eval(code);
+    const header = (page: Painted): string => {
+      const el = docOf(page).getElementById('dc') as HTMLElement;
+      return el.hidden ? '' : el.textContent ?? '';
+    };
+    const rows = (page: Painted): string[] =>
+      [...docOf(page).querySelectorAll('#ask [data-act^="undoEdit:"], #ask [data-act^="undoTmpl:"]')].map((el) => (el.getAttribute('data-act') ?? '').split(':')[1] ?? '');
+    const ask = (page: Painted): string => (docOf(page).getElementById('ask') as HTMLElement).textContent ?? '';
+    /** Three unsaved edits: one typed in the field, two set as the preview's edits arrive. */
+    async function three(over: Parameters<typeof paint>[0] = {}): Promise<Painted> {
+      const page = await paint(over);
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'Changed headline');
+      run(page, 'setDraft("seo_home_title", "Changed title"); setDraft("loose_key", "Changed loose"); render();');
+      await page.settle();
+      return page;
+    }
+    const stored = (page: Painted, id: string): unknown => run(page, `storedValue(${JSON.stringify(id)}, S.locale)`);
+
+    it('opens a list of the edited keys from the header count, each with Undo and Show, and Discard all', async () => {
+      const page = await three();
+      expect(header(page)).toBe('3 unsaved edits');
+      expect(docOf(page).querySelector('button#dc')).not.toBeNull();
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      await page.act('unsaved');
+      expect(rows(page)).toEqual(['default hero_headline', 'default seo_home_title', 'default loose_key']);
+      expect(docOf(page).querySelectorAll('#ask [data-act^="showEdit:"]')).toHaveLength(3);
+      expect(docOf(page).querySelector('#ask [data-act="discardAll"]')?.textContent).toBe('Discard all');
+      expect(docOf(page).querySelector('#ask [data-act="undoEdit:default loose_key"]')?.textContent).toBe('Undo');
+      expect(docOf(page).querySelector('#ask [data-act="showEdit:default loose_key"]')?.textContent).toBe('Show');
+      await page.act('unsaved');
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('undoes one of three: the key returns to its stored value, with no base left, and the header reads 2 unsaved edits', async () => {
+      const page = await three();
+      await page.act('unsaved');
+      expect(run(page, 'JSON.stringify(Object.keys(S.base))')).toBe('["default hero_headline","default seo_home_title","default loose_key"]');
+      await page.act('undoEdit:default loose_key');
+      expect(header(page)).toBe('2 unsaved edits');
+      expect(rows(page)).toEqual(['default hero_headline', 'default seo_home_title']);
+      expect(run(page, 'valueOf("loose_key")')).toBe(stored(page, 'loose_key'));
+      expect(run(page, 'JSON.stringify(Object.keys(S.base))')).toBe('["default hero_headline","default seo_home_title"]');
+      expect(run(page, 'JSON.stringify(Object.keys(S.draft))')).toBe('["default hero_headline","default seo_home_title"]');
+      page.dom.window.close();
+    });
+
+    it('undoes the key being typed in the field, and the field shows the stored value', async () => {
+      const page = await three();
+      await page.act('unsaved');
+      await page.act('undoEdit:default hero_headline');
+      expect((docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('Ship the copy');
+      expect(header(page)).toBe('2 unsaved edits');
+      page.dom.window.close();
+    });
+
+    it('ends an open edit of the key before undoing it, so the page’s typed words do not come back', async () => {
+      const page = await three();
+      run(page, 'S.edit = { key: "loose_key", locale: "default", entry: undefined, form: "inplace", before: undefined, rect: null };');
+      await page.act('unsaved');
+      await page.act('undoEdit:default loose_key');
+      expect(run(page, 'S.edit')).toBeNull();
+      expect(run(page, 'valueOf("loose_key")')).toBe(stored(page, 'loose_key'));
+      page.dom.window.close();
+    });
+
+    it('undoes a derived key’s template edit with its own button', async () => {
+      const page = await paint();
+      run(page, 'tmplEdit("welcome__subject", { before: "Hi " }); render();');
+      await page.settle();
+      expect(header(page)).toBe('1 unsaved edit');
+      await page.act('unsaved');
+      expect(rows(page)).toEqual(['welcome__subject']);
+      await page.act('undoTmpl:welcome__subject');
+      expect(header(page)).toBe('');
+      expect(run(page, 'Object.keys(S.tmpl).length')).toBe(0);
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('shows an edited key: selects it, on its group, in its locale', async () => {
+      const page = await three();
+      run(page, 'setDraftIn("de", "hero_headline", "Geaendert"); render();');
+      await page.settle();
+      await page.act('unsaved');
+      await page.act('showEdit:default loose_key');
+      expect(run(page, 'S.sel')).toBe('loose_key');
+      expect(run(page, 'S.group')).toBe('prefix:loose');
+      expect(docOf(page).querySelector('.row.on')?.getAttribute('data-act')).toBe('key:loose_key');
+      await page.act('showEdit:de hero_headline');
+      expect(run(page, 'S.locale')).toBe('de');
+      expect(run(page, 'S.sel')).toBe('hero_headline');
+      page.dom.window.close();
+    });
+
+    it('discards every unsaved edit of the selected environment, and none of another environment’s', async () => {
+      const page = await three({ site: siteBody({ mode: 'memory' }) });
+      expect(run(page, 'S.env')).toBe('default');
+      await page.act('cycleEnv');
+      expect(run(page, 'S.env')).toBe('staging');
+      expect(header(page)).toBe('');
+      run(page, 'setDraft("hero_headline", "Staging words"); render();');
+      await page.settle();
+      expect(header(page)).toBe('1 unsaved edit');
+      await page.act('unsaved');
+      await page.act('discardAll');
+      expect(header(page)).toBe('');
+      expect(run(page, 'Object.keys(S.draft).length + Object.keys(S.base).length')).toBe(0);
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      // Back in the first environment its three edits are where they were left.
+      await page.act('cycleEnv');
+      expect(run(page, 'S.env')).toBe('default');
+      expect(header(page)).toBe('3 unsaved edits');
+      await page.act('unsaved');
+      await page.act('discardAll');
+      expect(header(page)).toBe('');
+      expect(run(page, 'JSON.stringify(Object.keys(S.stashed).map((k) => Object.keys(S.stashed[k].draft).length))')).toBe('[0,0]');
+      page.dom.window.close();
+    });
+
+    it('asks before a project switch with unsaved edits; Cancel keeps the project and its edits', async () => {
+      const page = await three();
+      const before = page.requested('/api/site?').length;
+      await page.act('site:/checkouts/other');
+      expect(ask(page)).toContain('3 unsaved edits will be lost. Leave anyway?');
+      expect(docOf(page).querySelector('#ask [data-act="leaveGo"]')?.textContent).toBe('Leave');
+      expect(docOf(page).querySelector('#ask [data-act="leaveStay"]')?.textContent).toBe('Cancel');
+      expect(page.requested('/api/site?')).toHaveLength(before);
+      await page.act('leaveStay');
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      expect(header(page)).toBe('3 unsaved edits');
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      expect(page.requested('/api/site?')).toHaveLength(before);
+      page.dom.window.close();
+    });
+
+    it('leaves on Leave, losing the edits, and counts the other environments’ edits too', async () => {
+      const page = await three({ site: siteBody({ mode: 'memory' }) });
+      await page.act('cycleEnv');
+      run(page, 'setDraft("hero_headline", "Staging words"); render();');
+      await page.settle();
+      await page.act('site:/checkouts/other');
+      expect(ask(page)).toContain('4 unsaved edits will be lost. Leave anyway?');
+      await page.act('leaveGo');
+      expect(run(page, 'S.path')).toBe('/checkouts/other');
+      expect(page.requested('/api/site?')).toContain('/api/site?site=%2Fcheckouts%2Fother');
+      expect(header(page)).toBe('');
+      expect(run(page, 'Object.keys(S.stashed).length')).toBe(0);
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('switches at once with nothing unsaved', async () => {
+      const page = await paint();
+      await page.act('site:/checkouts/other');
+      expect(run(page, 'S.path')).toBe('/checkouts/other');
+      expect(ask(page)).not.toContain('will be lost');
+      page.dom.window.close();
+    });
+
+    /** One edit typed in the field, then the Setup tab, where Remove this project lives. */
+    async function oneThenSetup(): Promise<Painted> {
+      const page = await paint({ site: siteBody({ mode: 'memory' }) });
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'Changed headline');
+      await page.act('tab:Setup');
+      return page;
+    }
+
+    it('asks before Remove this project with unsaved edits, and removes nothing until Leave (D53)', async () => {
+      const page = await oneThenSetup();
+      await page.act('removeSite');
+      expect(ask(page)).toContain('1 unsaved edit will be lost. Leave anyway?');
+      expect(page.requested('/api/workspace/remove')).toEqual([]);
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      await page.act('leaveGo');
+      expect(page.requested('/api/workspace/remove')).toHaveLength(1);
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('keeps the project and its edit when Cancel answers the Remove ask (D53)', async () => {
+      const page = await oneThenSetup();
+      await page.act('removeSite');
+      await page.act('leaveStay');
+      expect(page.requested('/api/workspace/remove')).toEqual([]);
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      expect(header(page)).toBe('1 unsaved edit');
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('asks before Remove this project when only another environment holds the edit (D53)', async () => {
+      const page = await oneThenSetup();
+      await page.act('tab:Content');
+      await page.act('cycleEnv');
+      expect(header(page)).toBe('');
+      await page.act('tab:Setup');
+      await page.act('removeSite');
+      expect(ask(page)).toContain('1 unsaved edit will be lost. Leave anyway?');
+      expect(page.requested('/api/workspace/remove')).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('removes at once with nothing unsaved', async () => {
+      const page = await paint();
+      await page.act('tab:Setup');
+      await page.act('removeSite');
+      expect(ask(page)).not.toContain('will be lost');
+      expect(page.requested('/api/workspace/remove')).toHaveLength(1);
+      page.dom.window.close();
+    });
+
+    it('asks before a project switch when only another environment holds the edit (F3)', async () => {
+      const page = await three({ site: siteBody({ mode: 'memory' }) });
+      await page.act('cycleEnv');
+      expect(run(page, 'S.env')).toBe('staging');
+      expect(header(page)).toBe('');
+      await page.act('site:/checkouts/other');
+      expect(ask(page)).toContain('3 unsaved edits will be lost. Leave anyway?');
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      page.dom.window.close();
+    });
+
+    it('asks before Add a project switches away from unsaved edits; Cancel keeps the project and the edit (F3)', async () => {
+      const page = await three();
+      page.answer('/api/workspace/add', 200, { added: true, path: '/checkouts/other', sites: page.workspace.sites });
+      (docOf(page).getElementById('addpath') as HTMLInputElement).value = '/checkouts/other';
+      const before = page.requested('/api/site?').length;
+      await page.act('addSite');
+      expect(page.requested('/api/workspace/add')).toHaveLength(1);
+      expect(ask(page)).toContain('3 unsaved edits will be lost. Leave anyway?');
+      expect(page.requested('/api/site?')).toHaveLength(before);
+      await page.act('leaveStay');
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      expect(header(page)).toBe('3 unsaved edits');
+      page.dom.window.close();
+    });
+
+    it('raises the browser’s own prompt on a reload or a tab close while edits exist, in any environment', async () => {
+      const page = await paint();
+      const press = (): boolean => {
+        const event = new page.dom.window.Event('beforeunload', { cancelable: true });
+        page.dom.window.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      expect(press()).toBe(false);
+      run(page, 'setDraft("loose_key", "Changed loose"); render();');
+      await page.settle();
+      expect(press()).toBe(true);
+      run(page, 'switchEnv("staging");');
+      await page.settle();
+      expect(header(page)).toBe('');
+      expect(press()).toBe(true);
+      run(page, 'switchEnv("default"); undoEdit("default", "loose_key");');
+      await page.settle();
+      expect(press()).toBe(false);
+      page.dom.window.close();
+    });
+  });
+
+  // 10.5 — 360 px. jsdom has no layout: it proves the structure and the rules the browser run reads, and the pick behaviour at 360.
+  describe('editing at 360 px (journey B19)', () => {
+    const phone = (window: Painted['dom']['window']): void => {
+      Object.defineProperty(window, 'innerWidth', { value: 360, configurable: true });
+    };
+    const rules = (page: Painted): string =>
+      [...docOf(page).querySelectorAll('style')].map((el) => el.textContent ?? '').join('\n').replace(/\s+/g, ' ');
+    /** The declarations of every rule inside an `@media(max-width:760px)` block that names `selector`. */
+    const phoneRule = (css: string, selector: string): string[] => {
+      const out: string[] = [];
+      const opener = '@media(max-width:760px){';
+      for (let at = css.indexOf(opener); at !== -1; at = css.indexOf(opener, at + 1)) {
+        let depth = 1;
+        let end = at + opener.length;
+        for (; end < css.length && depth > 0; end += 1) depth += css[end] === '{' ? 1 : css[end] === '}' ? -1 : 0;
+        for (const rule of css.slice(at + opener.length, end - 1).matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+          if ((rule[1] ?? '').split(',').map((part) => part.trim()).includes(selector)) out.push((rule[2] ?? '').trim());
+        }
+      }
+      return out;
+    };
+
+    it('puts the selected key’s editor in the column directly under the preview, the key list after it', async () => {
+      const page = await paint({ prepare: phone });
+      await page.act('key:hero_headline');
+      const main = docOf(page).getElementById('main') as HTMLElement;
+      expect([...main.children].map((el) => el.className.split(' ')[0])).toEqual(['card', 'edcol']);
+      expect(docOf(page).querySelector('#main > .edcol > .card.edcard')).not.toBeNull();
+      const css = rules(page);
+      expect(phoneRule(css, '#main').join(';')).toMatch(/display:flex/);
+      expect(phoneRule(css, '#main').join(';')).toMatch(/flex-direction:column/);
+      expect(phoneRule(css, '.edcol').join(';')).toMatch(/order:-1/);
+      expect(phoneRule(css, '.edcard').join(';')).toMatch(/order:-1/);
+      page.dom.window.close();
+    });
+
+    it('focuses the field on a second tap, with no in-place edit and no popover', async () => {
+      const page = await paint({ prepare: phone });
+      page.dom.window.eval('onPick({ keys: [{ key: "hero_headline", attr: null, by: "whole", inplace: true }], again: true, rect: { left: 1, top: 1, width: 10, height: 10 } })');
+      await page.settle();
+      expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:hero_headline');
+      expect(page.dom.window.eval('S.edit')).toBeNull();
+      expect(page.dom.window.eval('S.popover')).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('breaks a long project name inside its row, so no name widens the page (F2)', async () => {
+      const page = await paint({ prepare: phone });
+      expect(rules(page)).toMatch(/\.prow>\.it\{[^}]*overflow-wrap:anywhere/);
+      page.dom.window.close();
+    });
+
+    it('caps the preview frame so a short phone screen shows the frame and the selected field together (D55)', async () => {
+      const page = await paint({ prepare: phone });
+      const wrap = phoneRule(rules(page), '.devwrap').join(';');
+      expect(wrap).toMatch(/height:min\(\d+px,calc\(100vh - \d+px\)\)/);
+      expect(wrap).toMatch(/min-height:0/);
+      page.dom.window.close();
+    });
+
+    it('leaves the frame’s height to the stylesheet under 760 px and sets it from the window above (D55)', async () => {
+      const page = await paint({ prepare: phone, site: siteBody({ host: 'html' }), preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true } });
+      const box = docOf(page).getElementById('devwrap') as HTMLElement;
+      Object.defineProperty(box, 'clientWidth', { value: 300, configurable: true });
+      box.style.height = '500px';
+      page.dom.window.eval('fitFrame()');
+      expect(box.style.height).toBe('');
+      Object.defineProperty(page.dom.window, 'innerWidth', { value: 1200, configurable: true });
+      page.dom.window.eval('fitFrame()');
+      expect(box.style.height).toMatch(/^\d+px$/);
+      page.dom.window.close();
+    });
+
+    it('lets every card of the column shrink to the viewport', async () => {
+      const page = await paint({ prepare: phone });
+      const css = rules(page);
+      expect(phoneRule(css, '#main>*').join(';')).toMatch(/min-width:0/);
+      expect(phoneRule(css, '.edcol>*').join(';')).toMatch(/min-width:0/);
+      page.dom.window.close();
+    });
+
+    it('selects on a tap and brings the field into view without opening the popover', async () => {
+      const page = await paint({ prepare: phone });
+      const scrolled: string[] = [];
+      (page.dom.window as unknown as { HTMLElement: { prototype: { scrollIntoView: unknown } } }).HTMLElement.prototype.scrollIntoView = function (this: HTMLElement, arg: unknown): void {
+        scrolled.push((this.getAttribute('data-act-input') ?? '') + ' ' + JSON.stringify(arg));
+      };
+      page.dom.window.eval('selectFromFrame("hero_headline", undefined)');
+      await page.settle();
+      expect(scrolled).toContain('text:hero_headline {"block":"nearest"}');
+      expect(page.dom.window.eval('S.popover')).toBeNull();
+      page.dom.window.close();
+    });
+  });
+
+  // 10.6 — shortcuts
+  describe('shortcuts (journey B23)', () => {
+    const key = (page: Painted, target: EventTarget, init: KeyboardEventInit & { key: string }): void => {
+      target.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init }));
+    };
+    const mode = (page: Painted): unknown => page.dom.window.eval('S.mode');
+
+    it('toggles Edit and Use on E outside a field, in either case', async () => {
+      const page = await paint();
+      expect(mode(page)).toBe('edit');
+      key(page, docOf(page).body, { key: 'e' });
+      expect(mode(page)).toBe('use');
+      expect(docOf(page).querySelector('[data-act="mode:use"]')?.className).toBe('on');
+      key(page, docOf(page).body, { key: 'E' });
+      expect(mode(page)).toBe('edit');
+      page.dom.window.close();
+    });
+
+    it('leaves E to the field when focus is in one: an input, a textarea, a select or an editable element', async () => {
+      const page = await paint();
+      await page.act('key:hero_headline');
+      const field = docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement;
+      key(page, field, { key: 'e' });
+      expect(mode(page)).toBe('edit');
+      key(page, docOf(page).getElementById('addpath') as HTMLElement, { key: 'e' });
+      key(page, docOf(page).getElementById('route') as HTMLElement, { key: 'e' });
+      const select = docOf(page).querySelector('[data-act-change]') as HTMLElement;
+      key(page, select, { key: 'e' });
+      const editable = docOf(page).createElement('div');
+      editable.setAttribute('contenteditable', 'true');
+      docOf(page).body.appendChild(editable);
+      key(page, editable, { key: 'e' });
+      expect(mode(page)).toBe('edit');
+      page.dom.window.close();
+    });
+
+    it('ignores E with a modifier, off the Content tab, and while composing', async () => {
+      const page = await paint();
+      for (const init of [{ metaKey: true }, { ctrlKey: true }, { altKey: true }]) key(page, docOf(page).body, { key: 'e', ...init });
+      key(page, docOf(page).body, { key: 'e', isComposing: true });
+      expect(mode(page)).toBe('edit');
+      await page.act('tab:Health');
+      key(page, docOf(page).body, { key: 'e' });
+      expect(mode(page)).toBe('edit');
+      page.dom.window.close();
+    });
+
+    it('leaves a key an element already answered', async () => {
+      const page = await paint();
+      docOf(page).body.addEventListener('keydown', (event) => event.preventDefault());
+      key(page, docOf(page).body, { key: 'e' });
+      expect(mode(page)).toBe('edit');
+      page.dom.window.close();
+    });
+
+    it('posts the new mode to the preview', async () => {
+      const page = await paint({ preview: { url: 'http://localhost:4321/', up: true, start: 'npx astro dev', source: 'astro' } });
+      const frame = docOf(page).querySelector('#devwrap iframe') as HTMLIFrameElement;
+      const posts: unknown[] = [];
+      (frame.contentWindow as unknown as { postMessage: unknown }).postMessage = (message: unknown): void => { posts.push(message); };
+      page.dom.window.eval('agentReady = true');
+      key(page, docOf(page).body, { key: 'e' });
+      expect(posts).toContainEqual({ stet: 'mode', mode: 'use' });
+      page.dom.window.close();
+    });
+
+    it('ends the selection on Escape outside a field, and not inside one', async () => {
+      const page = await paint();
+      await page.act('key:hero_headline');
+      const field = docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement;
+      key(page, field, { key: 'Escape' });
+      expect(page.dom.window.eval('S.sel')).toBe('hero_headline');
+      key(page, docOf(page).body, { key: 'Escape' });
+      expect(page.dom.window.eval('S.sel')).toBeNull();
+      expect(docOf(page).querySelector('.row.on')).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('does not take an Escape the open field over the frame is answering', async () => {
+      const page = await paint();
+      await page.act('key:hero_headline');
+      page.dom.window.eval('openPopover("hero_headline", "default", undefined, { left: 1, top: 1, width: 10, height: 10 })');
+      expect(page.dom.window.eval('S.popover !== null')).toBe(true);
+      key(page, docOf(page).body, { key: 'Escape' });
+      expect(page.dom.window.eval('S.sel')).toBe('hero_headline');
+      page.dom.window.close();
+    });
   });
 
   // 5.4 — the layout and the widths
@@ -8105,6 +8919,22 @@ describe('the page', () => {
         page.dom.window.close();
       });
 
+      it('Discard all ends an open edit, so its end does not bring the discarded key back (F3)', async () => {
+        const { page, agent } = await bridged();
+        await page.act('key:hero_headline');
+        await page.type('text:hero_headline', 'First words');
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Second words');
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Second words' });
+        await page.act('unsaved');
+        await page.act('discardAll');
+        expect(stateOf(page).draft).toEqual({});
+        await agent.edited('hero_headline', 'cancel');
+        expect(stateOf(page).draft).toEqual({});
+        expect(stateOf(page).base).toEqual({});
+        page.dom.window.close();
+      });
+
       it('keeps no draft and no base for a value typed back to the stored one (7.1)', async () => {
         const { page, agent } = await bridged();
         await agent.pick([{ key: 'hero_headline' }], { again: true });
@@ -8873,6 +9703,9 @@ describe('the page', () => {
           await page.type('text:hero_headline', 'Before the switch');
           expect(Object.keys(stateOf(page).base ?? {})).toEqual(['default hero_headline']);
           await page.act('site:/checkouts/other');
+          // The switch asks first, and the edit is lost only on Leave.
+          expect(Object.keys(stateOf(page).draft)).toEqual(['default hero_headline']);
+          await page.act('leaveGo');
           expect(stateOf(page).draft).toEqual({});
           expect(stateOf(page).base).toEqual({});
           page.dom.window.close();
@@ -10924,13 +11757,13 @@ describe('the page', () => {
     it('reads Not run yet by host, and Run fills the card (journey C13)', async () => {
       const held = { reply: { state: 'none', elapsed: 0, lines: [], result: null } as unknown };
       const html = await card(htmlSite(), held);
-      expect(body(html)).toContain("Not run yet. Runs against the checkout's documents.");
+      expect(body(html)).toContain("Not run yet. Runs against the project's documents.");
       expect(docOf(html).querySelector('[data-act="auditRun"]')?.textContent).toBe('Run');
       held.reply = done(resultOf([indexPage()]));
       await html.act('auditRun');
       expect(lastStart(html)).toEqual({});
       const text = docOf(html).querySelector('.card')?.textContent ?? '';
-      expect(text).toContain("lighthouse 13.5.0 · mobile · the checkout's documents · 1 page · 4 s");
+      expect(text).toContain("lighthouse 13.5.0 · mobile · the project's documents · 1 page · 4 s");
       expect(text).toContain('index.html');
       const tiles = [...docOf(html).querySelectorAll('.lht > div')].map((tile) => [tile.querySelector('.lb')?.textContent, tile.querySelector('.bdg')?.textContent, tile.querySelector('.bdg')?.className]);
       expect(tiles).toEqual([

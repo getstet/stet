@@ -8137,7 +8137,7 @@ describe('dashboard', () => {
       expect(refused.status).toBe(409);
       expect(refused.body['error']).toBe(
         "store adapter 'postgrest' is configured but STET_POSTGREST_URL is unset — " +
-          "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
+          "stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in",
       );
 
       // The dev command of each site: the started-in one holds the token, the other does not.

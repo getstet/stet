@@ -55,7 +55,7 @@ import {
 } from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
-import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
+import { closing, dialectCode, KEY_READ, nonCodeOf, openTag, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
 import { isGenerated, keyUsage, namedKeys, ownFiles, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
@@ -207,7 +207,7 @@ function crossOrigin(req: Request, origin: string): boolean {
 export function withEnvFilesHint(message: string): string {
   const clause = ' is unset — set it or remove the store block';
   return message.endsWith(clause)
-    ? `${message.slice(0, -clause.length)} is unset — stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in`
+    ? `${message.slice(0, -clause.length)} is unset — stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in`
     : message;
 }
 
@@ -404,6 +404,7 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
   if (route === 'workspace/update' && req.method === 'POST') {
     const body = await readJson(req);
     updateSite(ctx.workspaceFile, reqStr(body, 'path'), {
+      ...(typeof body['name'] === 'string' ? { name: body['name'] } : {}),
       ...(typeof body['dev'] === 'string' ? { dev: body['dev'] } : {}),
       ...(typeof body['devCommand'] === 'string' ? { devCommand: body['devCommand'] } : {}),
       ...(typeof body['devStopCommand'] === 'string' ? { devStopCommand: body['devStopCommand'] } : {}),
@@ -433,7 +434,7 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
   return withSite(ctx, url, async (site, entry) => {
     switch (`${req.method} ${route}`) {
       case 'GET site':
-        return siteReply(site, entry, ctx.launched);
+        return await siteReply(site, entry, ctx.launched);
       case 'POST site/save':
         return await save(ctx, req, site);
       case 'POST site/commit':
@@ -513,7 +514,7 @@ function requireReady(site: SiteState): Extract<SiteState, { state: 'ready' }> {
  * DIALING: a listing that opened a connection per environment would hang on
  * the first unreachable one, and `doctor` is where a live check belongs.
  */
-function siteReply(site: SiteState, entry: WorkspaceEntry, launched: string | undefined): Response {
+async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: string | undefined): Promise<Response> {
   if (site.state !== 'ready') return json(summary(site));
   const { config } = site;
   const env = connectionEnv(site, launched);
@@ -548,11 +549,61 @@ function siteReply(site: SiteState, entry: WorkspaceEntry, launched: string | un
       store: { adapter: config.store?.adapter ?? 'snapshot' },
     },
     environments,
+    previewReads: await previewReads(site, env),
     dev: devDefaults(config, entry),
     previewDefault: routerPreviewCommand(config),
     entry,
     pending: pendingForms(site),
     git: { ...site.git, live: liveOf(site.path, site.git.branch) },
+  });
+}
+
+/**
+ * Where a JavaScript host's preview reads its words (D11): the snapshot, when
+ * the read path holds the snapshot's path as a string literal (the scaffold's
+ * `READ_FROM` does), else, per declared environment, whether the dev server's
+ * own connection variable (the default store block's) holds that environment's
+ * value. Only the booleans leave the server, never a value. An html host's
+ * preview is its documents: none.
+ */
+async function previewReads(site: Ready, env: NodeJS.ProcessEnv): Promise<{ snapshot: string } | { stores: Record<string, boolean> } | null> {
+  if (site.host === 'html') return null;
+  const { config } = site;
+  const file = insideCheckout(site.path, join(site.path, config.readPath.file));
+  let text = '';
+  try {
+    if (file !== null) text = readFileSync(file, 'utf8');
+  } catch {
+    // An unreadable read path holds no literal; the stores answer below.
+  }
+  if (await holdsLiteral(config.readPath.file, text, config.snapshotPath)) return { snapshot: config.snapshotPath };
+  const devValue = config.store === undefined ? '' : (env[config.store.urlEnv] ?? '');
+  const stores: Record<string, boolean> = {};
+  const blocks: Array<[string, StoreBlock | undefined]> = [['default', config.store], ...Object.entries(config.environments ?? {})];
+  for (const [name, block] of blocks) {
+    const value = block === undefined ? '' : (env[block.urlEnv] ?? '');
+    stores[name] = value !== '' && value === devValue;
+  }
+  return { stores };
+}
+
+/**
+ * Whether `text` holds `value` as a quoted string outside every comment. The
+ * comments are the TypeScript scanner's (`nonCodeOf`), so a `//` inside a
+ * string is not one. Without `typescript` installed the text is read as it is.
+ */
+async function holdsLiteral(file: string, text: string, value: string): Promise<boolean> {
+  const literals = ["'", '"', '`'].map((quote) => quote + value + quote);
+  if (!literals.some((literal) => text.includes(literal))) return false;
+  let comments: Span[] = [];
+  try {
+    comments = nonCodeOf(await loadTypescript(), file, text);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+  }
+  return literals.some((literal) => {
+    for (let at = text.indexOf(literal); at !== -1; at = text.indexOf(literal, at + 1)) if (!within(comments, at)) return true;
+    return false;
   });
 }
 
@@ -1337,7 +1388,7 @@ function formsAt(site: Ready, rev: string): { descriptor: Descriptor; snapshot: 
 /** `sha` as a full commit hash, or a usage error: never read as an option. */
 function commitOf(site: Ready, sha: string): string {
   const found = sha.startsWith('-') ? null : gitData(site.path, ['rev-parse', '--verify', '-q', `${sha}^{commit}`]);
-  if (found === null || found.code !== 0) throw new UsageError(`${sha} is not a commit of this checkout`);
+  if (found === null || found.code !== 0) throw new UsageError(`${sha} is not a commit of this project`);
   return found.stdout.trim();
 }
 

@@ -25,6 +25,8 @@ body{margin:0;background:hsl(var(--bg));color:hsl(var(--fg));font:13px/1.5 ui-sa
 .it{display:block;width:100%;text-align:left;font:inherit;background:transparent;border:1px solid transparent;border-radius:6px;
  padding:6px 8px;cursor:pointer;color:inherit;margin-bottom:2px;font-size:12.5px;position:relative}
 .it:hover{background:hsl(var(--sba))}.it.on{background:hsl(var(--sba));font-weight:600}
+.prow{display:flex;flex-wrap:wrap;align-items:flex-start;gap:3px}.prow>.it{flex:1;min-width:0;width:auto;overflow-wrap:anywhere}.prow>.rn{margin-top:4px}.prow>.rf{flex-basis:100%;padding:0 3px 4px}
+@media(max-width:760px){.prow>.rn{min-height:36px}}
 .it .u{display:block;font-size:10.5px;color:hsl(var(--mf));font-family:ui-monospace,Menlo,monospace;font-weight:400}
 .it .n{position:absolute;right:7px;top:6px;background:hsl(var(--am));color:#000;border-radius:999px;font-size:10px;font-weight:700;padding:0 5px}
 .side .sep{border-top:1px solid hsl(var(--sbd));margin:11px 3px 0}
@@ -58,6 +60,7 @@ body{margin:0;background:hsl(var(--bg));color:hsl(var(--fg));font:13px/1.5 ui-sa
 textarea.in{resize:vertical;line-height:1.6}
 .bdg{font-size:10.5px;padding:1px 6px;border-radius:999px;border:1px solid hsl(var(--bd));color:hsl(var(--mf));white-space:nowrap}
 .bdg.d{border-color:hsl(var(--am));color:hsl(var(--am));font-weight:600}
+button.bdg{font:inherit;font-size:10.5px;font-weight:600;background:transparent;cursor:pointer}
 .bdg.g{border-color:hsl(var(--gr));color:hsl(var(--gr))}
 .bdg.b{border-color:hsl(var(--bl));color:hsl(var(--bl))}
 .bdg.v{border-color:hsl(var(--vi));color:hsl(var(--vi))}
@@ -111,6 +114,10 @@ body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-ev
 #giterr{margin:10px 16px 0}
 #panetools{flex-wrap:wrap}
 @media(max-width:760px){.shell{grid-template-columns:minmax(0,1fr)}.side{border-right:0;border-bottom:1px solid hsl(var(--sbd))}.tg button{padding:4px 8px}}
+/* Under 760 px the selected key's editor sits directly under the preview, and the key list follows it, so a tap and its field share one screen. */
+@media(max-width:760px){#main{display:flex;flex-direction:column}#main>*{min-width:0}.edcol{order:-1}.edcol>*{min-width:0}.edcard{order:-1}}
+/* On a short phone screen the frame is capped so it and the selected field fit together. */
+@media(max-width:760px){.devwrap{height:min(420px,calc(100vh - 230px));min-height:0}}
 .btn.amb{border-color:hsl(38 75% 45%);color:hsl(38 80% 38%);font-weight:700}
 [data-theme="dark"] .btn.amb{color:hsl(38 85% 62%)}
 .pg{border:1px solid hsl(var(--bd));border-radius:8px;overflow:hidden}
@@ -232,10 +239,10 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
   <aside class="side">
     <div class="brand"><div class="m">s</div><b>stet</b></div>
     <div class="edsub" id="edsub"></div>
-    <div class="lbl">Checkouts</div><div id="projs"></div>
+    <div class="lbl">Projects</div><div id="projs"></div>
     <div style="padding:4px 3px 0">
-      <input class="in sm" id="addpath" placeholder="/absolute/path/to/checkout">
-      <button class="btn sm" style="margin-top:5px;width:100%" data-act="addSite">Add a checkout</button>
+      <input class="in sm" id="addpath" placeholder="/absolute/path/to/project">
+      <button class="btn sm" style="margin-top:5px;width:100%" data-act="addSite">Add a project</button>
       <div class="err" id="adderr" style="display:none"></div>
     </div>
     <div class="scoped" id="pjnote">from ~/.stet/projects.json — select one to edit</div>
@@ -250,7 +257,7 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
         <button class="envchip" id="envchip" data-act="cycleEnv"></button>
         <span id="branchbar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"></span>
         <div class="muted" id="crumb"></div></div>
-      <div style="display:flex;gap:10px;align-items:center"><span class="bdg d" id="dc" hidden></span>
+      <div style="display:flex;gap:10px;align-items:center"><button class="bdg d" id="dc" data-act="unsaved" hidden></button>
         <span id="gitbar" style="display:flex;gap:8px;align-items:center"></span>
         <button class="btn sm" data-act="theme">Theme</button></div></div>
     <div id="giterr" hidden></div>
@@ -258,7 +265,7 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
     <div class="tabs" id="tabs"></div>
     <div class="wrap" id="work"><div id="main"></div>
       <div id="grip" role="separator" aria-orientation="vertical" aria-controls="main" tabindex="0" aria-label="Resize the key column" title="Drag to resize the key column. Double-click to restore its width."></div>
-      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="paneshow" hidden></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panepick" hidden></div><div id="paneinfo" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
+      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="paneenv" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="paneshow" hidden></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panepick" hidden></div><div id="paneinfo" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
   </main>
 </div>
 <div id="tst"></div>
@@ -409,6 +416,11 @@ const S = {
   edit: null,
   // Per '<locale> <key>', the stored value the first keystroke of a draft started from.
   base: {},
+  // The sidebar's open Rename field, { path, value } or null.
+  renaming: null,
+  // The header's list of unsaved edits is open; the project switch waiting on Leave or Cancel, { path } or null.
+  unsavedOpen: false,
+  leaveAsk: null,
   // The unsaved edits of each environment not selected, { draft, base } by name (D45).
   stashed: {},
   // The agent's last census, and what every census of this site has found in this tab (`seen`).
@@ -627,6 +639,7 @@ async function loadSite(path) {
   S.confirmed = new Set();
   S.census = null; S.hover = null; S.choose = null; S.usage = null; S.routeReads = null; routeReadsFor = null;
   S.unmanaged = null; S.warn = null; S.moved = null; S.pageInfo = false;
+  S.unsavedOpen = false; S.leaveAsk = null; S.renaming = null;
   // A new checkout is a new route field and a new frame, and ends any start
   // wait still running for the last one.
   paneGen += 1;
@@ -1130,7 +1143,7 @@ function render() {
     'local dashboard' + (S.version ? '<br>v' + esc(S.version) : '');
   document.getElementById('pjnote').textContent = S.sites.length
     ? 'from ~/.stet/projects.json — select one to edit'
-    : 'no checkouts yet — add one below';
+    : 'no projects yet — add one below';
 
   document.getElementById('projs').innerHTML = S.sites.map((s) => {
     const on = s.path === S.path ? ' on' : '';
@@ -1140,10 +1153,15 @@ function render() {
         ? 'not adopted — run stet init here'
         : 'cannot load: ' + esc(s.message);
     const kind = s.state === 'ready'
-      ? '<span class="u">' + esc(hostLabel(s)) + '</span><span class="u">' + esc('project ' + s.project) + '</span>'
+      ? '<span class="u">' + esc(hostLabel(s)) + '</span>' + (s.project === 'default' ? '' : '<span class="u">' + esc('store id ' + s.project) + '</span>')
       : '';
-    return '<button class="it' + on + '" data-act="site:' + esc(s.path) + '">' +
-      esc(siteLabel(s)) + '<span class="u">' + sub + '</span>' + kind + '</button>';
+    const folder = s.folder === undefined ? '' : '<span class="u">' + esc(s.folder) + '</span>';
+    const open = S.renaming !== null && S.renaming.path === s.path;
+    return '<div class="prow"><button class="it' + on + '" data-act="site:' + esc(s.path) + '">' +
+      esc(siteLabel(s)) + folder + '<span class="u">' + sub + '</span>' + kind + '</button>' +
+      '<button class="btn sm rn" data-act="renameOpen:' + esc(s.path) + '">Rename</button>' +
+      (open ? '<div class="rf"><input class="in sm" value="' + esc(S.renaming.value) + '" data-act-input="renameName">' +
+        '<button class="btn sm pri" style="margin-top:5px;width:100%" data-act="renameSave">Save</button></div>' : '') + '</div>';
   }).join('');
 
   for (const t of MACHINE_TABS) {
@@ -1187,7 +1205,9 @@ function render() {
 
 /** The folder name, or — where another entry shares it — the shortest run of trailing folders no twin shares. */
 function siteLabel(s) {
-  const twins = S.sites.filter((o) => o !== s && o.name === s.name);
+  // A set name is shown as it is; the folder name is the one twins share.
+  if (s.folder !== undefined) return s.name;
+  const twins = S.sites.filter((o) => o !== s && (o.folder !== undefined ? o.folder : o.name) === s.name);
   if (twins.length === 0) return s.name;
   const parts = s.path.split('/').filter(Boolean);
   const tail = (path, n) => path.split('/').filter(Boolean).slice(-n).join('/');
@@ -1249,18 +1269,110 @@ function branchBar() {
 /** A question the header asked (Commit's panel, Publish to live), under the header in the removal plan's shape. */
 function paintAsk() {
   const box = document.getElementById('ask');
-  if (S.commitPanel !== null && ready() && !storeBacked()) { box.hidden = false; box.innerHTML = commitPanel(); return; }
-  const show = S.publishAsk && previewBranch();
-  box.hidden = !show;
-  if (!show) { box.innerHTML = ''; return; }
-  const git = S.site.git;
-  const entry = S.sites.find((site) => site.path === S.path);
-  const name = entry ? siteLabel(entry) : S.site.name;
-  box.innerHTML = '<div class="card"><div class="cb"><div class="term">' +
-    esc('Publish ' + git.branch + ' to ' + liveBranch() + '? ' + liveBranch() + ' is what ' + name + ' serves.') + '</div>' +
-    '<div style="margin-top:8px"><button class="btn pri sm" data-act="publishLive">Publish</button>' +
-    '<button class="btn sm" data-act="publishCancel">Cancel</button></div></div></div>';
+  const parts = [];
+  if (S.leaveAsk !== null) parts.push(leaveCard());
+  if (S.unsavedOpen && dirty()) parts.push(unsavedCard());
+  if (S.commitPanel !== null && ready() && !storeBacked()) parts.push(commitPanel());
+  else if (S.publishAsk && previewBranch()) {
+    const git = S.site.git;
+    const entry = S.sites.find((site) => site.path === S.path);
+    const name = entry ? siteLabel(entry) : S.site.name;
+    parts.push('<div class="card"><div class="cb"><div class="term">' +
+      esc('Publish ' + git.branch + ' to ' + liveBranch() + '? ' + liveBranch() + ' is what ' + name + ' serves.') + '</div>' +
+      '<div style="margin-top:8px"><button class="btn pri sm" data-act="publishLive">Publish</button>' +
+      '<button class="btn sm" data-act="publishCancel">Cancel</button></div></div></div>');
+  }
+  box.hidden = parts.length === 0;
+  const html = parts.join('');
+  if (box.innerHTML !== html) box.innerHTML = html;
 }
+
+/** Every unsaved edit the selected environment holds: the drafts, then the derived keys' templates. */
+function unsavedRows() {
+  return Object.keys(S.draft).map((k) => ({ kind: 'draft', locale: k.slice(0, k.indexOf(' ')), key: k.slice(k.indexOf(' ') + 1) }))
+    .concat(Object.keys(S.tmpl).map((key) => ({ kind: 'tmpl', key: key })));
+}
+/** What a project switch or a tab close loses: this environment's edits and those stashed for the others (D45). */
+function lostEdits() {
+  return Object.keys(S.stashed).filter((name) => name !== S.env)
+    .reduce((n, name) => n + Object.keys(S.stashed[name].draft).length, edits());
+}
+/** The header count's list: each edited key with Undo and Show, and Discard all. */
+function unsavedCard() {
+  const rows = unsavedRows().map((r) => {
+    const arg = r.kind === 'draft' ? r.locale + ' ' + r.key : r.key;
+    const name = r.kind === 'draft' ? 'Edit' : 'Tmpl';
+    const label = r.kind === 'draft' && r.locale !== S.site.config.locales.default ? r.key + ' · ' + r.locale : r.key;
+    return '<div style="display:flex;gap:6px;align-items:center;margin-bottom:5px"><span class="mono" style="flex:1;min-width:0;overflow-wrap:anywhere;font-size:11.5px">' + esc(label) + '</span>' +
+      '<button class="btn sm" data-act="undo' + name + ':' + esc(arg) + '">Undo</button>' +
+      '<button class="btn sm" data-act="show' + name + ':' + esc(arg) + '">Show</button></div>';
+  }).join('');
+  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">' + esc(plural(edits(), 'unsaved edit')) + '</h3></div><div class="cb">' + rows +
+    '<div style="margin-top:8px"><button class="btn sm dg" data-act="discardAll">Discard all</button></div></div></div>';
+}
+/** The project switch or removal waiting on its answer. */
+function leaveCard() {
+  return '<div class="card"><div class="cb"><div class="term">' + esc(plural(lostEdits(), 'unsaved edit') + ' will be lost. Leave anyway?') + '</div>' +
+    '<div style="margin-top:8px"><button class="btn pri sm" data-act="leaveGo">Leave</button>' +
+    '<button class="btn sm" data-act="leaveStay">Cancel</button></div></div></div>';
+}
+/** One unsaved draft taken back to its stored value; its base goes with it. */
+function undoEdit(loc, id) {
+  endEdit();
+  closePopover();
+  const k = loc + ' ' + id;
+  delete S.draft[k];
+  delete S.base[k];
+  draftChanged();
+  if (loc === S.locale) paintDraft(id);
+  render();
+}
+/** A derived key's template edit taken back. */
+function undoTmpl(id) {
+  delete S.tmpl[id];
+  paintDerived(id);
+  paintRow(id);
+  paintDirty();
+  paintPaneCards();
+  render();
+}
+/** An edited key selected in its locale, on its group and its route. */
+function showEdit(loc, id) {
+  if (loc !== null && loc !== S.locale) { endEdit(); closePopover(); S.locale = loc; postCensus(); }
+  if (S.tab !== 'Content') { setMode('edit'); S.tab = 'Content'; }
+  if (!S.q && keysInGroup(S.group).indexOf(id) === -1) S.group = groupOf(id);
+  ACTIONS.key(null, id);
+}
+/** Every unsaved edit of the selected environment dropped, in place so the stash that shares the objects agrees; the other environments' stay. */
+function discardAll() {
+  endEdit();
+  closePopover();
+  for (const k of Object.keys(S.draft)) delete S.draft[k];
+  for (const k of Object.keys(S.base)) delete S.base[k];
+  S.tmpl = {};
+  S.unsavedOpen = false;
+  draftChanged();
+  render();
+  postCensus();
+}
+/** The selected project taken out of the workspace; its folder is left alone. */
+async function removeCurrent() {
+  const res = await post('/api/workspace/remove', { path: S.path });
+  S.sites = res.body.sites || [];
+  S.path = null;
+  S.site = null;
+  await loadWorkspace();
+}
+/** A project switch, asking first when edits would be lost. */
+function leaveFor(path) {
+  if (!dirty() && lostEdits() === 0) { void guard(loadSite(path)); return; }
+  S.leaveAsk = { path: path };
+  paintAsk();
+}
+// A reload or a tab close raises the browser's own prompt while edits exist.
+window.addEventListener('beforeunload', (event) => {
+  if (lostEdits() > 0) event.preventDefault();
+});
 
 /**
  * What this commit carries: each key whose value differs from HEAD with its
@@ -1349,6 +1461,8 @@ function paintDirty() {
   const count = document.getElementById('dc');
   count.hidden = !dirty();
   count.textContent = dirty() ? plural(edits(), 'unsaved edit') : '';
+  // The list under the header follows the count.
+  if (S.unsavedOpen) paintAsk();
 }
 
 const ENV_CLASSES = { default: 'local', prod: 'prod', production: 'prod', staging: 'staging', preview: 'preview' };
@@ -1362,7 +1476,7 @@ function adapterOf(name) {
 function view() {
   if (S.tab === 'Health') return vHealth();
   if (S.tab === 'Setup') return vSetup();
-  if (!S.site) return '<div class="hint">Add a checkout to begin. The path must be absolute and hold a stet project.</div>';
+  if (!S.site) return '<div class="hint">Add a project to begin. The path must be absolute and hold a stet project.</div>';
   if (S.site.state === 'not-adopted') {
     return '<div class="hint"><b>' + esc(S.site.name) + ' is not adopted.</b> Run <span class="mono">stet init</span> in ' +
       '<span class="mono">' + esc(S.site.path) + '</span>, then reload this page.</div>';
@@ -1576,8 +1690,8 @@ function clockShort(at) {
 }
 
 function editorColumn() {
-  return '<div style="display:flex;flex-direction:column;gap:11px;min-width:0">' + changeBar() + takeoverCard() +
-    '<div class="card">' + editorCard() + '</div>' + storeHistoryCard() + gitHistoryCard() +
+  return '<div class="edcol" style="display:flex;flex-direction:column;gap:11px;min-width:0">' + changeBar() + takeoverCard() +
+    '<div class="card edcard">' + editorCard() + '</div>' + storeHistoryCard() + gitHistoryCard() +
     historyCard() + '</div>';
 }
 
@@ -1940,7 +2054,8 @@ function fitFrame() {
   // The frame ends where the window does, less the pane card's 1 px border and
   // the Content tab's 14 px bottom padding, so the pane never scrolls the page.
   const top = box.getBoundingClientRect().top + window.scrollY;
-  box.style.height = Math.max(420, Math.floor(window.innerHeight - top - 15)) + 'px';
+  // Under 760 px the stylesheet sets the height.
+  box.style.height = window.innerWidth <= 760 ? '' : Math.max(420, Math.floor(window.innerHeight - top - 15)) + 'px';
   const fit = frameFit(box.clientWidth, S.width);
   frame.style.width = fit.width + 'px';
   frame.style.height = Math.round(box.clientHeight / fit.scale) + 'px';
@@ -1967,6 +2082,7 @@ function paintPane() {
   document.getElementById('pane').hidden = !content;
   if (!content) return;
   paintPaneHead();
+  paintPaneEnv();
   paintPaneShow();
   paintPaneNote();
   paintPanePick();
@@ -1992,6 +2108,28 @@ function paintPane() {
     }
   }
   fitFrame();
+}
+
+/**
+ * On a store-backed site with a dev-server pane, one line under the header
+ * saying where the preview's words come from: the snapshot, the selected
+ * environment's store, or the dev server's own store. The server sends only
+ * whether each environment's connection is the dev server's, never a value.
+ */
+function envLine() {
+  const reads = S.site.previewReads;
+  if (!storeBacked() || reads === null || typeof reads !== 'object') return '';
+  if (own(reads, 'snapshot')) {
+    return 'The preview shows ' + reads.snapshot + ' as this project holds it. Store drafts and publishes appear only as the dashboard layers them.';
+  }
+  const same = own(reads, 'stores') && own(reads.stores, S.env) && reads.stores[S.env] === true;
+  return same ? 'The preview reads the ' + S.env + ' store, the one this tab edits.' : "The preview reads the dev server's own store, not " + S.env + '.';
+}
+function paintPaneEnv() {
+  const box = document.getElementById('paneenv');
+  const text = paneState() === 'frame' && !S.preview.static ? envLine() : '';
+  box.hidden = text === '';
+  if (box.textContent !== text) box.textContent = text;
 }
 
 /** Under the pane's header while a preview stands: what it shows, its page tabs, and the way out. */
@@ -2090,7 +2228,7 @@ function paneBody(state) {
   }
   if (state === 'frame' && p.static) {
     return '<p class="note" style="margin:0;padding:6px 12px;border-left:0;border-bottom:1px solid hsl(var(--bd))">' +
-      'Served read-only from the checkout by this server. A root-absolute reference in the page ' +
+      'Served read-only from the project by this server. A root-absolute reference in the page ' +
       'resolves against the dashboard rather than the site and is not served here.</p>' +
       '<div class="devwrap" id="devwrap"><iframe src="' + esc(p.url) +
       '" sandbox="allow-scripts allow-forms allow-popups" title="the site"></iframe></div>';
@@ -3347,13 +3485,13 @@ function auditBody(a) {
       return '<div class="cb">' + errors.map((m) => '<div class="err lhmsg">' + esc(m) + '</div>').join('') + '</div>';
     }
     const lh = r.lighthouse || {};
-    const what = lh.targetKind === 'build' ? 'the production build' : lh.targetKind === 'url' ? lh.target : "the checkout's documents";
+    const what = lh.targetKind === 'build' ? 'the production build' : lh.targetKind === 'url' ? lh.target : "the project's documents";
     const summary = 'lighthouse ' + lh.version + ' · ' + (lh.formFactor === 'desktop' ? 'desktop' : 'mobile') + ' · ' + what + ' · ' +
       plural(pages.length, 'page') + ' · ' + (reply.elapsed || 0) + ' s';
     return '<div class="cb mono muted" style="font-size:11.5px;overflow-wrap:anywhere">' + esc(summary) + '</div>' +
       pages.map((p) => auditPage(p, r)).join('');
   }
-  return '<div class="cb muted">' + (htmlHost() ? "Not run yet. Runs against the checkout's documents." : 'Not run yet. Runs against the production build.') + '</div>';
+  return '<div class="cb muted">' + (htmlHost() ? "Not run yet. Runs against the project's documents." : 'Not run yet. Runs against the production build.') + '</div>';
 }
 
 function vLighthouse() {
@@ -3476,7 +3614,7 @@ async function revertChange() {
 
 // --- Health ------------------------------------------------------------------
 function vHealth() {
-  if (!S.site) return '<div class="hint">Add a checkout to run Health against it.</div>';
+  if (!S.site) return '<div class="hint">Add a project to run Health against it.</div>';
   const head = '<div class="card"><div class="ch"><h3>Health</h3>' +
     '<button class="btn sm pri" data-act="health">Run</button></div>' +
     (S.health === null ? '<div class="cb muted">Not run yet.</div>' : '<div class="cb">' + stampLine() + '</div>') + '</div>';
@@ -3540,7 +3678,7 @@ function vSetup() {
     '<span class="bdg mono">' + esc(S.site.path) + '</span></div><div class="cb">' + devFields +
     '<label style="display:flex;gap:7px;align-items:center;margin-top:9px;font-size:12px">' +
     '<input type="checkbox"' + (entry.pushAfterCommit ? ' checked' : '') + ' data-act-change="entryPush">Push after commit</label>' +
-    '<div style="margin-top:10px"><button class="btn sm dg" data-act="removeSite">Remove this checkout</button></div>' +
+    '<div style="margin-top:10px"><button class="btn sm dg" data-act="removeSite">Remove this project</button></div>' +
     '</div></div>';
 
   const upgrades = '<div class="card"><div class="ch"><h3>Pending upgrades — run stet upgrade in the terminal</h3>' +
@@ -3620,7 +3758,24 @@ const ACTIONS = {
     S.audit = Object.assign({}, S.audit, { form: lh.formFactor === 'desktop' ? 'desktop' : 'mobile' });
     void guard(startAudit(Object.assign({ fix: true, pages: [page] }, lh.targetKind === 'url' ? { url: lh.target } : {})));
   },
-  site: (el, path) => { void guard(loadSite(path)); },
+  site: (el, path) => { leaveFor(path); },
+  unsaved: () => { S.unsavedOpen = !S.unsavedOpen; paintAsk(); },
+  undoEdit: (el, arg) => { const cut = arg.indexOf(' '); undoEdit(arg.slice(0, cut), arg.slice(cut + 1)); },
+  undoTmpl: (el, id) => { undoTmpl(id); },
+  showEdit: (el, arg) => { const cut = arg.indexOf(' '); showEdit(arg.slice(0, cut), arg.slice(cut + 1)); },
+  showTmpl: (el, id) => { showEdit(null, id); },
+  discardAll: () => { discardAll(); },
+  leaveGo: () => { const ask = S.leaveAsk; S.leaveAsk = null; void guard(ask.remove === true ? removeCurrent() : loadSite(ask.path)); },
+  leaveStay: () => { S.leaveAsk = null; paintAsk(); },
+  renameOpen: (el, path) => {
+    if (S.renaming !== null && S.renaming.path === path) { S.renaming = null; render(); return; }
+    const row = S.sites.find((s) => s.path === path);
+    S.renaming = { path: path, value: row === undefined ? '' : row.name };
+    render();
+    const field = document.querySelector('[data-act-input="renameName"]');
+    if (field) field.focus();
+  },
+  renameSave: () => { void guard(saveRename()); },
   addSite: () => {
     const input = document.getElementById('addpath');
     const path = input.value.trim();
@@ -3633,17 +3788,12 @@ const ACTIONS = {
       err.textContent = '';
       input.value = '';
       S.sites = res.body.sites || [];
-      await loadSite(res.body.path);
+      leaveFor(res.body.path);
     })());
   },
   removeSite: () => {
-    void guard((async () => {
-      const res = await post('/api/workspace/remove', { path: S.path });
-      S.sites = res.body.sites || [];
-      S.path = null;
-      S.site = null;
-      await loadWorkspace();
-    })());
+    if (lostEdits() > 0) { S.leaveAsk = { path: S.path, remove: true }; paintAsk(); return; }
+    void guard(removeCurrent());
   },
   key: (el, id) => {
     S.sel = id;
@@ -3832,7 +3982,7 @@ const ACTIONS = {
   health: () => {
     void guard((async () => {
       S.health = (await api('/api/site/health' + envQuery())).body;
-      tst('Health ran against ' + (S.health.at && S.health.at.head ? S.health.at.head : 'this checkout'));
+      tst('Health ran against ' + (S.health.at && S.health.at.head ? S.health.at.head : 'this project'));
       render();
     })());
   },
@@ -3932,6 +4082,7 @@ const ACTIONS_CHANGE = {
 const ACTIONS_INPUT = {
   search: (el) => { S.q = el.value; render(); },
   editor: (el) => { writeEditor(el.value); },
+  renameName: (el) => { if (S.renaming !== null) S.renaming.value = el.value; },
   text: (el, id) => { clearRefusal(); setDraft(id, el.value); paintMirror(el); softCount(el, id); paintRow(id); paintDirty(); },
   tmplBefore: (el, id) => { tmplEdit(id, { before: el.value }); },
   tmplAfter: (el, id) => { tmplEdit(id, { after: el.value }); },
@@ -4493,6 +4644,22 @@ async function loadDevLog() {
   S.devlog = (await api('/api/site/dev-log' + query())).body;
 }
 
+/** The open Rename field's name sent to the workspace: the server trims it, and an empty one clears it. */
+async function saveRename() {
+  const r = S.renaming;
+  if (r === null) return;
+  const res = await post('/api/workspace/update', { path: r.path, name: r.value });
+  if (!res.ok) { tst(res.body.error || 'the name was refused'); return; }
+  S.renaming = null;
+  if (Array.isArray(res.body.sites)) S.sites = res.body.sites;
+  const row = S.sites.find((s) => s.path === r.path);
+  if (row !== undefined && S.site !== null && S.path === r.path) {
+    S.site.name = row.name;
+    if (row.folder === undefined) delete S.site.folder; else S.site.folder = row.folder;
+  }
+  render();
+}
+
 async function updateEntry(patch) {
   const res = await post('/api/workspace/update', Object.assign({ path: S.path }, patch));
   if (!res.ok) { tst(res.body.error || 'the entry was refused'); return; }
@@ -4598,6 +4765,32 @@ shell.addEventListener('scroll', (event) => {
 }, true);
 shell.addEventListener('change', (event) => dispatch(ACTIONS_CHANGE, event));
 shell.addEventListener('input', (event) => dispatch(ACTIONS_INPUT, event));
+// The Rename field: Enter saves, Escape closes it.
+shell.addEventListener('keydown', (event) => {
+  const el = event.target;
+  if (el.getAttribute === undefined || el.getAttribute('data-act-input') !== 'renameName') return;
+  if (event.key === 'Enter') { event.preventDefault(); ACTIONS.renameSave(); }
+  else if (event.key === 'Escape') { S.renaming = null; render(); }
+});
+
+// --- shortcuts ---------------------------------------------------------------
+// E switches Edit and Use, and Escape ends the selection, whenever focus is not
+// in a field: a key typed into a field belongs to the field. The same two keys
+// pressed inside the preview arrive as the frame's `key` messages.
+const FIELDS = 'input, textarea, select, [contenteditable]';
+document.addEventListener('keydown', (event) => {
+  if (event.defaultPrevented || event.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;
+  const target = event.target;
+  if (target !== null && target.closest !== undefined && target.closest(FIELDS) !== null) return;
+  if (!ready() || S.tab !== 'Content') return;
+  if (event.key === 'e' || event.key === 'E') {
+    event.preventDefault();
+    setMode(S.mode === 'edit' ? 'use' : 'edit');
+  } else if (event.key === 'Escape' && S.popover === null && S.sel !== null) {
+    event.preventDefault();
+    endSelection();
+  }
+});
 
 // --- focus -------------------------------------------------------------------
 // A repaint replaces the field being typed in, so the caret is put back where
