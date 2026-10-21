@@ -1,0 +1,16 @@
+{
+  "keys": {
+    "status_open": {
+      "shape": "text"
+    },
+    "status_closed": {
+      "shape": "text"
+    },
+    "status_paused": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

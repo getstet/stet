@@ -248,10 +248,15 @@ export async function startPreviewProxy(
   };
 }
 
-/** The agent's script tag, before `</head>`, else at the start of `<body>`, else first. */
-export function injectAgent(html: string, dashboardOrigin: string, channel: string, src = AGENT_PATH): string {
+/**
+ * The agent's script tag, before `</head>`, else at the start of `<body>`, else
+ * first. `hold` writes `data-hold`: the agent then waits for the page's
+ * hydration before it announces itself, so it writes nothing a hydrating page
+ * would find changed. A static page, which has no hydration, passes false.
+ */
+export function injectAgent(html: string, dashboardOrigin: string, channel: string, src = AGENT_PATH, hold = true): string {
   const quote = (value: string): string => value.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-  const tag = `<script src="${src}" data-parent="${quote(dashboardOrigin)}" data-channel="${quote(channel)}"></script>`;
+  const tag = `<script src="${src}" data-parent="${quote(dashboardOrigin)}" data-channel="${quote(channel)}"${hold ? ' data-hold' : ''}></script>`;
   const head = html.search(/<\/head\s*>/i);
   if (head !== -1) return html.slice(0, head) + tag + html.slice(head);
   const body = /<body\b[^>]*>/i.exec(html);

@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
+import { Report } from '../cli/report.js';
+import { validateValue } from '../cli/validate.js';
 import { miniDescriptor, miniSnapshot, mutable } from '../conformance/fixture.js';
 import {
   checkBudget,
   checkClassRules,
   checkLimits,
+  checkRequires,
+  checkSubjectLine,
   checkTags,
   checkVars,
   htmlEmailTarget,
@@ -781,5 +785,96 @@ describe('validateSave', () => {
   it('leaves a non-slot key out of the class rules entirely', () => {
     expect(templateOf(descriptor, 'hero_headline')).toBeNull();
     expect(templateOf(descriptor, 'welcome__subject')).toBe('welcome');
+  });
+});
+
+describe('checkRequires — required variables are kept at save (journey B4)', () => {
+  const reset: Descriptor = {
+    version: 1,
+    keys: {
+      password_reset__body: { shape: 'text', target: 'html-email', vars: ['reset_url', 'name'], requires: ['reset_url'] },
+      password_reset__lines: { shape: 'list', target: 'html-email', vars: ['reset_url'], requires: ['reset_url'] },
+    },
+    templates: { password_reset: { class: 'transactional', trigger: 'app-event', slots: ['body', 'lines'] } },
+  };
+  const gate = (value: unknown, locale = 'default', key = 'password_reset__body') => {
+    const report = new Report();
+    const ok = validateValue(reset, { default: {}, fr: {} }, key, value, locale, report);
+    return { ok, errors: report.findings.filter((f) => f.level === 'error').map((f) => f.message) };
+  };
+
+  it('refuses a value that dropped the variable, through the one gate, ending in the locale once', () => {
+    expect(gate('Hello {{name}}, choose a new password.')).toEqual({
+      ok: false,
+      errors: ['password_reset__body: {{reset_url}} is required and the value no longer carries it (default)'],
+    });
+    expect(gate('Bonjour.', 'fr').errors).toEqual(['password_reset__body: {{reset_url}} is required and the value no longer carries it (fr)']);
+  });
+
+  it('passes a value that keeps the variable anywhere in its text, spaces inside the braces included', () => {
+    expect(gate('Reset it here: {{reset_url}}')).toEqual({ ok: true, errors: [] });
+    expect(gate('Reset it here: {{ reset_url }}')).toEqual({ ok: true, errors: [] });
+  });
+
+  it('checks each entry of a list on its own', () => {
+    expect(gate(['{{reset_url}}', 'no link'], 'default', 'password_reset__lines').errors).toEqual([
+      'password_reset__lines[1]: {{reset_url}} is required and the value no longer carries it (default)',
+    ]);
+  });
+
+  it('answers a requires finding with the variable, and nothing for a key that requires none', () => {
+    expect(checkRequires(reset, 'password_reset__body', 'none here').findings).toEqual([
+      {
+        rule: 'requires',
+        severity: 'error',
+        key: 'password_reset__body',
+        vars: ['reset_url'],
+        message: 'password_reset__body: {{reset_url}} is required and the value no longer carries it',
+      },
+    ]);
+    expect(checkRequires(descriptor, 'welcome__body', 'anything')).toEqual({ ok: true, findings: [] });
+  });
+});
+
+describe('checkSubjectLine — an email subject fits on one line (D66)', () => {
+  const LINE = 'An email subject fits on one line. Remove the line break.';
+  const mail: Descriptor = {
+    version: 1,
+    keys: {
+      welcome__subject: { shape: 'text', target: 'html-email' },
+      welcome__headline: { shape: 'text', target: 'html-email' },
+      hero_subject: { shape: 'text', target: 'web' },
+    },
+    templates: { welcome: { class: 'transactional', trigger: 'manual', slots: ['subject', 'headline'] } },
+  };
+
+  it.each(['Hi\r\nBcc: x@evil.test', 'Hi\nthere', 'Hi\rthere'])('refuses a subject slot holding %j, with one finding', (value) => {
+    const verdict = validateSave(mail, { key: 'welcome__subject', value });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.findings.filter((f) => f.rule === 'subject')).toEqual([
+      { rule: 'subject', severity: 'error', key: 'welcome__subject', message: LINE },
+    ]);
+  });
+
+  it('picks the longest template a key belongs to: a__b__subject is the subject of a__b, though a is declared too', () => {
+    const nested: Descriptor = {
+      version: 1,
+      keys: { a__b__subject: { shape: 'text', target: 'html-email' }, a__x: { shape: 'text', target: 'html-email' } },
+      templates: {
+        a: { class: 'transactional', trigger: 'manual', slots: ['x'] },
+        a__b: { class: 'transactional', trigger: 'manual', slots: ['subject'] },
+      },
+    };
+    expect(templateOf(nested, 'a__b__subject')).toBe('a__b');
+    expect(templateOf(nested, 'a__x')).toBe('a');
+    const verdict = validateSave(nested, { key: 'a__b__subject', value: 'x\r\ny' });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.findings.filter((f) => f.rule === 'subject')).toHaveLength(1);
+  });
+
+  it('passes a subject on one line, and a line break in any other key', () => {
+    expect(checkSubjectLine(mail, 'welcome__subject', 'Welcome aboard')).toEqual({ ok: true, findings: [] });
+    expect(validateSave(mail, { key: 'welcome__headline', value: 'Two\nlines' }).ok).toBe(true);
+    expect(validateSave(mail, { key: 'hero_subject', value: 'Two\nlines' }).ok).toBe(true);
   });
 });

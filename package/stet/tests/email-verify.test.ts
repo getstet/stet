@@ -842,3 +842,77 @@ describe('email verify — the pointer boundary', () => {
     expect(result.code).toBe(0);
   });
 });
+
+describe('email verify — the frame and the fill (D2)', () => {
+  const POINTER = { file: 'lib/email/templates/welcome.ts', export: 'welcomeContent', sampleProps: { url: 'https://x', name: 'Ada' } };
+
+  /** A committed host whose welcome template is `head` at HEAD and `working` in the tree, its pointer `render`. */
+  function stringHost(head: string, working: string, render: Record<string, unknown>, files: Record<string, string> = {}): EmailHost {
+    const host = makeEmailHost();
+    gitInit(host.dir);
+    project(
+      host.put,
+      {
+        version: 1,
+        keys: { welcome__body: { shape: 'text', target: 'html-email', vars: ['name'] } },
+        templates: { welcome: { class: 'transactional', trigger: 'manual', slots: ['body'], render: render as never } },
+      },
+      { default: { welcome__body: '{{name}}' } },
+    );
+    host.put('lib/email/templates/welcome.ts', head);
+    for (const [rel, text] of Object.entries(files)) host.put(rel, text);
+    commit(host.dir);
+    host.put('lib/email/templates/welcome.ts', working);
+    return host;
+  }
+
+  const HEAD_STRING = 'export const welcomeContent = \'<a href="{{url}}">{{name}}</a>\';\n';
+  const REWRITTEN =
+    'export const welcomeContent = ({ welcome__body }: { welcome__body: string }) => \'<a href="{{url}}">\' + welcome__body + \'</a>\';\n';
+
+  it('passes a string export rewritten to a function of its slot, with fill on both sides (F6a, journey E19)', async () => {
+    const result = await verify(stringHost(HEAD_STRING, REWRITTEN, { ...POINTER, fill: true }).dir);
+    expect(result.out).toContain('welcome: PASS');
+    expect(result.code).toBe(0);
+  });
+
+  it('fails the same rewrite without fill, at the first differing byte', async () => {
+    const result = await verify(stringHost(HEAD_STRING, REWRITTEN, POINTER).dir);
+    expect(result.err).toContain('welcome: FAIL — the render changed');
+    expect(result.code).toBe(1);
+  });
+
+  const FRAME = 'export const shell = (c: string, pre?: string): string => `<html>${pre}|${c}</html>`;\n';
+  const FRAMED = { ...POINTER, fill: true, frame: { file: 'lib/email/base.ts', export: 'shell', args: ['url'] } };
+
+  it('passes through the frame read from the working tree when only the template changed', async () => {
+    const result = await verify(stringHost(HEAD_STRING, REWRITTEN, FRAMED, { 'lib/email/base.ts': FRAME }).dir);
+    expect(result.out).toContain('welcome: PASS');
+  });
+
+  it('reads the frame from the working tree on both sides, so a frame changed since HEAD still agrees', async () => {
+    const host = stringHost(HEAD_STRING, REWRITTEN, FRAMED, { 'lib/email/base.ts': FRAME });
+    host.put('lib/email/base.ts', 'export const shell = (c: string): string => `<body class="v2">${c}</body>`;\n');
+    const result = await verify(host.dir);
+    expect(result.out).toContain('welcome: PASS');
+    expect(result.code).toBe(0);
+  });
+
+  it('fails a pointer or a frame outside the project with the containment line, and runs nothing (F3)', async () => {
+    const escaping = stringHost(HEAD_STRING, REWRITTEN, { ...POINTER, file: '../../outside/tpl.tsx' });
+    const missing = await verify(escaping.dir);
+    expect(missing.err).toContain('welcome: FAIL — ../../outside/tpl.tsx is outside the project — a render pointer names a file inside it');
+    expect(missing.code).toBe(1);
+
+    // An escaping file that exists, and leaves a mark where it is ever loaded.
+    const outside = makeEmailHost({ deps: [] });
+    const mark = outside.path('loaded');
+    outside.put('tpl.ts', `require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x');\nexport const welcomeContent = '<p/>';\n`);
+    const rel = `../${outside.dir.split('/').pop()}/tpl.ts`;
+    for (const render of [{ ...POINTER, file: rel }, { ...POINTER, frame: { file: rel, export: 'welcomeContent' } }]) {
+      const result = await verify(stringHost(HEAD_STRING, REWRITTEN, render).dir);
+      expect(result.err).toContain(`welcome: FAIL — ${rel} is outside the project — a render pointer names a file inside it`);
+      expect(existsSync(mark)).toBe(false);
+    }
+  });
+});

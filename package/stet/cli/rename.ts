@@ -52,9 +52,6 @@ import { descriptorOf, snapshotOf } from './check.js';
 import {
   isHtmlHost,
   loadConfig,
-  normalizeNoExt,
-  pathAliasMappings,
-  resolveSpecifier,
   selectStoreBlock,
   type StetConfig,
 } from './config.js';
@@ -74,7 +71,7 @@ import {
   type NamingPlan,
   type PlanEntry,
 } from './key-plan.js';
-import { planReadRenames, type Occurrence } from './key-reads.js';
+import { planReadRenames, stetModuleTest, type Occurrence } from './key-reads.js';
 import type { CliIo } from './main.js';
 import { renameRecorded } from './meta.js';
 import { htmlPageOf, pageOfFile } from './pages.js';
@@ -868,10 +865,9 @@ export async function readRenames(
   only?: OnlyAt,
 ): Promise<HostRenames> {
   const ts = await loadTypescript();
-  const mappings = pathAliasMappings(cwd);
   const own = new Set([config.codegen.registry, config.codegen.dts, config.codegen.defaults, config.codegen.resolved, config.readPath.file]);
   const modules = filesForGlobs(cwd, config.copyModules);
-  const stetTargets = new Set([config.readPath.file, ...modules].map((rel) => normalizeNoExt(join(cwd, rel))));
+  const isStetModule = stetModuleTest(cwd, [config.readPath.file, ...modules]);
   const out: HostRenames = { edited: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
   const files = filesForGlobs(cwd, [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules]);
   for (const rel of files) {
@@ -888,7 +884,7 @@ export async function readRenames(
       source,
       dialect: dialectOf(rel),
       renames,
-      isStetModule: (spec) => resolveSpecifier(spec, rel, cwd, mappings).some((target) => stetTargets.has(target)),
+      isStetModule: isStetModule(rel),
       copyModule: config.copyModules.some((glob) => matchGlob(glob, rel)),
     });
     const here = (o: Occurrence): boolean => only === undefined || (o.file === only.file && o.line === only.line);

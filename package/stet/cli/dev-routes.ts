@@ -17,8 +17,10 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { closeSync, openSync, readFileSync, utimesSync } from 'node:fs';
-import { join, posix } from 'node:path';
+import { closeSync, existsSync, openSync, readFileSync, utimesSync } from 'node:fs';
+import { dirname, join, posix } from 'node:path';
+
+import type * as TS from 'typescript';
 
 import { json, readJson } from '../server/http.js';
 import { bearerMatches, createStetHandler } from '../server/mount.js';
@@ -31,7 +33,9 @@ import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
-import type { StetConfig, StoreBlock } from './config.js';
+import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
+import { pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
+import { isBarePackage } from './email-extract.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, type GitState } from './git.js';
 import {
@@ -51,15 +55,18 @@ import {
   type HtmlProposalSet,
 } from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
-import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
+import { importClosure, probeFile, type Chain } from './import-closure.js';
+import { closing, dialectCode, KEY_READ, nonCodeOf, openTag, within, type Span } from './key-reads.js';
+import { keyHistory } from './key-history.js';
+import { isGenerated, keyUsage, namedKeys, ownFiles, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
-import { applyPages, auditablePages, fileRoute, proposeForHost, servedRoute } from './pages.js';
+import { applyPages, auditablePages, fileRoute, proposeForHost, routeFiles, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
-import { blankNonMarkup, dialectOf, matchGlob, type Dialect } from './source-scan.js';
+import { blankNonMarkup, dialectOf, loadTypescript, matchGlob, packageNames, scriptKindFor, type Dialect } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -68,6 +75,7 @@ import {
   addSite,
   blockVariables,
   connectionEnv,
+  connectionNames,
   devDefaults,
   foreignConnectionNames,
   foregroundEnv,
@@ -120,6 +128,8 @@ export interface DevContext {
   fetchImpl: typeof globalThis.fetch;
   children: Map<string, DevChild>;
   stores: Map<string, StoreAdapter>;
+  /** The adapters being opened, by the same key as `stores`, so concurrent requests share one open. */
+  opening?: Map<string, Promise<StoreAdapter>>;
   /** One promise chain per checkout, so this server's requests never interleave on one site. */
   queues: Map<string, Promise<unknown>>;
   /** The checkout `stet dev` was started in: the one site the process environment supplies connection variables to. */
@@ -132,6 +142,10 @@ export interface DevContext {
   previewChannel?: string;
   /** Test seam: the script the audit child runs in place of the installed CLI. */
   auditCli?: string;
+  /** Each site's unread-key facts, per file, kept between `usage` requests. */
+  usage?: Map<string, UsageCache>;
+  /** Test seam: the deadline a host template render is killed at, in place of the render seam's own. */
+  renderDeadlineMs?: number;
 }
 
 /**
@@ -199,7 +213,7 @@ function crossOrigin(req: Request, origin: string): boolean {
 export function withEnvFilesHint(message: string): string {
   const clause = ' is unset — set it or remove the store block';
   return message.endsWith(clause)
-    ? `${message.slice(0, -clause.length)} is unset — stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in`
+    ? `${message.slice(0, -clause.length)} is unset — stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in`
     : message;
 }
 
@@ -247,7 +261,10 @@ function enqueue<T>(ctx: DevContext, path: string, fn: () => Promise<T>): Promis
 }
 
 /**
- * A route that names a site, run inside that site's queue.
+ * A route that names a site, run inside that site's queue, or outside it where
+ * `queued` is false: for a route that writes nothing to the checkout and may
+ * take as long as host code takes (a template render), so the site's other
+ * routes do not wait behind it.
  *
  * The path is resolved against the WORKSPACE first: a directory the operator
  * never added is 404 whatever else the request names, so the server cannot be
@@ -257,6 +274,7 @@ async function withSite(
   ctx: DevContext,
   url: URL,
   fn: (site: SiteState, entry: WorkspaceEntry) => Promise<Response>,
+  queued = true,
 ): Promise<Response> {
   const wanted = url.searchParams.get('site');
   const id = idSegment(url);
@@ -264,7 +282,7 @@ async function withSite(
     id === null ? site.path === wanted : siteId(site.path) === id,
   );
   if (entry === undefined) return json({ error: 'not a workspace site' }, 404);
-  return enqueue(ctx, entry.path, () => fn(loadSite(entry), entry));
+  return queued ? enqueue(ctx, entry.path, () => fn(loadSite(entry), entry)) : fn(loadSite(entry), entry);
 }
 
 /** The `<id>` of a `/s/<id>/…` path, or null where the path is not one. */
@@ -396,6 +414,7 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
   if (route === 'workspace/update' && req.method === 'POST') {
     const body = await readJson(req);
     updateSite(ctx.workspaceFile, reqStr(body, 'path'), {
+      ...(typeof body['name'] === 'string' ? { name: body['name'] } : {}),
       ...(typeof body['dev'] === 'string' ? { dev: body['dev'] } : {}),
       ...(typeof body['devCommand'] === 'string' ? { devCommand: body['devCommand'] } : {}),
       ...(typeof body['devStopCommand'] === 'string' ? { devStopCommand: body['devStopCommand'] } : {}),
@@ -422,12 +441,14 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
  * site's queue, so two requests against one checkout never interleave.
  */
 async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: string): Promise<Response> {
+  // The email preview runs host code and writes nothing: outside the queue.
+  if (req.method === 'POST' && route === 'site/email-preview') return withSite(ctx, url, (site) => emailPreview(ctx, req, site), false);
   return withSite(ctx, url, async (site, entry) => {
     switch (`${req.method} ${route}`) {
       case 'GET site':
-        return siteReply(site, entry, ctx.launched);
+        return await siteReply(site, entry, ctx.launched);
       case 'POST site/save':
-        return await save(ctx, req, site);
+        return await save(ctx, req, site, entry);
       case 'POST site/commit':
         return await commit(ctx, req, site);
       case 'POST site/push':
@@ -442,6 +463,10 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await splitPlace(req, site);
       case 'GET site/history':
         return history(site);
+      case 'GET site/carries':
+        return carries(site);
+      case 'GET site/key-history':
+        return await keyHistoryReply(url, site);
       case 'GET site/removed':
         return removed(url, site);
       case 'POST site/restore':
@@ -462,6 +487,10 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await preview(ctx, url, site, entry);
       case 'GET site/marks':
         return marks(site);
+      case 'GET site/usage':
+        return await usage(ctx, site);
+      case 'GET site/route-reads':
+        return await routeReads(url, site);
       case 'POST site/dev-start':
         return await devStart(ctx, site, entry);
       case 'POST site/dev-stop':
@@ -497,7 +526,7 @@ function requireReady(site: SiteState): Extract<SiteState, { state: 'ready' }> {
  * DIALING: a listing that opened a connection per environment would hang on
  * the first unreachable one, and `doctor` is where a live check belongs.
  */
-function siteReply(site: SiteState, entry: WorkspaceEntry, launched: string | undefined): Response {
+async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: string | undefined): Promise<Response> {
   if (site.state !== 'ready') return json(summary(site));
   const { config } = site;
   const env = connectionEnv(site, launched);
@@ -532,11 +561,61 @@ function siteReply(site: SiteState, entry: WorkspaceEntry, launched: string | un
       store: { adapter: config.store?.adapter ?? 'snapshot' },
     },
     environments,
+    previewReads: await previewReads(site, env),
     dev: devDefaults(config, entry),
     previewDefault: routerPreviewCommand(config),
     entry,
     pending: pendingForms(site),
     git: { ...site.git, live: liveOf(site.path, site.git.branch) },
+  });
+}
+
+/**
+ * Where a JavaScript host's preview reads its words (D11): the snapshot, when
+ * the read path holds the snapshot's path as a string literal (the scaffold's
+ * `READ_FROM` does), else, per declared environment, whether the dev server's
+ * own connection variable (the default store block's) holds that environment's
+ * value. Only the booleans leave the server, never a value. An html host's
+ * preview is its documents: none.
+ */
+async function previewReads(site: Ready, env: NodeJS.ProcessEnv): Promise<{ snapshot: string } | { stores: Record<string, boolean> } | null> {
+  if (site.host === 'html') return null;
+  const { config } = site;
+  const file = insideCheckout(site.path, join(site.path, config.readPath.file));
+  let text = '';
+  try {
+    if (file !== null) text = readFileSync(file, 'utf8');
+  } catch {
+    // An unreadable read path holds no literal; the stores answer below.
+  }
+  if (await holdsLiteral(config.readPath.file, text, config.snapshotPath)) return { snapshot: config.snapshotPath };
+  const devValue = config.store === undefined ? '' : (env[config.store.urlEnv] ?? '');
+  const stores: Record<string, boolean> = {};
+  const blocks: Array<[string, StoreBlock | undefined]> = [['default', config.store], ...Object.entries(config.environments ?? {})];
+  for (const [name, block] of blocks) {
+    const value = block === undefined ? '' : (env[block.urlEnv] ?? '');
+    stores[name] = value !== '' && value === devValue;
+  }
+  return { stores };
+}
+
+/**
+ * Whether `text` holds `value` as a quoted string outside every comment. The
+ * comments are the TypeScript scanner's (`nonCodeOf`), so a `//` inside a
+ * string is not one. Without `typescript` installed the text is read as it is.
+ */
+async function holdsLiteral(file: string, text: string, value: string): Promise<boolean> {
+  const literals = ["'", '"', '`'].map((quote) => quote + value + quote);
+  if (!literals.some((literal) => text.includes(literal))) return false;
+  let comments: Span[] = [];
+  try {
+    comments = nonCodeOf(await loadTypescript(), file, text);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+  }
+  return literals.some((literal) => {
+    for (let at = text.indexOf(literal); at !== -1; at = text.indexOf(literal, at + 1)) if (!within(comments, at)) return true;
+    return false;
   });
 }
 
@@ -574,12 +653,18 @@ function liveBranchOf(cwd: string, remote: string): string | null {
  * now resolves to, so a headline edit that pushes a share description past its
  * limit is refused like the description itself.
  */
-async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
-  const ready = requireReady(site);
-  if (ready.mode !== 'snapshot') {
-    return json({ error: 'a store-backed site is edited through its mounted API — use Save draft' }, 409);
-  }
+async function save(ctx: DevContext, req: Request, site: SiteState, listed: WorkspaceEntry): Promise<Response> {
+  const refuseStoreBacked = (): Response =>
+    json({ error: 'a store-backed site is edited through its mounted API — use Save draft' }, 409);
+  if (requireReady(site).mode !== 'snapshot') return refuseStoreBacked();
   const body = await readJson(req);
+  // The site is read again now the body is in. A body streams in over however
+  // long the client takes, and the snapshot read before it may be older than an
+  // agent's write meanwhile: the stale check and the whole-file rewrite below
+  // both start from this read. Nothing after it awaits, so no other request
+  // interleaves with them.
+  const ready = requireReady(loadSite(listed));
+  if (ready.mode !== 'snapshot') return refuseStoreBacked();
   const values = body['values'] ?? [];
   const templates = body['templates'] ?? [];
   if (!Array.isArray(values) || !Array.isArray(templates) || values.length + templates.length === 0) {
@@ -590,18 +675,29 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
   const descriptor = structuredClone(ready.descriptor);
   const next = structuredClone(ready.snapshot);
   const edits: Array<{ key: string; locale: string; value: unknown }> = [];
+  const stale: Array<{ key: string; locale: string; disk: unknown }> = [];
   for (const raw of values) {
-    if (typeof raw !== 'object' || raw === null) throw new UsageError('each value is { key, locale?, value }');
-    const entry = raw as { key?: unknown; locale?: unknown; value?: unknown };
+    if (typeof raw !== 'object' || raw === null) throw new UsageError('each value is { key, locale?, value, base? }');
+    const entry = raw as { key?: unknown; locale?: unknown; value?: unknown; base?: unknown };
     const key = typeof entry.key === 'string' ? entry.key : '';
     const locale = typeof entry.locale === 'string' ? entry.locale : config.locales.default;
     if (!Object.hasOwn(descriptor.keys, key)) return json({ error: `undeclared key: ${key}` }, 400);
     const from = descriptor.keys[key]?.derivesFrom;
     if (from !== undefined) return json({ error: `${key} derives from ${from} — edit its template instead` }, 400);
     if (!config.locales.enabled.includes(locale)) return json({ error: `locale ${locale} is not enabled` }, 400);
+    // The stored value the edit started from, against the disk's as this
+    // request read it: an agent's or another process's write since is never
+    // silently overwritten. A value sent without a base is not checked.
+    if (Object.hasOwn(entry, 'base')) {
+      const block = Object.hasOwn(ready.snapshot, locale) ? ready.snapshot[locale] : undefined;
+      const disk = block !== undefined && Object.hasOwn(block, key) ? block[key] : null;
+      if (JSON.stringify(canonicalize(disk)) !== JSON.stringify(canonicalize(entry.base ?? null))) stale.push({ key, locale, disk });
+    }
     (next[locale] ??= {})[key] = entry.value;
     edits.push({ key, locale, value: entry.value });
   }
+  // Before the gate, and nothing written: each clashing key is named with the disk's words.
+  if (stale.length > 0) return json({ error: 'changed on disk since the page loaded', stale }, 409);
   const retemplated: string[] = [];
   for (const raw of templates) {
     if (typeof raw !== 'object' || raw === null) throw new UsageError('each template is { key, tmpl }');
@@ -1226,12 +1322,12 @@ async function splitPlace(req: Request, site: SiteState): Promise<Response> {
 
 /**
  * The commits that touched the snapshot — and, on an html host, the documents
- * beside it. Git has no per-key history, and the page labels the table as what
- * it is. A store-backed site's history is the mount's.
+ * beside it, on a snapshot site and a store-backed one alike, since both keep
+ * their forms in git. A key's own past values are `key-history`'s, or on a
+ * store-backed site the mount's.
  */
 function history(site: SiteState): Response {
   const ready = requireReady(site);
-  if (ready.mode !== 'snapshot') return json({ mount: `/s/${ready.id}/api/stet/history` });
   // The globs go to git AS globs: an expanded file list is one argv entry per
   // document, which a static site of any size pushes past the argv limit.
   const paths = [
@@ -1257,6 +1353,49 @@ function history(site: SiteState): Response {
   return json({ commits });
 }
 
+/**
+ * `GET site/carries` — what a commit would carry: each key and locale whose
+ * canonical value on disk differs from HEAD's snapshot, with `head` (absent for a
+ * key new since HEAD) and `now` (absent where the disk holds none), and the
+ * pending forms. Put back saves `head` with `now` as its base.
+ */
+function carries(site: SiteState): Response {
+  const ready = requireReady(site);
+  const committed: Snapshot = formsAt(ready, 'HEAD')?.snapshot ?? {};
+  const blockOf = (forms: Snapshot, locale: string): Record<string, unknown> => (Object.hasOwn(forms, locale) ? forms[locale] ?? {} : {});
+  const own = (block: Record<string, unknown>, key: string): unknown => (Object.hasOwn(block, key) ? block[key] : undefined);
+  const keys: Array<{ key: string; locale: string; head: unknown; now: unknown }> = [];
+  for (const locale of new Set([...Object.keys(committed), ...Object.keys(ready.snapshot)])) {
+    const was = blockOf(committed, locale);
+    const is = blockOf(ready.snapshot, locale);
+    for (const key of new Set([...Object.keys(was), ...Object.keys(is)])) {
+      const head = own(was, key);
+      const now = own(is, key);
+      if (JSON.stringify(canonicalize(head)) !== JSON.stringify(canonicalize(now))) keys.push({ key, locale, head, now });
+    }
+  }
+  keys.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.locale < b.locale ? -1 : a.locale > b.locale ? 1 : 0));
+  return json({ keys, files: pendingForms(ready) });
+}
+
+/**
+ * `GET site/key-history?key=&locale=` — one key's past values from git
+ * (`keyHistory`), newest first, each numbered `n` oldest first, and `truncated`
+ * where a revision was too large to parse. The key must be declared and the
+ * locale enabled; the snapshot path reaches git only where it names a file
+ * inside the checkout.
+ */
+async function keyHistoryReply(url: URL, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const key = url.searchParams.get('key') ?? '';
+  const locale = url.searchParams.get('locale') ?? ready.config.locales.default;
+  if (!Object.hasOwn(ready.descriptor.keys, key)) return json({ error: `undeclared key: ${key}` }, 400);
+  if (!ready.config.locales.enabled.includes(locale)) return json({ error: `locale ${locale} is not enabled` }, 400);
+  if (insideCheckout(ready.path, join(ready.path, ready.config.snapshotPath)) === null) return json({ versions: [] });
+  const { versions, truncated } = await keyHistory(ready.path, gitSpelling(ready.config.snapshotPath), key, locale);
+  return json({ versions: versions.map((version, i) => ({ n: versions.length - i, ...version })), ...(truncated ? { truncated } : {}) });
+}
+
 /** The forms a revision holds, or null where it holds no descriptor. */
 function formsAt(site: Ready, rev: string): { descriptor: Descriptor; snapshot: Snapshot } | null {
   const descriptor = formAt(site, rev, site.config.descriptorPath, loadDescriptor);
@@ -1267,7 +1406,7 @@ function formsAt(site: Ready, rev: string): { descriptor: Descriptor; snapshot: 
 /** `sha` as a full commit hash, or a usage error: never read as an option. */
 function commitOf(site: Ready, sha: string): string {
   const found = sha.startsWith('-') ? null : gitData(site.path, ['rev-parse', '--verify', '-q', `${sha}^{commit}`]);
-  if (found === null || found.code !== 0) throw new UsageError(`${sha} is not a commit of this checkout`);
+  if (found === null || found.code !== 0) throw new UsageError(`${sha} is not a commit of this project`);
   return found.stdout.trim();
 }
 
@@ -1312,15 +1451,16 @@ function firstMarks(set: HtmlProposalSet, keys: readonly string[]): Map<string, 
  * `GET site/removed?sha=` — the keys a commit removed, each with the section
  * the naming rule gives its first mark in the document at `<sha>^` (the item
  * rule's word, read above a repeated item), else the entry's `section`, and its
- * default-locale text at `<sha>^`.
+ * default-locale text at `<sha>^`; on a JavaScript host, each with the places
+ * its reads had at `<sha>^`. A store-backed site's forms are in git too.
  */
 function removed(url: URL, site: SiteState): Response {
   const ready = requireReady(site);
-  if (ready.mode !== 'snapshot') return json({ keys: [] });
   const sha = commitOf(ready, url.searchParams.get('sha') ?? '');
   const { keys, before } = removedKeysOf(ready, sha);
   if (before === null || keys.length === 0) return json({ keys: [] });
   const marks = ready.host === 'html' ? firstMarks(documentsAt(ready, `${sha}^`), keys) : new Map<string, HtmlMark>();
+  const places = ready.host === 'html' ? null : placesAt(ready, `${sha}^`, before.descriptor, keys);
   const locale = ready.config.locales.default;
   return json({
     keys: keys.map((key) => {
@@ -1329,9 +1469,45 @@ function removed(url: URL, site: SiteState): Response {
         key,
         section: marks.get(key)?.sectionWord ?? before.descriptor.keys[key]?.section ?? null,
         text: typeof value === 'string' ? value : Array.isArray(value) ? value.join(', ') : '',
+        ...(places === null ? {} : { places: places.get(key) ?? [] }),
       };
     }),
   });
+}
+
+/**
+ * Where `keys` were read at `rev` on a JavaScript host: the managed surfaces'
+ * lines git finds naming any of them (`git grep -F`, as `:(glob)` pathspecs),
+ * each file read at `rev` by the marks route's reader, and a read kept where it
+ * names one of the keys on one of those lines.
+ */
+function placesAt(site: Ready, rev: string, descriptor: Descriptor, keys: readonly string[]): Map<string, Place[]> {
+  const out = new Map<string, Place[]>();
+  if (site.config.managedSurfaces.length === 0) return out;
+  const grep = gitData(site.path, [
+    'grep', '-n', '-I', '-F', '-z',
+    ...keys.flatMap((key) => ['-e', key]),
+    rev, '--',
+    ...site.config.managedSurfaces.map((glob) => `:(glob)${glob}`),
+  ]);
+  if (grep.code !== 0) return out;
+  // Each hit is `<rev>:<file>\0<line>\0<text>`.
+  const hits = new Map<string, Set<number>>();
+  for (const record of grep.stdout.split('\n')) {
+    const [name, line] = record.split('\0');
+    if (name === undefined || line === undefined || !name.startsWith(`${rev}:`)) continue;
+    const file = name.slice(rev.length + 1);
+    hits.set(file, (hits.get(file) ?? new Set()).add(Number(line)));
+  }
+  const wanted = new Set(keys);
+  for (const [file, lines] of [...hits].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    const shown = gitData(site.path, ['show', `${rev}:./${file}`]);
+    if (shown.code !== 0) continue;
+    for (const { key, place } of readsIn(file, shown.stdout, descriptor)) {
+      if (wanted.has(key) && lines.has(place.line)) out.set(key, [...(out.get(key) ?? []), place]);
+    }
+  }
+  return out;
 }
 
 /**
@@ -1533,6 +1709,39 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
 }
 
 /**
+ * The email preview: one declared template rendered through its render pointer
+ * with the request's drafts over the snapshot's words, or over the selected
+ * environment's drafts on a store-backed site. The reply is JSON — the markup is
+ * host code's output and travels as data, for a frame that runs no scripts — or
+ * `{ failure }` naming why nothing rendered.
+ */
+async function emailPreview(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const body = await readJson(req);
+  const name = reqStr(body, 'template');
+  if (!Object.hasOwn(ready.descriptor.templates ?? {}, name)) return json({ error: `unknown template: ${name}` }, 400);
+  const locale = typeof body['locale'] === 'string' ? body['locale'] : ready.config.locales.default;
+  if (!ready.config.locales.enabled.includes(locale)) return json({ error: `locale ${locale} is not enabled` }, 400);
+  const sent = body['drafts'] ?? {};
+  if (typeof sent !== 'object' || sent === null || Array.isArray(sent)) throw new UsageError('drafts is { key: value }');
+  const env = typeof body['env'] === 'string' ? body['env'] : undefined;
+  const store = ready.mode === 'snapshot' ? null : await storeOf(ctx, ready, env);
+  const drafts = new Map(Object.entries(sent));
+  return json(await renderPreview(renderIo(ctx, ready), ready, store, { template: name, locale, drafts }, ctx.renderDeadlineMs));
+}
+
+/**
+ * The environment a host template renders in: the checkout's `.env` files and
+ * the base variables. No connection variable of any environment reaches host
+ * code, and the run token is out of it.
+ */
+function renderIo(ctx: DevContext, ready: Extract<SiteState, { state: 'ready' }>): CliIo {
+  const env = connectionEnv(ready, ctx.launched);
+  for (const name of [...connectionNames(ready.config), 'STET_DEV_TOKEN']) delete env[name];
+  return siteIo(ready.path, env, { out: [], err: [] });
+}
+
+/**
  * `/s/<id>/api/stet/<route>` — the package's own mounted handler over this
  * site's store.
  *
@@ -1543,18 +1752,34 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
  * the dashboard is not the site's production API.
  */
 async function mountRoute(ctx: DevContext, req: Request, url: URL): Promise<Response> {
+  // Render and test send run host code and write nothing to the checkout (the
+  // store's writes are the store's): they wait behind no other route of the site.
+  const queued = !RENDERING_ROUTES.has(url.pathname.split('/').filter(Boolean).pop() ?? '');
   return withSite(ctx, url, async (site) => {
     const ready = requireReady(site);
+    const store = await storeOf(ctx, ready, envOf(url));
+    // `stet dev` carries the compiler, so its mount renders through each template's
+    // pointer; `createStetHandler` itself reaches no child process. A test send is
+    // wired only where the config names the host's send function, and sends what
+    // this request's render produced.
+    const io = renderIo(ctx, ready);
+    const last: LastRender = { current: null };
+    const emailSend = ready.config.emailSend;
     const handler = createStetHandler({
-      store: await storeOf(ctx, ready, envOf(url)),
+      store,
       descriptor: ready.descriptor,
       auth: 'STET_DEV_TOKEN',
+      renderEmail: mountRenderer(io, ready, store, last, ctx.renderDeadlineMs),
+      ...(emailSend === undefined ? {} : { sendTest: mountSender(io, ready, emailSend, last, ctx.renderDeadlineMs) }),
     });
     if (req.method === 'GET') return handler.GET(req);
     if (req.method === 'POST') return handler.POST(req);
     return json({ error: 'not found' }, 404);
-  });
+  }, queued);
 }
+
+/** The mounted API's routes that run a host template: the mount reads the last path segment. */
+const RENDERING_ROUTES = new Set(['render', 'test-send']);
 
 /**
  * The adapter for one site and one environment, built once and kept.
@@ -1575,9 +1800,21 @@ async function storeOf(
   const key = JSON.stringify([site.path, env ?? null]);
   const held = ctx.stores.get(key);
   if (held !== undefined) return held;
-  const store = await resolveStore(site.config, connectionEnv(site, ctx.launched), ctx.storeFor?.(site.path, env), env);
-  ctx.stores.set(key, store);
-  return store;
+  // Requests outside the site's queue (a render) can ask while another is still
+  // opening the adapter: they share the one open, so a second adapter, and a
+  // second pool, is never built.
+  const opening = (ctx.opening ??= new Map<string, Promise<StoreAdapter>>());
+  let building = opening.get(key);
+  if (building === undefined) {
+    building = resolveStore(site.config, connectionEnv(site, ctx.launched), ctx.storeFor?.(site.path, env), env)
+      .then((store) => {
+        ctx.stores.set(key, store);
+        return store;
+      })
+      .finally(() => opening.delete(key));
+    opening.set(key, building);
+  }
+  return building;
 }
 
 /**
@@ -1609,7 +1846,7 @@ async function staticRoute(ctx: DevContext, req: Request, url: URL): Promise<Res
     // disk is never written.
     const read = readFileSync(file);
     const body = file.endsWith('.html')
-      ? Buffer.from(injectAgent(read.toString('latin1'), ctx.origin, previewChannel(ctx), PREVIEW_AGENT_ROUTE), 'latin1')
+      ? Buffer.from(injectAgent(read.toString('latin1'), ctx.origin, previewChannel(ctx), PREVIEW_AGENT_ROUTE, false), 'latin1')
       : read;
     return new Response(req.method === 'HEAD' ? null : new Uint8Array(body), {
       status: 200,
@@ -1770,6 +2007,96 @@ function marks(site: SiteState): Response {
 }
 
 /**
+ * Which declared keys the site's source reads (`keyUsage`): the dashboard's
+ * unread-key badge. Each file's facts stay in `ctx` between requests and are
+ * read again only when the file's size or mtime moves.
+ */
+async function usage(ctx: DevContext, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const caches = (ctx.usage ??= new Map());
+  const cache = caches.get(ready.path) ?? usageCache();
+  caches.set(ready.path, cache);
+  return json(await keyUsage(ready.path, ready.config, ready.descriptor, cache));
+}
+
+/**
+ * The keys one route's files read: on the static-HTML host the marks of the
+ * document served at the route; on a JavaScript host the keys named in the
+ * route's page files (`routeFiles`) and everything they import, through the
+ * host's path aliases. `complete` is false where the walk met a file it could
+ * not follow or the route maps to no file.
+ */
+async function routeReads(url: URL, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const route = url.searchParams.get('route');
+  if (route === null) throw new UsageError('route is required');
+  const unmapped = { route, files: [], keys: [], complete: false };
+  if (ready.host === 'html') {
+    const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
+    const document = set.documents.find((d) => normalizeRoute(servedRoute(d.file)) === normalizeRoute(route));
+    if (document === undefined) return json(unmapped);
+    const keys = [...new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key))].sort();
+    return json({ route, files: [document.file], keys, complete: true });
+  }
+  const files = routeFiles(ready.path, route, ready.config);
+  if (files === null) return json(unmapped);
+  const ts = await loadTypescript();
+  const mappings = pathAliasMappings(ready.path);
+  const packages = packageNames(ready.path);
+  // The host's own resolution first, `baseUrl` and `paths` included; only a
+  // bare name that is a package of the project (declared, installed or built
+  // in) is not the host's source. A bare name that is none is an alias the
+  // walk does not know.
+  const alias = (fromRel: string, spec: string): string | null | undefined => {
+    for (const candidate of resolveSpecifier(spec, fromRel, ready.path, mappings)) {
+      const found = probeFile(ready.path, candidate);
+      if (found !== null) return found;
+    }
+    return isBarePackage(spec) && packages(spec) ? undefined : null;
+  };
+  // A file nested past the compiler's recursion cannot be walked: the route
+  // is answered incomplete, with the keys read before it.
+  let chain: Chain;
+  try {
+    chain = importClosure(ts, ready.path, files, alias, (rel) => insideCheckout(ready.path, join(ready.path, rel)) !== null);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    return json({ route, files, keys: [], complete: false });
+  }
+  const declared = new Set(Object.keys(ready.descriptor.keys));
+  const own = ownFiles(ready.config);
+  const keys = new Set<string>();
+  let complete = !chain.boundary;
+  for (const file of chain.files) {
+    // The files stet writes name every key, and read none.
+    if (own.has(file.rel) || isGenerated(file.text)) continue;
+    try {
+      for (const key of namedKeys(ts, file.rel, file.text, declared)) keys.add(key);
+      if (importsLazily(ts, file.rel, file.text)) complete = false;
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      complete = false;
+    }
+  }
+  return json({ route, files, keys: [...keys].sort(), complete });
+}
+
+/** Whether a file holds a dynamic `import()` or a `require()` call: a module the walk would not see. */
+export function importsLazily(ts: typeof import('typescript'), rel: string, text: string): boolean {
+  if (!/\b(?:import|require)\s*\(/.test(text)) return false;
+  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
+  const found = (node: TS.Node): boolean =>
+    (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) ||
+    ts.forEachChild(node, found) === true;
+  try {
+    return found(sf);
+  } catch (error) {
+    if (error instanceof RangeError) return true; // too deeply nested to read: not known to be free of one
+    throw error;
+  }
+}
+
+/**
  * Where a key renders, as the route answers it: the place, what kind of text it
  * is in the page's words (`kindOf`, the vocabulary role names are made from),
  * and whether it is a head text.
@@ -1808,41 +2135,52 @@ function keyReads(site: Ready): Record<string, Place[]> {
     } catch {
       continue;
     }
-    const dialect = dialectOf(file);
-    const lineAt = lineIndex(source);
-    // Markup stet cannot read — nesting deeper than the tokenizer's walk, say —
-    // leaves the file's reads with their file and line, and the route answers.
-    let document: Document | null = null;
-    try {
-      if (dialect === 'html') document = readDocument(file, source, dialect);
-      else if (dialect !== null && dialect !== 'mdx') {
-        const markup = selfClosedRaw(dialect === 'vue' ? vueMarkup(source) : source);
-        document = readDocument(file, maskExpressions(markup, dialect), dialect);
-      }
-    } catch {
-      document = null;
-    }
-    const code = dialect === null ? null : dialectCode(source, dialect);
-    const spans = code === null ? null : [...code.scripts, ...code.expressions];
-    for (const found of source.matchAll(KEY_READ)) {
-      const key = found[2] ?? found[4] ?? found[5] ?? '';
-      if (!Object.hasOwn(site.descriptor.keys, key)) continue;
-      const at = found.index;
-      if (spans !== null && !within(spans, at)) continue;
-      const place: KeyPlace & { head?: true } = { file, line: lineAt(at) };
-      if (document !== null && !document.blanked.slice(at, at + found[0].length).includes('\0')) {
-        try {
-          const element = elementAt(document.roots, at);
-          Object.assign(place, element);
-          if (element.tag !== undefined && isHeadKind(place)) place.head = true;
-        } catch {
-          document = null;
-        }
-      }
-      out.set(key, [...(out.get(key) ?? []), withKind(place)]);
-    }
+    for (const { key, place } of readsIn(file, source, site.descriptor)) out.set(key, [...(out.get(key) ?? []), place]);
   }
   return Object.fromEntries(out);
+}
+
+/**
+ * One file's reads of `descriptor`'s keys, each with its place and kind — the
+ * reader `keyReads` runs over the checkout, and `removed` over a revision's
+ * text.
+ */
+function readsIn(file: string, source: string, descriptor: Descriptor): Array<{ key: string; place: Place }> {
+  const reads: Array<{ key: string; place: Place }> = [];
+  const dialect = dialectOf(file);
+  const lineAt = lineIndex(source);
+  // Markup stet cannot read — nesting deeper than the tokenizer's walk, say —
+  // leaves the file's reads with their file and line, and the route answers.
+  let document: Document | null = null;
+  try {
+    if (dialect === 'html') document = readDocument(file, source, dialect);
+    else if (dialect !== null && dialect !== 'mdx') {
+      const markup = selfClosedRaw(dialect === 'vue' ? vueMarkup(source) : source);
+      document = readDocument(file, maskExpressions(markup, dialect), dialect);
+    }
+  } catch {
+    document = null;
+  }
+  const code = dialect === null ? null : dialectCode(source, dialect);
+  const spans = code === null ? null : [...code.scripts, ...code.expressions];
+  for (const found of source.matchAll(KEY_READ)) {
+    const key = found[2] ?? found[4] ?? found[5] ?? '';
+    if (!Object.hasOwn(descriptor.keys, key)) continue;
+    const at = found.index;
+    if (spans !== null && !within(spans, at)) continue;
+    const place: KeyPlace & { head?: true } = { file, line: lineAt(at) };
+    if (document !== null && !document.blanked.slice(at, at + found[0].length).includes('\0')) {
+      try {
+        const element = elementAt(document.roots, at);
+        Object.assign(place, element);
+        if (element.tag !== undefined && isHeadKind(place)) place.head = true;
+      } catch {
+        document = null;
+      }
+    }
+    reads.push({ key, place: withKind(place) });
+  }
+  return reads;
 }
 
 /**

@@ -33,6 +33,8 @@ import { isStoreBacked } from './store.js';
 export interface WorkspaceEntry {
   /** The checkout's real path. The site's identity in every request. */
   path: string;
+  /** What the dashboard calls the project, trimmed; the folder name where absent. The folder on disk is never renamed. */
+  name?: string;
   /** The dev server the preview pane embeds — loopback only, since the frame policy admits nothing else. */
   dev?: string;
   devCommand?: string;
@@ -134,11 +136,16 @@ export function addSite(file: string, raw: string): { workspace: Workspace; adde
 export function updateSite(
   file: string,
   path: string,
-  patch: Pick<WorkspaceEntry, 'dev' | 'devCommand' | 'devStopCommand' | 'previewCommand' | 'pushAfterCommit'>,
+  patch: Pick<WorkspaceEntry, 'name' | 'dev' | 'devCommand' | 'devStopCommand' | 'previewCommand' | 'pushAfterCommit'>,
 ): Workspace {
   const workspace = readWorkspace(file);
   const entry = workspace.sites.find((site) => site.path === path);
   if (entry === undefined) throw new CliError(`${path}: not a workspace site`);
+  // An empty name clears it: the folder name shows again.
+  if (patch.name !== undefined) {
+    if (patch.name.trim() === '') delete entry.name;
+    else entry.name = patch.name.trim();
+  }
   if (patch.dev !== undefined) {
     if (!isLoopbackUrl(patch.dev)) {
       throw new CliError(`${patch.dev}: the dev URL must be http(s) on 127.0.0.1 or localhost`);
@@ -196,11 +203,14 @@ export function siteId(path: string): string {
 
 /** What a workspace entry turned out to be when the server last looked. */
 export type SiteState =
-  | { state: 'not-adopted'; name: string; path: string; id: string }
-  | { state: 'broken'; name: string; path: string; id: string; message: string }
+  | { state: 'not-adopted'; name: string; folder?: string; path: string; id: string }
+  | { state: 'broken'; name: string; folder?: string; path: string; id: string; message: string }
   | {
       state: 'ready';
+      /** The entry's display name, else the folder's. */
       name: string;
+      /** The folder's name, present only where a display name replaces it. */
+      folder?: string;
       path: string;
       id: string;
       config: StetConfig;
@@ -229,15 +239,17 @@ export type SiteState =
  */
 export function loadSite(entry: WorkspaceEntry): SiteState {
   const path = entry.path;
-  const name = basename(path);
+  const folder = basename(path);
+  const name = entry.name ?? folder;
+  const named = entry.name === undefined ? {} : { folder };
   const id = siteId(path);
-  if (!existsSync(join(path, CONFIG_FILE))) return { state: 'not-adopted', name, path, id };
+  if (!existsSync(join(path, CONFIG_FILE))) return { state: 'not-adopted', name, ...named, path, id };
 
   let config: StetConfig;
   try {
     config = loadConfig(path);
   } catch (error) {
-    return { state: 'broken', name, path, id, message: (error as Error).message };
+    return { state: 'broken', name, ...named, path, id, message: (error as Error).message };
   }
 
   const report = new Report();
@@ -245,13 +257,14 @@ export function loadSite(entry: WorkspaceEntry): SiteState {
   const snapshot = descriptor === null ? null : snapshotOf(config, path, report);
   if (descriptor === null || snapshot === null) {
     const errors = report.findings.filter((f) => f.level === 'error').map((f) => f.message);
-    return { state: 'broken', name, path, id, message: errors.join('; ') };
+    return { state: 'broken', name, ...named, path, id, message: errors.join('; ') };
   }
 
   const block = selectStoreBlock(config, undefined).block;
   return {
     state: 'ready',
     name,
+    ...named,
     path,
     id,
     config,

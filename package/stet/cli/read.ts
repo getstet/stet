@@ -12,6 +12,7 @@
 
 import { activeRow, localeChain, resolve, type StoreRow } from '../src/resolve.js';
 import { ENV_OPTION, flag, noPositionals, parse, required, text } from './args.js';
+import { keyUsage, type KeyUsage, type UsageState } from './key-usage.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence, type LoadedProject } from './project.js';
 import { CliError, Report } from './report.js';
@@ -21,6 +22,8 @@ interface ListRow {
   source: string;
   version: number | null;
   draft: boolean;
+  /** `--json` only: what the unread-key scan says of a judged key. */
+  badge?: UsageState;
 }
 
 export async function runList(args: string[], io: CliIo): Promise<number> {
@@ -39,6 +42,19 @@ export async function runList(args: string[], io: CliIo): Promise<number> {
       report.warn('store', `the configured store was unreachable — resolving from the snapshot (${answer.message ?? 'unreachable'})`);
     }
 
+    // The unread-key scan, under --json alone: the text output stays as it was.
+    // Without the compiler the rows carry no badge and `usage` is null.
+    const json = flag(values, 'json');
+    let usage: KeyUsage | null = null;
+    if (json) {
+      try {
+        usage = await keyUsage(io.cwd, project.config, project.descriptor);
+      } catch (error) {
+        if (!(error instanceof CliError)) throw error;
+        report.warn('scan', error.message);
+      }
+    }
+
     const rows: ListRow[] = [];
     for (const key of Object.keys(project.descriptor.keys).sort()) {
       const resolution = resolve(project.descriptor, project.snapshot, answer.rows, { key, locale });
@@ -49,6 +65,7 @@ export async function runList(args: string[], io: CliIo): Promise<number> {
         source: resolution.source,
         version: live?.version ?? null,
         draft: candidates.some((r) => r.status === 'draft' && localeChain(locale).includes(r.locale)),
+        ...(usage !== null && Object.hasOwn(usage.keys, key) ? { badge: usage.keys[key]?.state } : {}),
       });
     }
 
@@ -63,7 +80,10 @@ export async function runList(args: string[], io: CliIo): Promise<number> {
     }
     report.data('locale', locale);
     report.data('rows', rows);
-    return report.emit(io, { json: flag(values, 'json') });
+    if (json) {
+      report.data('usage', usage === null ? null : { prefixes: usage.prefixes, causes: usage.causes, files: usage.files, root: usage.root });
+    }
+    return report.emit(io, { json });
   } finally {
     await project.dispose();
   }

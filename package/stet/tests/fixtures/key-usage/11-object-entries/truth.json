@@ -1,0 +1,7 @@
+{
+  "live": [
+    "faq_1",
+    "faq_2"
+  ],
+  "note": "iteration over the whole map, filtered by a word that is not a declared separator-ended prefix"
+}

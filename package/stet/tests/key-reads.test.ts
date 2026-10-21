@@ -4,9 +4,13 @@
  * occurrence of a leaving key is a read stet rewrites, a read it cannot
  * rewrite, or a mention.
  */
-import { describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { bindingsOf, dialectCode, planReadRenames, readFormAt, within } from '../cli/key-reads.js';
+import { afterAll, describe, expect, it } from 'vitest';
+
+import { bindingsOf, codeOf, dialectCode, planReadRenames, readFormAt, stetModuleTest, within } from '../cli/key-reads.js';
 import { applyFileEdits } from '../cli/rewrite.js';
 import { dialectOf, loadTypescript, type Dialect } from '../cli/source-scan.js';
 
@@ -380,5 +384,63 @@ describe('brace expressions (delta review)', () => {
     ]) {
       expect(classes('src/pages/a.astro', ASTRO(`<p>{copy.nav_docs}</p>\n${shape}`)).unparsed, shape).toEqual([5]);
     }
+  });
+});
+
+describe('codeOf', () => {
+  /** Whether the first `needle` (at `nth`) is code in `found`: in `code` and not in `nonCode`. */
+  const isCode = (found: { code: { start: number; end: number }[]; nonCode: { start: number; end: number }[] }, source: string, needle: string, nth = 0): boolean => {
+    let at = -1;
+    for (let i = 0; i <= nth; i++) at = source.indexOf(needle, at + 1);
+    if (at === -1) throw new Error(`no ${needle}`);
+    return within(found.code, at) && !within(found.nonCode, at);
+  };
+
+  it('reads a .tsx file as one region, its comment and its JSX text the spans that are not code', () => {
+    const source = "import { copy } from '../copy';\n// nav_docs in a comment\nexport const A = () => <p title={copy.nav_docs}>nav_docs as text</p>;\n";
+    const found = codeOf(ts, 'app/a.tsx', source, null);
+    expect(found).not.toBeNull();
+    if (found === null) return;
+    expect(found.regions).toEqual([{ start: 0, end: source.length, text: source }]);
+    expect(found.code).toEqual([{ start: 0, end: source.length }]);
+    expect(found.braces).toEqual([]);
+    expect(isCode(found, source, 'nav_docs', 0)).toBe(false);
+    expect(isCode(found, source, 'nav_docs', 1)).toBe(true);
+    expect(isCode(found, source, 'nav_docs', 2)).toBe(false);
+  });
+
+  it('reads an .astro file as its front matter and its braces, never its markup', () => {
+    const source = '---\nimport { copy } from "../copy";\n---\n<p>nav_docs in prose</p>\n<h1>{copy.nav_docs}</h1>\n';
+    const found = codeOf(ts, 'src/pages/a.astro', source, 'astro');
+    expect(found).not.toBeNull();
+    if (found === null) return;
+    expect(found.regions.map((r) => r.text)).toEqual(['import { copy } from "../copy";']);
+    expect(found.braces.map((b) => source.slice(b.start, b.end))).toEqual(['{copy.nav_docs}']);
+    expect(isCode(found, source, 'import')).toBe(true);
+    expect(isCode(found, source, 'nav_docs', 0)).toBe(false);
+    expect(isCode(found, source, 'nav_docs', 1)).toBe(true);
+  });
+
+  it('answers null for a file that is neither the TypeScript family nor a dialect', () => {
+    expect(codeOf(ts, 'docs/notes.md', 'copy.nav_docs\n', null)).toBeNull();
+  });
+});
+
+describe('stetModuleTest', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('resolves a specifier through the host\'s path alias to one of the targets', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'stet-module-test-'));
+    made.push(cwd);
+    writeFileSync(join(cwd, 'tsconfig.json'), JSON.stringify({ compilerOptions: { paths: { '@/*': ['./*'] } } }));
+    mkdirSync(join(cwd, 'lib'));
+    writeFileSync(join(cwd, 'lib/content.ts'), 'export const copy = {};\n');
+    const test = stetModuleTest(cwd, ['lib/content.ts'])('app/page.tsx');
+    expect(test('@/lib/content')).toBe(true);
+    expect(test('../lib/content')).toBe(true);
+    expect(test('@/lib/other')).toBe(false);
   });
 });

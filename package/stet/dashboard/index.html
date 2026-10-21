@@ -25,6 +25,8 @@ body{margin:0;background:hsl(var(--bg));color:hsl(var(--fg));font:13px/1.5 ui-sa
 .it{display:block;width:100%;text-align:left;font:inherit;background:transparent;border:1px solid transparent;border-radius:6px;
  padding:6px 8px;cursor:pointer;color:inherit;margin-bottom:2px;font-size:12.5px;position:relative}
 .it:hover{background:hsl(var(--sba))}.it.on{background:hsl(var(--sba));font-weight:600}
+.prow{display:flex;flex-wrap:wrap;align-items:flex-start;gap:3px}.prow>.it{flex:1;min-width:0;width:auto;overflow-wrap:anywhere}.prow>.rn{margin-top:4px}.prow>.rf{flex-basis:100%;padding:0 3px 4px}
+@media(max-width:760px){.prow>.rn{min-height:36px}}
 .it .u{display:block;font-size:10.5px;color:hsl(var(--mf));font-family:ui-monospace,Menlo,monospace;font-weight:400}
 .it .n{position:absolute;right:7px;top:6px;background:hsl(var(--am));color:#000;border-radius:999px;font-size:10px;font-weight:700;padding:0 5px}
 .side .sep{border-top:1px solid hsl(var(--sbd));margin:11px 3px 0}
@@ -58,6 +60,7 @@ body{margin:0;background:hsl(var(--bg));color:hsl(var(--fg));font:13px/1.5 ui-sa
 textarea.in{resize:vertical;line-height:1.6}
 .bdg{font-size:10.5px;padding:1px 6px;border-radius:999px;border:1px solid hsl(var(--bd));color:hsl(var(--mf));white-space:nowrap}
 .bdg.d{border-color:hsl(var(--am));color:hsl(var(--am));font-weight:600}
+button.bdg{font:inherit;font-size:10.5px;font-weight:600;background:transparent;cursor:pointer}
 .bdg.g{border-color:hsl(var(--gr));color:hsl(var(--gr))}
 .bdg.b{border-color:hsl(var(--bl));color:hsl(var(--bl))}
 .bdg.v{border-color:hsl(var(--vi));color:hsl(var(--vi))}
@@ -111,6 +114,12 @@ body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-ev
 #giterr{margin:10px 16px 0}
 #panetools{flex-wrap:wrap}
 @media(max-width:760px){.shell{grid-template-columns:minmax(0,1fr)}.side{border-right:0;border-bottom:1px solid hsl(var(--sbd))}.tg button{padding:4px 8px}}
+/* At 760 px and narrower the selected key's editor sits directly under the preview, and the key list follows it, so a tap and its field share one screen. */
+@media(max-width:760px){#main{display:flex;flex-direction:column}#main>*{min-width:0}.edcol{order:-1}.edcol>*{min-width:0}.edcard{order:-1}}
+/* On a short phone screen the frame is capped so it and the selected field fit together. */
+@media(max-width:760px){.devwrap{height:min(420px,calc(100vh - 230px));min-height:0}}
+@media(max-width:760px){[data-tpl] .ch h3,[data-tpl-meta] span{overflow-wrap:anywhere;min-width:0}}
+@media(max-width:760px){[data-tpl-send] .btn,[data-tpl-send] .in{min-height:36px}}
 .btn.amb{border-color:hsl(38 75% 45%);color:hsl(38 80% 38%);font-weight:700}
 [data-theme="dark"] .btn.amb{color:hsl(38 85% 62%)}
 .pg{border:1px solid hsl(var(--bd));border-radius:8px;overflow:hidden}
@@ -211,6 +220,20 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
 .lhi code{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;color:hsl(var(--mf))}
 .lhmsg{white-space:pre-wrap;overflow-wrap:anywhere}
 @media(max-width:760px){.lhbar .btn,.lhbar .tg button,.lhi .btn{min-height:36px;padding:6px 12px}}
+.bdg.wr{white-space:normal;overflow-wrap:anywhere}
+.cnt.amb{color:hsl(var(--am));font-weight:600}
+#panenote>div+div{margin-top:3px}
+#panepick,#paneinfo{padding:6px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px}
+#panepick .btn{margin:5px 5px 0 0}
+#paneinfo .hl{margin-bottom:3px}
+#paneinfo .cards{padding:6px 0 0;border-bottom:0}
+#hoverlabel,#counter{position:fixed;z-index:20;pointer-events:none;border-radius:5px;padding:2px 7px;font-size:11px;white-space:nowrap}
+#hoverlabel{background:hsl(var(--pri));color:hsl(var(--pf))}
+#counter{background:hsl(var(--card));border:1px solid hsl(var(--bd))}
+#popover{position:fixed;z-index:21;width:320px;max-width:calc(100vw - 16px);background:hsl(var(--card));border:1px solid hsl(var(--bd));
+ border-radius:var(--r);box-shadow:0 6px 24px hsl(0 0% 0% / .18);padding:8px}
+#popover .ph{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;margin-bottom:5px;overflow-wrap:anywhere}
+#popover .muted{font-size:11px;margin-top:4px}
 </style>
 </head>
 <body data-theme="light">
@@ -218,10 +241,10 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
   <aside class="side">
     <div class="brand"><div class="m">s</div><b>stet</b></div>
     <div class="edsub" id="edsub"></div>
-    <div class="lbl">Checkouts</div><div id="projs"></div>
+    <div class="lbl">Projects</div><div id="projs"></div>
     <div style="padding:4px 3px 0">
-      <input class="in sm" id="addpath" placeholder="/absolute/path/to/checkout">
-      <button class="btn sm" style="margin-top:5px;width:100%" data-act="addSite">Add a checkout</button>
+      <input class="in sm" id="addpath" placeholder="/absolute/path/to/project">
+      <button class="btn sm" style="margin-top:5px;width:100%" data-act="addSite">Add a project</button>
       <div class="err" id="adderr" style="display:none"></div>
     </div>
     <div class="scoped" id="pjnote">from ~/.stet/projects.json — select one to edit</div>
@@ -236,7 +259,7 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
         <button class="envchip" id="envchip" data-act="cycleEnv"></button>
         <span id="branchbar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"></span>
         <div class="muted" id="crumb"></div></div>
-      <div style="display:flex;gap:10px;align-items:center"><span class="bdg d" id="dc" hidden></span>
+      <div style="display:flex;gap:10px;align-items:center"><button class="bdg d" id="dc" data-act="unsaved" hidden></button>
         <span id="gitbar" style="display:flex;gap:8px;align-items:center"></span>
         <button class="btn sm" data-act="theme">Theme</button></div></div>
     <div id="giterr" hidden></div>
@@ -244,10 +267,15 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
     <div class="tabs" id="tabs"></div>
     <div class="wrap" id="work"><div id="main"></div>
       <div id="grip" role="separator" aria-orientation="vertical" aria-controls="main" tabindex="0" aria-label="Resize the key column" title="Drag to resize the key column. Double-click to restore its width."></div>
-      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
+      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="paneenv" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="paneshow" hidden></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panepick" hidden></div><div id="paneinfo" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
   </main>
 </div>
 <div id="tst"></div>
+<div id="hoverlabel" hidden></div>
+<div id="counter" class="cnt" hidden></div>
+<div id="popover" hidden><div class="ph"><span class="mono" id="popkey"></span><span class="cnt" id="popcount"></span></div>
+  <textarea class="in" id="poptext" rows="2"></textarea>
+  <div class="muted">Enter keeps it · Esc puts it back</div></div>
 <script nonce="__STET_NONCE__">
 // The local dashboard. Everything on this page is a call to a route on the
 // server that served it, and every route is a call the CLI already makes.
@@ -331,14 +359,37 @@ const S = {
   recent: null,
   preview: null,
   devlog: null,
+  // The mount's rows of the selected environment (`GET …/keys`), on a store-backed site.
   rows: null,
+  // The Scheduled tab's scheduled changes.
+  scheduled: null,
+  // The selected environment's open changes, the active one, and the name of every change seen, by id.
   changes: null,
+  change: null,
+  changeNames: {},
+  // A remembered change no longer open, by name; the New change form; Discard change's question; Publish change's refusal.
+  closed: null,
+  changeForm: null,
+  discardAsk: false,
+  changeError: '',
+  // What the preview shows in place of the ordinary layer: { kind: 'change' | 'published' | 'version', … } or null.
+  showing: null,
+  // The selected key's published versions in the selected environment: { key, locale, rows }.
+  keyHistory: null,
+  // Saves another editor's draft refused, each waiting for Take over or its no: { kind, key, locale, value, editor, since, change?, name? }.
+  held: [],
   removal: null,
   // The same-words question a save asked, Save anyway's question, Publish's,
   // a History row opened with the keys its commit removed, Restore's question
   // and the markup it handed back, and a place being given its own key.
   same: null,
   overLimit: null,
+  // The keys a snapshot save found changed on disk since the edit began, each { key, locale, disk }, and the
+  // 'locale key' drafts Save mine over it resends without their base.
+  staleKeys: [],
+  mine: [],
+  // The header's Commit opened: what the commit carries ({ keys, files }) and a refused Put back's line.
+  commitPanel: null,
   publishAsk: false,
   previewLink: null,
   opened: null,
@@ -360,7 +411,43 @@ const S = {
   located: null,
   confirmed: new Set(),
   saveCheck: null,
+  // Who owns the frame: Edit on the Content tab, else Use.
+  mode: 'edit',
+  // The open in-place edit, { key, locale, entry, form, before, rect }: the
+  // locale is the selector's when it started, and every proposal is pinned to it.
+  edit: null,
+  // Per '<locale> <key>', the stored value the first keystroke of a draft started from.
+  base: {},
+  // The sidebar's open Rename field, { path, value } or null.
+  renaming: null,
+  // The header's list of unsaved edits is open; the project switch waiting on Leave or Cancel, { path } or null.
+  unsavedOpen: false,
+  leaveAsk: null,
+  // The unsaved edits of each environment not selected, { draft, base } by name (D45).
+  stashed: {},
+  // The agent's last census, and what every census of this site has found in this tab (`seen`).
+  census: null,
+  seen: { keys: new Set(), routes: new Set(), read: new Set() },
+  // The frame's hover, an ambiguous pick's keys, the dashboard's field over the frame.
+  hover: null,
+  choose: null,
+  popover: null,
+  // The unread-key scan, the open route's reads, a click on text no key matches,
+  // the key a pick warned about, the route the app moved to, and Page info's panel.
+  usage: null,
+  routeReads: null,
+  unmanaged: null,
+  warn: null,
+  moved: null,
+  pageInfo: false,
+  // The Templates tab: the slot being edited, the frame's width preset, and each template's last render
+  // ({ html, subject, preheader, failure, ... }) under the project, environment and language it was made for.
+  tplKey: null,
+  tplWidth: 'desktop',
+  tpl: { ctx: '', byName: {} },
 };
+// What each site's censuses found, for the life of the tab.
+const SEEN = new Map();
 
 /** The page's one own-property test, for every map it did not build itself. */
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
@@ -406,13 +493,11 @@ const storeBacked = () => !!(ready() && S.site.mode !== 'snapshot');
 const keyDef = (id) => (ready() && Object.prototype.hasOwnProperty.call(S.site.descriptor.keys, id))
   ? S.site.descriptor.keys[id] : null;
 
-/** The value shown for a key: the unsaved edit, else the snapshot's. */
+/** The value shown for a key: the unsaved edit, else the stored one. */
 function valueOf(id, locale) {
   const loc = locale || S.locale;
   const held = S.draft[loc + ' ' + id];
-  if (held !== undefined) return held;
-  const block = (S.site && S.site.snapshot && S.site.snapshot[loc]) || {};
-  return Object.prototype.hasOwnProperty.call(block, id) ? block[id] : undefined;
+  return held !== undefined ? held : storedValue(id, loc);
 }
 /** The default locale's value, for the fallback line a translated key shows. */
 function defaultValue(id) {
@@ -469,20 +554,53 @@ function shownValue(id, locale, seen) {
 const edited = (id) => S.draft[S.locale + ' ' + id] !== undefined || own(S.tmpl, id);
 const edits = () => Object.keys(S.draft).length + Object.keys(S.tmpl).length;
 const dirty = () => edits() > 0;
-/** The value a locale's snapshot holds for a key, or undefined. */
-function savedValue(id, locale) {
-  const block = (S.site && S.site.snapshot && own(S.site.snapshot, locale)) ? S.site.snapshot[locale] : {};
+/** A key's draft row, or its active row, in one locale of the selected environment's rows. */
+function rowOf(id, loc, status) {
+  const rows = S.rows || [];
+  return rows.find((r) => r.key === id && r.locale === loc && (status === 'draft' ? r.status === 'draft' : r.is_active === true));
+}
+/** The saved value of a key: on a store-backed site its draft, else its active row; else the locale's snapshot. */
+function storedValue(id, loc) {
+  if (storeBacked()) {
+    const draft = rowOf(id, loc, 'draft');
+    if (draft) return draft.value;
+    const active = rowOf(id, loc, 'active');
+    if (active) return active.value;
+  }
+  const block = (S.site && S.site.snapshot && own(S.site.snapshot, loc)) ? S.site.snapshot[loc] : {};
   return own(block, id) ? block[id] : undefined;
 }
-/** A draft typed back to the saved value is no draft: it leaves the map, so Save greys again. */
-function setDraft(id, value) {
-  const k = S.locale + ' ' + id;
-  const saved = savedValue(id, S.locale);
-  // A locale with no saved value reads as empty: typing and then clearing leaves no draft.
+/**
+ * A key's draft in one locale. A draft typed back to the stored value is no
+ * draft: it leaves the map with its base, so Save greys again. A locale with no
+ * stored value reads as empty: typing and then clearing leaves no draft.
+ */
+function setDraftIn(loc, id, value) {
+  const k = loc + ' ' + id;
+  const saved = storedValue(id, loc);
   const same = saved === undefined ? value === '' : JSON.stringify(value) === JSON.stringify(saved);
-  if (same) delete S.draft[k];
-  else S.draft[k] = value;
-  draftChanged();
+  if (same) { delete S.draft[k]; delete S.base[k]; }
+  else {
+    // The base is the stored value the first keystroke of this edit started from (§4.7).
+    if (!own(S.base, k)) S.base[k] = saved === undefined ? null : saved;
+    S.draft[k] = value;
+  }
+  draftChanged(id);
+}
+function setDraft(id, value) { setDraftIn(S.locale, id, value); }
+/** A key's value with one list entry or record field replaced by `text`; the text itself for a plain value. */
+function withEntry(id, loc, entry, text) {
+  const held = S.draft[loc + ' ' + id];
+  const value = held !== undefined ? held : storedValue(id, loc);
+  if (Array.isArray(value) && typeof entry === 'number') { const next = value.slice(); next[entry] = text; return next; }
+  if (value && typeof value === 'object' && typeof entry === 'string') return Object.assign({}, value, { [entry]: text });
+  return text;
+}
+/** Every draft dropped, and each base with it. */
+function dropDrafts() {
+  S.draft = {};
+  S.base = {};
+  S.stashed = {};
 }
 
 // --- loading ----------------------------------------------------------------
@@ -500,18 +618,23 @@ async function loadWorkspace() {
 }
 
 async function loadSite(path) {
+  // An edit open in the last project ends kept, as a locale switch ends one.
+  endEdit();
+  closePopover();
   S.path = path;
   history.replaceState(null, '', siteUrl(path));
-  S.draft = {};
+  dropDrafts();
   S.findings = [];
   S.pending = [];
   S.message = '';
   S.removal = null;
-  S.same = null; S.overLimit = null; S.publishAsk = false; S.previewLink = null;
+  S.same = null; S.overLimit = null; S.staleKeys = []; S.mine = []; S.commitPanel = null; S.publishAsk = false; S.previewLink = null;
   S.opened = null; S.restoreAsk = false; S.markup = null; S.split = null;
   S.health = null; S.seo = null; S.audit = null; auditGen += 1; S.setup = null; S.verify = null;
   S.history = null; S.recent = null; S.preview = null; S.devlog = null;
-  S.rows = null; S.changes = null;
+  S.rows = null; S.scheduled = null; S.held = []; S.keyHistory = null;
+  dropChanges();
+  S.changeNames = {};
   S.marks = { documents: [], keys: {}, places: {} };
   S.tmpl = {};
   S.gitError = null;
@@ -521,6 +644,10 @@ async function loadSite(path) {
   S.located = null;
   S.saveCheck = null;
   S.confirmed = new Set();
+  S.census = null; S.hover = null; S.choose = null; S.usage = null; S.routeReads = null; routeReadsFor = null;
+  S.unmanaged = null; S.warn = null; S.moved = null; S.pageInfo = false;
+  S.unsavedOpen = false; S.leaveAsk = null; S.renaming = null;
+  S.tplKey = null; S.tpl = { ctx: '', byName: {} };
   // A new checkout is a new route field and a new frame, and ends any start
   // wait still running for the last one.
   paneGen += 1;
@@ -530,6 +657,7 @@ async function loadSite(path) {
   S.site = res.body;
   S.env = 'default';
   S.pending = Array.isArray(S.site.pending) ? S.site.pending : [];
+  S.seen = seenOf(S.site.id);
   if (ready()) {
     // Awaited before the first group is chosen: the marks decide the groups,
     // and a group chosen before they arrive would be one they dissolve.
@@ -549,9 +677,311 @@ async function loadSite(path) {
     }
   }
   render();
+  if (storeBacked()) void guard(loadRows());
+  if (storeBacked()) void guard(loadChanges(true));
   if (ready()) void guard(loadPreview());
+  if (ready()) void guard(loadUsage());
   if (previewBranch() && S.site.git.upstream) void guard(loadPreviewLink());
   if (S.tab === 'SEO' && ready()) void guard(pollAudit());
+}
+
+/** What this tab's censuses of one site have found: the keys, the routes visited, and the routes whose reads answered complete. */
+function seenOf(id) {
+  if (!SEEN.has(id)) SEEN.set(id, { keys: new Set(), routes: new Set(), read: new Set() });
+  return SEEN.get(id);
+}
+
+/** The unread-key scan, read after the site and after every save; a site without the compiler answers none. */
+async function loadUsage() {
+  const path = S.path;
+  const res = await api('/api/site/usage' + query());
+  if (path !== S.path) return;
+  S.usage = res.ok && res.body && typeof res.body.keys === 'object' ? res.body : null;
+  // The site line above the list comes and goes with the scan: the column is painted whole.
+  render();
+}
+
+/**
+ * The selected environment's rows, read on site load, on an environment switch
+ * and after every store write: the field, the row, the census and the layer
+ * show what the store holds.
+ */
+async function loadRows() {
+  if (!storeBacked()) return;
+  const path = S.path;
+  const env = S.env;
+  const res = await api(mountPath('keys'));
+  if (path !== S.path || env !== S.env) return;
+  S.rows = res.ok && Array.isArray(res.body.rows) ? res.body.rows : null;
+  queueTemplates();
+  render();
+  postCensus();
+  locateKey(false);
+  await loadKeyHistory();
+}
+/**
+ * The selected key's past values, newest first: on a store-backed site its
+ * published versions from the mount's `history`; on a snapshot site the values
+ * git holds (`GET /api/site/key-history`). A derived key has none of its own.
+ */
+async function loadKeyHistory() {
+  if (!ready() || S.sel === null) { S.keyHistory = null; return; }
+  const want = { path: S.path, env: S.env, key: S.sel, locale: S.locale };
+  if (!storeBacked()) {
+    const def = keyDef(want.key);
+    if (!def || def.derivesFrom !== undefined) { S.keyHistory = null; return; }
+    const res = await api('/api/site/key-history' + query() + '&key=' + encodeURIComponent(want.key) + '&locale=' + encodeURIComponent(want.locale));
+    if (want.path !== S.path || want.key !== S.sel || want.locale !== S.locale) return;
+    S.keyHistory = { key: want.key, locale: want.locale, versions: res.ok && Array.isArray(res.body.versions) ? res.body.versions : [], truncated: res.ok && res.body.truncated === true };
+    render();
+    return;
+  }
+  const res = await api(mountPath('history', 'key=' + encodeURIComponent(want.key) + '&locale=' + encodeURIComponent(want.locale)));
+  if (want.path !== S.path || want.env !== S.env || want.key !== S.sel || want.locale !== S.locale) return;
+  S.keyHistory = { key: want.key, locale: want.locale, rows: res.ok && Array.isArray(res.body.rows) ? res.body.rows : [] };
+  render();
+}
+
+/** Another environment selected: its rows read, and what the last one showed dropped. */
+function switchEnv(name) {
+  // An edit open in the field ends kept first, so it is part of the edits that stay behind.
+  endEdit();
+  closePopover();
+  // Unsaved edits belong to the environment they were typed in: the new one shows its own (D45).
+  S.stashed[S.env] = { draft: S.draft, base: S.base };
+  const there = own(S.stashed, name) ? S.stashed[name] : { draft: {}, base: {} };
+  S.draft = there.draft;
+  S.base = there.base;
+  S.env = name;
+  S.rows = null;
+  S.scheduled = null;
+  S.held = [];
+  S.recent = null;
+  S.keyHistory = null;
+  dropChanges();
+  render();
+  void guard(loadRows());
+  void guard(loadChanges(true));
+}
+
+// --- the change bar ------------------------------------------------------------
+// A change groups drafts so they publish together. The active change is kept
+// for the tab, per project and environment, in sessionStorage (D16).
+/** What the last environment's changes showed, dropped. */
+function dropChanges() {
+  S.changes = null;
+  S.change = null;
+  S.closed = null;
+  S.changeForm = null;
+  S.discardAsk = false;
+  S.changeError = '';
+  S.showing = null;
+}
+const changeSlot = () => 'stet.change ' + S.site.id + ' ' + S.env;
+function recallChange() {
+  try {
+    const held = sessionStorage.getItem(changeSlot());
+    return held !== null && /^\d+$/.test(held) ? Number(held) : null;
+  } catch (e) { return null; }
+}
+function rememberChange(id) {
+  try { sessionStorage.setItem(changeSlot(), String(id)); } catch (e) { /* private window */ }
+}
+function forgetChange() {
+  try { sessionStorage.removeItem(changeSlot()); } catch (e) { /* private window */ }
+}
+/**
+ * The selected environment's open changes, and the names of its published
+ * ones. `recall` (site load, environment switch) makes the remembered change
+ * active when it is still open, and says it is closed when it is not.
+ */
+async function loadChanges(recall) {
+  if (!storeBacked()) return;
+  const path = S.path;
+  const env = S.env;
+  const open = await api(mountPath('changes', 'status=open'));
+  const published = await api(mountPath('changes', 'status=published'));
+  if (path !== S.path || env !== S.env) return;
+  S.changes = open.ok && Array.isArray(open.body.changes) ? open.body.changes : null;
+  for (const c of (S.changes || []).concat(published.ok && Array.isArray(published.body.changes) ? published.body.changes : [])) {
+    S.changeNames[c.id] = c.name;
+  }
+  if (S.changes !== null && S.change !== null) {
+    const gone = S.change;
+    const still = S.changes.find((c) => c.id === gone.id);
+    if (still) S.change = still;
+    else {
+      // Published or discarded elsewhere: the bar says so, and the next Save carries no change.
+      deactivate();
+      S.closed = gone.name;
+    }
+  }
+  if (recall && S.changes !== null) {
+    const id = recallChange();
+    const found = id === null ? undefined : S.changes.find((c) => c.id === id);
+    if (found) S.change = found;
+    else if (id !== null) {
+      forgetChange();
+      S.closed = own(S.changeNames, id) ? S.changeNames[id] : 'change ' + id;
+    }
+  }
+  render();
+}
+/** One change's drafts in the selected environment's rows, every locale. */
+const membersOf = (id) => (S.rows || []).filter((r) => r.status === 'draft' && r.changesetId === id);
+const looseDrafts = () => (S.rows || []).filter((r) => r.status === 'draft' && (r.changesetId === null || r.changesetId === undefined));
+/** src/preview.ts's pageSpan: the deduped union of the keys' declared pages, first seen first. */
+function pageSpan(descriptor, keys) {
+  const span = [];
+  for (const key of keys) {
+    const def = own(descriptor.keys, key) ? descriptor.keys[key] : undefined;
+    for (const page of (def && def.pages) || []) if (span.indexOf(page) === -1) span.push(page);
+  }
+  return span;
+}
+/** A key's live value: its active row, else the snapshot's. */
+function liveValue(id, loc) {
+  const active = storeBacked() ? rowOf(id, loc, 'active') : undefined;
+  if (active) return active.value;
+  const block = (S.site.snapshot && own(S.site.snapshot, loc)) ? S.site.snapshot[loc] : {};
+  return own(block, id) ? block[id] : undefined;
+}
+/** Above the editor on a store-backed site: the open changes, or the active one with its members. */
+function changeBar() {
+  if (!storeBacked() || S.changes === null) return '';
+  const line = (text) => '<div class="cline">' + esc(text) + '</div>';
+  const c = S.change;
+  if (c === null) {
+    const form = S.changeForm === null ? '' :
+      '<div style="margin-top:8px"><label class="muted" style="font-size:11px">Name</label>' +
+      '<input class="in sm" value="' + esc(S.changeForm.name) + '" data-act-input="changeName">' +
+      '<label class="muted" style="font-size:11px">Note</label>' +
+      '<input class="in sm" value="' + esc(S.changeForm.note) + '" data-act-input="changeNote">' +
+      '<div style="margin-top:6px"><button class="btn pri sm" data-act="changeCreate">Create</button>' +
+      '<button class="btn sm" data-act="changeFormCancel">Cancel</button></div></div>';
+    return '<div class="card" id="changebar"><div class="ch"><h3 style="font-size:12.5px">Change</h3>' +
+      '<button class="btn sm" data-act="changeNew">New change</button></div><div class="cb">' +
+      (S.closed === null ? '' : line(S.closed + ' is closed. Edits now save on their own, outside any change.')) +
+      line('No open change. Edits save and publish key by key.') +
+      (S.changeError === '' ? '' : '<div class="err" style="white-space:pre-wrap">' + esc(S.changeError) + '</div>') +
+      S.changes.map((o) => '<div style="display:flex;gap:6px;align-items:center">' +
+        line('Open changes in ' + S.env + ': ' + o.name + ' · ' + plural(membersOf(o.id).length, 'key')) +
+        '<button class="btn sm" data-act="changeResume:' + esc(o.id) + '">Resume</button></div>').join('') +
+      form + '</div></div>';
+  }
+  // In the store's order, first saved first, as the span reads them.
+  const members = membersOf(c.id);
+  const span = pageSpan(S.site.descriptor, members.map((m) => m.key));
+  const loose = looseDrafts();
+  const head = 'change · ' + c.name + ' · ' + S.env + ' · ' + plural(members.length, 'key') + (span.length === 0 ? '' : ' · ' + span.join(', '));
+  const discard = S.discardAsk
+    ? '<div class="term" style="margin-top:8px">' + esc('Discard ' + c.name + '? Its ' + members.length +
+      ' drafts are dropped. Nothing was published, so the keys keep their live values.') + '</div>' +
+      '<div style="margin-top:6px"><button class="btn dg sm" data-act="discardChange">Discard</button>' +
+      '<button class="btn sm" data-act="discardCancel">Cancel</button></div>'
+    : '';
+  return '<div class="card" id="changebar"><div class="ch"><h3 style="font-size:12.5px">' + esc(head) + '</h3></div><div class="cb">' +
+    members.map((m) => '<div style="display:flex;gap:6px;align-items:center;justify-content:space-between">' +
+      line(m.key + '  ' + shown(liveValue(m.key, m.locale)) + ' → ' + shown(m.value)) +
+      '<button class="btn sm" data-act="removeMember:' + esc(m.version) + '">Remove</button></div>').join('') +
+    (loose.length === 0 ? '' : '<div style="display:flex;gap:6px;align-items:center">' +
+      '<div class="muted">' + esc(loose.length + ' saved draft(s) is not in this change.') + '</div>' +
+      '<button class="btn sm" data-act="addToChange">Add to this change</button></div>') +
+    (c.note ? line('Note: ' + c.note) : '') +
+    (S.changeError === '' ? '' : '<div class="err" style="white-space:pre-wrap">' + esc(S.changeError) + '</div>') +
+    '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' +
+    '<button class="btn env sm" data-act="publishChange">' + esc('Publish change to ' + S.env) + '</button>' +
+    '<button class="btn sm" data-act="changePreview">Preview</button>' +
+    '<button class="btn sm" data-act="setAside">Set aside</button>' +
+    '<button class="btn dg sm" data-act="discardAsk">Discard change…</button></div>' + discard + '</div></div>';
+}
+/** A change made the active one, and remembered for the tab. */
+function activate(change) {
+  S.change = change;
+  S.closed = null;
+  S.changeError = '';
+  rememberChange(change.id);
+}
+/** The active change no longer active; it stays open unless the caller closed it. */
+function deactivate() {
+  forgetChange();
+  S.change = null;
+  S.discardAsk = false;
+  S.changeError = '';
+  if (S.showing !== null && S.showing.kind === 'change') S.showing = null;
+}
+/**
+ * A write the store refused for a closed or missing change: the open list is
+ * read again, and when the active change has left it the bar says it is
+ * closed. Whether it did, so the caller does not show the raw error.
+ */
+async function changeLost(error) {
+  const change = S.change;
+  if (change === null || !/^(change_closed|no_change):/.test(error)) return false;
+  await loadChanges(false);
+  return S.change === null || S.change.id !== change.id;
+}
+/** A draft queued for Take over; one for the same kind, key and locale is replaced, so a second press asks once. */
+function hold(entry) {
+  const at = S.held.findIndex((h) => h.kind === entry.kind && h.key === entry.key && h.locale === entry.locale);
+  if (at === -1) S.held.push(entry);
+  else S.held[at] = entry;
+}
+async function createChange() {
+  const form = S.changeForm;
+  if (form === null || form.name.trim() === '') return;
+  const res = await post(mountPath('changes'), Object.assign({ name: form.name.trim() }, form.note.trim() === '' ? {} : { note: form.note.trim() }, { editor: S.editor }));
+  if (!res.ok) { S.changeError = res.body.error || 'the store refused that change'; render(); return; }
+  S.changeForm = null;
+  activate({ id: res.body.changeId, name: form.name.trim(), note: form.note.trim() || null });
+  await loadChanges(false);
+}
+/**
+ * Drafts re-saved with a change, or with none (`null`), never with `force`:
+ * a draft another editor holds waits for Take over, queued as `kind`.
+ */
+async function moveDrafts(rows, change, kind) {
+  // Every write stays in the environment and the change the move started in (D47).
+  const env = S.env;
+  const active = S.change;
+  S.changeError = '';
+  for (const row of rows) {
+    const res = await post(mountPath('draft', undefined, env), { editor: S.editor, key: row.key, locale: row.locale, value: row.value, change: change });
+    if (res.ok) continue;
+    if (S.env !== env) break;
+    if (res.status === 409 && res.body.refused === true) {
+      hold({ kind: kind, key: row.key, locale: row.locale, value: row.value, editor: res.body.incumbentEditor, since: res.body.heldSince, change: change, name: active.name });
+      continue;
+    }
+    const error = res.body.error || 'the store refused that draft';
+    if (!(await changeLost(error))) S.changeError = error;
+    break;
+  }
+  render();
+  await loadRows();
+}
+async function publishChange() {
+  const c = S.change;
+  if (c === null) return;
+  const res = await post(mountPath('publish-change'), { change: c.id, editor: S.editor });
+  if (!res.ok) {
+    S.changeError = [res.body.error || 'the store refused that publish'].concat((res.body.findings || []).map((f) => f.message)).join('\n');
+    render();
+    return;
+  }
+  deactivate();
+  tst('Published ' + c.name);
+  await loadRows();
+  await loadChanges(false);
+}
+async function discardChange() {
+  const c = S.change;
+  if (c === null) return;
+  const res = await post(mountPath('abandon-change'), { change: c.id, editor: S.editor });
+  if (!res.ok) { S.changeError = res.body.error || 'the store refused that discard'; S.discardAsk = false; render(); return; }
+  deactivate();
+  await loadRows();
+  await loadChanges(false);
 }
 
 async function loadMarks() {
@@ -722,7 +1152,7 @@ function render() {
     'local dashboard' + (S.version ? '<br>v' + esc(S.version) : '');
   document.getElementById('pjnote').textContent = S.sites.length
     ? 'from ~/.stet/projects.json — select one to edit'
-    : 'no checkouts yet — add one below';
+    : 'no projects yet — add one below';
 
   document.getElementById('projs').innerHTML = S.sites.map((s) => {
     const on = s.path === S.path ? ' on' : '';
@@ -732,10 +1162,15 @@ function render() {
         ? 'not adopted — run stet init here'
         : 'cannot load: ' + esc(s.message);
     const kind = s.state === 'ready'
-      ? '<span class="u">' + esc(hostLabel(s)) + '</span><span class="u">' + esc('project ' + s.project) + '</span>'
+      ? '<span class="u">' + esc(hostLabel(s)) + '</span>' + (s.project === 'default' ? '' : '<span class="u">' + esc('store id ' + s.project) + '</span>')
       : '';
-    return '<button class="it' + on + '" data-act="site:' + esc(s.path) + '">' +
-      esc(siteLabel(s)) + '<span class="u">' + sub + '</span>' + kind + '</button>';
+    const folder = s.folder === undefined ? '' : '<span class="u">' + esc(s.folder) + '</span>';
+    const open = S.renaming !== null && S.renaming.path === s.path;
+    return '<div class="prow"><button class="it' + on + '" data-act="site:' + esc(s.path) + '">' +
+      esc(siteLabel(s)) + folder + '<span class="u">' + sub + '</span>' + kind + '</button>' +
+      '<button class="btn sm rn" data-act="renameOpen:' + esc(s.path) + '">Rename</button>' +
+      (open ? '<div class="rf"><input class="in sm" value="' + esc(S.renaming.value) + '" data-act-input="renameName">' +
+        '<button class="btn sm pri" style="margin-top:5px;width:100%" data-act="renameSave">Save</button></div>' : '') + '</div>';
   }).join('');
 
   for (const t of MACHINE_TABS) {
@@ -774,12 +1209,15 @@ function render() {
   paintAsk();
   document.getElementById('main').innerHTML = view();
   paintPane();
+  if (S.tab === 'Templates' && ready()) paintTemplates();
   restoreFocus();
 }
 
 /** The folder name, or — where another entry shares it — the shortest run of trailing folders no twin shares. */
 function siteLabel(s) {
-  const twins = S.sites.filter((o) => o !== s && o.name === s.name);
+  // A set name is shown as it is; the folder name is the one twins share.
+  if (s.folder !== undefined) return s.name;
+  const twins = S.sites.filter((o) => o !== s && (o.folder !== undefined ? o.folder : o.name) === s.name);
   if (twins.length === 0) return s.name;
   const parts = s.path.split('/').filter(Boolean);
   const tail = (path, n) => path.split('/').filter(Boolean).slice(-n).join('/');
@@ -838,19 +1276,164 @@ function branchBar() {
   return '<span class="bdg">' + esc(git.branch + ' · preview') + '</span>' + preview + publish;
 }
 
-/** A question the header asked (Publish to live), under the header in the removal plan's shape. */
+/** A question the header asked (Commit's panel, Publish to live), under the header in the removal plan's shape. */
 function paintAsk() {
   const box = document.getElementById('ask');
-  const show = S.publishAsk && previewBranch();
-  box.hidden = !show;
-  if (!show) { box.innerHTML = ''; return; }
-  const git = S.site.git;
-  const entry = S.sites.find((site) => site.path === S.path);
-  const name = entry ? siteLabel(entry) : S.site.name;
-  box.innerHTML = '<div class="card"><div class="cb"><div class="term">' +
-    esc('Publish ' + git.branch + ' to ' + liveBranch() + '? ' + liveBranch() + ' is what ' + name + ' serves.') + '</div>' +
-    '<div style="margin-top:8px"><button class="btn pri sm" data-act="publishLive">Publish</button>' +
-    '<button class="btn sm" data-act="publishCancel">Cancel</button></div></div></div>';
+  const parts = [];
+  if (S.leaveAsk !== null) parts.push(leaveCard());
+  if (S.unsavedOpen && dirty()) parts.push(unsavedCard());
+  if (S.commitPanel !== null && ready() && !storeBacked()) parts.push(commitPanel());
+  else if (S.publishAsk && previewBranch()) {
+    const git = S.site.git;
+    const entry = S.sites.find((site) => site.path === S.path);
+    const name = entry ? siteLabel(entry) : S.site.name;
+    parts.push('<div class="card"><div class="cb"><div class="term">' +
+      esc('Publish ' + git.branch + ' to ' + liveBranch() + '? ' + liveBranch() + ' is what ' + name + ' serves.') + '</div>' +
+      '<div style="margin-top:8px"><button class="btn pri sm" data-act="publishLive">Publish</button>' +
+      '<button class="btn sm" data-act="publishCancel">Cancel</button></div></div></div>');
+  }
+  box.hidden = parts.length === 0;
+  const html = parts.join('');
+  if (box.innerHTML !== html) box.innerHTML = html;
+}
+
+/** Every unsaved edit the selected environment holds: the drafts, then the derived keys' templates. */
+function unsavedRows() {
+  return Object.keys(S.draft).map((k) => ({ kind: 'draft', locale: k.slice(0, k.indexOf(' ')), key: k.slice(k.indexOf(' ') + 1) }))
+    .concat(Object.keys(S.tmpl).map((key) => ({ kind: 'tmpl', key: key })));
+}
+/** What a project switch or a tab close loses: this environment's edits and those stashed for the others (D45). */
+function lostEdits() {
+  return Object.keys(S.stashed).filter((name) => name !== S.env)
+    .reduce((n, name) => n + Object.keys(S.stashed[name].draft).length, edits());
+}
+/** The header count's list: each edited key with Undo and Show, and Discard all. */
+function unsavedCard() {
+  const rows = unsavedRows().map((r) => {
+    const arg = r.kind === 'draft' ? r.locale + ' ' + r.key : r.key;
+    const name = r.kind === 'draft' ? 'Edit' : 'Tmpl';
+    const label = r.kind === 'draft' && r.locale !== S.site.config.locales.default ? r.key + ' · ' + r.locale : r.key;
+    return '<div style="display:flex;gap:6px;align-items:center;margin-bottom:5px"><span class="mono" style="flex:1;min-width:0;overflow-wrap:anywhere;font-size:11.5px">' + esc(label) + '</span>' +
+      '<button class="btn sm" data-act="undo' + name + ':' + esc(arg) + '">Undo</button>' +
+      '<button class="btn sm" data-act="show' + name + ':' + esc(arg) + '">Show</button></div>';
+  }).join('');
+  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">' + esc(plural(edits(), 'unsaved edit')) + '</h3></div><div class="cb">' + rows +
+    '<div style="margin-top:8px"><button class="btn sm dg" data-act="discardAll">Discard all</button></div></div></div>';
+}
+/** The project switch or removal waiting on its answer. */
+function leaveCard() {
+  return '<div class="card"><div class="cb"><div class="term">' + esc(plural(lostEdits(), 'unsaved edit') + ' will be lost. Leave anyway?') + '</div>' +
+    '<div style="margin-top:8px"><button class="btn pri sm" data-act="leaveGo">Leave</button>' +
+    '<button class="btn sm" data-act="leaveStay">Cancel</button></div></div></div>';
+}
+/** One unsaved draft taken back to its stored value; its base goes with it. */
+function undoEdit(loc, id) {
+  endEdit();
+  closePopover();
+  const k = loc + ' ' + id;
+  delete S.draft[k];
+  delete S.base[k];
+  draftChanged();
+  if (loc === S.locale) paintDraft(id);
+  render();
+}
+/** A derived key's template edit taken back. */
+function undoTmpl(id) {
+  delete S.tmpl[id];
+  paintDerived(id);
+  paintRow(id);
+  paintDirty();
+  paintPaneCards();
+  render();
+}
+/** An edited key selected in its locale, on its group and its route. */
+function showEdit(loc, id) {
+  if (loc !== null && loc !== S.locale) { endEdit(); closePopover(); S.locale = loc; postCensus(); }
+  if (S.tab !== 'Content') { setMode('edit'); S.tab = 'Content'; }
+  if (!S.q && keysInGroup(S.group).indexOf(id) === -1) S.group = groupOf(id);
+  ACTIONS.key(null, id);
+}
+/** Every unsaved edit of the selected environment dropped, in place so the stash that shares the objects agrees; the other environments' stay. */
+function discardAll() {
+  endEdit();
+  closePopover();
+  for (const k of Object.keys(S.draft)) delete S.draft[k];
+  for (const k of Object.keys(S.base)) delete S.base[k];
+  S.tmpl = {};
+  S.unsavedOpen = false;
+  draftChanged();
+  render();
+  postCensus();
+}
+/** The selected project taken out of the workspace; its folder is left alone. */
+async function removeCurrent() {
+  const res = await post('/api/workspace/remove', { path: S.path });
+  S.sites = res.body.sites || [];
+  S.path = null;
+  S.site = null;
+  await loadWorkspace();
+}
+/** A project switch, asking first when edits would be lost. */
+function leaveFor(path) {
+  if (!dirty() && lostEdits() === 0) { void guard(loadSite(path)); return; }
+  S.leaveAsk = { path: path };
+  paintAsk();
+}
+// A reload or a tab close raises the browser's own prompt while edits exist.
+window.addEventListener('beforeunload', (event) => {
+  if (lostEdits() > 0) event.preventDefault();
+});
+
+/**
+ * What this commit carries: each key whose value differs from HEAD with its
+ * word diff and Put back where HEAD holds a value, then the files, then Commit.
+ */
+function commitPanel() {
+  const p = S.commitPanel;
+  const keys = Array.isArray(p.keys) ? p.keys : [];
+  const files = Array.isArray(p.files) ? p.files : [];
+  const named = new Set(keys.map((k) => k.key));
+  const rows = keys.map((k, i) => {
+    const was = own(k, 'head') ? shown(k.head) : '';
+    const is = own(k, 'now') ? shown(k.now) : '';
+    return '<div style="margin-bottom:8px"><div class="mono" style="font-size:11.5px">' +
+      esc(k.locale === S.site.config.locales.default ? k.key : k.key + ' · ' + k.locale) + '</div>' +
+      '<div class="term">' + esc(own(k, 'head') ? wordDiff(was, is) : is) + '</div>' +
+      (own(k, 'head') ? '<button class="btn sm" data-act="putBack:' + i + '">Put back</button>' : '') + '</div>';
+  }).join('');
+  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">' +
+    esc('What this commit carries · ' + plural(named.size, 'key') + ' · ' + plural(files.length, 'file')) + '</h3></div>' +
+    '<div class="cb">' + rows +
+    files.map((f) => '<div class="muted mono" style="font-size:11px">' + esc(f) + '</div>').join('') +
+    (p.error ? '<div class="err">' + esc(p.error) + '</div>' : '') +
+    '<div style="margin-top:8px"><button class="btn pri sm" data-act="commitApply"' + (files.length === 0 ? ' disabled' : '') + '>Commit</button>' +
+    '<button class="btn sm" data-act="commitCancel">Cancel</button></div></div></div>';
+}
+/** Two values word by word, an LCS over whitespace-split words: removed runs `[-…-]`, added runs `[+…+]`. */
+function wordDiff(a, b) {
+  const x = a.split(/\s+/).filter((w) => w !== '');
+  const y = b.split(/\s+/).filter((w) => w !== '');
+  const t = Array.from({ length: x.length + 1 }, () => new Array(y.length + 1).fill(0));
+  for (let i = x.length - 1; i >= 0; i -= 1) {
+    for (let j = y.length - 1; j >= 0; j -= 1) t[i][j] = x[i] === y[j] ? t[i + 1][j + 1] + 1 : Math.max(t[i + 1][j], t[i][j + 1]);
+  }
+  const out = [];
+  let del = [];
+  let ins = [];
+  const flush = () => {
+    if (del.length > 0) out.push('[-' + del.join(' ') + '-]');
+    if (ins.length > 0) out.push('[+' + ins.join(' ') + '+]');
+    del = []; ins = [];
+  };
+  let i = 0;
+  let j = 0;
+  while (i < x.length || j < y.length) {
+    if (i < x.length && j < y.length && x[i] === y[j]) { flush(); out.push(x[i]); i += 1; j += 1; }
+    else if (j < y.length && (i === x.length || t[i][j + 1] >= t[i + 1][j])) { ins.push(y[j]); j += 1; }
+    else { del.push(x[i]); i += 1; }
+  }
+  flush();
+  return out.join(' ');
 }
 
 // CSI sequences (colour, cursor) and OSC ones (a hyperlink or a title, ended by BEL or ESC backslash).
@@ -888,6 +1471,9 @@ function paintDirty() {
   const count = document.getElementById('dc');
   count.hidden = !dirty();
   count.textContent = dirty() ? plural(edits(), 'unsaved edit') : '';
+  // The list under the header follows the count.
+  if (S.unsavedOpen) paintAsk();
+  paintUnsavedNotes();
 }
 
 const ENV_CLASSES = { default: 'local', prod: 'prod', production: 'prod', staging: 'staging', preview: 'preview' };
@@ -901,7 +1487,7 @@ function adapterOf(name) {
 function view() {
   if (S.tab === 'Health') return vHealth();
   if (S.tab === 'Setup') return vSetup();
-  if (!S.site) return '<div class="hint">Add a checkout to begin. The path must be absolute and hold a stet project.</div>';
+  if (!S.site) return '<div class="hint">Add a project to begin. The path must be absolute and hold a stet project.</div>';
   if (S.site.state === 'not-adopted') {
     return '<div class="hint"><b>' + esc(S.site.name) + ' is not adopted.</b> Run <span class="mono">stet init</span> in ' +
       '<span class="mono">' + esc(S.site.path) + '</span>, then reload this page.</div>';
@@ -947,28 +1533,49 @@ function keyList() {
     ? chooser('group', all.map((g) => g.id), S.group, 'gsel', undefined, all.map((g) => g.label))
     : '';
   const localeSelector = locales.length > 1 ? chooser('locale', locales, S.locale, 'lsel') : '';
+  const line = siteLine();
   return '<div class="card"><div class="ch" style="display:block">' +
     '<div style="display:flex;justify-content:space-between;align-items:center"><h3>Keys</h3>' +
     '<span class="bdg">' + items.length + '</span></div>' + selector + localeSelector +
     '<input class="in sm" id="ksearch" style="margin-top:6px" placeholder="Search…" value="' + esc(S.q) + '" data-act-input="search"></div>' +
-    '<div class="scroll">' + (items.length === 0
-      ? '<div class="cb muted">No keys.</div>'
-      : items.map((id) => {
-        const def = keyDef(id) || {};
-        const value = shownValue(id);
-        const kinds = kindsOf(id);
-        const badge = edited(id) ? '<span class="bdg d">edited</span>'
-          : def.shape === 'media' ? '<span class="bdg">img</span>'
-            : def.shape === 'richtext' ? '<span class="bdg">rich</span>'
-              : def.shape === 'list' ? '<span class="bdg b">list</span>'
-                : def.shape === 'record' ? '<span class="bdg b">record</span>'
-                  : '';
-        const group = S.q ? '<span class="bdg">' + esc((all.find((g) => g.keys.indexOf(id) !== -1) || {}).label || '') + '</span>' : '';
-        return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
-          '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + healthBadge(id) + group + '</span>' +
-          '<span class="s">' + (kinds.length === 0 ? '' : '<span class="kd">' + esc(kinds.join(' · ')) + '</span>') +
-          '<span class="v">' + esc(rowPreview(value)) + '</span></span></button>';
-      }).join('')) + '</div></div>';
+    (line === '' ? '' : '<p class="note" id="siteline" style="margin:8px 12px">' + esc(line) + '</p>') +
+    '<div class="scroll" id="keyrows">' + keyRows(items) + '</div></div>';
+}
+/** The key list's rows, each with its badges; repainted on its own as a census or the scan answers. */
+function keyRows(items) {
+  const all = groups();
+  if (items.length === 0) return '<div class="cb muted">No keys.</div>';
+  return items.map((id) => {
+    const def = keyDef(id) || {};
+    const value = shownValue(id);
+    const kinds = kindsOf(id);
+    const badge = edited(id) ? '<span class="bdg d">edited</span>'
+      : def.shape === 'media' ? '<span class="bdg">img</span>'
+        : def.shape === 'richtext' ? '<span class="bdg">rich</span>'
+          : def.shape === 'list' ? '<span class="bdg b">list</span>'
+            : def.shape === 'record' ? '<span class="bdg b">record</span>'
+              : '';
+    const group = S.q ? '<span class="bdg">' + esc((all.find((g) => g.keys.indexOf(id) !== -1) || {}).label || '') + '</span>' : '';
+    return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
+      '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + draftBadge(id) + healthBadge(id) + usageBadges(id) + group + '</span>' +
+      '<span class="s">' + (kinds.length === 0 ? '' : '<span class="kd">' + esc(kinds.join(' · ')) + '</span>') +
+      '<span class="v">' + esc(rowPreview(value)) + '</span></span></button>';
+  }).join('');
+}
+/** A saved draft's author and when it was first saved, on a store-backed site's row. */
+function draftBadge(id) {
+  const row = storeBacked() ? rowOf(id, S.locale, 'draft') : undefined;
+  return row ? '<span class="bdg">' + esc('draft · ' + (row.editor || '') + ' · ' + clockShort(row.createdAt)) + '</span>' : '';
+}
+// The rows last painted, and where: a render builds a fresh list, which is painted anew.
+let keyRowsShown = { box: null, html: '' };
+function paintKeyRows() {
+  const box = document.getElementById('keyrows');
+  if (!box || !ready()) return;
+  const html = keyRows(listedKeys());
+  if (box === keyRowsShown.box && html === keyRowsShown.html) return;
+  box.innerHTML = html;
+  keyRowsShown = { box: box, html: html };
 }
 
 /**
@@ -995,6 +1602,59 @@ function healthBadge(id) {
 function unreadSlots() {
   const findings = (S.health && S.health.scan && S.health.scan.findings) || [];
   return findings.filter((f) => f.slot !== undefined);
+}
+
+// --- the unread-key badge -------------------------------------------------------
+// The scan (`GET /api/site/usage`) says which keys no source file names; the
+// censuses of the pages the preview visited say whether any page shows them.
+/** A route as the page list and the census compare it: no query, no trailing slash but the root's. */
+const routePath = (route) => {
+  const path = String(route).replace(/[?#].*$/, '');
+  return path.length > 1 ? path.replace(/\/+$/, '') : path;
+};
+/** The pages a leftover must be missing from: the declared pages at a static route, or each marked document. */
+function pageList() {
+  const routes = htmlHost()
+    ? S.marks.documents.map((d) => d.route)
+    : Object.values(S.site.descriptor.pages || {}).map((p) => p.route).filter((r) => typeof r === 'string' && STATIC_ROUTE.test(r));
+  return [...new Set(routes.map(routePath))];
+}
+/** A page counts as checked once a census came from it and its reads answered complete. */
+const checked = (route) => S.seen.routes.has(route) && S.seen.read.has(route);
+/** The line above the key list while a read stet cannot follow stands: up to three, then the rest as a count. */
+function siteLine() {
+  const causes = (S.usage && Array.isArray(S.usage.causes)) ? S.usage.causes : [];
+  if (causes.length === 0) return '';
+  return 'This site reads some keys in ways stet cannot follow, so it cannot say which keys are unread: ' +
+    causes.slice(0, 3).map((c) => c.text + ' at ' + c.file + ':' + c.line).join(', ') +
+    (causes.length > 3 ? ' and ' + (causes.length - 3) + ' more' : '');
+}
+/** A key's badge, `{ row, note: [lines] }`, or null for a key read, excluded, or not yet judged. */
+function badgeOf(id) {
+  const usage = S.usage;
+  if (!usage || !usage.keys || !own(usage.keys, id)) return null;
+  const judged = usage.keys[id];
+  if (judged.state === 'unknown') {
+    const at = judged.prefix;
+    return { row: 'unknown', note: [at ? id + ' starts with ' + at.prefix + ', which ' + at.file + ':' + at.line +
+      ' reads without naming each key, so whether it is read is unknown.' : siteLine()] };
+  }
+  if (judged.state !== 'not_found') return null;
+  const scope = 'not found in any file stet searched (' + plural(usage.files, 'file') + ' in ' + usage.root + ')';
+  // A key an email or only server code reads never shows on a page, so no visit can tell it is a leftover.
+  const upgradable = (keyDef(id) || {}).target !== 'html-email' && (usage.serverOnly || []).indexOf(id) === -1;
+  const pages = pageList();
+  const left = pages.filter((route) => !checked(route)).length;
+  if (upgradable && pages.length > 0 && left === 0 && !S.seen.keys.has(id)) return { row: 'may be a leftover', note: ['may be a leftover'] };
+  return { row: scope, note: upgradable && left > 0 ? [scope, left + ' of ' + pages.length + ' pages not yet checked'] : [scope] };
+}
+/** A row's scan badge, and `not shown on this page` for a key of the open route the last census did not find. */
+function usageBadges(id) {
+  const badge = badgeOf(id);
+  const route = keyRoute(id);
+  const missing = S.census !== null && route !== null && routePath(route) === routePath(shownRoute(S.census.route)) && !own(S.census.found, id);
+  return (badge === null ? '' : '<span class="bdg wr">' + esc(badge.row) + '</span>') +
+    (missing ? '<span class="bdg wr">not shown on this page</span>' : '');
 }
 const healthStamp = () => (S.health && S.health.at && S.health.at.head) ? S.health.at.head : null;
 
@@ -1030,9 +1690,19 @@ function whenShort(at) {
   return m === null ? esc(at) : esc(m[1]) + '<br>' + esc(m[2]);
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+/** A stamp on this machine's clock: `HH:MM` today, else `D Mon HH:MM`; anything unparseable as it is. */
+function clockShort(at) {
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return String(at === undefined || at === null ? '' : at);
+  const pad = (n) => String(n).padStart(2, '0');
+  const time = pad(d.getHours()) + ':' + pad(d.getMinutes());
+  return d.toDateString() === new Date().toDateString() ? time : d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + time;
+}
+
 function editorColumn() {
-  return '<div style="display:flex;flex-direction:column;gap:11px;min-width:0">' +
-    '<div class="card">' + editorCard() + '</div>' +
+  return '<div class="edcol" style="display:flex;flex-direction:column;gap:11px;min-width:0">' + changeBar() + takeoverCard() +
+    '<div class="card edcard">' + editorCard() + '</div>' + storeHistoryCard() + gitHistoryCard() +
     historyCard() + '</div>';
 }
 
@@ -1048,14 +1718,14 @@ function editorCard() {
     '<span class="bdg">' + esc(def.shape || 'text') + '</span>' +
     (edited(id) ? '<span class="bdg d">edited</span>' : '') +
     (S.locale !== 'default' ? '<span class="bdg b">' + esc(S.locale) + '</span>' : '') +
-    '</span></div>' + kindLine(id) + placeList(id);
+    '</span></div>' + kindLine(id) + sharedBlock(id) + placeList(id);
 
   const fallback = (S.locale !== 'default' && value === undefined && defaultValue(id) !== undefined)
     ? '<div class="inf">falls back to default — ' + esc(String(shown(defaultValue(id))).slice(0, 90)) + '</div>'
     : '';
 
   return head + '<div class="cb">' + fallback + field(id, def, value, max) +
-    findingsBlock(id) + '</div>' + bar(id);
+    findingsBlock(id) + '</div>' + saveBar(id);
 }
 
 /** Under the editor's header: what element the key is and where, what it derives from, and what derives from it. */
@@ -1072,6 +1742,26 @@ function kindLine(id) {
   if (def.derivesFrom !== undefined) lines.push('derived from: ' + named(def.derivesFrom));
   for (const dep of dependents(id)) lines.push('feeds: ' + named(dep));
   return lines.length === 0 ? '' : '<div class="kline">' + lines.map((line) => '<div>' + line + '</div>').join('') + '</div>';
+}
+/**
+ * A key shown more than once on this page, said before the first keystroke:
+ * the count the census matched, else the marks route's, and the marks route's places.
+ */
+function sharedLine(id) {
+  const places = placesOf(id);
+  const found = S.census !== null && own(S.census.found, id) ? S.census.found[id] : 0;
+  const n = found > 0 ? found : places.length;
+  if (n < 2) return '';
+  return 'Shown in ' + n + ' places on this page' + places.map((p) => ' · ' + p.file + ':' + p.line).join('');
+}
+function sharedBlock(id) {
+  const line = sharedLine(id);
+  return '<div id="shared"' + (line === '' ? '>' : ' class="kline">' + esc(line)) + '</div>';
+}
+/** The shared-spots line, repainted on its own as a census answers. */
+function paintShared() {
+  const box = document.getElementById('shared');
+  if (box && S.sel !== null) box.outerHTML = sharedBlock(S.sel);
 }
 /** A key shown in several places, each place listed with the offer to give it its own key. */
 function placeList(id) {
@@ -1189,7 +1879,7 @@ function sourceBlock(id) {
 
 /** What the last save said about this key, under the field it is about. */
 function findingsBlock(id) {
-  const mine = S.findings.filter((f) => f.key === id || (f.key || '').indexOf(id) === 0);
+  const mine = id === null ? S.findings : S.findings.filter((f) => f.key === id || (f.key || '').indexOf(id) === 0);
   if (mine.length === 0 && S.message === '') return '';
   return '<div id="refusal">' + (S.message ? '<div class="err">' + esc(S.message) + '</div>' : '') +
     (mine.length === 0 ? '' : '<ul class="findings">' + mine.map((f) =>
@@ -1206,10 +1896,13 @@ function clearRefusal() {
 }
 
 /**
- * The save bar: Save, Remove key and the removal plan. Commit and Push live in
- * the page header (`gitBar`), where they are visible with no key selected.
+ * The save bar: Save, Remove key and the removal plan, with the asks a save
+ * raises. It is the Content editor's and the Templates tab's alike, and its
+ * Save saves every draft; `id` is the selected key, or null where none is
+ * (Remove key needs one). Commit and Push live in the page header (`gitBar`),
+ * where they are visible with no key selected.
  */
-function bar(id) {
+function saveBar(id) {
   const removal = S.removal
     ? '<div class="cb"><div class="term">' + esc(S.removal.lines.join('\n')) + '</div>' +
       '<div style="margin-top:8px"><button class="btn dg sm" data-act="removeApply">Remove</button>' +
@@ -1226,7 +1919,11 @@ function bar(id) {
   const over = S.overLimit
     ? ask(S.overLimit, '<button class="btn pri sm" data-act="saveAnyway">Save anyway</button>', 'saveCancel')
     : '';
-  const split = S.split && S.split.key === id
+  const staleBox = S.staleKeys.map((k, i) => '<div class="cb"><div class="term">' +
+    esc(k.key + ' changed on disk since you opened it: "' + (k.disk === null ? '' : shown(k.disk)) + '"') + '</div>' +
+    '<div style="margin-top:8px"><button class="btn sm" data-act="useTheirs:' + i + '">Use theirs</button>' +
+    '<button class="btn pri sm" data-act="saveMine:' + i + '">Save mine over it</button></div></div>').join('');
+  const split = S.split && (id === null || S.split.key === id)
     ? ask([S.split.at], '<button class="btn pri sm" data-act="splitApply">Split</button>', 'splitCancel',
       '<input class="in sm mono" style="margin-top:8px" value="' + esc(S.split.name) + '" data-act-input="splitName">')
     : '';
@@ -1239,34 +1936,96 @@ function bar(id) {
     (storeBacked()
       ? '<button class="btn env" data-act="publish">Publish</button><button class="btn" data-act="discard">Discard</button>'
       : '') +
-    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button></div>' + removal + same + over + split;
+    (id === null ? '' : '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button>') +
+    '</div>' + (id === null ? '' : aloneLine(id)) + staleBox + removal + same + over + split;
+}
+
+/** A stamp as `YYYY-MM-DD HH:MM` on this machine's clock. */
+function stampShort(at) {
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return String(at === undefined || at === null ? '' : at);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+/** Below the editor on a store-backed site: the selected key's published versions, each with Preview and Restore. */
+function storeHistoryCard() {
+  const h = S.keyHistory;
+  if (!storeBacked() || h === null || h.key !== S.sel) return '';
+  const rows = h.rows.map((r) => {
+    const name = r.changesetId === null || r.changesetId === undefined ? null
+      : own(S.changeNames, r.changesetId) ? S.changeNames[r.changesetId] : 'change ' + r.changesetId;
+    return '<div style="margin-bottom:6px"><div class="hline">' +
+      esc('v' + r.id + ' · ' + stampShort(r.publishedAt) + ' · ' + rowPreview(r.value) + ' · ' + (r.editor || '') + (name === null ? '' : ' · ' + name)) + '</div>' +
+      '<button class="btn sm" data-act="historyPreview:' + esc(r.id) + '">Preview</button>' +
+      '<button class="btn sm" data-act="historyRestore:' + esc(r.id) + '">Restore</button>' +
+      (name === null ? '' : '<button class="btn sm" data-act="previewChange:' + esc(r.changesetId) + '">Preview change</button>') + '</div>';
+  }).join('');
+  return '<div class="card" id="keyhistory"><div class="ch"><h3 style="font-size:12.5px">Key history</h3></div>' +
+    '<div class="cb">' + (h.error ? '<div class="err">' + esc(h.error) + '</div>' : '') + rows + '</div></div>';
+}
+/** Below the editor on a snapshot site: the selected key's past values from git, each with Restore, which loads it as an unsaved edit. */
+function gitHistoryCard() {
+  const h = S.keyHistory;
+  if (storeBacked() || h === null || h.key !== S.sel || !Array.isArray(h.versions) || (h.versions.length === 0 && !h.truncated)) return '';
+  const rows = h.versions.map((v) => '<div style="margin-bottom:6px"><div class="hline">' +
+    esc('v' + v.n + ' · ' + v.short + ' · ' + stampShort(v.date) + ' · ' + v.author + ' · ' + rowPreview(v.value)) + '</div>' +
+    '<button class="btn sm" data-act="gitRestore:' + esc(v.n) + '"' + (own(v, 'value') ? '' : ' disabled') + '>Restore</button></div>').join('');
+  return '<div class="card" id="keyhistory"><div class="ch"><h3 style="font-size:12.5px">Key history</h3></div>' +
+    '<div class="cb">' + rows + (h.truncated ? '<div class="note">Some older versions are too large to show.</div>' : '') + '</div></div>';
+}
+/** Restore: one past version published again, forward, its key checked against the version by the mount. */
+async function restoreVersion(id) {
+  const h = S.keyHistory;
+  const row = h === null ? undefined : h.rows.find((r) => String(r.id) === id);
+  if (!row) return;
+  const res = await post(mountPath('revert'), { key: h.key, versionId: row.id, editor: S.editor });
+  if (!res.ok) {
+    if (S.keyHistory === h) h.error = res.body.error || 'the store refused that restore';
+    render();
+    return;
+  }
+  h.error = '';
+  if (S.showing !== null && S.showing.kind === 'version') S.showing = null;
+  await loadRows();
+}
+
+/** Under a change member's own Publish: what publishing it alone does to the change. */
+function aloneLine(id) {
+  const row = storeBacked() && S.change !== null ? rowOf(id, S.locale, 'draft') : undefined;
+  return row && row.changesetId === S.change.id
+    ? '<p class="note" id="alone">' + esc('Publishing ' + id + ' alone takes it out of ' + S.change.name + '.') + '</p>' : '';
 }
 
 function historyCard() {
   const rows = (S.history && S.history.commits) || [];
   const body = S.history === null
     ? '<div class="cb muted">Not loaded. <button class="btn sm" data-act="history">Load</button></div>'
-    : S.history.mount
-      ? '<div class="cb muted">This site is store-backed — its history is the store&rsquo;s, at ' +
-        '<span class="mono">' + esc(S.history.mount) + '</span>.</div>'
-      : commitTable(rows, S.history !== null, true);
-  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">History</h3>' +
+    : commitTable(rows, S.history !== null, true);
+  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">Commit history</h3>' +
     '<span class="bdg">' + (htmlHost() ? 'the commits that touched the snapshot or the pages' : 'the commits that touched the snapshot') +
     '</span></div>' + body + markupPanel() + '</div>';
 }
-/** Under an opened History row: the keys its commit removed, each with its section and text, and Restore. */
+/**
+ * Under an opened History row: the keys its commit removed — on a JavaScript
+ * host where each was shown at the commit's parent, else its section and text —
+ * and Restore, which a store-backed site's commits do not offer.
+ */
 function removedRow(r) {
   const keys = S.opened.keys || [];
   if (keys.length === 0 && !S.opened.error) return '';
-  const lines = keys.map((k) => esc(k.key + (k.section ? ' — ' + k.section : '') + ' — "' + rowPreview(k.text) + '"'));
+  const lines = keys.map((k) => esc(Array.isArray(k.places) && k.places.length > 0
+    ? k.key + ' was removed in ' + r.short + '. It was shown at ' + k.places.map(removedPlace).join(', ') + '.'
+    : k.key + (k.section ? ' — ' + k.section : '') + ' — "' + rowPreview(k.text) + '"'));
   const ask = S.restoreAsk
     ? '<div class="term" style="margin-top:6px">' + esc('Restore the ' + plural(keys.length, 'key') + ' ' + r.short + ' removed?') + '</div>' +
       '<div style="margin-top:6px"><button class="btn pri sm" data-act="restoreApply">Restore</button>' +
       '<button class="btn sm" data-act="restoreCancel">Cancel</button></div>'
     : '<div style="margin-top:6px"><button class="btn sm" data-act="restoreAsk"' + (dirty() ? ' disabled' : '') + '>Restore</button></div>';
   return '<tr><td colspan="3"><div class="mono" style="font-size:11px">' + lines.join('<br>') + '</div>' +
-    (S.opened.error ? '<div class="err">' + esc(S.opened.error) + '</div>' : '') + (keys.length === 0 ? '' : ask) + '</td></tr>';
+    (S.opened.error ? '<div class="err">' + esc(S.opened.error) + '</div>' : '') + (keys.length === 0 || storeBacked() ? '' : ask) + '</td></tr>';
 }
+/** A removed key's place: `<file>:<line> (<kind>)`, the kind left out where it only names the file again. */
+const removedPlace = (p) => p.file + ':' + p.line + (p.kind === 'text in ' + p.file ? '' : ' (' + p.kind + ')');
 /** The markup a restore handed back, section by section, each with Copy markup. */
 function markupPanel() {
   if (!Array.isArray(S.markup) || S.markup.length === 0) return '';
@@ -1310,7 +2069,8 @@ function fitFrame() {
   // The frame ends where the window does, less the pane card's 1 px border and
   // the Content tab's 14 px bottom padding, so the pane never scrolls the page.
   const top = box.getBoundingClientRect().top + window.scrollY;
-  box.style.height = Math.max(420, Math.floor(window.innerHeight - top - 15)) + 'px';
+  // At 760 px and narrower the stylesheet sets the height.
+  box.style.height = window.innerWidth <= 760 ? '' : Math.max(420, Math.floor(window.innerHeight - top - 15)) + 'px';
   const fit = frameFit(box.clientWidth, S.width);
   frame.style.width = fit.width + 'px';
   frame.style.height = Math.round(box.clientHeight / fit.scale) + 'px';
@@ -1337,7 +2097,11 @@ function paintPane() {
   document.getElementById('pane').hidden = !content;
   if (!content) return;
   paintPaneHead();
+  paintPaneEnv();
+  paintPaneShow();
   paintPaneNote();
+  paintPanePick();
+  paintPageInfo();
   paintPaneCards();
   const state = paneState();
   // A frame is rebuilt only when its sandbox must change; a new route is a navigation of the same frame.
@@ -1361,6 +2125,66 @@ function paintPane() {
   fitFrame();
 }
 
+/**
+ * On a store-backed site with a dev-server pane, one line under the header
+ * saying where the preview's words come from: the snapshot, the selected
+ * environment's store, or the dev server's own store. The server sends only
+ * whether each environment's connection is the dev server's, never a value.
+ */
+function envLine() {
+  const reads = S.site.previewReads;
+  if (!storeBacked() || reads === null || typeof reads !== 'object') return '';
+  if (own(reads, 'snapshot')) {
+    return 'The preview shows ' + reads.snapshot + ' as this project holds it. Store drafts and publishes appear only as the dashboard layers them.';
+  }
+  const same = own(reads, 'stores') && own(reads.stores, S.env) && reads.stores[S.env] === true;
+  return same ? 'The preview reads the ' + S.env + ' store, the one this tab edits.' : "The preview reads the dev server's own store, not " + S.env + '.';
+}
+function paintPaneEnv() {
+  const box = document.getElementById('paneenv');
+  const text = paneState() === 'frame' && !S.preview.static ? envLine() : '';
+  box.hidden = text === '';
+  if (box.textContent !== text) box.textContent = text;
+}
+
+/** Under the pane's header while a preview stands: what it shows, its page tabs, and the way out. */
+function paintPaneShow() {
+  const box = document.getElementById('paneshow');
+  const v = S.showing;
+  if (v === null || !ready()) { box.hidden = true; box.innerHTML = ''; return; }
+  const keys = v.kind === 'change' ? membersOf(v.id).map((r) => r.key) : v.kind === 'published' ? v.members.map((m) => m.key) : [];
+  const span = pageSpan(S.site.descriptor, keys);
+  const tabs = span.map((name) => '<button class="btn sm' + (groupRoute('page:' + name) === S.route ? ' pri' : '') +
+    '" data-act="spanPage:' + esc(name) + '">' + esc(name) + '</button>').join('');
+  const html = '<div class="ch" style="flex-wrap:wrap;gap:6px">' +
+    (v.kind === 'version' ? '' : '<b style="font-size:12px">' + esc('Previewing the change ' + v.name) + '</b>') +
+    showSwitch(v) + tabs + showActions(v) +
+    '<button class="btn sm" data-act="exitPreview">Exit preview</button></div>' + showBody(v);
+  box.hidden = false;
+  if (box.innerHTML !== html) box.innerHTML = html;
+}
+/** A published change's before | current switch. */
+function showSwitch(v) {
+  if (v.kind !== 'published') return '';
+  return '<div class="tg">' + ['before', 'current'].map((view) => '<button class="' + (v.view === view ? 'on' : '') +
+    '" data-act="showView:' + view + '">' + view + '</button>').join('') + '</div>';
+}
+const showActions = (v) => (v.kind === 'published' ? '<button class="btn sm" data-act="revertAsk">Revert change…</button>' : '');
+/** Revert change's question, its refusal, and the members it could not restore. */
+function showBody(v) {
+  if (v.kind !== 'published') return '';
+  const span = pageSpan(S.site.descriptor, v.members.map((m) => m.key));
+  const ask = v.ask
+    ? '<div class="term">' + esc('Revert ' + v.name + '? Restores ' + plural(v.members.length, 'key') + ' on ' + span.join(', ') +
+      ' to the before values shown here, written forward as a new publish. Drafts are left alone, and a key published again since is skipped and named.') + '</div>' +
+      '<div style="margin-top:6px"><button class="btn pri sm" data-act="revertChange">Revert</button>' +
+      '<button class="btn sm" data-act="revertCancel">Cancel</button></div>'
+    : '';
+  const skipped = (v.skipped || []).map((line) => '<div class="skip">' + esc(line) + '</div>').join('');
+  const error = v.error ? '<div class="err">' + esc(v.error) + '</div>' : '';
+  return ask + skipped + error === '' ? '' : '<div class="cb">' + ask + error + skipped + '</div>';
+}
+
 let paneLeadShown = null;
 let paneToolsShown = null;
 /**
@@ -1374,13 +2198,16 @@ function paintPaneHead() {
     document.getElementById('panehead').innerHTML =
       '<div class="ch"><div style="display:flex;gap:6px;align-items:center"><span id="panelead"></span>' +
       '<label class="muted" style="font-size:11px;display:flex;gap:6px;align-items:center">Route' +
-      '<input class="in sm mono" id="route" aria-label="Route" style="width:160px;flex:none" data-act-change="route"></label></div>' +
+      '<input class="in sm mono" id="route" aria-label="Route" style="width:160px;flex:none" data-act-change="route"></label>' +
+      '<span class="muted mono" id="panemoved" style="font-size:11px"></span></div>' +
       '<div id="panetools" style="display:flex;gap:6px;align-items:center"></div></div>';
     paneLeadShown = null;
     paneToolsShown = null;
   }
   const field = document.getElementById('route');
   if (document.activeElement !== field && field.value !== S.route) field.value = S.route;
+  // The app's own navigation is named beside the field; the field keeps the route typed.
+  document.getElementById('panemoved').textContent = S.moved === null ? '' : 'The app moved to ' + S.moved;
   const lead = '<button class="btn sm" data-act="keys">' + (S.keysOpen ? 'Hide keys' : 'Show keys') + '</button>';
   if (lead !== paneLeadShown) { document.getElementById('panelead').innerHTML = lead; paneLeadShown = lead; }
   const tools = paneTools();
@@ -1392,7 +2219,10 @@ function paneTools() {
   const dev = S.site.host !== 'html';
   const log = S.devlog || {};
   const running = log.state === 'running' || log.state === 'detached';
-  return '<div class="tg">' + PRESETS.map((preset) => '<button class="' + (S.width === preset[0] ? 'on' : '') +
+  return '<div class="tg">' + [['edit', 'Edit'], ['use', 'Use']].map((m) => '<button class="' + (S.mode === m[0] ? 'on' : '') +
+      '" data-act="mode:' + m[0] + '">' + m[1] + '</button>').join('') + '</div>' +
+    '<button class="btn sm' + (S.pageInfo ? ' pri' : '') + '" data-act="pageInfo">Page info</button>' +
+    '<div class="tg">' + PRESETS.map((preset) => '<button class="' + (S.width === preset[0] ? 'on' : '') +
       '" data-act="width:' + preset[0] + '">' + preset[1] + '</button>').join('') + '</div>' +
     '<span class="muted mono" style="font-size:11px" id="panewidth"></span>' +
     '<button class="btn sm" data-act="previewLoad">Reload</button>' +
@@ -1413,7 +2243,7 @@ function paneBody(state) {
   }
   if (state === 'frame' && p.static) {
     return '<p class="note" style="margin:0;padding:6px 12px;border-left:0;border-bottom:1px solid hsl(var(--bd))">' +
-      'Served read-only from the checkout by this server. A root-absolute reference in the page ' +
+      'Served read-only from the project by this server. A root-absolute reference in the page ' +
       'resolves against the dashboard rather than the site and is not served here.</p>' +
       '<div class="devwrap" id="devwrap"><iframe src="' + esc(p.url) +
       '" sandbox="allow-scripts allow-forms allow-popups" title="the site"></iframe></div>';
@@ -1444,6 +2274,7 @@ function paneBody(state) {
  * pages the server regenerated; a dev server reloads its own page after a save.
  */
 async function loadPreview(opts) {
+  if (opts && opts.reload) S.moved = null;
   S.preview = (await api('/api/site/preview' + query() + '&route=' + encodeURIComponent(S.route))).body;
   const kept = paneShown;
   render();
@@ -1455,6 +2286,28 @@ async function loadPreview(opts) {
       frame.setAttribute('src', S.preview.url);
     }
   }
+  await loadRouteReads(S.route);
+}
+
+/**
+ * The keys the files of one route read (`GET /api/site/route-reads`), read on
+ * every route change. A route whose reads are incomplete or failed never counts
+ * as checked for the badge, and never warns that no file reads a key.
+ */
+let routeReadsFor = null; // the route the last reads were asked for, so a census asks once per route
+async function loadRouteReads(route) {
+  const path = S.path;
+  routeReadsFor = routePath(route);
+  const res = await api('/api/site/route-reads' + query() + '&route=' + encodeURIComponent(route));
+  if (path !== S.path) return;
+  const reads = res.ok && res.body && Array.isArray(res.body.keys) ? res.body : null;
+  S.routeReads = reads === null ? null : { route: routePath(route), keys: reads.keys, complete: reads.complete === true };
+  if (reads !== null) {
+    if (reads.complete === true) S.seen.read.add(routePath(route));
+    else S.seen.read.delete(routePath(route));
+  }
+  paintKeyRows();
+  paintPaneNote();
 }
 
 const STATIC_ROUTE = /^\/[^\[\]:*]*$/;
@@ -1491,6 +2344,7 @@ function groupRoute(id) {
 function moveTo(known) {
   if (known === null || known === S.route) return;
   S.route = known;
+  S.moved = null;
   void guard(loadPreview());
 }
 
@@ -1527,16 +2381,127 @@ function postToPreview(message) {
   // that reaches it; the dev pane's is its proxy's origin.
   win.postMessage(message, S.preview.static ? '*' : new URL(S.preview.url).origin);
 }
-/** Every string a key renders as saved: a text value, each list entry, each string field. */
-function renderedTexts(id) {
+/** A key's saved value as the selected locale renders it: its own, else the default locale's. */
+function renderedValue(id) {
   const snapshot = S.site.snapshot || {};
   const block = own(snapshot, S.locale) ? snapshot[S.locale] : {};
   const fallback = own(snapshot, S.site.config.locales.default) ? snapshot[S.site.config.locales.default] : {};
-  const value = own(block, id) ? block[id] : own(fallback, id) ? fallback[id] : undefined;
-  if (typeof value === 'string') return [value];
-  if (Array.isArray(value)) return value.filter((v) => typeof v === 'string');
-  if (value && typeof value === 'object') return Object.values(value).filter((v) => typeof v === 'string');
-  return [];
+  return own(block, id) ? block[id] : own(fallback, id) ? fallback[id] : undefined;
+}
+/**
+ * The values a key may render as in the selected locale, each once: the
+ * snapshot's and, on a store-backed site, the active row's and the draft
+ * row's (fork 20) — the page shows whichever its read path reads.
+ */
+function renderedValues(id) {
+  const out = [];
+  const add = (value) => {
+    if (value !== undefined && !out.some((v) => JSON.stringify(v) === JSON.stringify(value))) out.push(value);
+  };
+  add(renderedValue(id));
+  if (storeBacked()) {
+    const loc = rowOf(id, S.locale, 'active') || rowOf(id, S.locale, 'draft') ? S.locale : S.site.config.locales.default;
+    const active = rowOf(id, loc, 'active');
+    const draft = rowOf(id, loc, 'draft');
+    if (active) add(active.value);
+    if (draft) add(draft.value);
+  }
+  return out;
+}
+/** The distinct strings of a list of texts, in order. */
+const distinct = (texts) => texts.filter((t, i) => typeof t === 'string' && texts.indexOf(t) === i);
+/** Every string a key renders as saved: a text value, each list entry, each string field. */
+function renderedTexts(id) {
+  const texts = [];
+  for (const value of renderedValues(id)) {
+    if (typeof value === 'string') texts.push(value);
+    else if (Array.isArray(value)) texts.push(...value);
+    else if (value && typeof value === 'object') texts.push(...Object.values(value));
+  }
+  return distinct(texts);
+}
+/** The strings one list entry or record field renders as saved. */
+function entryTexts(id, entry) {
+  return distinct(renderedValues(id).map((value) => (value && typeof value === 'object' && own(value, entry) ? value[entry] : undefined)));
+}
+/** A key's saved draft in the selected locale of a store-backed site, else undefined. */
+function savedDraft(id) {
+  const row = storeBacked() ? rowOf(id, S.locale, 'draft') : undefined;
+  return row ? row.value : undefined;
+}
+/**
+ * Every shown draft but the selected key's, as the agent's layer takes them:
+ * this locale's unsaved edits, then the selected environment's saved drafts
+ * an unsaved edit does not cover. A list or record shows entry by entry.
+ */
+function layerDrafts() {
+  if (!ready()) return [];
+  if (S.showing !== null) return showingDrafts();
+  const out = [];
+  const taken = new Set();
+  const push = (id, value) => {
+    if (id === S.sel || taken.has(id)) return;
+    taken.add(id);
+    out.push(...layerItems(id, value));
+  };
+  for (const held of Object.keys(S.draft)) {
+    const cut = held.indexOf(' ');
+    if (held.slice(0, cut) === S.locale) push(held.slice(cut + 1), S.draft[held]);
+  }
+  for (const row of S.rows || []) if (storeBacked() && row.status === 'draft' && row.locale === S.locale) push(row.key, row.value);
+  return out;
+}
+/**
+ * One key's value as layer entries, matched against `from`, the values the
+ * page may show for it (the key's rendered values unless given). A list or a
+ * record is one entry per changed string.
+ */
+function layerItems(id, value, from) {
+  const def = keyDef(id);
+  if (!def || def.derivesFrom !== undefined || def.target === 'html-email') return [];
+  const candidates = from || renderedValues(id);
+  if (typeof value === 'string') {
+    const texts = distinct(candidates);
+    return texts.length === 0 ? [] : [Object.assign({ key: id, texts: texts, draft: value }, def.tags === undefined ? {} : { tags: def.tags })];
+  }
+  if (!value || typeof value !== 'object') return [];
+  const out = [];
+  for (const name of Object.keys(value)) {
+    const entry = Array.isArray(value) ? Number(name) : name;
+    const texts = distinct(candidates.map((v) => (v && typeof v === 'object' && own(v, entry) ? v[entry] : undefined)));
+    const text = value[name];
+    if (typeof text === 'string' && texts.length > 0 && !(texts.length === 1 && texts[0] === text)) out.push({ key: id, texts: texts, draft: text, entry: entry });
+  }
+  return out;
+}
+/**
+ * What a preview shows in place of the ordinary layer: an open change's
+ * drafts alone; a published change's before values, or its current ones over
+ * the snapshot's words (F96); one past value of one key.
+ */
+function showingDrafts() {
+  const v = S.showing;
+  const out = [];
+  if (v.kind === 'change') {
+    for (const row of membersOf(v.id)) if (row.locale === S.locale) out.push(...layerItems(row.key, row.value));
+  } else if (v.kind === 'published') {
+    for (const m of v.members) {
+      if (m.locale !== S.locale) continue;
+      const active = rowOf(m.key, m.locale, 'active');
+      const snapshot = renderedValue(m.key);
+      if (v.view === 'before') {
+        if (own(m, 'beforeValue')) out.push(...layerItems(m.key, m.beforeValue, [snapshot, active ? active.value : undefined]));
+      } else if (active) {
+        out.push(...layerItems(m.key, active.value, [snapshot]));
+      }
+    }
+  } else if (v.kind === 'version' && v.locale === S.locale) {
+    out.push(...layerItems(v.key, v.value));
+  }
+  return out;
+}
+function postLayer() {
+  postToPreview({ stet: 'layer', drafts: layerDrafts() });
 }
 /** Whether the selected key's draft is a list or a record, which the page shows only after Save. */
 function structuredDraft() {
@@ -1545,14 +2510,18 @@ function structuredDraft() {
 }
 /** Outline the selected key in the preview, with its draft in place where it maps onto the page's text. */
 function locateKey(scroll) {
-  if (!ready() || S.sel === null) { postToPreview({ stet: 'clear' }); return; }
+  if (!ready() || S.sel === null) { postToPreview({ stet: 'clear' }); postLayer(); return; }
   const def = keyDef(S.sel) || {};
   if (def.derivesFrom !== undefined) {
     // A derived key is shown where its source renders, outlined dashed; the whole message names the key picked.
     postLocate({ key: S.sel, mark: def.derivesFrom, texts: renderedTexts(def.derivesFrom), draft: null, scroll: scroll, guess: true, dashed: true });
+    postLayer();
     return;
   }
-  const held = S.draft[S.locale + ' ' + S.sel];
+  // The unsaved edit, else the saved draft: the preview shows what Publish would ship.
+  // A preview of a change or a past value shows only what it names.
+  const unsaved = S.draft[S.locale + ' ' + S.sel];
+  const held = S.showing !== null ? undefined : unsaved !== undefined ? unsaved : savedDraft(S.sel);
   if (structuredDraft()) {
     S.located = Object.assign({}, S.located, { key: S.sel, draft: 'after-save' });
     paintPaneNote();
@@ -1562,18 +2531,28 @@ function locateKey(scroll) {
     texts: renderedTexts(S.sel),
     draft: typeof held === 'string' ? held : null,
     scroll: scroll,
-    guess: !S.confirmed.has(S.sel),
+    // Dashed where a match is a guess, and where no file of the route reads the key.
+    guess: !S.confirmed.has(S.sel) || S.warn === S.sel,
     ...(def.tags === undefined ? {} : { tags: def.tags }),
   });
+  postLayer();
 }
-function draftChanged() {
+function draftChanged(id) {
   clearTimeout(draftTimer);
   draftTimer = setTimeout(() => locateKey(false), DRAFT_MS);
   paintPaneCards();
+  queueTemplates(id);
 }
 /** A document loaded in the frame: it is asked to announce itself, and one that stays silent cannot be highlighted. */
 function previewLoaded() {
   agentReady = false;
+  // A new document: the last census, the hover, an open edit and the field over the frame were the last page's.
+  S.census = null;
+  S.hover = null;
+  S.edit = null;
+  closePopover();
+  paintPopover();
+  paintHover();
   postToPreview({ stet: 'hello' });
   clearTimeout(agentTimer);
   agentTimer = setTimeout(() => {
@@ -1618,6 +2597,8 @@ window.addEventListener('message', (event) => {
   } else if (data.stet === 'ready') {
     agentReady = true;
     clearTimeout(agentTimer);
+    postToPreview({ stet: 'mode', mode: S.mode });
+    postCensus();
     if (S.located && S.located.unavailable) S.located = null;
     if (S.saveCheck) verifyNow();
     else locateKey(scrollNext);
@@ -1644,21 +2625,94 @@ window.addEventListener('message', (event) => {
     const hardcoded = (check && data.found > 0) || (S.located && S.located.key === data.key && S.located.hardcoded === true);
     S.located = Object.assign({}, data, hardcoded ? { hardcoded: true } : {}, structuredDraft() ? { draft: 'after-save' } : {});
     paintPaneNote();
+  } else if (data.stet === 'typed') {
+    // A proposal for the open edit only: its key, its locale, its entry.
+    const e = S.edit;
+    if (!e || data.key !== e.key || data.locale !== e.locale || data.entry !== e.entry || typeof data.value !== 'string') return;
+    setDraftIn(e.locale, e.key, e.entry === undefined ? data.value : withEntry(e.key, e.locale, e.entry, data.value));
+    paintPopover();
+    paintDraft(e.key);
+  } else if (data.stet === 'edited') {
+    const e = S.edit;
+    if (!e || data.key !== e.key || data.locale !== e.locale) return;
+    S.edit = null;
+    if (data.how === 'cancel') {
+      if (e.before === undefined) { delete S.draft[e.locale + ' ' + e.key]; delete S.base[e.locale + ' ' + e.key]; }
+      else S.draft[e.locale + ' ' + e.key] = e.before;
+      draftChanged();
+    } else if (data.how === 'lost') {
+      if (data.proposed !== true && e.before === undefined) { delete S.draft[e.locale + ' ' + e.key]; delete S.base[e.locale + ' ' + e.key]; }
+      S.located = Object.assign({}, S.located, { key: e.key, redrawn: true });
+      openPopover(e.key, e.locale, e.entry, e.rect);
+      if (S.popover !== null) S.popover.redrawn = true;
+    }
+    paintPopover();
+    render();
+  } else if (data.stet === 'key' && data.which === 'save') {
+    // The frame's Cmd/Ctrl-S moves focus to Save. It never saves: a press of the button does.
+    // A frame that does not hold focus has no key to answer, so a forged message cannot take the next keypress.
+    if (document.activeElement !== document.querySelector('#devwrap iframe')) return;
+    focusSave();
+  } else if (data.stet === 'key' && data.which === 'mode') {
+    setMode(S.mode === 'edit' ? 'use' : 'edit');
+  } else if (data.stet === 'key' && data.which === 'escape') {
+    endSelection();
+  } else if (data.stet === 'pick') {
+    onPick(data);
+  } else if (data.stet === 'hover') {
+    onHover(data);
+  } else if (data.stet === 'rect') {
+    onRect(data);
+  } else if (data.stet === 'unmanaged') {
+    onUnmanaged(data);
+  } else if (data.stet === 'census') {
+    onCensus(data);
+  } else if (data.stet === 'moved') {
+    onMoved(data);
   }
 });
-/** One line under the pane header: the key is not on this page or hidden on it, its draft waits for Save, or the page cannot be highlighted. */
+
+/**
+ * The lines under the pane header: the page cannot be highlighted; or a click
+ * found no key, and what the route reads that the census did not find; or, for
+ * the selected key, that an edit moved to a field, where it shows or that it is
+ * not on this page, hidden or shown after Save, that no file of the route reads
+ * it, and what the unread-key scan says of it.
+ */
 function paintPaneNote() {
   const note = document.getElementById('panenote');
   const at = S.located;
-  let line = '';
-  if (at && at.unavailable) line = 'Highlighting is not available on this page.';
-  else if (S.sel !== null && whereLine(S.sel) !== '') line = whereLine(S.sel);
-  else if (at && at.key === S.sel && at.hardcoded) line = "The outlined text does not come from stet — the page's template writes it out itself, so saving " + S.sel + ' does not change it.';
-  else if (at && at.key === S.sel && at.found === 0) line = S.sel + ' was not found on ' + shownRoute(at.route) + '.';
-  else if (at && at.key === S.sel && at.hidden === true) line = S.sel + ' is on this page but hidden, so the preview cannot show it.';
-  else if (at && at.key === S.sel && at.draft === 'after-save') line = 'This draft is shown after Save.';
-  note.hidden = line === '';
-  note.textContent = line;
+  const lines = [];
+  // While the key is typed in place its element no longer holds the saved text, so a look finds nothing there.
+  const typing = S.edit !== null && S.edit.key === S.sel;
+  if (at && at.unavailable) lines.push('Highlighting is not available on this page.');
+  else if (S.unmanaged !== null) {
+    lines.push('No key matches this text.');
+    const unfound = unfoundKeys();
+    if (unfound.length > 0) lines.push('Keys this page reads that were not found: ' + unfound.join(', ') + '.');
+  } else if (S.sel !== null) {
+    if ((at && at.key === S.sel && at.redrawn) || (S.popover !== null && S.popover.key === S.sel && S.popover.redrawn)) {
+      lines.push('The page redrew this text, so the edit moved to a field.');
+    }
+    let line = '';
+    if (whereLine(S.sel) !== '') line = whereLine(S.sel);
+    else if (at && at.key === S.sel && at.hardcoded) line = "The outlined text does not come from stet — the page's template writes it out itself, so saving " + S.sel + ' does not change it.';
+    else if (at && at.key === S.sel && at.found === 0 && !typing) line = S.sel + ' was not found on ' + shownRoute(at.route) + '.';
+    else if (at && at.key === S.sel && at.hidden === true) line = S.sel + ' is on this page but hidden, so the preview cannot show it.';
+    else if (at && at.key === S.sel && at.draft === 'after-save') line = 'This draft is shown after Save.';
+    if (line !== '') lines.push(line);
+    if (S.warn === S.sel) lines.push('This text matches ' + S.sel + ', but no file on this page reads that key — saving may not change it.');
+    const badge = badgeOf(S.sel);
+    if (badge !== null) {
+      lines.push(...badge.note);
+    }
+    const prefixes = S.usage && Array.isArray(S.usage.prefixes) ? S.usage.prefixes : [];
+    if (prefixes.length > 0) {
+      lines.push('Key prefixes read without naming each key: ' + prefixes.map((p) => p.prefix + ' (' + p.file + ':' + p.line + ')').join(', '));
+    }
+  }
+  note.hidden = lines.length === 0;
+  note.innerHTML = lines.map((line) => '<div>' + esc(line) + '</div>').join('');
 }
 const WHERE = {
   'page title': 'as the page title, in the browser tab and in search results',
@@ -1683,6 +2737,8 @@ function whereLine(id) {
   const sourceKind = def.derivesFrom === undefined ? undefined : kindsOf(def.derivesFrom)[0];
   const follows = def.derivesFrom === undefined ? ''
     : 'It follows ' + def.derivesFrom + (sourceKind === undefined ? '' : ' (' + sourceKind + ')') + ', outlined dashed on the page.';
+  const head = headOnly(id);
+  if (!unseen(id) && head.length > 0 && follows === '') return id + ' appears ' + head.map((kind) => WHERE[kind]).join(', and ') + '. It is not part of the page’s visible text.';
   if (!unseen(id)) return follows === '' ? '' : id + ' is derived. ' + follows;
   const where = kindsOf(id).map((kind) => WHERE[kind]);
   return id + ' appears ' + where.join(', and ') + '. ' + (follows || 'It is not part of the page’s visible text.');
@@ -1738,22 +2794,26 @@ function headOf(id) {
   }
   return null;
 }
-/** The search result and the share card beside the pane, from each key's shown value — a draft as it is typed. */
-function paintPaneCards() {
-  const box = document.getElementById('panecards');
-  if (!box) return;
-  const head = ready() && S.sel !== null ? headOf(S.sel) : null;
+/** The search result and the share card for a page's head keys, from each key's shown value — a draft as it is typed. */
+function cardsHtml(head) {
   const text = (key) => {
     // A key with no value in this locale shows the default locale's, as the site renders it.
     let value = key === null ? undefined : shownValue(key);
     if (value === undefined && key !== null) value = shownValue(key, S.site.config.locales.default);
     return value === undefined || value === '' ? '<span class="muted">—</span>' : esc(shown(value));
   };
-  const html = head === null ? '' : '<div class="cards">' +
+  return '<div class="cards">' +
     '<div class="serp"><div class="lb">Search result</div><div class="u mono">' + esc(head.route) + '</div>' +
     '<div class="tt">' + text(head.title) + '</div><div class="ds">' + text(head.description) + '</div></div>' +
     '<div class="share"><div class="lb">Share card</div><div class="u mono">' + esc(head.route) + '</div>' +
     '<div class="tt">' + text(head.shareTitle) + '</div><div class="ds">' + text(head.shareDescription) + '</div></div></div>';
+}
+/** The search result and the share card beside the pane, for the selected key's page. */
+function paintPaneCards() {
+  const box = document.getElementById('panecards');
+  if (!box) return;
+  const head = ready() && S.sel !== null ? headOf(S.sel) : null;
+  const html = head === null ? '' : cardsHtml(head);
   if (box.innerHTML === html) return;
   box.hidden = head === null;
   box.innerHTML = html;
@@ -1765,6 +2825,475 @@ function shownRoute(route) {
   const prefix = '/s/' + S.site.id + '/site';
   return typeof route !== 'string' ? S.route : S.preview && S.preview.static && route.startsWith(prefix) ? route.slice(prefix.length) || '/' : route;
 }
+/** The route the frame shows: where the app moved to, else the route field's. */
+const currentRoute = () => (S.moved === null ? S.route : S.moved);
+
+// --- editing from the preview (D8) ------------------------------------------------
+// The agent reports what the editor points at, clicks and types in the page;
+// each message changes what the page shows, or the open edit's unsaved value,
+// and nothing more. No message from the frame starts a write: Cmd/Ctrl-S there
+// moves focus to Save, and a press of Save is what saves. Every field is
+// checked: a key the descriptor declares (own property), the open edit's own
+// locale and entry, an entry the key's value holds.
+const NARROW_PX = 760;
+const narrow = () => window.innerWidth <= NARROW_PX;
+const declared = (key) => typeof key === 'string' && ready() && own(S.site.descriptor.keys, key);
+/** A list entry's index or a record field's name, or none. */
+const isEntry = (value) => value === undefined || typeof value === 'string' || (Number.isInteger(value) && value >= 0);
+/** The kinds of the head texts the census matches, by where it matched them. */
+const HEAD_WHERE = {
+  title: 'page title', description: 'meta description', 'og:title': 'share title', 'twitter:title': 'share title',
+  'og:description': 'share description', 'twitter:description': 'share description',
+};
+/** The element a hover or a pick names, in the marks route's words (cli/key-names.ts `kindOf`). */
+const ELEMENT_KINDS = {
+  attr: { alt: 'image alt text', 'aria-label': 'aria label', title: 'tooltip', placeholder: 'placeholder' },
+  tag: { p: 'paragraph', a: 'link text', button: 'button text', label: 'label', li: 'list item', title: 'page title', summary: 'headline' },
+};
+function elementKind(tag, attr) {
+  const has = (map, name) => Object.prototype.hasOwnProperty.call(map, name);
+  if (attr !== null) return has(ELEMENT_KINDS.attr, attr) ? ELEMENT_KINDS.attr[attr] : attr + ' attribute';
+  if (/^h[1-6]$/.test(tag)) return 'headline';
+  return has(ELEMENT_KINDS.tag, tag) ? ELEMENT_KINDS.tag[tag] : 'text in <' + tag + '>';
+}
+
+/** A box from a frame message: four finite numbers, or null. */
+function rectOf(rect) {
+  if (!rect || typeof rect !== 'object') return null;
+  const out = {};
+  for (const name of ['left', 'top', 'width', 'height']) {
+    if (typeof rect[name] !== 'number' || !Number.isFinite(rect[name])) return null;
+    out[name] = rect[name];
+  }
+  return out;
+}
+/** A pick's or a hover's hits, each read into a fresh record; one naming an undeclared key, or of the wrong shape, is dropped. */
+function hitsOf(keys) {
+  if (!Array.isArray(keys)) return [];
+  const out = [];
+  for (const k of keys) {
+    if (!k || typeof k !== 'object' || !declared(k.key) || !isEntry(k.entry)) continue;
+    if (k.attr !== null && k.attr !== undefined && typeof k.attr !== 'string') continue;
+    out.push({ key: k.key, attr: typeof k.attr === 'string' ? k.attr : null, by: typeof k.by === 'string' ? k.by : '', entry: k.entry, inplace: k.inplace === true });
+  }
+  return out;
+}
+/**
+ * Whether a hit's entry is one the key's value holds: an index below a list's
+ * length, an own field of a record, and no entry on a plain value. A list or a
+ * record named with no entry holds none, since typing would replace it whole.
+ */
+function entryHeld(key, entry) {
+  const value = valueOf(key);
+  if (entry === undefined) return value === undefined || value === null || typeof value !== 'object';
+  if (Array.isArray(value)) return typeof entry === 'number' && entry < value.length;
+  if (value && typeof value === 'object') return typeof entry === 'string' && own(value, entry);
+  return false;
+}
+/** The text one entry of a key's value holds, or the value's own, as a string. */
+function entryText(key, loc, entry) {
+  const value = valueOf(key, loc);
+  const part = entry === undefined ? value : Array.isArray(value) ? value[entry] : value && typeof value === 'object' && own(value, entry) ? value[entry] : undefined;
+  return typeof part === 'string' ? part : part === undefined || part === null ? '' : shown(part);
+}
+
+/**
+ * A click on copy in Edit. An edit open on another key or entry ends kept
+ * first, whatever order the agent's own end and this pick arrive in. Words two
+ * keys share open the chooser; one key is selected, and a second click on it
+ * starts typing in place where its hit allows, else opens the field over the frame.
+ */
+function onPick(data) {
+  const hits = hitsOf(data.keys);
+  if (hits.length === 0) return;
+  const e = S.edit;
+  if (e !== null && !hits.some((h) => h.key === e.key && h.entry === e.entry)) postToPreview({ stet: 'end', how: 'keep' });
+  const rect = rectOf(data.rect);
+  const again = data.again === true;
+  S.unmanaged = null;
+  closePopover();
+  const keys = hits.map((h) => h.key).filter((key, i, all) => all.indexOf(key) === i);
+  S.choose = keys.length > 1 ? { keys: keys, hits: hits, again: again, rect: rect } : null;
+  paintPanePick();
+  if (S.choose !== null) { paintPaneNote(); return; }
+  choosePick(hits.find((h) => h.inplace && h.attr === null) || hits[0], again, rect);
+}
+function choosePick(hit, again, rect) {
+  const key = hit.key;
+  // A key found by its text on a route whose files are all read, and none names it.
+  const reads = S.routeReads;
+  S.warn = hit.by !== 'mark' && reads !== null && reads.complete && reads.route === routePath(currentRoute()) &&
+    reads.keys.indexOf(key) === -1 ? key : null;
+  selectFromFrame(key, hit.entry);
+  if (!again) return;
+  if (narrow()) { focusField(key, hit.entry); return; }
+  if (!entryHeld(key, hit.entry)) return;
+  if (hit.attr === null && hit.inplace) {
+    const form = hit.by === 'mark' ? 'runs' : 'inplace';
+    postToPreview(Object.assign({ stet: 'edit', key: key, locale: S.locale }, hit.entry === undefined ? {} : { entry: hit.entry },
+      { form: form, oneLine: entryText(key, S.locale, hit.entry).indexOf('\n') === -1 }));
+    S.edit = { key: key, locale: S.locale, entry: hit.entry, form: form, before: S.draft[S.locale + ' ' + key], rect: rect };
+    paintPopover();
+  } else {
+    openPopover(key, S.locale, hit.entry, rect);
+  }
+}
+/** The key a frame click named, selected as a pick from the list is, its field scrolled into view; the pane stays where it is. */
+function selectFromFrame(id, entry) {
+  if (S.sel !== id) {
+    S.sel = id;
+    S.message = '';
+    S.findings = [];
+    S.located = null;
+    if (!S.q && keysInGroup(S.group).indexOf(id) === -1) S.group = groupOf(id);
+    showKeys();
+    render();
+    locateKey(false);
+  } else {
+    paintPaneNote();
+  }
+  const field = fieldOf(id, entry);
+  if (field !== null && typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
+}
+/** A key's field in the column: its entry's, else its own. */
+function fieldOf(id, entry) {
+  const names = entry === undefined ? ['text:' + id, 'number:' + id, 'color:' + id, 'list:' + id + ' 0']
+    : ['list:' + id + ' ' + entry, 'record:' + id + ' ' + entry];
+  for (const el of document.querySelectorAll('#main [data-act-input]')) {
+    if (names.indexOf(el.getAttribute('data-act-input')) !== -1) return el;
+  }
+  for (const el of document.querySelectorAll('#main [data-act-change]')) {
+    if (el.getAttribute('data-act-change') === 'enum:' + id) return el;
+  }
+  return null;
+}
+/** The field focused where it stands once scrolled the least distance into view, so the tapped element stays on screen too. */
+function focusField(id, entry) {
+  const field = fieldOf(id, entry);
+  if (field === null) return;
+  if (typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
+  field.focus({ preventScroll: true });
+}
+/** The column's field for a key whose value changed from the frame or the field over it, written without repainting the column. */
+function paintField(id) {
+  if (S.sel !== id) return;
+  const value = valueOf(id);
+  const want = {};
+  if (Array.isArray(value)) value.forEach((entry, i) => { want['list:' + id + ' ' + i] = String(entry); });
+  else if (value && typeof value === 'object') Object.keys(value).forEach((name) => { want['record:' + id + ' ' + name] = String(value[name]); });
+  else want['text:' + id] = value === undefined ? '' : String(value);
+  for (const el of document.querySelectorAll('#main [data-act-input]')) {
+    const act = el.getAttribute('data-act-input');
+    if (!own(want, act) || el === document.activeElement || el.value === want[act]) continue;
+    el.value = want[act];
+    if (act === 'text:' + id) { paintMirror(el); softCount(el, id); }
+  }
+}
+/** Everything that shows a key's unsaved value, but the field typed in. */
+function paintDraft(id) {
+  paintRow(id);
+  paintField(id);
+  paintDirty();
+}
+
+/** An open edit ended from the dashboard, kept under its own locale; the agent's `edited` that follows finds no open edit. */
+function endEdit() {
+  if (S.edit === null) return;
+  postToPreview({ stet: 'end', how: 'keep' });
+  S.edit = null;
+  paintPopover();
+}
+/** Edit or Use: in Use the page has its clicks back, and an open edit ends kept. */
+function setMode(next) {
+  if (next === 'use') { endEdit(); closePopover(); S.hover = null; paintHover(); }
+  S.mode = next;
+  postToPreview({ stet: 'mode', mode: next });
+  if (ready() && S.tab === 'Content') paintPaneHead();
+}
+/** The frame's Escape with no edit open: the selection ends. */
+function endSelection() {
+  S.sel = null;
+  S.choose = null;
+  S.unmanaged = null;
+  S.warn = null;
+  closePopover();
+  render();
+  locateKey(false);
+}
+function focusSave() {
+  const button = document.querySelector('#main [data-act="save"]');
+  if (button) button.focus();
+}
+/** Every declared key's saved texts as the selected locale renders them, so the agent can say which the page shows. */
+function postCensus() {
+  if (!ready()) return;
+  const keys = [];
+  for (const id of Object.keys(S.site.descriptor.keys).sort()) {
+    const def = S.site.descriptor.keys[id];
+    // A derived key shows as its source, and an email's key on no page.
+    if (def.derivesFrom !== undefined || def.target === 'html-email') continue;
+    const values = renderedValues(id);
+    const texts = distinct(values);
+    const parts = [];
+    for (const value of values) {
+      if (!value || typeof value !== 'object') continue;
+      const entries = Array.isArray(value) ? value.map((v, i) => i) : Object.keys(value);
+      for (const entry of entries) {
+        if (typeof value[entry] !== 'string') continue;
+        const part = parts.find((p) => p.entry === entry);
+        if (!part) parts.push({ entry: entry, texts: [value[entry]] });
+        else if (part.texts.indexOf(value[entry]) === -1) part.texts.push(value[entry]);
+      }
+    }
+    if (parts.length > 0 || values.some((v) => v && typeof v === 'object')) keys.push({ key: id, texts: texts, parts: parts });
+    else if (texts.length > 0) keys.push({ key: id, texts: texts });
+  }
+  postToPreview({ stet: 'census', keys: keys });
+}
+
+function onHover(data) {
+  const hits = hitsOf(data.keys);
+  S.hover = hits.length === 0 ? null : { hits: hits, tag: typeof data.tag === 'string' ? data.tag : '', rect: rectOf(data.rect) };
+  paintHover();
+}
+/** Where else a key shows: the marks route's other place for it, else the census's count less this one. */
+function alsoLine(key, kind) {
+  const places = placesOf(key);
+  if (places.length > 1) {
+    // The hovered element is the first place of its kind; the line names another.
+    const here = places.find((p) => p.kind === kind);
+    const rest = places.filter((p) => p !== here);
+    const other = rest.find((p) => p.kind !== kind) || rest[0];
+    return 'also in ' + other.file + ':' + other.line;
+  }
+  const found = S.census !== null && own(S.census.found, key) ? S.census.found[key] : 0;
+  return found > 1 ? 'also on ' + plural(found - 1, 'other spot') : '';
+}
+/** The label `<kind> · <key>` over the copy under the pointer, with where else the key shows. */
+function paintHover() {
+  const label = document.getElementById('hoverlabel');
+  const h = S.hover;
+  if (h === null || h.rect === null || S.mode !== 'edit' || S.tab !== 'Content' || !ready()) { label.hidden = true; return; }
+  const lines = [];
+  const seen = [];
+  for (const hit of h.hits) {
+    if (seen.indexOf(hit.key) !== -1) continue;
+    seen.push(hit.key);
+    const kind = elementKind(h.tag, hit.attr);
+    lines.push(kind + ' · ' + hit.key);
+    const also = alsoLine(hit.key, kind);
+    if (also !== '') lines.push(also);
+  }
+  label.innerHTML = lines.map((line) => '<div>' + esc(line) + '</div>').join('');
+  label.hidden = false;
+  placeAt(label, h.rect, 'above');
+}
+function onRect(data) {
+  const rect = rectOf(data.rect);
+  if (rect === null) return;
+  if (S.edit !== null) S.edit.rect = rect;
+  if (S.popover !== null) S.popover.rect = rect;
+  paintPopover();
+}
+function onUnmanaged(data) {
+  if (typeof data.text !== 'string') return;
+  S.unmanaged = { text: data.text.slice(0, 120) };
+  S.choose = null;
+  paintPanePick();
+  paintPaneNote();
+}
+/** The keys the open route's files read that the last census did not find on the page, in the descriptor's order. */
+function unfoundKeys() {
+  const reads = S.routeReads;
+  if (reads === null || reads.route !== routePath(currentRoute())) return [];
+  const found = S.census !== null ? S.census.found : {};
+  return Object.keys(S.site.descriptor.keys).filter((key) => reads.keys.indexOf(key) !== -1 && !own(found, key));
+}
+/**
+ * A census reply: what this page shows. Every key it found and its route join
+ * what this tab has seen of the site, and a route the frame reached on its own
+ * has its reads read.
+ */
+function onCensus(data) {
+  if (!data.found || typeof data.found !== 'object' || typeof data.route !== 'string') return;
+  const found = {};
+  for (const key of Object.keys(data.found)) {
+    if (declared(key) && typeof data.found[key] === 'number' && data.found[key] > 0) found[key] = data.found[key];
+  }
+  const head = (Array.isArray(data.head) ? data.head : [])
+    .filter((h) => h && typeof h === 'object' && declared(h.key) && typeof h.where === 'string' && own(HEAD_WHERE, h.where))
+    .map((h) => ({ key: h.key, where: h.where }));
+  S.census = { found: found, head: head, route: data.route };
+  const route = routePath(shownRoute(data.route));
+  for (const key of Object.keys(found)) S.seen.keys.add(key);
+  S.seen.routes.add(route);
+  if (routeReadsFor !== route) void guard(loadRouteReads(route));
+  paintKeyRows();
+  paintShared();
+  paintPaneNote();
+  paintPageInfo();
+}
+function onMoved(data) {
+  if (typeof data.route !== 'string') return;
+  S.moved = shownRoute(data.route);
+  if (ready() && S.tab === 'Content') paintPaneHead();
+  void guard(loadRouteReads(routePath(S.moved)));
+}
+/** The kinds a key the last census found only in the page's head shows as; none where it shows anywhere else too. */
+function headOnly(id) {
+  if (S.census === null || !own(S.census.found, id)) return [];
+  const at = S.census.head.filter((h) => h.key === id);
+  if (at.length < S.census.found[id]) return [];
+  return at.map((h) => HEAD_WHERE[h.where]).filter((kind, i, all) => all.indexOf(kind) === i);
+}
+
+/** Two keys show the clicked words: each a button. */
+function paintPanePick() {
+  const box = document.getElementById('panepick');
+  const c = S.choose;
+  box.hidden = c === null;
+  box.innerHTML = c === null ? '' : '<div>Two keys show these words. Which one?</div>' +
+    c.keys.map((key) => '<button class="btn sm mono" data-act="choose:' + esc(key) + '">' + esc(key) + '</button>').join('');
+}
+
+/** The open page's head copy as keys: the marks of its document on the html host, the census's head matches elsewhere. */
+function headEntries() {
+  const out = [];
+  const add = (key, kind) => { if (!out.some((e) => e.key === key && e.kind === kind)) out.push({ key: key, kind: kind }); };
+  if (htmlHost()) {
+    const doc = S.marks.documents.find((d) => routePath(d.route) === routePath(currentRoute()));
+    if (doc) {
+      for (const key of Object.keys(S.marks.places).sort()) {
+        for (const p of S.marks.places[key]) if (p.file === doc.file && HEAD_KINDS.indexOf(p.kind) !== -1) add(key, p.kind);
+      }
+    }
+  } else if (S.census !== null) {
+    for (const h of S.census.head) add(h.key, HEAD_WHERE[h.where]);
+  }
+  return out;
+}
+/** Page info: the title, the description and the share texts the page carries out of sight, with the two cards. */
+function paintPageInfo() {
+  const box = document.getElementById('paneinfo');
+  if (!S.pageInfo || !ready()) { box.hidden = true; box.innerHTML = ''; return; }
+  const entries = headEntries();
+  const keyOf = (kind) => { const e = entries.find((x) => x.kind === kind); return e ? e.key : null; };
+  const title = keyOf('page title');
+  const description = keyOf('meta description');
+  const head = entries.length === 0 ? null : htmlHost() ? headOf(entries[0].key) : {
+    route: currentRoute(), title: title, description: description,
+    shareTitle: keyOf('share title') || title, shareDescription: keyOf('share description') || description,
+  };
+  const html = (entries.length === 0 ? '<div class="muted">No head text on this page matches a key.</div>'
+    : entries.map((e) => '<div class="hl">' + esc(e.kind + ' · ' + e.key) + '</div>').join('')) + (head === null ? '' : cardsHtml(head));
+  box.hidden = false;
+  if (box.innerHTML !== html) box.innerHTML = html;
+}
+
+/**
+ * The page's text box over the frame (fork 2): the raw value of the key, its
+ * entry or its attribute, `{{name}}` tokens as written. At 760 px and narrower the
+ * column's own field takes the edit instead (fork 15).
+ */
+function openPopover(key, loc, entry, rect) {
+  if (narrow()) { focusField(key, entry); return; }
+  S.popover = { key: key, locale: loc, entry: entry, rect: rect, before: S.draft[loc + ' ' + key], redrawn: false };
+  // The field over the frame holds the caret: no repaint puts it back on a column field.
+  focusKey = null;
+  const text = document.getElementById('poptext');
+  text.value = entryText(key, loc, entry);
+  text.setAttribute('aria-label', key);
+  paintPopover();
+  text.focus();
+}
+function closePopover() {
+  if (S.popover === null) return;
+  S.popover = null;
+  paintPopover();
+}
+/** The field over the frame and the counter by an element typed in place, each at its element's box. */
+function paintPopover() {
+  const pop = document.getElementById('popover');
+  const p = S.popover;
+  pop.hidden = p === null;
+  if (p !== null) {
+    document.getElementById('popkey').textContent = p.key + (p.entry === undefined ? '' : '[' + p.entry + ']');
+    paintCount(document.getElementById('popcount'), p.key, entryText(p.key, p.locale, p.entry));
+    placeAt(pop, p.rect, 'below');
+  }
+  const counter = document.getElementById('counter');
+  const e = S.edit;
+  counter.hidden = e === null;
+  if (e !== null) {
+    paintCount(counter, e.key, entryText(e.key, e.locale, e.entry));
+    placeAt(counter, e.rect, 'end');
+  }
+}
+/**
+ * The counter: the length the column's field counts, a tagged value's plain
+ * text, an entry's own. Grey, amber from 90 % of the limit, and past it red,
+ * saying what Save does with it.
+ */
+function paintCount(el, id, text) {
+  const def = keyDef(id) || {};
+  const max = def.limits ? def.limits.max : null;
+  const n = def.tags !== undefined ? deriveText('{v}', text, true).length : text.length;
+  const over = max !== null && n > max;
+  el.textContent = max === null ? String(n)
+    : n + ' / ' + max + (!over ? '' : def.limits.severity === 'hard' ? ' · Save refuses this' : ' · Save asks first');
+  el.className = 'cnt' + (over ? ' bad' : max !== null && n >= Math.ceil(0.9 * max) ? ' amb' : '');
+}
+/** A frame element's box as the dashboard shows it, through the frame's own scale. */
+function projected(rect) {
+  const frame = document.querySelector('#devwrap iframe');
+  const box = frame.getBoundingClientRect();
+  const k = frame.offsetWidth === 0 ? 1 : box.width / frame.offsetWidth;
+  return { left: box.left + rect.left * k, top: box.top + rect.top * k, width: rect.width * k, height: rect.height * k };
+}
+/**
+ * A fixed element put at a frame element's box: under it (`below`), at its
+ * lower right (`end`) or over it (`above`), flipped where it would leave the
+ * window, and 8 px in from each edge.
+ */
+function placeAt(el, rect, where) {
+  if (!document.querySelector('#devwrap iframe')) return;
+  const box = projected(rect || { left: 0, top: 0, width: 0, height: 0 });
+  const w = el.offsetWidth;
+  const h = el.offsetHeight;
+  let left = where === 'end' ? box.left + box.width - w : box.left;
+  let top = where === 'above' ? box.top - h - 4 : box.top + box.height + 6;
+  if (where === 'above' && top < 8) top = box.top + box.height + 4;
+  else if (where !== 'above' && top + h > window.innerHeight - 8) top = box.top - h - 6;
+  el.style.left = Math.max(8, Math.min(left, window.innerWidth - 8 - w)) + 'px';
+  el.style.top = Math.max(8, top) + 'px';
+}
+const popText = document.getElementById('poptext');
+popText.addEventListener('input', () => {
+  const p = S.popover;
+  if (p === null) return;
+  clearRefusal();
+  setDraftIn(p.locale, p.key, p.entry === undefined ? popText.value : withEntry(p.key, p.locale, p.entry, popText.value));
+  paintPopover();
+  paintDraft(p.key);
+});
+popText.addEventListener('keydown', (event) => {
+  const p = S.popover;
+  if (p === null || event.isComposing) return;
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    closePopover();
+    render();
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    const k = p.locale + ' ' + p.key;
+    if (p.before === undefined) { delete S.draft[k]; delete S.base[k]; }
+    else S.draft[k] = p.before;
+    draftChanged();
+    closePopover();
+    render();
+  }
+});
+document.getElementById('popover').addEventListener('focusin', () => { focusKey = null; });
 
 const START_POLL_MS = 1000;
 const START_WAIT_MS = 60000;
@@ -1817,15 +3346,232 @@ function vTemplates() {
         (verdict.detail ? ' <span class="muted">' + esc(verdict.detail) + '</span>' : '') : '<span class="muted">—</span>') +
       '</td></tr>' + slots;
   }).join('');
-  return '<div class="card"><div class="ch"><h3>Templates</h3>' +
+  const refusal = findingsBlock(null);
+  return '<div class="card" data-tpl-save>' + (refusal === '' ? '' : '<div class="cb">' + refusal + '</div>') + saveBar(null) + '</div>' +
+    '<div class="card"><div class="ch"><h3>Templates</h3>' +
     '<button class="btn sm" data-act="verify">Run</button></div>' +
     '<table><thead><tr><th style="width:170px">Template</th><th style="width:120px">Class</th><th>Verdict</th></tr></thead>' +
-    '<tbody>' + (rows || '<tr><td colspan="3" class="muted">No templates declared.</td></tr>') + '</tbody></table>' +
-    '<div class="bar"><span class="muted" style="font-size:11.5px">' +
-    (storeBacked()
-      ? 'The assembled preview is not built yet.'
-      : 'the assembled preview needs a store-backed site — a snapshot site has no render route') +
-    '</span></div></div>';
+    '<tbody>' + (rows || '<tr><td colspan="3" class="muted">No templates declared.</td></tr>') + '</tbody></table></div>' +
+    pointered().map(emailCard).join('');
+}
+
+// --- the email preview ---------------------------------------------------------
+// The server renders each template through its render pointer with the slot values wrapped in markers
+// (`POST /api/site/email-preview`); the page only places the markup it is handed in a frame that runs no
+// scripts and reads the clicks that frame holds.
+const TPL_WIDTHS = { desktop: 640, mobile: 375 };
+const TPL_WAIT_MS = 400;
+let tplTimer = null;
+const wiredFrames = new WeakSet();
+
+/** The templates that declare a render pointer, by name. */
+const pointered = () => {
+  const templates = (ready() && S.site.descriptor.templates) || {};
+  return Object.keys(templates).sort().filter((name) => !!templates[name].render);
+};
+const tplSlotKeys = (name) => (((S.site.descriptor.templates || {})[name] || {}).slots || []).map((slot) => name + '__' + slot);
+/** The template that owns a slot key, or null. */
+const tplOwner = (id) => pointered().find((name) => tplSlotKeys(name).indexOf(id) !== -1) || null;
+/** What a render is valid for: the project, the environment and the language. */
+const tplContext = () => S.path + '\n' + S.env + '\n' + S.locale;
+function tplEntry(name) {
+  if (S.tpl.ctx !== tplContext()) S.tpl = { ctx: tplContext(), byName: {} };
+  if (!own(S.tpl.byName, name)) S.tpl.byName[name] = { loading: false, stale: false, loaded: false, html: null, subject: '', preheader: '', failure: null, sendOpen: false, to: '', sending: false, sendMsg: '', sendBad: false };
+  return S.tpl.byName[name];
+}
+
+/** One template's card: Subject and Preview, the width presets, the email in its frame, the slot being edited. */
+function emailCard(name) {
+  return '<div class="card" data-tpl="' + esc(name) + '"><div class="ch"><h3>' + esc(name) + '</h3>' +
+    '<span class="tg">' + [['desktop', 'Desktop'], ['mobile', 'Mobile']].map((w) => '<button class="' + (S.tplWidth === w[0] ? 'on' : '') +
+      '" data-act="tplWidth:' + w[0] + '">' + w[1] + '</button>').join('') + '</span></div>' +
+    '<div data-tpl-meta="' + esc(name) + '">' + tplMeta(name) + '</div>' +
+    '<div class="cb"><div data-tpl-fail="' + esc(name) + '">' + tplFail(name) + '</div>' +
+    '<div data-tpl-box="' + esc(name) + '">' + tplFrame(name) + '</div>' +
+    '<p class="note">Images hosted on other sites don\'t show in this preview.</p>' +
+    (storeBacked() ? '<div data-tpl-send="' + esc(name) + '" style="margin-bottom:9px">' + tplSend(name) + '</div>' : '') +
+    '<div data-tpl-field="' + esc(name) + '">' + slotEditor(name) + '</div></div></div>';
+}
+/** `Subject <text>` and `Preview <text>`, each with its key, which selects the slot. */
+function tplMeta(name) {
+  const e = tplEntry(name);
+  const slots = tplSlotKeys(name);
+  const line = (label, text, slot) => '<div class="kline"><span><b>' + label + '</b> ' +
+    (text === '' || text === null ? '<span class="muted">(empty)</span>' : esc(text)) + '</span>' +
+    (slots.indexOf(name + '__' + slot) === -1 ? '' : '<span><button class="btn sm mono" data-act="tplSlot:' + esc(name + '__' + slot) + '">' +
+      esc(name + '__' + slot) + '</button></span>') + '</div>';
+  return line('Subject', e.loaded ? e.subject : '', 'subject') + line('Preview', e.loaded ? e.preheader : '', 'preheader');
+}
+function tplFail(name) {
+  const e = tplEntry(name);
+  if (e.failure) return '<div class="err">' + esc(e.failure.reason + ': ' + e.failure.detail) + '</div>';
+  return e.loaded ? '' : '<div class="muted" style="font-size:11.5px">Rendering…</div>';
+}
+/** The sandboxed frame: no scripts run in it, and the page reads its clicks. */
+function tplFrame(name) {
+  const e = tplEntry(name);
+  if (e.html === null || e.failure) return '';
+  return '<iframe sandbox="allow-same-origin" data-tpl-frame="' + esc(name) + '" title="' + esc('Email preview: ' + name) + '" srcdoc="' + esc(e.html) +
+    '" style="display:block;margin:0 auto;width:' + TPL_WIDTHS[S.tplWidth] + 'px;max-width:100%;height:' + (e.height || 320) +
+    'px;border:1px solid hsl(var(--bd));border-radius:6px;background:#fff"></iframe>';
+}
+/** Whether `to` can be sent to: an address with an `@` and no line break (the mount refuses one that has). */
+const tplToOk = (to) => to.indexOf('@') !== -1 && !/[\r\n]/.test(to);
+/** What a test send leaves out: the words typed and not yet saved. */
+const tplUnsaved = () => !dirty() ? '' : plural(edits(), 'unsaved edit') + (edits() === 1 ? ' is' : ' are') + ' not in this email.';
+/** A store-backed template's Test send: a button, then the address and Send; the host's own function sends the saved drafts. */
+function tplSend(name) {
+  const e = tplEntry(name);
+  const line = e.sendMsg === '' ? '' : '<div class="' + (e.sendBad ? 'err' : 'muted') + '" role="status" style="font-size:11.5px;margin-top:5px">' + esc(e.sendMsg) + '</div>';
+  if (!e.sendOpen) return '<button class="btn sm" data-act="tplSendOpen:' + esc(name) + '">Test send…</button>' + line;
+  return '<div class="derive"><input class="in sm" type="text" inputmode="email" autocomplete="off" spellcheck="false" aria-label="Send the test email to" value="' +
+    esc(e.to) + '" data-act-input="tplTo:' + esc(name) + '">' +
+    '<button class="btn pri sm" data-act="tplSendGo:' + esc(name) + '"' + (tplToOk(e.to) && !e.sending ? '' : ' disabled') + '>Send</button>' +
+    '<button class="btn sm" data-act="tplSendClose:' + esc(name) + '">Cancel</button></div>' +
+    '<p class="note" data-tpl-unsaved="' + esc(name) + '">' + esc(tplUnsaved()) + '</p>' + line;
+}
+function paintSend(name) {
+  const box = document.querySelector('[data-tpl-send="' + name.replace(/"/g, '') + '"]');
+  if (box !== null) box.innerHTML = tplSend(name);
+}
+/** The note under each open address field, which follows the unsaved count as words are typed. */
+function paintUnsavedNotes() {
+  for (const note of document.querySelectorAll('[data-tpl-unsaved]')) note.textContent = tplUnsaved();
+}
+async function tplSendTest(name) {
+  const e = tplEntry(name);
+  if (!tplToOk(e.to) || e.sending) return;
+  const to = e.to;
+  e.sending = true;
+  e.sendMsg = '';
+  paintSend(name);
+  let res;
+  try { res = await post(mountPath('test-send'), { template: name, to: to }); } finally { e.sending = false; }
+  e.sendBad = !res.ok;
+  e.sendMsg = res.ok ? 'Sent to ' + to + '.'
+    : res.status === 501 ? 'Test send needs emailSend in stet.config.json: the host function that sends one email, the same one `stet email test` uses.'
+    : res.body.error || 'the test send was refused';
+  paintSend(name);
+}
+/** The selected slot's field under the frame: `<key> · <n> / <max>`, then what the value must keep. */
+function slotEditor(name) {
+  const id = S.tplKey;
+  if (id === null || tplSlotKeys(name).indexOf(id) === -1) return '<p class="note">Click the text you want to change in the email.</p>';
+  const def = keyDef(id) || {};
+  const max = def.limits ? def.limits.max : null;
+  const held = valueOf(id);
+  const text = held === undefined ? '' : String(held);
+  const requires = def.requires || [];
+  return '<textarea class="in" rows="3" aria-label="' + esc(id) + '" data-act-input="text:' + esc(id) + '">' + esc(text) + '</textarea>' +
+    '<div style="margin-top:5px"><span class="mono">' + esc(id) + '</span> · <span class="cnt ' + (max !== null && text.length > max ? 'bad' : '') + '">' +
+    text.length + (max === null ? '' : ' / ' + max + (def.limits && def.limits.severity === 'hard' ? ' · hard' : '')) + '</span></div>' +
+    '<div class="muted" style="font-size:11.5px;margin-top:3px">requires: ' + (requires.length === 0 ? 'none' : esc(requires.join(', '))) + '</div>';
+}
+
+/** Marks the templates a draft of `id` touches (every template without one) for a render, and renders after the pause. */
+function queueTemplates(id) {
+  if (!ready() || S.site.descriptor.templates === undefined) return;
+  const hit = id === undefined ? pointered() : [tplOwner(id)].filter((name) => name !== null);
+  for (const name of hit) tplEntry(name).stale = true;
+  if (hit.length === 0 || S.tab !== 'Templates') return;
+  clearTimeout(tplTimer);
+  tplTimer = setTimeout(() => { tplTimer = null; fetchTemplates(); }, TPL_WAIT_MS);
+}
+/** After a paint of the tab: the frames wired, and every template never rendered, or stale with no pause pending, requested. */
+function paintTemplates() {
+  for (const frame of document.querySelectorAll('#main iframe[data-tpl-frame]')) wireFrame(frame);
+  for (const name of pointered()) {
+    const e = tplEntry(name);
+    if (!e.loading && (!e.loaded || (e.stale && tplTimer === null))) void guard(fetchTemplate(name));
+  }
+}
+function fetchTemplates() {
+  for (const name of pointered()) {
+    const e = tplEntry(name);
+    if (!e.loading && e.stale) void guard(fetchTemplate(name));
+  }
+}
+/** One template rendered by the server with the unsaved words of its slots, and painted where it stands. */
+async function fetchTemplate(name) {
+  const e = tplEntry(name);
+  e.loading = true;
+  e.stale = false;
+  const drafts = {};
+  for (const id of tplSlotKeys(name)) if (own(S.draft, S.locale + ' ' + id)) drafts[id] = S.draft[S.locale + ' ' + id];
+  const body = { template: name, locale: S.locale, drafts: drafts };
+  if (S.env !== 'default') body.env = S.env;
+  let res;
+  try { res = await post('/api/site/email-preview' + query(), body); } finally { e.loading = false; }
+  // `e` is the entry of the project, environment and language that asked: an answer for another one lands on an entry nothing shows.
+  e.loaded = true;
+  const ok = res.ok && typeof res.body.html === 'string';
+  e.failure = ok ? null : (res.body.failure || { reason: 'not-renderable', detail: res.body.error || 'the preview did not answer' });
+  if (ok) { e.html = res.body.html; e.subject = res.body.subject; e.preheader = res.body.preheader; }
+  paintTemplate(name);
+  // Words typed while it rendered are rendered next, once.
+  if (e.stale && tplTimer === null) void guard(fetchTemplate(name));
+}
+/** One card's parts repainted in place, so a field being typed in is never replaced. */
+function paintTemplate(name) {
+  const at = (part) => document.querySelector('[' + part + '="' + name.replace(/"/g, '') + '"]');
+  const meta = at('data-tpl-meta');
+  if (meta === null) return;
+  meta.innerHTML = tplMeta(name);
+  at('data-tpl-fail').innerHTML = tplFail(name);
+  const box = at('data-tpl-box');
+  const e = tplEntry(name);
+  const frame = box.querySelector('iframe');
+  if (e.html === null || e.failure) { box.innerHTML = ''; return; }
+  if (frame === null) { box.innerHTML = tplFrame(name); wireFrame(box.querySelector('iframe')); return; }
+  // The frame stays where it is: only its document is replaced, and it is wired again as it loads.
+  if (frame.getAttribute('srcdoc') !== e.html) frame.setAttribute('srcdoc', e.html);
+}
+/** The frame's clicks, read when its document loads: a click on text a slot wrote selects that slot. */
+function wireFrame(frame) {
+  if (frame === null || wiredFrames.has(frame)) return;
+  wiredFrames.add(frame);
+  const name = frame.getAttribute('data-tpl-frame');
+  frame.addEventListener('load', () => {
+    const doc = frame.contentDocument;
+    if (doc === null || doc.body === null) return;
+    const height = Math.max(120, doc.documentElement.scrollHeight);
+    tplEntry(name).height = height;
+    frame.style.height = height + 'px';
+    const style = doc.createElement('style');
+    style.setAttribute('data-stet-preview', '');
+    doc.head.appendChild(style);
+    paintSlotMark(frame);
+    doc.addEventListener('click', (event) => {
+      // A preview: a link inside it goes nowhere.
+      event.preventDefault();
+      const hit = event.target && event.target.closest ? event.target.closest('[data-stet]') : null;
+      // The marker is the email's own markup, so only a slot of this template is believed.
+      const key = hit === null ? null : hit.getAttribute('data-stet');
+      if (key !== null && tplSlotKeys(name).indexOf(key) !== -1) selectSlot(name, key);
+    });
+  });
+}
+/** The selected slot's text outlined in the frame, and every marked text showing it can be clicked. */
+function paintSlotMark(frame) {
+  const doc = frame.contentDocument;
+  const style = doc && doc.querySelector('style[data-stet-preview]');
+  if (!style) return;
+  style.textContent = '[data-stet]{cursor:pointer}[data-stet]:hover{outline:1px dashed #3b82f6;outline-offset:1px}' +
+    (S.tplKey === null ? '' : '[data-stet=' + JSON.stringify(S.tplKey) + ']{outline:2px solid #3b82f6;outline-offset:1px}');
+}
+/** A slot opened for editing under its frame; on a phone the field is scrolled into view with the tapped text kept on screen. */
+function selectSlot(name, key) {
+  S.tplKey = key;
+  for (const other of pointered()) {
+    const field = document.querySelector('[data-tpl-field="' + other + '"]');
+    if (field !== null) field.innerHTML = slotEditor(other);
+    const frame = document.querySelector('iframe[data-tpl-frame="' + other + '"]');
+    if (frame !== null) paintSlotMark(frame);
+  }
+  const field = fieldOf(key);
+  if (field === null) return;
+  if (typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
+  field.focus({ preventScroll: true });
 }
 
 // --- Brand -------------------------------------------------------------------
@@ -1837,8 +3583,7 @@ function vBrand() {
     keys.map((id) => '<tr><td class="mono">' + esc(id) + '</td><td>' +
       esc(String(shown(valueOf(id) === undefined ? '' : valueOf(id))).slice(0, 90)) + '</td>' +
       '<td><button class="btn sm" data-act="edit:' + esc(id) + '">Edit</button></td></tr>').join('') +
-    '</tbody></table><div class="bar"><span class="muted" style="font-size:11.5px">' +
-    'The email preview these values frame is not built yet.</span></div></div>';
+    '</tbody></table></div>';
 }
 
 // --- SEO ---------------------------------------------------------------------
@@ -1972,13 +3717,13 @@ function auditBody(a) {
       return '<div class="cb">' + errors.map((m) => '<div class="err lhmsg">' + esc(m) + '</div>').join('') + '</div>';
     }
     const lh = r.lighthouse || {};
-    const what = lh.targetKind === 'build' ? 'the production build' : lh.targetKind === 'url' ? lh.target : "the checkout's documents";
+    const what = lh.targetKind === 'build' ? 'the production build' : lh.targetKind === 'url' ? lh.target : "the project's documents";
     const summary = 'lighthouse ' + lh.version + ' · ' + (lh.formFactor === 'desktop' ? 'desktop' : 'mobile') + ' · ' + what + ' · ' +
       plural(pages.length, 'page') + ' · ' + (reply.elapsed || 0) + ' s';
     return '<div class="cb mono muted" style="font-size:11.5px;overflow-wrap:anywhere">' + esc(summary) + '</div>' +
       pages.map((p) => auditPage(p, r)).join('');
   }
-  return '<div class="cb muted">' + (htmlHost() ? "Not run yet. Runs against the checkout's documents." : 'Not run yet. Runs against the production build.') + '</div>';
+  return '<div class="cb muted">' + (htmlHost() ? "Not run yet. Runs against the project's documents." : 'Not run yet. Runs against the production build.') + '</div>';
 }
 
 function vLighthouse() {
@@ -1999,15 +3744,15 @@ function vLighthouse() {
 
 // --- Scheduled, Environments, Recent ----------------------------------------
 function vScheduled() {
-  const rows = (S.rows && S.rows.rows) || [];
+  const rows = S.rows || [];
   const scheduled = rows.filter((r) => r.publishAt);
-  const changes = (S.changes && S.changes.changes) || [];
+  const changes = (S.scheduled && S.scheduled.changes) || [];
   const grouped = '<div class="card"><div class="ch"><h3>Scheduled changes</h3>' +
     '<span class="bdg">a change publishes as one unit</span></div>' +
     '<table><thead><tr><th style="width:200px">When</th><th style="width:200px">Change</th>' +
     '<th>Note</th><th style="width:90px">Opened</th></tr></thead><tbody>' +
     (changes.length === 0
-      ? '<tr><td colspan="4" class="muted">' + (S.changes === null ? 'Not loaded.' : 'No change is scheduled.') + '</td></tr>'
+      ? '<tr><td colspan="4" class="muted">' + (S.scheduled === null ? 'Not loaded.' : 'No change is scheduled.') + '</td></tr>'
       : changes.map((c) => '<tr><td>' + esc(c.publishAt) + '</td><td><b>' + esc(c.name) + '</b></td>' +
         '<td class="muted">' + esc(c.note || '') + '</td>' +
         '<td class="muted">' + esc(c.authorKind) + '</td></tr>').join('')) + '</tbody></table></div>';
@@ -2053,7 +3798,7 @@ function vRecent() {
       (rows.length === 0
         ? '<tr><td colspan="4" class="muted">' + (S.recent === null ? 'Not loaded.' : 'Nothing published yet.') + '</td></tr>'
         : rows.map((r) => '<tr><td class="mono">v' + esc(r.id) + '</td><td class="muted">' + esc(r.publishedAt) +
-          '</td><td class="mono">' + esc(r.key) + '</td><td>' + esc(String(shown(r.value)).slice(0, 60)) +
+          '</td><td class="mono">' + esc(r.key) + '</td><td>' + esc(String(shown(r.value)).slice(0, 60)) + changeOf(r) +
           '</td></tr>').join('')) + '</tbody></table></div>';
   }
   const rows = (S.history && S.history.commits) || [];
@@ -2066,9 +3811,42 @@ function vRecent() {
       : 'On a snapshot site a publish is a commit, so this is the snapshot file&rsquo;s own log.') + '</span></div></div>';
 }
 
+/** A published row's change: its name and Preview change, or nothing for a row published on its own. */
+function changeOf(row) {
+  if (row.changesetId === null || row.changesetId === undefined) return '';
+  const name = own(S.changeNames, row.changesetId) ? S.changeNames[row.changesetId] : 'change ' + row.changesetId;
+  return esc(' · ' + name) + ' <button class="btn sm" data-act="previewChange:' + esc(row.changesetId) + '">Preview change</button>';
+}
+/** A published change opened before and current over its pages, from `GET …/changes?id=`. */
+async function openChangePreview(id) {
+  const res = await api(mountPath('changes', 'id=' + id));
+  if (!res.ok) { tst(res.body.error || 'that change could not be read'); return; }
+  S.changeNames[id] = res.body.change.name;
+  S.showing = { kind: 'published', id: id, name: res.body.change.name, members: res.body.members || [], view: 'before', ask: false, skipped: null, error: '' };
+  // The preview is the Content tab's pane.
+  if (S.tab !== 'Content') setMode('edit');
+  S.tab = 'Content';
+  render();
+  locateKey(false);
+}
+/** Revert change: every member back to its before value, written forward; a member that cannot be is named. */
+async function revertChange() {
+  const v = S.showing;
+  if (v === null || v.kind !== 'published') return;
+  v.ask = false;
+  const res = await post(mountPath('revert-change'), { change: v.id, editor: S.editor });
+  if (!res.ok) { v.error = res.body.error || 'the store refused that revert'; render(); return; }
+  v.skipped = (res.body.skipped || []).map((m) => m.reason === 'stale_active'
+    ? m.key + ' was published again since — kept as it is'
+    : m.key + ' had no earlier published value — left as it is');
+  v.error = '';
+  render();
+  await loadRows();
+}
+
 // --- Health ------------------------------------------------------------------
 function vHealth() {
-  if (!S.site) return '<div class="hint">Add a checkout to run Health against it.</div>';
+  if (!S.site) return '<div class="hint">Add a project to run Health against it.</div>';
   const head = '<div class="card"><div class="ch"><h3>Health</h3>' +
     '<button class="btn sm pri" data-act="health">Run</button></div>' +
     (S.health === null ? '<div class="cb muted">Not run yet.</div>' : '<div class="cb">' + stampLine() + '</div>') + '</div>';
@@ -2132,7 +3910,7 @@ function vSetup() {
     '<span class="bdg mono">' + esc(S.site.path) + '</span></div><div class="cb">' + devFields +
     '<label style="display:flex;gap:7px;align-items:center;margin-top:9px;font-size:12px">' +
     '<input type="checkbox"' + (entry.pushAfterCommit ? ' checked' : '') + ' data-act-change="entryPush">Push after commit</label>' +
-    '<div style="margin-top:10px"><button class="btn sm dg" data-act="removeSite">Remove this checkout</button></div>' +
+    '<div style="margin-top:10px"><button class="btn sm dg" data-act="removeSite">Remove this project</button></div>' +
     '</div></div>';
 
   const upgrades = '<div class="card"><div class="ch"><h3>Pending upgrades — run stet upgrade in the terminal</h3>' +
@@ -2189,10 +3967,23 @@ function fxPacks() {
 // One entry per control. The delegated listeners below look a name up here and
 // call it with the element, the argument the attribute carried, and the event.
 const ACTIONS = {
+  tplSendOpen: (el, name) => { const e = tplEntry(name); e.sendOpen = true; e.sendMsg = ''; paintSend(name); },
+  tplSendClose: (el, name) => { const e = tplEntry(name); e.sendOpen = false; e.sendMsg = ''; paintSend(name); },
+  tplSendGo: (el, name) => { void guard(tplSendTest(name)); },
+  tplSlot: (el, key) => { const name = tplOwner(key); if (name !== null) selectSlot(name, key); },
+  tplWidth: (el, width) => {
+    if (!own(TPL_WIDTHS, width)) return;
+    S.tplWidth = width;
+    for (const frame of document.querySelectorAll('iframe[data-tpl-frame]')) frame.style.width = TPL_WIDTHS[width] + 'px';
+    for (const button of document.querySelectorAll('[data-act^="tplWidth:"]')) button.classList.toggle('on', button.getAttribute('data-act') === 'tplWidth:' + width);
+  },
   theme: () => {
     document.body.dataset.theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
   },
   tab: (el, name) => {
+    // Away from Content an open edit ends kept; Content opens in Edit.
+    if (name !== 'Content') { endEdit(); closePopover(); S.hover = null; paintHover(); }
+    else if (S.tab !== 'Content') setMode('edit');
     S.tab = name;
     render();
     if (name === 'SEO' && ready() && S.audit === null) void guard(pollAudit());
@@ -2209,7 +4000,24 @@ const ACTIONS = {
     S.audit = Object.assign({}, S.audit, { form: lh.formFactor === 'desktop' ? 'desktop' : 'mobile' });
     void guard(startAudit(Object.assign({ fix: true, pages: [page] }, lh.targetKind === 'url' ? { url: lh.target } : {})));
   },
-  site: (el, path) => { void guard(loadSite(path)); },
+  site: (el, path) => { leaveFor(path); },
+  unsaved: () => { S.unsavedOpen = !S.unsavedOpen; paintAsk(); },
+  undoEdit: (el, arg) => { const cut = arg.indexOf(' '); undoEdit(arg.slice(0, cut), arg.slice(cut + 1)); },
+  undoTmpl: (el, id) => { undoTmpl(id); },
+  showEdit: (el, arg) => { const cut = arg.indexOf(' '); showEdit(arg.slice(0, cut), arg.slice(cut + 1)); },
+  showTmpl: (el, id) => { showEdit(null, id); },
+  discardAll: () => { discardAll(); },
+  leaveGo: () => { const ask = S.leaveAsk; S.leaveAsk = null; void guard(ask.remove === true ? removeCurrent() : loadSite(ask.path)); },
+  leaveStay: () => { S.leaveAsk = null; paintAsk(); },
+  renameOpen: (el, path) => {
+    if (S.renaming !== null && S.renaming.path === path) { S.renaming = null; render(); return; }
+    const row = S.sites.find((s) => s.path === path);
+    S.renaming = { path: path, value: row === undefined ? '' : row.name };
+    render();
+    const field = document.querySelector('[data-act-input="renameName"]');
+    if (field) field.focus();
+  },
+  renameSave: () => { void guard(saveRename()); },
   addSite: () => {
     const input = document.getElementById('addpath');
     const path = input.value.trim();
@@ -2222,23 +4030,24 @@ const ACTIONS = {
       err.textContent = '';
       input.value = '';
       S.sites = res.body.sites || [];
-      await loadSite(res.body.path);
+      leaveFor(res.body.path);
     })());
   },
   removeSite: () => {
-    void guard((async () => {
-      const res = await post('/api/workspace/remove', { path: S.path });
-      S.sites = res.body.sites || [];
-      S.path = null;
-      S.site = null;
-      await loadWorkspace();
-    })());
+    if (lostEdits() > 0) { S.leaveAsk = { path: S.path, remove: true }; paintAsk(); return; }
+    void guard(removeCurrent());
   },
   key: (el, id) => {
     S.sel = id;
+    if (S.showing !== null && S.showing.kind === 'version') S.showing = null;
+    void guard(loadKeyHistory());
     S.message = '';
     S.findings = [];
     S.located = null;
+    S.warn = null;
+    S.unmanaged = null;
+    S.choose = null;
+    closePopover();
     showKeys();
     render();
     // A key on another page moves the pane first, and is located once that
@@ -2264,16 +4073,28 @@ const ACTIONS = {
     paintPane();
   },
   gitErrorDismiss: () => { clearGitError(); },
+  mode: (el, next) => { setMode(next === 'use' ? 'use' : 'edit'); },
+  pageInfo: () => {
+    S.pageInfo = !S.pageInfo;
+    paintPaneHead();
+    paintPageInfo();
+    fitFrame();
+  },
+  choose: (el, key) => {
+    const c = S.choose;
+    const hit = c === null ? undefined : c.hits.find((h) => h.key === key);
+    if (hit === undefined) return;
+    S.choose = null;
+    paintPanePick();
+    // Words two keys share are never typed in place: the chosen key opens in the field.
+    choosePick(Object.assign({}, hit, { inplace: false }), c.again, c.rect);
+  },
   cycleEnv: () => {
     const names = ((ready() && S.site.environments) || []).map((e) => e.name);
     if (names.length < 2) return;
-    S.env = names[(names.indexOf(S.env) + 1) % names.length];
-    S.rows = null;
-    S.changes = null;
-    S.recent = null;
-    render();
+    switchEnv(names[(names.indexOf(S.env) + 1) % names.length]);
   },
-  env: (el, name) => { S.env = name; S.rows = null; S.changes = null; S.recent = null; render(); },
+  env: (el, name) => { switchEnv(name); },
   'list-add': (el, arg) => {
     const id = arg;
     const held = valueOf(id);
@@ -2298,15 +4119,75 @@ const ACTIONS = {
     });
   },
   save: () => { void guard(save()); },
+  takeOver: () => { void guard(takeOver()); },
+  changeNew: () => { S.changeForm = { name: '', note: '' }; S.changeError = ''; render(); },
+  changeFormCancel: () => { S.changeForm = null; S.changeError = ''; render(); },
+  changeCreate: () => { void guard(createChange()); },
+  changeResume: (el, id) => {
+    const found = (S.changes || []).find((c) => String(c.id) === id);
+    if (!found) return;
+    activate(found);
+    render();
+  },
+  setAside: () => { deactivate(); render(); locateKey(false); },
+  removeMember: (el, version) => {
+    const row = (S.rows || []).find((r) => r.status === 'draft' && String(r.version) === version);
+    if (row && S.change !== null) void guard(moveDrafts([row], null, 'remove'));
+  },
+  addToChange: () => { if (S.change !== null) void guard(moveDrafts(looseDrafts(), S.change.id, 'add')); },
+  publishChange: () => { void guard(publishChange()); },
+  discardAsk: () => { S.discardAsk = true; render(); },
+  discardCancel: () => { S.discardAsk = false; render(); },
+  discardChange: () => { void guard(discardChange()); },
+  changePreview: () => { if (S.change !== null) { S.showing = { kind: 'change', id: S.change.id, name: S.change.name }; render(); locateKey(false); } },
+  exitPreview: () => { S.showing = null; render(); locateKey(false); },
+  spanPage: (el, name) => { moveTo(groupRoute('page:' + name)); },
+  previewChange: (el, id) => { void guard(openChangePreview(Number(id))); },
+  historyPreview: (el, id) => {
+    const h = S.keyHistory;
+    const row = h === null ? undefined : h.rows.find((r) => String(r.id) === id);
+    if (!row) return;
+    S.showing = { kind: 'version', key: h.key, locale: h.locale, value: row.value, id: row.id };
+    render();
+    locateKey(false);
+  },
+  historyRestore: (el, id) => { void guard(restoreVersion(id)); },
+  gitRestore: (el, n) => {
+    const h = S.keyHistory;
+    const v = h === null || !Array.isArray(h.versions) ? undefined : h.versions.find((x) => String(x.n) === n);
+    if (!v || !own(v, 'value')) return;
+    setDraftIn(h.locale, h.key, v.value);
+    render();
+  },
+  showView: (el, view) => {
+    if (S.showing === null || S.showing.kind !== 'published') return;
+    S.showing.view = view === 'current' ? 'current' : 'before';
+    paintPaneShow();
+    locateKey(false);
+  },
+  revertAsk: () => { if (S.showing !== null) { S.showing.ask = true; paintPaneShow(); fitFrame(); } },
+  revertCancel: () => { if (S.showing !== null) { S.showing.ask = false; paintPaneShow(); fitFrame(); } },
+  revertChange: () => { void guard(revertChange()); },
+  keepTheirs: () => { keepTheirs(); },
   publish: () => { void guard(mountWrite('publish')); },
   discard: () => { void guard(mountWrite('discard')); },
-  commit: () => { void guard(commit()); },
+  commit: () => { void guard(openCommitPanel()); },
+  commitApply: () => { S.commitPanel = null; void guard(commit()); },
+  commitCancel: () => { S.commitPanel = null; render(); },
+  putBack: (el, i) => { void guard(putBack(Number(i))); },
   push: () => { void guard(push()); },
   removePlan: (el, id) => { void guard(removeKey(id, false)); },
   sameLink: () => { void guard(linkThem()); },
   sameKeep: () => { S.same = null; render(); },
   saveAnyway: () => { S.overLimit = null; void guard(save(true)); },
   saveCancel: () => { S.overLimit = null; render(); },
+  useTheirs: (el, i) => { void guard(useTheirs(Number(i))); },
+  saveMine: (el, i) => {
+    const k = S.staleKeys[Number(i)];
+    if (!k) return;
+    S.mine = S.mine.concat([k.locale + ' ' + k.key]);
+    void guard(save(true));
+  },
   previewCheck: () => { void guard(loadPreviewLink()); },
   publishAsk: () => { S.publishAsk = true; render(); },
   publishCancel: () => { S.publishAsk = false; render(); },
@@ -2335,15 +4216,15 @@ const ACTIONS = {
   },
   rowsLoad: () => {
     void guard((async () => {
-      S.rows = (await api(mountPath('keys'))).body;
-      S.changes = (await api(mountPath('changes', 'status=scheduled'))).body;
+      await loadRows();
+      S.scheduled = (await api(mountPath('changes', 'status=scheduled'))).body;
       render();
     })());
   },
   health: () => {
     void guard((async () => {
       S.health = (await api('/api/site/health' + envQuery())).body;
-      tst('Health ran against ' + (S.health.at && S.health.at.head ? S.health.at.head : 'this checkout'));
+      tst('Health ran against ' + (S.health.at && S.health.at.head ? S.health.at.head : 'this project'));
       render();
     })());
   },
@@ -2426,11 +4307,13 @@ const ACTIONS_CHANGE = {
   route: (el) => {
     const v = pastedPath(el.value.trim());
     S.route = v.startsWith('/') ? v : '/' + v;
+    S.moved = null;
     el.value = S.route;
     writeStore('stet.route.' + S.site.id, S.route);
     void guard(loadPreview());
   },
-  locale: (el) => { S.locale = el.value; render(); },
+  // An open edit ends kept under its own locale before the selector moves (F3).
+  locale: (el) => { endEdit(); closePopover(); S.locale = el.value; render(); postCensus(); void guard(loadKeyHistory()); },
   enum: (el, id) => { setDraft(id, el.value); render(); },
   entryDev: (el) => { void guard(updateEntry({ dev: el.value })); },
   entryCommand: (el) => { void guard(updateEntry({ devCommand: el.value })); },
@@ -2441,10 +4324,19 @@ const ACTIONS_CHANGE = {
 const ACTIONS_INPUT = {
   search: (el) => { S.q = el.value; render(); },
   editor: (el) => { writeEditor(el.value); },
+  renameName: (el) => { if (S.renaming !== null) S.renaming.value = el.value; },
   text: (el, id) => { clearRefusal(); setDraft(id, el.value); paintMirror(el); softCount(el, id); paintRow(id); paintDirty(); },
   tmplBefore: (el, id) => { tmplEdit(id, { before: el.value }); },
   tmplAfter: (el, id) => { tmplEdit(id, { after: el.value }); },
   splitName: (el) => { if (S.split) S.split.name = el.value; },
+  tplTo: (el, name) => {
+    const e = tplEntry(name);
+    e.to = el.value;
+    const go = document.querySelector('[data-act="tplSendGo:' + name.replace(/"/g, '') + '"]');
+    if (go !== null) go.disabled = !tplToOk(e.to) || e.sending;
+  },
+  changeName: (el) => { if (S.changeForm) S.changeForm.name = el.value; },
+  changeNote: (el) => { if (S.changeForm) S.changeForm.note = el.value; },
   number: (el, id) => { clearRefusal(); setDraft(id, el.value === '' ? '' : Number(el.value)); paintRow(id); paintDirty(); },
   color: (el, id) => { clearRefusal(); setDraft(id, el.value); paintRow(id); paintDirty(); },
   list: (el, arg) => { listEdit(arg, (entries, i) => { entries[i] = el.value; }); },
@@ -2537,20 +4429,53 @@ async function save(anyway) {
   const over = anyway ? [] : overLimits(values);
   if (over.length > 0) { S.overLimit = over; render(); return; }
   if (storeBacked()) {
+    // Each value on its own: a draft another editor holds waits for the
+    // editor's Take over; any other refusal stops the loop with its line.
+    // The environment, its change and its edits are those the Save started
+    // in, whatever is selected by the time a write answers (D47).
+    const env = S.env;
+    const into = S.change;
+    const { draft, base } = S;
+    let saved = 0;
+    let refused = '';
     for (const value of values) {
-      const res = await post(mountPath('draft'), {
-        editor: S.editor, key: value.key, locale: value.locale, value: value.value,
-      });
-      if (!res.ok) { S.message = res.body.error || 'the store refused that draft'; render(); return; }
+      const k = value.locale + ' ' + value.key;
+      const res = await post(mountPath('draft', undefined, env), Object.assign(
+        { editor: S.editor, key: value.key, locale: value.locale, value: value.value },
+        into ? { change: into.id } : {},
+      ));
+      if (res.ok) { delete draft[k]; delete base[k]; saved += 1; continue; }
+      if (S.env !== env) break;
+      if (res.status === 409 && res.body.refused === true) {
+        hold({ kind: 'save', key: value.key, locale: value.locale, value: value.value, editor: res.body.incumbentEditor, since: res.body.heldSince });
+        continue;
+      }
+      refused = res.body.error || 'the store refused that draft';
+      break;
     }
-    S.draft = {};
+    if (refused !== '' && S.env === env && await changeLost(refused)) refused = '';
+    if (S.env === env) S.message = refused;
+    if (saved > 0) tst(plural(saved, 'draft') + ' saved');
+    render();
+    await loadRows();
+    return;
+  }
+  // Each value carries the stored value its edit started from (§4.7), except a
+  // key Save mine over it is resending over the disk's words.
+  const sent = values.map((v) => {
+    const k = v.locale + ' ' + v.key;
+    return own(S.base, k) && !S.mine.includes(k) ? Object.assign({}, v, { base: S.base[k] }) : v;
+  });
+  const res = await post('/api/site/save' + query(), Object.assign({ values: sent }, templates.length === 0 ? {} : { templates: templates }));
+  S.findings = res.body.findings || [];
+  if (res.status === 409 && Array.isArray(res.body.stale)) {
+    // Nothing was written: each clashing key waits for Use theirs or Save mine over it.
+    S.staleKeys = res.body.stale;
     S.message = '';
-    tst(plural(values.length, 'draft') + ' saved');
     render();
     return;
   }
-  const res = await post('/api/site/save' + query(), Object.assign({ values: values }, templates.length === 0 ? {} : { templates: templates }));
-  S.findings = res.body.findings || [];
+  S.staleKeys = []; S.mine = [];
   if (!res.ok) {
     // A refused save wrote nothing, so whatever was already pending still is.
     S.message = res.body.error || 'the save was refused';
@@ -2572,7 +4497,7 @@ async function save(anyway) {
     verifyTimer = setTimeout(() => { if (S.saveCheck === check) verifyNow(); }, AGENT_WAIT_MS);
   }
   S.message = '';
-  S.draft = {};
+  dropDrafts();
   for (const template of templates) S.site.descriptor.keys[template.key].tmpl = template.tmpl;
   S.tmpl = {};
   // The server reads the committable files from the checkout, so a save that
@@ -2581,6 +4506,8 @@ async function save(anyway) {
   if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
   takeGit(res.body.at);
   S.site.snapshot = mergedSnapshot(values);
+  postCensus();
+  void guard(loadUsage());
   S.same = sameQuestion(res.body.same);
   tst(wrote.length === 0 ? 'Nothing changed.' : 'Wrote ' + wrote.join(', '));
   render();
@@ -2599,6 +4526,52 @@ function mergedSnapshot(values) {
   return next;
 }
 
+/** Use theirs: the stale key's draft and its base dropped, and the site read again so the disk's words show. */
+async function useTheirs(i) {
+  const k = S.staleKeys[i];
+  if (!k) return;
+  const held = k.locale + ' ' + k.key;
+  delete S.draft[held];
+  delete S.base[held];
+  S.staleKeys = S.staleKeys.filter((other) => other !== k);
+  draftChanged();
+  await refreshSite();
+}
+
+/** Commit pressed: what the commit carries, read from the checkout; `error` is the line a refused Put back leaves over the read again. */
+async function openCommitPanel(error = '') {
+  clearGitError();
+  const res = await api('/api/site/carries' + query());
+  S.commitPanel = res.ok ? { keys: res.body.keys, files: res.body.files, error: error } : { keys: [], files: S.pending, error: res.body.error || 'the change list could not be read' };
+  render();
+}
+/**
+ * Put back: HEAD's value saved through the stale check and the gate, its base
+ * the disk value the panel showed; the panel read again, after a stale refusal
+ * too, with the refusal's line kept.
+ */
+async function putBack(i) {
+  const p = S.commitPanel;
+  const k = p && Array.isArray(p.keys) ? p.keys[i] : undefined;
+  if (!k || !own(k, 'head')) return;
+  const res = await post('/api/site/save' + query(), { values: [{ key: k.key, locale: k.locale, value: k.head, base: own(k, 'now') ? k.now : null }] });
+  if (!res.ok) {
+    if (Array.isArray(res.body.stale)) {
+      // The file changed again: the panel is read afresh so the next press sends the new `now`, the line kept over it.
+      await openCommitPanel(res.body.stale.map((st) => st.key + ' changed on disk since you opened it: "' + (st.disk === null ? '' : shown(st.disk)) + '"').join('\n'));
+      return;
+    }
+    p.error = res.body.error || 'the save was refused';
+    render();
+    return;
+  }
+  if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
+  takeGit(res.body.at);
+  S.site.snapshot = mergedSnapshot([{ key: k.key, locale: k.locale, value: k.head }]);
+  await openCommitPanel();
+  await loadPreview(htmlHost() ? { reload: true } : undefined);
+}
+
 /** The committable files the last reply named, committed; the server titles the commit from the snapshot. */
 async function commit() {
   clearGitError();
@@ -2613,6 +4586,8 @@ async function commit() {
   tst('Committed ' + res.body.short + ' — ' + res.body.subject);
   S.pending = Array.isArray(res.body.pending) ? res.body.pending : [];
   takeGit(res.body.at);
+  // The commit is the key's newest past value.
+  void guard(loadKeyHistory());
   const entry = (ready() && S.site.entry) || {};
   if (entry.pushAfterCommit) await push();
   else render();
@@ -2771,6 +4746,52 @@ async function split() {
 }
 
 
+/**
+ * The first held draft, taken over: its value sent again with `force` — the
+ * one path that sends it — and the change it was meant for. A refusal (the
+ * content gate's) shows its line, and the other editor's draft stands.
+ */
+async function takeOver() {
+  const held = S.held.shift();
+  if (!held) return;
+  const env = S.env;
+  const { draft, base } = S;
+  const change = held.kind === 'save' ? (S.change ? { change: S.change.id } : {}) : { change: held.change };
+  const res = await post(mountPath('draft', undefined, env), Object.assign(
+    { editor: S.editor, key: held.key, locale: held.locale, value: held.value }, change, { force: true },
+  ));
+  const k = held.locale + ' ' + held.key;
+  if (res.ok) {
+    // A value typed on since the save stays an unsaved edit.
+    if (held.kind === 'save' && JSON.stringify(draft[k]) === JSON.stringify(held.value)) { delete draft[k]; delete base[k]; }
+    if (S.env === env) S.message = '';
+  } else if (S.env === env) {
+    const error = res.body.error || 'the store refused that draft';
+    if (await changeLost(error)) S.message = '';
+    else S.message = error;
+  }
+  render();
+  await loadRows();
+}
+/** The first held draft left as it is: nothing is written. */
+function keepTheirs() {
+  S.held.shift();
+  render();
+}
+/** The confirm for the first held draft, one at a time. */
+function takeoverCard() {
+  const held = S.held[0];
+  if (!held) return '';
+  const ask = held.kind === 'save' ? 'Save yours over it? Their wording is replaced and the draft becomes yours.'
+    : held.kind === 'add' ? 'Add it to ' + held.name + '? The draft becomes yours.'
+      : 'Take it out of ' + held.name + '? The draft becomes yours.';
+  return '<div class="card" id="takeover"><div class="cb"><div class="term">' +
+    esc(held.editor + ' has a draft of ' + held.key + ' from ' + clockShort(held.since) + '. ' + ask) + '</div>' +
+    '<div style="margin-top:8px"><button class="btn pri sm" data-act="takeOver">Take over</button>' +
+    (held.kind === 'save' ? '<button class="btn sm" data-act="keepTheirs">Keep theirs</button>'
+      : '<button class="btn sm" data-act="keepTheirs">Cancel</button>') + '</div></div></div>';
+}
+
 async function mountWrite(route) {
   if (S.sel === null) return;
   const res = await post(mountPath(route), { editor: S.editor, key: S.sel, locale: S.locale });
@@ -2780,12 +4801,13 @@ async function mountWrite(route) {
   render();
   // The discarded draft leaves the preview too.
   if (route === 'discard') draftChanged();
+  await loadRows();
 }
 
-function mountPath(route, search) {
+function mountPath(route, search, env = S.env) {
   const query = [
     ...(search === undefined ? [] : [search]),
-    ...(S.env === 'default' ? [] : ['env=' + encodeURIComponent(S.env)]),
+    ...(env === 'default' ? [] : ['env=' + encodeURIComponent(env)]),
   ];
   return '/s/' + encodeURIComponent(S.site.id) + '/api/stet/' + route +
     (query.length === 0 ? '' : '?' + query.join('&'));
@@ -2868,6 +4890,22 @@ async function startAudit(extra) {
 /** What the dev server has printed so far, and what the launcher turned out to be. */
 async function loadDevLog() {
   S.devlog = (await api('/api/site/dev-log' + query())).body;
+}
+
+/** The open Rename field's name sent to the workspace: the server trims it, and an empty one clears it. */
+async function saveRename() {
+  const r = S.renaming;
+  if (r === null) return;
+  const res = await post('/api/workspace/update', { path: r.path, name: r.value });
+  if (!res.ok) { tst(res.body.error || 'the name was refused'); return; }
+  S.renaming = null;
+  if (Array.isArray(res.body.sites)) S.sites = res.body.sites;
+  const row = S.sites.find((s) => s.path === r.path);
+  if (row !== undefined && S.site !== null && S.path === r.path) {
+    S.site.name = row.name;
+    if (row.folder === undefined) delete S.site.folder; else S.site.folder = row.folder;
+  }
+  render();
 }
 
 async function updateEntry(patch) {
@@ -2975,6 +5013,32 @@ shell.addEventListener('scroll', (event) => {
 }, true);
 shell.addEventListener('change', (event) => dispatch(ACTIONS_CHANGE, event));
 shell.addEventListener('input', (event) => dispatch(ACTIONS_INPUT, event));
+// The Rename field: Enter saves, Escape closes it.
+shell.addEventListener('keydown', (event) => {
+  const el = event.target;
+  if (el.getAttribute === undefined || el.getAttribute('data-act-input') !== 'renameName') return;
+  if (event.key === 'Enter') { event.preventDefault(); ACTIONS.renameSave(); }
+  else if (event.key === 'Escape') { S.renaming = null; render(); }
+});
+
+// --- shortcuts ---------------------------------------------------------------
+// E switches Edit and Use, and Escape ends the selection, whenever focus is not
+// in a field: a key typed into a field belongs to the field. The same two keys
+// pressed inside the preview arrive as the frame's `key` messages.
+const FIELDS = 'input, textarea, select, [contenteditable]';
+document.addEventListener('keydown', (event) => {
+  if (event.defaultPrevented || event.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;
+  const target = event.target;
+  if (target !== null && target.closest !== undefined && target.closest(FIELDS) !== null) return;
+  if (!ready() || S.tab !== 'Content') return;
+  if (event.key === 'e' || event.key === 'E') {
+    event.preventDefault();
+    setMode(S.mode === 'edit' ? 'use' : 'edit');
+  } else if (event.key === 'Escape' && S.popover === null && S.sel !== null) {
+    event.preventDefault();
+    endSelection();
+  }
+});
 
 // --- focus -------------------------------------------------------------------
 // A repaint replaces the field being typed in, so the caret is put back where
@@ -3001,6 +5065,12 @@ function captureFocus() {
   focusAt = el.selectionStart === undefined || el.selectionStart === null ? 0 : el.selectionStart;
 }
 
+// Condition 1: the frame taking focus lets go of the remembered field, so no
+// repaint pulls the caret back out of the page being typed in (F93).
+window.addEventListener('blur', () => {
+  const frame = document.querySelector('#devwrap iframe');
+  if (frame && document.activeElement === frame) { focusKey = null; focusAt = null; }
+});
 shell.addEventListener('focusin', (event) => {
   const el = event.target;
   const act = el.getAttribute === undefined ? null : (el.getAttribute('data-act-input') || el.getAttribute('data-act-change'));

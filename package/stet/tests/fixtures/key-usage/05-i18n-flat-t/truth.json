@@ -1,0 +1,6 @@
+{
+  "live": [
+    "hero_title"
+  ],
+  "note": "react-i18next-style t('key') through an adapter over the accessor; the adapter itself is copy(k)"
+}

@@ -1072,6 +1072,18 @@ describe('the content gate on the draft and publish routes', () => {
     expect(String(body['error'])).toBe(printed.join('; '));
   });
 
+  it('draft refuses a value that dropped a required variable with 422, its line ending in the locale (journey B4)', async () => {
+    const store = await seeded();
+    const required = miniDescriptor();
+    required.keys['welcome__body'] = { ...required.keys['welcome__body']!, requires: ['handle'] };
+    const h = createStetHandler({ store, descriptor: required, auth: TOKEN_ENV });
+    const before = await store.read({ preview: true });
+    const res = await h.POST(post('/api/stet/draft', { key: 'welcome__body', value: 'Welcome aboard.', editor: 'ada' }));
+    expect(res.status).toBe(422);
+    expect(String((await bodyOf(res))['error'])).toBe('welcome__body: {{handle}} is required and the value no longer carries it (default)');
+    expect(await store.read({ preview: true })).toEqual(before);
+  });
+
   it('draft saves a valid value with 200', async () => {
     const store = await seeded();
     const h = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
@@ -1207,3 +1219,70 @@ describe('the content gate on the draft and publish routes', () => {
     expect(calls.filter((c) => c.method === 'read').at(-1)?.arg).toEqual({ keys: ['hero_headline'], preview: true });
   });
 });
+
+describe('GET changes?id (8.2, stage 5)', () => {
+  const h = () => {
+    const made = makeStore();
+    return { ...made, handler: createStetHandler({ store: made.store, descriptor, auth: TOKEN_ENV }) };
+  };
+
+  it('answers a published change with each member’s before version and value (journey B24)', async () => {
+    const store = createMemoryStore({ project: 'before' });
+    await store.saveDraft({ key: 'hero_headline', value: 'Buy', target: 'web', editor: 'ada' });
+    const first = (await store.publish({ key: 'hero_headline', editor: 'ada' })) as { versionId: number };
+    const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+    await store.saveDraft({ key: 'hero_headline', value: 'Buy now', target: 'web', editor: 'ada', change: opened.changeId });
+    await store.changesets.publishChange({ changeId: opened.changeId, editor: 'ada' });
+    const handler = createStetHandler({ store, descriptor, auth: TOKEN_ENV });
+
+    const res = await handler.GET(get(`/api/stet/changes?id=${opened.changeId}`));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { change: { id: number; name: string }; members: Record<string, unknown>[] };
+    expect(body.change).toMatchObject({ id: opened.changeId, name: 'Spring pricing', status: 'published' });
+    expect(body.members).toEqual([
+      expect.objectContaining({ key: 'hero_headline', locale: 'default', beforeVersionId: first.versionId, beforeValue: 'Buy' }),
+    ]);
+  });
+
+  it('is authenticated: no Bearer answers 401 and id=abc 400, and neither reads the store', async () => {
+    const { handler, calls } = h();
+    expect((await handler.GET(get('/api/stet/changes?id=3', null))).status).toBe(401);
+    const bad = await handler.GET(get('/api/stet/changes?id=abc'));
+    expect(bad.status).toBe(400);
+    expect(await bodyOf(bad)).toEqual({ error: 'id must be an integer' });
+    expect(calls).toEqual([]);
+  });
+
+  it('a 20-digit id answers 400 and reaches no store, as do a sign, a fraction and an empty id', async () => {
+    const { handler, calls } = h();
+    for (const id of ['12345678901234567890', '9007199254740992', '-1', '1.5', '', '1e3', ' 3']) {
+      const res = await handler.GET(get(`/api/stet/changes?id=${encodeURIComponent(id)}`));
+      expect({ id, status: res.status }).toEqual({ id, status: 400 });
+    }
+    expect(calls).toEqual([]);
+    // The largest safe id is an id.
+    expect((await handler.GET(get('/api/stet/changes?id=9007199254740991'))).status).toBe(200);
+    expect(calls.map((c) => [c.method, c.arg])).toEqual([['changesets.get', { changeId: 9007199254740991 }]]);
+  });
+
+  it('an unknown id answers the store’s no_change conflict, 409', async () => {
+    const handler = createStetHandler({ store: createMemoryStore({ project: 'unknown' }), descriptor, auth: TOKEN_ENV });
+    const res = await handler.GET(get('/api/stet/changes?id=41'));
+    expect(res.status).toBe(409);
+    expect(await bodyOf(res)).toEqual({ error: 'no_change:41', code: 'conflict' });
+  });
+
+  it('the snapshot store answers 501 naming changesets.get', async () => {
+    const handler = createStetHandler({ store: createSnapshotStore({ project: 'none' }), descriptor, auth: TOKEN_ENV });
+    const res = await handler.GET(get('/api/stet/changes?id=3'));
+    expect(res.status).toBe(501);
+    expect(await bodyOf(res)).toEqual({ error: 'not supported: changesets.get' });
+  });
+
+  it('without an id the route lists changes as it does', async () => {
+    const { handler, calls } = h();
+    expect((await handler.GET(get('/api/stet/changes?status=open'))).status).toBe(200);
+    expect(calls.map((c) => c.method)).toEqual(['changesets.list']);
+  });
+});
+

@@ -313,14 +313,7 @@ export function proposePages(
   const proposedByName = new Map<string, PageProposal>();
 
   for (const { arm, file, rel } of files) {
-    const read =
-      arm === 'html'
-        ? { route: fileRoute(rel) }
-        : arm === 'astro'
-          ? readAstro(rel)
-          : arm === 'next-app'
-            ? readNextApp(rel)
-            : readNextPages(rel);
+    const read = armRead(arm, rel);
     if (read === null) continue;
     if ('skip' in read) {
       skips.push({ file, ...read.skip });
@@ -613,6 +606,57 @@ function dynamicSkip(route: string): { skip: Omit<PageSkip, 'file'> } {
   };
 }
 
+/** What one file under an arm's root is, by that arm's contract. */
+function armRead(arm: PagesArm, rel: string): RouteRead {
+  return arm === 'html'
+    ? { route: fileRoute(rel) }
+    : arm === 'astro'
+      ? readAstro(rel)
+      : arm === 'next-app'
+        ? readNextApp(rel)
+        : readNextPages(rel);
+}
+
+/** The files a Next App page is rendered inside: its directory's and each ancestor's under the root. */
+const NEXT_APP_FRAME_FILES = /^(?:layout|template)\.(?:tsx|jsx|ts|js)$/;
+
+/** The files every Next Pages page is rendered inside, at the root. */
+const NEXT_PAGES_FRAME_FILES = /^_(?:app|document)\.(?:tsx|jsx|ts|js)$/;
+
+/**
+ * The files a JavaScript host renders a route from: every file under a
+ * routing root whose arm gives that static route, plus on the Next App Router
+ * each `layout.*` and `template.*` from the page's directory up to the root,
+ * and on the Pages Router `_app.*` and `_document.*`. Null where no arm reads
+ * the route — a Vite host, a dynamic route.
+ */
+export function routeFiles(cwd: string, route: string, config: Pick<StetConfig, 'host'>): string[] | null {
+  const wanted = normalizeRoute(route);
+  const found = new Set<string>();
+  for (const root of detectPagesRoots(cwd, { html: isHtmlHost(config) })) {
+    if (root.arm === 'html') continue;
+    const base = join(cwd, root.root);
+    const pages: string[] = [];
+    const frames: string[] = [];
+    walk(base, (abs) => {
+      const rel = posixRelative(base, abs);
+      const read = armRead(root.arm, rel);
+      if (read !== null && 'route' in read && normalizeRoute(read.route) === wanted) pages.push(rel);
+      const name = rel.slice(rel.lastIndexOf('/') + 1);
+      if (root.arm === 'next-app' && NEXT_APP_FRAME_FILES.test(name)) frames.push(rel);
+      if (root.arm === 'next-pages' && !rel.includes('/') && NEXT_PAGES_FRAME_FILES.test(name)) frames.push(rel);
+    });
+    if (pages.length === 0) continue;
+    for (const rel of pages) found.add(`${root.root}/${rel}`);
+    for (const rel of frames) {
+      const dir = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/') + 1) : '';
+      // A frame applies where its directory holds the page's.
+      if (root.arm === 'next-pages' || pages.some((page) => page.startsWith(dir))) found.add(`${root.root}/${rel}`);
+    }
+  }
+  return found.size === 0 ? null : [...found].sort();
+}
+
 /**
  * Astro's contract: every file below the root maps by its path minus the last
  * extension, an `index` file collapsing to its directory, and the EXTENSION
@@ -737,14 +781,7 @@ export function pageOfFile(
     const prefix = root.root === '' ? '' : `${root.root}/`;
     if (!file.startsWith(prefix)) continue;
     const rel = file.slice(prefix.length);
-    const read: RouteRead =
-      root.arm === 'html'
-        ? { route: fileRoute(rel) }
-        : root.arm === 'astro'
-          ? readAstro(rel)
-          : root.arm === 'next-app'
-            ? readNextApp(rel)
-            : readNextPages(rel);
+    const read = armRead(root.arm, rel);
     if (read !== null && 'route' in read) {
       route = read.route;
       break;

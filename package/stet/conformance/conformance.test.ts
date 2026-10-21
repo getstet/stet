@@ -3,6 +3,11 @@
  * files, one named test each, against the mini-project fixture.
  * `add-store-and-publish`'s adapters extend this suite rather than starting a
  * second one — a run here is the evidence that an install works.
+ * `add-preview-editing` adds its ten capabilities (descriptor, validation,
+ * store, mount, adoption, cli, email-custody, key-usage, preview-editing and
+ * dashboard), each requirement `Requirement: <exact title>`; what only a
+ * browser can show (hydration warnings, `scrollWidth` at 360 px) is named in
+ * the test that covers the rest.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { get as httpGet, createServer as createHttpServer, type IncomingHttpHeaders } from 'node:http';
@@ -22,10 +27,10 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { revertChange } from '../adapters/changesets.js';
 import { createMemoryDb, createMemoryStore } from '../adapters/store-memory.js';
@@ -42,6 +47,9 @@ import {
 } from '../adapters/store-postgrest.js';
 import { createSnapshotStore } from '../adapters/store-snapshot.js';
 import { loadConfig } from '../cli/config.js';
+import { keyUsage, type KeyUsage } from '../cli/key-usage.js';
+import { DEV_PREVIEW, agentOf, bridged, byId, docOf, siteBody, wait } from '../tests/helpers/dashboard-stub.js';
+import { censusPasses, expectCensusScale } from '../tests/helpers/census-scale.js';
 import { INIT_READ_IMPORT, SERVER_READ_IMPORT } from '../cli/footprint.js';
 import { createStetHandler, type PublishEvent } from '../server/mount.js';
 import { createStetFormsHandler, type JoinEvent } from '../server/forms.js';
@@ -50,19 +58,23 @@ import { migrations as installedMigrations, packageRoot } from '../cli/installed
 import { mintUnsubscribeToken, verifyUnsubscribeToken } from '../server/unsubscribe-token.js';
 import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
-import { GATE_LINE, HOOK_BEFORE_0_3_1, SHARED_GATE_LINE } from '../cli/hook.js';
+import { GATE_LINE, HOOK_BEFORE_0_3_1, SHARED_GATE_LINE, runHookInstall } from '../cli/hook.js';
 import { refuseDanglingReferences } from '../cli/remove.js';
 import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
 import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
 import { TS7_REFUSAL } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
+import { MARKETING, chainProject, doctor as doctorOf, write as writeChain } from '../tests/helpers/chain-project.js';
+import { cleanupOutsideFiles, outsideFile, previewHost } from '../tests/helpers/email-preview-host.js';
+import { mountRenderer, renderPreview } from '../cli/email-preview.js';
+import { renderTemplate, type RenderRequest } from '../cli/email-render.js';
 import { handlerOver, paintPage, req, TOKEN, type PaintedPage } from '../tests/helpers/dashboard-page.js';
 import { dashboardPage } from '../cli/dev.js';
 import { startPreviewProxy } from '../cli/preview-proxy.js';
-import { siteId, updateSite } from '../cli/workspace.js';
-import { DASHED, closeFrames, frame, located, tick } from '../tests/helpers/preview-frame.js';
+import { addSite, readWorkspace, siteId, updateSite } from '../cli/workspace.js';
+import { AGENT, DASHED, closeFrames, frame, located, tick, type Framed } from '../tests/helpers/preview-frame.js';
 import { installRegistryDts, typecheckHost } from '../tests/helpers/ts-host.js';
-import { generateDefaultsModule, generateRegistry, generatedBody } from '../src/codegen.js';
+import { generateDefaultsModule, generateRegistry, generateResolvedModule, generatedBody } from '../src/codegen.js';
 import * as root from '../src/index.js';
 import {
   DESCRIPTOR_SCHEMA,
@@ -71,6 +83,7 @@ import {
   DescriptorError,
   checkBudget,
   checkClassRules,
+  checkDescriptorStructure,
   checkCurrency,
   checkLimits,
   plainOf,
@@ -78,6 +91,7 @@ import {
   deriveLabel,
   htmlEmailTarget,
   loadDescriptor,
+  loadSnapshot,
   pageSpan,
   readBundle,
   resolve,
@@ -90,7 +104,7 @@ import {
   validateSave,
   webTarget,
 } from '../src/index.js';
-import type { Bundle, Descriptor, SeoFinding, SeoRule, Snapshot, StoreAdapter, StoreError, StoreRow } from '../src/index.js';
+import type { Bundle, Descriptor, KeyDef, SeoFinding, SeoRule, Snapshot, StoreAdapter, StoreError, StoreRow, TemplateDef } from '../src/index.js';
 import {
   bareHtmlHost,
   cleanupCliHosts,
@@ -141,6 +155,26 @@ function siblingsOf(template: string): Record<string, unknown> {
     key: 'brand__footer_address',
   }).value;
   return out;
+}
+
+/**
+ * The host's descriptor (and, where given, its snapshot) replaced and every generated file brought current.
+ * A descriptor the loader refuses has no generated files to bring current, and is left on disk as written.
+ */
+function withDescriptor(host: CliHost, document: unknown, defaults?: unknown): void {
+  writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(document, null, 2));
+  if (defaults !== undefined) writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(defaults, null, 2));
+  try {
+    const loaded = loadDescriptor(document);
+    const snap = loadSnapshot(JSON.parse(host.file('content/defaults.json')));
+    const registry = generateRegistry(loaded);
+    writeFileSync(join(host.cwd, 'content/keys.ts'), registry.keysTs);
+    writeFileSync(join(host.cwd, 'content/stet-env.d.ts'), registry.dts);
+    writeFileSync(join(host.cwd, 'content/defaults.ts'), generateDefaultsModule(snap));
+    writeFileSync(join(host.cwd, 'content/resolved.ts'), generateResolvedModule(loaded, snap));
+  } catch {
+    // Nothing to bring current.
+  }
 }
 
 describe('descriptor', () => {
@@ -504,6 +538,93 @@ describe('descriptor', () => {
     expect(typo.ok).toBe(false);
     expect(typo.output).toContain('hero_headlin');
   }, 60_000);
+
+  /** A project whose descriptor is `document`, its generated files current, run through `stet check`. */
+  const checkWith = async (document: unknown): Promise<{ code: number; err: string }> => {
+    const host = makeCliHost({ config: {} });
+    withDescriptor(host, document);
+    const code = await host.run('check');
+    return { code, err: host.stderr() };
+  };
+
+  it('Requirement: A render pointer may frame and fill its markup', async () => {
+    const MIRRA = {
+      file: 'lib/email/templates/welcome.ts',
+      export: 'welcomeContent',
+      sampleProps: {},
+      fill: true,
+      frame: { file: 'lib/email/templates/base.ts', export: 'baseTemplate', args: ['preheader'] },
+    };
+    const withRender = (render: unknown): Record<string, any> => {
+      const document = mutable(readFixture('descriptor.json')) as Record<string, any>;
+      document['templates']['welcome']['render'] = render;
+      return document;
+    };
+    const refusedAt = (document: unknown): string => {
+      try {
+        loadDescriptor(document);
+      } catch (error) {
+        if (error instanceof DescriptorError) return error.path;
+        throw error;
+      }
+      throw new Error('expected the descriptor to be refused');
+    };
+
+    // Mirra's pointer loads, and `stet check` accepts it.
+    expect(loadDescriptor(withRender(MIRRA)).templates?.['welcome']?.render).toEqual(MIRRA);
+    expect((await checkWith(withRender(MIRRA))).code).toBe(0);
+    // `args` is a list of names, "$all", or absent.
+    for (const args of ['$all', undefined]) {
+      const frame = args === undefined ? { file: 'b.ts', export: 'f' } : { file: 'b.ts', export: 'f', args };
+      expect(() => loadDescriptor(withRender({ ...MIRRA, frame }))).not.toThrow();
+    }
+    // The schema refuses a frame with no export and any member it does not declare.
+    expect(refusedAt(withRender({ ...MIRRA, frame: { file: 'x.ts' } }))).toBe('templates/welcome/render/frame/export');
+    expect(refusedAt(withRender({ ...MIRRA, wrap: true }))).toBe('templates/welcome/render/wrap');
+    expect(refusedAt(withRender({ ...MIRRA, frame: { ...MIRRA.frame, wrap: true } }))).toBe(
+      'templates/welcome/render/frame/wrap',
+    );
+    expect((await checkWith(withRender({ ...MIRRA, frame: { file: 'x.ts' } }))).code).toBe(1);
+    for (const args of ['all', ['a', 'a'], [''], [1]]) {
+      expect(() => loadDescriptor(withRender({ ...MIRRA, frame: { ...MIRRA.frame, args } })), JSON.stringify(args)).toThrow(
+        DescriptorError,
+      );
+    }
+    expect(() => loadDescriptor(withRender({ ...MIRRA, fill: 'yes' }))).toThrow(DescriptorError);
+  });
+
+  it('Requirement: An email slot declares the variables it requires', async () => {
+    const withRequires = (requires: string[]): Record<string, any> => {
+      const document = mutable(readFixture('descriptor.json')) as Record<string, any>;
+      document['keys']['welcome__body']['requires'] = requires;
+      return document;
+    };
+    // requires inside vars loads.
+    expect(loadDescriptor(withRequires(['handle'])).keys['welcome__body']?.requires).toEqual(['handle']);
+
+    // `password_reset__body` declares `vars: ["reset_url"]` and `requires: ["reset_url", "name"]`.
+    const handBuilt: Descriptor = {
+      version: 1,
+      keys: { password_reset__body: { shape: 'text', target: 'html-email', vars: ['reset_url'], requires: ['reset_url', 'name'] } },
+    };
+    expect(() => checkDescriptorStructure(handBuilt)).toThrowError(
+      'password_reset__body: requires names {{name}}, which vars does not declare',
+    );
+
+    // The loader refuses it at the key's `requires`, and `stet check` fails naming the variable.
+    const outside = withRequires(['handle', 'name']);
+    try {
+      loadDescriptor(outside);
+      throw new Error('expected the descriptor to be refused');
+    } catch (error) {
+      expect(error).toBeInstanceOf(DescriptorError);
+      expect((error as DescriptorError).path).toBe('keys/welcome__body/requires');
+      expect((error as DescriptorError).message).toBe('welcome__body: requires names {{name}}, which vars does not declare');
+    }
+    const run = await checkWith(outside);
+    expect(run.code).toBe(1);
+    expect(run.err).toContain('welcome__body: requires names {{name}}, which vars does not declare');
+  });
 });
 
 describe('snapshot', () => {
@@ -1098,6 +1219,159 @@ describe('validation', () => {
     const listBudget = mutable(descriptor);
     listBudget.keys['footer_links']!.budget = { desktop: 1 };
     expect(checkBudget(listBudget, 'footer_links', ['x'.repeat(100), 'x'.repeat(100)])).toBeNull();
+  });
+
+  it('Requirement: Required variables are kept at save', async () => {
+    const RESET = {
+      version: 1,
+      keys: {
+        password_reset__body: { shape: 'text', target: 'html-email', vars: ['reset_url', 'name'], requires: ['reset_url'] },
+      },
+      templates: { password_reset: { class: 'transactional', trigger: 'app-event', slots: ['body'] } },
+    };
+    const LINE = 'password_reset__body: {{reset_url}} is required and the value no longer carries it (default)';
+    const KEPT = 'Reset it here: {{reset_url}}';
+    const loaded = loadDescriptor(RESET);
+
+    // The core's check names the variable; every path below prints the one line, ending in the locale once.
+    const verdict = validateSave(loaded, { key: 'password_reset__body', value: 'Hello {{name}}, choose a new password.' });
+    expect(verdict.ok).toBe(false);
+    expect(validateSave(loaded, { key: 'password_reset__body', value: 'Keep it: {{ reset_url }}' }).ok).toBe(true);
+
+    // `stet draft` refuses the dropped variable and stores nothing; keeping it anywhere passes.
+    const store = createMemoryStore({ project: 'walk' });
+    const drafting = makeCliHost({ config: { store: { adapter: 'memory' } }, store });
+    withDescriptor(drafting, RESET, { default: { password_reset__body: KEPT } });
+    expect(await drafting.run('draft', 'password_reset__body', '--value=Hello {{name}}, choose a new password.', '--editor', 'neil')).toBe(1);
+    expect(drafting.stderr()).toContain(LINE);
+    expect(await store.read({ preview: true })).toEqual([]);
+    expect(await drafting.run('draft', 'password_reset__body', '--value=Reset it here: {{ reset_url }}', '--editor', 'neil')).toBe(0);
+
+    // The mount's draft route answers 422 with the same line and writes nothing.
+    const TOKEN_ENV = 'STET_CONF_REQUIRES_TOKEN';
+    process.env[TOKEN_ENV] = 'sekret';
+    try {
+      const mountStore = createMemoryStore({ project: 'walk' });
+      const handler = createStetHandler({ store: mountStore, descriptor: loaded, auth: TOKEN_ENV });
+      const draft = (value: string): Promise<Response> =>
+        handler.POST(
+          new Request('https://h/api/stet/draft', {
+            method: 'POST',
+            headers: { authorization: 'Bearer sekret', 'content-type': 'application/json' },
+            body: JSON.stringify({ key: 'password_reset__body', value, editor: 'ed' }),
+          }),
+        );
+      const refused = await draft('Hello {{name}}, choose a new password.');
+      expect(refused.status).toBe(422);
+      expect(((await refused.json()) as { error: string }).error).toBe(LINE);
+      expect(await mountStore.read({ preview: true })).toEqual([]);
+      expect((await draft(KEPT)).status).toBe(200);
+    } finally {
+      delete process.env[TOKEN_ENV];
+    }
+
+    // `stet dev`'s save refuses it through the gate and writes nothing.
+    const site = makeCliHost({ config: {} });
+    withDescriptor(site, RESET, { default: { password_reset__body: KEPT } });
+    const snapshotBefore = site.file('content/defaults.json');
+    const { handler: dev } = handlerOver([site.cwd]);
+    const saved = await dev(
+      req(`/api/site/save?site=${encodeURIComponent(realpathSync(site.cwd))}`, {
+        method: 'POST',
+        body: { values: [{ key: 'password_reset__body', value: 'Hello {{name}}, choose a new password.' }] },
+      }),
+    );
+    expect(saved.status).toBe(409);
+    expect(JSON.stringify(await saved.json())).toContain(LINE);
+    expect(site.file('content/defaults.json')).toBe(snapshotBefore);
+
+    // `stet check` refuses a committed snapshot value that dropped it.
+    const stale = makeCliHost({ config: {} });
+    withDescriptor(stale, RESET, { default: { password_reset__body: 'Hello {{name}}.' } });
+    expect(await stale.run('check')).toBe(1);
+    expect(stale.stderr()).toContain(LINE);
+  });
+
+  it('Requirement: An email subject keeps to one line', async () => {
+    const MAIL = {
+      version: 1,
+      keys: { welcome__subject: { shape: 'text', target: 'html-email' }, welcome__headline: { shape: 'text', target: 'html-email' } },
+      templates: { welcome: { class: 'transactional', trigger: 'manual', slots: ['subject', 'headline'] } },
+    };
+    const LINE = 'An email subject fits on one line. Remove the line break.';
+    const HOSTILE = 'Hi\r\nBcc: x@evil.test';
+    const loaded = loadDescriptor(MAIL);
+
+    // Scenario: the save refuses a subject value holding CR or LF. The content gate names the one line; other keys keep their line breaks.
+    for (const value of [HOSTILE, 'Hi\nthere', 'Hi\rthere']) {
+      const verdict = validateSave(loaded, { key: 'welcome__subject', value });
+      expect(verdict.ok).toBe(false);
+      expect(verdict.findings.map((f) => f.message)).toEqual([LINE]);
+    }
+    expect(validateSave(loaded, { key: 'welcome__subject', value: 'Welcome aboard' }).ok).toBe(true);
+    expect(validateSave(loaded, { key: 'welcome__headline', value: 'Two\nlines' }).ok).toBe(true);
+
+    // The mount's draft route answers 422 with the line and stores nothing.
+    const TOKEN_ENV = 'STET_CONF_SUBJECT_TOKEN';
+    process.env[TOKEN_ENV] = 'sekret';
+    try {
+      const store = createMemoryStore({ project: 'walk' });
+      const handler = createStetHandler({ store, descriptor: loaded, auth: TOKEN_ENV });
+      const drafted = await handler.POST(
+        new Request('https://h/api/stet/draft', {
+          method: 'POST',
+          headers: { authorization: 'Bearer sekret', 'content-type': 'application/json' },
+          body: JSON.stringify({ key: 'welcome__subject', value: HOSTILE, editor: 'ed' }),
+        }),
+      );
+      expect(drafted.status).toBe(422);
+      expect(((await drafted.json()) as { error: string }).error).toContain(LINE);
+      expect(await store.read({ preview: true })).toEqual([]);
+    } finally {
+      delete process.env[TOKEN_ENV];
+    }
+
+    // `stet dev`'s save refuses it and writes nothing.
+    const site = makeCliHost({ config: {} });
+    withDescriptor(site, MAIL, { default: { welcome__subject: 'Welcome aboard', welcome__headline: 'Welcome' } });
+    const before = site.file('content/defaults.json');
+    const { handler: dev } = handlerOver([site.cwd]);
+    const saved = await dev(
+      req(`/api/site/save?site=${encodeURIComponent(realpathSync(site.cwd))}`, {
+        method: 'POST',
+        body: { values: [{ key: 'welcome__subject', value: HOSTILE }] },
+      }),
+    );
+    expect(saved.status).toBe(409);
+    expect(JSON.stringify(await saved.json())).toContain(LINE);
+    expect(site.file('content/defaults.json')).toBe(before);
+
+    // Scenario: the send path refuses such a subject before the host's send function runs.
+    const host = makeEmailHost();
+    const sent = host.path('sent.log');
+    host.put('lib/email/plain.ts', "export function plain(): string {\n  return '<p>x</p>';\n}\n");
+    host.put(
+      'lib/send.ts',
+      `export function sendTest(message: unknown): void {\n  require('node:fs').appendFileSync(${JSON.stringify(sent)}, JSON.stringify(message) + '\\n');\n}\n`,
+    );
+    const send = (subject: string | null): ReturnType<typeof renderTemplate> =>
+      renderTemplate(
+        { cwd: host.dir, env: process.env, stdout: () => {}, stderr: () => {} },
+        {
+          hostDir: host.dir,
+          file: host.path('lib/email/plain.ts'),
+          exportName: 'plain',
+          props: {},
+          send: { file: 'lib/send.ts', export: 'sendTest', message: { to: 'a@b.test', subject, template: 'welcome' } },
+        },
+      );
+    const refusedSend = send(HOSTILE);
+    expect(refusedSend.ok).toBe(false);
+    expect(!refusedSend.ok && refusedSend.reason).toBe('send-failed');
+    expect(!refusedSend.ok && refusedSend.detail).toBe('the subject has a line break, which an email header cannot hold');
+    expect(existsSync(sent)).toBe(false);
+    expect(send('Welcome aboard').ok).toBe(true);
+    expect(readFileSync(sent, 'utf8').trim().split('\n')).toHaveLength(1);
   });
 });
 
@@ -2389,6 +2663,43 @@ describe('store', () => {
     const member = ok(await store.changesets.get({ changeId })).members[0];
     expect(member?.beforeValue).toBe('v1');
     expect(member?.versionId).toBeGreaterThan(member?.beforeVersionId ?? 0);
+  });
+
+  it('Requirement: A draft row names its author and when it was first saved', async () => {
+    // The memory store: `agent:claude` saves a draft of `lab_link`, and the keys read names the author.
+    const store = createMemoryStore({ project: 'authored' });
+    store.seed([{ key: 'lab_link', value: 'Read the docs' }]);
+    await store.saveDraft({ key: 'lab_link', value: 'Read the guide', target: 'web', editor: 'agent:claude' });
+    const rows = await store.read({ preview: true });
+    if (!Array.isArray(rows)) throw new Error('expected rows');
+    const active = rows.find((row) => row.status === 'published');
+    const draft = rows.find((row) => row.status === 'draft');
+    expect(draft).toMatchObject({ key: 'lab_link', value: 'Read the guide', editor: 'agent:claude' });
+    expect(draft?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(active).not.toHaveProperty('editor');
+    expect(active).not.toHaveProperty('createdAt');
+
+    // The PostgREST adapter maps the same two columns the same way, and neither onto the active row.
+    const raw = (over: Record<string, unknown>): Record<string, unknown> => ({
+      id: 1, key: 'lab_link', locale: 'default', target: 'web', state: 'published', is_active: true, value: 'Read the docs',
+      publish_at: null, editor: 'neil', label: null, note: null, published_by: 'neil', reverted_from: null, changeset_id: null,
+      created_at: '2026-10-19 09:00:00+00', published_at: '2026-10-19 09:01:00+00', ...over,
+    });
+    const body = [
+      raw({}),
+      raw({ id: 2, state: 'draft', is_active: false, value: 'Read the guide', editor: 'agent:claude', published_by: null, created_at: '2026-10-19 17:44:05.123+00', published_at: null }),
+    ];
+    const wire = createPostgrestStore({
+      url: 'http://rest.test',
+      token: 't',
+      project: 'walk',
+      fetchImpl: async () => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } }),
+    });
+    const wired = await wire.read({ preview: true });
+    if (!Array.isArray(wired)) throw new Error('expected rows');
+    expect(wired[0]).not.toHaveProperty('editor');
+    expect(wired[0]).not.toHaveProperty('createdAt');
+    expect(wired[1]).toMatchObject({ status: 'draft', editor: 'agent:claude', createdAt: '2026-10-19T17:44:05.123Z' });
   });
 });
 
@@ -5250,6 +5561,192 @@ describe('cli', () => {
     expect(broken.code).toBe(0);
     expect(broken.text).toContain(NOT_INSTALLED);
   });
+
+  /** A host with one declared, pointered template `welcome`, a recording send function and the given store. */
+  const sendProject = (opts: { store?: StoreAdapter; emailSend?: boolean; pointer?: boolean; sendSource?: string } = {}) => {
+    const host = makeEmailHost();
+    const renderMark = host.path('rendered');
+    const sentMark = host.path('sent.json');
+    const key = { shape: 'text', target: 'html-email' } as const;
+    host.put(
+      'content/descriptor.json',
+      `${JSON.stringify({
+        version: 1,
+        keys: { welcome__headline: key, welcome__subject: key },
+        templates: {
+          welcome: {
+            class: 'transactional',
+            trigger: 'manual',
+            slots: ['headline', 'subject'],
+            ...(opts.pointer === false ? {} : { render: { file: 'lib/email/welcome.ts', export: 'welcome', sampleProps: {} } }),
+          },
+        },
+      })}\n`,
+    );
+    host.put('content/defaults.json', `${JSON.stringify({ default: { welcome__headline: 'Welcome', welcome__subject: 'Welcome aboard' } })}\n`);
+    host.put(
+      'lib/email/welcome.ts',
+      'export function welcome(props: { welcome__headline: string }): string {\n' +
+        `  require('node:fs').writeFileSync(${JSON.stringify(renderMark)}, 'x');\n` +
+        "  return '<h1>' + props.welcome__headline + '</h1>';\n" +
+        '}\n',
+    );
+    host.put(
+      'lib/email/stet-send.ts',
+      opts.sendSource ??
+        'export function sendTest(message: unknown): void {\n' +
+          `  require('node:fs').writeFileSync(${JSON.stringify(sentMark)}, JSON.stringify(message));\n` +
+          '}\n',
+    );
+    host.put(
+      'stet.config.json',
+      `${JSON.stringify({
+        project: 'default',
+        managedSurfaces: [],
+        emailSurfaces: [],
+        ...(opts.store === undefined ? {} : { store: { adapter: 'memory' } }),
+        ...(opts.emailSend === false ? {} : { emailSend: { file: 'lib/email/stet-send.ts', export: 'sendTest' } }),
+      })}\n`,
+    );
+    return {
+      host,
+      renderMark,
+      sentMark,
+      run: async (...argv: string[]): Promise<{ code: number; out: string[]; err: string }> => {
+        const out: string[] = [];
+        const err: string[] = [];
+        const io: CliIo = {
+          cwd: host.dir,
+          env: {},
+          stdout: (l) => out.push(l),
+          stderr: (l) => err.push(l),
+          ...(opts.store === undefined ? {} : { store: opts.store }),
+        };
+        return { code: await runCli(argv, io), out, err: err.join('\n') };
+      },
+    };
+  };
+
+  it('Requirement: email render writes the email as it would be sent', async () => {
+    const store = createMemoryStore({ project: 'default' });
+    const project = sendProject({ store });
+    await project.run('draft', 'welcome__headline', '--value=Draft words', '--editor', 'neil');
+
+    // `--draft --out`: the file holds the email with the draft's words, stderr names the subject, stdout is empty.
+    const outFile = join(project.host.dir, 'welcome.html');
+    const written = await project.run('email', 'render', 'welcome', '--draft', '--out', outFile);
+    expect(written.code).toBe(0);
+    expect(readFileSync(outFile, 'utf8')).toBe('<h1>Draft words</h1>');
+    expect(written.err).toBe('subject: Welcome aboard');
+    expect(written.out).toEqual([]);
+
+    // Without --out the markup alone goes to stdout; the draft applies only under --draft.
+    expect((await project.run('email', 'render', 'welcome')).out).toEqual(['<h1>Welcome</h1>']);
+    expect((await project.run('email', 'render', 'welcome', '--draft')).out).toEqual(['<h1>Draft words</h1>']);
+
+    // Through the built bin, stdout ends with one trailing newline and `--out` holds the exact bytes.
+    if (builtBinExists()) {
+      const piped = spawnSync(process.execPath, [BUILT_BIN, 'email', 'render', 'welcome'], { cwd: project.host.dir, encoding: 'utf8' });
+      expect(piped.status).toBe(0);
+      expect(piped.stdout).toBe('<h1>Welcome</h1>\n');
+    }
+
+    // A template without a pointer exits 1 with the line, and nothing is written.
+    const bare = sendProject({ pointer: false });
+    const refused = await bare.run('email', 'render', 'welcome');
+    expect(refused.code).toBe(1);
+    expect(refused.err).toContain('welcome has no render pointer — declare one, or render it through the host');
+    expect(refused.out).toEqual([]);
+  });
+
+  it("Requirement: email test sends through the host's send function", async () => {
+    // A snapshot-only site declaring `emailSend`: the host function receives the rendered email, subject and recipient.
+    const project = sendProject();
+    const sent = await project.run('email', 'test', 'welcome', '--to', 'neil@example.com');
+    expect(sent.code).toBe(0);
+    expect(sent.out).toEqual(['sent welcome to neil@example.com']);
+    expect(JSON.parse(readFileSync(project.sentMark, 'utf8'))).toEqual({
+      to: 'neil@example.com',
+      subject: 'Welcome aboard',
+      html: '<h1>Welcome</h1>',
+      template: 'welcome',
+    });
+
+    // A recipient holding CR or LF is refused before anything renders.
+    const injected = sendProject();
+    const crlf = await injected.run('email', 'test', 'welcome', '--to', 'neil@example.com\r\nBcc: x@example.com');
+    expect(crlf.code).toBe(1);
+    expect(existsSync(injected.renderMark)).toBe(false);
+    expect(existsSync(injected.sentMark)).toBe(false);
+
+    // No emailSend: exit 1 with the line naming it, and nothing is rendered.
+    const none = sendProject({ emailSend: false });
+    const unsent = await none.run('email', 'test', 'welcome', '--to', 'neil@example.com');
+    expect(unsent.code).toBe(1);
+    expect(unsent.err).toContain('stet email test needs emailSend in stet.config.json — the host function that sends one email');
+    expect(existsSync(none.renderMark)).toBe(false);
+
+    // A throwing send function exits 1 with the host's error.
+    const failing = sendProject({ sendSource: "export function sendTest(): void {\n  throw new Error('provider down');\n}\n" });
+    const failed = await failing.run('email', 'test', 'welcome', '--to', 'neil@example.com');
+    expect(failed.code).toBe(1);
+    expect(failed.err).toContain('provider down');
+    expect(failed.out).toEqual([]);
+  });
+
+  it('Requirement: publish checks the stored draft as draft checks it', async () => {
+    const RESET = {
+      version: 1,
+      keys: {
+        password_reset__body: { shape: 'text', target: 'html-email', vars: ['reset_url'], requires: ['reset_url'] },
+        plain_title: { shape: 'text', target: 'web' },
+      },
+      templates: { password_reset: { class: 'transactional', trigger: 'app-event', slots: ['body'] } },
+    };
+    const KEPT = 'Reset it here: {{reset_url}}';
+    const LINE = 'password_reset__body: {{reset_url}} is required and the value no longer carries it (default)';
+    const DUE = '2020-01-01T00:00:00.000Z';
+    const store = createMemoryStore({ project: 'default' });
+    const project = makeCliHost({ store });
+    withDescriptor(project, RESET, { default: { password_reset__body: KEPT, plain_title: 'Plain' } });
+    const live = (key: string): unknown => store.dump().find((row) => row.key === key && row.is_active)?.value;
+    // The draft is written past the command, as an earlier release or another client could.
+    const stored = async (key: string, value: string, over: Record<string, unknown> = {}): Promise<void> => {
+      await store.saveDraft({ key, value, target: key === 'plain_title' ? 'web' : 'html-email', editor: 'neil', ...over });
+    };
+    await store.saveDraft({ key: 'password_reset__body', value: KEPT, target: 'html-email', editor: 'neil' });
+    await store.publish({ key: 'password_reset__body', editor: 'neil' });
+
+    // A failing draft is not published: the line, exit 1, the live value unchanged.
+    await stored('password_reset__body', 'Hello {{name}}, choose a new password.');
+    expect(await project.run('publish', 'password_reset__body', '--editor', 'neil')).toBe(1);
+    expect(project.stderr()).toContain(LINE);
+    expect(live('password_reset__body')).toBe(KEPT);
+
+    // `--due` holds the failing due draft back with the validator's words, publishes the rest and exits non-zero.
+    await store.saveDraft({ key: 'password_reset__body', value: 'Hello {{name}}, choose a new password.', target: 'html-email', editor: 'neil', publishAt: DUE, force: true });
+    await stored('plain_title', 'Fresh', { publishAt: DUE });
+    const clock = makeCliHost({ store });
+    withDescriptor(clock, RESET, { default: { password_reset__body: KEPT, plain_title: 'Plain' } });
+    expect(await clock.run('publish', '--due', '--editor', 'clock')).toBe(1);
+    expect(clock.stderr()).toContain(LINE);
+    expect(live('plain_title')).toBe('Fresh');
+    expect(live('password_reset__body')).toBe(KEPT);
+    expect(store.dump().find((row) => row.key === 'password_reset__body' && row.state === 'draft')?.publish_at).not.toBeNull();
+
+    // A due change with one failing member stays scheduled whole.
+    const grouped = createMemoryStore({ project: 'default' });
+    const { changeId } = (await grouped.changesets.open({ name: 'spring' })) as { changeId: number };
+    await grouped.saveDraft({ key: 'plain_title', value: 'Spring', target: 'web', editor: 'neil', change: changeId });
+    await grouped.saveDraft({ key: 'password_reset__body', value: 'Hello.', target: 'html-email', editor: 'neil', change: changeId });
+    await grouped.changesets.schedule({ changeId, publishAt: DUE });
+    const batch = makeCliHost({ store: grouped });
+    withDescriptor(batch, RESET, { default: { password_reset__body: KEPT, plain_title: 'Plain' } });
+    expect(await batch.run('publish', '--due', '--editor', 'clock')).toBe(1);
+    expect(batch.stderr()).toContain(LINE);
+    expect(grouped.dump().filter((row) => row.is_active)).toHaveLength(0);
+    expect(((await grouped.changesets.get({ changeId })) as { change: { status: string } }).change.status).toBe('scheduled');
+  });
 });
 
 /** A plain HTML page shaped as psyon.ai's: a skip link, a header, a hero, four questions, a card of chips, a footer. */
@@ -7462,6 +7959,89 @@ describe('adoption', () => {
       rmSync(top, { recursive: true, force: true });
     }
   });
+
+  it('Requirement: scan warns about an email template no entry manages', async () => {
+    const INVOICE = 'lib/email/templates/invoice-paid.ts';
+    const LINE = `${INVOICE} exports a template stet does not manage — run stet email extract ${INVOICE}`;
+    const MARKUP = "export const invoicePaidContent = '<h1>Your invoice is paid</h1><p>Thanks for staying with us.</p>';\n";
+    const BASE = 'export function baseTemplate(content: string): string {\n  return `<html>${content}</html>`;\n}\n';
+    const declared = {
+      version: 1,
+      keys: {},
+      templates: {
+        welcome: {
+          class: 'transactional',
+          trigger: 'manual',
+          slots: ['body'],
+          render: {
+            file: 'lib/email/templates/welcome.ts',
+            export: 'welcome',
+            sampleProps: {},
+            frame: { file: 'lib/email/templates/base.ts', export: 'baseTemplate' },
+          },
+        },
+      },
+    };
+    const emailHost = (severity: 'warn' | 'fail') => {
+      const host = makeCliHost({
+        config: { managedSurfaces: [], emailSurfaces: ['lib/email/**/*.ts'], scan: { severity, baseline: '.stet/scan-baseline.json' } },
+      });
+      withDescriptor(host, declared);
+      const put = (rel: string, text: string): void => {
+        mkdirSync(join(host.cwd, rel, '..'), { recursive: true });
+        writeFileSync(join(host.cwd, rel), text);
+      };
+      put('lib/email/templates/welcome.ts', 'export function welcome(props: { welcome__body: string }): string {\n  return `<p>${props.welcome__body}</p>`;\n}\n');
+      // The frame and the registry both export functions that return markup, and neither is reported.
+      put('lib/email/templates/base.ts', BASE);
+      put('lib/email/registry.ts', 'export const renderNamed = (name: string): string => `<p>${name}</p>`;\n');
+      put(INVOICE, MARKUP);
+      return host;
+    };
+
+    // The scan warns for the undeclared template alone, and exits 0 under either severity.
+    for (const severity of ['warn', 'fail'] as const) {
+      const host = emailHost(severity);
+      expect(await host.run('scan')).toBe(0);
+      expect(host.stderr().split('\n').filter((line) => line.includes('exports a template stet does not manage'))).toEqual([`warn: ${LINE}`]);
+    }
+
+    // At the commit the hook prints it and the commit lands.
+    if (builtBinExists()) {
+      const top = mkdtempSync(join(tmpdir(), 'stet-walk-gate-'));
+      try {
+        execFileSync('git', ['init', '-q'], { cwd: top });
+        for (const [key, value] of [['user.email', 'gate@test'], ['user.name', 'gate'], ['commit.gpgsign', 'false']]) {
+          execFileSync('git', ['config', key as string, value as string], { cwd: top });
+        }
+        writeFileSync(join(top, '.gitignore'), 'node_modules\n');
+        const seed = emailHost('fail');
+        rmSync(join(seed.cwd, 'lib/email/templates/invoice-paid.ts'));
+        cpSync(seed.cwd, top, { recursive: true });
+        installStetShim(top);
+        const commit = (message: string): { code: number; out: string } => {
+          execFileSync('git', ['add', '-A'], { cwd: top });
+          const run = spawnSync('git', ['commit', '-m', message], {
+            cwd: top,
+            encoding: 'utf8',
+            env: { ...process.env, npm_config_registry: 'http://127.0.0.1:9' },
+          });
+          return { code: run.status ?? 1, out: `${run.stdout}${run.stderr}` };
+        };
+        expect(commit('base').code).toBe(0);
+        const io: CliIo = { cwd: top, env: {}, stdout: () => {}, stderr: () => {} };
+        expect(await runHookInstall([], io)).toBe(0);
+        mkdirSync(join(top, 'lib/email/templates'), { recursive: true });
+        writeFileSync(join(top, INVOICE), MARKUP);
+        const landed = commit('an invoice template');
+        expect(landed.code, landed.out).toBe(0);
+        expect(landed.out).toContain(LINE);
+        expect(execFileSync('git', ['log', '-1', '--format=%s'], { cwd: top, encoding: 'utf8' }).trim()).toBe('an invoice template');
+      } finally {
+        rmSync(top, { recursive: true, force: true });
+      }
+    }
+  });
 });
 
 describe('mount', () => {
@@ -7630,10 +8210,168 @@ describe('mount', () => {
       delete process.env[TOKEN_ENV];
     }
   });
+
+  let mounts = 0;
+  /** A handler over `store` behind a Bearer of `sekret`, and the two ways to call it. */
+  const mountOver = (
+    store: StoreAdapter,
+    over: { descriptor?: Descriptor; onPublish?: (event: PublishEvent) => void } = {},
+  ) => {
+    const TOKEN_ENV = `STET_CONF_MOUNT_GATE_TOKEN_${(mounts += 1)}`;
+    process.env[TOKEN_ENV] = 'sekret';
+    const handler = createStetHandler({
+      store,
+      descriptor: over.descriptor ?? descriptor,
+      auth: TOKEN_ENV,
+      ...(over.onPublish === undefined ? {} : { onPublish: over.onPublish }),
+    });
+    const authed = { authorization: 'Bearer sekret', 'content-type': 'application/json' };
+    return {
+      handler,
+      done: () => delete process.env[TOKEN_ENV],
+      get: (path: string, headers: Record<string, string> | null = authed) =>
+        handler.GET(new Request(`https://h/api/stet/${path}`, headers === null ? {} : { headers })),
+      post: (path: string, body: unknown) =>
+        handler.POST(new Request(`https://h/api/stet/${path}`, { method: 'POST', headers: authed, body: JSON.stringify(body) })),
+    };
+  };
+
+  it('Requirement: GET changes?id answers one change with its members', async () => {
+    const store = createMemoryStore({ project: 'walk' });
+    await store.saveDraft({ key: 'hero_headline', value: 'Buy', target: 'web', editor: 'ada' });
+    const first = (await store.publish({ key: 'hero_headline', editor: 'ada' })) as { versionId: number };
+    const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+    await store.saveDraft({ key: 'hero_headline', value: 'Buy now', target: 'web', editor: 'ada', change: opened.changeId });
+    await store.changesets.publishChange({ changeId: opened.changeId, editor: 'ada' });
+    const mount = mountOver(store);
+    try {
+      // The before values of a published change.
+      const answer = await mount.get(`changes?id=${opened.changeId}`);
+      expect(answer.status).toBe(200);
+      const body = (await answer.json()) as { change: { id: number; name: string; status: string }; members: Array<Record<string, unknown>> };
+      expect(body.change).toMatchObject({ id: opened.changeId, name: 'Spring pricing', status: 'published' });
+      expect(body.members).toEqual([
+        expect.objectContaining({ key: 'hero_headline', locale: 'default', beforeVersionId: first.versionId, beforeValue: 'Buy' }),
+      ]);
+
+      // The read is authenticated, and a malformed id is refused before the store is read.
+      const reads: string[] = [];
+      const spied: StoreAdapter = {
+        ...store,
+        changesets: {
+          ...store.changesets,
+          get: async (arg) => {
+            reads.push('get');
+            return store.changesets.get(arg);
+          },
+        },
+      };
+      const guarded = mountOver(spied);
+      try {
+        expect((await guarded.get(`changes?id=${opened.changeId}`, null)).status).toBe(401);
+        const bad = await guarded.get('changes?id=abc');
+        expect(bad.status).toBe(400);
+        expect(await bad.json()).toEqual({ error: 'id must be an integer' });
+        for (const id of ['12345678901234567890', '9007199254740992', '-1', '1.5', '']) {
+          expect((await guarded.get(`changes?id=${encodeURIComponent(id)}`)).status, id).toBe(400);
+        }
+        expect(reads).toEqual([]);
+      } finally {
+        guarded.done();
+      }
+
+      // An unknown id is the store's own conflict, and a store without changesets answers 501.
+      const unknown = await mount.get('changes?id=41');
+      expect(unknown.status).toBe(409);
+      expect(await unknown.json()).toEqual({ error: 'no_change:41', code: 'conflict' });
+      const bare = mountOver(createSnapshotStore({ project: 'none' }));
+      try {
+        expect((await bare.get('changes?id=3')).status).toBe(501);
+      } finally {
+        bare.done();
+      }
+      // Without an id the route lists changes as it does.
+      expect((await mount.get('changes?status=open')).status).toBe(200);
+    } finally {
+      mount.done();
+    }
+  });
+
+  it('Requirement: Draft and publish pass the content gate', async () => {
+    const ADDRESS = '1 Main Street, Springfield';
+    const seeded = async (): Promise<StoreAdapter> => {
+      const store = createMemoryStore({ project: 'walk' });
+      await store.saveDraft({ key: 'brand__footer_address', value: ADDRESS, target: 'html-email', editor: 'ada' });
+      await store.publish({ key: 'brand__footer_address', editor: 'ada' });
+      return store;
+    };
+
+    // A takeover over a hard limit is refused: `force` passes the same check, and the other editor's draft stays.
+    const held = await seeded();
+    await held.saveDraft({ key: 'welcome__subject', value: 'Welcome', target: 'html-email', editor: 'agent:claude' });
+    const takeover = mountOver(held);
+    try {
+      const over = await takeover.post('draft', { key: 'welcome__subject', value: 'x'.repeat(61), editor: 'dashboard:neil', force: true });
+      expect(over.status).toBe(422);
+      expect(((await over.json()) as { error: string }).error).toMatch(/60-character limit/);
+      const drafts = ((await held.read({ preview: true })) as StoreRow[]).filter((row) => row.status === 'draft');
+      expect(drafts.map((row) => [row.key, row.value, row.editor])).toEqual([['welcome__subject', 'Welcome', 'agent:claude']]);
+      // An unforced draft over the other editor's is refused as a clash, not as a content error.
+      const clash = await takeover.post('draft', { key: 'welcome__subject', value: 'Mine', editor: 'dashboard:neil' });
+      expect(clash.status).toBe(409);
+      // A valid takeover goes through.
+      expect((await takeover.post('draft', { key: 'welcome__subject', value: 'Mine', editor: 'dashboard:neil', force: true })).status).toBe(200);
+    } finally {
+      takeover.done();
+    }
+
+    // One invalid member refuses the whole change, and nothing is published.
+    const store = await seeded();
+    const opened = (await store.changesets.open({ name: 'spring' })) as { changeId: number };
+    await store.saveDraft({ key: 'hero_headline', value: 'Fine', target: 'web', editor: 'ada', change: opened.changeId });
+    await store.saveDraft({ key: 'newsletter__body', value: 'No way out of this list.', target: 'html-email', editor: 'ada', change: opened.changeId });
+    const events: PublishEvent[] = [];
+    const grouped = mountOver(store, { onPublish: (event) => void events.push(event) });
+    try {
+      const before = await store.read({ preview: true });
+      const refused = await grouped.post('publish-change', { change: opened.changeId, editor: 'ada' });
+      expect(refused.status).toBe(422);
+      expect(((await refused.json()) as { error: string }).error).toMatch(/unsubscribe_url/);
+      expect(await store.read({ preview: true })).toEqual(before);
+      expect(events).toEqual([]);
+      // `publish` of a stored draft judges it the same way.
+      await store.saveDraft({ key: 'welcome__subject', value: 'x'.repeat(61), target: 'html-email', editor: 'ada' });
+      expect((await grouped.post('publish', { key: 'welcome__subject', editor: 'ada' })).status).toBe(422);
+      expect(events).toEqual([]);
+    } finally {
+      grouped.done();
+    }
+
+    // A rollback is never blocked: a limit tightened since does not stop `revert-change`.
+    const rolled = createMemoryStore({ project: 'rollback' });
+    const long = 'x'.repeat(50);
+    await rolled.saveDraft({ key: 'welcome__subject', value: long, target: 'html-email', editor: 'ada' });
+    await rolled.publish({ key: 'welcome__subject', editor: 'ada' });
+    const change = (await rolled.changesets.open({ name: 'shorten' })) as { changeId: number };
+    await rolled.saveDraft({ key: 'welcome__subject', value: 'Short', target: 'html-email', editor: 'ada', change: change.changeId });
+    await rolled.changesets.publishChange({ changeId: change.changeId, editor: 'ada' });
+    const tightened = mutable(descriptor);
+    tightened.keys['welcome__subject'] = { ...tightened.keys['welcome__subject']!, limits: { max: 40, severity: 'hard' } };
+    const reverting = mountOver(rolled, { descriptor: tightened });
+    try {
+      const reverted = await reverting.post('revert-change', { change: change.changeId, editor: 'ada' });
+      expect(reverted.status).toBe(200);
+      expect(((await reverted.json()) as { reverted: unknown[] }).reverted).toHaveLength(1);
+      const live = ((await rolled.read()) as StoreRow[]).find((row) => row.key === 'welcome__subject');
+      expect(live?.value).toBe(long);
+    } finally {
+      reverting.done();
+    }
+  });
 });
 
 /**
- * email-custody: the bulk-adoption pair. Every case drives `runCli`, so the
+ * email-custody: `email extract` and `email verify`. Every case drives `runCli`, so the
  * two-token dispatch, the argument split and the exit codes are part of what is
  * being proven — and the verify cases run against a real git repository,
  * because the before comes from HEAD or it does not come at all.
@@ -7800,7 +8538,379 @@ describe('email-custody', () => {
     expect(await host.run('email', 'verify')).toBe(0);
     expect(host.stdout()).toContain('welcome: PASS');
   });
+
+  const runnerIo = (cwd: string): CliIo => ({ cwd, env: process.env, stdout: () => {}, stderr: () => {} });
+  /** One export rendered through the runner, with the optional frame and fill. */
+  const renderOne = (
+    host: { dir: string; path(rel: string): string },
+    rel: string,
+    exportName: string,
+    props: Record<string, unknown> = {},
+    shape: Pick<RenderRequest, 'frame' | 'fill'> = {},
+  ) => renderTemplate(runnerIo(host.dir), { hostDir: host.dir, file: host.path(rel), exportName, props, ...shape });
+  const renderedOf = (result: ReturnType<typeof renderOne>): unknown => {
+    if (!result.ok) throw new Error(`${result.reason}: ${result.detail}`);
+    return JSON.parse(result.result);
+  };
+
+  it('Requirement: One render path awaits the template and applies the frame and the fill', async () => {
+    const host = makeEmailHost();
+
+    // An async template that logs: it renders `<p/>`, exit 0, and the log reaches stderr, before or after the await.
+    host.put('lib/email/later.ts', "export const later = async () => { console.log('before'); await 0; console.log('x'); return '<p/>'; };\n");
+    expect(renderOne(host, 'lib/email/later.ts', 'later')).toEqual({ ok: true, result: JSON.stringify('<p/>') });
+    const runner = join(packageRoot(), 'templates', 'email-runner.cjs');
+    const child = spawnSync(process.execPath, [runner, host.dir, host.path('lib/email/later.ts'), 'later', '{}'], { encoding: 'utf8' });
+    expect(child.status).toBe(0);
+    expect(child.stdout).toBe(JSON.stringify('<p/>'));
+    expect(child.stderr).toBe('before\nx\n');
+
+    // A markup string and a map of strings render as they stand; a variable is filled only on request.
+    host.put('lib/email/plain.ts', "export const plain = '<a href=\"{{url}}\">{{ name }}</a> $& {{missing}}';\nexport const map = { subject: 'Hi', html: '<p>{{name}}</p>' };\n");
+    const props = { url: 'https://x', name: "$&Ada$'", preheader: 'pre' };
+    expect(renderedOf(renderOne(host, 'lib/email/plain.ts', 'plain', props))).toBe('<a href="{{url}}">{{ name }}</a> $& {{missing}}');
+    expect(renderedOf(renderOne(host, 'lib/email/plain.ts', 'map', props))).toEqual({ subject: 'Hi', html: '<p>{{name}}</p>' });
+    // `fill` fills each variable the props hold as plain text with no escaping, and leaves the one they lack.
+    expect(renderedOf(renderOne(host, 'lib/email/plain.ts', 'plain', props, { fill: true }))).toBe(
+      "<a href=\"https://x\">$&Ada$'</a> $& {{missing}}",
+    );
+
+    // The frame wraps the markup (a map's `html` member) with the declared arguments, and the fill runs after it.
+    host.put(
+      'lib/email/base.ts',
+      'export const named = (c: string, pre?: string) => `<html>{{preheader}}${pre}|${c}</html>`;\n' +
+        'export const all = (c: string, p: { name: string }) => `<b>${p.name}</b>${c}`;\n' +
+        'export const boxed = (c: string) => ({ wrapped: c });\n' +
+        'export const forgot = (c: string): void => { void c; };\n' +
+        "export const notAFunction = '<html></html>';\n",
+    );
+    const frame = (name: string, args?: string[] | '$all') => ({ file: 'lib/email/base.ts', export: name, ...(args === undefined ? {} : { args }) });
+    expect(renderedOf(renderOne(host, 'lib/email/plain.ts', 'plain', props, { frame: frame('named', ['preheader']), fill: true }))).toBe(
+      "<html>prepre|<a href=\"https://x\">$&Ada$'</a> $& {{missing}}</html>",
+    );
+    expect(renderedOf(renderOne(host, 'lib/email/plain.ts', 'map', props, { frame: frame('all', '$all'), fill: true }))).toEqual({
+      subject: 'Hi',
+      html: "<b>$&Ada$'</b><p>$&Ada$'</p>",
+    });
+
+    // A map with a frame and no `html` member, and a frame that returns anything but a string, are not emails.
+    host.put('lib/email/nohtml.ts', "export const map = { subject: 'Hi', text: 'Hi' };\n");
+    const noHtml = renderOne(host, 'lib/email/nohtml.ts', 'map', {}, { frame: frame('named') });
+    expect(!noHtml.ok && noHtml.reason).toBe('not-renderable');
+    expect(!noHtml.ok && noHtml.detail).toBe(`${host.path('lib/email/nohtml.ts')} map: the frame wraps the html member, and this map has none`);
+    // A frame that returns nothing: the render names the frame, and nothing is reported as the email.
+    for (const fill of [false, true]) {
+      const none = renderOne(host, 'lib/email/plain.ts', 'plain', {}, { frame: frame('forgot'), fill });
+      expect(!none.ok && none.reason).toBe('not-renderable');
+      expect(!none.ok && none.detail).toBe('lib/email/base.ts forgot: the frame returned undefined — a frame returns a string');
+    }
+    const object = renderOne(host, 'lib/email/plain.ts', 'plain', {}, { frame: frame('boxed') });
+    expect(!object.ok && object.detail).toBe('lib/email/base.ts boxed: the frame returned an object — a frame returns a string');
+    const notFunction = renderOne(host, 'lib/email/plain.ts', 'plain', {}, { frame: frame('notAFunction') });
+    expect(!notFunction.ok && notFunction.reason).toBe('export-not-function');
+
+    // A string export becomes a function and verify passes: HEAD holds the string, the working tree R3's function of the slot.
+    const POINTER = { file: 'lib/email/templates/welcome.ts', export: 'welcomeContent', sampleProps: { url: 'https://x', name: 'Ada' } };
+    const declare = (fill: boolean) => ({
+      version: 1,
+      keys: { welcome__body: { shape: 'text', target: 'html-email', vars: ['name'] } },
+      templates: {
+        welcome: { class: 'transactional', trigger: 'manual', slots: ['body'], render: { ...POINTER, ...(fill ? { fill: true } : {}) } },
+      },
+    });
+    const project = emailProject(
+      { 'lib/email/templates/welcome.ts': 'export const welcomeContent = \'<a href="{{url}}">{{name}}</a>\';\n' },
+      declare(true),
+    );
+    project.put('content/defaults.json', '{"default":{"welcome__body":"{{name}}"}}\n');
+    project.put(
+      'lib/email/templates/welcome.ts',
+      'export const welcomeContent = ({ welcome__body }: { welcome__body: string }) => \'<a href="{{url}}">\' + welcome__body + \'</a>\';\n',
+    );
+    expect(await project.run('email', 'verify')).toBe(0);
+    expect(project.stdout()).toContain('welcome: PASS');
+    // Without the fill it fails, at the first byte of the href.
+    project.put('content/descriptor.json', `${JSON.stringify(declare(false))}\n`);
+    expect(await project.run('email', 'verify')).toBe(1);
+    expect(project.stderr()).toContain('welcome: FAIL — the render changed');
+
+    // A frame is read from the working tree on both sides: a frame changed since HEAD still agrees.
+    const framed = emailProject(
+      {
+        'lib/email/templates/welcome.ts': 'export const welcomeContent = \'<a href="{{url}}">{{name}}</a>\';\n',
+        'lib/email/templates/shell.ts': 'export const shell = (c: string): string => `<html>${c}</html>`;\n',
+      },
+      {
+        ...declare(true),
+        templates: {
+          welcome: {
+            class: 'transactional',
+            trigger: 'manual',
+            slots: ['body'],
+            render: { ...POINTER, fill: true, frame: { file: 'lib/email/templates/shell.ts', export: 'shell' } },
+          },
+        },
+      },
+    );
+    framed.put('content/defaults.json', '{"default":{"welcome__body":"{{name}}"}}\n');
+    framed.put('lib/email/templates/shell.ts', 'export const shell = (c: string): string => `<body class="v2">${c}</body>`;\n');
+    expect(await framed.run('email', 'verify')).toBe(0);
+    expect(framed.stdout()).toContain('welcome: PASS');
+
+    // Mirra's 27 string templates render through the runner with the preheader passed and no variable left that the props hold.
+    const mirra = makeEmailHost();
+    mirra.put(
+      'lib/email/templates/base.ts',
+      'export function baseTemplate(content: string, preheader?: string): string {\n  return `<html><span>${preheader ?? \'\'}</span>${content}</html>`;\n}\n',
+    );
+    const sample = { url: 'https://example.com/go', name: 'Ada', preheader: 'Your week, sorted.' };
+    for (let n = 1; n <= 27; n += 1) {
+      const id = `t${String(n).padStart(2, '0')}`;
+      mirra.put(`lib/email/templates/${id}.ts`, `export const ${id}Content = '<h1>${id}</h1><p>Hi {{name}}</p><a href="{{url}}">Open</a>';\n`);
+      const html = renderedOf(
+        renderOne(mirra, `lib/email/templates/${id}.ts`, `${id}Content`, sample, {
+          fill: true,
+          frame: { file: 'lib/email/templates/base.ts', export: 'baseTemplate', args: ['preheader'] },
+        }),
+      ) as string;
+      expect(html).toBe(`<html><span>Your week, sorted.</span><h1>${id}</h1><p>Hi Ada</p><a href="https://example.com/go">Open</a></html>`);
+    }
+
+    // `stet dev`'s mount renders the same way where the host wires no renderEmail; a render by version rejects.
+    const dev = previewHost({ config: { store: { adapter: 'memory' } } });
+    const render = mountRenderer(
+      { cwd: dev.dir, env: {}, stdout: () => {}, stderr: () => {} },
+      {
+        path: dev.dir,
+        descriptor: loadDescriptor(JSON.parse(readFileSync(join(dev.dir, 'content/descriptor.json'), 'utf8'))),
+        snapshot: loadSnapshot(JSON.parse(readFileSync(join(dev.dir, 'content/defaults.json'), 'utf8'))),
+      },
+      createMemoryStore({ project: 'default' }),
+    );
+    expect(await render('welcome')).toContain('<h1>Welcome to mirra</h1>');
+    await expect(render('welcome', { version: 3 })).rejects.toThrow("render by version needs the host's renderEmail");
+  }, 60_000);
+
+  it("Requirement: Doctor's wrapper chain walks the frame", async () => {
+    // A declared token that lives only in the frame's file, which the template never imports.
+    const entry = MARKETING(['unsubscribe_url']);
+    const dir = chainProject(
+      { welcome: { ...entry, render: { ...entry.render!, frame: { file: 'lib/email/base.ts', export: 'baseTemplate', args: ['preheader'] } } } },
+      { brand__footer_address: '1 Any Road' },
+    );
+    writeChain(dir, 'lib/email/welcome.ts', "export const welcome = '<h1>Hello</h1>';\n");
+    writeChain(dir, 'lib/email/base.ts', 'export const baseTemplate = (c: string): string => `${c}<a href="{{unsubscribe_url}}">Unsubscribe</a>`;\n');
+    const found = await doctorOf(dir);
+    expect(found.err).not.toContain('wrapperProvides');
+    expect(found.out).toContain('wrapper chain (welcome): 2 file(s), 1 declared token(s)');
+    expect(found.out).not.toContain('unfound');
+
+    // The same token in neither file is reported.
+    const bare = chainProject(
+      { welcome: { ...entry, render: { ...entry.render!, frame: { file: 'lib/email/base.ts', export: 'baseTemplate' } } } },
+      { brand__footer_address: '1 Any Road' },
+    );
+    writeChain(bare, 'lib/email/welcome.ts', "export const welcome = '<h1>Hello</h1>';\n");
+    writeChain(bare, 'lib/email/base.ts', 'export const baseTemplate = (c: string): string => `<html>${c}</html>`;\n');
+    expect((await doctorOf(bare)).err).toContain('"unsubscribe_url"');
+  });
+
+  it('Requirement: Pointer files stay inside the project', async () => {
+    const LINE = (file: string): string => `${file} is outside the project — a render pointer names a file inside it`;
+    const POINTER = { file: 'lib/email/templates/welcome.ts', export: 'welcomeContent', sampleProps: { url: 'https://x', name: 'Ada' } };
+    const declare = (render: Record<string, unknown>) => ({
+      version: 1,
+      keys: { welcome__body: { shape: 'text', target: 'html-email', vars: ['name'] } },
+      templates: { welcome: { class: 'transactional', trigger: 'manual', slots: ['body'], render } },
+    });
+    const HEAD = 'export const welcomeContent = \'<a href="{{url}}">{{name}}</a>\';\n';
+
+    // `email verify` fails the template with the containment line, for a missing file and for an existing one
+    // that would leave a mark if it were ever loaded, as a pointer and as a frame.
+    const absent = emailProject({ 'lib/email/templates/welcome.ts': HEAD }, declare({ ...POINTER, file: '../../outside/tpl.tsx' }));
+    expect(await absent.run('email', 'verify')).toBe(1);
+    expect(absent.stderr()).toContain(`welcome: FAIL — ${LINE('../../outside/tpl.tsx')}`);
+
+    const outside = makeEmailHost({ deps: [] });
+    const mark = outside.path('loaded');
+    outside.put('tpl.ts', `require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x');\nexport const welcomeContent = '<p/>';\n`);
+    const rel = `../${outside.dir.split('/').pop()}/tpl.ts`;
+    for (const render of [{ ...POINTER, file: rel }, { ...POINTER, frame: { file: rel, export: 'welcomeContent' } }]) {
+      const escaping = emailProject({ 'lib/email/templates/welcome.ts': HEAD }, declare(render));
+      expect(await escaping.run('email', 'verify')).toBe(1);
+      expect(escaping.stderr()).toContain(`welcome: FAIL — ${LINE(rel)}`);
+      expect(existsSync(mark)).toBe(false);
+    }
+
+    // `stet email render` and `stet email test` refuse it before the file is read, and so does the send function's file.
+    const sending = emailProject({ 'lib/email/templates/welcome.ts': HEAD }, declare({ ...POINTER, file: rel }));
+    sending.put('content/defaults.json', '{"default":{"welcome__body":"{{name}}"}}\n');
+    expect(await sending.run('email', 'render', 'welcome')).toBe(1);
+    expect(sending.stderr()).toContain(LINE(rel));
+    expect(existsSync(mark)).toBe(false);
+
+    const mailing = emailProject({ 'lib/email/templates/welcome.ts': HEAD }, declare(POINTER));
+    mailing.put('content/defaults.json', '{"default":{"welcome__body":"{{name}}"}}\n');
+    mailing.put('stet.config.json', `${JSON.stringify({ project: 't', managedSurfaces: [], emailSurfaces: [], emailSend: { file: rel, export: 'welcomeContent' } })}\n`);
+    expect(await mailing.run('email', 'test', 'welcome', '--to', 'neil@example.com')).toBe(1);
+    expect(mailing.stderr()).toContain(LINE(rel));
+    expect(existsSync(mark)).toBe(false);
+
+    // The dashboard's email preview and `stet dev`'s mount renderer answer the same line with nothing spawned.
+    const dev = previewHost({ config: { store: { adapter: 'memory' } } });
+    const away = outsideFile(dev, `export function welcome(): string { require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); return '<p>out</p>'; }\n`);
+    const descriptorPath = join(dev.dir, 'content/descriptor.json');
+    const document = JSON.parse(readFileSync(descriptorPath, 'utf8'));
+    document.templates.welcome.render.file = away.rel;
+    writeFileSync(descriptorPath, JSON.stringify(document));
+    const site = {
+      path: dev.dir,
+      descriptor: loadDescriptor(document),
+      snapshot: loadSnapshot(JSON.parse(readFileSync(join(dev.dir, 'content/defaults.json'), 'utf8'))),
+    };
+    const devIo = { cwd: dev.dir, env: {}, stdout: () => {}, stderr: () => {} };
+    await expect(mountRenderer(devIo, site, createMemoryStore({ project: 'default' }))('welcome')).rejects.toThrow(LINE(away.rel));
+    const preview = await renderPreview(devIo, site, createMemoryStore({ project: 'default' }), { template: 'welcome', locale: 'default', drafts: new Map() });
+    expect(preview).toEqual({ failure: { reason: 'not-renderable', detail: LINE(away.rel) } });
+    expect(existsSync(mark)).toBe(false);
+    cleanupOutsideFiles();
+  });
+
+  it("Requirement: extract reads string-constant templates, their subjects and the frame's arguments", async () => {
+    const FRAME = 'lib/email/templates/base.ts#baseTemplate';
+    const MIRRA = {
+      'lib/email/registry.ts':
+        "import { welcomeContent } from './templates/welcome';\n\n" +
+        'export const emailRegistry = {\n  welcome: {\n    subject: \'Welcome to Mirra\',\n    content: welcomeContent,\n  },\n};\n',
+      'lib/email/templates/base.ts':
+        "const MIRRA_BRAND = { name: 'Mirra', color: '#2d6a4f' };\n\n" +
+        'export function baseTemplate(content: string, preheader?: string, shellWidth = 600, brand = MIRRA_BRAND): string {\n' +
+        '  return `<html><body style="color:${brand.color}"><span class="preheader">${preheader ?? \'\'}</span>` +\n' +
+        '    `<table width="${shellWidth}"><tr><td>${content}</td></tr></table><p>${brand.name}</p></body></html>`;\n}\n',
+      'lib/email/templates/welcome.ts':
+        "export const WELCOME_BILLING_TRIAL = 'Your first 14 days are free.';\n" +
+        "export const WELCOME_PREHEADER = 'Your week, sorted.';\n\n" +
+        'export const welcomeContent = `\n  <h1>Welcome to Mirra</h1>\n' +
+        '  <p>Hi {{name}}, your week is sorted. Every plan you make lands in one place.</p>\n' +
+        '  <a href="{{loginUrl}}">Open your dashboard</a>\n`;\n',
+    };
+    const project = emailProject(MIRRA);
+
+    // Mirra's welcome is proposed from `welcomeContent`; the markup-free constant is no candidate.
+    expect(await project.run('email', 'extract', WALK, '--frame', FRAME, '--json')).toBe(0);
+    const payload = JSON.parse(project.stdout()) as {
+      templates: Array<{ name: string; entry: TemplateDef; keys: Record<string, KeyDef>; values: Record<string, string> }>;
+      skips: unknown[];
+    };
+    expect(payload.templates.map((t) => t.name)).toEqual(['welcome']);
+    expect(payload.skips).toEqual([]);
+    const welcome = payload.templates[0]!;
+    expect(welcome.entry.slots).toEqual(['subject', 'headline', 'body', 'cta_label']);
+    expect(welcome.values['welcome__subject']).toBe('Welcome to Mirra');
+    expect(welcome.entry.render).toEqual({
+      file: 'lib/email/templates/welcome.ts',
+      export: 'welcomeContent',
+      sampleProps: { name: 'sample-name', loginUrl: 'https://example.com/loginUrl' },
+      fill: true,
+      frame: { file: 'lib/email/templates/base.ts', export: 'baseTemplate', args: ['preheader', 'shellWidth', 'brand'] },
+    });
+    expect(welcome.keys['welcome__body']).toEqual({ shape: 'text', target: 'html-email', vars: ['name'], requires: ['name'] });
+    expect(welcome.keys['welcome__headline']).toEqual({ shape: 'text', target: 'html-email' });
+
+    // The review names the registry the subject came from, and the registry is never rewritten.
+    const reviewed = emailProject(MIRRA);
+    expect(await reviewed.run('email', 'extract', WALK, '--frame', FRAME)).toBe(0);
+    expect(reviewed.stdout()).toContain('welcome__subject is seeded from lib/email/registry.ts:5, which stet leaves as it is');
+    expect(await reviewed.run('email', 'extract', WALK, '--frame', FRAME, '--apply')).toBe(0);
+    expect(reviewed.file('lib/email/registry.ts')).toBe(MIRRA['lib/email/registry.ts']);
+    expect(await reviewed.run('email', 'verify')).toBe(0);
+    expect(reviewed.stdout()).toContain('welcome: PASS');
+
+    // A substitution stays shell with its note, and the other runs are proposed.
+    const shell = emailProject({
+      'lib/email/templates/welcome.ts':
+        "const BRAND = 'Mirra';\nexport const welcomeContent = `<h1>Welcome to ${BRAND}</h1><p>Hi {{name}}, your week is sorted.</p>`;\n",
+    });
+    expect(await shell.run('email', 'extract', WALK, '--json')).toBe(0);
+    const kept = (JSON.parse(shell.stdout()) as { templates: Array<{ values: Record<string, string>; notes?: string[]; edited?: string }> }).templates[0]!;
+    expect(Object.values(kept.values)).toContain('Hi {{name}}, your week is sorted.');
+    expect(Object.values(kept.values).some((value) => value.includes('BRAND'))).toBe(false);
+    expect(JSON.stringify(kept)).toContain('interpolates ${…}, which a string template cannot pass as a prop — left as shell');
+
+    // A frame of one destructured parameter is "$all", one taking only the content has no args.
+    const FRAMES = {
+      'lib/email/templates/welcome.ts': MIRRA['lib/email/templates/welcome.ts'],
+      'lib/email/frames.ts':
+        'export const shell = (c: string, { name }: { name: string }): string => `<div>${name}${c}</div>`;\n' +
+        'export function plain(c: string): string {\n  return `<div>${c}</div>`;\n}\n',
+    };
+    const frameOf = async (spec: string): Promise<unknown> => {
+      const run = emailProject(FRAMES);
+      await run.run('email', 'extract', WALK, '--frame', spec, '--json');
+      return (JSON.parse(run.stdout()) as { templates: Array<{ entry: TemplateDef }> }).templates[0]?.entry.render?.frame;
+    };
+    expect(await frameOf('lib/email/frames.ts#shell')).toEqual({ file: 'lib/email/frames.ts', export: 'shell', args: '$all' });
+    expect(await frameOf('lib/email/frames.ts#plain')).toEqual({ file: 'lib/email/frames.ts', export: 'plain' });
+    // A frame export that is not there refuses the run before any proposal.
+    const refused = emailProject(FRAMES);
+    expect(await refused.run('email', 'extract', WALK, '--frame', 'lib/email/frames.ts#nope')).not.toBe(0);
+    expect(refused.file('lib/email/templates/welcome.ts')).toBe(FRAMES['lib/email/templates/welcome.ts']);
+  });
 });
+
+// The dashboard's side, played against a stubbed site: shared by the `preview-editing` and `dashboard` sections.
+interface PageState {
+  draft: Record<string, unknown>;
+  edit: Record<string, unknown> | null;
+  snapshot: Record<string, Record<string, unknown>>;
+}
+const stateOf = (page: PaintedPage): PageState =>
+  JSON.parse(
+    (page.dom.window as unknown as { eval: (code: string) => string }).eval(
+      'JSON.stringify({ draft: S.draft, edit: S.edit === undefined ? null : S.edit, snapshot: S.site.snapshot })',
+    ),
+  ) as PageState;
+const note = (page: PaintedPage): HTMLElement => byId(page, 'panenote');
+const lines = (page: PaintedPage): string[] => [...note(page).children].map((line) => line.textContent ?? '');
+const selected = (page: PaintedPage): string => docOf(page).querySelector('#main .ch h3 .mono')?.textContent ?? '';
+const typeInto = async (page: PaintedPage, field: HTMLTextAreaElement, value: string): Promise<void> => {
+  field.value = value;
+  field.dispatchEvent(new page.dom.window.Event('input', { bubbles: true }));
+  await page.settle();
+};
+const pressKey = async (page: PaintedPage, field: HTMLElement, name: string): Promise<void> => {
+  field.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true }));
+  await page.settle();
+};
+const LAB: Descriptor = {
+  version: 1,
+  keys: {
+    hero_headline: { shape: 'text', target: 'web', limits: { max: 60, severity: 'advisory' }, pages: ['home'] },
+    hero_bullets: { shape: 'list', target: 'web', limits: { max: 40, severity: 'hard' }, pages: ['home'] },
+    lab_greeting: { shape: 'text', target: 'web', limits: { max: 40, severity: 'advisory' } },
+    lab_link: { shape: 'text', target: 'web', pages: ['home'] },
+    lab_button: { shape: 'text', target: 'web', pages: ['home'] },
+    lab_hero_alt: { shape: 'text', target: 'web', pages: ['home'] },
+    loose_key: { shape: 'text', target: 'web', pages: ['home'] },
+    nav_link: { shape: 'text', target: 'web', pages: ['home'] },
+    nav_button_text: { shape: 'text', target: 'web', pages: ['home'] },
+  },
+  pages: { home: { route: '/' } },
+};
+const LAB_VALUES = {
+  hero_headline: 'Ship the copy',
+  hero_bullets: ['one', 'two', 'three'],
+  lab_greeting: 'Welcome back, {{name}}.',
+  lab_link: 'Read the guide',
+  lab_button: 'Start free trial',
+  lab_hero_alt: 'A desk with two laptops',
+  loose_key: 'loose',
+  nav_link: 'Docs',
+  nav_button_text: 'Start',
+};
+const labSite = (over: Record<string, unknown> = {}): Record<string, unknown> =>
+  siteBody({ descriptor: LAB, snapshot: { default: LAB_VALUES, de: {} }, ...over });
+const RECT = { left: 100, top: 50, width: 200, height: 20 };
 
 describe('dashboard', () => {
   afterEach(closeFrames);
@@ -8137,7 +9247,7 @@ describe('dashboard', () => {
       expect(refused.status).toBe(409);
       expect(refused.body['error']).toBe(
         "store adapter 'postgrest' is configured but STET_POSTGREST_URL is unset — " +
-          "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
+          "stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in",
       );
 
       // The dev command of each site: the started-in one holds the token, the other does not.
@@ -8384,6 +9494,1033 @@ describe('dashboard', () => {
       await proxy.close();
       await new Promise<void>((done) => dev.close(() => done()));
     }
+  });
+
+  // The store-backed page: the real dashboard in jsdom over the real dev handler, a memory store per environment behind it.
+  type Mem = ReturnType<typeof createMemoryStore>;
+  const LAB_D = {
+    version: 1,
+    keys: {
+      lab_headline: { shape: 'text', target: 'web', limits: { max: 60, severity: 'advisory' }, pages: ['home'] },
+      lab_button: { shape: 'text', target: 'web', pages: ['pricing'] },
+      lab_link: { shape: 'text', target: 'web', pages: ['home'] },
+      lab_alt: { shape: 'text', target: 'web', pages: ['home'] },
+      lab_note: { shape: 'text', target: 'web', limits: { max: 40, severity: 'hard' }, pages: ['home'] },
+    },
+    pages: { home: { route: '/' }, pricing: { route: '/pricing' } },
+  };
+  const LAB_V = { lab_headline: 'Copy that ships', lab_button: 'Buy', lab_link: 'Read the docs', lab_alt: 'A lab photo', lab_note: 'Small print' };
+  const clockOf = (at: string): string => {
+    const d = new Date(at);
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  };
+  const fieldOf = (page: PaintedPage, key: string): HTMLTextAreaElement =>
+    docOf(page).querySelector(`[data-act-input="text:${key}"]`) as HTMLTextAreaElement;
+  const rowText = (page: PaintedPage, key: string): string => docOf(page).querySelector(`[data-act="key:${key}"]`)?.textContent ?? '';
+  const barLines = (page: PaintedPage): string[] => [...docOf(page).querySelectorAll('#changebar .cline')].map((el) => el.textContent ?? '');
+  const barText = (page: PaintedPage): string => docOf(page).getElementById('changebar')?.textContent ?? '';
+  const confirmText = (page: PaintedPage): string => docOf(page).querySelector('#takeover .term')?.textContent ?? '';
+
+  /** Runs `fn` with the mount's Bearer token in the environment, as `stet dev` sets it. */
+  const underToken = async (fn: () => Promise<void>): Promise<void> => {
+    const held = process.env['STET_DEV_TOKEN'];
+    process.env['STET_DEV_TOKEN'] = TOKEN;
+    try {
+      await fn();
+    } finally {
+      if (held === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held;
+    }
+  };
+  /** A store-backed project: the lab's keys, one memory store per environment behind the dev handler. */
+  const labProject = () => {
+    const host = makeCliHost({ config: { project: 'default', store: { adapter: 'memory' }, environments: { staging: { adapter: 'memory' } } } });
+    withDescriptor(host, LAB_D, { default: LAB_V });
+    const stores: Record<string, Mem> = { default: createMemoryStore({ project: 'lab' }), staging: createMemoryStore({ project: 'lab' }) };
+    const { handler } = handlerOver([host.cwd], { page: dashboardPage(), storeFor: (_path, env) => stores[env ?? 'default'] });
+    return { host, stores, handler, id: siteId(realpathSync(host.cwd)) };
+  };
+  type Lab = ReturnType<typeof labProject>;
+  /** The page over a project, its dev pane framed (an agent announced) where asked. */
+  const labPage = async (lab: Lab, over: { session?: Record<string, string>; storage?: Record<string, string>; framed?: boolean } = {}) => {
+    const html = await (await lab.handler(req('/', { token: null }))).text();
+    const page = await paintPage({
+      html,
+      token: TOKEN,
+      ...(over.session === undefined ? {} : { session: over.session }),
+      ...(over.storage === undefined ? {} : { storage: over.storage }),
+      serve: async (path, body) => {
+        if (over.framed === true && path.startsWith('/api/site/preview')) return { status: 200, body: DEV_PREVIEW };
+        const res = await lab.handler(req(path, body === undefined ? {} : { method: 'POST', body }));
+        return { status: res.status, body: await res.json() };
+      },
+    });
+    const agent = over.framed === true ? agentOf(page) : null;
+    if (agent !== null) {
+      await agent.load();
+      await agent.ready();
+    }
+    return { page, agent: agent as ReturnType<typeof agentOf> };
+  };
+  const draftPosts = (page: PaintedPage, lab: Lab): Array<Record<string, unknown>> =>
+    page.sent.filter((r) => r.path.split('?')[0] === `/s/${lab.id}/api/stet/draft`).map((r) => r.body as Record<string, unknown>);
+  const draftRows = async (store: StoreAdapter, key: string): Promise<StoreRow[]> => {
+    const rows = await store.read({ preview: true });
+    if (!Array.isArray(rows)) throw new Error('read failed');
+    return rows.filter((r) => r.key === key && r.status === 'draft');
+  };
+  const editorOf = async (lab: Lab): Promise<string> =>
+    ((await (await lab.handler(req('/api/workspace'))).json()) as { editor: string }).editor;
+
+  it('Requirement: A store-backed site shows its saved drafts', () =>
+    underToken(async () => {
+      const lab = labProject();
+      const editor = await editorOf(lab);
+      const first = await labPage(lab);
+      await first.page.act('key:lab_headline');
+      await first.page.type('text:lab_headline', 'Copy changes without a deploy');
+      await first.page.act('save');
+      expect((await draftRows(lab.stores['default'] as Mem, 'lab_headline'))[0]).toMatchObject({ value: 'Copy changes without a deploy', editor });
+      const storage = first.page.storage();
+      first.page.dom.window.close();
+
+      // A reload: the page reads the mount's rows on load, and the field, the row and the preview show the draft.
+      const { page, agent } = await labPage(lab, { storage, framed: true });
+      expect(page.requested(`/s/${lab.id}/api/stet/keys`).length).toBeGreaterThan(0);
+      expect(rowText(page, 'lab_headline')).toMatch(new RegExp(`draft · ${editor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} · \\d{2}:\\d{2}`));
+      await page.act('key:lab_headline');
+      expect(fieldOf(page, 'lab_headline').value).toBe('Copy changes without a deploy');
+      await page.act('key:lab_link');
+      const layer = agent.sent('layer').at(-1) as { drafts: Array<{ key: string; draft: unknown }> };
+      expect(layer.drafts.map((d) => [d.key, d.draft])).toEqual([['lab_headline', 'Copy changes without a deploy']]);
+      const framed = await frame('<h1>Copy that ships</h1>');
+      framed.send(layer);
+      await tick();
+      expect((framed.doc.querySelector('h1') as HTMLElement).textContent).toBe('Copy changes without a deploy');
+      // An environment switch reads the rows again, and staging holds no draft.
+      await page.act('cycleEnv');
+      expect(rowText(page, 'lab_headline')).not.toContain('draft ·');
+      page.dom.window.close();
+    }));
+
+  it("Requirement: A save over another editor's draft is a takeover the editor confirms", () =>
+    underToken(async () => {
+      const lab = labProject();
+      const store = lab.stores['default'] as Mem;
+      const editor = await editorOf(lab);
+      await store.saveDraft({ key: 'lab_headline', value: 'The agent’s words', target: 'web', editor: 'agent:claude' });
+      const since = (await draftRows(store, 'lab_headline'))[0]?.createdAt as string;
+      const { page } = await labPage(lab);
+      await page.act('key:lab_headline');
+      await page.type('text:lab_headline', 'The editor’s words');
+      await page.act('save');
+      expect(confirmText(page)).toBe(
+        `agent:claude has a draft of lab_headline from ${clockOf(since)}. Save yours over it? Their wording is replaced and the draft becomes yours.`,
+      );
+      expect([...docOf(page).querySelectorAll('#takeover button')].map((b) => b.textContent)).toEqual(['Take over', 'Keep theirs']);
+      // `force` has not been sent by any path yet.
+      expect(draftPosts(page, lab).some((b) => 'force' in b)).toBe(false);
+
+      // Keep theirs writes nothing and keeps the edit unsaved.
+      await page.act('keepTheirs');
+      expect(confirmText(page)).toBe('');
+      expect((await draftRows(store, 'lab_headline'))[0]).toMatchObject({ editor: 'agent:claude', value: 'The agent’s words' });
+      expect(fieldOf(page, 'lab_headline').value).toBe('The editor’s words');
+      expect(docOf(page).getElementById('dc')?.textContent).toBe('1 unsaved edit');
+      expect(draftPosts(page, lab).some((b) => 'force' in b)).toBe(false);
+
+      // Take over resends that value with force: true, and the draft becomes the dashboard's.
+      await page.act('save');
+      await page.act('takeOver');
+      expect(draftPosts(page, lab).at(-1)).toEqual({ editor, key: 'lab_headline', locale: 'default', value: 'The editor’s words', force: true });
+      expect((await draftRows(store, 'lab_headline'))[0]).toMatchObject({ editor, value: 'The editor’s words' });
+      expect(confirmText(page)).toBe('');
+      expect(rowText(page, 'lab_headline')).toContain(`draft · ${editor} · `);
+      // Only the press sent a force.
+      expect(draftPosts(page, lab).filter((b) => 'force' in b)).toHaveLength(1);
+      page.dom.window.close();
+
+      // The change-move path asks the same way: Add to change sends no force, and the press sends the only one.
+      const move = labProject();
+      const mine = move.stores['default'] as Mem;
+      const opened = (await mine.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+      await mine.saveDraft({ key: 'lab_link', value: 'Agent link', target: 'web', editor: 'agent:claude' });
+      const member = await labPage(move, { session: { [`stet.change ${move.id} default`]: String(opened.changeId) } });
+      await member.page.act('addToChange');
+      expect(confirmText(member.page)).toContain('Add it to Spring pricing?');
+      expect(draftPosts(member.page, move).some((b) => 'force' in b)).toBe(false);
+      await member.page.act('takeOver');
+      expect(draftPosts(member.page, move).filter((b) => 'force' in b)).toHaveLength(1);
+      expect((await draftRows(mine, 'lab_link'))[0]).toMatchObject({ changesetId: opened.changeId });
+      member.page.dom.window.close();
+    }));
+
+  it('Requirement: The change bar groups edits on a store-backed site', () =>
+    underToken(async () => {
+      const lab = labProject();
+      const staging = lab.stores['staging'] as Mem;
+      const editor = await editorOf(lab);
+      const slot = (env = 'default'): string => `stet.change ${lab.id} ${env}`;
+      // Group three edits and publish them together.
+      const { page } = await labPage(lab);
+      await page.act('cycleEnv');
+      expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.']);
+      await page.act('changeNew');
+      await page.type('changeName', 'Spring pricing');
+      await page.type('changeNote', 'New plan names');
+      await page.act('changeCreate');
+      expect(page.sent.find((r) => r.path.startsWith(`/s/${lab.id}/api/stet/changes?env=staging`) && r.body !== undefined)?.body).toEqual({
+        name: 'Spring pricing',
+        note: 'New plan names',
+        editor,
+      });
+      const id = Number(page.dom.window.sessionStorage.getItem(slot('staging')));
+      expect(id).toBeGreaterThan(0);
+      await page.act('key:lab_headline');
+      await page.type('text:lab_headline', 'Spring headline');
+      await page.act('key:lab_link');
+      await page.type('text:lab_link', 'Spring link');
+      await page.change('group', 'page:pricing');
+      await page.act('key:lab_button');
+      await page.type('text:lab_button', 'Buy the spring plan');
+      await page.act('save');
+      expect(draftPosts(page, lab).map((b) => b['change'])).toEqual([id, id, id]);
+      expect(docOf(page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · staging · 3 keys · home, pricing');
+      expect(barLines(page)).toEqual([
+        'lab_headline  Copy that ships → Spring headline',
+        'lab_link  Read the docs → Spring link',
+        'lab_button  Buy → Buy the spring plan',
+        'Note: New plan names',
+      ]);
+      expect(docOf(page).getElementById('alone')?.textContent).toBe('Publishing lab_button alone takes it out of Spring pricing.');
+      await page.act('publishChange');
+      const live = (await staging.read()) as Array<{ key: string; value: unknown }>;
+      expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({
+        lab_button: 'Buy the spring plan',
+        lab_headline: 'Spring headline',
+        lab_link: 'Spring link',
+      });
+      expect(page.dom.window.sessionStorage.getItem(slot('staging'))).toBeNull();
+      expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.']);
+      page.dom.window.close();
+
+      // Add an agent's draft: the confirm names the agent; Take over makes it a member and the dashboard's, Cancel leaves it loose.
+      for (const answer of ['takeOver', 'keepTheirs'] as const) {
+        const again = labProject();
+        const store = again.stores['default'] as Mem;
+        const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+        await store.saveDraft({ key: 'lab_headline', value: 'Spring headline', target: 'web', editor: 'dashboard:neil', change: opened.changeId });
+        await store.saveDraft({ key: 'lab_link', value: 'Agent link', target: 'web', editor: 'agent:claude' });
+        const since = (await draftRows(store, 'lab_link'))[0]?.createdAt as string;
+        const member = await labPage(again, { session: { [`stet.change ${again.id} default`]: String(opened.changeId) } });
+        expect(barText(member.page)).toContain('1 saved draft(s) is not in this change.');
+        await member.page.act('addToChange');
+        expect(confirmText(member.page)).toBe(
+          `agent:claude has a draft of lab_link from ${clockOf(since)}. Add it to Spring pricing? The draft becomes yours.`,
+        );
+        expect([...docOf(member.page).querySelectorAll('#takeover button')].map((b) => b.textContent)).toEqual(['Take over', 'Cancel']);
+        await member.page.act(answer);
+        const row = (await draftRows(store, 'lab_link'))[0];
+        if (answer === 'takeOver') {
+          expect(row).toMatchObject({ editor: await editorOf(again), changesetId: opened.changeId });
+          expect(barLines(member.page)).toContain('lab_link  Read the docs → Agent link');
+        } else {
+          expect(row).toMatchObject({ editor: 'agent:claude', changesetId: null });
+        }
+        member.page.dom.window.close();
+      }
+
+      // A reload keeps the open change; after it was published elsewhere the bar says it is closed and Save carries no change.
+      const reload = labProject();
+      const store = reload.stores['default'] as Mem;
+      const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+      await store.saveDraft({ key: 'lab_headline', value: 'Spring headline', target: 'web', editor: 'dashboard:neil', change: opened.changeId });
+      const key = `stet.change ${reload.id} default`;
+      const first = await labPage(reload, { session: { [key]: String(opened.changeId) } });
+      expect(docOf(first.page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · default · 1 key · home');
+      await first.page.act('key:lab_link');
+      await first.page.type('text:lab_link', 'Spring link');
+      await first.page.act('save');
+      expect(draftPosts(first.page, reload).at(-1)).toMatchObject({ key: 'lab_link', change: opened.changeId });
+      const session = { [key]: first.page.dom.window.sessionStorage.getItem(key) as string };
+      first.page.dom.window.close();
+      await store.changesets.publishChange({ changeId: opened.changeId, editor: 'sam' });
+      const second = await labPage(reload, { session });
+      expect(barLines(second.page)).toEqual([
+        'Spring pricing is closed. Edits now save on their own, outside any change.',
+        'No open change. Edits save and publish key by key.',
+      ]);
+      await second.page.act('key:lab_note');
+      await second.page.type('text:lab_note', 'Fine print');
+      await second.page.act('save');
+      expect(draftPosts(second.page, reload).at(-1)).toEqual({ editor: await editorOf(reload), key: 'lab_note', locale: 'default', value: 'Fine print' });
+      second.page.dom.window.close();
+
+      // Discard a change of three drafts: the confirm names them, the change and its drafts go, the keys keep their live values.
+      const discard = labProject();
+      const dstore = discard.stores['default'] as Mem;
+      dstore.seed([{ key: 'lab_headline', value: 'Live headline' }]);
+      const open = (await dstore.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+      for (const [k, v] of [['lab_headline', 'A'], ['lab_link', 'B'], ['lab_note', 'C']] as const) {
+        await dstore.saveDraft({ key: k, value: v, target: 'web', editor: 'dashboard:neil', change: open.changeId });
+      }
+      const gone = await labPage(discard, { session: { [`stet.change ${discard.id} default`]: String(open.changeId) } });
+      await gone.page.act('discardAsk');
+      expect(docOf(gone.page).querySelector('#changebar .term')?.textContent).toBe(
+        'Discard Spring pricing? Its 3 drafts are dropped. Nothing was published, so the keys keep their live values.',
+      );
+      await gone.page.act('discardChange');
+      expect(await dstore.changesets.list({ status: 'open' })).toEqual({ changes: [], nextBeforeId: null });
+      expect((await dstore.read({ preview: true })) as StoreRow[]).toEqual([expect.objectContaining({ key: 'lab_headline', value: 'Live headline', status: 'published' })]);
+      gone.page.dom.window.close();
+    }));
+
+  it('Requirement: A published change is undone after a before/current preview', () =>
+    underToken(async () => {
+      const lab = labProject();
+      const store = lab.stores['default'] as Mem;
+      const editor = await editorOf(lab);
+      store.seed([
+        { key: 'lab_headline', value: 'Old headline' },
+        { key: 'lab_button', value: 'Old button' },
+        { key: 'lab_link', value: 'Old link' },
+      ]);
+      const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+      for (const [key, value] of [['lab_headline', 'New headline'], ['lab_button', 'New button'], ['lab_link', 'New link'], ['lab_alt', 'First alt']]) {
+        await store.saveDraft({ key: key as string, value: value as string, target: 'web', editor, change: opened.changeId });
+      }
+      await store.changesets.publishChange({ changeId: opened.changeId, editor });
+      // `lab_link` is published again since, by someone else.
+      await store.saveDraft({ key: 'lab_link', value: 'Newer link', target: 'web', editor: 'sam' });
+      await store.publish({ key: 'lab_link', editor: 'sam' });
+
+      const { page, agent } = await labPage(lab, { framed: true });
+      // The agent in the page is the real one: the dashboard's layers reach it.
+      const framed = await frame('<h1>New headline</h1><button>New button</button><p id="link">Newer link</p><img alt="First alt">');
+      const toFrame = async (): Promise<void> => {
+        framed.send(JSON.parse(JSON.stringify(agent.sent('layer').at(-1))));
+        await tick();
+      };
+      await page.act('tab:Recent');
+      await page.act('recentLoad');
+      const row = [...docOf(page).querySelectorAll('#main tbody tr')].find((tr) => tr.textContent?.includes('lab_headline'));
+      expect(row?.textContent).toContain('New headline · Spring pricing');
+      await page.act(`previewChange:${opened.changeId}`);
+      expect(page.requested(`/s/${lab.id}/api/stet/changes?id=${opened.changeId}`)).toHaveLength(1);
+      const strip = docOf(page).getElementById('paneshow') as HTMLElement;
+      expect(strip.querySelector('b')?.textContent).toBe('Previewing the change Spring pricing');
+      expect([...strip.querySelectorAll('[data-act^="spanPage:"]')].map((b) => b.textContent)).toEqual(['home', 'pricing']);
+      await wait(50);
+      await toFrame();
+      // Before: each member's before value in the page where it shows the live words.
+      expect(framed.doc.querySelector('h1')?.textContent).toBe('Old headline');
+      expect(framed.doc.querySelector('button')?.textContent).toBe('Old button');
+      expect(framed.doc.getElementById('link')?.textContent).toBe('Old link');
+
+      // Revert change…: the question, then `revert-change`, naming each member it skipped.
+      await page.act('revertAsk');
+      expect(strip.querySelector('.term')?.textContent).toBe(
+        'Revert Spring pricing? Restores 4 keys on home, pricing to the before values shown here, written forward as a new publish. Drafts are left alone, and a key published again since is skipped and named.',
+      );
+      await page.act('revertChange');
+      expect(page.sent.find((r) => r.path.startsWith(`/s/${lab.id}/api/stet/revert-change`))?.body).toEqual({ change: opened.changeId, editor });
+      expect([...strip.querySelectorAll('.skip')].map((el) => el.textContent)).toEqual([
+        'lab_link was published again since — kept as it is',
+        'lab_alt had no earlier published value — left as it is',
+      ]);
+      const live = (await store.read()) as Array<{ key: string; value: unknown }>;
+      expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({
+        lab_headline: 'Old headline',
+        lab_button: 'Old button',
+        lab_link: 'Newer link',
+        lab_alt: 'First alt',
+      });
+      page.dom.window.close();
+    }));
+
+  it('Requirement: Each key shows its history and restores one value', () =>
+    underToken(async () => {
+      // A store key's restore: `v<id> · <date> <time>` rows, Preview change on a change's row, and Restore touches no other member.
+      const lab = labProject();
+      const store = lab.stores['default'] as Mem;
+      const editor = await editorOf(lab);
+      store.seed([{ key: 'lab_button', value: 'Buy' }, { key: 'lab_link', value: 'Read the docs' }]);
+      const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+      await store.saveDraft({ key: 'lab_button', value: 'Buy now', target: 'web', editor: 'agent:claude', change: opened.changeId });
+      await store.saveDraft({ key: 'lab_link', value: 'Read now', target: 'web', editor: 'agent:claude', change: opened.changeId });
+      const minted = (await store.changesets.publishChange({ changeId: opened.changeId, editor })) as { published: Array<{ key: string; versionId: number }> };
+      const v = minted.published.find((m) => m.key === 'lab_button')?.versionId as number;
+      for (const [key, value] of [['lab_button', 'Buy today'], ['lab_link', 'Read later']]) {
+        await store.saveDraft({ key: key as string, value: value as string, target: 'web', editor: 'sam' });
+        await store.publish({ key: key as string, editor: 'sam' });
+      }
+      const at = ((await store.history({ key: 'lab_button' })) as { rows: Array<{ id: number; publishedAt: string }> }).rows.find((r) => r.id === v)?.publishedAt as string;
+      const { page } = await labPage(lab, { framed: true });
+      await page.change('group', 'page:pricing');
+      await page.act('key:lab_button');
+      const lines = [...docOf(page).querySelectorAll('#keyhistory .hline')].map((el) => el.textContent);
+      const d = new Date(at);
+      const when = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${clockOf(at)}`;
+      expect(lines).toContain(`v${v} · ${when} · Buy now · agent:claude · Spring pricing`);
+      expect(lines[0]).toMatch(/^v\d+ · .* · Buy today · sam$/);
+      expect(docOf(page).querySelector(`#keyhistory [data-act="previewChange:${opened.changeId}"]`)?.textContent).toBe('Preview change');
+      await page.act(`historyRestore:${v}`);
+      expect(page.sent.find((r) => r.path.startsWith(`/s/${lab.id}/api/stet/revert`))?.body).toEqual({ key: 'lab_button', versionId: v, editor });
+      const live = (await store.read()) as Array<{ key: string; value: unknown; version?: number }>;
+      expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({ lab_button: 'Buy now', lab_link: 'Read later' });
+      expect((live.find((r) => r.key === 'lab_button')?.version as number) > v).toBe(true);
+      page.dom.window.close();
+
+      // A snapshot key's past values: 1,001 commits, the newest 1,000 values listed newest first with commit, date and author, and Restore loads one as an unsaved edit.
+      const site = snapshotSite();
+      const base = JSON.parse(site.file('content/defaults.json')) as { default: Record<string, unknown> };
+      const branch = git(site.cwd, 'rev-parse', '--abbrev-ref', 'HEAD');
+      let stream = '';
+      for (let i = 1; i <= 1001; i += 1) {
+        const text = `${JSON.stringify({ ...base, default: { ...base.default, lab_stand_in: undefined, hero_headline: `Headline ${i}` } }, null, 2)}\n`;
+        const message = `edit ${i}`;
+        stream +=
+          `commit refs/heads/${branch}\ncommitter Ada <ada@test> ${1_700_000_000 + i * 3600} +0000\ndata ${message.length}\n${message}\n` +
+          `${i === 1 ? `from refs/heads/${branch}^0\n` : ''}M 100644 inline content/defaults.json\ndata ${Buffer.byteLength(text, 'utf8')}\n${text}\n`;
+      }
+      execFileSync('git', ['fast-import', '--quiet'], { cwd: site.cwd, input: stream });
+      git(site.cwd, 'reset', '-q', '--hard');
+      const { handler: snapHandler } = handlerOver([site.cwd], { page: dashboardPage() });
+      const started = Date.now();
+      const history = (await call(snapHandler, `/api/site/key-history${siteOf(site.cwd)}&key=hero_headline&locale=default`)).body as {
+        versions: Array<{ n: number; short: string; author: string; value: unknown }>;
+      };
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(history.versions).toHaveLength(1000);
+      expect(history.versions.slice(0, 3).map((v) => [v.value, v.author])).toEqual([['Headline 1001', 'Ada'], ['Headline 1000', 'Ada'], ['Headline 999', 'Ada']]);
+      expect(history.versions[0]?.short).toMatch(/^[0-9a-f]{7,}$/);
+      const html = await (await snapHandler(req('/', { token: null }))).text();
+      const snapPage = await paintPage({
+        html,
+        token: TOKEN,
+        serve: async (path, body) => {
+          const res = await snapHandler(req(path, body === undefined ? {} : { method: 'POST', body }));
+          return { status: res.status, body: await res.json() };
+        },
+      });
+      await snapPage.act('key:hero_headline');
+      const rowsOf = [...docOf(snapPage).querySelectorAll('#keyhistory .hline')].map((line) => line.textContent ?? '');
+      expect(rowsOf).toHaveLength(1000);
+      expect(rowsOf[0]).toMatch(/^v1000 · [0-9a-f]{7,} · \d{4}-\d{2}-\d{2} \d{2}:\d{2} · Ada · Headline 1001$/);
+      await snapPage.act('gitRestore:998');
+      expect(fieldOf(snapPage, 'hero_headline').value).toBe('Headline 999');
+      expect((docOf(snapPage).querySelector('[data-act="save"]') as HTMLButtonElement).disabled).toBe(false);
+      snapPage.dom.window.close();
+    }));
+
+  // The snapshot-site page: the real dashboard in jsdom over the real dev handler, a committed checkout behind it.
+  /** A checkout as the dashboard's tests keep one: the mini project, committed, its words moved by `edit`. */
+  const snapshotSite = (edit: (host: CliHost) => void = () => {}): CliHost => {
+    const host = makeCliHost({ config: { project: 't' } });
+    edit(host);
+    committed(host.cwd);
+    return host;
+  };
+  const git = (cwd: string, ...args: string[]): string => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  /** The checkout's snapshot with `values` of the default locale written behind the page's back, as an agent would. */
+  const diskWrites = (cwd: string, values: Record<string, unknown>): void => {
+    const file = join(cwd, 'content/defaults.json');
+    const snap = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    Object.assign(snap.default, values);
+    writeFileSync(file, `${JSON.stringify(snap, null, 2)}\n`);
+  };
+  const withPage = async (page: PaintedPage, run: () => Promise<void>): Promise<void> => {
+    try {
+      await run();
+    } finally {
+      page.dom.window.close();
+    }
+  };
+  const evalIn = (page: PaintedPage, code: string): unknown => (page.dom.window as unknown as { eval: (code: string) => unknown }).eval(code);
+
+  it('Requirement: A snapshot save refuses a key changed on disk since the page loaded', async () => {
+    const host = snapshotSite();
+    const page = await served(host.cwd);
+    await withPage(page, async () => {
+      const original = String((JSON.parse(host.file('content/defaults.json')) as { default: Record<string, unknown> }).default['hero_headline']);
+      await page.act('key:hero_headline');
+      // An agent writes lab_link-like keys on disk after the page loaded: here hero_headline and pricing_price.
+      diskWrites(host.cwd, { hero_headline: 'The agent’s headline', pricing_price: '$18' });
+      const before = host.file('content/defaults.json');
+      await page.type('text:hero_headline', 'The editor’s headline');
+      await page.act('save');
+      const saves = (): unknown[] => page.sent.filter((r) => r.path.startsWith('/api/site/save')).map((r) => r.body);
+      expect(saves().at(-1)).toEqual({ values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline', base: original }] });
+      const asks = (): string[] => [...docOf(page).querySelectorAll('.term')].map((el) => el.textContent ?? '');
+      expect(asks()).toContain('hero_headline changed on disk since you opened it: "The agent’s headline"');
+      // Nothing is written, not even the key the agent did not touch.
+      expect(host.file('content/defaults.json')).toBe(before);
+
+      // Save mine over it writes the editor's value.
+      await page.act('saveMine:0');
+      expect(JSON.parse(host.file('content/defaults.json')).default.hero_headline).toBe('The editor’s headline');
+      expect(asks().filter((line) => line.includes('changed on disk'))).toEqual([]);
+
+      // Use theirs drops the draft and shows the disk's words.
+      diskWrites(host.cwd, { hero_headline: 'The agent again' });
+      await page.type('text:hero_headline', 'A second try');
+      await page.act('save');
+      await page.act('useTheirs:0');
+      expect(fieldOf(page, 'hero_headline').value).toBe('The agent again');
+      expect((docOf(page).querySelector('[data-act="save"]') as HTMLButtonElement).disabled).toBe(true);
+
+      // A key whose disk value is unchanged is never blocked by another key's change.
+      diskWrites(host.cwd, { pricing_price: '$19' });
+      await page.act('key:hero_body');
+      await page.type('text:hero_body', 'Follow {{handle}} on Telegram.');
+      await page.act('save');
+      expect(JSON.parse(host.file('content/defaults.json')).default.hero_body).toBe('Follow {{handle}} on Telegram.');
+      expect(JSON.parse(host.file('content/defaults.json')).default.pricing_price).toBe('$19');
+    });
+  });
+
+  it('Requirement: The commit panel says what the commit carries', async () => {
+    const host = snapshotSite();
+    const page = await served(host.cwd);
+    await withPage(page, async () => {
+      // `hero_headline` and `hero_body` differ from HEAD once saved.
+      for (const [key, value] of [['hero_headline', 'Talk to us today'], ['hero_body', 'Follow {{handle}} on Telegram.']] as const) {
+        await page.act(`key:${key}`);
+        await page.type(`text:${key}`, value);
+      }
+      await page.act('save');
+      await page.act('commit');
+      const doc = docOf(page);
+      expect(doc.querySelector('#ask h3')?.textContent).toMatch(/^What this commit carries · 2 keys · \d+ files?$/);
+      const terms = [...doc.querySelectorAll('#ask .term')].map((el) => el.textContent ?? '');
+      expect(terms).toHaveLength(2);
+      expect(terms.some((t) => t.includes('[+') && t.includes('Talk to'))).toBe(true);
+      const putBacks = [...doc.querySelectorAll('#ask [data-act^="putBack:"]')].map((el) => el.getAttribute('data-act'));
+      expect(putBacks).toEqual(['putBack:0', 'putBack:1']);
+
+      // Put one key back: HEAD's value saved through the gate, with the panel's `now` as its base.
+      const headBody = String((JSON.parse(git(host.cwd, 'show', 'HEAD:content/defaults.json')) as { default: Record<string, unknown> }).default['hero_body']);
+      const index = terms.findIndex((term) => term.includes('Telegram'));
+      expect(index).toBeGreaterThanOrEqual(0);
+      await page.act(`putBack:${index}`);
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+        values: [expect.objectContaining({ key: 'hero_body', locale: 'default', value: headBody, base: 'Follow {{handle}} on Telegram.' })],
+      });
+      expect(JSON.parse(host.file('content/defaults.json')).default.hero_body).toBe(headBody);
+      expect(doc.querySelector('#ask h3')?.textContent).toMatch(/^What this commit carries · 1 key · \d+ files?$/);
+      expect([...doc.querySelectorAll('#ask .term')].map((el) => el.textContent ?? '')).toHaveLength(1);
+
+      // A disk change since the panel loaded: the refusal names the key and the panel stays.
+      diskWrites(host.cwd, { hero_headline: 'Talk to the team' });
+      await page.act('putBack:0');
+      expect(doc.querySelector('#ask .err')?.textContent).toBe('hero_headline changed on disk since you opened it: "Talk to the team"');
+    });
+  });
+
+  it('Requirement: Unsaved edits are listed, undone and guarded', async () => {
+    const other = snapshotSite();
+    const host = snapshotSite();
+    const { handler } = handlerOver([host.cwd, other.cwd], { page: dashboardPage() });
+    const html = await (await handler(req('/', { token: null }))).text();
+    const page = await paintPage({
+      html,
+      token: TOKEN,
+      serve: async (path, body) => {
+        const res = await handler(req(path, body === undefined ? {} : { method: 'POST', body }));
+        return { status: res.status, body: await res.json() };
+      },
+    });
+    await withPage(page, async () => {
+      const header = (): string => {
+        const el = docOf(page).getElementById('dc') as HTMLElement;
+        return el.hidden ? '' : el.textContent ?? '';
+      };
+      const stored = (key: string): unknown => evalIn(page, `storedValue(${JSON.stringify(key)}, S.locale)`);
+      // Three unsaved edits.
+      for (const [key, value] of [['hero_headline', 'Changed headline'], ['hero_body', 'Changed body'], ['brand__name', 'Changed name']] as const) {
+        await page.act(`key:${key}`);
+        await page.type(`text:${key}`, value);
+      }
+      expect(header()).toBe('3 unsaved edits');
+      // The header count opens the list: each key with Undo and Show, and Discard all.
+      await page.act('unsaved');
+      expect([...docOf(page).querySelectorAll('#ask [data-act^="undoEdit:"]')].map((el) => (el.getAttribute('data-act') ?? '').split(':')[1])).toEqual([
+        'default hero_headline',
+        'default hero_body',
+        'default brand__name',
+      ]);
+      expect(docOf(page).querySelectorAll('#ask [data-act^="showEdit:"]')).toHaveLength(3);
+      expect(docOf(page).querySelector('#ask [data-act="discardAll"]')?.textContent).toBe('Discard all');
+      // Undo one of three: back to its stored value, and the header reads 2 unsaved edits.
+      await page.act('undoEdit:default brand__name');
+      expect(header()).toBe('2 unsaved edits');
+      expect(evalIn(page, 'valueOf("brand__name")')).toBe(stored('brand__name'));
+      // A project switch with unsaved edits asks; Cancel keeps the project and its edits.
+      const before = page.requested('/api/site?').length;
+      await page.act(`site:${realpathSync(other.cwd)}`);
+      expect((docOf(page).getElementById('ask') as HTMLElement).textContent).toContain('2 unsaved edits will be lost. Leave anyway?');
+      expect(page.requested('/api/site?')).toHaveLength(before);
+      await page.act('leaveStay');
+      expect(evalIn(page, 'S.path')).toBe(realpathSync(host.cwd));
+      expect(header()).toBe('2 unsaved edits');
+      // A reload or tab close raises the browser's own prompt while edits stand.
+      const unload = new page.dom.window.Event('beforeunload', { cancelable: true });
+      page.dom.window.dispatchEvent(unload);
+      expect(unload.defaultPrevented).toBe(true);
+      // Discard all clears them, and the prompt goes with them.
+      if (docOf(page).querySelector('#ask [data-act="discardAll"]') === null) await page.act('unsaved');
+      await page.act('discardAll');
+      expect(header()).toBe('');
+      const clean = new page.dom.window.Event('beforeunload', { cancelable: true });
+      page.dom.window.dispatchEvent(clean);
+      expect(clean.defaultPrevented).toBe(false);
+    });
+  });
+
+  it('Requirement: The counter warns while typing', async () => {
+    const { page, agent } = await bridged({ site: labSite() });
+    const popover = (): HTMLElement => byId(page, 'popover');
+    const poptext = (): HTMLTextAreaElement => byId(page, 'poptext') as HTMLTextAreaElement;
+    const count = (id = 'popcount'): [string, string] => [byId(page, id).textContent ?? '', byId(page, id).className];
+    // A 40-character advisory key: grey at 32 and 35, amber at 36, red past the limit saying what Save does.
+    await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+    await typeInto(page, poptext(), 'x'.repeat(32));
+    expect(count()).toEqual(['32 / 40', 'cnt']);
+    await typeInto(page, poptext(), 'x'.repeat(35));
+    expect(count()).toEqual(['35 / 40', 'cnt']);
+    await typeInto(page, poptext(), 'x'.repeat(36));
+    expect(count()).toEqual(['36 / 40', 'cnt amb']);
+    await typeInto(page, poptext(), 'x'.repeat(40));
+    expect(count()).toEqual(['40 / 40', 'cnt amb']);
+    await typeInto(page, poptext(), 'x'.repeat(41));
+    expect(count()).toEqual(['41 / 40 · Save asks first', 'cnt bad']);
+    await pressKey(page, poptext(), 'Enter');
+    expect(popover().hidden).toBe(true);
+    // A list entry counts against the per-entry limit, and a hard limit says Save refuses.
+    await agent.pick([{ key: 'hero_bullets', entry: 2, by: 'contained', inplace: false }], { again: true, tag: 'li' });
+    expect(byId(page, 'popkey').textContent).toBe('hero_bullets[2]');
+    expect(count()).toEqual(['5 / 40', 'cnt']);
+    await typeInto(page, poptext(), 'y'.repeat(41));
+    expect(count()).toEqual(['41 / 40 · Save refuses this', 'cnt bad']);
+    await pressKey(page, poptext(), 'Enter');
+    // Typing in place: the counter sits by the element.
+    await agent.pick([{ key: 'hero_headline' }], { again: true });
+    await agent.typed('hero_headline', 'x'.repeat(54));
+    expect(byId(page, 'counter').hidden).toBe(false);
+    expect(count('counter')).toEqual(['54 / 60', 'cnt amb']);
+    await agent.edited('hero_headline', 'keep');
+    expect(byId(page, 'counter').hidden).toBe(true);
+    page.dom.window.close();
+  });
+
+  it('Requirement: Page info lists the copy the page shows nowhere visible', async () => {
+    const { page, agent } = await bridged({
+      site: siteBody({
+        descriptor: {
+          version: 1,
+          keys: {
+            seo_home_title: { shape: 'text', target: 'web', pages: ['home'] },
+            seo_home_description: { shape: 'text', target: 'web', pages: ['home'] },
+          },
+          pages: { home: { route: '/', seo: { title: 'seo_home_title', description: 'seo_home_description' } } },
+        },
+        snapshot: { default: { seo_home_title: 'Ship copy without a deploy', seo_home_description: 'Edit the words on your site from one place.' } },
+      }),
+    });
+    await agent.census({
+      found: { seo_home_title: 1, seo_home_description: 1 },
+      head: [{ key: 'seo_home_title', where: 'title' }, { key: 'seo_home_description', where: 'description' }],
+    });
+    await page.act('pageInfo');
+    const info = byId(page, 'paneinfo');
+    expect(info.hidden).toBe(false);
+    expect([...info.querySelectorAll('.hl')].map((line) => line.textContent)).toEqual([
+      'page title · seo_home_title',
+      'meta description · seo_home_description',
+    ]);
+    expect([...info.querySelectorAll('.serp > div')].map((part) => part.textContent)).toEqual([
+      'Search result',
+      '/',
+      'Ship copy without a deploy',
+      'Edit the words on your site from one place.',
+    ]);
+    await page.act('pageInfo');
+    expect(info.hidden).toBe(true);
+    page.dom.window.close();
+  });
+
+  it("Requirement: The environment line says where the preview's words come from", () =>
+    underToken(async () => {
+      const lab = labProject();
+      // The lab's store site reads the snapshot: its read path names `content/defaults.json`.
+      mkdirSync(join(lab.host.cwd, 'lib'), { recursive: true });
+      writeFileSync(join(lab.host.cwd, 'lib/content.ts'), "import { join } from 'node:path';\nexport const READ_FROM = join(process.cwd(), 'content/defaults.json');\n");
+      const config = JSON.parse(lab.host.file('stet.config.json')) as Record<string, unknown>;
+      writeFileSync(join(lab.host.cwd, 'stet.config.json'), JSON.stringify({ ...config, readPath: { file: 'lib/content.ts', import: '@/lib/content' } }));
+      const line = (page: PaintedPage): string => {
+        const el = docOf(page).getElementById('paneenv') as HTMLElement | null;
+        return el === null || el.hidden ? '' : el.textContent ?? '';
+      };
+      const { page } = await labPage(lab, { framed: true });
+      const SNAPSHOT_LINE =
+        'The preview shows content/defaults.json as this project holds it. Store drafts and publishes appear only as the dashboard layers them.';
+      await page.act('cycleEnv');
+      expect(docOf(page).querySelector('.envchip')?.textContent).toContain('staging');
+      expect(line(page)).toBe(SNAPSHOT_LINE);
+      page.dom.window.close();
+      // The reply names where the words come from and carries no connection value.
+      const reply = await (await lab.handler(req(`/api/site?site=${encodeURIComponent(realpathSync(lab.host.cwd))}`))).text();
+      expect(JSON.parse(reply).previewReads).toEqual({ snapshot: 'content/defaults.json' });
+
+      // Where the read path holds no snapshot path, the line follows the environments whose connection is the dev server's own.
+      writeFileSync(join(lab.host.cwd, 'lib/content.ts'), "export const READ_FROM = 'somewhere/else.json';\n");
+      const pg = (urlEnv: string): Record<string, unknown> => ({ adapter: 'pg', urlEnv });
+      writeFileSync(
+        join(lab.host.cwd, 'stet.config.json'),
+        JSON.stringify({ ...config, store: pg('LAB_DB'), environments: { staging: pg('LAB_STAGING_DB') }, readPath: { file: 'lib/content.ts', import: '@/lib/content' } }),
+      );
+      for (const [staging, expected] of [
+        ['postgres://lab/one', ['The preview reads the default store, the one this tab edits.', 'The preview reads the staging store, the one this tab edits.']],
+        ['postgres://lab/two', ['The preview reads the default store, the one this tab edits.', "The preview reads the dev server's own store, not staging."]],
+      ] as const) {
+        writeFileSync(join(lab.host.cwd, '.env'), `LAB_DB=postgres://lab/one\nLAB_STAGING_DB=${staging}\n`);
+        const stores = await labPage(lab, { framed: true });
+        expect(line(stores.page)).toBe(expected[0]);
+        await stores.page.act('cycleEnv');
+        expect(line(stores.page)).toBe(expected[1]);
+        stores.page.dom.window.close();
+      }
+    }));
+
+  it('Requirement: Editing works at 360 px', async () => {
+    const phone = (window: PaintedPage['dom']['window']): void => {
+      Object.defineProperty(window, 'innerWidth', { value: 360, configurable: true });
+    };
+    const rules = (page: PaintedPage): string =>
+      [...docOf(page).querySelectorAll('style')].map((el) => el.textContent ?? '').join('\n').replace(/\s+/g, ' ');
+    /** The declarations of every rule inside an `@media(max-width:760px)` block that names `selector`. */
+    const phoneRule = (css: string, selector: string): string[] => {
+      const out: string[] = [];
+      const opener = '@media(max-width:760px){';
+      for (let at = css.indexOf(opener); at !== -1; at = css.indexOf(opener, at + 1)) {
+        let depth = 1;
+        let end = at + opener.length;
+        for (; end < css.length && depth > 0; end += 1) depth += css[end] === '{' ? 1 : css[end] === '}' ? -1 : 0;
+        for (const rule of css.slice(at + opener.length, end - 1).matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+          if ((rule[1] ?? '').split(',').map((part) => part.trim()).includes(selector)) out.push((rule[2] ?? '').trim());
+        }
+      }
+      return out;
+    };
+    // jsdom lays nothing out: this walks the structure and the rules a browser at 360 px reads, and the tap behaviour.
+    const scrolled: string[] = [];
+    const { page, agent } = await bridged({
+      site: labSite(),
+      prepare: (window) => {
+        phone(window);
+        (window.HTMLElement.prototype as unknown as { scrollIntoView: (arg: unknown) => void }).scrollIntoView = function (this: HTMLElement, arg: unknown) {
+          scrolled.push((this.getAttribute('data-act-input') ?? '') + ' ' + JSON.stringify(arg));
+        };
+      },
+    });
+    await agent.pick([{ key: 'lab_button' }]);
+    // The tap selects, scrolls the field into view with the tapped element kept on screen, and opens no popover.
+    expect(scrolled).toContain('text:lab_button {"block":"nearest"}');
+    expect(evalIn(page, 'S.popover')).toBeNull();
+    // A second tap on the selected key opens the column's field, not the popover.
+    await agent.pick([{ key: 'lab_button' }], { again: true });
+    expect(evalIn(page, 'S.popover')).toBeNull();
+    expect(evalIn(page, 'S.edit')).toBeNull();
+    // The editor sits directly under the preview, the key list after it, every card of the column one column wide.
+    const main = docOf(page).getElementById('main') as HTMLElement;
+    expect([...main.children].map((el) => el.className.split(' ')[0])).toEqual(['card', 'edcol']);
+    const css = rules(page);
+    expect(phoneRule(css, '#main').join(';')).toMatch(/display:flex/);
+    expect(phoneRule(css, '#main').join(';')).toMatch(/flex-direction:column/);
+    expect(phoneRule(css, '.edcol').join(';')).toMatch(/order:-1/);
+    expect(phoneRule(css, '#main>*').join(';')).toMatch(/min-width:0/);
+    expect(phoneRule(css, '.edcol>*').join(';')).toMatch(/min-width:0/);
+    expect(phoneRule(css, '.devwrap').join(';')).toMatch(/height:min\(\d+px,calc\(100vh - \d+px\)\)/);
+    expect(css).toContain('@media(max-width:760px){.cards{grid-template-columns:1fr}}');
+    // Typing happens in the field.
+    await page.type('text:lab_button', 'Begin');
+    expect(stateOf(page).draft).toEqual({ 'default lab_button': 'Begin' });
+    page.dom.window.close();
+  });
+
+  it('Requirement: 760 px is phone width: the in-pane field at 760, the popover from 761', async () => {
+    // The stylesheet's phone rules end at `max-width:760px`; the tap follows the same line.
+    for (const [width, opens] of [[760, false], [761, true]] as const) {
+      const { page, agent } = await bridged({
+        site: labSite(),
+        prepare: (window) => Object.defineProperty(window, 'innerWidth', { value: width, configurable: true }),
+      });
+      await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+      expect(evalIn(page, 'S.popover') !== null, `popover at ${width}`).toBe(opens);
+      page.dom.window.close();
+    }
+  });
+
+  it('Requirement: The workspace is a file of local checkout paths', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'stet-walk-ws-')));
+    const project = (rel: string, config: Record<string, unknown>): string => {
+      const dir = join(root, rel);
+      mkdirSync(join(dir, 'content'), { recursive: true });
+      writeFileSync(join(dir, 'stet.config.json'), JSON.stringify(config));
+      writeFileSync(join(dir, 'content/descriptor.json'), JSON.stringify({ version: 1, keys: {} }));
+      writeFileSync(join(dir, 'content/defaults.json'), JSON.stringify({ default: {} }));
+      return dir;
+    };
+    const file = join(root, 'ws', 'projects.json');
+
+    // Add, list and remove: an adopted checkout by its folder name with its mode, key count, host, router and project id;
+    // one with no config as not adopted; one whose config fails to load with the loader's message. Adding twice keeps one.
+    const first = project('a/stet-website-v1/site', { project: 'default', router: 'astro' });
+    const bare = join(root, 'a/blank');
+    mkdirSync(bare, { recursive: true });
+    const bent = join(root, 'a/bent');
+    mkdirSync(bent, { recursive: true });
+    writeFileSync(join(bent, 'stet.config.json'), JSON.stringify({ project: 't', host: 'static' }));
+    const { handler } = handlerOver([], { workspaceFile: file });
+    const post = async (path: string, body: unknown): Promise<Response> => handler(req(path, { method: 'POST', body }));
+    for (const path of [first, bare, bent, first]) expect((await post('/api/workspace/add', { path })).status).toBe(200);
+    const listing = async (): Promise<Array<Record<string, unknown>>> =>
+      ((await (await handler(req('/api/workspace'))).json()) as { sites: Array<Record<string, unknown>> }).sites;
+    expect(readWorkspace(file).sites.map((site) => site.path)).toEqual([first, bare, bent]);
+    const rows = await listing();
+    expect(rows[0]).toMatchObject({ state: 'ready', name: 'site', mode: 'snapshot', host: 'js', router: 'astro', project: 'default', keys: 0 });
+    expect(rows[0]?.['id']).toBe(siteId(first));
+    expect(rows[1]).toMatchObject({ state: 'not-adopted', name: 'blank' });
+    expect(rows[2]).toMatchObject({ state: 'broken', name: 'bent' });
+    expect(String(rows[2]?.['message'])).toContain('host');
+    await post('/api/workspace/remove', { path: bent });
+    expect(readWorkspace(file).sites.map((site) => site.path)).toEqual([first, bare]);
+
+    // A path outside the rules is refused with a line naming the path and the rule, and the file is unchanged.
+    const before = readFileSync(file, 'utf8');
+    const refusedLines: string[] = [];
+    for (const path of ['relative/path', join(first, 'stet.config.json'), join(root, 'nowhere')]) {
+      const res = await post('/api/workspace/add', { path });
+      expect(res.status, path).toBeGreaterThanOrEqual(400);
+      refusedLines.push(((await res.json()) as { error: string }).error);
+    }
+    expect(refusedLines[0]).toBe('relative/path: a workspace path must be absolute');
+    expect(refusedLines[1]).toBe(`${join(first, 'stet.config.json')}: not a directory`);
+    expect(refusedLines[2]).toBe(`${join(root, 'nowhere')}: not a directory`);
+    expect(readFileSync(file, 'utf8')).toBe(before);
+
+    // The file is written whole and read strictly: it parses, no temporary file remains, a hand-broken file is refused naming both remedies.
+    expect(() => JSON.parse(readFileSync(file, 'utf8'))).not.toThrow();
+    expect(existsSync(`${file}.tmp`)).toBe(false);
+    const broken = join(root, 'ws', 'broken.json');
+    writeFileSync(broken, '{ not json');
+    expect(() => readWorkspace(broken)).toThrow(/fix or delete the file/);
+    expect(() => readWorkspace(broken)).toThrow(broken);
+
+    // Identity is the real path: a symlinked path and the real path are one entry with one id, and a directory the workspace does not hold is 404.
+    const link = join(root, 'link');
+    symlinkSync(first, link, 'dir');
+    expect(addSite(file, link).added).toBe(false);
+    expect(readWorkspace(file).sites).toHaveLength(2);
+    expect((await handler(req(`/api/site?site=${encodeURIComponent(join(root, 'a'))}`))).status).toBe(404);
+
+    // Rename: the entry carries the trimmed name, the listing shows it with the folder line, the folder is untouched, and clearing removes it.
+    const renamed = await post('/api/workspace/update', { path: first, name: ' Taskboard ' });
+    expect(renamed.status).toBe(200);
+    expect(readWorkspace(file).sites[0]).toEqual({ path: first, name: 'Taskboard' });
+    expect((await listing())[0]).toMatchObject({ name: 'Taskboard', folder: 'site' });
+    expect(existsSync(first)).toBe(true);
+    await post('/api/workspace/update', { path: first, name: '' });
+    expect(readWorkspace(file).sites[0]).toEqual({ path: first });
+    expect('folder' in ((await listing())[0] as object)).toBe(false);
+
+    // The preview command is the entry's: set and cleared through `workspace/update`.
+    await post('/api/workspace/update', { path: first, previewCommand: 'node serve.mjs --port {port}' });
+    expect(readWorkspace(file).sites[0]).toEqual({ path: first, previewCommand: 'node serve.mjs --port {port}' });
+    await post('/api/workspace/update', { path: first, previewCommand: '' });
+    expect(readWorkspace(file).sites[0]).toEqual({ path: first });
+
+    // The sidebar tells two checkouts named alike apart, and names each ready row's host and store id.
+    let rowTexts: string[] = [];
+    const tellApart = async (paths: string[]): Promise<string[][]> => {
+      const { handler: sidebar } = handlerOver(paths, { page: dashboardPage() });
+      const html = await (await sidebar(req('/', { token: null }))).text();
+      const page = await paintPage({
+        html,
+        token: TOKEN,
+        serve: async (path, body) => {
+          const res = await sidebar(req(path, body === undefined ? {} : { method: 'POST', body }));
+          return { status: res.status, body: await res.json() };
+        },
+      });
+      const buttons = [...docOf(page).querySelectorAll('#projs .it')];
+      rowTexts = buttons.map((button) => button.textContent ?? '');
+      const out = buttons.map((button) => [
+        button.childNodes[0]?.textContent ?? '',
+        ...[...button.querySelectorAll('.u')].slice(1).map((line) => line.textContent ?? ''),
+      ]);
+      page.dom.window.close();
+      return out;
+    };
+    // A checkout with no config is listed as not adopted, with `stet init` named.
+    expect(await tellApart([bare])).toEqual([['blank']]);
+    expect(rowTexts[0]).toContain('not adopted — run stet init here');
+
+    expect(
+      await tellApart([
+        project('b/stet-website-v1/site', { project: 'default', router: 'astro' }),
+        project('b/stet-planning/site', { project: 'default', router: 'astro' }),
+        project('b/psyon-site', { project: 'psyon', host: 'html' }),
+      ]),
+    ).toEqual([
+      ['stet-website-v1/site', 'js host · astro'],
+      ['stet-planning/site', 'js host · astro'],
+      ['psyon-site', 'html host', 'store id psyon'],
+    ]);
+    expect(
+      (await tellApart([project('c/a/x/site', { project: 'a' }), project('c/b/x/site', { project: 'b' }), project('c/c/y/site', { project: 'c' })])).map((row) => row[0]),
+    ).toEqual(['a/x/site', 'b/x/site', 'y/site']);
+  });
+
+  it('Requirement: A removed key shows where it rendered', async () => {
+    const PAGE = 'app/(marketing)/lab/page.tsx';
+    const labPageSource = [
+      "import { copy } from '@/lib/content';",
+      '',
+      '// lab_long was the old footer line',
+      ...Array.from({ length: 13 }, () => ''),
+      'export default function Page() {',
+      '  return (',
+      '    <main>',
+      "      <p>{copy.get('lab_long')}</p>",
+      '    </main>',
+      '  );',
+      '}',
+      '',
+    ].join('\n');
+    const host = makeCliHost({ config: { project: 't', router: 'app', managedSurfaces: ['app/**/*.tsx'] } });
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, unknown> };
+    descriptor.keys['lab_long'] = { shape: 'text', target: 'web' };
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as { default: Record<string, unknown> };
+    snapshot.default['lab_long'] = 'Every change ships in one step.';
+    const write = (rel: string, text: string): void => {
+      mkdirSync(join(host.cwd, rel, '..'), { recursive: true });
+      writeFileSync(join(host.cwd, rel), text);
+    };
+    write('content/descriptor.json', JSON.stringify(descriptor, null, 2));
+    write('content/defaults.json', JSON.stringify(snapshot, null, 2));
+    write(PAGE, labPageSource);
+    committed(host.cwd);
+    // The commit that removes the key from the forms and the page.
+    delete descriptor.keys['lab_long'];
+    delete snapshot.default['lab_long'];
+    write('content/descriptor.json', JSON.stringify(descriptor, null, 2));
+    write('content/defaults.json', JSON.stringify(snapshot, null, 2));
+    write(PAGE, labPageSource.replace("      <p>{copy.get('lab_long')}</p>\n", ''));
+    git(host.cwd, 'commit', '-qam', 'lab: long copy removed');
+    const sha = git(host.cwd, 'rev-parse', 'HEAD');
+
+    // The route names each place at the commit's parent; the row on the page says where the key was shown, and Restore stands.
+    const { handler } = handlerOver([host.cwd]);
+    const removed = (await call(handler, `/api/site/removed${siteOf(host.cwd)}&sha=${sha}`)).body;
+    expect(removed['keys']).toEqual([
+      { key: 'lab_long', section: null, text: 'Every change ships in one step.', places: [{ file: PAGE, line: 20, kind: `text in ${PAGE}` }] },
+    ]);
+    const page = await served(host.cwd);
+    await page.act('history');
+    await page.act(`commitOpen:${sha}`);
+    const listed = docOf(page).querySelector('tr td[colspan="3"] .mono') as HTMLElement;
+    expect(listed.textContent).toBe(`lab_long was removed in ${sha.slice(0, 7)}. It was shown at ${PAGE}:20.`);
+    expect(docOf(page).querySelector('[data-act="restoreAsk"]')).not.toBeNull();
+    page.dom.window.close();
+  });
+
+  it('Requirement: The Templates tab renders each email with click-to-edit', async () => {
+    const host = previewHost({
+      template:
+        'export function welcome(props: Record<string, string>): string {\n' +
+        "  return '<html><head><title>' + props.welcome__subject + '</title></head><body>' +\n" +
+        "    '<h1>' + props.welcome__headline + '</h1><p>' + props.welcome__greeting + '</p>' +\n" +
+        "    '<a href=\"https://x.test/?p=' + props.welcome__preheader + '\">Open</a></body></html>';\n" +
+        '}\n',
+    });
+    committed(host.dir);
+    const { handler } = handlerOver([host.dir], { page: dashboardPage() });
+    const html = await (await handler(req('/', { token: null }))).text();
+    const page = await paintPage({
+      html,
+      token: TOKEN,
+      serve: async (path, body) => {
+        const res = await handler(req(path, body === undefined ? {} : { method: 'POST', body }));
+        return { status: res.status, body: await res.json() };
+      },
+    });
+    const frameOf = (): HTMLIFrameElement | null => docOf(page).querySelector('iframe[data-tpl-frame="welcome"]');
+    // jsdom does not load a frame's `srcdoc`: the document a browser would load is put in its body.
+    const loadFrame = (): void => {
+      const el = frameOf() as HTMLIFrameElement;
+      const parsed = new page.dom.window.DOMParser().parseFromString(el.getAttribute('srcdoc') as string, 'text/html');
+      ((el.contentDocument as Document).body as HTMLElement).innerHTML = parsed.body.innerHTML;
+      el.dispatchEvent(new page.dom.window.Event('load'));
+    };
+    const clickIn = (selector: string): void => {
+      const hit = ((frameOf() as HTMLIFrameElement).contentDocument as Document).querySelector(selector) as HTMLElement;
+      expect(hit, selector).not.toBeNull();
+      hit.dispatchEvent(new page.dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    };
+    await page.act('tab:Templates');
+    // The render runs the project's own compiler in a child process: the frame arrives with its reply.
+    for (let waited = 0; frameOf() === null && waited < 10_000; waited += 100) await wait(100);
+    loadFrame();
+    // The email rendered through the pointer, in a sandboxed frame with no scripts, the card saying what it cannot show.
+    const el = frameOf() as HTMLIFrameElement;
+    expect(el.getAttribute('sandbox')).toBe('allow-same-origin');
+    const card = docOf(page).querySelector('[data-tpl="welcome"]') as HTMLElement;
+    expect(card.textContent).toContain("Images hosted on other sites don't show in this preview.");
+    const meta = (docOf(page).querySelector('[data-tpl-meta="welcome"]') as HTMLElement).textContent as string;
+    expect(meta).toContain('Subject Welcome aboard');
+    expect(meta).toContain('welcome__subject');
+    expect(meta).toContain('Preview Your first week starts here');
+    expect(((el.contentDocument as Document).querySelectorAll('script'))).toHaveLength(0);
+    // Desktop and Mobile.
+    expect(el.style.width).toBe('640px');
+    await page.act('tplWidth:mobile');
+    expect((frameOf() as HTMLIFrameElement).style.width).toBe('375px');
+    await page.act('tplWidth:desktop');
+    loadFrame();
+
+    // Click a headline: its slot opens with the counter and what it requires, and typing renders again with the draft.
+    clickIn('[data-stet="welcome__headline"]');
+    await page.settle();
+    const field = docOf(page).querySelector('[data-tpl-field="welcome"]') as HTMLElement;
+    expect((field.querySelector('textarea') as HTMLTextAreaElement).value).toBe('Welcome to mirra');
+    expect(field.textContent).toContain('welcome__headline · 16 / 60');
+    expect(field.textContent).toContain('requires: none');
+    clickIn('[data-stet="welcome__greeting"]');
+    await page.settle();
+    expect(docOf(page).querySelector('[data-tpl-field="welcome"]')?.textContent).toContain('requires: name');
+    clickIn('[data-stet="welcome__headline"]');
+    await page.settle();
+    const rendersBefore = page.requested('/api/site/email-preview').length;
+    await page.type('text:welcome__headline', 'Welcome back');
+    await wait(700);
+    expect(page.requested('/api/site/email-preview').length).toBeGreaterThan(rendersBefore);
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/email-preview')).at(-1)?.body).toMatchObject({
+      template: 'welcome',
+      drafts: { welcome__headline: 'Welcome back' },
+    });
+    expect(frameOf()?.getAttribute('srcdoc')).toContain('Welcome back');
+
+    // A marker never lands in an attribute: the value in an `href` and in `<title>` carries no marker and no span there.
+    const direct = await call(handler, `/api/site/email-preview${siteOf(host.dir)}`, { template: 'welcome', locale: 'default', drafts: {} });
+    expect(direct.status).toBe(200);
+    const markup = String(direct.body['html']);
+    expect(markup).toContain('<title>Welcome aboard</title>');
+    expect(markup).toContain('href="https://x.test/?p=Your first week starts here"');
+    expect(markup).not.toMatch(/<title>[^<]*<span/);
+    expect(markup).not.toMatch(/href="[^"]*data-stet/);
+    expect(markup).toContain('<span data-stet="welcome__headline">Welcome to mirra</span>');
+    page.dom.window.close();
   });
 });
 
@@ -8783,5 +10920,997 @@ describe('contacts', () => {
     const members = ok(await store.contacts.members({ group: 'cloud-waitlist' })).rows;
     expect(members[0]?.joinedAt).toBe('2026-09-01T10:00:00.000Z');
     expect((await run(...args, '--write')).out).toBe('imported 0 into cloud-waitlist — 14 already members, 0 erased, 0 suppressed, 0 invalid');
+  });
+});
+
+const KEY_USAGE_FIXTURES = join(fileURLToPath(new URL('../tests/fixtures/key-usage', import.meta.url)));
+
+describe('key-usage', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true });
+  });
+  const put = (dir: string, rel: string, text: string): void => {
+    mkdirSync(join(dir, rel, '..'), { recursive: true });
+    writeFileSync(join(dir, rel), text, 'utf8');
+  };
+  /** A temp copy of one badge-review fixture, `edit` applied, then made a git repository with every file added. */
+  const fixtureRepo = (name: string, edit: (dir: string) => void = () => {}): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-walk-usage-'));
+    made.push(dir);
+    cpSync(join(KEY_USAGE_FIXTURES, name), dir, { recursive: true });
+    rmSync(join(dir, 'truth.json'));
+    edit(dir);
+    execFileSync('git', ['init', '-q'], { cwd: dir });
+    execFileSync('git', ['add', '-A'], { cwd: dir });
+    return dir;
+  };
+  const usageOf = async (dir: string): Promise<KeyUsage> => {
+    const config = loadConfig(dir);
+    return keyUsage(dir, config, JSON.parse(readFileSync(join(dir, config.descriptorPath), 'utf8')) as Descriptor);
+  };
+  const stateOf = (usage: KeyUsage, key: string): string | undefined => usage.keys[key]?.state;
+  /** Every file under `dir` with its bytes, to prove a run changed none. */
+  const treeOf = (dir: string): Record<string, string> => {
+    const out: Record<string, string> = {};
+    const walk = (at: string): void => {
+      for (const entry of readdirSync(at, { withFileTypes: true })) {
+        if (entry.name === '.git') continue;
+        const path = join(at, entry.name);
+        if (entry.isDirectory()) walk(path);
+        else out[path.slice(dir.length)] = readFileSync(path, 'utf8');
+      }
+    };
+    walk(dir);
+    return out;
+  };
+
+  it('Requirement: The unread-key scan reads every source file and judges each key', async () => {
+    // A computed key is unknown: ``copy(`tier_${id}_name`)`` is the only read of the tier keys.
+    const tiers = fixtureRepo('07-template-literal');
+    const before = treeOf(tiers);
+    const computed = await usageOf(tiers);
+    expect(computed.keys['tier_solo_name']).toEqual({ state: 'unknown', prefix: { prefix: 'tier_', file: 'lib/pricing.ts', line: 2 } });
+    expect(stateOf(computed, 'tier_team_name')).toBe('unknown');
+    expect(stateOf(computed, 'footer_note')).toBe('not_found');
+    expect(computed.prefixes).toEqual([{ prefix: 'tier_', file: 'lib/pricing.ts', line: 2 }]);
+    // The scan reads and never writes.
+    expect(treeOf(tiers)).toEqual(before);
+
+    // Reads followed to key names raise no line: an adapter called with literals, an array of names, a map of names.
+    for (const name of ['05-i18n-flat-t', '09-array-of-names', '10-keyof-map']) {
+      const followed = await usageOf(fixtureRepo(name));
+      expect(followed.causes, name).toEqual([]);
+    }
+    expect(stateOf(await usageOf(fixtureRepo('09-array-of-names')), 'hero_title')).toBe('read');
+
+    // Visibility is per read: the prefix is learnt from `copy(SECTION + 'title')`, and the bare `copy(k)` is a cause.
+    const mixed = await usageOf(fixtureRepo('23-mixed-file'));
+    expect(mixed.prefixes.map((p) => p.prefix)).toEqual(['home_']);
+    expect(mixed.causes.map((c) => `${c.text} @ ${c.file}:${c.line}`)).toEqual(['copy(k) @ app/page.tsx:3']);
+    // While a cause stands a key outside every learnt prefix cannot be judged.
+    expect(stateOf(mixed, 'footer_note')).toBe('unknown');
+    expect(stateOf(mixed, 'pricing_title')).toBe('unknown');
+
+    // A clipboard helper named copy is no binding: no cause stands.
+    const clipboard = await usageOf(fixtureRepo('25-unrelated-copy-fn'));
+    expect(clipboard.causes).toEqual([]);
+    expect(stateOf(clipboard, 'hero_sub')).toBe('not_found');
+
+    // A comment is not a read: a key named in `// copy.hero_sub` and in the prose of a `.md` file is not found.
+    const commented = await usageOf(
+      fixtureRepo('01-copy-call', (dir) => {
+        put(dir, 'app/note.ts', '// copy.hero_sub\nexport const n = 1;\n');
+        put(dir, 'docs/x.md', 'copy.hero_sub\n');
+      }),
+    );
+    expect(stateOf(commented, 'hero_sub')).toBe('not_found');
+    expect(stateOf(commented, 'hero_title')).toBe('read');
+
+    // The file set is git's: an untracked ignored file is not scanned, an untracked one is, and a tracked file deleted from the tree is skipped.
+    const sets = fixtureRepo('01-copy-call', (dir) => {
+      put(dir, '.gitignore', 'scratch/\n');
+      put(dir, 'scratch/old.tsx', "import { copy } from '@/lib/content';\nexport const Old = () => copy('hero_sub');\n");
+      put(dir, 'app/gone.tsx', "export const Gone = () => 'footer_note';\n");
+    });
+    rmSync(join(sets, 'app/gone.tsx'));
+    put(sets, 'app/new.tsx', "import { copy } from '@/lib/content';\nexport const New = () => copy('hero_sub');\n");
+    const scanned = await usageOf(sets);
+    expect(stateOf(scanned, 'hero_sub')).toBe('read');
+    expect(stateOf(scanned, 'footer_note')).toBe('not_found');
+    // A file headed `// generated by stet` that the config does not name contributes no name.
+    const generated = await usageOf(
+      fixtureRepo('01-copy-call', (dir) => put(dir, 'lib/gen.ts', '// generated by stet — source-hash: x\nexport const G = { hero_sub: 1 };\n')),
+    );
+    expect(stateOf(generated, 'hero_sub')).toBe('not_found');
+
+    // A symlink out of the checkout is not followed; a brand key, a derived key and a template slot carry no state.
+    const outside = mkdtempSync(join(tmpdir(), 'stet-walk-usage-out-'));
+    made.push(outside);
+    put(outside, 'outside.tsx', "export const Out = () => 'footer_note';\n");
+    const linked = await usageOf(
+      fixtureRepo('01-copy-call', (dir) => {
+        symlinkSync(join(outside, 'outside.tsx'), join(dir, 'app/out.tsx'));
+        const descriptor = JSON.parse(readFileSync(join(dir, 'content/descriptor.json'), 'utf8'));
+        descriptor.keys.brand__name = { shape: 'text' };
+        descriptor.keys.hero_share = { shape: 'text', derivesFrom: 'hero_title', tmpl: '{{value}}' };
+        descriptor.keys.welcome__body = { shape: 'text' };
+        descriptor.templates = { welcome: { class: 'transactional', trigger: 'manual', slots: ['body'] } };
+        put(dir, 'content/descriptor.json', JSON.stringify(descriptor));
+      }),
+    );
+    expect(stateOf(linked, 'footer_note')).toBe('not_found');
+    expect(Object.keys(linked.keys).sort()).toEqual(['footer_note', 'hero_sub', 'hero_title']);
+
+    // Without git on the PATH the scan falls back to a walk and still judges the keys.
+    const bare = mkdtempSync(join(tmpdir(), 'stet-walk-usage-nogit-'));
+    made.push(bare);
+    const noGit = fixtureRepo('07-template-literal');
+    const held = process.env['PATH'];
+    process.env['PATH'] = bare;
+    try {
+      expect(stateOf(await usageOf(noGit), 'tier_solo_name')).toBe('unknown');
+    } finally {
+      if (held === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = held;
+    }
+  });
+
+  /** The badge-review fixture 01 with a page list of five and an email key no file names, as a site the page shows. */
+  const pagedSite = async (fixture = '01-copy-call') => {
+    const PAGES = Object.fromEntries(['/', '/a', '/b', '/c', '/d'].map((route, i) => [`p${i}`, { route }]));
+    const dir = fixtureRepo(fixture, (d) => {
+      const descriptor = JSON.parse(readFileSync(join(d, 'content/descriptor.json'), 'utf8'));
+      for (const def of Object.values(descriptor.keys) as Array<Record<string, unknown>>) def['target'] = 'web';
+      descriptor.keys.mail_key = { shape: 'text', target: 'html-email' };
+      descriptor.pages = PAGES;
+      put(d, 'content/descriptor.json', JSON.stringify({ version: 1, ...descriptor }));
+    });
+    const usage = await usageOf(dir);
+    const descriptor = JSON.parse(readFileSync(join(dir, 'content/descriptor.json'), 'utf8')) as Descriptor;
+    const values = { hero_title: 'Hero', hero_sub: 'Sub', footer_note: 'Footer', mail_key: 'Mail' };
+    const { page, agent } = await bridged({
+      site: siteBody({ descriptor, snapshot: { default: values } }),
+      routes: [
+        ['/api/site/usage', 200, usage],
+        ['/api/site/route-reads', 200, { route: '/', files: [], keys: [], complete: true }],
+      ],
+    });
+    return { page, agent, usage, rootLine: `${usage.files} file${usage.files === 1 ? '' : 's'} in ${usage.root}` };
+  };
+  const badgesOf = async (page: PaintedPage, key: string): Promise<string[]> => {
+    await page.type('search', '_');
+    return [...(page.dom.window.document.querySelector(`[data-act="key:${key}"]`)?.querySelectorAll('.bdg') ?? [])].map((b) => b.textContent ?? '');
+  };
+  const noteLines = async (page: PaintedPage, key: string): Promise<string[]> => {
+    await page.type('search', '_');
+    await page.act(`key:${key}`);
+    return [...(page.dom.window.document.getElementById('panenote')?.children ?? [])].map((line) => line.textContent ?? '');
+  };
+
+  it("Requirement: The badge is worded as the scan's scope, upgraded only after every page is visited", async () => {
+    const { page, agent, usage, rootLine } = await pagedSite();
+    const SCOPE = `not found in any file stet searched (${rootLine})`;
+    expect(stateOf(usage, 'hero_sub')).toBe('not_found');
+
+    // Pages not yet checked: two of five visited.
+    for (const route of ['/', '/a']) {
+      await agent.moved(route);
+      await agent.census({ route, found: { hero_title: 1 } });
+    }
+    expect(await badgesOf(page, 'hero_sub')).toContain(SCOPE);
+    expect(await noteLines(page, 'hero_sub')).toEqual([SCOPE, '3 of 5 pages not yet checked']);
+
+    // The upgrade: every declared page visited and the key's text never found; an email key keeps the scan wording.
+    for (const route of ['/b', '/c', '/d']) {
+      await agent.moved(route);
+      await agent.census({ route, found: { hero_title: 1 } });
+    }
+    expect(await badgesOf(page, 'hero_sub')).toContain('may be a leftover');
+    expect(await noteLines(page, 'hero_sub')).toEqual(['may be a leftover']);
+    expect(await badgesOf(page, 'mail_key')).toContain(SCOPE);
+    expect(await noteLines(page, 'mail_key')).toEqual([SCOPE]);
+    // A key a visited page showed keeps the scan's wording.
+    await agent.moved('/d');
+    await agent.census({ route: '/d', found: { footer_note: 1 } });
+    expect(await badgesOf(page, 'footer_note')).not.toContain('may be a leftover');
+    page.dom.window.close();
+
+    // A sibling package's read keeps the scan's wording: `footer_note` is read only by code outside the checkout, and no page is visited.
+    const sibling = await pagedSite('19-monorepo-sibling');
+    expect(stateOf(sibling.usage, 'footer_note')).toBe('not_found');
+    expect(await badgesOf(sibling.page, 'footer_note')).toContain(`not found in any file stet searched (${sibling.rootLine})`);
+    expect(await noteLines(sibling.page, 'footer_note')).toEqual([`not found in any file stet searched (${sibling.rootLine})`, '5 of 5 pages not yet checked']);
+    expect(await badgesOf(sibling.page, 'footer_note')).not.toContain('may be a leftover');
+    sibling.page.dom.window.close();
+
+    // `unknown` names the prefix and the read that taught it; the site line names three causes, then the rest as a count.
+    const causes = [
+      { text: 'copy(a)', file: 'a.ts', line: 1 },
+      { text: 'copy(b)', file: 'b.ts', line: 2 },
+      { text: 'copy(c)', file: 'c.ts', line: 3 },
+      { text: 'fn(copy)', file: 'd.ts', line: 4 },
+    ];
+    const { page: unknown } = await bridged({
+      site: siteBody({
+        descriptor: { version: 1, keys: { tier_solo_name: { shape: 'text', target: 'web' }, blind_key: { shape: 'text', target: 'web' } }, pages: { home: { route: '/' } } },
+        snapshot: { default: { tier_solo_name: 'Solo', blind_key: 'Blind' } },
+      }),
+      routes: [
+        [
+          '/api/site/usage',
+          200,
+          {
+            keys: { tier_solo_name: { state: 'unknown', prefix: { prefix: 'tier_', file: 'src/pricing.ts', line: 4 } }, blind_key: { state: 'unknown' } },
+            prefixes: [{ prefix: 'tier_', file: 'src/pricing.ts', line: 4 }],
+            causes,
+            serverOnly: [],
+            files: 55,
+            root: 'site/',
+          },
+        ],
+        ['/api/site/route-reads', 200, { route: '/', files: [], keys: [], complete: true }],
+      ],
+    });
+    expect(unknown.dom.window.document.getElementById('siteline')?.textContent).toBe(
+      'This site reads some keys in ways stet cannot follow, so it cannot say which keys are unread: copy(a) at a.ts:1, copy(b) at b.ts:2, copy(c) at c.ts:3 and 1 more',
+    );
+    expect(await badgesOf(unknown, 'tier_solo_name')).toContain('unknown');
+    expect(await noteLines(unknown, 'tier_solo_name')).toEqual([
+      'tier_solo_name starts with tier_, which src/pricing.ts:4 reads without naming each key, so whether it is read is unknown.',
+      'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)',
+    ]);
+    unknown.dom.window.close();
+  });
+
+  it('Requirement: stet list --json carries the badge', async () => {
+    const hostOver = (): { cwd: string; run(...argv: string[]): Promise<{ code: number; out: string[] }> } => {
+      const cwd = fixtureRepo('07-template-literal', (dir) => {
+        const descriptor = JSON.parse(readFileSync(join(dir, 'content/descriptor.json'), 'utf8')) as { keys: Record<string, Record<string, unknown>> };
+        for (const def of Object.values(descriptor.keys)) def['target'] = 'web';
+        put(dir, 'content/descriptor.json', JSON.stringify({ version: 1, ...descriptor }));
+      });
+      return {
+        cwd,
+        run: async (...argv: string[]) => {
+          const out: string[] = [];
+          const code = await runCli(argv, { cwd, env: {}, stdout: (l) => out.push(l), stderr: () => {} });
+          return { code, out };
+        },
+      };
+    };
+    const host = hostOver();
+    const json = await host.run('list', '--json');
+    expect(json.code).toBe(0);
+    const answer = JSON.parse(json.out[json.out.length - 1] as string) as {
+      rows: Array<{ key: string; badge?: string }>;
+      usage: { prefixes: unknown[]; causes: unknown[]; files: number; root: string };
+      findings: unknown[];
+    };
+    expect(answer.rows.map((r) => [r.key, r.badge])).toEqual([
+      ['footer_note', 'not_found'],
+      ['tier_solo_name', 'unknown'],
+      ['tier_solo_price', 'unknown'],
+      ['tier_team_name', 'unknown'],
+    ]);
+    expect(answer.usage).toEqual({
+      prefixes: [{ prefix: 'tier_', file: 'lib/pricing.ts', line: 2 }],
+      causes: [],
+      files: 1,
+      root: `${basename(host.cwd)}/`,
+    });
+    expect(answer.findings).toEqual([]);
+    // It never says `may be a leftover` and gates nothing; the text output is the table it always was.
+    expect(JSON.stringify(answer)).not.toContain('leftover');
+    const text = await host.run('list');
+    expect(text.code).toBe(0);
+    expect(text.out.join('\n')).toBe(
+      [
+        'key              source    version  draft',
+        'footer_note      snapshot        —  —',
+        'tier_solo_name   snapshot        —  —',
+        'tier_solo_price  snapshot        —  —',
+        'tier_team_name   snapshot        —  —',
+      ].join('\n'),
+    );
+
+    // Without `typescript` the rows carry no badge, `usage` is null and the install line is among the findings.
+    const noCompiler = hostOver();
+    vi.resetModules();
+    vi.doMock('typescript', () =>
+      Promise.reject(Object.assign(new Error("Cannot find package 'typescript'"), { code: 'ERR_MODULE_NOT_FOUND' })),
+    );
+    try {
+      const { runCli: freshCli } = await import('../cli/main.js');
+      const out: string[] = [];
+      const code = await freshCli(['list', '--json'], { cwd: noCompiler.cwd, env: {}, stdout: (l) => out.push(l), stderr: () => {} });
+      expect(code).toBe(0);
+      const bareAnswer = JSON.parse(out[out.length - 1] as string) as {
+        rows: Array<{ key: string; badge?: string }>;
+        usage: unknown;
+        findings: Array<{ level: string; message: string }>;
+      };
+      expect(bareAnswer.rows.every((r) => !('badge' in r))).toBe(true);
+      expect(bareAnswer.usage).toBeNull();
+      expect(bareAnswer.findings).toEqual([
+        expect.objectContaining({ level: 'warn', message: "stet needs 'typescript' to read your source — install it as a dev dependency: npm i -D typescript" }),
+      ]);
+    } finally {
+      vi.doUnmock('typescript');
+      vi.resetModules();
+    }
+  });
+});
+
+describe('preview-editing', () => {
+  afterEach(closeFrames);
+
+  // The agent's side, played in a jsdom frame ------------------------------------------------------------------------
+  interface CensusKey {
+    key: string;
+    texts: string[];
+    parts?: Array<{ entry: number | string; texts: string[] }>;
+  }
+  const sentOf = (framed: Framed, stet: string): Array<Record<string, unknown>> => framed.sent.filter((m) => m['stet'] === stet);
+  const lastOf = (framed: Framed, stet: string): Record<string, unknown> | undefined => sentOf(framed, stet).at(-1);
+  const censusOf = async (framed: Framed, keys: CensusKey[]): Promise<Record<string, unknown> | undefined> => {
+    const before = framed.sent.length;
+    framed.send({ stet: 'census', keys });
+    await tick();
+    return framed.sent.slice(before).find((m) => m['stet'] === 'census');
+  };
+  const setMode = async (framed: Framed, mode: 'edit' | 'use'): Promise<void> => {
+    framed.send({ stet: 'mode', mode });
+    await tick();
+  };
+  const press = (framed: Framed, el: Element, type: string, init: MouseEventInit = {}): boolean =>
+    el.dispatchEvent(new framed.win.MouseEvent(type, { bubbles: true, cancelable: true, ...init }));
+  const keydown = (framed: Framed, el: Element, init: KeyboardEventInit): KeyboardEvent => {
+    const event = new framed.win.KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init });
+    el.dispatchEvent(event);
+    return event;
+  };
+  /** One keystroke as a browser delivers it: `beforeinput`, the DOM edit, the microtask checkpoint, then `input`. */
+  const keystroke = async (framed: Framed, host: Element, write: () => void, inputType = 'insertText'): Promise<void> => {
+    host.dispatchEvent(new framed.win.InputEvent('beforeinput', { inputType, bubbles: true, cancelable: true }));
+    write();
+    await Promise.resolve();
+    host.dispatchEvent(new framed.win.InputEvent('input', { inputType, bubbles: true }));
+  };
+  const typeAtEnd = async (framed: Framed, host: Element, node: Text, chars: string): Promise<void> => {
+    for (const ch of chars) {
+      await keystroke(framed, host, () => {
+        node.data += ch;
+      });
+    }
+    await tick();
+  };
+  const caret = (framed: Framed, node: Node, offset: number): void => {
+    const selection = framed.win.getSelection() as Selection;
+    selection.removeAllRanges();
+    selection.collapse(node, offset);
+  };
+  /** The census holding `keys`, Edit on, a click on `el` (the pick) and the page's `edit` for `id`. */
+  const editOn = async (framed: Framed, el: Element, keys: CensusKey[], id: string, extra: Record<string, unknown> = {}): Promise<void> => {
+    await censusOf(framed, keys);
+    await setMode(framed, 'edit');
+    press(framed, el, 'click');
+    framed.send({ stet: 'edit', key: id, locale: 'default', form: 'inplace', oneLine: true, ...extra });
+    await tick();
+  };
+  const BUTTON: CensusKey[] = [{ key: 'lab_button', texts: ['Start free trial'] }];
+  const typedValues = (framed: Framed): unknown[] => sentOf(framed, 'typed').map((m) => m['value']);
+  const idOf = (framed: Framed, id: string): HTMLElement => framed.doc.getElementById(id) as HTMLElement;
+
+  it('Requirement: Edit and Use decide who owns the frame', async () => {
+    // A click in Edit picks the key and nothing navigates: a link, a button, a summary and an inline handler.
+    const framed = await frame(
+      '<a id="link" href="#moved">Read the pricing guide</a>' +
+        '<button id="btn">Start free trial</button>' +
+        '<details id="faq"><summary id="sum">Questions and answers</summary><p>Hidden answer text</p></details>' +
+        '<span id="inline" onclick="window.__ran = (window.__ran || 0) + 1">Inline handler copy</span>' +
+        '<p id="plain">Text no key holds</p><input id="field">',
+    );
+    const counts = { click: 0, mousedown: 0 };
+    idOf(framed, 'btn').addEventListener('click', () => (counts.click += 1));
+    idOf(framed, 'btn').addEventListener('mousedown', () => (counts.mousedown += 1));
+    await censusOf(framed, [
+      { key: 'lab_link', texts: ['Read the pricing guide'] },
+      { key: 'lab_button', texts: ['Start free trial'] },
+      { key: 'lab_summary', texts: ['Questions and answers'] },
+      { key: 'lab_inline', texts: ['Inline handler copy'] },
+    ]);
+    await setMode(framed, 'edit');
+    for (const id of ['link', 'btn', 'sum', 'inline']) {
+      press(framed, idOf(framed, id), 'click');
+      await tick();
+    }
+    expect(sentOf(framed, 'pick').map((m) => (m['keys'] as Array<Record<string, unknown>>).map((k) => k['key']))).toEqual([
+      ['lab_link'], ['lab_button'], ['lab_summary'], ['lab_inline'],
+    ]);
+    expect(framed.win.location.hash).toBe('');
+    expect(counts.click).toBe(0);
+    expect(idOf(framed, 'faq').hasAttribute('open')).toBe(false);
+    expect((framed.win as unknown as { __ran?: number }).__ran).toBeUndefined();
+    // Nothing else is prevented: a press keeps its default while the page's handlers never see it.
+    expect(press(framed, idOf(framed, 'btn'), 'mousedown')).toBe(true);
+    expect(counts.mousedown).toBe(0);
+    // Every listed press is stopped without losing its default, and the other blocked events are prevented.
+    const seen: string[] = [];
+    for (const type of ['pointerdown', 'mouseup', 'pointerup', 'touchstart']) {
+      idOf(framed, 'btn').addEventListener(type, () => seen.push(type));
+      const ev = new framed.win.Event(type, { bubbles: true, cancelable: true });
+      idOf(framed, 'btn').dispatchEvent(ev);
+      expect(ev.defaultPrevented, type).toBe(false);
+    }
+    expect(seen).toEqual([]);
+    for (const type of ['auxclick', 'submit', 'dblclick']) {
+      const ev = new framed.win.Event(type, { bubbles: true, cancelable: true });
+      idOf(framed, 'btn').dispatchEvent(ev);
+      expect(ev.defaultPrevented, type).toBe(true);
+    }
+    // Hovering rrings the copy and names `<kind> · <key>`'s parts; a click on text no key matches says so.
+    press(framed, idOf(framed, 'plain'), 'click');
+    await tick();
+    expect(lastOf(framed, 'unmanaged')).toEqual({ stet: 'unmanaged', text: 'Text no key holds', tag: 'p', channel: 'c1' });
+    // E switches the mode where focus is in no field, and Cmd/Ctrl-S sends `save` and writes nothing in the frame.
+    keydown(framed, idOf(framed, 'field'), { key: 'e' });
+    keydown(framed, framed.doc.body, { key: 'e' });
+    expect(keydown(framed, framed.doc.body, { key: 's', metaKey: true }).defaultPrevented).toBe(true);
+    await tick();
+    expect(sentOf(framed, 'key').map((m) => m['which'])).toEqual(['mode', 'save']);
+    // Use gives the page back: the listeners are gone and the click acts.
+    await setMode(framed, 'use');
+    press(framed, idOf(framed, 'btn'), 'click');
+    expect(press(framed, idOf(framed, 'btn'), 'mousedown')).toBe(true);
+    expect(counts).toEqual({ click: 1, mousedown: 1 });
+    closeFrames();
+
+    // The pane: in Use the app moves and the header says so, the route field keeping the route the editor typed.
+    const { page, agent } = await bridged({ site: labSite() });
+    await page.act('mode:use');
+    expect(agent.sent('mode').at(-1)).toEqual({ stet: 'mode', mode: 'use' });
+    await agent.moved('/pricing');
+    expect(byId(page, 'panemoved').textContent).toBe('The app moved to /pricing');
+    expect((byId(page, 'route') as HTMLInputElement).value).toBe('/');
+    // Content opens in Edit.
+    await page.act('tab:Health');
+    await page.act('tab:Content');
+    expect(agent.sent('mode').at(-1)).toEqual({ stet: 'mode', mode: 'edit' });
+    await page.act('mode:use');
+    // E on the dashboard toggles the switch when focus is in no field; Esc ends the selection.
+    docOf(page).body.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: 'e', bubbles: true }));
+    await page.settle();
+    expect(agent.sent('mode').at(-1)).toEqual({ stet: 'mode', mode: 'edit' });
+    await agent.pick([{ key: 'hero_headline' }]);
+    expect(selected(page)).toBe('hero_headline');
+    docOf(page).body.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await page.settle();
+    expect(selected(page)).toBe('');
+    page.dom.window.close();
+
+    // Text no key matches says what the route reads: never unmanaged.
+    const nav = await bridged({
+      site: labSite(),
+      routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['hero_headline', 'nav_button_text', 'nav_link'], complete: true }]],
+    });
+    await nav.agent.census({ found: { hero_headline: 1 } });
+    await nav.agent.tell({ stet: 'unmanaged', text: 'Docs Start', tag: 'a' });
+    expect(lines(nav.page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: nav_link, nav_button_text.']);
+    expect(note(nav.page).textContent).not.toContain('unmanaged');
+    nav.page.dom.window.close();
+  });
+
+  it('Requirement: The census finds copy on a JavaScript host', async () => {
+    const LAB_PAGE =
+      '<img id="hero" src="x.png" alt="A desk with two laptops">' +
+      '<button id="close" aria-label="Close this panel">×</button>' +
+      '<input id="search" placeholder="Search every page">' +
+      '<ul><li>Fast setup for teams</li><li>One file per site</li><li>No deploy to change words</li></ul>' +
+      '<dl><dt>Plans for every team</dt><dd>Pay only for the seats you use</dd></dl>' +
+      '<nav><a>Talk to our team</a></nav><footer><a>Talk to our team</a></footer>' +
+      '<p id="greet">Welcome back, Maya.</p>' +
+      '<nav id="twin"><a id="one">Pricing</a><a id="two">Pricing</a></nav>';
+    const KEYS: CensusKey[] = [
+      { key: 'lab_hero_alt', texts: ['A desk with two laptops'] },
+      { key: 'lab_close_label', texts: ['Close this panel'] },
+      { key: 'lab_search_placeholder', texts: ['Search every page'] },
+      {
+        key: 'lab_list',
+        texts: [],
+        parts: [
+          { entry: 0, texts: ['Fast setup for teams'] },
+          { entry: 1, texts: ['One file per site'] },
+          { entry: 2, texts: ['No deploy to change words'] },
+        ],
+      },
+      { key: 'lab_record', texts: [], parts: [{ entry: 'title', texts: ['Plans for every team'] }, { entry: 'body', texts: ['Pay only for the seats you use'] }] },
+      { key: 'lab_shared', texts: ['Talk to our team'] },
+      { key: 'lab_greeting', texts: ['Welcome back, {{name}}.'] },
+      { key: 'lab_absent', texts: ['Nowhere on this page'] },
+      { key: 'nav_pricing_a', texts: ['Pricing'] },
+      { key: 'nav_pricing_b', texts: ['Pricing'] },
+    ];
+    // Attributes, entries, fields and patterns are found.
+    const framed = await frame(LAB_PAGE);
+    const reply = await censusOf(framed, KEYS);
+    expect(reply).toMatchObject({
+      found: { lab_hero_alt: 1, lab_close_label: 1, lab_search_placeholder: 1, lab_list: 3, lab_record: 2, lab_shared: 2, lab_greeting: 1 },
+      entries: { lab_list: [0, 1, 2], lab_record: ['title', 'body'] },
+      route: framed.win.location.pathname,
+    });
+    expect(Object.keys(reply?.['found'] as object)).not.toContain('lab_absent');
+    // Two keys with one text are ambiguous; the page offers a chooser.
+    expect((reply?.['ambiguous'] as unknown[]).length).toBeGreaterThan(0);
+    await setMode(framed, 'edit');
+    const picked = async (id: string): Promise<unknown> => {
+      press(framed, idOf(framed, id), 'click');
+      await tick();
+      return lastOf(framed, 'pick')?.['keys'];
+    };
+    expect(await picked('hero')).toEqual([{ key: 'lab_hero_alt', attr: 'alt', by: 'attr', inplace: false }]);
+    expect(await picked('close')).toEqual([{ key: 'lab_close_label', attr: 'aria-label', by: 'attr', inplace: false }]);
+    expect(await picked('search')).toEqual([{ key: 'lab_search_placeholder', attr: 'placeholder', by: 'attr', inplace: false }]);
+    expect(await picked('greet')).toEqual([{ key: 'lab_greeting', attr: null, by: 'pattern', inplace: false }]);
+    expect(((await picked('one')) as Array<Record<string, unknown>>).map((k) => k['key']).sort()).toEqual(['nav_pricing_a', 'nav_pricing_b']);
+    closeFrames();
+
+    // On the page: two keys with one text show the chooser.
+    const { page, agent } = await bridged({ site: labSite() });
+    await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }]);
+    const box = byId(page, 'panepick');
+    expect(box.hidden).toBe(false);
+    expect(box.textContent).toContain('Two keys show these words. Which one?');
+    expect([...box.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['hero_headline', 'loose_key']);
+    await page.act('choose:loose_key');
+    expect(selected(page)).toBe('loose_key');
+    page.dom.window.close();
+
+    // The census scales: a page of 32,000 elements against 1,000 keys, three passes in a row, in bounded work and time.
+    const passes = censusPasses();
+    expect(Object.keys(passes[0]?.reply['found'] as object).length).toBeGreaterThan(80);
+    expectCensusScale(passes);
+  });
+
+  it("Requirement: An element whose only words are the key's is typed in place under four conditions", async () => {
+    const buttonEdit = async (body = '<button id="btn">Start free trial</button><p id="other" tabindex="-1">Other words</p>') => {
+      const framed = await frame(body);
+      const btn = idOf(framed, 'btn');
+      const node = btn.firstChild as Text;
+      await editOn(framed, btn, BUTTON, 'lab_button');
+      return { framed, btn, node };
+    };
+
+    // Typing in place on a React page: the whole text selected, typing replaces it, Enter keeps it, React's nodes come back.
+    const typing = await buttonEdit();
+    const range = (typing.framed.win.getSelection() as Selection).getRangeAt(0);
+    expect([range.startContainer, range.startOffset, range.endContainer, range.endOffset]).toEqual([typing.btn, 0, typing.btn, typing.btn.childNodes.length]);
+    expect(typing.btn.getAttribute('contenteditable')).toBe('plaintext-only');
+    typing.btn.textContent = 'Try it free';
+    typing.btn.dispatchEvent(new typing.framed.win.InputEvent('input', { inputType: 'insertText', bubbles: true }));
+    expect(keydown(typing.framed, typing.btn, { key: 'Enter' }).defaultPrevented).toBe(true);
+    await tick();
+    expect(lastOf(typing.framed, 'edited')).toMatchObject({ how: 'keep', proposed: true });
+    expect(typedValues(typing.framed).at(-1)).toBe('Try it free');
+    expect(typing.btn.hasAttribute('contenteditable')).toBe(false);
+    closeFrames();
+
+    // React rewrites the text mid-edit: the edit ends lost, the draft is the last proposal.
+    const flipped = await buttonEdit();
+    caret(flipped.framed, flipped.node, flipped.node.length);
+    await typeAtEnd(flipped.framed, flipped.btn, flipped.node, 'now');
+    flipped.node.data = 'Saved.';
+    await tick();
+    expect(typedValues(flipped.framed)).toEqual(['Start free trialn', 'Start free trialno', 'Start free trialnow']);
+    expect(lastOf(flipped.framed, 'edited')).toMatchObject({ key: 'lab_button', how: 'lost', proposed: true });
+    expect(flipped.btn.hasAttribute('contenteditable')).toBe(false);
+    expect(flipped.btn.textContent).toBe('Saved.');
+    closeFrames();
+
+    // A keystroke that changes nothing: Backspace at the start, the page then rewrites the text; the edit ends lost with no draft.
+    for (const [where, inputType] of [['start', 'deleteContentBackward'], ['end', 'deleteContentForward']] as const) {
+      const idle = await buttonEdit();
+      caret(idle.framed, idle.node, where === 'start' ? 0 : idle.node.length);
+      idle.btn.dispatchEvent(new idle.framed.win.InputEvent('beforeinput', { inputType, bubbles: true, cancelable: true }));
+      await tick(10);
+      idle.node.data = 'Saved.';
+      await tick();
+      await keystroke(idle.framed, idle.btn, () => {
+        idle.node.data = 'x' + idle.node.data;
+      });
+      await tick();
+      expect(lastOf(idle.framed, 'edited')).toMatchObject({ how: 'lost', proposed: false });
+      expect(typedValues(idle.framed)).toEqual([]);
+      closeFrames();
+    }
+
+    // Clicking elsewhere keeps the edit: the first element is no longer editable, and the click picks the other key.
+    const away = await frame('<button id="btn">Start free trial</button><p id="other">Other words here</p>');
+    await editOn(away, idOf(away, 'btn'), [...BUTTON, { key: 'lab_other', texts: ['Other words here'] }], 'lab_button');
+    const text = idOf(away, 'btn').firstChild as Text;
+    caret(away, text, text.length);
+    await typeAtEnd(away, idOf(away, 'btn'), text, '!');
+    press(away, idOf(away, 'other'), 'click');
+    await tick();
+    expect(lastOf(away, 'edited')).toMatchObject({ key: 'lab_button', how: 'keep', proposed: true });
+    expect(idOf(away, 'btn').hasAttribute('contenteditable')).toBe(false);
+    expect((lastOf(away, 'pick')?.['keys'] as Array<Record<string, unknown>>)[0]).toMatchObject({ key: 'lab_other' });
+    closeFrames();
+
+    // Sibling text sends the key to the field and the draft never carries it.
+    const sibling = await frame('<p id="long"></p>');
+    const long = idOf(sibling, 'long');
+    long.append('Every change ships in one step.', ' Questions? Ask us.');
+    await censusOf(sibling, [{ key: 'lab_long', texts: ['Every change ships in one step.'] }]);
+    await setMode(sibling, 'edit');
+    press(sibling, long, 'click');
+    sibling.send({ stet: 'edit', key: 'lab_long', locale: 'default', form: 'inplace', oneLine: true });
+    await tick();
+    expect(((lastOf(sibling, 'pick')?.['keys'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>)['inplace']).toBe(false);
+    expect(lastOf(sibling, 'edited')).toMatchObject({ key: 'lab_long', how: 'lost', proposed: false });
+    expect(long.hasAttribute('contenteditable')).toBe(false);
+    expect(typedValues(sibling)).toEqual([]);
+    closeFrames();
+
+    // The element is unmounted mid-edit: the edit ends lost and the draft is what was typed.
+    const unmounted = await frame('<div id="toggle"><p id="p">Ship copy without a deploy</p></div>');
+    const p = idOf(unmounted, 'p');
+    await editOn(unmounted, p, [{ key: 'lab_headline', texts: ['Ship copy without a deploy'] }], 'lab_headline');
+    const pText = p.firstChild as Text;
+    caret(unmounted, pText, pText.length);
+    await typeAtEnd(unmounted, p, pText, ' today');
+    const fresh = unmounted.doc.createElement('p');
+    fresh.textContent = 'Ship copy without a deploy';
+    p.replaceWith(fresh);
+    await tick();
+    expect(lastOf(unmounted, 'edited')).toMatchObject({ key: 'lab_headline', how: 'lost', proposed: true });
+    expect(typedValues(unmounted).at(-1)).toBe('Ship copy without a deploy today');
+    closeFrames();
+
+    // The trimmed value: `" "`, the key's node and `" "`, the caret in the trailing space before typing `X`.
+    const trimmed = await frame('<p id="ws"></p>');
+    const ws = idOf(trimmed, 'ws');
+    ws.append(' ', 'Ship copy without a deploy', ' ');
+    const trailing = ws.lastChild as Text;
+    await editOn(trimmed, ws, [{ key: 'lab_headline', texts: ['Ship copy without a deploy'] }], 'lab_headline');
+    caret(trimmed, trailing, 1);
+    await typeAtEnd(trimmed, ws, trailing, 'X');
+    expect(typedValues(trimmed)).toEqual(['Ship copy without a deploy X']);
+    closeFrames();
+
+    // The tagged headline is typed run by run on the html host, and the value composes with its tags.
+    const html = await frame(
+      '<h1 data-stet="hero">Your site’s words<span class="tail"> in one place.</span></h1><p id="away" tabindex="-1">Away</p>',
+    );
+    const h1 = html.doc.querySelector('h1') as HTMLElement;
+    const innerBefore = h1.innerHTML;
+    await editOn(html, h1, [{ key: 'hero', texts: ['Your site’s words<1> in one place.</1>'] }], 'hero', { form: 'runs' });
+    const islands = [...h1.querySelectorAll('[data-stet-island]')] as HTMLElement[];
+    expect(islands.map((island) => island.textContent)).toEqual(['Your site’s words', ' in one place.']);
+    const [first, second] = islands.map((island) => island.firstChild as Text) as [Text, Text];
+    caret(html, first, first.length);
+    await typeAtEnd(html, islands[0] as HTMLElement, first, ' (all)');
+    caret(html, second, second.length);
+    await typeAtEnd(html, islands[1] as HTMLElement, second, ' today');
+    expect(typedValues(html).at(-1)).toBe('Your site’s words (all)<1> in one place. today</1>');
+    keydown(html, islands[1] as HTMLElement, { key: 'Enter' });
+    await tick();
+    expect(lastOf(html, 'edited')).toMatchObject({ key: 'hero', how: 'keep', proposed: true });
+    expect(h1.innerHTML).toBe(innerBefore);
+    closeFrames();
+
+    // The save writes the snapshot and the document; the same value with its tags removed is refused.
+    const host = await makeHtmlHost({
+      files: {
+        'index.html':
+          '<!DOCTYPE html>\n<html><head><title>Words</title></head><body>\n' +
+          '<h1 data-stet="hero_headline">Your site’s words<span class="tail"> in one place.</span></h1>\n</body></html>\n',
+      },
+      keys: { hero_headline: { shape: 'text', target: 'web', tags: 1 } },
+      defaults: { hero_headline: 'Your site’s words<1> in one place.</1>' },
+    });
+    expect(await host.run('pull')).toBe(0);
+    const { handler } = handlerOver([host.cwd]);
+    const save = async (value: string) => {
+      const res = await handler(req(`/api/site/save?site=${encodeURIComponent(realpathSync(host.cwd))}`, { method: 'POST', body: { values: [{ key: 'hero_headline', value }] } }));
+      return { status: res.status, body: (await res.json()) as Record<string, any> };
+    };
+    const refused = await save('Your site’s words (all) in one place. today');
+    expect(refused.status).toBe(409);
+    expect(JSON.stringify(refused.body['findings'])).toContain('found tag 1 missing');
+    expect(host.file('index.html')).toContain('Your site’s words<span class="tail"> in one place.</span>');
+    const saved = await save('Your site’s words (all)<1> in one place. today</1>');
+    expect(saved.status).toBe(200);
+    expect(saved.body['written']).toEqual(expect.arrayContaining(['content/defaults.json', 'index.html']));
+    expect(host.file('index.html')).toContain('Your site’s words (all)<span class="tail"> in one place. today</span>');
+  });
+
+  it('Requirement: An edit pins its locale', async () => {
+    const { page, agent } = await bridged({ site: labSite() });
+    await agent.pick([{ key: 'hero_headline' }], { again: true });
+    expect(agent.sent('edit').at(-1)).toEqual({ stet: 'edit', key: 'hero_headline', locale: 'default', form: 'inplace', oneLine: true });
+    await agent.typed('hero_headline', 'Ship it');
+    const at = agent.posts.length;
+    // The selector switches to fr with the edit open: the edit ends kept under its own locale first.
+    await page.change('locale', 'de');
+    expect(agent.posts.slice(at).map((p) => p.message)).toContainEqual({ stet: 'end', how: 'keep' });
+    await agent.typed('hero_headline', 'Ship it now');
+    expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Ship it' });
+    expect(stateOf(page).edit).toBeNull();
+    // An edit started under the selector's locale carries it, and a proposal for another locale is dropped.
+    await agent.pick([{ key: 'hero_headline' }], { again: true });
+    expect(agent.sent('edit').at(-1)).toEqual({ stet: 'edit', key: 'hero_headline', locale: 'de', form: 'inplace', oneLine: true });
+    await agent.typed('hero_headline', 'Forged in default', { locale: 'default' });
+    expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Ship it' });
+    page.dom.window.close();
+  });
+
+  it("Requirement: The dashboard's field opens over the frame at the dashboard's scale", async () => {
+    const popover = (page: PaintedPage): HTMLElement => byId(page, 'popover');
+    const poptext = (page: PaintedPage): HTMLTextAreaElement => byId(page, 'poptext') as HTMLTextAreaElement;
+
+    // A `{{name}}` key opens the field under its element, at the dashboard's scale, with the raw value, the name and the counter.
+    const { page, agent } = await bridged({ site: labSite() });
+    const frameEl = agent.frame();
+    // The frame renders at 1280 px, scaled to 640 in a pane that starts 500 px from the left.
+    Object.defineProperty(frameEl, 'offsetWidth', { configurable: true, get: () => 1280 });
+    frameEl.getBoundingClientRect = () => ({ left: 500, top: 100, width: 640, height: 400, right: 1140, bottom: 500, x: 500, y: 100, toJSON: () => ({}) }) as DOMRect;
+    await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true, rect: { left: 100, top: 60, width: 300, height: 20 } });
+    expect(agent.sent('edit')).toEqual([]);
+    expect(popover(page).hidden).toBe(false);
+    expect(poptext(page).value).toBe('Welcome back, {{name}}.');
+    expect(byId(page, 'popkey').textContent).toBe('lab_greeting');
+    expect(byId(page, 'popcount').textContent).toBe('23 / 40');
+    expect(popover(page).textContent).toContain('Enter keeps it · Esc puts it back');
+    expect([popover(page).style.left, popover(page).style.top]).toEqual(['550px', '146px']);
+    await typeInto(page, poptext(page), 'Welcome, {{name}}.');
+    expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+    await pressKey(page, poptext(page), 'Enter');
+    expect(popover(page).hidden).toBe(true);
+    await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+    await typeInto(page, poptext(page), 'Gone');
+    await pressKey(page, poptext(page), 'Escape');
+    expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+    page.dom.window.close();
+
+    // Alt text: the field opens on the key and the draft shows in place in the page, through the real agent.
+    const bridge = await bridged({ site: labSite() });
+    const framed = await frame('<img id="hero" src="x.png" alt="A desk with two laptops"><button id="close" aria-label="Start free trial">×</button>');
+    await bridge.agent.pick([{ key: 'lab_hero_alt', attr: 'alt', by: 'attr', inplace: false }], { again: true, tag: 'img' });
+    expect(bridge.agent.sent('edit')).toEqual([]);
+    expect(poptext(bridge.page).value).toBe('A desk with two laptops');
+    await typeInto(bridge.page, poptext(bridge.page), 'A desk');
+    await wait(300);
+    framed.send(bridge.agent.sent('locate').at(-1));
+    await tick();
+    expect(idOf(framed, 'hero').getAttribute('alt')).toBe('A desk');
+    // An icon button's label: the same, on the aria-label.
+    await bridge.agent.pick([{ key: 'lab_button', attr: 'aria-label', by: 'attr', inplace: false }], { again: true, tag: 'button' });
+    await typeInto(bridge.page, poptext(bridge.page), 'Begin');
+    await wait(300);
+    framed.send(bridge.agent.sent('locate').at(-1));
+    await tick();
+    expect(idOf(framed, 'close').getAttribute('aria-label')).toBe('Begin');
+    bridge.page.dom.window.close();
+
+    // A tap at phone width: no popover, the key is selected, the column's field scrolled into view and typed in.
+    const scrolled: string[] = [];
+    const phone = await bridged({
+      site: labSite(),
+      prepare: (window) => {
+        Object.defineProperty(window, 'innerWidth', { configurable: true, get: () => 360 });
+        (window.HTMLElement.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = function (this: HTMLElement) {
+          scrolled.push(this.getAttribute('data-act-input') ?? '');
+        };
+      },
+    });
+    await phone.agent.pick([{ key: 'lab_button' }]);
+    expect(selected(phone.page)).toBe('lab_button');
+    expect(scrolled).toContain('text:lab_button');
+    await phone.agent.pick([{ key: 'lab_button' }], { again: true });
+    expect(phone.agent.sent('edit')).toEqual([]);
+    expect(popover(phone.page).hidden).toBe(true);
+    expect(docOf(phone.page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_button');
+    await phone.page.type('text:lab_button', 'Begin now');
+    expect(stateOf(phone.page).draft).toEqual({ 'default lab_button': 'Begin now' });
+    phone.page.dom.window.close();
+  });
+
+  it('Requirement: A frame message is an unsaved edit and nothing more', async () => {
+    let saves = 0;
+    const { page, agent } = await bridged({
+      site: labSite(),
+      routes: [['/api/site/save', 200, () => { saves += 1; return { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] }; }]],
+    });
+    // A pick naming a key the descriptor does not declare, or a prototype member, selects nothing and starts no edit.
+    for (const key of ['constructor', '__proto__', 'nope', '']) {
+      await agent.pick([{ key }], { again: true });
+      await agent.typed(key, 'X');
+      expect(selected(page), key).toBe('');
+      expect(agent.sent('edit'), key).toEqual([]);
+    }
+    // A pick naming a list entry or record field the key's value lacks starts no edit.
+    for (const [key, entry] of [['hero_bullets', 5], ['hero_bullets', -1], ['hero_bullets', '1'], ['hero_headline', 0], ['hero_headline', 'title']] as const) {
+      await agent.pick([{ key, entry }], { again: true });
+      expect(agent.sent('edit'), `${key} ${entry}`).toEqual([]);
+    }
+    // A forged proposal reaches only the open edit.
+    await agent.pick([{ key: 'hero_headline' }], { again: true });
+    await agent.typed('hero_headline', 'Forged words');
+    await agent.typed('loose_key', 'Forged into another key');
+    await agent.typed('hero_headline', 'Forged into another locale', { locale: 'de' });
+    expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Forged words' });
+    // A forged save: Cmd/Ctrl-S in the frame ends the edit and moves focus to Save, and writes nothing.
+    agent.frame().focus();
+    await agent.key('save');
+    await wait(150);
+    expect(saves).toBe(0);
+    expect(page.requested('/api/site/save')).toEqual([]);
+    expect(docOf(page).activeElement).toBe(docOf(page).querySelector('#main [data-act="save"]'));
+    expect(stateOf(page).snapshot['default']?.['hero_headline']).toBe('Ship the copy');
+    // No message carries a force, a write or the token: everything the page sent a write to is the pick's own reads.
+    expect(page.sent.filter((r) => r.body !== undefined).map((r) => r.path)).toEqual([]);
+    // A forged save while a column field holds focus leaves the focus there, and the next Space saves nothing.
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'Drafted');
+    const field = docOf(page).querySelector('#main [data-act-input="text:hero_headline"]') as HTMLElement;
+    field.focus();
+    await agent.key('save');
+    expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:hero_headline');
+    expect(page.requested('/api/site/save')).toEqual([]);
+    // The shipped origin and channel checks stand: a message from another window or on another channel is no frame message.
+    const before = JSON.stringify(stateOf(page).draft);
+    agent.say({ channel: 'another', stet: 'typed', key: 'hero_headline', locale: 'default', value: 'Wrong channel' });
+    agent.say({ channel: 'chan-1', stet: 'typed', key: 'hero_headline', locale: 'default', value: 'Wrong window' }, page.dom.window);
+    await page.settle();
+    expect(JSON.stringify(stateOf(page).draft)).toBe(before);
+    page.dom.window.close();
+  });
+
+  it('Requirement: Every shown draft is in the page at once', async () => {
+    const { page, agent } = await bridged({ site: labSite() });
+    // Unsaved edits of three keys, then a fourth selected and typed: the layer holds the three, the locate the fourth.
+    for (const [key, value] of [['lab_link', 'Read it'], ['lab_button', 'Begin'], ['lab_hero_alt', 'A desk']] as const) {
+      await page.act(`key:${key}`);
+      await page.type(`text:${key}`, value);
+    }
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'Ship words');
+    await wait(300);
+    const layer = agent.sent('layer').at(-1) as { drafts: Array<{ key: string; draft: unknown }> };
+    expect(layer.drafts.map((d) => [d.key, d.draft])).toEqual([
+      ['lab_link', 'Read it'],
+      ['lab_button', 'Begin'],
+      ['lab_hero_alt', 'A desk'],
+    ]);
+    expect(agent.sent('locate').at(-1)).toMatchObject({ key: 'hero_headline', draft: 'Ship words' });
+
+    // Handed to the agent in a page, all four show, an attribute draft included.
+    const framed = await frame(
+      '<h2 id="h">Ship the copy</h2><p id="p">Read the guide</p><button id="b" aria-label="Start free trial">×</button><img id="i" src="x.png" alt="A desk with two laptops">',
+    );
+    framed.send(layer);
+    framed.send(agent.sent('locate').at(-1));
+    await tick();
+    expect([idOf(framed, 'h').textContent, idOf(framed, 'p').textContent, idOf(framed, 'b').getAttribute('aria-label'), idOf(framed, 'i').getAttribute('alt')]).toEqual([
+      'Ship words',
+      'Read it',
+      'Begin',
+      'A desk',
+    ]);
+    // A new layer puts back what the page left alone, and keeps what the page rewrote.
+    (idOf(framed, 'p').firstChild as Text).data = 'Read the docs';
+    framed.send({ stet: 'layer', drafts: [] });
+    await tick();
+    expect([idOf(framed, 'p').textContent, idOf(framed, 'b').getAttribute('aria-label'), idOf(framed, 'i').getAttribute('alt')]).toEqual([
+      'Read the docs',
+      'Start free trial',
+      'A desk with two laptops',
+    ]);
+    page.dom.window.close();
+    closeFrames();
+
+    // On a JavaScript host no DOM write precedes hydration: with the hold, the layer, the mode and the edit change nothing and send nothing.
+    const held = await frame('<h1>Ship the copy</h1>', 'c1', '', AGENT, { hold: true, loading: true });
+    const h1 = held.doc.querySelector('h1') as HTMLElement;
+    held.doc.dispatchEvent(new held.win.Event('DOMContentLoaded'));
+    held.send({ stet: 'census', keys: [{ key: 'k', texts: ['Ship the copy'] }] });
+    held.send({ stet: 'layer', drafts: [{ key: 'k', texts: ['Ship the copy'], draft: 'Early' }] });
+    held.send({ stet: 'mode', mode: 'edit' });
+    held.send({ stet: 'edit', key: 'k', locale: 'default', form: 'inplace', oneLine: true });
+    await tick();
+    expect(held.sent).toEqual([]);
+    expect(h1.textContent).toBe('Ship the copy');
+    expect(h1.hasAttribute('contenteditable')).toBe(false);
+    // It announces itself after `load` and two animation frames, and then takes the layer.
+    Object.defineProperty(held.doc, 'readyState', { value: 'complete', configurable: true });
+    held.win.dispatchEvent(new held.win.Event('load'));
+    await tick(80);
+    expect(held.sent.map((m) => m['stet'])).toEqual(['ready']);
+    held.send({ stet: 'layer', drafts: [{ key: 'k', texts: ['Ship the copy'], draft: 'On time' }] });
+    await tick();
+    expect(h1.textContent).toBe('On time');
+  });
+
+  it("Requirement: Shared spots and the route's reads are named", async () => {
+    // A key in the nav and the heading: the hover names the other place, and the editor header lists both.
+    const RECT_ = RECT;
+    const { page, agent } = await bridged({
+      site: labSite(),
+      routes: [
+        [
+          '/api/site/marks',
+          200,
+          {
+            documents: [],
+            keys: {},
+            places: {
+              hero_headline: [
+                { file: 'app/(app)/inbox/page.tsx', line: 9, kind: 'headline', tag: 'h1' },
+                { file: 'components/AppShell.tsx', line: 12, kind: 'text in components/AppShell.tsx' },
+              ],
+            },
+          },
+        ],
+      ],
+    });
+    await agent.census({ found: { hero_headline: 2, loose_key: 2 } });
+    const label = byId(page, 'hoverlabel');
+    await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: null, by: 'whole' }], tag: 'a', rect: RECT_, inplace: true });
+    expect(label.hidden).toBe(false);
+    expect([...label.children].map((line) => line.textContent)).toEqual(['link text · hero_headline', 'also in app/(app)/inbox/page.tsx:9']);
+    await agent.tell({ stet: 'hover', keys: [{ key: 'loose_key', attr: 'aria-label', by: 'attr' }], tag: 'button', rect: RECT_, inplace: false });
+    expect([...label.children].map((line) => line.textContent)).toEqual(['aria label · loose_key', 'also on 1 other spot']);
+    await agent.pick([{ key: 'hero_headline' }]);
+    expect(byId(page, 'shared').textContent).toBe('Shown in 2 places on this page · app/(app)/inbox/page.tsx:9 · components/AppShell.tsx:12');
+    page.dom.window.close();
+
+    // A text match no file reads: dashed, and the pane note carries the route-level warning. The route's reads are the route's files' keys.
+    const WARN = 'This text matches hero_headline, but no file on this page reads that key — saving may not change it.';
+    const warned = await bridged({
+      site: labSite(),
+      routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: true }]],
+    });
+    await warned.agent.pick([{ key: 'hero_headline', by: 'whole' }]);
+    expect(lines(warned.page)).toContain(WARN);
+    expect(warned.agent.locates().at(-1)).toMatchObject({ key: 'hero_headline', guess: true });
+    // A mark is certain, and a route whose reads are incomplete never warns.
+    await warned.agent.pick([{ key: 'hero_headline', by: 'mark' }]);
+    expect(lines(warned.page)).not.toContain(WARN);
+    warned.page.answer('/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: false });
+    await warned.page.act('previewLoad');
+    await warned.agent.load();
+    await warned.agent.ready();
+    await warned.agent.pick([{ key: 'hero_headline', by: 'whole' }]);
+    expect(lines(warned.page)).not.toContain(WARN);
+    warned.page.dom.window.close();
+
+    // `GET /api/site/route-reads` itself: the keys named in a page's files and their import closure, through the host's alias.
+    const next = mkdtempSync(join(tmpdir(), 'stet-walk-routes-'));
+    try {
+      const at = (rel: string, text: string): void => {
+        mkdirSync(join(next, rel, '..'), { recursive: true });
+        writeFileSync(join(next, rel), text);
+      };
+      at('stet.config.json', JSON.stringify({ project: 't', managedSurfaces: ['app/**/*.tsx'], router: 'app', readPath: { file: 'lib/content.ts', import: '@/lib/content' } }));
+      at('content/descriptor.json', JSON.stringify({ version: 1, keys: { nav_link: { shape: 'text', target: 'web' }, page_title: { shape: 'text', target: 'web' } } }));
+      at('content/defaults.json', JSON.stringify({ default: { nav_link: 'Docs', page_title: 'Hello' } }));
+      at('lib/content.ts', 'export const copy = (k: string): string => k;\n');
+      at('tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } }));
+      at('app/layout.tsx', "export default function L({ children }: { children: unknown }) { return children; }\n");
+      at('app/page.tsx', "import { Nav } from '@/components/Nav';\nimport { copy } from '@/lib/content';\nexport default function P() { return <><Nav /><h1>{copy('page_title')}</h1></>; }\n");
+      at('components/Nav.tsx', "import { copy } from '@/lib/content';\nexport const Nav = () => <a>{copy('nav_link')}</a>;\n");
+      execFileSync('git', ['init', '-q'], { cwd: next });
+      execFileSync('git', ['add', '-A'], { cwd: next });
+      const { handler } = handlerOver([next]);
+      const reads = await handler(req(`/api/site/route-reads?route=%2F&site=${encodeURIComponent(realpathSync(next))}`));
+      expect(reads.status).toBe(200);
+      const body = (await reads.json()) as { files: string[]; keys: string[]; complete: boolean };
+      expect(body.keys.sort()).toEqual(['nav_link', 'page_title']);
+      expect(body.files).toContain('app/page.tsx');
+      expect(body.complete).toBe(true);
+    } finally {
+      rmSync(next, { recursive: true, force: true });
+    }
   });
 });

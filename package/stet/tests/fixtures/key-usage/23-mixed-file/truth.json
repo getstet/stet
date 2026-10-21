@@ -1,0 +1,8 @@
+{
+  "live": [
+    "home_title",
+    "pricing_title",
+    "footer_note"
+  ],
+  "note": "adversarial: a file with a visible prefix AND a read with no prefix; the rule's 'no prefix visible' test is per file"
+}

@@ -145,6 +145,13 @@ export interface StetConfig {
    * selects among for contacts, as the top-level map is for content.
    */
   contacts?: { store: StoreBlock; environments?: Record<string, StoreBlock> };
+  /**
+   * The host function `stet email test` hands one rendered email to, in the
+   * render pointer's shape: a file inside the project and the export that
+   * takes `{ to, subject, html, template }`. Absent, the command says so and
+   * renders nothing.
+   */
+  emailSend?: { file: string; export: string };
   descriptorPath: string;
   snapshotPath: string;
   bundlePath: string;
@@ -390,6 +397,16 @@ export function loadConfig(cwd: string): StetConfig {
     config.contacts = { store: parseStoreBlock(contacts['store'], 'contacts.store') };
     const named = obj(contacts, 'environments');
     if (named) config.contacts.environments = parseEnvironments(named, 'contacts.environments');
+  }
+
+  const emailSend = obj(source, 'emailSend');
+  if (emailSend) {
+    const file = str(emailSend, 'file', '', 'emailSend.');
+    const exportName = str(emailSend, 'export', '', 'emailSend.');
+    if (file === '' || exportName === '') {
+      throw new CliError(`${CONFIG_FILE}: emailSend needs a file and an export — the host function that sends one email`);
+    }
+    config.emailSend = { file, export: exportName };
   }
 
   config.managedSurfaces = stringArray(source, 'managedSurfaces', config.managedSurfaces);

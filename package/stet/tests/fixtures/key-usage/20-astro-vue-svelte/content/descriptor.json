@@ -1,0 +1,19 @@
+{
+  "keys": {
+    "hero_title": {
+      "shape": "text"
+    },
+    "hero_sub": {
+      "shape": "text"
+    },
+    "nav_label": {
+      "shape": "text"
+    },
+    "cta_label": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

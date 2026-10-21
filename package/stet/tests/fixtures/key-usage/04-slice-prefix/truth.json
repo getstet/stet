@@ -1,0 +1,7 @@
+{
+  "live": [
+    "home_live_kicker",
+    "home_live_headline"
+  ],
+  "note": "Mirra's slice-by-prefix with c.<key> reads; home_live_lead is dead but under the prefix"
+}

@@ -92,9 +92,12 @@ npx stet hook install                    # the pre-commit gate
 - **Page declaration from your routes.** `stet pages scan` reads your
   file-based routing convention, proposes page records with scaffolded SEO
   keys, and writes nothing without `--apply`.
-- **Email custody.** `stet email extract` adopts template copy into slots;
-  `stet email verify` proves the rendered output byte-identical through your
-  own renderer.
+- **Email custody.** `stet email extract` adopts template copy into slots,
+  including templates written as a string constant, a registry's subject and a
+  shared frame function; `stet email verify` proves the rendered output
+  byte-identical through your own renderer; `stet email render` writes an email
+  as it would be sent; `stet email test` sends one through your own send
+  function.
 - **A real exit.** `stet eject` un-rewrites your source, writes the content
   back, and removes the dependency. Adoption is reversible by construction.
   `stet hook remove` takes a checkout out of the pre-commit gate and leaves stet
@@ -138,6 +141,82 @@ token is minted per run, carried in the URL the terminal prints, and taken out
 of every child process the server starts. Anyone who can reach the port and
 holds that token can edit every checkout in the workspace file and run commands
 as you: the dev command a site's Setup names is run through your shell.
+
+### Editing in the preview
+
+The preview pane has an `Edit | Use` switch, set to Edit when the Content tab
+opens. In Edit, hovering copy rings it and names its key, and a click selects
+that key; the page's own handlers do not run, so a link does not navigate and a
+button does not fire. In Use the page behaves as it does without stet. E
+switches between the two when focus is in no field.
+
+A second click, a double click or Enter on selected copy edits the text where
+it stands, with the whole text selected so typing replaces it. Enter keeps the
+edit and Esc puts the text back. Copy that shares its element with other text,
+a value carrying `{{name}}`, an attribute such as alt text, and every tap at a
+viewport 760 px wide or narrower open the dashboard's field instead, with the
+key's counter beside it. What is typed is an unsaved edit until Save; the page shows
+every saved and unsaved draft at once, and the header's unsaved list undoes
+each one.
+
+A key with no matching text on the page says so, and names the keys the open
+route's files read that the page did not show. A key shown in more than one
+place says so before the first keystroke.
+
+### Key badges
+
+Each key shows whether the source reads it. A key some scanned file names shows
+no badge. A key no file names shows `not found in any file stet searched`, and
+`may be a leftover` once the preview has visited every page the descriptor
+declares without finding its text. A key stet cannot judge, because a file
+reads copy through a computed key such as ``copy(`tier_${id}`)``, shows
+`unknown` with the prefix and the read that taught it, and a read stet cannot
+follow at all adds one line above the key list naming it. `stet list --json`
+carries the same judgment in each row as `badge` (`read`, `unknown` or
+`not_found`), with `usage` listing the learnt prefixes and the reads stet could
+not follow. The scan only reads files, and `badge` gates no command.
+
+### Drafts, changes and history
+
+On a store-backed project the page shows each saved draft as `draft ·
+<editor> · <time>`. A save over another editor's draft asks `Save yours over
+it?` with Take over and Keep theirs. Two tabs of one browser profile share one editor name, so no ask
+appears between them. The change bar groups edits
+into a change that publishes, previews before and after, and reverts as one
+unit. Each key's History lists its past values and restores one.
+
+On a snapshot-only project a save is refused for a key that changed on disk
+since the page loaded, naming the new words with Use theirs and Save mine over
+it. The Commit button opens what the commit carries, with a word diff per key
+and Put back. A key's History comes from git.
+
+### Email preview
+
+The Templates tab renders each email that has a render pointer through your own
+renderer, with the slot drafts laid in. A click on the rendered text opens the
+slot that wrote it.
+
+On a store-backed project each template also has Test send, which sends the
+saved drafts to the address typed there through the function `emailSend` names
+in `stet.config.json`:
+
+```json
+"emailSend": { "file": "lib/mail.ts", "export": "sendMail" }
+```
+
+The function receives `{ to, subject, html, template }`. The same function
+serves the terminal:
+
+```sh
+npx stet email render welcome --draft --out welcome.html
+npx stet email test welcome --to you@example.com --draft
+```
+
+`email render` writes the email to `--out` byte for byte. Without `--out` it
+writes the markup to stdout followed by one newline, so `stet email render
+welcome > welcome.html` holds the markup plus that newline. `email test` prints
+`sent <template> to <address>` on success and exits 1 with the host function's
+error when it throws.
 
 ## The store, when you want one
 

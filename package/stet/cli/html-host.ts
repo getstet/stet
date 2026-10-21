@@ -99,7 +99,7 @@ const VOID = new Set([
 ]);
 
 /** Read whole to the matching close tag as ONE text segment — their content is text, not markup. */
-const RCDATA = new Set(['title', 'textarea']);
+export const RCDATA: ReadonlySet<string> = new Set(['title', 'textarea']);
 
 /**
  * Read whole to the matching close tag and never entered: nothing inside is copy

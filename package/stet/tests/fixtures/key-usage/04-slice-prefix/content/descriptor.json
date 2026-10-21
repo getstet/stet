@@ -1,0 +1,19 @@
+{
+  "keys": {
+    "home_live_kicker": {
+      "shape": "text"
+    },
+    "home_live_headline": {
+      "shape": "text"
+    },
+    "home_live_lead": {
+      "shape": "text"
+    },
+    "home_faq_1_question": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

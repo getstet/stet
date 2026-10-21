@@ -1,0 +1,16 @@
+{
+  "copyModules": [],
+  "descriptorPath": "content/descriptor.json",
+  "snapshotPath": "content/defaults.json",
+  "codegen": {
+    "defaults": "content/defaults.ts",
+    "registry": "content/keys.ts"
+  },
+  "readPath": {
+    "file": "lib/content.ts",
+    "import": "@/lib/content"
+  },
+  "managedSurfaces": [
+    "app/**/*.tsx"
+  ]
+}

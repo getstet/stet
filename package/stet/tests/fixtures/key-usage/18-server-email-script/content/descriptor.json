@@ -1,0 +1,19 @@
+{
+  "keys": {
+    "hero_title": {
+      "shape": "text"
+    },
+    "api_error": {
+      "shape": "text"
+    },
+    "welcome_subject": {
+      "shape": "text"
+    },
+    "og_title": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

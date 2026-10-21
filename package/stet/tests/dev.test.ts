@@ -29,22 +29,29 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createMemoryStore } from '../adapters/store-memory.js';
+import { createStetHandler } from '../server/mount.js';
+import type { StoreAdapter } from '../src/store.js';
+import { closeFrames, frame as frameAgent, tick, type Framed } from './helpers/preview-frame.js';
 import { cleanupCliHosts, fakeFetch, htmlFixture, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
 import { cleanupEmailHosts, makeEmailHost } from './helpers/email-host.js';
 import { handlerOver, NONCE, paintPage, req, TOKEN, type PaintedPage } from './helpers/dashboard-page.js';
+import { cleanupOutsideFiles, linkOut, outsideFile, previewHost, SNAPSHOT, type PreviewHost } from './helpers/email-preview-host.js';
+import { runtimeImportClosure } from './helpers/source-roster.js';
 import { builtBinExists, installStetShim } from './helpers/stet-shim.js';
 import { writeJsonDeterministic } from '../cli/artifacts.js';
 import { check } from '../cli/check.js';
+import { mountRenderer, mountSender } from '../cli/email-preview.js';
 import { loadConfig } from '../cli/config.js';
 import { planDocuments } from '../cli/html-host.js';
-import { HEAD_KINDS } from '../cli/key-names.js';
+import { HEAD_KINDS, kindOf } from '../cli/key-names.js';
 import { Report } from '../cli/report.js';
 import {
   captured,
   createDevHandler,
+  importsLazily,
   githubRepoOf,
   previewOfSummary,
   stopEveryChild,
@@ -57,9 +64,11 @@ import { git, gitData, gitRun, gitState, operationInProgress, pushRemoteOf, unco
 import { runHookInstall } from '../cli/hook.js';
 import { gone } from '../cli/liveness.js';
 import { runCli, type CliIo } from '../cli/main.js';
+import { loadTypescript } from '../cli/source-scan.js';
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptor, loadSnapshot, resolve } from '../src/index.js';
 import { derivedText } from '../src/resolve.js';
+import { pageSpan } from '../src/preview.js';
 import { PLACEHOLDER } from '../src/validate.js';
 import type { Descriptor } from '../src/types.js';
 import {
@@ -86,6 +95,7 @@ import {
 
 afterAll(cleanupCliHosts);
 afterAll(cleanupEmailHosts);
+afterAll(cleanupOutsideFiles);
 
 /** A temp directory that is not a checkout — for the paths a rule has to refuse. */
 function tempDir(prefix = 'stet-dev-'): string {
@@ -591,6 +601,24 @@ describe('the workspace file', () => {
     expect(readWorkspace(file).sites).toEqual([]);
   });
 
+  it('stores a trimmed display name, and an empty one clears it (journey A22)', () => {
+    const file = workspaceFile();
+    const dir = tempDir();
+    addSite(file, dir);
+    const path = readWorkspace(file).sites[0]?.path as string;
+
+    updateSite(file, path, { name: '  Taskboard ' });
+    expect(readWorkspace(file).sites[0]).toEqual({ path, name: 'Taskboard' });
+    // Another field's update leaves the name where it is.
+    updateSite(file, path, { devCommand: 'npm run dev' });
+    expect(readWorkspace(file).sites[0]).toMatchObject({ name: 'Taskboard', devCommand: 'npm run dev' });
+    updateSite(file, path, { name: '' });
+    expect('name' in (readWorkspace(file).sites[0] as object)).toBe(false);
+    updateSite(file, path, { name: 'Again' });
+    updateSite(file, path, { name: '   ' });
+    expect('name' in (readWorkspace(file).sites[0] as object)).toBe(false);
+  });
+
   it('derives a stable twelve-hex id from the path', () => {
     expect(siteId('/abs/one')).toMatch(/^[0-9a-f]{12}$/);
     expect(siteId('/abs/one')).toBe(siteId('/abs/one'));
@@ -639,6 +667,43 @@ describe('loadSite', () => {
     expect(site.git.head).toMatch(/^[0-9a-f]{7,}$/);
     expect(site.project).toBe('t');
     expect(site.router).toBe(loadConfig(host.cwd).router);
+  });
+
+  it('shows an entry’s display name with its folder, and the folder name alone where none is set (journey A22)', () => {
+    const host = gitHost({ config: { project: 't' } });
+    const folder = host.cwd.split('/').pop() as string;
+    const plain = loadSite({ path: host.cwd });
+    expect(plain).toMatchObject({ state: 'ready', name: folder });
+    expect('folder' in plain).toBe(false);
+    const named = loadSite({ path: host.cwd, name: 'Taskboard' });
+    expect(named).toMatchObject({ state: 'ready', name: 'Taskboard', folder });
+
+    const blank = tempDir();
+    expect(loadSite({ path: blank, name: 'Soon' })).toMatchObject({ state: 'not-adopted', name: 'Soon', folder: blank.split('/').pop() });
+    write(blank, 'stet.config.json', JSON.stringify({ project: 't', host: 'static' }));
+    expect(loadSite({ path: blank, name: 'Soon' })).toMatchObject({ state: 'broken', name: 'Soon', folder: blank.split('/').pop() });
+  });
+
+  it('renames through workspace/update, lists the name, and leaves the folder alone (journey A22)', async () => {
+    const host = gitHost({ config: { project: 't' } });
+    const { handler, file } = handlerOver([host.cwd]);
+    const path = readWorkspace(file).sites[0]?.path as string;
+    const listed = async (): Promise<Array<Record<string, unknown>>> =>
+      ((await (await handler(req('/api/workspace'))).json()) as { sites: Array<Record<string, unknown>> }).sites;
+
+    const renamed = await handler(req('/api/workspace/update', { method: 'POST', body: { path, name: ' Taskboard ' } }));
+    expect(renamed.status).toBe(200);
+    expect(((await renamed.json()) as { sites: Array<Record<string, unknown>> }).sites[0]).toMatchObject({ name: 'Taskboard', folder: path.split('/').pop() });
+    expect((await listed())[0]).toMatchObject({ name: 'Taskboard' });
+    const site = (await (await handler(req(`/api/site?site=${encodeURIComponent(path)}`))).json()) as Record<string, unknown>;
+    expect(site).toMatchObject({ name: 'Taskboard', folder: path.split('/').pop() });
+    expect(existsSync(path)).toBe(true);
+
+    await handler(req('/api/workspace/update', { method: 'POST', body: { path, name: '' } }));
+    expect(readWorkspace(file).sites).toEqual([{ path }]);
+    const cleared = (await listed())[0] as Record<string, unknown>;
+    expect(cleared['name']).toBe(path.split('/').pop());
+    expect('folder' in cleared).toBe(false);
   });
 
   it('carries the project id and the router into the workspace listing', async () => {
@@ -1145,7 +1210,7 @@ describe('withEnvFilesHint', () => {
       ),
     ).toBe(
       "store adapter 'pg' is configured but DATABASE_URL is unset — " +
-        "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
+        "stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in",
     );
     const driver =
       "store adapter 'pg' needs the optional peer dependency `pg`, which is not installed — " +
@@ -1510,6 +1575,110 @@ describe('GET /api/site', () => {
     expect((await ask()).environments[0].vars).toEqual([{ name: 'DATABASE_URL', set: true }]);
     // The offline guard is the proof nothing was dialed: a real pg connection
     // would have to open a socket, and this suite refuses one.
+  });
+
+  describe('previewReads, where the preview’s words come from (journey B8)', () => {
+    const STAGING = 'postgres://staging.example/db';
+    const PROD = 'postgres://prod.example/db';
+    /** A store site with a staging and a prod environment, its read path as the caller writes it, and `.env` lines. */
+    function storeSite(read: string, envFile: string): CliHost {
+      const host = snapshotHost();
+      writeFileSync(
+        join(host.cwd, 'stet.config.json'),
+        JSON.stringify(
+          {
+            project: 't',
+            store: { adapter: 'pg', urlEnv: 'DATABASE_URL' },
+            environments: {
+              staging: { adapter: 'pg', urlEnv: 'STAGING_DATABASE_URL' },
+              prod: { adapter: 'pg', urlEnv: 'PROD_DATABASE_URL' },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      writeFileSync(join(host.cwd, 'lib/content.ts'), read);
+      writeFileSync(join(host.cwd, '.env'), envFile);
+      return host;
+    }
+    const ask = async (host: CliHost, over: Partial<Parameters<typeof handlerOver>[1] & object> = {}): Promise<{ text: string; body: any }> => {
+      const { handler } = handlerOver([host.cwd], over);
+      const text = await (await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.cwd))}`))).text();
+      return { text, body: JSON.parse(text) };
+    };
+
+    it('names no source of words for an html host, whose preview is its documents (F3)', async () => {
+      const html = await makeHtmlHost();
+      expect((await ask(html)).body.previewReads).toBeNull();
+    });
+
+    it('reads the stores where the snapshot’s path appears only in comments (D56)', async () => {
+      const read = [
+        "// const READ_FROM = join(process.cwd(), 'content/defaults.json');",
+        '/* the old path: "content/defaults.json"',
+        '   `content/defaults.json` */',
+        'export const live = 1;',
+        '',
+      ].join('\n');
+      const host = storeSite(read, `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\nPROD_DATABASE_URL=${PROD}\n`);
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: true, staging: true, prod: false } });
+    });
+
+    it('names the snapshot for a live literal beside a commented one, and past a URL string holding // (D56)', async () => {
+      const beside = storeSite("// const OLD = 'content/defaults.json';\nconst READ_FROM = join(cwd, 'content/defaults.json');\n", `DATABASE_URL=${STAGING}\n`);
+      expect((await ask(beside)).body.previewReads).toEqual({ snapshot: 'content/defaults.json' });
+      const url = storeSite("const A = 'http://example.test/x', READ_FROM = join(cwd, 'content/defaults.json'); // trailing\n", `DATABASE_URL=${STAGING}\n`);
+      expect((await ask(url)).body.previewReads).toEqual({ snapshot: 'content/defaults.json' });
+    });
+
+    it('names the snapshot where the read path holds its path as a string literal', async () => {
+      for (const quote of ["'", '"', '`']) {
+        const host = storeSite(`import { join } from 'node:path';\nconst READ_FROM = join(process.cwd(), ${quote}content/defaults.json${quote});\n`, `DATABASE_URL=${STAGING}\n`);
+        expect((await ask(host)).body.previewReads).toEqual({ snapshot: 'content/defaults.json' });
+      }
+    });
+
+    it('reads the stores where the read path names another file', async () => {
+      const host = storeSite("const READ_FROM = 'content/other.json';\n", `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\n`);
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: true, staging: true, prod: false } });
+    });
+
+    it('says per environment whether the dev server’s connection variable holds that environment’s value', async () => {
+      const host = storeSite("export const x = 1;\n", `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\nPROD_DATABASE_URL=${PROD}\n`);
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: true, staging: true, prod: false } });
+      // Nothing set: no environment is the dev server's own.
+      writeFileSync(join(host.cwd, '.env'), `STAGING_DATABASE_URL=${STAGING}\n`);
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: false, staging: false, prod: false } });
+      // Two unset variables are not equal values.
+      writeFileSync(join(host.cwd, '.env'), 'DATABASE_URL=\nPROD_DATABASE_URL=\n');
+      expect((await ask(host)).body.previewReads).toEqual({ stores: { default: false, staging: false, prod: false } });
+    });
+
+    it('reads the shell’s value for the started-in project, as the dev command receives it', async () => {
+      const host = storeSite("export const x = 1;\n", `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\nPROD_DATABASE_URL=${PROD}\n`);
+      const prior = process.env['DATABASE_URL'];
+      process.env['DATABASE_URL'] = PROD;
+      try {
+        const started = await ask(host, { launched: realpathSync(host.cwd) });
+        expect(started.body.previewReads).toEqual({ stores: { default: true, staging: false, prod: true } });
+        expect((await ask(host)).body.previewReads).toEqual({ stores: { default: true, staging: true, prod: false } });
+      } finally {
+        if (prior === undefined) delete process.env['DATABASE_URL'];
+        else process.env['DATABASE_URL'] = prior;
+      }
+    });
+
+    it('never carries a connection value in the reply', async () => {
+      const host = storeSite("export const x = 1;\n", `DATABASE_URL=${STAGING}\nSTAGING_DATABASE_URL=${STAGING}\nPROD_DATABASE_URL=${PROD}\n`);
+      const { text, body } = await ask(host);
+      expect(body.previewReads.stores).toEqual({ default: true, staging: true, prod: false });
+      expect(text).not.toContain(STAGING);
+      expect(text).not.toContain(PROD);
+      expect(text).not.toContain('staging.example');
+      const snapshot = storeSite("const R = 'content/defaults.json';\n", `DATABASE_URL=${STAGING}\n`);
+      expect((await ask(snapshot)).text).not.toContain('staging.example');
+    });
   });
 
   it('answers a not-adopted and a broken site with what they are, and no forms', async () => {
@@ -2120,6 +2289,367 @@ const DERIVE_KEYS = {
   p: 'home_page_paragraph',
   description: 'home_meta_description',
 };
+
+describe('the stale base on a snapshot save (D10, 9.1)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  /** Every file the save batch writes, as bytes: the forms plus the descriptor. */
+  const allForms = (cwd: string): Record<string, Buffer> => ({
+    ...forms(cwd),
+    'content/descriptor.json': readFileSync(join(cwd, 'content/descriptor.json')),
+    'content/resolved.ts': readFileSync(join(cwd, 'content/resolved.ts')),
+  });
+  /** An agent's write: the snapshot file edited on disk behind the page's back. */
+  function agentWrites(cwd: string, values: Record<string, unknown>): void {
+    const file = join(cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    Object.assign(snapshot.default, values);
+    writeJsonDeterministic(file, snapshot);
+  }
+
+  it('F3 (R5-6): an agent write that lands while the body is still arriving is stale, and no other key the agent wrote is reverted', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const body = JSON.stringify({
+      values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline', base: 'Never miss a post again.' }],
+    });
+    const enc = new TextEncoder();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(enc.encode(body.slice(0, 5)));
+        await gate;
+        controller.enqueue(enc.encode(body.slice(5)));
+        controller.close();
+      },
+    });
+    const pending = handler(
+      new Request(`http://127.0.0.1:4400/api/site/save${at(host)}`, {
+        method: 'POST',
+        headers: { host: '127.0.0.1:4400', authorization: `Bearer ${TOKEN}` },
+        body: stream,
+        duplex: 'half',
+      } as RequestInit),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    agentWrites(host.cwd, { hero_headline: 'The agent’s headline', pricing_price: '$18' });
+    const written = allForms(host.cwd);
+    release();
+    const res = await pending;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    expect(allForms(host.cwd)).toEqual(written);
+    expect(JSON.parse(host.file('content/defaults.json')).default.pricing_price).toBe('$18');
+  });
+
+  it('F3: a config turned store-backed while the body arrives is refused as store-backed, and nothing is written', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const body = JSON.stringify({ values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline' }] });
+    const enc = new TextEncoder();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(enc.encode(body.slice(0, 5)));
+        await gate;
+        controller.enqueue(enc.encode(body.slice(5)));
+        controller.close();
+      },
+    });
+    const pending = handler(
+      new Request(`http://127.0.0.1:4400/api/site/save${at(host)}`, {
+        method: 'POST',
+        headers: { host: '127.0.0.1:4400', authorization: `Bearer ${TOKEN}` },
+        body: stream,
+        duplex: 'half',
+      } as RequestInit),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const config = JSON.parse(host.file('stet.config.json'));
+    writeFileSync(join(host.cwd, 'stet.config.json'), JSON.stringify({ ...config, store: { adapter: 'memory' } }));
+    const written = allForms(host.cwd);
+    release();
+    const res = await pending;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'a store-backed site is edited through its mounted API — use Save draft' });
+    expect(allForms(host.cwd)).toEqual(written);
+  });
+
+  it('refuses a key an agent wrote after the page loaded, naming it with the agent’s words, and Save mine over it then writes (journey B18)', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    agentWrites(host.cwd, { hero_headline: 'The agent’s headline', pricing_price: '$18' });
+    const before = allForms(host.cwd);
+
+    const refused = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline', base: 'Never miss a post again.' }],
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body).toEqual({
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    expect(allForms(host.cwd)).toEqual(before);
+
+    // Save mine over it: the batch again, the stale key's base left out.
+    const mine = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline' }],
+    });
+    expect(mine.status).toBe(200);
+    expect(JSON.parse(host.file('content/defaults.json')).default.hero_headline).toBe('The editor’s headline');
+
+    // A key the agent left alone saves with no refusal, whatever else moved on disk.
+    const alone = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_body', locale: 'default', value: 'Follow {{handle}} from Telegram.', base: 'Follow {{handle}} without leaving Telegram.' }],
+    });
+    expect(alone.status).toBe(200);
+    expect(JSON.parse(host.file('content/defaults.json')).default.pricing_price).toBe('$18');
+  });
+
+  // Mutation guard: green on the first build by design; it fails when a base is
+  // compared as it arrives rather than by its canonical form.
+  it('reads a record whose fields arrive in another order as unchanged', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const saved = await post(handler, `/api/site/save${at(host)}`, {
+      values: [
+        {
+          key: 'contact_form_labels',
+          locale: 'default',
+          value: { heading: 'Say hello', submit: 'Send it' },
+          base: { submit: 'Send it', heading: 'Get in touch' },
+        },
+      ],
+    });
+    expect(saved.status).toBe(200);
+    expect(JSON.parse(host.file('content/defaults.json')).default.contact_form_labels.heading).toBe('Say hello');
+  });
+
+  // Mutation guard: green on the first build by design; it fails when a value
+  // sent without a base is checked against the disk anyway.
+  it('checks no value that carries no base', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    agentWrites(host.cwd, { hero_headline: 'The agent’s headline' });
+    const saved = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline' }],
+    });
+    expect(saved.status).toBe(200);
+  });
+
+  // Mutation guard: green on the first build by design; it fails when a key the
+  // disk does not hold reads as anything but the null base the page sends.
+  it('reads a key the disk does not hold as a null base, and a null base against a held value as stale', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    delete snapshot.default['farewell_notice'];
+    writeJsonDeterministic(file, snapshot);
+    const fresh = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'farewell_notice', locale: 'default', value: 'So long.', base: null }],
+    });
+    expect(fresh.status).toBe(200);
+    const held = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_headline', locale: 'default', value: 'Mine', base: null }],
+    });
+    expect(held.status).toBe(409);
+    expect(held.body['stale']).toEqual([{ key: 'hero_headline', locale: 'default', disk: 'Never miss a post again.' }]);
+  });
+
+  // Mutation guard: green on the first build by design; it fails when the disk's
+  // value is looked up with `in`, which finds a member named like Object.prototype's own.
+  it('reads a declared key named like Object.prototype’s own, absent on disk, as a null base', async () => {
+    const host = snapshotHost((descriptor) => {
+      descriptor.keys['constructor'] = { shape: 'text', target: 'web' };
+    });
+    const { handler } = handlerOver([host.cwd]);
+    const saved = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'constructor', locale: 'default', value: 'A value', base: null }],
+    });
+    expect(saved.status).toBe(200);
+  });
+
+  it('writes nothing on a 409, the clean key of the batch included', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    agentWrites(host.cwd, { pricing_price: '$18' });
+    const before = allForms(host.cwd);
+    const refused = await post(handler, `/api/site/save${at(host)}`, {
+      values: [
+        { key: 'hero_headline', locale: 'default', value: 'Clean edit', base: 'Never miss a post again.' },
+        { key: 'pricing_price', locale: 'default', value: '$20', base: '$16' },
+      ],
+    });
+    expect(refused.status).toBe(409);
+    expect((refused.body['stale'] as Array<{ key: string }>).map((s) => s.key)).toEqual(['pricing_price']);
+    expect(allForms(host.cwd)).toEqual(before);
+  });
+
+  it('names a stale key before the gate can refuse it', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    agentWrites(host.cwd, { welcome__subject: 'Hello from the agent' });
+    const refused = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'welcome__subject', locale: 'default', value: 'x'.repeat(200), base: 'Welcome, {{handle}}' }],
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body).toEqual({
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'welcome__subject', locale: 'default', disk: 'Hello from the agent' }],
+    });
+  });
+});
+
+describe('GET /api/site/carries and Put back (D10, 9.2)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  type Carried = { keys: Array<{ key: string; locale: string; head?: unknown; now?: unknown }>; files: string[] };
+  const carried = async (handler: (r: Request) => Promise<Response>, host: CliHost): Promise<Carried> =>
+    (await (await handler(req(`/api/site/carries${at(host)}`))).json()) as Carried;
+
+  it('lists each key that differs from HEAD, and Put back saves HEAD’s value through the gate (journey B18)', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    for (const [key, value] of [['hero_headline', 'A saved headline'], ['pricing_price', '$18']]) {
+      expect((await post(handler, `/api/site/save${at(host)}`, { values: [{ key, locale: 'default', value }] })).status).toBe(200);
+    }
+    const panel = await carried(handler, host);
+    expect(panel.keys).toEqual([
+      { key: 'hero_headline', locale: 'default', head: 'Never miss a post again.', now: 'A saved headline' },
+      { key: 'pricing_price', locale: 'default', head: '$16', now: '$18' },
+    ]);
+    expect(panel.files).toEqual(['content/defaults.json', 'content/defaults.ts', 'content/resolved.ts']);
+
+    const price = panel.keys[1] as { key: string; locale: string; head: unknown; now: unknown };
+    const back = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: price.key, locale: price.locale, value: price.head, base: price.now }],
+    });
+    expect(back.status).toBe(200);
+    expect(JSON.parse(host.file('content/defaults.json')).default.pricing_price).toBe('$16');
+    expect((await carried(handler, host)).keys.map((k) => k.key)).toEqual(['hero_headline']);
+  });
+
+  it('refuses a Put back whose key changed on disk after the panel loaded, naming it', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'pricing_price', locale: 'default', value: '$18' }] });
+    const price = (await carried(handler, host)).keys[0] as { key: string; locale: string; head: unknown; now: unknown };
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    snapshot.default['pricing_price'] = '$19';
+    writeJsonDeterministic(file, snapshot);
+    const before = readFileSync(file);
+    const back = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: price.key, locale: price.locale, value: price.head, base: price.now }],
+    });
+    expect(back.status).toBe(409);
+    expect(back.body['stale']).toEqual([{ key: 'pricing_price', locale: 'default', disk: '$19' }]);
+    expect(readFileSync(file)).toEqual(before);
+  });
+
+  // Addition: guards `carries` comparing HEAD's value and the disk's by their
+  // canonical forms, so a record an agent rewrote with its fields in another
+  // order is not listed as a change.
+  it('lists no key whose record HEAD and the disk hold with their fields in another order', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    const labels = snapshot.default['contact_form_labels'] as Record<string, unknown>;
+    snapshot.default['contact_form_labels'] = Object.fromEntries(Object.entries(labels).reverse());
+    writeFileSync(file, `${JSON.stringify(snapshot, null, 2)}\n`);
+    expect(Object.keys(JSON.parse(readFileSync(file, 'utf8')).default.contact_form_labels)).not.toEqual(Object.keys(labels));
+    expect((await carried(handler, host)).keys).toEqual([]);
+  });
+
+  it('gives a key new since HEAD no head', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    // HEAD holds no value for farewell_notice; the editor gives it one.
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    delete snapshot.default['farewell_notice'];
+    writeJsonDeterministic(file, snapshot);
+    git(host.cwd, ['commit', '-qam', 'farewell_notice unset']);
+    await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'farewell_notice', locale: 'default', value: 'So long.' }] });
+    expect((await carried(handler, host)).keys).toEqual([{ key: 'farewell_notice', locale: 'default', now: 'So long.' }]);
+  });
+});
+
+describe('GET /api/site/key-history (D10, 9.3)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+
+  it('answers a snapshot key’s past values newest first, numbered oldest first (journey B25)', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    for (const value of ['Second headline', 'Third headline']) {
+      const saved = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'hero_headline', value }] });
+      await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['written'] as string[], keys: ['hero_headline'], message: value });
+    }
+    const body = (await (await handler(req(`/api/site/key-history${at(host)}&key=hero_headline&locale=default`))).json()) as {
+      versions: Array<{ n: number; short: string; author: string; value: unknown }>;
+    };
+    expect(body.versions.map((v) => [v.n, v.value, v.author])).toEqual([
+      [3, 'Third headline', 'dev'],
+      [2, 'Second headline', 'dev'],
+      [1, 'Never miss a post again.', 'dev'],
+    ]);
+    expect(body.versions[0]?.short).toMatch(/^[0-9a-f]{7,}$/);
+  });
+
+  it('skips a revision over the 64 MB parse cap, lists the rest and says some are too large', async () => {
+    const host = snapshotHost();
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    for (const value of ['x'.repeat(64 * 1024 * 1024 + 1), 'Back to normal']) {
+      snapshot.default['hero_headline'] = value;
+      writeFileSync(file, JSON.stringify(snapshot));
+      git(host.cwd, ['commit', '-qam', 'edit']);
+    }
+    const { handler } = handlerOver([host.cwd]);
+    const res = await handler(req(`/api/site/key-history${at(host)}&key=hero_headline&locale=default`));
+    expect(await res.json()).toEqual({
+      versions: [
+        expect.objectContaining({ n: 2, value: 'Back to normal' }),
+        expect.objectContaining({ n: 1, value: 'Never miss a post again.' }),
+      ],
+      truncated: true,
+    });
+  });
+
+  it('refuses an undeclared key and a locale that is not enabled before git runs', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    for (const key of ['constructor', '__proto__', '../content/defaults.json', '/etc/passwd', '-n', '--output=/tmp/x']) {
+      const res = await handler(req(`/api/site/key-history${at(host)}&key=${encodeURIComponent(key)}&locale=default`));
+      expect(res.status, key).toBe(400);
+      expect(await res.json()).toEqual({ error: `undeclared key: ${key}` });
+    }
+    for (const locale of ['..', '/etc', '-p', '__proto__']) {
+      const res = await handler(req(`/api/site/key-history${at(host)}&key=hero_headline&locale=${encodeURIComponent(locale)}`));
+      expect(res.status, locale).toBe(400);
+    }
+  });
+
+  it('reads no snapshot outside the checkout, though the repository holds it', async () => {
+    // The checkout is a folder of its repository, and its config points the
+    // snapshot at a file beside the folder, which git would read.
+    const { top, cwd } = subfolderHost();
+    writeFileSync(join(top, 'secret.json'), readFileSync(join(cwd, 'content/defaults.json')));
+    git(top, ['add', 'secret.json']);
+    git(top, ['commit', '-qm', 'beside the checkout']);
+    const config = JSON.parse(readFileSync(join(cwd, 'stet.config.json'), 'utf8')) as Record<string, unknown>;
+    writeFileSync(join(cwd, 'stet.config.json'), JSON.stringify({ ...config, snapshotPath: '../secret.json' }));
+    const { handler } = handlerOver([cwd]);
+    const res = await handler(req(`/api/site/key-history?site=${encodeURIComponent(cwd)}&key=hero_headline&locale=default`));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ versions: [] });
+  });
+});
 
 describe('POST /api/site/commit and /push', () => {
   const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
@@ -3644,6 +4174,14 @@ describe('GET /api/site/removed and POST /api/site/restore (D12)', () => {
   });
 
   describe('refuses, writing nothing', () => {
+    it('for a hash that is not a commit, saying project', async () => {
+      const host = await restoreHost();
+      const { handler } = handlerOver([host.cwd]);
+      const refused = await post(handler, `/api/site/restore${at(host)}`, { sha: 'deadbeef' });
+      expect(refused.status).toBe(400);
+      expect(refused.body['error']).toBe('deadbeef is not a commit of this project');
+    });
+
     it('while a stet file is uncommitted', async () => {
       const host = await restoreHost();
       const sha = removeOperating(host);
@@ -3784,13 +4322,112 @@ describe('GET /api/site/history', () => {
     expect(body.commits.map((c) => c.subject)).toContain('the gone document');
   });
 
-  it('names the mount on a store-backed site', async () => {
+  it('lists a store-backed site’s commits as a snapshot site’s, with no repository answering none', async () => {
     const host = makeCliHost({ config: { project: 't', store: { adapter: 'memory' } } });
     const { handler } = handlerOver([host.cwd]);
     const body = await (
       await handler(req(`/api/site/history?site=${encodeURIComponent(realpathSync(host.cwd))}`))
     ).json();
-    expect(body).toEqual({ mount: `/s/${siteId(realpathSync(host.cwd))}/api/stet/history` });
+    expect(body).toEqual({ commits: [] });
+  });
+});
+
+describe('removed keys and commits on a JavaScript host and a store-backed site (D10, 9.4)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  const rev = (cwd: string, ref: string): string => git(cwd, ['rev-parse', ref]).out.trim();
+  const PAGE = 'app/(marketing)/lab/page.tsx';
+  /** The page at `<sha>^`: `farewell_notice` read in a paragraph on line 20, and named in a comment on line 3. */
+  const labPage = (): string =>
+    [
+      "import { copy } from '@/lib/content';",
+      '',
+      '// farewell_notice was the old footer line',
+      ...Array.from({ length: 13 }, () => ''),
+      'export default function Page() {',
+      '  return (',
+      '    <main>',
+      "      <p>{copy.get('farewell_notice')}</p>",
+      '    </main>',
+      '  );',
+      '}',
+      '',
+    ].join('\n');
+  /** One commit taking `key` (or each of several) out of the descriptor and the snapshot, and `page` written as given; answers its hash. */
+  function removeKey(cwd: string, key: string | string[], page?: string): string {
+    const gone = [key].flat();
+    for (const rel of ['content/descriptor.json', 'content/defaults.json']) {
+      const forms = JSON.parse(readFileSync(join(cwd, rel), 'utf8')) as { keys?: Record<string, unknown>; default?: Record<string, unknown> };
+      for (const name of gone) delete (forms.keys ?? forms.default ?? {})[name];
+      writeJsonDeterministic(join(cwd, rel), forms);
+    }
+    if (page !== undefined) write(cwd, PAGE, page);
+    git(cwd, ['add', '-A']);
+    git(cwd, ['commit', '-qm', `remove ${gone.join(' and ')}`]);
+    return rev(cwd, 'HEAD');
+  }
+
+  it('names where a removed key was shown on a Next host, at the commit’s parent (journey B22)', async () => {
+    const host = snapshotHost();
+    const config = JSON.parse(host.file('stet.config.json')) as Record<string, unknown>;
+    write(host.cwd, 'stet.config.json', JSON.stringify({ ...config, router: 'app', managedSurfaces: ['app/**/*.tsx'] }));
+    write(host.cwd, PAGE, labPage());
+    git(host.cwd, ['add', '-A']);
+    git(host.cwd, ['commit', '-qm', 'the lab page']);
+    const sha = removeKey(host.cwd, 'farewell_notice', labPage().replace("      <p>{copy.get('farewell_notice')}</p>\n", ''));
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/removed${at(host)}&sha=${sha}`)).toEqual({
+      keys: [
+        {
+          key: 'farewell_notice',
+          section: null,
+          text: 'This channel is closing. Thanks for reading.',
+          places: [{ file: PAGE, line: 20, kind: `text in ${PAGE}` }],
+        },
+      ],
+    });
+  });
+
+  // Addition: guards the places read for a commit that removes several keys at
+  // once (git grep takes each key as its own `-e` pattern).
+  it('names where each of several removed keys was shown, in one commit', async () => {
+    const host = snapshotHost();
+    const config = JSON.parse(host.file('stet.config.json')) as Record<string, unknown>;
+    write(host.cwd, 'stet.config.json', JSON.stringify({ ...config, router: 'app', managedSurfaces: ['app/**/*.tsx'] }));
+    write(host.cwd, PAGE, labPage().replace("      <p>{copy.get('farewell_notice')}</p>\n", "      <p>{copy.get('farewell_notice')}</p>\n      <p>{copy.get('footer_links')}</p>\n"));
+    git(host.cwd, ['add', '-A']);
+    git(host.cwd, ['commit', '-qm', 'the lab page']);
+    const sha = removeKey(host.cwd, ['farewell_notice', 'footer_links'], labPage().replace("      <p>{copy.get('farewell_notice')}</p>\n", ''));
+    const { handler } = handlerOver([host.cwd]);
+    const listed = (await get(handler, `/api/site/removed${at(host)}&sha=${sha}`)) as { keys: Array<{ key: string; places: Array<{ file: string; line: number }> }> };
+    expect(listed.keys.map((k) => [k.key, k.places.map((p) => [p.file, p.line])])).toEqual([
+      ['farewell_notice', [[PAGE, 20]]],
+      ['footer_links', [[PAGE, 21]]],
+    ]);
+  });
+
+  it('lists the commits and the keys a commit removed on a store-backed site', async () => {
+    const host = makeCliHost({ config: { project: 't', store: { adapter: 'memory' } } });
+    gitInit(host.cwd);
+    const sha = removeKey(host.cwd, 'farewell_notice');
+    const { handler } = handlerOver([host.cwd]);
+    const history = (await get(handler, `/api/site/history${at(host)}`)) as { commits: Array<{ sha: string; subject: string }> };
+    expect(history.commits.map((c) => c.subject)).toEqual(['remove farewell_notice', 'base']);
+    expect(history.commits[0]?.sha).toBe(sha);
+    const listed = (await get(handler, `/api/site/removed${at(host)}&sha=${sha}`)) as { keys: Array<{ key: string; text: string }> };
+    expect(listed.keys.map((k) => [k.key, k.text])).toEqual([['farewell_notice', 'This channel is closing. Thanks for reading.']]);
+  });
+
+  // Mutation guard: green on the first build by design; it fails when a commit
+  // named like an option is handed to git as one.
+  it('refuses a commit named like an option, a range or a path before git reads it', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const written = join(tempDir(), 'out.txt');
+    for (const sha of ['-n', `--output=${written}`, 'HEAD..HEAD', '/etc/passwd', '../content', '']) {
+      const res = await handler(req(`/api/site/removed${at(host)}&sha=${encodeURIComponent(sha)}`));
+      expect(res.status, sha).toBe(400);
+    }
+    expect(existsSync(written)).toBe(false);
   });
 });
 
@@ -4103,23 +4740,23 @@ describe('GET /api/site/setup and /verify', () => {
 
 // --- the store-backed mount --------------------------------------------------
 
+/** The mount reads the run token from this process's own environment. */
+function withToken(fn: () => Promise<void>): () => Promise<void> {
+  return async () => {
+    const held = process.env['STET_DEV_TOKEN'];
+    process.env['STET_DEV_TOKEN'] = TOKEN;
+    try {
+      await fn();
+    } finally {
+      if (held === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held;
+    }
+  };
+}
+
 describe('the mounted API under /s/<id>/api/stet', () => {
   const mount = (host: CliHost, route: string, query = ''): string =>
     `/s/${siteId(realpathSync(host.cwd))}/api/stet/${route}${query}`;
-
-  /** The mount reads the run token from this process's own environment. */
-  function withToken(fn: () => Promise<void>): () => Promise<void> {
-    return async () => {
-      const held = process.env['STET_DEV_TOKEN'];
-      process.env['STET_DEV_TOKEN'] = TOKEN;
-      try {
-        await fn();
-      } finally {
-        if (held === undefined) delete process.env['STET_DEV_TOKEN'];
-        else process.env['STET_DEV_TOKEN'] = held;
-      }
-    };
-  }
 
   it(
     'answers keys and a draft behind the run token, and refuses a blank editor',
@@ -4158,7 +4795,7 @@ describe('the mounted API under /s/<id>/api/stet', () => {
       expect(unset.status).toBe(409);
       expect(((await unset.json()) as { error: string }).error).toBe(
         "store adapter 'pg' is configured but DATABASE_URL is unset — " +
-          "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in",
+          "stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in",
       );
     }),
   );
@@ -4267,7 +4904,7 @@ describe('the mounted API under /s/<id>/api/stet', () => {
     const PAIR = { project: 't', store: { adapter: 'postgrest', urlEnv: 'STET_POSTGREST_URL', tokenEnv: 'STET_POSTGREST_TOKEN' } };
     const UNSET =
       "store adapter 'postgrest' is configured but STET_POSTGREST_URL is unset — " +
-      "stet dev reads it from the checkout's .env and .env.local, and for the checkout it was started in, from the shell it was started in";
+      "stet dev reads it from the project's .env and .env.local, and for the project it was started in, from the shell it was started in";
 
     /** Two checkouts declaring the pair; the first's `.env.local` holds an older URL. */
     function twoCheckouts(): { a: CliHost; b: CliHost } {
@@ -4435,6 +5072,447 @@ describe('the mounted API under /s/<id>/api/stet', () => {
     }
     // The run is over, so the credential it set is gone with it.
     expect(process.env['STET_DEV_TOKEN']).toBe(held);
+  });
+});
+
+describe('the mount renders email through the pointer in stet dev (D12, 11.3)', () => {
+  const mount = (host: { dir: string }, route: string, query = ''): string =>
+    `/s/${siteId(realpathSync(host.dir))}/api/stet/${route}${query}`;
+  const withDraft = async (headline: string): Promise<StoreAdapter> => {
+    const store = createMemoryStore({ project: 'default' });
+    await store.saveDraft({ key: 'welcome__headline', value: headline, target: 'html-email', editor: 't' });
+    return store;
+  };
+  const storeHost = (opts: Parameters<typeof previewHost>[0] = {}): PreviewHost =>
+    previewHost({ ...opts, config: { store: { adapter: 'memory' }, ...opts.config } });
+  /** The renderer over a host's forms, as `mountRoute` builds it, with its own store. */
+  const rendererOver = (host: PreviewHost, store: StoreAdapter): ReturnType<typeof mountRenderer> =>
+    mountRenderer(
+      { cwd: host.dir, env: {}, stdout: () => {}, stderr: () => {} },
+      {
+        path: host.dir,
+        descriptor: loadDescriptor(JSON.parse(readFileSync(join(host.dir, 'content/descriptor.json'), 'utf8'))),
+        snapshot: loadSnapshot(JSON.parse(readFileSync(join(host.dir, 'content/defaults.json'), 'utf8'))),
+      },
+      store,
+    );
+  const pointTo = (host: PreviewHost, edit: (render: Record<string, unknown>) => void): void => {
+    const path = join(host.dir, 'content/descriptor.json');
+    const descriptor = JSON.parse(readFileSync(path, 'utf8'));
+    edit(descriptor.templates.welcome.render);
+    writeFileSync(path, JSON.stringify(descriptor));
+  };
+
+  it(
+    'the render route renders a string template with the store’s draft',
+    withToken(async () => {
+      const host = storeHost();
+      const store = await withDraft('A headline from the store');
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const res = await handler(req(mount(host, 'render', '?template=welcome')));
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toContain('text/html');
+      const html = await res.text();
+      expect(html).toContain('<h1>A headline from the store</h1>');
+      // The sample props fill {{name}} and the mount's markup carries no preview marker.
+      expect(html).toContain('<p>Hi Ada</p>');
+      expect(html).not.toContain('data-stet');
+    }),
+  );
+
+  it(
+    'the render route falls to the snapshot for a slot with no stored row',
+    withToken(async () => {
+      const host = storeHost();
+      const store = createMemoryStore({ project: 'default' });
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const html = await (await handler(req(mount(host, 'render', '?template=welcome')))).text();
+      expect(html).toContain('<h1>Welcome to mirra</h1>');
+    }),
+  );
+
+  it('test-send renders with opts.override laid over the store values, key by key', async () => {
+    const host = storeHost();
+    const render = rendererOver(host, await withDraft('From the store'));
+    const html = await render('welcome', { override: { welcome__headline: 'From the override' } });
+    expect(html).toContain('<h1>From the override</h1>');
+    // A key the override does not name keeps the store's (or the snapshot's) value.
+    expect(html).toContain('<p>Your first week starts here</p>');
+    // An override that is not text is refused as the CLI's render refuses it.
+    await expect(render('welcome', { override: { welcome__headline: 5 } })).rejects.toThrow(/welcome__headline resolved to a number, not a string/);
+  });
+
+  it('rejects, naming the store’s message, when the store does not answer', async () => {
+    const host = storeHost();
+    const store = createMemoryStore({ project: 'default' });
+    const down = { ...store, read: async () => ({ storeError: true as const, message: 'connection refused' }) } as unknown as StoreAdapter;
+    await expect(rendererOver(host, down)('welcome')).rejects.toThrow('the store did not answer: connection refused');
+  });
+
+  it(
+    'a string map resolves its html member',
+    withToken(async () => {
+      const host = storeHost({
+        template: "export function welcome(p: Record<string, string>) { return { subject: 'S', html: '<b>' + p.welcome__headline + '</b>' }; }\n",
+      });
+      const { handler } = handlerOver([host.dir], { storeFor: () => createMemoryStore({ project: 'default' }) });
+      expect(await (await handler(req(mount(host, 'render', '?template=welcome')))).text()).toBe('<b>Welcome to mirra</b>');
+    }),
+  );
+
+  it('rejects a map with no html member, a runner failure and a slot with no value, each with its sentence', async () => {
+    const store = createMemoryStore({ project: 'default' });
+    const noHtml = rendererOver(storeHost({ template: "export function welcome() { return { subject: 'only' }; }\n" }), store);
+    await expect(noHtml('welcome')).rejects.toThrow('not-renderable: welcome renders a map with no html member — the email is its html');
+    const threw = rendererOver(storeHost({ template: "export function welcome(): string { throw new Error('kaput'); }\n" }), store);
+    await expect(threw('welcome')).rejects.toThrow(/^render-threw: .*kaput/s);
+    const gap = rendererOver(storeHost({ snapshot: { welcome__headline: 'x' } }), store);
+    await expect(gap('welcome')).rejects.toThrow(/welcome__subject/);
+  });
+
+  it(
+    'a render by version rejects: only the host’s own renderEmail can',
+    withToken(async () => {
+      const host = storeHost();
+      const store = createMemoryStore({ project: 'default' });
+      await expect(rendererOver(host, store)('welcome', { version: 3 })).rejects.toThrow("render by version needs the host's renderEmail");
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const res = await handler(req(mount(host, 'render', '?template=welcome&version=3')));
+      expect(res.status).toBe(500);
+      expect(((await res.json()) as { error: string }).error).toBe("render by version needs the host's renderEmail");
+    }),
+  );
+
+  it('rejects a template with no render pointer', async () => {
+    const host = storeHost();
+    const path = join(host.dir, 'content/descriptor.json');
+    const descriptor = JSON.parse(readFileSync(path, 'utf8'));
+    delete descriptor.templates.welcome.render;
+    writeFileSync(path, JSON.stringify(descriptor));
+    await expect(rendererOver(host, createMemoryStore({ project: 'default' }))('welcome')).rejects.toThrow(
+      'welcome has no render pointer — declare one, or render it through the host',
+    );
+  });
+
+  it(
+    'S3: a pointer ../../outside/tpl.ts rejects with the containment line and spawns nothing',
+    withToken(async () => {
+      const host = storeHost();
+      const mark = join(host.dir, 'spawned');
+      const out = outsideFile(
+        host,
+        `export function welcome(): string { require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); return '<p>outside</p>'; }\n`,
+      );
+      pointTo(host, (render) => (render['file'] = out.rel));
+      const line = `${out.rel} is outside the project — a render pointer names a file inside it`;
+      const store = createMemoryStore({ project: 'default' });
+      await expect(rendererOver(host, store)('welcome')).rejects.toThrow(line);
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const res = await handler(req(mount(host, 'render', '?template=welcome')));
+      expect(((await res.json()) as { error: string }).error).toBe(line);
+      expect(existsSync(mark)).toBe(false);
+    }),
+  );
+
+  it('F6c: a template named after an Object.prototype member rejects with the no-render-pointer sentence', async () => {
+    const render = rendererOver(storeHost(), createMemoryStore({ project: 'default' }));
+    for (const name of ['constructor', '__proto__', 'toString']) {
+      await expect(render(name)).rejects.toThrow(`${name} has no render pointer — declare one, or render it through the host`);
+    }
+  });
+
+  it(
+    'F6d: a pointer that escapes the project never reaches the store, on the render route and on the renderer itself',
+    withToken(async () => {
+      const host = storeHost();
+      const out = outsideFile(host, "export function welcome(): string { return '<p>outside</p>'; }\n");
+      pointTo(host, (render) => (render['file'] = out.rel));
+      const base = createMemoryStore({ project: 'default' });
+      let reads = 0;
+      const counting = {
+        ...base,
+        read: async (...args: Parameters<StoreAdapter['read']>) => {
+          reads += 1;
+          return base.read(...args);
+        },
+      } as StoreAdapter;
+      await expect(rendererOver(host, counting)('welcome')).rejects.toThrow('is outside the project');
+      const { handler } = handlerOver([host.dir], { storeFor: () => counting });
+      const res = await handler(req(mount(host, 'render', '?template=welcome')));
+      expect(((await res.json()) as { error: string }).error).toContain('is outside the project');
+      const previewed = await handler(
+        req(`/api/site/email-preview?site=${encodeURIComponent(realpathSync(host.dir))}`, { method: 'POST', body: { template: 'welcome' } }),
+      );
+      expect(((await previewed.json()) as { failure: { detail: string } }).failure.detail).toContain('is outside the project');
+      expect(reads).toBe(0);
+    }),
+  );
+
+  it(
+    'a host’s own createStetHandler without renderEmail still answers 501, and its closure reaches no child process',
+    withToken(async () => {
+      const host = storeHost();
+      const handler = createStetHandler({
+        store: createMemoryStore({ project: 'default' }),
+        descriptor: loadDescriptor(JSON.parse(readFileSync(join(host.dir, 'content/descriptor.json'), 'utf8'))),
+        auth: 'STET_DEV_TOKEN',
+      });
+      const res = await handler.GET(req('/api/stet/render?template=welcome'));
+      expect(res.status).toBe(501);
+      expect(((await res.json()) as { error: string }).error).toBe('render is not wired');
+      const closure = runtimeImportClosure(new URL('../server/index.ts', import.meta.url));
+      expect(closure.bare.filter((spec) => /(^|:)child_process$/.test(spec))).toEqual([]);
+      expect(closure.modules.filter((m) => /^(cli|templates)\//.test(m))).toEqual([]);
+    }),
+  );
+});
+
+describe('the dashboard sends a test email through the host’s emailSend (D58)', () => {
+  const SEND =
+    "const { appendFileSync } = require('node:fs');\n" +
+    "const { join } = require('node:path');\n" +
+    "const log = join(__dirname, '..', 'sent.log');\n" +
+    "exports.sendTest = (message) => appendFileSync(log, JSON.stringify(message) + '\\n');\n" +
+    "exports.sendEnv = (message) => appendFileSync(log, JSON.stringify({ ...message, token: process.env.STET_DEV_TOKEN ?? 'unset' }) + '\\n');\n" +
+    "exports.sendDown = () => { throw new Error('smtp down'); };\n" +
+    "exports.sendHang = () => { setInterval(() => {}, 1000); return new Promise(() => {}); };\n";
+  const sendHost = (emailSend: { file: string; export: string } | null = { file: 'lib/send.js', export: 'sendTest' }): PreviewHost =>
+    previewHost({
+      config: { store: { adapter: 'memory' }, ...(emailSend === null ? {} : { emailSend }) },
+      files: { 'lib/send.js': SEND },
+    });
+  const mountOf = (host: PreviewHost, route: string): string => `/s/${siteId(realpathSync(host.dir))}/api/stet/${route}`;
+  const sentLog = (host: PreviewHost): Array<Record<string, any>> => {
+    const path = join(host.dir, 'sent.log');
+    return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [];
+  };
+  const withDraft = async (headline: string): Promise<StoreAdapter> => {
+    const store = createMemoryStore({ project: 'default' });
+    await store.saveDraft({ key: 'welcome__headline', value: headline, target: 'html-email', editor: 't' });
+    return store;
+  };
+  const send = (host: PreviewHost, store: StoreAdapter, body: Record<string, unknown> = { template: 'welcome', to: 'typed@example.test' }) => {
+    const { handler } = handlerOver([host.dir], { storeFor: () => store });
+    return post(handler, mountOf(host, 'test-send'), body);
+  };
+
+  it(
+    'T1: sends the store’s draft to the typed address through the host’s function, with the subject and template, and no marker',
+    withToken(async () => {
+      const host = sendHost();
+      const reply = await send(host, await withDraft('A drafted headline'));
+      expect(reply).toEqual({ status: 200, body: { sent: true } });
+      const lines = sentLog(host);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ to: 'typed@example.test', subject: 'Welcome aboard', template: 'welcome' });
+      expect(lines[0]?.['html']).toContain('<h1>A drafted headline</h1>');
+      expect(lines[0]?.['html']).not.toContain('data-stet');
+    }),
+  );
+
+  it(
+    'T2: without emailSend the route stays 501 and nothing is sent',
+    withToken(async () => {
+      const host = sendHost(null);
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(501);
+      expect(reply.body['error']).toBe('test-send is not wired');
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'T3: a recipient holding a line break is refused with nothing rendered and nothing sent',
+    withToken(async () => {
+      const host = sendHost();
+      const mark = join(host.dir, 'rendered');
+      writeFileSync(
+        join(host.dir, 'lib/email/welcome.ts'),
+        `export function welcome(): string { require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); return '<p>x</p>'; }\n`,
+      );
+      const reply = await send(host, await withDraft('x'), { template: 'welcome', to: 'a@example.test\r\nBcc: b@example.test' });
+      expect(reply.status).toBe(400);
+      expect(sentLog(host)).toEqual([]);
+      expect(existsSync(mark)).toBe(false);
+    }),
+  );
+
+  it(
+    'T4: rendering, reading the keys and saving a draft never send',
+    withToken(async () => {
+      const host = sendHost();
+      const store = await withDraft('x');
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      expect((await handler(req(mountOf(host, 'render') + '?template=welcome'))).status).toBe(200);
+      expect((await handler(req(mountOf(host, 'keys')))).status).toBe(200);
+      const drafted = await post(handler, mountOf(host, 'draft'), { editor: 't', key: 'welcome__headline', value: 'y' });
+      expect(drafted.status).toBe(200);
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'T5: an emailSend file outside the project, or a symlink out of it, answers the containment line and runs nothing',
+    withToken(async () => {
+      const host = sendHost();
+      const mark = join(host.dir, 'outside-ran');
+      const out = outsideFile(host, `require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); exports.sendTest = () => {};\n`);
+      const config = JSON.parse(readFileSync(join(host.dir, 'stet.config.json'), 'utf8'));
+      const store = await withDraft('x');
+      for (const [file, line] of [
+        [out.rel, `${out.rel} is outside the project — a render pointer names a file inside it`],
+        ['lib/linked.js', 'lib/linked.js is outside the project — a render pointer names a file inside it'],
+      ] as const) {
+        if (file === 'lib/linked.js') linkOut(host, file, out.abs);
+        writeFileSync(join(host.dir, 'stet.config.json'), JSON.stringify({ ...config, emailSend: { file, export: 'sendTest' } }));
+        const reply = await send(host, store);
+        expect(reply.status).toBe(500);
+        expect(reply.body['error']).toBe(line);
+      }
+      expect(existsSync(mark)).toBe(false);
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'F4: an emailSend file with no extension whose sibling is a symlink out of the project runs nothing and answers the containment line',
+    withToken(async () => {
+      const host = sendHost();
+      const mark = join(host.dir, 'outside-ran');
+      const out = outsideFile(host, `require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); exports.sendTest = () => {};\n`);
+      linkOut(host, 'lib/linked.js', out.abs);
+      const config = JSON.parse(readFileSync(join(host.dir, 'stet.config.json'), 'utf8'));
+      writeFileSync(join(host.dir, 'stet.config.json'), JSON.stringify({ ...config, emailSend: { file: 'lib/linked', export: 'sendTest' } }));
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(500);
+      expect(reply.body['error']).toBe('lib/linked is outside the project — a render pointer names a file inside it');
+      expect(existsSync(mark)).toBe(false);
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'T6: a host send that throws answers its own error and records nothing',
+    withToken(async () => {
+      const host = sendHost({ file: 'lib/send.js', export: 'sendDown' });
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(500);
+      expect(String(reply.body['error'])).toContain('smtp down');
+      // The host's own error as it stands, not a reason tag put in front of it.
+      expect(String(reply.body['error'])).not.toContain('send-failed');
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'T7: the host send function runs without the dashboard’s run token',
+    withToken(async () => {
+      const host = sendHost({ file: 'lib/send.js', export: 'sendEnv' });
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(200);
+      expect(process.env['STET_DEV_TOKEN']).toBe(TOKEN);
+      expect(sentLog(host)[0]?.['token']).toBe('unset');
+    }),
+  );
+
+  it(
+    'D66: a mount draft of a subject holding a line break is refused (422), and the stored draft is never written',
+    withToken(async () => {
+      const host = sendHost();
+      const store = createMemoryStore({ project: 'default' });
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const reply = await post(handler, mountOf(host, 'draft'), { editor: 'mallory', key: 'welcome__subject', value: 'Hi\r\nBcc: x@evil.test' });
+      expect(reply.status).toBe(422);
+      expect(String(reply.body['error'])).toContain('An email subject fits on one line. Remove the line break.');
+      expect(await store.read({ keys: ['welcome__subject'], preview: true })).toEqual([]);
+    }),
+  );
+
+  it(
+    'D66: a subject with a line break that arrives by a hand-edited snapshot is refused at send, and the sender is never called',
+    withToken(async () => {
+      const host = sendHost();
+      writeFileSync(
+        join(host.dir, 'content/defaults.json'),
+        JSON.stringify({ default: { ...SNAPSHOT, welcome__subject: 'Hi\r\nBcc: x@evil.test' } }),
+      );
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(500);
+      expect(String(reply.body['error'])).toContain('the subject has a line break, which an email header cannot hold');
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  const HANG = 'export function welcome(): Promise<string> {\n  setInterval(() => {}, 1000);\n  return new Promise(() => {});\n}\n';
+
+  it(
+    'F1: a mount render that never returns holds only its own request, not the site’s other routes',
+    withToken(async () => {
+      const host = previewHost({ config: { store: { adapter: 'memory' } }, template: HANG });
+      const { handler } = handlerOver([host.dir], { renderDeadlineMs: 3000, storeFor: () => createMemoryStore({ project: 'default' }) });
+      const started = Date.now();
+      const hung = handler(req(mountOf(host, 'render') + '?template=welcome'));
+      await sleep(500);
+      expect((await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.dir))}`))).status).toBe(200);
+      expect(Date.now() - started).toBeLessThan(2000);
+      const answer = await hung;
+      expect(answer.status).toBe(500);
+      expect(((await answer.json()) as { error: string }).error).toContain('did not finish within 3s');
+    }),
+    15_000,
+  );
+
+  // An addition beyond R5-1: renders run outside the site's queue, so two can ask for the
+  // adapter while the first is still opening it. It guards a second pool being built.
+  it(
+    'two renders asking at once open the site’s store once',
+    withToken(async () => {
+      const host = previewHost({ config: { store: { adapter: 'memory' } } });
+      const store = createMemoryStore({ project: 'default' });
+      let opened = 0;
+      const { handler } = handlerOver([host.dir], {
+        storeFor: () => {
+          opened += 1;
+          return store;
+        },
+      });
+      const replies = await Promise.all([1, 2, 3].map(() => handler(req(mountOf(host, 'render') + '?template=welcome'))));
+      expect(replies.map((r) => r.status)).toEqual([200, 200, 200]);
+      expect(opened).toBe(1);
+    }),
+  );
+
+  it(
+    'F1: a host send function that never returns holds only its own request, not the site’s other routes',
+    withToken(async () => {
+      const host = sendHost({ file: 'lib/send.js', export: 'sendHang' });
+      const { handler } = handlerOver([host.dir], { renderDeadlineMs: 3000, storeFor: () => createMemoryStore({ project: 'default' }) });
+      const started = Date.now();
+      const hung = post(handler, mountOf(host, 'test-send'), { template: 'welcome', to: 'typed@example.test' });
+      await sleep(500);
+      expect((await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.dir))}`))).status).toBe(200);
+      expect(Date.now() - started).toBeLessThan(2000);
+      const answer = await hung;
+      expect(answer.status).toBe(500);
+      expect(String(answer.body['error'])).toContain('did not finish within 3s');
+      expect(sentLog(host)).toEqual([]);
+    }),
+    15_000,
+  );
+
+  // An addition beyond T1-T8: it guards the sender's own refusal when no render came before it in the request.
+  it('the sender refuses what was never rendered in its request, and sends nothing', async () => {
+    const host = sendHost();
+    const site = {
+      path: host.dir,
+      descriptor: loadDescriptor(JSON.parse(readFileSync(join(host.dir, 'content/descriptor.json'), 'utf8'))),
+      snapshot: loadSnapshot(JSON.parse(readFileSync(join(host.dir, 'content/defaults.json'), 'utf8'))),
+    };
+    const io = { cwd: host.dir, env: {}, stdout: () => {}, stderr: () => {} };
+    const sender = mountSender(io, site, { file: 'lib/send.js', export: 'sendTest' }, { current: null });
+    await expect(sender('<p>x</p>', 'me@example.test')).rejects.toThrow('nothing was rendered to send');
+    expect(sentLog(host)).toEqual([]);
   });
 });
 
@@ -5480,6 +6558,13 @@ describe('the static-HTML site’s own files', () => {
     expect(ctx.previewChannel).toBe(preview.channel);
   });
 
+  it('writes no hydration hold on the tag of a static page, which has no hydration to wait for (6.1)', async () => {
+    const { host, handler } = await htmlServerWithContext();
+    const text = await (await handler(req(at(host, ''), { token: null }))).text();
+    expect(text).toMatch(AGENT_TAG);
+    expect(text).not.toContain('data-hold');
+  });
+
   it('serves every other file byte for byte, under the same sandbox', async () => {
     const { host, handler } = await htmlServerWithContext({ 'site.css': 'body { color: #123; } /* é */\n' });
     const css = await handler(req(at(host, 'site.css'), { token: null }));
@@ -5716,6 +6801,7 @@ describe('the page', () => {
       ['/api/site/dev-start', 200, { running: true, state: 'running', pid: 1234, command: 'npx astro dev', lines: [] }],
       ['/api/site/dev-stop', 200, { running: false, state: 'stopped', lines: [] }],
       ['/api/site/marks', 200, { documents: [], keys: {}, places: {} }],
+      ['/api/site/carries', 200, { keys: [], files: ['stet/defaults.json'] }],
       [`/s/${SITE_ID}/api/stet/recent`, 200, { rows: [{ id: 3, key: 'hero_headline', locale: 'default', status: 'published', value: 'Ship the copy', publishedAt: '2026-09-01T10:00:00Z' }], nextBeforeId: null }],
       [`/s/${SITE_ID}/api/stet/keys`, 200, { descriptor, rows: [{ key: 'hero_headline', locale: 'default', status: 'draft', value: 'Later', publishAt: '2026-09-09T09:00:00Z' }] }],
       [`/s/${SITE_ID}/api/stet/changes`, 200, { changes: [{ id: 2, name: 'September prices', note: 'the whole page', status: 'scheduled', authorKind: 'human', publishAt: '2026-09-30T09:00:00Z', createdAt: '2026-09-01T09:00:00Z', revertedAt: null }], nextBeforeId: null }],
@@ -5756,6 +6842,8 @@ describe('the page', () => {
       session?: Record<string, string>;
       /** Run on the page's window before its script. */
       prepare?: (window: Painted['dom']['window']) => void;
+      /** Answers every request to the site's mount (`/s/<id>/api/stet/…`) in place of the table. */
+      mount?: (path: string, body: unknown) => Promise<{ status: number; body: unknown }>;
     } = {},
   ): Promise<Painted> {
     const site = opts.site ?? siteBody();
@@ -5774,7 +6862,8 @@ describe('the page', () => {
       ...(opts.storage === undefined ? {} : { storage: opts.storage }),
       ...(opts.session === undefined ? {} : { session: opts.session }),
       ...(opts.prepare === undefined ? {} : { prepare: opts.prepare }),
-      serve: async (path) => {
+      serve: async (path, body) => {
+        if (opts.mount !== undefined && path.startsWith(`/s/${SITE_ID}/api/stet/`)) return opts.mount(path, body);
         const found = table.get(path.split('?')[0] ?? '');
         if (found === undefined) return { status: 404, body: { error: 'not found' } };
         if (found[2] !== undefined) await new Promise((resolve) => setTimeout(resolve, found[2]));
@@ -6042,6 +7131,7 @@ describe('the page', () => {
       pending: [],
     });
     await page.act('commit');
+    await page.act('commitApply');
     expect(gitButtons(page)).toEqual([
       { label: 'Commit', blue: false, grey: true, title: null },
       { label: 'Push · 1 commit', blue: true, grey: false, title: null },
@@ -6104,9 +7194,233 @@ describe('the page', () => {
     await page.act('save');
     expect(page.dom.window.document.querySelector('#gitbar [data-act="commit"]')).not.toBeNull();
 
+    // Commit opens what the commit carries; its own Commit commits.
+    page.answer('/api/site/carries', 200, { keys: [], files: ['stet/defaults.json'] });
     await page.act('commit');
+    await page.act('commitApply');
     const body = page.sent.filter((r) => r.path.startsWith('/api/site/commit')).at(-1)?.body;
     expect(body).toEqual({ files: ['stet/defaults.json'] });
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('sends each value’s base, names a key changed on disk, and Use theirs or Save mine over it settles it (journey B18)', async () => {
+    const page = await paint();
+    const disk = { ...snapshot, default: { ...snapshot.default, hero_headline: 'The agent’s headline' } };
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'The editor’s headline');
+    await page.act('save');
+    const saves = (): unknown[] => page.sent.filter((r) => r.path.startsWith('/api/site/save')).map((r) => r.body);
+    const asks = (): string[] => [...page.dom.window.document.querySelectorAll('.term')].map((el) => el.textContent ?? '');
+    expect(saves().at(-1)).toEqual({ values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline', base: 'Ship the copy' }] });
+    expect(asks()).toContain('hero_headline changed on disk since you opened it: "The agent’s headline"');
+
+    // Save mine over it: the batch again, the stale key without its base.
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.act('saveMine:0');
+    expect(saves().at(-1)).toEqual({ values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline' }] });
+    expect(asks().filter((line) => line.includes('changed on disk'))).toEqual([]);
+
+    // Use theirs: the draft and its base dropped, and the disk's words read again.
+    page.answer('/api/site', 200, siteBody({ snapshot: disk }));
+    await page.type('text:hero_headline', 'A second try');
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    await page.act('save');
+    const reads = page.requested('/api/site?').length;
+    await page.act('useTheirs:0');
+    expect(page.requested('/api/site?').length).toBe(reads + 1);
+    expect(asks().filter((line) => line.includes('changed on disk'))).toEqual([]);
+    expect((page.dom.window.document.querySelector('[data-act="save"]') as HTMLButtonElement).disabled).toBe(true);
+    expect((page.dom.window.document.querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe(
+      'The agent’s headline',
+    );
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  // Mutation guard: green on the first build by design; it fails when Save mine
+  // over one stale key drops the bases of the others.
+  it('sends Save mine over one of two stale keys without its base and the other with its own', async () => {
+    const page = await paint();
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [
+        { key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' },
+        { key: 'hero_tone', locale: 'default', disk: 'loud' },
+      ],
+    });
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'The editor’s headline');
+    await page.act('key:hero_tone');
+    await page.change('enum:hero_tone', 'loud');
+    await page.act('save');
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_tone', locale: 'default', disk: 'loud' }],
+    });
+    await page.act('saveMine:0');
+    const values = (page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body as { values: unknown[] }).values;
+    expect(values).toEqual([
+      { key: 'hero_headline', locale: 'default', value: 'The editor’s headline' },
+      { key: 'hero_tone', locale: 'default', value: 'loud', base: 'calm' },
+    ]);
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  // Mutation guard: green on the first build by design; it fails when Use theirs
+  // leaves the dropped edit's base behind for the next edit of the key.
+  it('sends a fresh edit after Use theirs with the disk’s word as its base', async () => {
+    const page = await paint();
+    const disk = { ...snapshot, default: { ...snapshot.default, hero_headline: 'The agent’s headline' } };
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'The editor’s headline');
+    await page.act('save');
+    page.answer('/api/site', 200, siteBody({ snapshot: disk }));
+    await page.act('useTheirs:0');
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.type('text:hero_headline', 'A fresh try');
+    await page.act('save');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+      values: [{ key: 'hero_headline', locale: 'default', value: 'A fresh try', base: 'The agent’s headline' }],
+    });
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('reads what the commit carries again after a stale Put back, keeps its line, and sends the new now on the next press', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json'] }) });
+    const carries = (now: string): void =>
+      page.answer('/api/site/carries', 200, {
+        keys: [{ key: 'hero_headline', locale: 'default', head: 'Talk to sales today', now }],
+        files: ['stet/defaults.json'],
+      });
+    carries('Talk to us today');
+    await page.act('commit');
+    const doc = page.dom.window.document;
+    const reads = page.requested('/api/site/carries').length;
+
+    // The file changed again after the panel loaded: the refusal is shown over a panel read again.
+    page.answer('/api/site/save', 409, { error: 'changed on disk since the page loaded', stale: [{ key: 'hero_headline', locale: 'default', disk: 'Talk to the team' }] });
+    carries('Talk to the team');
+    await page.act('putBack:0');
+    expect(page.requested('/api/site/carries').length).toBe(reads + 1);
+    expect(doc.querySelector('#ask .err')?.textContent).toBe('hero_headline changed on disk since you opened it: "Talk to the team"');
+    expect([...doc.querySelectorAll('#ask .term')].map((el) => el.textContent)).toEqual(['Talk to [-sales today-] [+the team+]']);
+
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.act('putBack:0');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+      values: [{ key: 'hero_headline', locale: 'default', value: 'Talk to sales today', base: 'Talk to the team' }],
+    });
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('opens what the commit carries, and Put back saves HEAD’s value with the panel’s now as its base (journey B18)', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json', 'src/stet.ts'] }) });
+    page.answer('/api/site/carries', 200, {
+      keys: [
+        { key: 'hero_headline', locale: 'default', head: 'Talk to sales today', now: 'Talk to us today' },
+        { key: 'loose_key', locale: 'default', head: 'loose', now: 'tight' },
+        { key: 'unseeded_key', locale: 'default', now: 'A new value' },
+      ],
+      files: ['stet/defaults.json', 'src/stet.ts'],
+    });
+    await page.act('commit');
+    const doc = page.dom.window.document;
+    expect(doc.querySelector('#ask h3')?.textContent).toBe('What this commit carries · 3 keys · 2 files');
+    const terms = [...doc.querySelectorAll('#ask .term')].map((el) => el.textContent);
+    expect(terms).toEqual(['Talk to [-sales-] [+us+] today', '[-loose-] [+tight+]', 'A new value']);
+    // A key new since HEAD shows its value with no Put back.
+    expect([...doc.querySelectorAll('#ask [data-act^="putBack:"]')].map((el) => el.getAttribute('data-act'))).toEqual(['putBack:0', 'putBack:1']);
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/commit'))).toEqual([]);
+
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json', 'src/stet.ts'] });
+    page.answer('/api/site/carries', 200, {
+      keys: [{ key: 'hero_headline', locale: 'default', head: 'Talk to sales today', now: 'Talk to us today' }],
+      files: ['stet/defaults.json', 'src/stet.ts'],
+    });
+    await page.act('putBack:1');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+      values: [{ key: 'loose_key', locale: 'default', value: 'loose', base: 'tight' }],
+    });
+    expect(doc.querySelector('#ask h3')?.textContent).toBe('What this commit carries · 1 key · 2 files');
+    expect([...doc.querySelectorAll('#ask .term')].map((el) => el.textContent)).toEqual(['Talk to [-sales-] [+us+] today']);
+
+    // A disk change since the panel loaded: the refusal names the key and the panel stays.
+    page.answer('/api/site/save', 409, { error: 'changed on disk since the page loaded', stale: [{ key: 'hero_headline', locale: 'default', disk: 'Talk to the team' }] });
+    await page.act('putBack:0');
+    expect(doc.querySelector('#ask .err')?.textContent).toBe('hero_headline changed on disk since you opened it: "Talk to the team"');
+
+    await page.act('commitApply');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/commit')).at(-1)?.body).toEqual({ files: ['stet/defaults.json', 'src/stet.ts'] });
+    expect((doc.getElementById('ask') as HTMLElement).hidden).toBe(true);
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('lists a snapshot key’s past values from git, and Restore loads one as an unsaved edit (journey B25)', async () => {
+    const page = await paint();
+    page.answer('/api/site/key-history', 200, {
+      versions: [
+        { n: 3, commit: 'c'.repeat(40), short: 'ccccccc', date: '2026-10-03T09:00:00Z', author: 'Ada', value: 'Ship the copy' },
+        { n: 2, commit: 'b'.repeat(40), short: 'bbbbbbb', date: '2026-10-02T09:00:00Z', author: 'Grace', value: 'Ship it today' },
+        { n: 1, commit: 'a'.repeat(40), short: 'aaaaaaa', date: '2026-10-01T09:00:00Z', author: 'Ada', value: 'First words' },
+      ],
+    });
+    await page.act('key:hero_headline');
+    expect(page.requested('/api/site/key-history')).toEqual([
+      `/api/site/key-history?site=${encodeURIComponent('/checkouts/mini')}&key=hero_headline&locale=default`,
+    ]);
+    const doc = page.dom.window.document;
+    const card = doc.getElementById('keyhistory') as HTMLElement;
+    expect(card.querySelector('h3')?.textContent).toBe('Key history');
+    const lines = [...card.querySelectorAll('.hline')].map((el) => el.textContent ?? '');
+    expect(lines).toHaveLength(3);
+    expect(lines[2]).toMatch(/^v1 · aaaaaaa · 2026-10-0[12] \d\d:\d\d · Ada · First words$/);
+
+    // The third row, restored: the field holds its words, unsaved, and the save carries the stored value as its base.
+    await page.act('gitRestore:1');
+    expect((doc.querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('First words');
+    expect((doc.querySelector('[data-act="save"]') as HTMLButtonElement).disabled).toBe(false);
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.act('save');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+      values: [{ key: 'hero_headline', locale: 'default', value: 'First words', base: 'Ship the copy' }],
+    });
+    // The commit history card says what it lists.
+    expect([...doc.querySelectorAll('h3')].map((el) => el.textContent)).toContain('Commit history');
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('says some older versions are too large to show when git’s history was cut short', async () => {
+    const page = await paint();
+    page.answer('/api/site/key-history', 200, {
+      versions: [{ n: 1, commit: 'a'.repeat(40), short: 'aaaaaaa', date: '2026-10-01T09:00:00Z', author: 'Ada', value: 'First words' }],
+      truncated: true,
+    });
+    await page.act('key:hero_headline');
+    const card = page.dom.window.document.getElementById('keyhistory') as HTMLElement;
+    expect(card.querySelectorAll('.hline')).toHaveLength(1);
+    expect(card.querySelector('.note')?.textContent).toBe('Some older versions are too large to show.');
+
+    // Every version cut: the card still says so.
+    page.answer('/api/site/key-history', 200, { versions: [], truncated: true });
+    await page.act('key:hero_tone');
+    expect(page.dom.window.document.querySelector('#keyhistory .note')?.textContent).toBe('Some older versions are too large to show.');
     expect(page.errors).toEqual([]);
     page.dom.window.close();
   });
@@ -6183,7 +7497,7 @@ describe('the page', () => {
     const reload = await paint({ url: '?site=%2Fcheckouts%2Fmini', session });
     expect(reload.requested('/api/site?')[0]).toBe('/api/site?site=%2Fcheckouts%2Fmini');
     expect(painted(reload)).not.toContain('token is from an earlier run');
-    expect(painted(reload)).toContain('project other-site');
+    expect(painted(reload)).toContain('store id other-site');
     expect(reload.errors).toEqual([]);
     reload.dom.window.close();
   });
@@ -6218,6 +7532,7 @@ describe('the page', () => {
     });
     // No key selected: the card is the page's, not the editor's.
     await page.act('commit');
+    await page.act('commitApply');
     expect(card().hidden).toBe(false);
     expect(card().textContent).toContain("The commit was refused. Git's output is below.");
     expect(card().querySelector('.term')?.textContent).toBe('git commit failed\nerror: hook says no');
@@ -6233,6 +7548,7 @@ describe('the page', () => {
       pending: [],
     });
     await page.act('commit');
+    await page.act('commitApply');
     page.answer('/api/site/push', 409, { error: 'git push failed', output: 'fatal: No configured push destination.' });
     await page.act('push');
     expect(card().textContent).toContain("The push failed. Git's output is below.");
@@ -6259,6 +7575,7 @@ describe('the page', () => {
       '\u001b]8;;http://lint.example/rule\u0007see the rule\u001b]8;;\u0007 and \u001b]0;a title\u001b\\done';
     page.answer('/api/site/commit', 409, { error: 'git commit failed', output, pending: ['stet/defaults.json'] });
     await page.act('commit');
+    await page.act('commitApply');
     const card = doc.getElementById('giterr') as HTMLElement;
     expect(card.hidden).toBe(false);
     expect(card.querySelector('img, script, b')).toBeNull();
@@ -6278,10 +7595,12 @@ describe('the page', () => {
     const card = (): HTMLElement => docOf(page).getElementById('giterr') as HTMLElement;
     page.answer('/api/site/commit', 409, { error: 'git commit failed', output: 'no', pending: ['stet/defaults.json'] });
     await page.act('commit');
+    await page.act('commitApply');
     expect(card().hidden).toBe(false);
     // Held back, so the card is read while the commit is still in flight.
     page.answer('/api/site/commit', 409, { error: 'git commit failed', output: 'no', pending: ['stet/defaults.json'] }, 300);
     await page.act('commit');
+    await page.act('commitApply');
     expect(page.requested('/api/site/commit')).toHaveLength(2);
     expect(card().hidden).toBe(true);
     // The held reply lands before the window goes, so nothing paints into a closed page.
@@ -6290,7 +7609,7 @@ describe('the page', () => {
   });
 
   // 5.3 — the sidebar
-  it('tells two checkouts named alike apart, and names each ready row’s host and project (journey A19)', async () => {
+  it('tells two projects named alike apart, and names each ready row’s host and store id (journey A19)', async () => {
     const row = (path: string, host: string, router: string, project: string): Record<string, unknown> => ({
       state: 'ready',
       name: path.split('/').pop(),
@@ -6316,9 +7635,9 @@ describe('the page', () => {
       ],
     });
     expect(rows(first)).toEqual([
-      ['stet-website-v1/site', 'js host · astro', 'project default'],
-      ['stet-planning/site', 'js host · astro', 'project default'],
-      ['psyon-site', 'html host', 'project psyon'],
+      ['stet-website-v1/site', 'js host · astro'],
+      ['stet-planning/site', 'js host · astro'],
+      ['psyon-site', 'html host', 'store id psyon'],
     ]);
     first.dom.window.close();
 
@@ -6327,6 +7646,1076 @@ describe('the page', () => {
     });
     expect(rows(second).map((r) => r[0])).toEqual(['a/x/site', 'b/x/site', 'y/site']);
     second.dom.window.close();
+  });
+
+  // 10.1 — Rename
+  describe('Rename (journey A22)', () => {
+    const miniRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      state: 'ready', name: 'mini', path: '/checkouts/mini', id: SITE_ID, mode: 'snapshot', keys: 11, host: 'js', router: 'astro', project: 'default', ...over,
+    });
+    const labels = (page: Painted): string[][] =>
+      [...docOf(page).querySelectorAll('#projs .it')].map((button) => [
+        button.childNodes[0]?.textContent ?? '',
+        ...[...button.querySelectorAll('.u')].map((line) => line.textContent ?? ''),
+      ]);
+    const updates = (page: Painted): unknown[] =>
+      page.sent.filter((r) => r.path.startsWith('/api/workspace/update')).map((r) => r.body);
+
+    it('renames a project, shows the name with the folder line under it, and clears it', async () => {
+      const page = await paint();
+      expect(labels(page)[0]).toEqual(['mini', 'snapshot-only · 11 keys', 'js host · astro']);
+      expect(docOf(page).querySelectorAll('#projs [data-act^="renameOpen:"]')).toHaveLength(4);
+
+      await page.act('renameOpen:/checkouts/mini');
+      const field = docOf(page).querySelector('[data-act-input="renameName"]') as HTMLInputElement;
+      expect(field.value).toBe('mini');
+      page.answer('/api/workspace/update', 200, { sites: [miniRow({ name: 'Taskboard', folder: 'mini' })] });
+      await page.type('renameName', 'Taskboard');
+      await page.act('renameSave');
+      expect(updates(page)).toEqual([{ path: '/checkouts/mini', name: 'Taskboard' }]);
+      expect(labels(page)[0]).toEqual(['Taskboard', 'mini', 'snapshot-only · 11 keys', 'js host · astro']);
+      expect(docOf(page).getElementById('crumb')?.textContent).toContain('Taskboard');
+      expect(docOf(page).querySelector('[data-act-input="renameName"]')).toBeNull();
+
+      await page.act('renameOpen:/checkouts/mini');
+      expect((docOf(page).querySelector('[data-act-input="renameName"]') as HTMLInputElement).value).toBe('Taskboard');
+      page.answer('/api/workspace/update', 200, { sites: [miniRow()] });
+      await page.type('renameName', '');
+      await page.act('renameSave');
+      expect(updates(page).at(-1)).toEqual({ path: '/checkouts/mini', name: '' });
+      expect(labels(page)[0]).toEqual(['mini', 'snapshot-only · 11 keys', 'js host · astro']);
+      expect(docOf(page).getElementById('crumb')?.textContent).toContain('mini');
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('keeps a name the server refused open with its line, and ends on Escape with nothing sent', async () => {
+      const page = await paint();
+      await page.act('renameOpen:/checkouts/mini');
+      page.answer('/api/workspace/update', 409, { error: 'no such project' });
+      await page.type('renameName', 'Taskboard');
+      await page.act('renameSave');
+      expect(page.toast()).toBe('no such project');
+      expect(docOf(page).querySelector('[data-act-input="renameName"]')).not.toBeNull();
+      const field = docOf(page).querySelector('[data-act-input="renameName"]') as HTMLInputElement;
+      field.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await page.settle();
+      expect(docOf(page).querySelector('[data-act-input="renameName"]')).toBeNull();
+      expect(updates(page)).toHaveLength(1);
+      page.dom.window.close();
+    });
+
+    it('saves on Enter in the field', async () => {
+      const page = await paint();
+      await page.act('renameOpen:/checkouts/mini');
+      page.answer('/api/workspace/update', 200, { sites: [miniRow({ name: 'Taskboard', folder: 'mini' })] });
+      await page.type('renameName', 'Taskboard');
+      const field = docOf(page).querySelector('[data-act-input="renameName"]') as HTMLInputElement;
+      field.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await page.settle();
+      expect(updates(page)).toEqual([{ path: '/checkouts/mini', name: 'Taskboard' }]);
+      page.dom.window.close();
+    });
+
+    it('tells two unnamed twins apart by folder, and never extends a name', async () => {
+      const page = await paint({
+        sites: [
+          miniRow({ path: '/a/x/site', name: 'site' }),
+          miniRow({ path: '/b/x/site', name: 'Taskboard', folder: 'site' }),
+          miniRow({ path: '/c/y/site', name: 'site' }),
+          // A name that spells another row's folder is still the name, never extended.
+          miniRow({ path: '/d/q/proj', name: 'site', folder: 'proj' }),
+        ],
+      });
+      expect(labels(page).map((row) => row[0])).toEqual(['a/x/site', 'Taskboard', 'y/site', 'site']);
+      page.dom.window.close();
+    });
+  });
+
+  // 10.2 — "project" for a workspace entry
+  describe('the word project (journey A19)', () => {
+    // The fixture's own path is /checkouts/mini: only the page's words are read.
+    const noCheckout = (text: string): void => expect(text.replace(/\/checkouts\//g, '/').replace(/\s+/g, ' ')).not.toMatch(/checkout/i);
+
+    it('heads the sidebar Projects and asks for a project path', async () => {
+      const page = await paint({ sites: [] });
+      const doc = docOf(page);
+      expect(doc.querySelector('.side .lbl')?.textContent).toBe('Projects');
+      expect(doc.getElementById('addpath')?.getAttribute('placeholder')).toBe('/absolute/path/to/project');
+      expect(doc.querySelector('[data-act="addSite"]')?.textContent).toBe('Add a project');
+      expect(doc.getElementById('pjnote')?.textContent).toBe('no projects yet — add one below');
+      expect(doc.getElementById('work')?.textContent ?? '').toContain('Add a project to begin. The path must be absolute and hold a stet project.');
+      noCheckout(doc.querySelector('.side')?.textContent ?? '');
+      noCheckout(doc.getElementById('main')?.textContent ?? '');
+      page.dom.window.close();
+    });
+
+    it('says project on the Health tab with no project and after a run with no head', async () => {
+      const empty = await paint({ sites: [] });
+      await empty.act('tab:Health');
+      expect(docOf(empty).getElementById('main')?.textContent).toContain('Add a project to run Health against it.');
+      noCheckout(docOf(empty).getElementById('main')?.textContent ?? '');
+      empty.dom.window.close();
+
+      const page = await paint();
+      await page.act('tab:Health');
+      page.answer('/api/site/health', 200, {
+        at: { head: null, branch: null, dirty: false },
+        doctor: { code: 0, out: [], err: [] }, check: [], unseeded: [], drift: [], scan: { findings: [] }, audit: { orphans: [], unseeded: [], drift: [], findings: [] },
+      });
+      await page.act('health');
+      expect(page.toast()).toBe('Health ran against this project');
+      page.dom.window.close();
+    });
+
+    it('offers Remove this project in Setup, and says the static pane is served from the project', async () => {
+      const page = await paint();
+      await page.act('tab:Setup');
+      expect(docOf(page).querySelector('[data-act="removeSite"]')?.textContent).toBe('Remove this project');
+      noCheckout(docOf(page).getElementById('main')?.textContent ?? '');
+      page.dom.window.close();
+
+      const stat = await paint({
+        site: siteBody({ host: 'html' }),
+        preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+      });
+      expect(docOf(stat).getElementById('pane')?.textContent).toContain('Served read-only from the project by this server.');
+      noCheckout(docOf(stat).getElementById('pane')?.textContent ?? '');
+      stat.dom.window.close();
+    });
+  });
+
+  // 10.3 — the environment line
+  describe('the environment line (journey B8)', () => {
+    const UP = { url: 'http://localhost:4321/', up: true, start: 'npx astro dev', source: 'astro' };
+    const line = (page: Painted): string => {
+      const el = docOf(page).getElementById('paneenv') as HTMLElement | null;
+      return el === null || el.hidden ? '' : el.textContent ?? '';
+    };
+    const store = (previewReads: unknown, over: Record<string, unknown> = {}): Record<string, unknown> =>
+      siteBody({ mode: 'memory', previewReads, ...over });
+    const SNAPSHOT_LINE = 'The preview shows content/defaults.json as this project holds it. Store drafts and publishes appear only as the dashboard layers them.';
+
+    it('says the preview shows the snapshot where the read path reads it, in any environment', async () => {
+      const page = await paint({ site: store({ snapshot: 'content/defaults.json' }), preview: UP });
+      expect(line(page)).toBe(SNAPSHOT_LINE);
+      await page.act('cycleEnv');
+      expect(docOf(page).querySelector('.envchip')?.textContent).toContain('staging');
+      expect(line(page)).toBe(SNAPSHOT_LINE);
+      page.dom.window.close();
+    });
+
+    it('says the preview reads the selected environment’s store where the dev server’s own holds it', async () => {
+      const page = await paint({ site: store({ stores: { default: true, staging: true } }), preview: UP });
+      await page.act('cycleEnv');
+      expect(line(page)).toBe('The preview reads the staging store, the one this tab edits.');
+      page.dom.window.close();
+    });
+
+    it('says the preview reads the dev server’s own store where it does not, and follows the environment switch', async () => {
+      const page = await paint({ site: store({ stores: { default: true, staging: false } }), preview: UP });
+      expect(line(page)).toBe('The preview reads the default store, the one this tab edits.');
+      await page.act('cycleEnv');
+      expect(line(page)).toBe("The preview reads the dev server's own store, not staging.");
+      await page.act('cycleEnv');
+      expect(line(page)).toBe('The preview reads the default store, the one this tab edits.');
+      page.dom.window.close();
+    });
+
+    it('shows no line on a snapshot site, with no dev-server pane, or on a reply that names none', async () => {
+      const snap = await paint({ site: siteBody({ previewReads: { snapshot: 'content/defaults.json' } }), preview: UP });
+      expect(line(snap)).toBe('');
+      snap.dom.window.close();
+      const stat = await paint({
+        site: store({ snapshot: 'content/defaults.json' }, { host: 'html' }),
+        preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true },
+      });
+      expect(line(stat)).toBe('');
+      stat.dom.window.close();
+      const down = await paint({ site: store({ snapshot: 'content/defaults.json' }), preview: { ...UP, up: false } });
+      expect(line(down)).toBe('');
+      down.dom.window.close();
+      const none = await paint({ site: store(undefined), preview: UP });
+      expect(line(none)).toBe('');
+      none.dom.window.close();
+    });
+
+    it('reads an environment the reply does not list as the dev server’s own store', async () => {
+      const page = await paint({ site: store({ stores: {} }), preview: UP });
+      expect(line(page)).toBe("The preview reads the dev server's own store, not default.");
+      page.dom.window.close();
+    });
+  });
+
+  // 11.2 — the email preview on the Templates tab
+  describe('the email preview (journey B4, 11.2)', () => {
+    const HEADLINE = 'welcome__headline';
+    const text = { shape: 'text', target: 'html-email' } as const;
+    const mailDescriptor: Descriptor = {
+      version: 1,
+      keys: {
+        [HEADLINE]: { ...text, limits: { max: 60, severity: 'advisory' } },
+        welcome__subject: text,
+        welcome__preheader: text,
+        welcome__greeting: { ...text, vars: ['name'], requires: ['name'] },
+      },
+      templates: {
+        welcome: {
+          class: 'transactional',
+          trigger: 'app-event',
+          slots: ['headline', 'subject', 'preheader', 'greeting'],
+          render: { file: 'lib/email/welcome.ts', export: 'welcome', sampleProps: { name: 'Ada' } },
+        },
+        receipt: { class: 'transactional', trigger: 'app-event', slots: [] },
+      },
+    };
+    const mailSnapshot = {
+      default: {
+        [HEADLINE]: 'Welcome to mirra',
+        welcome__subject: 'Welcome aboard',
+        welcome__preheader: '',
+        welcome__greeting: 'Hi {{name}}',
+      },
+    };
+    const mark = (key: string, value: string): string => `<span data-stet="${key}">${value}</span>`;
+    const mail = (headline = 'Welcome to mirra'): string =>
+      `<html><body><h1>${mark(HEADLINE, headline)}</h1><p>${mark('welcome__greeting', 'Hi Ada')}</p><a href="https://x.test/">link</a></body></html>`;
+    const reply = (html = mail(), over: Record<string, unknown> = {}): unknown => ({ html, subject: 'Welcome aboard', preheader: '', ...over });
+    const mailSite = (over: Record<string, unknown> = {}): Record<string, unknown> => siteBody({ descriptor: mailDescriptor, snapshot: mailSnapshot, ...over });
+    const previews = (page: Painted): Array<{ template: string; locale: string; drafts: Record<string, unknown>; env?: string }> =>
+      page.sent.filter((r) => r.path.startsWith('/api/site/email-preview')).map((r) => r.body as never);
+    const frameOf = (page: Painted): HTMLIFrameElement | null => docOf(page).querySelector('iframe[data-tpl-frame="welcome"]');
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    /** The Templates tab of a site whose preview answers `body`. */
+    async function open(body: unknown = reply(), site: Record<string, unknown> = mailSite()): Promise<Painted> {
+      const page = await paint({ site, routes: [['/api/site/email-preview', 200, body]] });
+      await page.act('tab:Templates');
+      if (frameOf(page) !== null) loadFrame(page);
+      return page;
+    }
+    /**
+     * jsdom does not load a frame's `srcdoc`, so the document a browser would load into it is put in its body,
+     * which leaves the listeners the page attached to that document where they are.
+     */
+    const loadFrame = (page: Painted): void => {
+      const frame = frameOf(page) as HTMLIFrameElement;
+      const parsed = new page.dom.window.DOMParser().parseFromString(frame.getAttribute('srcdoc') as string, 'text/html');
+      ((frame.contentDocument as Document).body as HTMLElement).innerHTML = parsed.body.innerHTML;
+      frame.dispatchEvent(new page.dom.window.Event('load'));
+    };
+    /** A click on a marked text inside the frame, as the dashboard's listener on the frame's document hears it. */
+    const clickIn = (page: Painted, selector: string): void => {
+      const doc = (frameOf(page) as HTMLIFrameElement).contentDocument as Document;
+      const hit = doc.querySelector(selector) as HTMLElement;
+      expect(hit, selector).not.toBeNull();
+      hit.dispatchEvent(new page.dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    };
+
+    it('shows each template with a pointer in a frame that runs no scripts, and says what it is rendered from', async () => {
+      const page = await open();
+      const doc = docOf(page);
+      expect(doc.querySelectorAll('[data-tpl]')).toHaveLength(1);
+      const frame = frameOf(page) as HTMLIFrameElement;
+      expect(frame.getAttribute('sandbox')).toBe('allow-same-origin');
+      expect(frame.getAttribute('srcdoc')).toBe(mail());
+      expect(doc.querySelector('[data-tpl="welcome"]')?.textContent).toContain("Images hosted on other sites don't show in this preview.");
+      // Subject and Preview with their keys, and (empty) where a slot is empty.
+      const meta = (doc.querySelector('[data-tpl-meta="welcome"]') as HTMLElement).textContent as string;
+      expect(meta).toContain('Subject Welcome aboard');
+      expect(meta).toContain('welcome__subject');
+      expect(meta).toContain('Preview (empty)');
+      expect(meta).toContain('welcome__preheader');
+      expect(previews(page)).toEqual([{ template: 'welcome', locale: 'default', drafts: {} }]);
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('the page adds nothing to the frame but a stylesheet and a click listener, and no other frame allows scripts and the dashboard’s origin together', async () => {
+      const page = await open();
+      for (const el of docOf(page).querySelectorAll('iframe')) {
+        const sandbox = el.getAttribute('sandbox') ?? '';
+        expect(sandbox.includes('allow-scripts') && sandbox.includes('allow-same-origin')).toBe(false);
+      }
+      const doc = (frameOf(page) as HTMLIFrameElement).contentDocument as Document;
+      expect(doc.querySelectorAll('script')).toHaveLength(0);
+      expect(doc.querySelectorAll('style')).toHaveLength(1);
+      expect(doc.querySelector('style')?.hasAttribute('data-stet-preview')).toBe(true);
+      expect(inlineHandlers(page.html())).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('Desktop and Mobile set the frame to 640 and 375 px', async () => {
+      const page = await open();
+      expect((frameOf(page) as HTMLIFrameElement).style.width).toBe('640px');
+      await page.act('tplWidth:mobile');
+      expect((frameOf(page) as HTMLIFrameElement).style.width).toBe('375px');
+      expect((frameOf(page) as HTMLIFrameElement).style.maxWidth).toBe('100%');
+      await page.act('tplWidth:desktop');
+      expect((frameOf(page) as HTMLIFrameElement).style.width).toBe('640px');
+      page.dom.window.close();
+    });
+
+    it('a click on rendered text opens the slot that wrote it, with its count and what it requires (journey B4)', async () => {
+      const page = await open();
+      const doc = docOf(page);
+      expect(doc.querySelector('[data-tpl-field="welcome"] textarea')).toBeNull();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      const field = doc.querySelector('[data-tpl-field="welcome"]') as HTMLElement;
+      expect((field.querySelector('textarea') as HTMLTextAreaElement).value).toBe('Welcome to mirra');
+      expect(field.textContent).toContain(`${HEADLINE} · 16 / 60`);
+      expect(field.textContent).toContain('requires: none');
+      clickIn(page, '[data-stet="welcome__greeting"]');
+      await page.settle();
+      expect(doc.querySelector('[data-tpl-field="welcome"]')?.textContent).toContain('requires: name');
+      expect((doc.querySelector('[data-tpl-field="welcome"] textarea') as HTMLTextAreaElement).value).toBe('Hi {{name}}');
+      page.dom.window.close();
+    });
+
+    it('a click on Subject’s key opens the subject slot, and a click on a link in the email goes nowhere', async () => {
+      const page = await open();
+      const doc = docOf(page);
+      await page.act('tplSlot:welcome__subject');
+      expect(doc.querySelector('[data-tpl-field="welcome"] textarea')?.getAttribute('data-act-input')).toBe('text:welcome__subject');
+      const link = ((frameOf(page) as HTMLIFrameElement).contentDocument as Document).querySelector('a') as HTMLElement;
+      const click = new page.dom.window.MouseEvent('click', { bubbles: true, cancelable: true });
+      link.dispatchEvent(click);
+      expect(click.defaultPrevented).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('believes only the slots of its own template: a marker the email forges selects nothing (S4)', async () => {
+      const forged = '<html><body>' + mark('constructor', 'a') + mark('brand__accent', 'b') + mark('welcome__nope', 'c') + '</body></html>';
+      const page = await open(reply(forged));
+      const sheet = ((frameOf(page) as HTMLIFrameElement).contentDocument as Document).querySelector('style[data-stet-preview]') as HTMLElement;
+      for (const key of ['constructor', 'brand__accent', 'welcome__nope']) {
+        clickIn(page, `[data-stet="${key}"]`);
+        await page.settle();
+        expect(docOf(page).querySelector('[data-tpl-field="welcome"] textarea')).toBeNull();
+        // Nothing of the forged name reaches the stylesheet the page keeps in the frame.
+        expect(sheet.textContent).not.toContain(key);
+      }
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('typing in the slot’s field renders again 400 ms after the last keystroke, with the draft', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      expect(previews(page)).toHaveLength(1);
+      page.answer('/api/site/email-preview', 200, reply(mail('Welcome back')));
+      await page.type(`text:${HEADLINE}`, 'Welcome ba');
+      await sleep(150);
+      await page.type(`text:${HEADLINE}`, 'Welcome back');
+      await sleep(250);
+      // 400 ms after the first keystroke, but 250 ms after the last: nothing yet.
+      expect(previews(page)).toHaveLength(1);
+      await sleep(300);
+      await page.settle();
+      expect(previews(page)).toHaveLength(2);
+      expect(previews(page)[1]?.drafts).toEqual({ [HEADLINE]: 'Welcome back' });
+      expect((frameOf(page) as HTMLIFrameElement).getAttribute('srcdoc')).toBe(mail('Welcome back'));
+      loadFrame(page);
+      expect(((frameOf(page) as HTMLIFrameElement).contentDocument as Document).querySelector('h1')?.textContent).toBe('Welcome back');
+      // The field being typed in keeps its words and the caret: the frame's repaint touches nothing else.
+      const typed = docOf(page).querySelector(`[data-act-input="text:${HEADLINE}"]`) as HTMLTextAreaElement;
+      expect(typed.value).toBe('Welcome back');
+      expect(docOf(page).activeElement === typed).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('words typed while a render is in flight are rendered next, once, with the latest of them', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      page.answer('/api/site/email-preview', 200, reply(mail('OLD')), 600);
+      await page.type(`text:${HEADLINE}`, 'a');
+      await sleep(500);
+      page.answer('/api/site/email-preview', 200, reply(mail('NEW')), 0);
+      await page.type(`text:${HEADLINE}`, 'ab');
+      await sleep(1200);
+      await page.settle();
+      expect(previews(page).map((r) => r.drafts[HEADLINE])).toEqual([undefined, 'a', 'ab']);
+      expect((frameOf(page) as HTMLIFrameElement).getAttribute('srcdoc')).toBe(mail('NEW'));
+      page.dom.window.close();
+    });
+
+    it('renders again after a request that failed on the way', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      page.answer('/api/site/email-preview', 500, { error: 'the server stopped' });
+      await page.type(`text:${HEADLINE}`, 'x');
+      await sleep(500);
+      expect(docOf(page).querySelector('[data-tpl-fail="welcome"]')?.textContent).toBe('not-renderable: the server stopped');
+      // A request that never got an answer leaves the next one free to go.
+      page.answer('/api/site/email-preview', 200, () => { throw new Error('offline'); });
+      await page.type(`text:${HEADLINE}`, 'xx');
+      await sleep(500);
+      expect(page.toast()).toContain('offline');
+      page.answer('/api/site/email-preview', 200, reply(mail('Back again')));
+      await page.type(`text:${HEADLINE}`, 'xy');
+      await sleep(500);
+      expect(frameOf(page)?.getAttribute('srcdoc')).toBe(mail('Back again'));
+      expect(docOf(page).querySelector('[data-tpl-fail="welcome"]')?.textContent).toBe('');
+      page.dom.window.close();
+    });
+
+    it('answers a render that failed with its reason and detail, and shows no frame', async () => {
+      const page = await open({ failure: { reason: 'render-threw', detail: 'boom from the template' } });
+      expect(docOf(page).querySelector('[data-tpl-fail="welcome"]')?.textContent).toBe('render-threw: boom from the template');
+      expect(frameOf(page)).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('sends the selected environment and language with the draft, and renders a snapshot-only site as well', async () => {
+      const snap = await open();
+      expect(previews(snap)[0]).not.toHaveProperty('env');
+      snap.dom.window.close();
+      const page = await open(reply(), mailSite({ mode: 'memory' }));
+      await page.act('cycleEnv');
+      await page.settle();
+      expect(previews(page).at(-1)?.env).toBe('staging');
+      await page.act('tab:Content');
+      await page.change('locale', 'de');
+      await page.act('tab:Templates');
+      expect(previews(page).at(-1)?.locale).toBe('de');
+      page.dom.window.close();
+    });
+
+    // --- the fix round: what the first build left unproved ---------------------
+
+    const run = (page: Painted, code: string): unknown => (page.dom.window as unknown as { eval: (code: string) => unknown }).eval(code);
+    const TEST_SEND = `/s/${SITE_ID}/api/stet/test-send`;
+    const sends = (page: Painted): Array<{ path: string; body: unknown }> => page.sent.filter((r) => r.path.startsWith(TEST_SEND));
+    /** The Templates tab of a store-backed site, whose test send answers `answer`. */
+    async function openStored(answer: [number, unknown] = [200, { sent: true }]): Promise<Painted> {
+      const page = await paint({
+        site: mailSite({ mode: 'memory' }),
+        routes: [['/api/site/email-preview', 200, reply()], [TEST_SEND, answer[0], answer[1]]],
+      });
+      await page.act('tab:Templates');
+      loadFrame(page);
+      return page;
+    }
+    const field = (page: Painted, act: string): HTMLInputElement => docOf(page).querySelector(`[data-act-input="${act}"]`) as HTMLInputElement;
+    const press = (page: Painted, act: string): HTMLButtonElement | null => docOf(page).querySelector(`[data-act="${act}"]`);
+
+    it('F6a: painting the tab again while a render is pending asks for it once', async () => {
+      const page = await paint({ site: mailSite(), routes: [['/api/site/email-preview', 200, reply(), 600]] });
+      await page.act('tab:Templates');
+      run(page, 'render(); render();');
+      await page.settle();
+      expect(previews(page)).toHaveLength(1);
+      await sleep(700);
+      page.dom.window.close();
+    });
+
+    it('F6b: once rendered, toggling the unsaved list or repainting the tab asks for nothing more', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      await page.type(`text:${HEADLINE}`, 'Edited');
+      await sleep(600);
+      await page.settle();
+      const before = previews(page).length;
+      expect(before).toBe(2);
+      await page.act('unsaved');
+      await page.act('unsaved');
+      run(page, 'render();');
+      await page.act('tab:Content');
+      await page.act('tab:Templates');
+      await sleep(600);
+      expect(previews(page)).toHaveLength(before);
+      page.dom.window.close();
+    });
+
+    it('F8: at 360 px the email card’s name and the Subject and Preview text break inside the card', async () => {
+      const page = await open();
+      const css = [...docOf(page).querySelectorAll('style')].map((el) => el.textContent ?? '').join('\n').replace(/\s+/g, ' ');
+      expect(css).toMatch(/@media\(max-width:760px\)\{[^}]*\[data-tpl\] \.ch h3[^{]*\{[^}]*overflow-wrap:anywhere/);
+      expect(css).toMatch(/@media\(max-width:760px\)\{[^}]*\[data-tpl-meta\] span[^{]*\{[^}]*overflow-wrap:anywhere/);
+      page.dom.window.close();
+    });
+
+    // An addition beyond T1-T8: the send row's controls are touch targets at a phone's width.
+    it('T8: at 360 px the Test send controls are 36 px tall', async () => {
+      const page = await open();
+      const css = [...docOf(page).querySelectorAll('style')].map((el) => el.textContent ?? '').join('\n').replace(/\s+/g, ' ');
+      expect(css).toMatch(/@media\(max-width:760px\)\{\[data-tpl-send\] \.btn,\[data-tpl-send\] \.in\{[^}]*min-height:36px/);
+      page.dom.window.close();
+    });
+
+    it('F10: the Brand tab says nothing of an email preview that is not built', async () => {
+      const brand = { ...mailDescriptor, keys: { ...mailDescriptor.keys, brand__accent: { shape: 'text', target: 'html-email' } } } as Descriptor;
+      const page = await paint({ site: mailSite({ descriptor: brand, snapshot: { default: { ...mailSnapshot.default, brand__accent: '#fff' } } }) });
+      await page.act('tab:Brand');
+      expect(docOf(page).querySelector('#main')?.textContent).toContain('brand__accent');
+      expect(page.html()).not.toContain('not built yet');
+      page.dom.window.close();
+    });
+
+    it('D62: the Templates tab carries Save, which saves the drafts typed there; Remove key stays on the Content editor', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: [] });
+      await page.type(`text:${HEADLINE}`, 'Welcome back');
+      expect(press(page, 'save')).not.toBeNull();
+      expect(docOf(page).querySelector('[data-act^="removePlan:"]')).toBeNull();
+      await page.act('save');
+      const saves = page.sent.filter((r) => r.path.startsWith('/api/site/save'));
+      expect(saves).toHaveLength(1);
+      expect((saves[0]?.body as { values: unknown[] }).values).toMatchObject([{ key: HEADLINE, locale: 'default', value: 'Welcome back' }]);
+      await page.act('tab:Content');
+      await page.act(`key:${HEADLINE}`);
+      expect(press(page, `removePlan:${HEADLINE}`)).not.toBeNull();
+      page.dom.window.close();
+    });
+
+    it('D62: an over-limit value asks Save anyway on the Templates tab, and a refused save says why there', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      await page.type(`text:${HEADLINE}`, 'x'.repeat(71));
+      await page.act('save');
+      expect(press(page, 'saveAnyway')).not.toBeNull();
+      expect(docOf(page).querySelector('[data-tpl-save]')?.textContent).toContain('Over the 60-character limit');
+      await page.act('saveAnyway');
+      expect(docOf(page).querySelector('[data-tpl-save] #refusal')?.textContent).toContain('refused by the save gate');
+      page.dom.window.close();
+    });
+
+    it('D62: on a store-backed site the Templates tab’s Save saves every draft to the store', async () => {
+      const page = await openStored();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      await page.type(`text:${HEADLINE}`, 'Stored words');
+      expect(press(page, 'save')?.textContent).toBe('Save draft');
+      await page.act('save');
+      const drafts = page.sent.filter((r) => r.path.startsWith(`/s/${SITE_ID}/api/stet/draft`));
+      expect(drafts.map((r) => (r.body as { key: string; value: string }).value)).toEqual(['Stored words']);
+      page.dom.window.close();
+    });
+
+    it('T8: a store-backed card offers Test send…; a snapshot site’s card does not', async () => {
+      const stored = await openStored();
+      expect(press(stored, 'tplSendOpen:welcome')?.textContent).toBe('Test send…');
+      expect(field(stored, 'tplTo:welcome')).toBeNull();
+      stored.dom.window.close();
+      const snapshot = await open();
+      expect(docOf(snapshot).querySelector('[data-act^="tplSendOpen:"]')).toBeNull();
+      snapshot.dom.window.close();
+    });
+
+    it('T8: the address starts empty, Send waits for an @ and no line break, and typing posts nothing', async () => {
+      const page = await openStored();
+      await page.act('tplSendOpen:welcome');
+      expect(field(page, 'tplTo:welcome').value).toBe('');
+      expect(press(page, 'tplSendGo:welcome')?.disabled).toBe(true);
+      for (const [typed, enabled] of [['me', false], ['me@example.test', true], ['', false]] as const) {
+        await page.type('tplTo:welcome', typed);
+        expect(press(page, 'tplSendGo:welcome')?.disabled, JSON.stringify(typed)).toBe(!enabled);
+      }
+      // A text field strips line breaks on its own; the page's rule does not rely on that.
+      expect(run(page, 'tplToOk("me@example.test\\r\\nBcc: x@example.test")')).toBe(false);
+      expect(run(page, 'tplToOk("me@example.test")')).toBe(true);
+      run(page, 'render();');
+      await page.settle();
+      expect(sends(page)).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('T8: Send posts exactly the template and the address to the mount’s test-send, and says where it went', async () => {
+      const page = await openStored();
+      await page.act('tplSendOpen:welcome');
+      await page.type('tplTo:welcome', 'me@example.test');
+      await page.act('tplSendGo:welcome');
+      expect(sends(page)).toEqual([{ path: TEST_SEND, body: { template: 'welcome', to: 'me@example.test' } }]);
+      expect(docOf(page).querySelector('[data-tpl-send="welcome"]')?.textContent).toContain('Sent to me@example.test.');
+      page.dom.window.close();
+    });
+
+    it('T8: without emailSend (501) the page says what to add; any other refusal shows the server’s sentence', async () => {
+      const none = await openStored([501, { error: 'test-send is not wired' }]);
+      await none.act('tplSendOpen:welcome');
+      await none.type('tplTo:welcome', 'me@example.test');
+      await none.act('tplSendGo:welcome');
+      expect(docOf(none).querySelector('[data-tpl-send="welcome"]')?.textContent).toContain(
+        'Test send needs emailSend in stet.config.json: the host function that sends one email, the same one `stet email test` uses.',
+      );
+      none.dom.window.close();
+      const down = await openStored([500, { error: 'smtp down' }]);
+      await down.act('tplSendOpen:welcome');
+      await down.type('tplTo:welcome', 'me@example.test');
+      await down.act('tplSendGo:welcome');
+      expect(docOf(down).querySelector('[data-tpl-send="welcome"]')?.textContent).toContain('smtp down');
+      expect(docOf(down).querySelector('[data-tpl-send="welcome"] .err')).not.toBeNull();
+      down.dom.window.close();
+    });
+
+    it('T8: unsaved edits are named as not in the email, pluralised as the header does', async () => {
+      const page = await openStored();
+      await page.act('tplSendOpen:welcome');
+      const note = (): string => docOf(page).querySelector('[data-tpl-unsaved="welcome"]')?.textContent ?? '';
+      expect(note()).toBe('');
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      await page.type(`text:${HEADLINE}`, 'one');
+      expect(note()).toBe('1 unsaved edit is not in this email.');
+      run(page, 'setDraft("welcome__subject", "two"); paintDirty();');
+      expect(note()).toBe('2 unsaved edits are not in this email.');
+      page.dom.window.close();
+    });
+  });
+
+  // 10.4 — the unsaved list, Undo, Show, Discard all, the project-switch ask and beforeunload
+  describe('unsaved edits (journey B23)', () => {
+    const run = (page: Painted, code: string): unknown => (page.dom.window as unknown as { eval: (code: string) => unknown }).eval(code);
+    const header = (page: Painted): string => {
+      const el = docOf(page).getElementById('dc') as HTMLElement;
+      return el.hidden ? '' : el.textContent ?? '';
+    };
+    const rows = (page: Painted): string[] =>
+      [...docOf(page).querySelectorAll('#ask [data-act^="undoEdit:"], #ask [data-act^="undoTmpl:"]')].map((el) => (el.getAttribute('data-act') ?? '').split(':')[1] ?? '');
+    const ask = (page: Painted): string => (docOf(page).getElementById('ask') as HTMLElement).textContent ?? '';
+    /** Three unsaved edits: one typed in the field, two set as the preview's edits arrive. */
+    async function three(over: Parameters<typeof paint>[0] = {}): Promise<Painted> {
+      const page = await paint(over);
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'Changed headline');
+      run(page, 'setDraft("seo_home_title", "Changed title"); setDraft("loose_key", "Changed loose"); render();');
+      await page.settle();
+      return page;
+    }
+    const stored = (page: Painted, id: string): unknown => run(page, `storedValue(${JSON.stringify(id)}, S.locale)`);
+
+    it('opens a list of the edited keys from the header count, each with Undo and Show, and Discard all', async () => {
+      const page = await three();
+      expect(header(page)).toBe('3 unsaved edits');
+      expect(docOf(page).querySelector('button#dc')).not.toBeNull();
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      await page.act('unsaved');
+      expect(rows(page)).toEqual(['default hero_headline', 'default seo_home_title', 'default loose_key']);
+      expect(docOf(page).querySelectorAll('#ask [data-act^="showEdit:"]')).toHaveLength(3);
+      expect(docOf(page).querySelector('#ask [data-act="discardAll"]')?.textContent).toBe('Discard all');
+      expect(docOf(page).querySelector('#ask [data-act="undoEdit:default loose_key"]')?.textContent).toBe('Undo');
+      expect(docOf(page).querySelector('#ask [data-act="showEdit:default loose_key"]')?.textContent).toBe('Show');
+      await page.act('unsaved');
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('undoes one of three: the key returns to its stored value, with no base left, and the header reads 2 unsaved edits', async () => {
+      const page = await three();
+      await page.act('unsaved');
+      expect(run(page, 'JSON.stringify(Object.keys(S.base))')).toBe('["default hero_headline","default seo_home_title","default loose_key"]');
+      await page.act('undoEdit:default loose_key');
+      expect(header(page)).toBe('2 unsaved edits');
+      expect(rows(page)).toEqual(['default hero_headline', 'default seo_home_title']);
+      expect(run(page, 'valueOf("loose_key")')).toBe(stored(page, 'loose_key'));
+      expect(run(page, 'JSON.stringify(Object.keys(S.base))')).toBe('["default hero_headline","default seo_home_title"]');
+      expect(run(page, 'JSON.stringify(Object.keys(S.draft))')).toBe('["default hero_headline","default seo_home_title"]');
+      page.dom.window.close();
+    });
+
+    it('undoes the key being typed in the field, and the field shows the stored value', async () => {
+      const page = await three();
+      await page.act('unsaved');
+      await page.act('undoEdit:default hero_headline');
+      expect((docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('Ship the copy');
+      expect(header(page)).toBe('2 unsaved edits');
+      page.dom.window.close();
+    });
+
+    it('ends an open edit of the key before undoing it, so the page’s typed words do not come back', async () => {
+      const page = await three();
+      run(page, 'S.edit = { key: "loose_key", locale: "default", entry: undefined, form: "inplace", before: undefined, rect: null };');
+      await page.act('unsaved');
+      await page.act('undoEdit:default loose_key');
+      expect(run(page, 'S.edit')).toBeNull();
+      expect(run(page, 'valueOf("loose_key")')).toBe(stored(page, 'loose_key'));
+      page.dom.window.close();
+    });
+
+    it('undoes a derived key’s template edit with its own button', async () => {
+      const page = await paint();
+      run(page, 'tmplEdit("welcome__subject", { before: "Hi " }); render();');
+      await page.settle();
+      expect(header(page)).toBe('1 unsaved edit');
+      await page.act('unsaved');
+      expect(rows(page)).toEqual(['welcome__subject']);
+      await page.act('undoTmpl:welcome__subject');
+      expect(header(page)).toBe('');
+      expect(run(page, 'Object.keys(S.tmpl).length')).toBe(0);
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('shows an edited key: selects it, on its group, in its locale', async () => {
+      const page = await three();
+      run(page, 'setDraftIn("de", "hero_headline", "Geaendert"); render();');
+      await page.settle();
+      await page.act('unsaved');
+      await page.act('showEdit:default loose_key');
+      expect(run(page, 'S.sel')).toBe('loose_key');
+      expect(run(page, 'S.group')).toBe('prefix:loose');
+      expect(docOf(page).querySelector('.row.on')?.getAttribute('data-act')).toBe('key:loose_key');
+      await page.act('showEdit:de hero_headline');
+      expect(run(page, 'S.locale')).toBe('de');
+      expect(run(page, 'S.sel')).toBe('hero_headline');
+      page.dom.window.close();
+    });
+
+    it('discards every unsaved edit of the selected environment, and none of another environment’s', async () => {
+      const page = await three({ site: siteBody({ mode: 'memory' }) });
+      expect(run(page, 'S.env')).toBe('default');
+      await page.act('cycleEnv');
+      expect(run(page, 'S.env')).toBe('staging');
+      expect(header(page)).toBe('');
+      run(page, 'setDraft("hero_headline", "Staging words"); render();');
+      await page.settle();
+      expect(header(page)).toBe('1 unsaved edit');
+      await page.act('unsaved');
+      await page.act('discardAll');
+      expect(header(page)).toBe('');
+      expect(run(page, 'Object.keys(S.draft).length + Object.keys(S.base).length')).toBe(0);
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      // Back in the first environment its three edits are where they were left.
+      await page.act('cycleEnv');
+      expect(run(page, 'S.env')).toBe('default');
+      expect(header(page)).toBe('3 unsaved edits');
+      await page.act('unsaved');
+      await page.act('discardAll');
+      expect(header(page)).toBe('');
+      expect(run(page, 'JSON.stringify(Object.keys(S.stashed).map((k) => Object.keys(S.stashed[k].draft).length))')).toBe('[0,0]');
+      page.dom.window.close();
+    });
+
+    it('asks before a project switch with unsaved edits; Cancel keeps the project and its edits', async () => {
+      const page = await three();
+      const before = page.requested('/api/site?').length;
+      await page.act('site:/checkouts/other');
+      expect(ask(page)).toContain('3 unsaved edits will be lost. Leave anyway?');
+      expect(docOf(page).querySelector('#ask [data-act="leaveGo"]')?.textContent).toBe('Leave');
+      expect(docOf(page).querySelector('#ask [data-act="leaveStay"]')?.textContent).toBe('Cancel');
+      expect(page.requested('/api/site?')).toHaveLength(before);
+      await page.act('leaveStay');
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      expect(header(page)).toBe('3 unsaved edits');
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      expect(page.requested('/api/site?')).toHaveLength(before);
+      page.dom.window.close();
+    });
+
+    it('leaves on Leave, losing the edits, and counts the other environments’ edits too', async () => {
+      const page = await three({ site: siteBody({ mode: 'memory' }) });
+      await page.act('cycleEnv');
+      run(page, 'setDraft("hero_headline", "Staging words"); render();');
+      await page.settle();
+      await page.act('site:/checkouts/other');
+      expect(ask(page)).toContain('4 unsaved edits will be lost. Leave anyway?');
+      await page.act('leaveGo');
+      expect(run(page, 'S.path')).toBe('/checkouts/other');
+      expect(page.requested('/api/site?')).toContain('/api/site?site=%2Fcheckouts%2Fother');
+      expect(header(page)).toBe('');
+      expect(run(page, 'Object.keys(S.stashed).length')).toBe(0);
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('switches at once with nothing unsaved', async () => {
+      const page = await paint();
+      await page.act('site:/checkouts/other');
+      expect(run(page, 'S.path')).toBe('/checkouts/other');
+      expect(ask(page)).not.toContain('will be lost');
+      page.dom.window.close();
+    });
+
+    /** One edit typed in the field, then the Setup tab, where Remove this project lives. */
+    async function oneThenSetup(): Promise<Painted> {
+      const page = await paint({ site: siteBody({ mode: 'memory' }) });
+      await page.act('key:hero_headline');
+      await page.type('text:hero_headline', 'Changed headline');
+      await page.act('tab:Setup');
+      return page;
+    }
+
+    it('asks before Remove this project with unsaved edits, and removes nothing until Leave (D53)', async () => {
+      const page = await oneThenSetup();
+      await page.act('removeSite');
+      expect(ask(page)).toContain('1 unsaved edit will be lost. Leave anyway?');
+      expect(page.requested('/api/workspace/remove')).toEqual([]);
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      await page.act('leaveGo');
+      expect(page.requested('/api/workspace/remove')).toHaveLength(1);
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('keeps the project and its edit when Cancel answers the Remove ask (D53)', async () => {
+      const page = await oneThenSetup();
+      await page.act('removeSite');
+      await page.act('leaveStay');
+      expect(page.requested('/api/workspace/remove')).toEqual([]);
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      expect(header(page)).toBe('1 unsaved edit');
+      expect((docOf(page).getElementById('ask') as HTMLElement).hidden).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('asks before Remove this project when only another environment holds the edit (D53)', async () => {
+      const page = await oneThenSetup();
+      await page.act('tab:Content');
+      await page.act('cycleEnv');
+      expect(header(page)).toBe('');
+      await page.act('tab:Setup');
+      await page.act('removeSite');
+      expect(ask(page)).toContain('1 unsaved edit will be lost. Leave anyway?');
+      expect(page.requested('/api/workspace/remove')).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('removes at once with nothing unsaved', async () => {
+      const page = await paint();
+      await page.act('tab:Setup');
+      await page.act('removeSite');
+      expect(ask(page)).not.toContain('will be lost');
+      expect(page.requested('/api/workspace/remove')).toHaveLength(1);
+      page.dom.window.close();
+    });
+
+    it('asks before a project switch when only another environment holds the edit (F3)', async () => {
+      const page = await three({ site: siteBody({ mode: 'memory' }) });
+      await page.act('cycleEnv');
+      expect(run(page, 'S.env')).toBe('staging');
+      expect(header(page)).toBe('');
+      await page.act('site:/checkouts/other');
+      expect(ask(page)).toContain('3 unsaved edits will be lost. Leave anyway?');
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      page.dom.window.close();
+    });
+
+    it('asks before Add a project switches away from unsaved edits; Cancel keeps the project and the edit (F3)', async () => {
+      const page = await three();
+      page.answer('/api/workspace/add', 200, { added: true, path: '/checkouts/other', sites: page.workspace.sites });
+      (docOf(page).getElementById('addpath') as HTMLInputElement).value = '/checkouts/other';
+      const before = page.requested('/api/site?').length;
+      await page.act('addSite');
+      expect(page.requested('/api/workspace/add')).toHaveLength(1);
+      expect(ask(page)).toContain('3 unsaved edits will be lost. Leave anyway?');
+      expect(page.requested('/api/site?')).toHaveLength(before);
+      await page.act('leaveStay');
+      expect(run(page, 'S.path')).toBe('/checkouts/mini');
+      expect(header(page)).toBe('3 unsaved edits');
+      page.dom.window.close();
+    });
+
+    it('raises the browser’s own prompt on a reload or a tab close while edits exist, in any environment', async () => {
+      const page = await paint();
+      const press = (): boolean => {
+        const event = new page.dom.window.Event('beforeunload', { cancelable: true });
+        page.dom.window.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      expect(press()).toBe(false);
+      run(page, 'setDraft("loose_key", "Changed loose"); render();');
+      await page.settle();
+      expect(press()).toBe(true);
+      run(page, 'switchEnv("staging");');
+      await page.settle();
+      expect(header(page)).toBe('');
+      expect(press()).toBe(true);
+      run(page, 'switchEnv("default"); undoEdit("default", "loose_key");');
+      await page.settle();
+      expect(press()).toBe(false);
+      page.dom.window.close();
+    });
+  });
+
+  // 10.5 — 360 px. jsdom has no layout: it proves the structure and the rules the browser run reads, and the pick behaviour at 360.
+  describe('editing at 360 px (journey B19)', () => {
+    const phone = (window: Painted['dom']['window']): void => {
+      Object.defineProperty(window, 'innerWidth', { value: 360, configurable: true });
+    };
+    const rules = (page: Painted): string =>
+      [...docOf(page).querySelectorAll('style')].map((el) => el.textContent ?? '').join('\n').replace(/\s+/g, ' ');
+    /** The declarations of every rule inside an `@media(max-width:760px)` block that names `selector`. */
+    const phoneRule = (css: string, selector: string): string[] => {
+      const out: string[] = [];
+      const opener = '@media(max-width:760px){';
+      for (let at = css.indexOf(opener); at !== -1; at = css.indexOf(opener, at + 1)) {
+        let depth = 1;
+        let end = at + opener.length;
+        for (; end < css.length && depth > 0; end += 1) depth += css[end] === '{' ? 1 : css[end] === '}' ? -1 : 0;
+        for (const rule of css.slice(at + opener.length, end - 1).matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+          if ((rule[1] ?? '').split(',').map((part) => part.trim()).includes(selector)) out.push((rule[2] ?? '').trim());
+        }
+      }
+      return out;
+    };
+
+    it('puts the selected key’s editor in the column directly under the preview, the key list after it', async () => {
+      const page = await paint({ prepare: phone });
+      await page.act('key:hero_headline');
+      const main = docOf(page).getElementById('main') as HTMLElement;
+      expect([...main.children].map((el) => el.className.split(' ')[0])).toEqual(['card', 'edcol']);
+      expect(docOf(page).querySelector('#main > .edcol > .card.edcard')).not.toBeNull();
+      const css = rules(page);
+      expect(phoneRule(css, '#main').join(';')).toMatch(/display:flex/);
+      expect(phoneRule(css, '#main').join(';')).toMatch(/flex-direction:column/);
+      expect(phoneRule(css, '.edcol').join(';')).toMatch(/order:-1/);
+      expect(phoneRule(css, '.edcard').join(';')).toMatch(/order:-1/);
+      page.dom.window.close();
+    });
+
+    it('focuses the field on a second tap, with no in-place edit and no popover', async () => {
+      const page = await paint({ prepare: phone });
+      page.dom.window.eval('onPick({ keys: [{ key: "hero_headline", attr: null, by: "whole", inplace: true }], again: true, rect: { left: 1, top: 1, width: 10, height: 10 } })');
+      await page.settle();
+      expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:hero_headline');
+      expect(page.dom.window.eval('S.edit')).toBeNull();
+      expect(page.dom.window.eval('S.popover')).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('breaks a long project name inside its row, so no name widens the page (F2)', async () => {
+      const page = await paint({ prepare: phone });
+      expect(rules(page)).toMatch(/\.prow>\.it\{[^}]*overflow-wrap:anywhere/);
+      page.dom.window.close();
+    });
+
+    it('caps the preview frame so a short phone screen shows the frame and the selected field together (D55)', async () => {
+      const page = await paint({ prepare: phone });
+      const wrap = phoneRule(rules(page), '.devwrap').join(';');
+      expect(wrap).toMatch(/height:min\(\d+px,calc\(100vh - \d+px\)\)/);
+      expect(wrap).toMatch(/min-height:0/);
+      page.dom.window.close();
+    });
+
+    it('leaves the frame’s height to the stylesheet under 760 px and sets it from the window above (D55)', async () => {
+      const page = await paint({ prepare: phone, site: siteBody({ host: 'html' }), preview: { url: `http://127.0.0.1:4400/s/${SITE_ID}/site/`, up: true, static: true } });
+      const box = docOf(page).getElementById('devwrap') as HTMLElement;
+      Object.defineProperty(box, 'clientWidth', { value: 300, configurable: true });
+      box.style.height = '500px';
+      page.dom.window.eval('fitFrame()');
+      expect(box.style.height).toBe('');
+      Object.defineProperty(page.dom.window, 'innerWidth', { value: 1200, configurable: true });
+      page.dom.window.eval('fitFrame()');
+      expect(box.style.height).toMatch(/^\d+px$/);
+      page.dom.window.close();
+    });
+
+    it('lets every card of the column shrink to the viewport', async () => {
+      const page = await paint({ prepare: phone });
+      const css = rules(page);
+      expect(phoneRule(css, '#main>*').join(';')).toMatch(/min-width:0/);
+      expect(phoneRule(css, '.edcol>*').join(';')).toMatch(/min-width:0/);
+      page.dom.window.close();
+    });
+
+    it('selects on a tap and brings the field into view without opening the popover', async () => {
+      const page = await paint({ prepare: phone });
+      const scrolled: string[] = [];
+      (page.dom.window as unknown as { HTMLElement: { prototype: { scrollIntoView: unknown } } }).HTMLElement.prototype.scrollIntoView = function (this: HTMLElement, arg: unknown): void {
+        scrolled.push((this.getAttribute('data-act-input') ?? '') + ' ' + JSON.stringify(arg));
+      };
+      page.dom.window.eval('selectFromFrame("hero_headline", undefined)');
+      await page.settle();
+      expect(scrolled).toContain('text:hero_headline {"block":"nearest"}');
+      expect(page.dom.window.eval('S.popover')).toBeNull();
+      page.dom.window.close();
+    });
+  });
+
+  // 10.6 — shortcuts
+  describe('shortcuts (journey B23)', () => {
+    const key = (page: Painted, target: EventTarget, init: KeyboardEventInit & { key: string }): void => {
+      target.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init }));
+    };
+    const mode = (page: Painted): unknown => page.dom.window.eval('S.mode');
+
+    it('toggles Edit and Use on E outside a field, in either case', async () => {
+      const page = await paint();
+      expect(mode(page)).toBe('edit');
+      key(page, docOf(page).body, { key: 'e' });
+      expect(mode(page)).toBe('use');
+      expect(docOf(page).querySelector('[data-act="mode:use"]')?.className).toBe('on');
+      key(page, docOf(page).body, { key: 'E' });
+      expect(mode(page)).toBe('edit');
+      page.dom.window.close();
+    });
+
+    it('leaves E to the field when focus is in one: an input, a textarea, a select or an editable element', async () => {
+      const page = await paint();
+      await page.act('key:hero_headline');
+      const field = docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement;
+      key(page, field, { key: 'e' });
+      expect(mode(page)).toBe('edit');
+      key(page, docOf(page).getElementById('addpath') as HTMLElement, { key: 'e' });
+      key(page, docOf(page).getElementById('route') as HTMLElement, { key: 'e' });
+      const select = docOf(page).querySelector('[data-act-change]') as HTMLElement;
+      key(page, select, { key: 'e' });
+      const editable = docOf(page).createElement('div');
+      editable.setAttribute('contenteditable', 'true');
+      docOf(page).body.appendChild(editable);
+      key(page, editable, { key: 'e' });
+      expect(mode(page)).toBe('edit');
+      page.dom.window.close();
+    });
+
+    it('ignores E with a modifier, off the Content tab, and while composing', async () => {
+      const page = await paint();
+      for (const init of [{ metaKey: true }, { ctrlKey: true }, { altKey: true }]) key(page, docOf(page).body, { key: 'e', ...init });
+      key(page, docOf(page).body, { key: 'e', isComposing: true });
+      expect(mode(page)).toBe('edit');
+      await page.act('tab:Health');
+      key(page, docOf(page).body, { key: 'e' });
+      expect(mode(page)).toBe('edit');
+      page.dom.window.close();
+    });
+
+    it('leaves a key an element already answered', async () => {
+      const page = await paint();
+      docOf(page).body.addEventListener('keydown', (event) => event.preventDefault());
+      key(page, docOf(page).body, { key: 'e' });
+      expect(mode(page)).toBe('edit');
+      page.dom.window.close();
+    });
+
+    it('posts the new mode to the preview', async () => {
+      const page = await paint({ preview: { url: 'http://localhost:4321/', up: true, start: 'npx astro dev', source: 'astro' } });
+      const frame = docOf(page).querySelector('#devwrap iframe') as HTMLIFrameElement;
+      const posts: unknown[] = [];
+      (frame.contentWindow as unknown as { postMessage: unknown }).postMessage = (message: unknown): void => { posts.push(message); };
+      page.dom.window.eval('agentReady = true');
+      key(page, docOf(page).body, { key: 'e' });
+      expect(posts).toContainEqual({ stet: 'mode', mode: 'use' });
+      page.dom.window.close();
+    });
+
+    it('ends the selection on Escape outside a field, and not inside one', async () => {
+      const page = await paint();
+      await page.act('key:hero_headline');
+      const field = docOf(page).querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement;
+      key(page, field, { key: 'Escape' });
+      expect(page.dom.window.eval('S.sel')).toBe('hero_headline');
+      key(page, docOf(page).body, { key: 'Escape' });
+      expect(page.dom.window.eval('S.sel')).toBeNull();
+      expect(docOf(page).querySelector('.row.on')).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('does not take an Escape the open field over the frame is answering', async () => {
+      const page = await paint();
+      await page.act('key:hero_headline');
+      page.dom.window.eval('openPopover("hero_headline", "default", undefined, { left: 1, top: 1, width: 10, height: 10 })');
+      expect(page.dom.window.eval('S.popover !== null')).toBe(true);
+      key(page, docOf(page).body, { key: 'Escape' });
+      expect(page.dom.window.eval('S.sel')).toBe('hero_headline');
+      page.dom.window.close();
+    });
   });
 
   // 5.4 — the layout and the widths
@@ -6558,11 +8947,29 @@ describe('the page', () => {
         };
       };
       spy();
+      /** One message from the frame's agent, carrying the channel, then the page settled. */
+      const tell = async (message: Record<string, unknown>): Promise<void> => {
+        say({ channel: CHANNEL, ...message });
+        await page.settle();
+      };
       return {
         posts,
         say,
         spy,
         frame,
+        tell,
+        /** The messages of one kind the page posted to the frame. */
+        sent: (stet: string): Array<Record<string, unknown>> => posts.map((p) => p.message).filter((m) => m['stet'] === stet),
+        pick: (keys: Array<Record<string, unknown>>, over: Record<string, unknown> = {}): Promise<void> =>
+          tell({ stet: 'pick', keys: keys.map((k) => ({ attr: null, by: 'whole', inplace: true, ...k })), tag: 'h1', rect: { left: 100, top: 50, width: 200, height: 20 }, again: false, ...over }),
+        typed: (key: string, value: unknown, over: Record<string, unknown> = {}): Promise<void> =>
+          tell({ stet: 'typed', key, locale: 'default', value, ...over }),
+        edited: (key: string, how: string, over: Record<string, unknown> = {}): Promise<void> =>
+          tell({ stet: 'edited', key, locale: 'default', how, proposed: true, ...over }),
+        census: (over: Record<string, unknown> = {}): Promise<void> =>
+          tell({ stet: 'census', found: {}, entries: {}, ambiguous: [], weak: [], head: [], route: '/', ...over }),
+        moved: (route: string): Promise<void> => tell({ stet: 'moved', how: 'pushState', route }),
+        key: (which: string): Promise<void> => tell({ stet: 'key', which }),
         /** The frame's `load`, as a navigation ends. */
         load: async (): Promise<void> => {
           spy();
@@ -6823,7 +9230,7 @@ describe('the page', () => {
         expect(doc.querySelector('.cb .cnt')?.textContent).toBe(String(typed.length));
         await page.act('save');
         expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
-          values: [{ key: 'hero', locale: 'default', value: typed }],
+          values: [{ key: 'hero', locale: 'default', value: typed, base: HEADLINE }],
         });
         expect(page.dom.window.document.querySelector('style')?.textContent).toContain('.tagged textarea{display:block;');
         page.dom.window.close();
@@ -7385,6 +9792,1952 @@ describe('the page', () => {
       await page.settle();
       expect(note(page).textContent).toBe('This draft is shown after Save.');
       page.dom.window.close();
+    });
+
+    // --- add-preview-editing D8: the frame's messages, the pinned locale, the popover, the badge ---
+    describe('the bridge (D8)', () => {
+      const RECT = { left: 100, top: 50, width: 200, height: 20 };
+      type State = {
+        draft: Record<string, unknown>;
+        base: Record<string, unknown> | null;
+        edit: Record<string, unknown> | null;
+        snapshot: Record<string, Record<string, unknown>>;
+      };
+      /** The page's own state, read in its global scope: the drafts, their bases, the open edit and the snapshot it holds. */
+      const stateOf = (page: Painted): State =>
+        JSON.parse(
+          (page.dom.window as unknown as { eval: (code: string) => string }).eval(
+            'JSON.stringify({ draft: S.draft, base: S.base === undefined ? null : S.base, edit: S.edit === undefined ? null : S.edit, snapshot: S.site.snapshot })',
+          ),
+        ) as State;
+      /** The page over the dev pane, its agent announced. */
+      async function bridged(over: Parameters<typeof paint>[0] = {}) {
+        const page = await paint({ preview: DEV_PREVIEW, ...over });
+        const agent = agentOf(page);
+        await agent.load();
+        await agent.ready();
+        return { page, agent };
+      }
+      const byId = (page: Painted, id: string): HTMLElement => docOf(page).getElementById(id) as HTMLElement;
+      const popover = (page: Painted): HTMLElement => byId(page, 'popover');
+      const poptext = (page: Painted): HTMLTextAreaElement => byId(page, 'poptext') as HTMLTextAreaElement;
+      const lines = (page: Painted): string[] => [...note(page).children].map((line) => line.textContent ?? '');
+      const selected = (page: Painted): string => docOf(page).querySelector('#main .ch h3 .mono')?.textContent ?? '';
+      const typeInto = async (page: Painted, field: HTMLTextAreaElement, value: string): Promise<void> => {
+        field.value = value;
+        field.dispatchEvent(new page.dom.window.Event('input', { bubbles: true }));
+        await page.settle();
+      };
+      const press = async (page: Painted, field: HTMLElement, key: string): Promise<void> => {
+        field.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+        await page.settle();
+      };
+      const THREE = siteBody({ snapshot: { ...snapshot, default: { ...snapshot.default, hero_bullets: ['one', 'two', 'three'] } } });
+      /** The fixture with a 40-character advisory key whose value holds a `{{name}}` token. */
+      const GREETING = siteBody({
+        descriptor: {
+          ...descriptor,
+          keys: {
+            ...descriptor.keys,
+            lab_greeting: { shape: 'text', target: 'web', limits: { max: 40, severity: 'advisory' } },
+            lab_tagged: { shape: 'text', target: 'web', tags: 1, limits: { max: 20, severity: 'hard' } },
+          },
+        },
+        snapshot: {
+          ...snapshot,
+          default: { ...snapshot.default, hero_bullets: ['one', 'two', 'three'], lab_greeting: 'Welcome back, {{name}}.', lab_tagged: 'Ship <1>it</1> now' },
+        },
+      });
+
+      // 7.1 — the values
+      it('writes a typed list entry into that entry alone (7.1)', async () => {
+        const { page, agent } = await bridged({ site: THREE });
+        await agent.pick([{ key: 'hero_bullets', entry: 2 }], { again: true, tag: 'li' });
+        expect(agent.sent('edit').at(-1)).toEqual({ stet: 'edit', key: 'hero_bullets', locale: 'default', entry: 2, form: 'inplace', oneLine: true });
+        await agent.typed('hero_bullets', 'tres', { entry: 2 });
+        expect(stateOf(page).draft).toEqual({ 'default hero_bullets': ['one', 'two', 'tres'] });
+        expect(page.html()).toContain('1 unsaved edit');
+        page.dom.window.close();
+      });
+
+      it('Discard all ends an open edit, so its end does not bring the discarded key back (F3)', async () => {
+        const { page, agent } = await bridged();
+        await page.act('key:hero_headline');
+        await page.type('text:hero_headline', 'First words');
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Second words');
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Second words' });
+        await page.act('unsaved');
+        await page.act('discardAll');
+        expect(stateOf(page).draft).toEqual({});
+        await agent.edited('hero_headline', 'cancel');
+        expect(stateOf(page).draft).toEqual({});
+        expect(stateOf(page).base).toEqual({});
+        page.dom.window.close();
+      });
+
+      it('keeps no draft and no base for a value typed back to the stored one (7.1)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Ship it');
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Ship it' });
+        expect(stateOf(page).base).toEqual({ 'default hero_headline': 'Ship the copy' });
+        await agent.typed('hero_headline', 'Ship the copy');
+        expect(stateOf(page).draft).toEqual({});
+        expect(stateOf(page).base).toEqual({});
+        page.dom.window.close();
+      });
+
+      it('drops the bases with the drafts a save writes (7.1: every draft removal clears its base)', async () => {
+        const page = await paint();
+        page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] });
+        await page.act('key:hero_headline');
+        await page.type('text:hero_headline', 'Saved words');
+        expect(stateOf(page).base).toEqual({ 'default hero_headline': 'Ship the copy' });
+        await page.act('save');
+        expect(stateOf(page).draft).toEqual({});
+        expect(stateOf(page).base).toEqual({});
+        page.dom.window.close();
+      });
+
+      // 7.2 — the frame message arms
+      it('takes a typed value only for the open edit’s key, locale and entry (7.2)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Mine');
+        await agent.typed('loose_key', 'Forged');
+        await agent.typed('hero_headline', 'Forged in de', { locale: 'de' });
+        await agent.typed('hero_headline', 'Forged entry', { entry: 0 });
+        await agent.typed('hero_headline', 7);
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Mine' });
+        // An end for another key or another locale is not this edit's.
+        await agent.edited('loose_key', 'cancel');
+        await agent.edited('hero_headline', 'lost', { locale: 'de', proposed: false });
+        expect(stateOf(page).edit).toMatchObject({ key: 'hero_headline', locale: 'default' });
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Mine' });
+        page.dom.window.close();
+      });
+
+      it('puts back the value from before the edit on cancel, and keeps no draft for an edit lost before any proposal (7.2)', async () => {
+        const { page, agent } = await bridged();
+        await page.act('key:hero_headline');
+        await page.type('text:hero_headline', 'Before');
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'During');
+        await agent.edited('hero_headline', 'cancel');
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Before' });
+        expect(stateOf(page).edit).toBeNull();
+
+        await agent.pick([{ key: 'loose_key' }], { again: true, tag: 'p' });
+        await agent.typed('loose_key', 'Typed');
+        await agent.edited('loose_key', 'lost', { proposed: false });
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Before' });
+        expect(stateOf(page).edit).toBeNull();
+        expect(popover(page).hidden).toBe(false);
+        expect(poptext(page).value).toBe('loose');
+        expect(lines(page)).toContain('The page redrew this text, so the edit moved to a field.');
+        page.dom.window.close();
+      });
+
+      it('starts an in-place edit on a second pick under the selector’s locale, and ends an open edit before a pick of another key (7.2)', async () => {
+        const { page, agent } = await bridged();
+        await page.change('locale', 'de');
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        expect(agent.sent('edit').at(-1)).toEqual({ stet: 'edit', key: 'hero_headline', locale: 'de', form: 'inplace', oneLine: true });
+        expect(stateOf(page).edit).toMatchObject({ key: 'hero_headline', locale: 'de' });
+        const at = agent.posts.length;
+        await agent.pick([{ key: 'loose_key' }], { tag: 'p' });
+        expect(agent.posts[at]?.message).toEqual({ stet: 'end', how: 'keep' });
+        expect(selected(page)).toBe('loose_key');
+        page.dom.window.close();
+      });
+
+      it('starts no edit and no popover for an entry the key’s value lacks (7.2)', async () => {
+        const { page, agent } = await bridged({ site: THREE });
+        const cases: Array<[string, number | string]> = [
+          ['hero_bullets', 5], ['hero_bullets', 1.5], ['hero_bullets', -1], ['hero_bullets', '1'],
+          ['hero_card', 'constructor'], ['hero_headline', 0], ['hero_headline', 'title'],
+        ];
+        for (const [key, entry] of cases) {
+          await agent.pick([{ key, entry }], { again: true });
+          await agent.pick([{ key, entry, attr: 'alt', by: 'attr', inplace: false }], { again: true });
+          expect(agent.sent('edit'), `${key} ${entry}`).toEqual([]);
+          expect(popover(page).hidden, `${key} ${entry}`).toBe(true);
+          expect(selected(page), `${key} ${entry}`).toBe(key);
+        }
+        page.dom.window.close();
+      });
+
+      // 7.3 — the pinned locale
+      it('F3: keeps an edit’s draft under its own locale across a locale switch, and ends the edit (7.3)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Ship it');
+        const at = agent.posts.length;
+        await page.change('locale', 'de');
+        await agent.typed('hero_headline', 'Ship it now');
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Ship it' });
+        expect(stateOf(page).edit).toBeNull();
+        expect(agent.posts.slice(at).map((p) => p.message)).toContainEqual({ stet: 'end', how: 'keep' });
+        page.dom.window.close();
+      });
+
+      // 7.4 — condition 1
+      it('lets go of the remembered field when the frame takes focus, so a repaint leaves focus in the frame (7.4)', async () => {
+        const { page, agent } = await bridged();
+        const route = byId(page, 'route') as HTMLInputElement;
+        route.focus();
+        // Focus moving into a frame fires no focusin on the dashboard's side, as in a browser.
+        const frame = agent.frame();
+        page.dom.window.addEventListener('focusin', (event) => { if (event.target === frame) event.stopImmediatePropagation(); }, true);
+        frame.focus();
+        expect(docOf(page).activeElement).toBe(frame);
+        page.dom.window.dispatchEvent(new page.dom.window.FocusEvent('blur'));
+        let pulled = 0;
+        route.addEventListener('focus', () => { pulled += 1; });
+        await page.act('keys');
+        await page.act('keys');
+        expect(pulled).toBe(0);
+        page.dom.window.close();
+      });
+
+      // 7.5 — the popover and the counter
+      it('opens the popover under the element’s box at the dashboard’s scale with the raw value; Enter keeps it, Esc puts it back (7.5)', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const frame = agent.frame();
+        // The frame renders at 1280 px, scaled to 640 in a pane that starts 500 px from the left.
+        Object.defineProperty(frame, 'offsetWidth', { configurable: true, get: () => 1280 });
+        frame.getBoundingClientRect = () => ({ left: 500, top: 100, width: 640, height: 400, right: 1140, bottom: 500, x: 500, y: 100, toJSON: () => ({}) }) as DOMRect;
+        const greeting = { key: 'lab_greeting', by: 'pattern', inplace: false };
+        await agent.pick([greeting], { again: true, rect: { left: 100, top: 60, width: 300, height: 20 } });
+        expect(agent.sent('edit')).toEqual([]);
+        expect(popover(page).hidden).toBe(false);
+        expect(poptext(page).value).toBe('Welcome back, {{name}}.');
+        expect(byId(page, 'popkey').textContent).toBe('lab_greeting');
+        expect(byId(page, 'popcount').textContent).toBe('23 / 40');
+        expect(popover(page).textContent).toContain('Enter keeps it · Esc puts it back');
+        expect([popover(page).style.left, popover(page).style.top]).toEqual(['550px', '146px']);
+        await typeInto(page, poptext(page), 'Welcome, {{name}}.');
+        expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+        await press(page, poptext(page), 'Enter');
+        expect(popover(page).hidden).toBe(true);
+        expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+
+        // Kept inside the window: clamped at the right edge, flipped above a box near the bottom.
+        await agent.pick([greeting], { again: true, rect: { left: 1200, top: 1300, width: 300, height: 20 } });
+        expect([popover(page).style.left, popover(page).style.top]).toEqual(['1016px', '744px']);
+        expect(poptext(page).value).toBe('Welcome, {{name}}.');
+        await typeInto(page, poptext(page), 'Gone');
+        await press(page, poptext(page), 'Escape');
+        expect(popover(page).hidden).toBe(true);
+        expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+        page.dom.window.close();
+      });
+
+      it('colours the counter grey, amber from 90 % and red past the limit saying what Save does, and counts a list entry alone (7.5)', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const count = (id = 'popcount'): [string, string] => [byId(page, id).textContent ?? '', byId(page, id).className];
+        await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+        await typeInto(page, poptext(page), 'x'.repeat(32));
+        expect(count()).toEqual(['32 / 40', 'cnt']);
+        await typeInto(page, poptext(page), 'x'.repeat(35));
+        expect(count()).toEqual(['35 / 40', 'cnt']);
+        await typeInto(page, poptext(page), 'x'.repeat(36));
+        expect(count()).toEqual(['36 / 40', 'cnt amb']);
+        await typeInto(page, poptext(page), 'x'.repeat(40));
+        expect(count()).toEqual(['40 / 40', 'cnt amb']);
+        await typeInto(page, poptext(page), 'x'.repeat(41));
+        expect(count()).toEqual(['41 / 40 · Save asks first', 'cnt bad']);
+        await press(page, poptext(page), 'Enter');
+
+        await agent.pick([{ key: 'hero_bullets', entry: 2, by: 'contained', inplace: false }], { again: true, tag: 'li' });
+        expect(byId(page, 'popkey').textContent).toBe('hero_bullets[2]');
+        expect(poptext(page).value).toBe('three');
+        expect(count()).toEqual(['5 / 40', 'cnt']);
+        await typeInto(page, poptext(page), 'y'.repeat(41));
+        expect(count()).toEqual(['41 / 40 · Save refuses this', 'cnt bad']);
+        expect(stateOf(page).draft['default hero_bullets']).toEqual(['one', 'two', 'y'.repeat(41)]);
+        await press(page, poptext(page), 'Enter');
+
+        // A tagged value counts its plain text.
+        await agent.pick([{ key: 'lab_tagged', by: 'element', inplace: false }], { again: true });
+        expect(poptext(page).value).toBe('Ship <1>it</1> now');
+        expect(count()).toEqual(['11 / 20', 'cnt']);
+        await press(page, poptext(page), 'Enter');
+
+        // Typing in place: the counter sits by the element.
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'x'.repeat(54));
+        expect(byId(page, 'counter').hidden).toBe(false);
+        expect(count('counter')).toEqual(['54 / 60', 'cnt amb']);
+        await agent.edited('hero_headline', 'keep');
+        expect(byId(page, 'counter').hidden).toBe(true);
+        page.dom.window.close();
+      });
+
+      it('opens no popover under 760 px: a pick selects and scrolls the field into view, and a second pick focuses it (7.5)', async () => {
+        const scrolled: string[] = [];
+        const { page, agent } = await bridged({
+          site: GREETING,
+          prepare: (window) => {
+            Object.defineProperty(window, 'innerWidth', { configurable: true, get: () => 500 });
+            (window.HTMLElement.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = function (this: HTMLElement) {
+              scrolled.push(this.getAttribute('data-act-input') ?? '');
+            };
+          },
+        });
+        await agent.pick([{ key: 'hero_headline' }]);
+        expect(selected(page)).toBe('hero_headline');
+        expect(scrolled).toContain('text:hero_headline');
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        expect(agent.sent('edit')).toEqual([]);
+        expect(popover(page).hidden).toBe(true);
+        expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:hero_headline');
+        await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+        expect(popover(page).hidden).toBe(true);
+        expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_greeting');
+        page.dom.window.close();
+      });
+
+      // 7.6 — the hover label, the chooser, unmanaged text, shared spots, the route warning, Page info, moved
+      it('answers text no key matches with the keys the route reads that the census did not find (7.6, journey B23)', async () => {
+        const nav = {
+          ...descriptor,
+          keys: { ...descriptor.keys, nav_link: { shape: 'text', target: 'web' }, nav_button_text: { shape: 'text', target: 'web' } },
+        } as Descriptor;
+        const { page, agent } = await bridged({
+          site: siteBody({ descriptor: nav, snapshot: { ...snapshot, default: { ...snapshot.default, nav_link: 'Docs', nav_button_text: 'Start' } } }),
+          routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['hero_headline', 'nav_button_text', 'nav_link'], complete: true }]],
+        });
+        await agent.census({ found: { hero_headline: 1 } });
+        await agent.tell({ stet: 'unmanaged', text: 'Docs Start', tag: 'a' });
+        expect(lines(page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: nav_link, nav_button_text.']);
+        expect(note(page).textContent).not.toContain('unmanaged');
+        // Every key the route reads was found: the first line alone.
+        await agent.census({ found: { hero_headline: 1, nav_link: 1, nav_button_text: 1 } });
+        expect(lines(page)).toEqual(['No key matches this text.']);
+        page.dom.window.close();
+      });
+
+      it('shows a chooser for words two keys share, and selects the key chosen (7.6, journey B23)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }]);
+        const box = byId(page, 'panepick');
+        expect(box.hidden).toBe(false);
+        expect(box.textContent).toContain('Two keys show these words. Which one?');
+        expect([...box.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['hero_headline', 'loose_key']);
+        await page.act('choose:loose_key');
+        expect(selected(page)).toBe('loose_key');
+        expect(box.hidden).toBe(true);
+        page.dom.window.close();
+      });
+
+      it('names a key’s other spots on hover and in the editor header (7.6, journey B23)', async () => {
+        const { page, agent } = await bridged({
+          routes: [['/api/site/marks', 200, {
+            documents: [],
+            keys: {},
+            places: {
+              hero_headline: [
+                { file: 'app/(app)/inbox/page.tsx', line: 9, kind: 'headline', tag: 'h1' },
+                { file: 'components/AppShell.tsx', line: 12, kind: 'text in components/AppShell.tsx' },
+              ],
+            },
+          }]],
+        });
+        await agent.census({ found: { hero_headline: 2, loose_key: 2 } });
+        const label = byId(page, 'hoverlabel');
+        await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: null, by: 'whole' }], tag: 'a', rect: RECT, inplace: true });
+        expect(label.hidden).toBe(false);
+        expect([...label.children].map((line) => line.textContent)).toEqual(['link text · hero_headline', 'also in app/(app)/inbox/page.tsx:9']);
+        await agent.tell({ stet: 'hover', keys: [{ key: 'loose_key', attr: 'aria-label', by: 'attr' }], tag: 'button', rect: RECT, inplace: false });
+        expect([...label.children].map((line) => line.textContent)).toEqual(['aria label · loose_key', 'also on 1 other spot']);
+        await agent.tell({ stet: 'hover', keys: [] });
+        expect(label.hidden).toBe(true);
+        await agent.pick([{ key: 'hero_headline' }]);
+        expect(byId(page, 'shared').textContent).toBe('Shown in 2 places on this page · app/(app)/inbox/page.tsx:9 · components/AppShell.tsx:12');
+        await agent.pick([{ key: 'seo_home_title' }]);
+        expect(byId(page, 'shared').textContent).toBe('');
+        page.dom.window.close();
+      });
+
+      it('F7: names the other place of a key on hover when both places are the same kind, never the hovered one (7.6)', async () => {
+        const { page, agent } = await bridged({
+          routes: [['/api/site/marks', 200, {
+            documents: [],
+            keys: {},
+            places: {
+              hero_headline: [
+                { file: 'app/a/page.tsx', line: 3, kind: 'headline', tag: 'h1' },
+                { file: 'app/b/page.tsx', line: 8, kind: 'headline', tag: 'h1' },
+              ],
+            },
+          }]],
+        });
+        const label = byId(page, 'hoverlabel');
+        await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: null, by: 'whole' }], tag: 'h1', rect: RECT, inplace: true });
+        const shown = [...label.children].map((line) => line.textContent);
+        expect(shown).toEqual(['headline · hero_headline', 'also in app/b/page.tsx:8']);
+        page.dom.window.close();
+      });
+
+      it('warns where a key found by its text is read by no file of a fully read route, and nowhere else (7.6, journey B23)', async () => {
+        const WARN = 'This text matches hero_headline, but no file on this page reads that key — saving may not change it.';
+        const { page, agent } = await bridged({
+          routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: true }]],
+        });
+        await agent.pick([{ key: 'hero_headline', by: 'whole' }]);
+        expect(lines(page)).toContain(WARN);
+        expect(agent.locates().at(-1)).toMatchObject({ key: 'hero_headline', guess: true });
+        await agent.pick([{ key: 'hero_headline', by: 'mark' }]);
+        expect(lines(page)).not.toContain(WARN);
+        await agent.pick([{ key: 'loose_key', by: 'contained', inplace: false }]);
+        expect(lines(page).join(' ')).not.toContain('but no file on this page reads');
+        // A route whose reads are incomplete never warns.
+        page.answer('/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: false });
+        await page.act('previewLoad');
+        await agent.load();
+        await agent.ready();
+        await agent.pick([{ key: 'hero_headline', by: 'whole' }]);
+        expect(lines(page)).not.toContain(WARN);
+        page.dom.window.close();
+      });
+
+      it('lists the census’s head keys under Page info, with the search result and the share card (7.6, journey B26)', async () => {
+        const { page, agent } = await bridged();
+        await agent.census({ found: { seo_home_title: 1, loose_key: 1 }, head: [{ key: 'seo_home_title', where: 'title' }, { key: 'loose_key', where: 'description' }] });
+        await page.act('pageInfo');
+        const info = byId(page, 'paneinfo');
+        expect(info.hidden).toBe(false);
+        expect([...info.querySelectorAll('.hl')].map((line) => line.textContent)).toEqual(['page title · seo_home_title', 'meta description · loose_key']);
+        expect([...info.querySelectorAll('.serp > div')].map((part) => part.textContent)).toEqual(['Search result', '/', 'Home', 'loose']);
+        await page.act('pageInfo');
+        expect(info.hidden).toBe(true);
+        page.dom.window.close();
+      });
+
+      it('names the app’s own navigation beside the route field, keeps the route, and reads the new route’s files (7.6)', async () => {
+        const { page, agent } = await bridged();
+        await agent.moved('/pricing?plan=pro');
+        expect(byId(page, 'panemoved').textContent).toBe('The app moved to /pricing?plan=pro');
+        expect((byId(page, 'route') as HTMLInputElement).value).toBe('/');
+        expect(page.requested('/api/site/route-reads').at(-1)).toContain('route=%2Fpricing');
+        page.dom.window.close();
+      });
+
+      it('names a hovered element’s kind as the marks route does (the kind parity table, an addition)', () => {
+        const source = /const ELEMENT_KINDS = [\s\S]*?\nfunction elementKind\([\s\S]*?\n\}/.exec(dashboardPage())?.[0];
+        expect(source).toBeDefined();
+        const elementKind = new Function(`${source as string}; return elementKind;`)() as (tag: string, attr: string | null) => string;
+        const rows: Array<[string, string | undefined]> = [
+          ['h1', undefined], ['h6', undefined], ['p', undefined], ['a', undefined], ['button', undefined], ['label', undefined],
+          ['li', undefined], ['summary', undefined], ['span', undefined], ['constructor', undefined], ['img', 'alt'],
+          ['button', 'aria-label'], ['div', 'title'], ['input', 'placeholder'], ['div', 'data-x'],
+        ];
+        const mismatches = rows
+          .map(([tag, attr]) => [tag, attr, elementKind(tag, attr ?? null), kindOf({ file: 'x', line: 1, tag, ...(attr === undefined ? {} : { attr }) })])
+          .filter(([, , page, core]) => page !== core);
+        expect(mismatches).toEqual([]);
+      });
+
+      it('says nothing of a key missing from the page while it is typed in place (the C5 flag, an addition)', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Typed in place');
+        await wait(150);
+        agent.say(LOCATED({ found: 0, seq: agent.locates().at(-1)?.['seq'] }));
+        await page.settle();
+        expect(note(page).textContent).not.toContain('was not found');
+        await agent.edited('hero_headline', 'keep');
+        agent.say(LOCATED({ found: 0, seq: agent.locates().at(-1)?.['seq'] }));
+        await page.settle();
+        expect(note(page).textContent).toContain('hero_headline was not found on /.');
+        page.dom.window.close();
+      });
+
+      it('says where a key the census found only in the head sits (the C5 flag, an addition)', async () => {
+        const { page, agent } = await bridged();
+        await agent.census({ found: { loose_key: 1 }, head: [{ key: 'loose_key', where: 'description' }] });
+        await page.change('group', 'prefix:loose');
+        await page.act('key:loose_key');
+        expect(note(page).textContent).toBe('loose_key appears as the meta description, under the title in search results. It is not part of the page’s visible text.');
+        page.dom.window.close();
+      });
+
+      // 7.7 — the badge
+      describe('the unread-key badge (7.7)', () => {
+        const PAGES = { home: { route: '/' }, a: { route: '/a' }, b: { route: '/b/' }, c: { route: '/c' }, d: { route: '/d' }, post: { route: '/blog/[slug]' } };
+        const BADGED: Descriptor = {
+          version: 1,
+          keys: {
+            lone_key: { shape: 'text', target: 'web' },
+            mail_key: { shape: 'text', target: 'html-email' },
+            server_key: { shape: 'text', target: 'web' },
+            home_key: { shape: 'text', target: 'web', pages: ['home'] },
+            tier_solo_name: { shape: 'text', target: 'web' },
+            blind_key: { shape: 'text', target: 'web' },
+          },
+          pages: PAGES,
+        };
+        const VALUES = { lone_key: 'Lone words', mail_key: 'Mail words', server_key: 'Server words', home_key: 'Home words', tier_solo_name: 'Solo', blind_key: 'Blind' };
+        const usageOf = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+          keys: { lone_key: { state: 'not_found' }, mail_key: { state: 'not_found' }, server_key: { state: 'not_found' }, home_key: { state: 'read' } },
+          prefixes: [],
+          causes: [],
+          serverOnly: ['server_key'],
+          files: 55,
+          root: 'site/',
+          ...over,
+        });
+        const COMPLETE = { route: '/', files: [], keys: [], complete: true };
+        /** Every route's reads answer complete unless `routes` says otherwise. */
+        const badged = (usage: Record<string, unknown>, d: Descriptor = BADGED, routes: Array<[string, number, unknown]> = []) =>
+          bridged({
+            site: siteBody({ descriptor: d, snapshot: { default: VALUES } }),
+            routes: [['/api/site/usage', 200, usage], ['/api/site/route-reads', 200, COMPLETE], ...routes],
+          });
+        const SCOPE = 'not found in any file stet searched (55 files in site/)';
+        const badges = async (page: Painted, id: string): Promise<string[]> => {
+          await page.type('search', '_');
+          return [...(docOf(page).querySelector(`[data-act="key:${id}"]`)?.querySelectorAll('.bdg') ?? [])].map((b) => b.textContent ?? '');
+        };
+        const noteOf = async (page: Painted, id: string): Promise<string[]> => {
+          await page.type('search', '_');
+          await page.act(`key:${id}`);
+          return lines(page);
+        };
+        const visit = async (agent: ReturnType<typeof agentOf>, routes: string[], found: Record<string, number> = {}): Promise<void> => {
+          for (const route of routes) {
+            await agent.moved(route);
+            await agent.census({ route, found });
+          }
+        };
+
+        it('says how many pages are not yet checked (key-usage: pages not yet checked)', async () => {
+          const { page, agent } = await badged(usageOf());
+          await visit(agent, ['/', '/a']);
+          expect(await badges(page, 'lone_key')).toContain(SCOPE);
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '3 of 5 pages not yet checked']);
+          page.dom.window.close();
+        });
+
+        it('upgrades to may be a leftover once every page is visited, never for an email or server-only key (key-usage: the upgrade)', async () => {
+          const { page, agent } = await badged(usageOf());
+          await visit(agent, ['/', '/a', '/b/', '/c', '/d']);
+          expect(await badges(page, 'lone_key')).toContain('may be a leftover');
+          expect(await noteOf(page, 'lone_key')).toEqual(['may be a leftover']);
+          expect(await badges(page, 'mail_key')).toContain(SCOPE);
+          expect(await noteOf(page, 'mail_key')).toEqual([SCOPE]);
+          expect(await noteOf(page, 'server_key')).toEqual([SCOPE]);
+          page.dom.window.close();
+        });
+
+        it('keeps the scan’s wording for a key a visited page showed, and before any page is visited (key-usage: a sibling package’s read)', async () => {
+          const { page, agent } = await badged(usageOf());
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '5 of 5 pages not yet checked']);
+          await visit(agent, ['/', '/a', '/b', '/c'], {});
+          await visit(agent, ['/d'], { lone_key: 1 });
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE]);
+          expect(await badges(page, 'lone_key')).not.toContain('may be a leftover');
+          page.dom.window.close();
+        });
+
+        it('never upgrades on a site with no page list', async () => {
+          const { page } = await badged(usageOf(), { ...BADGED, pages: {} });
+          expect(await badges(page, 'lone_key')).toContain(SCOPE);
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE]);
+          page.dom.window.close();
+        });
+
+        it('counts a page whose route reads are incomplete as not yet checked', async () => {
+          const { page, agent } = await badged(usageOf(), BADGED, [['/api/site/route-reads', 200, { route: '/a', files: [], keys: [], complete: false }]]);
+          await visit(agent, ['/', '/a', '/b/', '/c', '/d']);
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '5 of 5 pages not yet checked']);
+          page.dom.window.close();
+        });
+
+        it('reads unknown under a learnt prefix or the site line, the line naming three causes and the rest as a count', async () => {
+          const causes = [
+            { text: 'copy(a)', file: 'a.ts', line: 1 },
+            { text: 'copy(b)', file: 'b.ts', line: 2 },
+            { text: 'copy(c)', file: 'c.ts', line: 3 },
+            { text: 'fn(copy)', file: 'd.ts', line: 4 },
+          ];
+          const LINE = 'This site reads some keys in ways stet cannot follow, so it cannot say which keys are unread: ' +
+            'copy(a) at a.ts:1, copy(b) at b.ts:2, copy(c) at c.ts:3 and 1 more';
+          const { page } = await badged(usageOf({
+            keys: { tier_solo_name: { state: 'unknown', prefix: { prefix: 'tier_', file: 'src/pricing.ts', line: 4 } }, blind_key: { state: 'unknown' } },
+            prefixes: [{ prefix: 'tier_', file: 'src/pricing.ts', line: 4 }],
+            causes,
+          }));
+          expect(byId(page, 'siteline').textContent).toBe(LINE);
+          expect(await badges(page, 'tier_solo_name')).toContain('unknown');
+          expect(await noteOf(page, 'tier_solo_name')).toEqual([
+            'tier_solo_name starts with tier_, which src/pricing.ts:4 reads without naming each key, so whether it is read is unknown.',
+            'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)',
+          ]);
+          expect(await noteOf(page, 'blind_key')).toEqual([LINE, 'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)']);
+          expect(page.html()).not.toContain('can’t tell');
+          expect(page.html()).not.toContain("can't tell");
+          page.dom.window.close();
+        });
+
+        /** A visit as the frame reports it: the app moves, the route's reads answer as `reads` says, the census follows. */
+        const visitWith = async (
+          page: Painted,
+          agent: ReturnType<typeof agentOf>,
+          route: string,
+          reads: { status?: number; complete?: boolean; delay?: number } = {},
+          shown = route,
+        ): Promise<void> => {
+          const status = reads.status ?? 200;
+          page.answer('/api/site/route-reads', status, status >= 400 ? { error: 'x' } : { route, files: [], keys: [], complete: reads.complete ?? true }, reads.delay);
+          await agent.moved(route);
+          await agent.census({ route: shown, found: {} });
+        };
+        const AMONG_FIVE = [SCOPE, '1 of 5 pages not yet checked'];
+
+        it('P8a: one incomplete route among five holds the upgrade until it is read again complete (key-usage: the upgrade)', async () => {
+          const { page, agent } = await badged(usageOf());
+          await visitWith(page, agent, '/');
+          await visitWith(page, agent, '/a');
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '3 of 5 pages not yet checked']);
+          await visitWith(page, agent, '/b/');
+          await visitWith(page, agent, '/c', { complete: false });
+          await visitWith(page, agent, '/d');
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          expect(await badges(page, 'lone_key')).not.toContain('may be a leftover');
+          await visitWith(page, agent, '/c', { complete: true });
+          expect(await noteOf(page, 'lone_key')).toEqual(['may be a leftover']);
+          expect(await badges(page, 'lone_key')).toContain('may be a leftover');
+          expect(await noteOf(page, 'mail_key')).toEqual([SCOPE]);
+          expect(await noteOf(page, 'server_key')).toEqual([SCOPE]);
+          page.dom.window.close();
+        });
+
+        it('P8b: a query, a trailing slash and a route outside the list count the page they belong to, or none', async () => {
+          const { page, agent } = await badged(usageOf());
+          await visitWith(page, agent, '/');
+          await visitWith(page, agent, '/a', {}, '/a?x=1');
+          await visitWith(page, agent, '/b', {}, '/b');
+          await visitWith(page, agent, '/c');
+          await visitWith(page, agent, '/zzz');
+          await visitWith(page, agent, '/blog/hello');
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          page.dom.window.close();
+        });
+
+        it('P8c: a route whose reads fail (500) is not checked, and the badge never upgrades on it (D42)', async () => {
+          const { page, agent } = await badged(usageOf());
+          for (const route of ['/', '/a', '/b/', '/c']) await visitWith(page, agent, route);
+          await visitWith(page, agent, '/d', { status: 500 });
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          expect(await badges(page, 'lone_key')).not.toContain('may be a leftover');
+          page.dom.window.close();
+        });
+
+        it('P8d: a census that lands before its page’s reads leaves the page unchecked until they answer complete (D42)', async () => {
+          const { page, agent } = await badged(usageOf());
+          for (const route of ['/', '/a', '/b/', '/c']) await visitWith(page, agent, route);
+          // The last page's reads answer incomplete after 300 ms; its census arrives first.
+          page.answer('/api/site/route-reads', 200, { route: '/d', files: [], keys: [], complete: false }, 300);
+          await agent.census({ route: '/d', found: {} });
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          await wait(500);
+          await page.settle();
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+
+          // The same page, its reads slow but complete: unchecked until they answer, then the upgrade.
+          const second = await badged(usageOf());
+          for (const route of ['/', '/a', '/b/', '/c']) await visitWith(second.page, second.agent, route);
+          second.page.answer('/api/site/route-reads', 200, { route: '/d', files: [], keys: [], complete: true }, 300);
+          await second.agent.census({ route: '/d', found: {} });
+          expect(await noteOf(second.page, 'lone_key')).toEqual(AMONG_FIVE);
+          await wait(500);
+          await second.page.settle();
+          expect(await noteOf(second.page, 'lone_key')).toEqual(['may be a leftover']);
+          page.dom.window.close();
+          second.page.dom.window.close();
+        });
+
+        it('a page whose reads answered complete and later answer incomplete is unchecked again (D42)', async () => {
+          const { page, agent } = await badged(usageOf());
+          for (const route of ['/', '/a', '/b/', '/c', '/d']) await visitWith(page, agent, route);
+          expect(await noteOf(page, 'lone_key')).toEqual(['may be a leftover']);
+          await visitWith(page, agent, '/c', { complete: false });
+          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          page.dom.window.close();
+        });
+
+        it('lists the learnt prefixes in the pane for any selected key, a key the scan found read among them (key-usage: the pane lists the learnt prefixes)', async () => {
+          const { page } = await badged(usageOf({ prefixes: [{ prefix: 'tier_', file: 'src/pricing.ts', line: 4 }] }));
+          expect(await noteOf(page, 'home_key')).toEqual(['Key prefixes read without naming each key: tier_ (src/pricing.ts:4)']);
+          page.dom.window.close();
+        });
+
+        it('marks a key of the open route the census did not find as not shown on this page', async () => {
+          const { page, agent } = await badged(usageOf());
+          await agent.census({ route: '/', found: {} });
+          expect(await badges(page, 'home_key')).toContain('not shown on this page');
+          await agent.census({ route: '/', found: { home_key: 1 } });
+          expect(await badges(page, 'home_key')).not.toContain('not shown on this page');
+          page.dom.window.close();
+        });
+      });
+
+      // 7.8 — the frame message boundary
+      it('stage 5: a forged pick, typed and save from the frame writes nothing and moves focus to Save (7.8)', async () => {
+        let saves = 0;
+        const { page, agent } = await bridged({
+          routes: [['/api/site/save', 200, () => { saves += 1; return { written: ['stet/defaults.json'], pending: ['stet/defaults.json'] }; }]],
+        });
+        // A pick naming a key the descriptor does not declare changes nothing.
+        for (const key of ['constructor', 'nope']) {
+          await agent.pick([{ key }], { again: true });
+          expect(selected(page), key).toBe('');
+          expect(agent.sent('edit'), key).toEqual([]);
+          expect(popover(page).hidden, key).toBe(true);
+        }
+        await agent.pick([{ key: 'hero_headline' }], { again: true });
+        await agent.typed('hero_headline', 'Forged words');
+        await agent.typed('loose_key', 'Forged into another key');
+        await agent.typed('hero_headline', 'Forged into another locale', { locale: 'de' });
+        // Cmd/Ctrl-S pressed in the page: the frame holds focus.
+        agent.frame().focus();
+        await agent.key('save');
+        await wait(150);
+        expect(saves).toBe(0);
+        expect(page.requested('/api/site/save')).toEqual([]);
+        expect(docOf(page).activeElement).toBe(docOf(page).querySelector('#main [data-act="save"]'));
+        expect(stateOf(page).draft).toEqual({ 'default hero_headline': 'Forged words' });
+        expect(stateOf(page).snapshot['default']?.['hero_headline']).toBe('Ship the copy');
+        page.dom.window.close();
+      });
+
+      // 7.8 — what the frame cannot do (D41), and the boundary probed from the other side
+      it('D41: a forged key:save with a column field focused leaves the focus there, and the next Space saves nothing (7.8)', async () => {
+        const { page, agent } = await bridged();
+        await page.act('key:hero_headline');
+        await page.type('text:hero_headline', 'Drafted');
+        const field = docOf(page).querySelector('#main [data-act-input="text:hero_headline"]') as HTMLElement;
+        const focused = (): string | null => docOf(page).activeElement?.getAttribute('data-act-input') ?? docOf(page).activeElement?.getAttribute('data-act') ?? null;
+        field.focus();
+        expect(focused()).toBe('text:hero_headline');
+        await agent.key('save');
+        expect(focused()).toBe('text:hero_headline');
+        // A Space on a focused button presses it, as in a browser.
+        const active = docOf(page).activeElement as HTMLElement;
+        active.dispatchEvent(new page.dom.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+        if (active.tagName === 'BUTTON') active.click();
+        await page.settle();
+        await wait(100);
+        expect(page.requested('/api/site/save')).toEqual([]);
+        page.dom.window.close();
+      });
+
+      describe('the frame message boundary, probed', () => {
+        const dump = (page: Painted): string =>
+          (page.dom.window as unknown as { eval: (code: string) => string }).eval(
+            'JSON.stringify({draft:S.draft,base:S.base,edit:S.edit,sel:S.sel,mode:S.mode,moved:S.moved,census:S.census,hover:S.hover,popover:S.popover,unmanaged:S.unmanaged,choose:S.choose,warn:S.warn,locale:S.locale,seenKeys:[...S.seen.keys],seenRoutes:[...S.seen.routes],tmpl:S.tmpl})',
+          );
+        const writesOf = (page: Painted): string[] => page.sent.filter((r) => r.body !== undefined).map((r) => r.path);
+
+        it('P2: prototype-chain keys and an empty key select nothing and edit nothing, in a pick, a hover, typed, edited and a census', async () => {
+          const { page, agent } = await bridged({ site: THREE });
+          const before = dump(page);
+          for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf', 'prototype', '']) {
+            await agent.pick([{ key }], { again: true });
+            await agent.tell({ stet: 'hover', keys: [{ key, attr: null, by: 'whole' }], tag: 'p', rect: RECT, inplace: true });
+            await agent.typed(key, 'X');
+            await agent.edited(key, 'cancel');
+          }
+          const found = JSON.parse('{"__proto__":1,"constructor":2,"toString":3,"hero_headline":1}') as Record<string, number>;
+          await agent.census({
+            found,
+            head: [{ key: 'constructor', where: 'title' }, { key: '__proto__', where: 'title' }, { key: 'hero_headline', where: '__proto__' }, { key: 'hero_headline', where: 'constructor' }],
+          });
+          const after = JSON.parse(dump(page)) as { census: { found: Record<string, number>; head: unknown[] }; seenKeys: string[] };
+          expect(Object.keys(after.census.found)).toEqual(['hero_headline']);
+          expect(after.census.head).toEqual([]);
+          expect(after.seenKeys).toEqual(['hero_headline']);
+          const was = JSON.parse(before) as Record<string, unknown>;
+          const now = JSON.parse(dump(page)) as Record<string, unknown>;
+          for (const field of ['draft', 'base', 'edit', 'sel', 'popover', 'choose', 'hover']) expect(now[field], field).toEqual(was[field]);
+          expect(agent.sent('edit')).toEqual([]);
+          expect(writesOf(page)).toEqual([]);
+          expect(page.errors).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('P7: nothing from a frame message is written as HTML', async () => {
+          const { page, agent } = await bridged({
+            routes: [['/api/site/route-reads', 200, { route: '/', files: [], keys: ['hero_headline'], complete: true }]],
+          });
+          const evil = '<img src=x onerror="window.__pwn=1"><svg onload="window.__pwn=2">';
+          await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: evil, by: 'whole' }], tag: evil, rect: RECT, inplace: true });
+          await agent.tell({ stet: 'unmanaged', text: evil, tag: evil });
+          await agent.moved(evil);
+          await agent.census({ route: evil, found: { hero_headline: 1 }, head: [{ key: 'hero_headline', where: 'title' }] });
+          await agent.tell({ stet: 'pick', keys: [{ key: 'hero_headline', attr: null, by: evil, inplace: true }, { key: 'loose_key', attr: evil, by: evil }], tag: evil, rect: RECT, again: true });
+          await page.act('pageInfo');
+          await agent.pick([{ key: 'hero_headline', attr: evil, by: 'whole', inplace: false }], { again: true, tag: evil });
+          await agent.tell({ stet: 'located', key: 'hero_headline', found: 0, by: evil, route: evil, hardcoded: false, redrawn: true });
+          await agent.tell({ stet: 'edited', key: 'hero_headline', locale: 'default', how: 'lost', proposed: true });
+          expect((page.dom.window as unknown as { __pwn?: number }).__pwn).toBeUndefined();
+          for (const id of ['hoverlabel', 'panenote', 'panemoved', 'paneinfo', 'panepick', 'popover', 'counter', 'panehead']) {
+            expect(byId(page, id).querySelectorAll('img, svg, script').length, id).toBe(0);
+          }
+          expect(docOf(page).querySelectorAll('[onerror], [onload]').length).toBe(0);
+          page.dom.window.close();
+        });
+
+        it('P9: no message arm of the frame, and no Enter in the popover, requests a write', async () => {
+          const { page, agent } = await bridged({ site: GREETING });
+          const arms: Array<Record<string, unknown>> = [
+            { stet: 'pick', keys: [{ key: 'hero_headline', attr: null, by: 'whole', inplace: true }], tag: 'h1', rect: RECT, again: true },
+            { stet: 'typed', key: 'hero_headline', locale: 'default', value: 'x', force: true },
+            { stet: 'hover', keys: [{ key: 'hero_headline', attr: null, by: 'whole' }], tag: 'h1', rect: RECT, inplace: true },
+            { stet: 'rect', rect: RECT },
+            { stet: 'unmanaged', text: 't', tag: 'p' },
+            { stet: 'census', found: { hero_headline: 1 }, head: [], route: '/' },
+            { stet: 'moved', how: 'pushState', route: '/x' },
+            { stet: 'key', which: 'mode' },
+            { stet: 'key', which: 'mode' },
+            { stet: 'key', which: 'escape' },
+            { stet: 'key', which: 'save' },
+            { stet: 'edited', key: 'hero_headline', locale: 'default', how: 'lost', proposed: true },
+            { stet: 'edited', key: 'hero_headline', locale: 'default', how: 'cancel' },
+            { stet: 'edited', key: 'hero_headline', locale: 'default', how: 'keep' },
+          ];
+          for (const arm of arms) await agent.tell(arm);
+          expect(writesOf(page)).toEqual([]);
+          await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+          await typeInto(page, poptext(page), 'Hello');
+          await press(page, poptext(page), 'Enter');
+          expect(writesOf(page)).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('P10: every draft removal clears its base: cancel, lost without a proposal, the popover’s Esc, a project switch', async () => {
+          const { page, agent } = await bridged({ site: GREETING });
+          await agent.pick([{ key: 'hero_headline' }], { again: true });
+          await agent.typed('hero_headline', 'During');
+          expect(stateOf(page).base).toEqual({ 'default hero_headline': 'Ship the copy' });
+          await agent.edited('hero_headline', 'cancel');
+          expect(stateOf(page).draft).toEqual({});
+          expect(stateOf(page).base).toEqual({});
+
+          await agent.pick([{ key: 'loose_key' }], { again: true, tag: 'p' });
+          await agent.typed('loose_key', 'Typed');
+          await agent.edited('loose_key', 'lost', { proposed: false });
+          expect(stateOf(page).draft).toEqual({});
+          expect(stateOf(page).base).toEqual({});
+
+          await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+          await typeInto(page, poptext(page), 'Gone');
+          expect(Object.keys(stateOf(page).base ?? {})).toEqual(['default lab_greeting']);
+          await press(page, poptext(page), 'Escape');
+          expect(stateOf(page).draft).toEqual({});
+          expect(stateOf(page).base).toEqual({});
+
+          await agent.pick([{ key: 'hero_headline' }]);
+          await page.type('text:hero_headline', 'Before the switch');
+          expect(Object.keys(stateOf(page).base ?? {})).toEqual(['default hero_headline']);
+          await page.act('site:/checkouts/other');
+          // The switch asks first, and the edit is lost only on Leave.
+          expect(Object.keys(stateOf(page).draft)).toEqual(['default hero_headline']);
+          await page.act('leaveGo');
+          expect(stateOf(page).draft).toEqual({});
+          expect(stateOf(page).base).toEqual({});
+          page.dom.window.close();
+        });
+
+        it('P11: markup in a frame string stays text in the hover label and the pane note', async () => {
+          const { page, agent } = await bridged();
+          const evil = '<b id="pwn">x</b>';
+          await agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: evil, by: 'whole' }], tag: evil, rect: RECT, inplace: true });
+          expect(byId(page, 'hoverlabel').querySelector('#pwn')).toBeNull();
+          expect(byId(page, 'hoverlabel').textContent).toContain(evil);
+          await agent.pick([{ key: 'hero_headline' }]);
+          await agent.tell({ stet: 'located', key: 'hero_headline', found: 0, by: 'text', route: evil, seq: agent.locates().at(-1)?.['seq'] });
+          expect(byId(page, 'panenote').querySelector('#pwn')).toBeNull();
+          expect(byId(page, 'panenote').textContent).toContain(evil);
+          page.dom.window.close();
+        });
+
+        it('P12: a pick of another entry of the same key ends the open edit first', async () => {
+          const { page, agent } = await bridged({ site: THREE });
+          await agent.pick([{ key: 'hero_bullets', entry: 0 }], { again: true, tag: 'li' });
+          expect(stateOf(page).edit).toMatchObject({ key: 'hero_bullets', entry: 0 });
+          const at = agent.posts.length;
+          await agent.pick([{ key: 'hero_bullets', entry: 1 }], { tag: 'li' });
+          expect(agent.posts[at]?.message).toEqual({ stet: 'end', how: 'keep' });
+          page.dom.window.close();
+        });
+
+        it('P13: a click right after the app moved lists no not-found keys until the new route’s reads arrive (F8)', async () => {
+          const { page, agent } = await bridged({
+            routes: [['/api/site/route-reads', 200, { route: '/', files: ['index.html'], keys: ['hero_headline', 'loose_key'], complete: true }]],
+          });
+          await agent.census({ found: {} });
+          page.answer('/api/site/route-reads', 200, { route: '/pricing', files: [], keys: ['seo_home_title'], complete: true }, 300);
+          await agent.moved('/pricing');
+          await agent.tell({ stet: 'unmanaged', text: 'x', tag: 'p' });
+          expect(lines(page)).toEqual(['No key matches this text.']);
+          await wait(500);
+          await page.settle();
+          expect(lines(page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: seo_home_title.']);
+          page.dom.window.close();
+        });
+      });
+    });
+
+    // --- add-preview-editing D9: store-backed sites --------------------------------
+    // The page over a real mount: one memory store per environment behind
+    // `createStetHandler`, as `stet dev` builds it, so a draft saved by one
+    // page is the row the next page reads.
+    describe('store-backed sites (D9)', () => {
+      const MOUNT_ENV = 'STET_D9_MOUNT_TOKEN';
+      beforeAll(() => { process.env[MOUNT_ENV] = 'd9-token'; });
+      afterAll(() => { delete process.env[MOUNT_ENV]; });
+      afterEach(() => { closeFrames(); });
+
+      const D9: Descriptor = {
+        version: 1,
+        keys: {
+          lab_headline: { shape: 'text', target: 'web', limits: { max: 60, severity: 'advisory' }, pages: ['home'] },
+          lab_button: { shape: 'text', target: 'web', pages: ['pricing'] },
+          lab_link: { shape: 'text', target: 'web', pages: ['home'] },
+          lab_alt: { shape: 'text', target: 'web', pages: ['home'] },
+          lab_note: { shape: 'text', target: 'web', limits: { max: 40, severity: 'hard' }, pages: ['home'] },
+        },
+        pages: { home: { route: '/' }, pricing: { route: '/pricing' } },
+      };
+      const D9_SNAPSHOT = {
+        default: { lab_headline: 'Copy that ships', lab_button: 'Buy', lab_link: 'Read the docs', lab_alt: 'A lab photo', lab_note: 'Small print' },
+      };
+      const D9_SITE = siteBody({
+        mode: 'memory',
+        descriptor: D9,
+        snapshot: D9_SNAPSHOT,
+        keys: 5,
+        environments: [
+          { name: 'default', adapter: 'memory', vars: [] },
+          { name: 'staging', adapter: 'memory', vars: [] },
+        ],
+      });
+      /** The framed page the agent edits: each lab key once, the alt text an attribute. */
+      const D9_PAGE = '<h1>Copy that ships</h1><p id="link">Read the docs</p><img alt="A lab photo"><p id="note">Small print</p>';
+
+      type Stores = Record<string, ReturnType<typeof createMemoryStore>>;
+      const storesOf = (): Stores => ({ default: createMemoryStore({ project: 'd9' }), staging: createMemoryStore({ project: 'd9' }) });
+      /** The mount over one store per environment, answering the page's `/s/<id>/api/stet/…` requests by its `env`. */
+      function storeMount(stores: Stores, d: () => Descriptor = () => D9) {
+        return async (path: string, body: unknown): Promise<{ status: number; body: unknown }> => {
+          const url = new URL(`http://127.0.0.1:4400${path}`);
+          const store = stores[url.searchParams.get('env') ?? 'default'] as StoreAdapter;
+          const handler = createStetHandler({ store, descriptor: d(), auth: MOUNT_ENV });
+          const init = {
+            method: body === undefined ? 'GET' : 'POST',
+            headers: { authorization: 'Bearer d9-token', 'content-type': 'application/json' },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          };
+          const res = body === undefined ? await handler.GET(new Request(url, init)) : await handler.POST(new Request(url, init));
+          return { status: res.status, body: await res.json() };
+        };
+      }
+      /** Every page this describe painted, with where in its requests each Take over was pressed. */
+      const audits: Array<{ page: Painted; presses: number[] }> = [];
+      /** The page over the stores, the dev pane's agent announced; `framed` plays the agent for real. */
+      async function d9Page(stores: Stores, over: Parameters<typeof paint>[0] & { framed?: Framed } = {}) {
+        const { framed, ...rest } = over;
+        const page = await paint({ site: D9_SITE, preview: DEV_PREVIEW, storage: { 'stet.editor': 'dashboard:neil' }, mount: storeMount(stores), ...rest });
+        const presses: number[] = [];
+        const act = page.act.bind(page);
+        page.act = async (name: string): Promise<void> => {
+          if (name === 'takeOver') presses.push(page.sent.length);
+          await act(name);
+        };
+        audits.push({ page, presses });
+        const agent = agentOf(page, framed === undefined ? undefined : (message) => {
+          framed.send(JSON.parse(JSON.stringify(message)));
+          return null;
+        });
+        await agent.load();
+        await agent.ready();
+        return { page, agent };
+      }
+      /** The draft POSTs the page sent, their bodies in order. */
+      const draftPosts = (page: Painted): Array<Record<string, unknown>> =>
+        page.sent.filter((r) => r.path.split('?')[0] === `/s/${SITE_ID}/api/stet/draft`).map((r) => r.body as Record<string, unknown>);
+      /** A store's rows for one key, as the dashboard's read gets them. */
+      const rowsOf = async (store: StoreAdapter, key: string) => {
+        const rows = await store.read({ preview: true });
+        if (!Array.isArray(rows)) throw new Error('read failed');
+        return rows.filter((r) => r.key === key);
+      };
+      /** `HH:MM` of an ISO stamp on this machine's clock, as the page shows a stamp of today. */
+      const clockOf = (at: string): string => {
+        const d = new Date(at);
+        return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+      };
+      const fieldOf = (page: Painted, key: string): HTMLTextAreaElement =>
+        docOf(page).querySelector(`[data-act-input="text:${key}"]`) as HTMLTextAreaElement;
+      const rowText = (page: Painted, key: string): string => docOf(page).querySelector(`[data-act="key:${key}"]`)?.textContent ?? '';
+
+      describe('the value model (8.3)', () => {
+        it('a draft survives a reload: the field, the row and the preview show it (journey B16)', async () => {
+          const stores = storesOf();
+          const first = await d9Page(stores);
+          await first.page.act('key:lab_headline');
+          await first.page.type('text:lab_headline', 'Copy changes without a deploy');
+          await first.page.act('save');
+          expect(draftPosts(first.page)).toHaveLength(1);
+          first.page.dom.window.close();
+
+          const [draft] = (await rowsOf(stores['default'] as StoreAdapter, 'lab_headline')).filter((r) => r.status === 'draft');
+          const { page, agent } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Copy changes without a deploy');
+          expect(rowText(page, 'lab_headline')).toContain(`draft · dashboard:neil · ${clockOf(draft?.createdAt as string)}`);
+          const located = agent.locates().at(-1) as Record<string, unknown>;
+          expect(located['draft']).toBe('Copy changes without a deploy');
+          expect(located['texts']).toEqual(['Copy that ships', 'Copy changes without a deploy']);
+          page.dom.window.close();
+        });
+
+        it('an environment switch reads that environment’s rows', async () => {
+          const stores = storesOf();
+          await stores['staging']?.saveDraft({ key: 'lab_headline', value: 'Staging words', target: 'web', editor: 'agent:claude' });
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Copy that ships');
+          await page.act('cycleEnv');
+          expect(page.requested(`/s/${SITE_ID}/api/stet/keys?env=staging`)).toHaveLength(1);
+          expect(fieldOf(page, 'lab_headline').value).toBe('Staging words');
+          expect(rowText(page, 'lab_headline')).toContain('draft · agent:claude · ');
+          await page.act('cycleEnv');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Copy that ships');
+          page.dom.window.close();
+        });
+
+        it('the census offers the snapshot’s, the active row’s and the draft’s words, each once (fork 20)', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([
+            { key: 'lab_headline', value: 'Copy that shipped' },
+            { key: 'lab_headline', value: 'Copy changes without a deploy', state: 'draft', editor: 'agent:claude' },
+            { key: 'lab_link', value: 'Read the docs' },
+          ]);
+          const { agent } = await d9Page(stores);
+          const census = agent.sent('census').at(-1) as { keys: Array<{ key: string; texts: string[] }> };
+          expect(census.keys.find((k) => k.key === 'lab_headline')?.texts).toEqual(['Copy that ships', 'Copy that shipped', 'Copy changes without a deploy']);
+          expect(census.keys.find((k) => k.key === 'lab_link')?.texts).toEqual(['Read the docs']);
+        });
+
+        it('several drafts show together: three unsaved edits, an attribute among them, and a fourth key’s saved draft (journey B23, D44)', async () => {
+          const stores = storesOf();
+          await stores['default']?.saveDraft({ key: 'lab_note', value: 'Fine print', target: 'web', editor: 'agent:claude' });
+          const framed = await frameAgent(D9_PAGE, CHANNEL);
+          const { page } = await d9Page(stores, { framed });
+          for (const [key, value] of [['lab_headline', 'Copy that sells'], ['lab_link', 'Read the guide'], ['lab_alt', 'A lab at night']] as const) {
+            await page.act(`key:${key}`);
+            await page.type(`text:${key}`, value);
+          }
+          await page.act('key:lab_note');
+          await wait(150);
+          await tick();
+          const doc = framed.doc;
+          expect(doc.querySelector('h1')?.textContent).toBe('Copy that sells');
+          expect(doc.getElementById('link')?.textContent).toBe('Read the guide');
+          expect(doc.querySelector('img')?.getAttribute('alt')).toBe('A lab at night');
+          expect(doc.getElementById('note')?.textContent).toBe('Fine print');
+          page.dom.window.close();
+        });
+
+        it('a finished in-place draft stays on the page when another key is picked (D44, a snapshot site)', async () => {
+          const framed = await frameAgent('<h1>Ship the copy</h1><p>loose</p>', CHANNEL);
+          const page = await paint({ preview: DEV_PREVIEW });
+          const agent = agentOf(page, (message) => { framed.send(JSON.parse(JSON.stringify(message))); return null; });
+          await agent.load();
+          await agent.ready();
+          await page.act('key:hero_headline');
+          await page.type('text:hero_headline', 'Ship the words');
+          await page.change('group', 'prefix:loose');
+          await page.act('key:loose_key');
+          await wait(150);
+          await tick();
+          expect(framed.doc.querySelector('h1')?.textContent).toBe('Ship the words');
+          expect(agent.sent('layer').at(-1)).toEqual({ stet: 'layer', drafts: [{ key: 'hero_headline', texts: ['Ship the copy'], draft: 'Ship the words' }] });
+          page.dom.window.close();
+        });
+      });
+
+      describe('Save and the takeover (8.4, stage 5)', () => {
+        const confirmText = (page: Painted): string => docOf(page).querySelector('#takeover .term')?.textContent ?? '';
+        /** An agent's draft of `key`, saved before the page loads. */
+        const agentHolds = async (stores: Stores, key: string, value: string, env = 'default'): Promise<string> => {
+          await stores[env]?.saveDraft({ key, value, target: 'web', editor: 'agent:claude' });
+          const [row] = (await rowsOf(stores[env] as StoreAdapter, key)).filter((r) => r.status === 'draft');
+          return row?.createdAt as string;
+        };
+
+        it('an agent’s draft is taken over: the confirm names it and its time; Keep theirs keeps both, Take over makes the draft the dashboard’s (journey B16)', async () => {
+          const stores = storesOf();
+          const since = await agentHolds(stores, 'lab_headline', 'The agent’s words');
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'The editor’s words');
+          await page.act('save');
+          expect(confirmText(page)).toBe(`agent:claude has a draft of lab_headline from ${clockOf(since)}. Save yours over it? Their wording is replaced and the draft becomes yours.`);
+          expect([...docOf(page).querySelectorAll('#takeover button')].map((b) => b.textContent)).toEqual(['Take over', 'Keep theirs']);
+
+          await page.act('keepTheirs');
+          expect(confirmText(page)).toBe('');
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_headline')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'agent:claude', value: 'The agent’s words' });
+          expect(fieldOf(page, 'lab_headline').value).toBe('The editor’s words');
+          expect(docOf(page).getElementById('dc')?.textContent).toBe('1 unsaved edit');
+
+          await page.act('save');
+          await page.act('takeOver');
+          const posts = draftPosts(page);
+          expect(posts.at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_headline', locale: 'default', value: 'The editor’s words', force: true });
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_headline')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'dashboard:neil', value: 'The editor’s words' });
+          expect(confirmText(page)).toBe('');
+          expect(docOf(page).getElementById('dc')?.hidden).toBe(true);
+          expect(rowText(page, 'lab_headline')).toContain('draft · dashboard:neil · ');
+          page.dom.window.close();
+        });
+
+        it('a 409 store conflict without refused shows the error line, stops the loop and queues nothing', async () => {
+          const stores = storesOf();
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => (path.split('?')[0]?.endsWith('/draft')
+              ? { status: 409, body: { error: 'concurrent_save:lab_headline', code: 'conflict' } }
+              : mount(path, body)),
+          });
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Read the guide');
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Another headline');
+          await page.act('save');
+          expect(draftPosts(page)).toHaveLength(1);
+          expect(docOf(page).querySelector('#refusal .err')?.textContent).toBe('concurrent_save:lab_headline');
+          expect(docOf(page).getElementById('takeover')).toBeNull();
+          expect(docOf(page).getElementById('dc')?.textContent).toBe('2 unsaved edits');
+          page.dom.window.close();
+        });
+
+        it('Keep theirs writes nothing, and the next held draft follows', async () => {
+          const stores = storesOf();
+          await agentHolds(stores, 'lab_headline', 'Agent headline');
+          await agentHolds(stores, 'lab_link', 'Agent link');
+          const { page } = await d9Page(stores);
+          for (const [key, value] of [['lab_headline', 'Mine'], ['lab_link', 'Mine too']] as const) {
+            await page.act(`key:${key}`);
+            await page.type(`text:${key}`, value);
+          }
+          await page.act('save');
+          const sent = page.sent.length;
+          expect(confirmText(page)).toContain('agent:claude has a draft of lab_headline from ');
+          await page.act('keepTheirs');
+          expect(confirmText(page)).toContain('agent:claude has a draft of lab_link from ');
+          await page.act('keepTheirs');
+          expect(confirmText(page)).toBe('');
+          expect(page.sent.slice(sent).filter((r) => r.body !== undefined)).toEqual([]);
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_headline')).find((r) => r.status === 'draft')?.value).toBe('Agent headline');
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_link')).find((r) => r.status === 'draft')?.value).toBe('Agent link');
+          expect(docOf(page).getElementById('dc')?.textContent).toBe('2 unsaved edits');
+          page.dom.window.close();
+        });
+
+        it('Take over inside an active change resends with force and the change, and the draft joins it', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+          await agentHolds(stores, 'lab_headline', 'Agent headline');
+          const { page } = await d9Page(stores, { session: { [`stet.change ${SITE_ID} default`]: String(opened.changeId) } });
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          expect(draftPosts(page).at(-1)).toMatchObject({ key: 'lab_headline', change: opened.changeId });
+          await page.act('takeOver');
+          expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_headline', locale: 'default', value: 'Mine', change: opened.changeId, force: true });
+          expect((await rowsOf(store, 'lab_headline')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'dashboard:neil', changesetId: opened.changeId });
+          page.dom.window.close();
+        });
+
+        it('a Take over over a hard limit tightened since answers 422, shows the gate’s line, and the other draft stands (journey B16, an addition)', async () => {
+          const stores = storesOf();
+          await agentHolds(stores, 'lab_note', 'Fine print');
+          let descriptor = D9;
+          const { page } = await d9Page(stores, { mount: storeMount(stores, () => descriptor) });
+          await page.act('key:lab_note');
+          await page.type('text:lab_note', 'Small print, said at more length');
+          await page.act('save');
+          expect(confirmText(page)).toContain('agent:claude has a draft of lab_note from ');
+          descriptor = { ...D9, keys: { ...D9.keys, lab_note: { shape: 'text', target: 'web', limits: { max: 10, severity: 'hard' }, pages: ['home'] } } };
+          await page.act('takeOver');
+          const refusal = docOf(page).querySelector('#refusal .err')?.textContent ?? '';
+          expect(refusal).toMatch(/^lab_note: .*10/);
+          expect((await rowsOf(stores['default'] as StoreAdapter, 'lab_note')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'agent:claude', value: 'Fine print' });
+          expect(docOf(page).getElementById('dc')?.textContent).toBe('1 unsaved edit');
+          page.dom.window.close();
+        });
+      });
+
+      describe('the change bar (8.5)', () => {
+        const barText = (page: Painted): string => docOf(page).getElementById('changebar')?.textContent ?? '';
+        const barLines = (page: Painted): string[] => [...docOf(page).querySelectorAll('#changebar .cline')].map((el) => el.textContent ?? '');
+        const slot = (env = 'default'): string => `stet.change ${SITE_ID} ${env}`;
+        const typeIn = async (page: Painted, name: string, value: string): Promise<void> => page.type(name, value);
+        /** A change opened in one store, with drafts of the given keys in it. */
+        const changeWith = async (store: ReturnType<typeof createMemoryStore>, name: string, drafts: Array<[string, string, string?]>, note?: string): Promise<number> => {
+          const opened = (await store.changesets.open({ name, ...(note === undefined ? {} : { note }) })) as { changeId: number };
+          for (const [key, value, editor] of drafts) {
+            await store.saveDraft({ key, value, target: 'web', editor: editor ?? 'dashboard:neil', change: opened.changeId });
+          }
+          return opened.changeId;
+        };
+
+        it('groups three edits and publishes them together (journey B24)', async () => {
+          const stores = storesOf();
+          const staging = stores['staging'] as ReturnType<typeof createMemoryStore>;
+          const { page } = await d9Page(stores);
+          await page.act('cycleEnv');
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.']);
+          await page.act('changeNew');
+          await typeIn(page, 'changeName', 'Spring pricing');
+          await typeIn(page, 'changeNote', 'New plan names');
+          await page.act('changeCreate');
+          expect(page.sent.find((r) => r.path.startsWith(`/s/${SITE_ID}/api/stet/changes?env=staging`) && r.body !== undefined)?.body).toEqual({ name: 'Spring pricing', note: 'New plan names', editor: 'dashboard:neil' });
+          const id = Number(page.dom.window.sessionStorage.getItem(slot('staging')));
+          expect(id).toBeGreaterThan(0);
+
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Spring headline');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Spring link');
+          await page.change('group', 'page:pricing');
+          await page.act('key:lab_button');
+          await page.type('text:lab_button', 'Buy the spring plan');
+          await page.act('save');
+          expect(draftPosts(page).map((b) => b['change'])).toEqual([id, id, id]);
+          expect((await staging.read({ preview: true }) as Array<{ status: string; changesetId?: number | null }>).filter((r) => r.status === 'draft').map((r) => r.changesetId)).toEqual([id, id, id]);
+
+          expect(docOf(page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · staging · 3 keys · home, pricing');
+          expect(barLines(page)).toEqual([
+            'lab_headline  Copy that ships → Spring headline',
+            'lab_link  Read the docs → Spring link',
+            'lab_button  Buy → Buy the spring plan',
+            'Note: New plan names',
+          ]);
+          // A member's own Publish stays, and says what it does to the change.
+          expect(docOf(page).getElementById('alone')?.textContent).toBe('Publishing lab_button alone takes it out of Spring pricing.');
+
+          await page.act('publishChange');
+          const live = (await staging.read()) as Array<{ key: string; value: unknown }>;
+          expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({ lab_button: 'Buy the spring plan', lab_headline: 'Spring headline', lab_link: 'Spring link' });
+          expect(page.dom.window.sessionStorage.getItem(slot('staging'))).toBeNull();
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.']);
+          page.dom.window.close();
+        });
+
+        it('adds an agent’s draft: the confirm names the agent; Take over makes it a member and the dashboard’s, Cancel leaves it loose (journey B24)', async () => {
+          for (const answer of ['takeOver', 'keepTheirs'] as const) {
+            const stores = storesOf();
+            const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+            const id = await changeWith(store, 'Spring pricing', [['lab_headline', 'Spring headline']]);
+            await store.saveDraft({ key: 'lab_link', value: 'Agent link', target: 'web', editor: 'agent:claude' });
+            const since = (await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft')?.createdAt as string;
+            const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+            expect(barText(page)).toContain('1 saved draft(s) is not in this change.');
+            await page.act('addToChange');
+            expect(docOf(page).querySelector('#takeover .term')?.textContent).toBe(`agent:claude has a draft of lab_link from ${clockOf(since)}. Add it to Spring pricing? The draft becomes yours.`);
+            expect([...docOf(page).querySelectorAll('#takeover button')].map((b) => b.textContent)).toEqual(['Take over', 'Cancel']);
+            expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_link', locale: 'default', value: 'Agent link', change: id });
+            await page.act(answer);
+            const row = (await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft');
+            if (answer === 'takeOver') {
+              expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_link', locale: 'default', value: 'Agent link', change: id, force: true });
+              expect(row).toMatchObject({ editor: 'dashboard:neil', changesetId: id });
+              expect(barLines(page)).toContain('lab_link  Read the docs → Agent link');
+            } else {
+              expect(row).toMatchObject({ editor: 'agent:claude', changesetId: null });
+              expect(barText(page)).toContain('1 saved draft(s) is not in this change.');
+            }
+            page.dom.window.close();
+          }
+        });
+
+        it('a reload keeps the open change; after it is published elsewhere the bar says it is closed and Save carries no change (journey B24)', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = await changeWith(store, 'Spring pricing', [['lab_headline', 'Spring headline']]);
+          const first = await d9Page(stores, { session: { [slot()]: String(id) } });
+          expect(docOf(first.page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · default · 1 key · home');
+          await first.page.act('key:lab_link');
+          await first.page.type('text:lab_link', 'Spring link');
+          await first.page.act('save');
+          expect(draftPosts(first.page).at(-1)).toMatchObject({ key: 'lab_link', change: id });
+          const session = { [slot()]: first.page.dom.window.sessionStorage.getItem(slot()) as string };
+          first.page.dom.window.close();
+
+          await store.changesets.publishChange({ changeId: id, editor: 'sam' });
+          const { page } = await d9Page(stores, { session });
+          expect(barLines(page)).toEqual([
+            'Spring pricing is closed. Edits now save on their own, outside any change.',
+            'No open change. Edits save and publish key by key.',
+          ]);
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          await page.act('key:lab_note');
+          await page.type('text:lab_note', 'Fine print');
+          await page.act('save');
+          expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_note', locale: 'default', value: 'Fine print' });
+          page.dom.window.close();
+        });
+
+        it('a remembered change that is gone is named by its id', async () => {
+          const { page } = await d9Page(storesOf(), { session: { [slot()]: '41' } });
+          expect(barLines(page)[0]).toBe('change 41 is closed. Edits now save on their own, outside any change.');
+          page.dom.window.close();
+        });
+
+        it('a sessionStorage that throws loads the page with no active change', async () => {
+          const stores = storesOf();
+          await changeWith(stores['default'] as ReturnType<typeof createMemoryStore>, 'Spring pricing', [['lab_headline', 'Spring headline']]);
+          const { page } = await d9Page(stores, {
+            prepare: (window) => {
+              Object.defineProperty(window, 'sessionStorage', { configurable: true, get: () => { throw new Error('denied'); } });
+            },
+          });
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.', 'Open changes in default: Spring pricing · 1 key']);
+          await page.act('changeResume:1');
+          expect(docOf(page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · default · 1 key · home');
+          expect(page.errors).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('a refused Remove shows its confirm, and Take over takes the draft out of the change', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = await changeWith(store, 'Spring pricing', [['lab_headline', 'Spring headline'], ['lab_link', 'Agent link', 'agent:claude']]);
+          const since = (await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft')?.createdAt as string;
+          const version = (await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft')?.version as number;
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await page.act(`removeMember:${version}`);
+          expect(draftPosts(page).at(-1)).toEqual({ editor: 'dashboard:neil', key: 'lab_link', locale: 'default', value: 'Agent link', change: null });
+          expect(docOf(page).querySelector('#takeover .term')?.textContent).toBe(`agent:claude has a draft of lab_link from ${clockOf(since)}. Take it out of Spring pricing? The draft becomes yours.`);
+          await page.act('takeOver');
+          expect((await rowsOf(store, 'lab_link')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'dashboard:neil', changesetId: null });
+          expect(barText(page)).toContain('1 saved draft(s) is not in this change.');
+          page.dom.window.close();
+        });
+
+        it('discards a change: the confirm names its drafts, the change and its drafts go, the keys keep their live values (journey B24)', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([{ key: 'lab_headline', value: 'Live headline' }]);
+          const id = await changeWith(store, 'Spring pricing', [['lab_headline', 'A'], ['lab_link', 'B'], ['lab_note', 'C']]);
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await page.act('discardAsk');
+          expect(docOf(page).querySelector('#changebar .term')?.textContent).toBe('Discard Spring pricing? Its 3 drafts are dropped. Nothing was published, so the keys keep their live values.');
+          await page.act('discardChange');
+          expect(await store.changesets.list({ status: 'open' })).toEqual({ changes: [], nextBeforeId: null });
+          expect((await store.read({ preview: true }) as Array<{ status: string }>).filter((r) => r.status === 'draft')).toEqual([]);
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          await page.act('key:lab_headline');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Live headline');
+          page.dom.window.close();
+        });
+
+        it('each environment lists and remembers its own change', async () => {
+          const stores = storesOf();
+          const id = await changeWith(stores['default'] as ReturnType<typeof createMemoryStore>, 'Spring pricing', []);
+          await changeWith(stores['staging'] as ReturnType<typeof createMemoryStore>, 'Staging copy', []);
+          await changeWith(stores['staging'] as ReturnType<typeof createMemoryStore>, 'Staging extra', []);
+          const { page } = await d9Page(stores);
+          await page.act(`changeResume:${id}`);
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBe(String(id));
+          await page.act('cycleEnv');
+          // The store lists the newest first.
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.', 'Open changes in staging: Staging extra · 0 keys', 'Open changes in staging: Staging copy · 0 keys']);
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Staging link');
+          await page.act('save');
+          expect(draftPosts(page).at(-1)).not.toHaveProperty('change');
+          await page.act('cycleEnv');
+          expect(docOf(page).querySelector('#changebar h3')?.textContent).toBe('change · Spring pricing · default · 0 keys');
+          page.dom.window.close();
+        });
+
+        it('Set aside keeps the change open and stops attaching new drafts', async () => {
+          const stores = storesOf();
+          const id = await changeWith(stores['default'] as ReturnType<typeof createMemoryStore>, 'Spring pricing', []);
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await page.act('setAside');
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          expect(barLines(page)).toEqual(['No open change. Edits save and publish key by key.', 'Open changes in default: Spring pricing · 0 keys']);
+          page.dom.window.close();
+        });
+
+        it('Preview layers only the change’s drafts, with a tab per page of its span; Exit preview restores the ordinary layer (an addition)', async () => {
+          const stores = storesOf();
+          const id = await changeWith(stores['default'] as ReturnType<typeof createMemoryStore>, 'Spring pricing', [['lab_headline', 'Spring headline'], ['lab_button', 'Buy spring']]);
+          const { page, agent } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Loose link');
+          await page.act('key:lab_note');
+          const keysOf = (m: Record<string, unknown> | undefined): string[] => ((m?.['drafts'] as Array<{ key: string }>) ?? []).map((d) => d.key);
+          expect(keysOf(agent.sent('layer').at(-1))).toEqual(['lab_link', 'lab_headline', 'lab_button']);
+          await page.act('changePreview');
+          expect(keysOf(agent.sent('layer').at(-1))).toEqual(['lab_headline', 'lab_button']);
+          expect([...docOf(page).querySelectorAll('#paneshow [data-act^="spanPage:"]')].map((b) => b.textContent)).toEqual(['home', 'pricing']);
+          await page.act('spanPage:pricing');
+          expect(page.requested('/api/site/preview').at(-1)).toContain('route=%2Fpricing');
+          await page.act('exitPreview');
+          expect(keysOf(agent.sent('layer').at(-1))).toEqual(['lab_link', 'lab_headline', 'lab_button']);
+          page.dom.window.close();
+        });
+
+        it('the page span is src/preview.ts’s, entry for entry (the parity case)', () => {
+          const source = /function pageSpan\(descriptor, keys\) \{[\s\S]*?\n\}/.exec(dashboardPage())?.[0];
+          expect(source).toBeDefined();
+          const mirror = new Function(`const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k); ${source as string}; return pageSpan;`)() as (d: Descriptor, keys: string[]) => string[];
+          const d: Descriptor = {
+            version: 1,
+            keys: {
+              a: { shape: 'text', target: 'web', pages: ['pricing', 'home'] },
+              b: { shape: 'text', target: 'web', pages: ['home', 'about'] },
+              c: { shape: 'text', target: 'html-email' },
+              d: { shape: 'text', target: 'web', pages: [] },
+            },
+            pages: { home: { route: '/' }, pricing: { route: '/pricing' }, about: { route: '/about' } },
+          };
+          const inputs: string[][] = [[], ['a'], ['b', 'a'], ['a', 'b', 'c', 'd'], ['gone', 'constructor', 'toString', '__proto__'], ['c', 'a', 'a']];
+          for (const keys of inputs) expect({ keys, span: mirror(d, keys) }).toEqual({ keys, span: pageSpan(d, keys) });
+        });
+      });
+
+      describe('undo of a published change (8.6)', () => {
+        /** `Spring pricing` published over three live keys, then `lab_link` published again since. */
+        const published = async (stores: Stores): Promise<number> => {
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([
+            { key: 'lab_headline', value: 'Old headline' },
+            { key: 'lab_button', value: 'Old button' },
+            { key: 'lab_link', value: 'Old link' },
+          ]);
+          const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+          for (const [key, value] of [['lab_headline', 'New headline'], ['lab_button', 'New button'], ['lab_link', 'New link'], ['lab_alt', 'First alt']]) {
+            await store.saveDraft({ key: key as string, value, target: 'web', editor: 'dashboard:neil', change: opened.changeId });
+          }
+          await store.changesets.publishChange({ changeId: opened.changeId, editor: 'dashboard:neil' });
+          await store.saveDraft({ key: 'lab_link', value: 'Newer link', target: 'web', editor: 'sam' });
+          await store.publish({ key: 'lab_link', editor: 'sam' });
+          return opened.changeId;
+        };
+        const strip = (page: Painted): HTMLElement => docOf(page).getElementById('paneshow') as HTMLElement;
+
+        it('previews a change before and current from Recent, then reverts it, naming the key published since (journey B24)', async () => {
+          const stores = storesOf();
+          const id = await published(stores);
+          const framed = await frameAgent('<h1>New headline</h1><button>New button</button><p id="link">Newer link</p><img alt="First alt">', CHANNEL);
+          const { page, agent } = await d9Page(stores, { framed });
+          await page.act('tab:Recent');
+          await page.act('recentLoad');
+          const row = [...docOf(page).querySelectorAll('#main tbody tr')].find((tr) => tr.textContent?.includes('lab_headline'));
+          expect(row?.textContent).toContain('New headline · Spring pricing');
+          await page.act(`previewChange:${id}`);
+          expect(page.requested(`/s/${SITE_ID}/api/stet/changes?id=${id}`)).toHaveLength(1);
+          expect(strip(page).querySelector('b')?.textContent).toBe('Previewing the change Spring pricing');
+          expect([...strip(page).querySelectorAll('[data-act^="spanPage:"]')].map((b) => b.textContent)).toEqual(['home', 'pricing']);
+          await wait(50);
+          await tick();
+          // Before: each member's before value swapped in where the page shows its snapshot or live words.
+          expect(framed.doc.querySelector('h1')?.textContent).toBe('Old headline');
+          expect(framed.doc.querySelector('button')?.textContent).toBe('Old button');
+          expect(framed.doc.getElementById('link')?.textContent).toBe('Old link');
+          expect(framed.doc.querySelector('img')?.getAttribute('alt')).toBe('First alt');
+          // Current: the live value over the snapshot's words (F96).
+          await page.act('showView:current');
+          const current = agent.sent('layer').at(-1) as { drafts: Array<Record<string, unknown>> };
+          expect(current.drafts.find((d) => d['key'] === 'lab_headline')).toEqual({ key: 'lab_headline', texts: ['Copy that ships'], draft: 'New headline' });
+
+          await page.act('revertAsk');
+          expect(strip(page).querySelector('.term')?.textContent).toBe('Revert Spring pricing? Restores 4 keys on home, pricing to the before values shown here, written forward as a new publish. Drafts are left alone, and a key published again since is skipped and named.');
+          await page.act('revertChange');
+          expect(page.sent.find((r) => r.path.startsWith(`/s/${SITE_ID}/api/stet/revert-change`))?.body).toEqual({ change: id, editor: 'dashboard:neil' });
+          expect([...strip(page).querySelectorAll('.skip')].map((el) => el.textContent)).toEqual([
+            'lab_link was published again since — kept as it is',
+            'lab_alt had no earlier published value — left as it is',
+          ]);
+          const live = (await (stores['default'] as StoreAdapter).read()) as Array<{ key: string; value: unknown }>;
+          expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({ lab_headline: 'Old headline', lab_button: 'Old button', lab_link: 'Newer link', lab_alt: 'First alt' });
+          await page.act('exitPreview');
+          expect(strip(page).hidden).toBe(true);
+          page.dom.window.close();
+        });
+      });
+
+      describe('the store history card (8.7)', () => {
+        it('restores one past value of a key forward and leaves the other members of its change alone (journey B6)', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([{ key: 'lab_button', value: 'Buy' }, { key: 'lab_link', value: 'Read the docs' }]);
+          const opened = (await store.changesets.open({ name: 'Spring pricing' })) as { changeId: number };
+          await store.saveDraft({ key: 'lab_button', value: 'Buy now', target: 'web', editor: 'agent:claude', change: opened.changeId });
+          await store.saveDraft({ key: 'lab_link', value: 'Read now', target: 'web', editor: 'agent:claude', change: opened.changeId });
+          const minted = (await store.changesets.publishChange({ changeId: opened.changeId, editor: 'dashboard:neil' })) as { published: Array<{ key: string; versionId: number }> };
+          const v = minted.published.find((m) => m.key === 'lab_button')?.versionId as number;
+          for (const [key, value] of [['lab_button', 'Buy today'], ['lab_link', 'Read later']]) {
+            await store.saveDraft({ key: key as string, value: value as string, target: 'web', editor: 'sam' });
+            await store.publish({ key: key as string, editor: 'sam' });
+          }
+          const at = (await store.history({ key: 'lab_button' }) as { rows: Array<{ id: number; publishedAt: string }> }).rows.find((r) => r.id === v)?.publishedAt as string;
+
+          const { page, agent } = await d9Page(stores);
+          await page.change('group', 'page:pricing');
+          await page.act('key:lab_button');
+          expect(page.requested(`/s/${SITE_ID}/api/stet/history?key=lab_button&locale=default`).length).toBeGreaterThan(0);
+          const lines = [...docOf(page).querySelectorAll('#keyhistory .hline')].map((el) => el.textContent);
+          const d = new Date(at);
+          const when = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${clockOf(at)}`;
+          expect(lines).toContain(`v${v} · ${when} · Buy now · agent:claude · Spring pricing`);
+          expect(lines[0]).toMatch(/^v\d+ · .* · Buy today · sam$/);
+          expect(docOf(page).querySelector(`#keyhistory [data-act="previewChange:${opened.changeId}"]`)?.textContent).toBe('Preview change');
+
+          await page.act(`historyPreview:${v}`);
+          expect(agent.sent('layer').at(-1)).toEqual({ stet: 'layer', drafts: [{ key: 'lab_button', texts: ['Buy', 'Buy today'], draft: 'Buy now' }] });
+          await page.act('exitPreview');
+
+          await page.act(`historyRestore:${v}`);
+          expect(page.sent.find((r) => r.path.startsWith(`/s/${SITE_ID}/api/stet/revert`))?.body).toEqual({ key: 'lab_button', versionId: v, editor: 'dashboard:neil' });
+          const live = (await store.read()) as Array<{ key: string; value: unknown; version?: number }>;
+          expect(Object.fromEntries(live.map((r) => [r.key, r.value]))).toEqual({ lab_button: 'Buy now', lab_link: 'Read later' });
+          expect((live.find((r) => r.key === 'lab_button')?.version as number) > v).toBe(true);
+          expect([...docOf(page).querySelectorAll('#keyhistory .hline')][0]?.textContent).toMatch(/^v\d+ · .* · Buy now · /);
+          page.dom.window.close();
+        });
+      });
+
+      describe('the review round (D45 to D47, F1 to F7)', () => {
+        const confirmOf = (page: Painted): string => docOf(page).querySelector('#takeover .term')?.textContent ?? '';
+        const slot = (env = 'default'): string => `stet.change ${SITE_ID} ${env}`;
+        const draftOf = async (store: StoreAdapter, key: string) => (await rowsOf(store, key)).find((r) => r.status === 'draft');
+        const heldBy = async (stores: Stores, key: string) =>
+          (stores['default'] as StoreAdapter).saveDraft({ key, value: 'Agent ' + key, target: 'web', editor: 'agent:claude' });
+        const barOf = (page: Painted): string => docOf(page).getElementById('changebar')?.textContent ?? '';
+        const dcOf = (page: Painted): string => docOf(page).getElementById('dc')?.textContent ?? '';
+        const isDraftPath = (path: string): boolean => path.split('?')[0]?.endsWith('/draft') === true;
+
+        it('P1 a plain Save after a Take over carries no force', async () => {
+          const stores = storesOf();
+          await heldBy(stores, 'lab_headline');
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          await page.act('takeOver');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Next');
+          await page.act('save');
+          expect(draftPosts(page).map((b) => 'force' in b)).toEqual([false, true, false]);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine again');
+          await page.act('save');
+          expect(draftPosts(page).map((b) => 'force' in b)).toEqual([false, true, false, false]);
+          page.dom.window.close();
+        });
+
+        it('P2 a Take over the gate refuses (422) leaves no force for the next Save', async () => {
+          const stores = storesOf();
+          await heldBy(stores, 'lab_headline');
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => (isDraftPath(path) && (body as { force?: boolean } | undefined)?.force === true
+              ? { status: 422, body: { error: 'over the hard limit', findings: [] } }
+              : mount(path, body)),
+          });
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          await page.act('takeOver');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Next');
+          await page.act('save');
+          // The refused Take over leaves the headline unsaved, so this Save sends it again, and the agent's draft still holds it.
+          expect(draftPosts(page).map((b) => 'force' in b)).toEqual([false, true, false, false]);
+          expect((await draftOf(stores['default'] as StoreAdapter, 'lab_link'))?.value).toBe('Next');
+          expect(confirmOf(page)).toContain('agent:claude');
+          page.dom.window.close();
+        });
+
+        it('P3 a value typed after the refused save stays unsaved through Take over', async () => {
+          const stores = storesOf();
+          await heldBy(stores, 'lab_headline');
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          expect(confirmOf(page)).toContain('agent:claude');
+          await page.type('text:lab_headline', 'Mine, newer');
+          await page.act('takeOver');
+          expect((await draftOf(stores['default'] as StoreAdapter, 'lab_headline'))?.value).toBe('Mine');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Mine, newer');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          page.dom.window.close();
+        });
+
+        it('P4 Revert change posts the previewed change, not the active one', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([{ key: 'lab_headline', value: 'Old headline' }]);
+          const done = (await store.changesets.open({ name: 'Done' })) as { changeId: number };
+          await store.saveDraft({ key: 'lab_headline', value: 'New headline', target: 'web', editor: 'dashboard:neil', change: done.changeId });
+          await store.changesets.publishChange({ changeId: done.changeId, editor: 'dashboard:neil' });
+          const live = (await store.changesets.open({ name: 'Live one' })) as { changeId: number };
+          const { page } = await d9Page(stores, { session: { [slot()]: String(live.changeId) } });
+          await page.act('tab:Recent');
+          await page.act('recentLoad');
+          await page.act(`previewChange:${done.changeId}`);
+          await page.act('revertAsk');
+          await page.act('revertChange');
+          expect(page.sent.find((r) => r.path.includes('/revert-change'))?.body).toEqual({ change: done.changeId, editor: 'dashboard:neil' });
+          page.dom.window.close();
+        });
+
+        it('P5 a slow answer from the environment left behind does not replace the new environment’s rows', async () => {
+          const stores = storesOf();
+          await (stores['default'] as StoreAdapter).saveDraft({ key: 'lab_headline', value: 'Default only', target: 'web', editor: 'agent:claude' });
+          await (stores['staging'] as StoreAdapter).saveDraft({ key: 'lab_link', value: 'Staging only', target: 'web', editor: 'agent:claude' });
+          const mount = storeMount(stores);
+          let slow = false;
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => {
+              const res = await mount(path, body);
+              if (slow && path.split('?')[0]?.endsWith('/keys') && !path.includes('env=staging')) await new Promise((r) => setTimeout(r, 400));
+              return res;
+            },
+          });
+          slow = true;
+          // A read of the default environment is in flight when the switch happens, and answers last.
+          void page.dom.window.eval('loadRows()');
+          await page.act('cycleEnv');
+          await page.settle();
+          await new Promise((r) => setTimeout(r, 700));
+          await page.settle();
+          const drafts = (await page.dom.window.eval('JSON.stringify(S.rows.filter((r)=>r.status==="draft").map((r)=>r.key))')) as string;
+          expect(drafts).toBe('["lab_link"]');
+          page.dom.window.close();
+        });
+
+        it('P5b until the new environment answers, the rows of the one left behind are not shown', async () => {
+          const stores = storesOf();
+          await (stores['default'] as StoreAdapter).saveDraft({ key: 'lab_headline', value: 'Default only', target: 'web', editor: 'agent:claude' });
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => {
+              if (path.split('?')[0]?.endsWith('/keys') && path.includes('env=staging')) await new Promise((r) => setTimeout(r, 400));
+              return mount(path, body);
+            },
+          });
+          await page.act('cycleEnv');
+          expect(await page.dom.window.eval('S.rows')).toBeNull();
+          await new Promise((r) => setTimeout(r, 700));
+          await page.settle();
+          expect(await page.dom.window.eval('S.rows.some((r) => r.status === "draft")')).toBe(false);
+          page.dom.window.close();
+        });
+
+        it('P6 a save refused for a closed change says the change is closed, and the next Save goes outside any change', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const { page } = await d9Page(stores);
+          await page.act('changeNew');
+          await page.type('changeName', 'Held');
+          await page.act('changeCreate');
+          const id = Number(page.dom.window.sessionStorage.getItem(slot()));
+          await store.saveDraft({ key: 'lab_headline', value: 'In', target: 'web', editor: 'dashboard:neil', change: id });
+          await store.changesets.publishChange({ changeId: id, editor: 'agent:claude' });
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'After close');
+          await page.act('save');
+          expect(barOf(page)).toContain('Held is closed. Edits now save on their own, outside any change.');
+          expect(barOf(page)).not.toContain('change_closed');
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          expect(docOf(page).getElementById('refusal')?.textContent ?? '').not.toContain('change_closed');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          await page.act('save');
+          expect(draftPosts(page).at(-1)).not.toHaveProperty('change');
+          expect(await draftOf(store, 'lab_link')).toMatchObject({ value: 'After close', changesetId: null });
+          page.dom.window.close();
+        });
+
+        it('P6b a refresh that finds the active change gone from the open list drops it and says it is closed', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await store.changesets.open({ name: 'Away' }) as { changeId: number }).changeId;
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          expect(barOf(page)).toContain('change · Away');
+          await store.changesets.abandon({ changeId: id });
+          await page.dom.window.eval('loadChanges(false)');
+          await page.settle();
+          expect(barOf(page)).toContain('Away is closed. Edits now save on their own, outside any change.');
+          expect(page.dom.window.sessionStorage.getItem(slot())).toBeNull();
+          expect(await page.dom.window.eval('S.change')).toBeNull();
+          page.dom.window.close();
+        });
+
+        it('P6c Add and Take over refused for a closed change say so too', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await store.changesets.open({ name: 'Gone' }) as { changeId: number }).changeId;
+          await store.saveDraft({ key: 'lab_link', value: 'loose', target: 'web', editor: 'dashboard:neil' });
+          const { page } = await d9Page(stores, { session: { [slot()]: String(id) } });
+          await store.changesets.abandon({ changeId: id });
+          await page.act('addToChange');
+          expect(barOf(page)).toContain('Gone is closed. Edits now save on their own, outside any change.');
+          expect(barOf(page)).not.toContain('no_change');
+          expect(barOf(page)).not.toContain('change_closed');
+          page.dom.window.close();
+        });
+
+        it('P7 a failed Remove shows its error in the change bar with no key selected', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await store.changesets.open({ name: 'C' }) as { changeId: number }).changeId;
+          await store.saveDraft({ key: 'lab_headline', value: 'm', target: 'web', editor: 'dashboard:neil', change: id });
+          const mount = storeMount(stores);
+          let failing = false;
+          const { page } = await d9Page(stores, {
+            session: { [slot()]: String(id) },
+            mount: async (path, body) => (failing && isDraftPath(path) ? { status: 500, body: { error: 'the store is unreachable' } } : mount(path, body)),
+          });
+          failing = true;
+          const remove = [...docOf(page).querySelectorAll('[data-act^="removeMember:"]')][0]?.getAttribute('data-act') as string;
+          await page.act(remove);
+          expect(barOf(page)).toContain('the store is unreachable');
+          failing = false;
+          await page.act(remove);
+          expect(barOf(page)).not.toContain('the store is unreachable');
+          page.dom.window.close();
+        });
+
+        it('P7b a failed Add shows its error in the change bar', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await store.changesets.open({ name: 'C' }) as { changeId: number }).changeId;
+          await store.saveDraft({ key: 'lab_link', value: 'loose', target: 'web', editor: 'dashboard:neil' });
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            session: { [slot()]: String(id) },
+            mount: async (path, body) => (isDraftPath(path) ? { status: 500, body: { error: 'the store is unreachable' } } : mount(path, body)),
+          });
+          await page.act('addToChange');
+          expect(barOf(page)).toContain('the store is unreachable');
+          page.dom.window.close();
+        });
+
+        it('P7c a failed Create keeps the form and shows its error', async () => {
+          const stores = storesOf();
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => (path.split('?')[0]?.endsWith('/changes') && body !== undefined ? { status: 500, body: { error: 'the store is unreachable' } } : mount(path, body)),
+          });
+          await page.act('changeNew');
+          await page.type('changeName', 'Spring');
+          await page.act('changeCreate');
+          expect(barOf(page)).toContain('the store is unreachable');
+          expect((docOf(page).querySelector('[data-act-input="changeName"]') as HTMLInputElement | null)?.value).toBe('Spring');
+          await page.act('changeFormCancel');
+          expect(barOf(page)).not.toContain('the store is unreachable');
+          page.dom.window.close();
+        });
+
+        it('P7d a failed Restore shows its error in the History card', async () => {
+          const stores = storesOf();
+          const store = stores['default'] as ReturnType<typeof createMemoryStore>;
+          store.seed([{ key: 'lab_button', value: 'Buy' }]);
+          await store.saveDraft({ key: 'lab_button', value: 'Buy now', target: 'web', editor: 'dashboard:neil' });
+          await store.publish({ key: 'lab_button', editor: 'dashboard:neil' });
+          const mount = storeMount(stores);
+          const { page } = await d9Page(stores, {
+            mount: async (path, body) => (path.split('?')[0]?.endsWith('/revert') ? { status: 500, body: { error: 'the store is unreachable' } } : mount(path, body)),
+          });
+          await page.change('group', 'page:pricing');
+          await page.act('key:lab_button');
+          const restore = docOf(page).querySelector('#keyhistory [data-act^="historyRestore:"]')?.getAttribute('data-act') as string;
+          await page.act(restore);
+          expect(docOf(page).getElementById('keyhistory')?.textContent).toContain('the store is unreachable');
+          page.dom.window.close();
+        });
+
+        it('P8 Save pressed twice over a held draft queues one confirm', async () => {
+          const stores = storesOf();
+          await heldBy(stores, 'lab_headline');
+          const { page } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Mine');
+          await page.act('save');
+          await page.act('save');
+          expect(await page.dom.window.eval('S.held.length')).toBe(1);
+          page.dom.window.close();
+        });
+
+        it('P9 Remove, Add and Take over in staging write to staging', async () => {
+          const stores = storesOf();
+          const staging = stores['staging'] as ReturnType<typeof createMemoryStore>;
+          const dflt = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const id = (await staging.changesets.open({ name: 'S' }) as { changeId: number }).changeId;
+          await staging.saveDraft({ key: 'lab_headline', value: 'member', target: 'web', editor: 'dashboard:neil', change: id });
+          await staging.saveDraft({ key: 'lab_link', value: 'agent loose', target: 'web', editor: 'agent:claude' });
+          const { page } = await d9Page(stores, { session: { [slot('staging')]: String(id) } });
+          await page.act('cycleEnv');
+          const remove = [...docOf(page).querySelectorAll('[data-act^="removeMember:"]')][0]?.getAttribute('data-act') as string;
+          await page.act(remove);
+          await page.act('addToChange');
+          await page.act('takeOver');
+          const paths = page.sent.filter((r) => r.path.split('?')[0] === `/s/${SITE_ID}/api/stet/draft`).map((r) => r.path);
+          expect(paths.length).toBeGreaterThanOrEqual(3);
+          for (const p of paths) expect(p).toContain('env=staging');
+          expect((await rowsOf(staging, 'lab_link')).find((r) => r.status === 'draft')).toMatchObject({ editor: 'dashboard:neil', changesetId: id });
+          expect((await rowsOf(dflt, 'lab_link')).length).toBe(0);
+          page.dom.window.close();
+        });
+
+        it('D45 unsaved edits belong to their environment: a switch shows that environment’s own, Save writes only those, and switching back restores the first', async () => {
+          const stores = storesOf();
+          const dflt = stores['default'] as StoreAdapter;
+          const staging = stores['staging'] as StoreAdapter;
+          const { page, agent } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Typed on default');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Link on default');
+          expect(dcOf(page)).toBe('2 unsaved edits');
+          await page.act('key:lab_headline');
+
+          await page.act('cycleEnv');
+          expect(dcOf(page)).toBe('');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Copy that ships');
+          expect((agent.sent('layer').at(-1) as { drafts: unknown[] }).drafts).toEqual([]);
+          await page.act('save');
+          expect(draftPosts(page)).toEqual([]);
+          expect(await draftOf(staging, 'lab_headline')).toBeUndefined();
+          expect(await draftOf(dflt, 'lab_headline')).toBeUndefined();
+
+          await page.type('text:lab_headline', 'Typed on staging');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          await page.act('cycleEnv');
+          expect(dcOf(page)).toBe('2 unsaved edits');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Typed on default');
+          expect(JSON.stringify(agent.sent('layer').at(-1))).toContain('Link on default');
+          await page.act('cycleEnv');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Typed on staging');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          await page.act('cycleEnv');
+
+          await page.act('save');
+          expect(draftPosts(page).map((b) => b['value'])).toEqual(['Typed on default', 'Link on default']);
+          for (const r of page.sent.filter((s) => isDraftPath(s.path))) expect(r.path).not.toContain('env=');
+          expect((await draftOf(dflt, 'lab_headline'))?.value).toBe('Typed on default');
+          expect((await draftOf(dflt, 'lab_link'))?.value).toBe('Link on default');
+          expect(await draftOf(staging, 'lab_headline')).toBeUndefined();
+          expect(dcOf(page)).toBe('');
+          await page.act('cycleEnv');
+          expect(dcOf(page)).toBe('1 unsaved edit');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Typed on staging');
+          page.dom.window.close();
+        });
+
+        it('D45 an edit open in the field ends kept before the environment changes, so it stays with the environment it was typed in', async () => {
+          const stores = storesOf();
+          const { page, agent } = await d9Page(stores);
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'Typed on default');
+          await page.dom.window.eval(`S.edit = { key: 'lab_headline', locale: 'default', entry: undefined, form: 'text', before: undefined, rect: { left: 0, top: 0, width: 1, height: 1 } }`);
+          await page.act('cycleEnv');
+          expect(await page.dom.window.eval('S.edit')).toBeNull();
+          expect(agent.sent('end').at(-1)).toEqual({ stet: 'end', how: 'keep' });
+          await page.act('cycleEnv');
+          expect(fieldOf(page, 'lab_headline').value).toBe('Typed on default');
+          page.dom.window.close();
+        });
+
+        it('D47 a Save that is running stays in the environment it started in: every key goes there, with its change', async () => {
+          const stores = storesOf();
+          const dflt = stores['default'] as ReturnType<typeof createMemoryStore>;
+          const staging = stores['staging'] as StoreAdapter;
+          const id = (await dflt.changesets.open({ name: 'Mid' }) as { changeId: number }).changeId;
+          const mount = storeMount(stores);
+          let flip: () => void = () => undefined;
+          let flipped = false;
+          const { page } = await d9Page(stores, {
+            session: { [slot()]: String(id) },
+            mount: async (path, body) => {
+              const res = await mount(path, body);
+              if (!flipped && isDraftPath(path)) { flipped = true; flip(); }
+              return res;
+            },
+          });
+          flip = () => (docOf(page).querySelector('[data-act="cycleEnv"]') as HTMLElement).click();
+          await page.act('key:lab_headline');
+          await page.type('text:lab_headline', 'First');
+          await page.act('key:lab_link');
+          await page.type('text:lab_link', 'Second');
+          await page.act('save');
+          expect(await page.dom.window.eval('S.env')).toBe('staging');
+          const posts = page.sent.filter((r) => isDraftPath(r.path));
+          expect(posts).toHaveLength(2);
+          for (const r of posts) expect(r.path).not.toContain('env=');
+          expect(posts.map((r) => (r.body as { change?: number }).change)).toEqual([id, id]);
+          expect(await draftOf(dflt, 'lab_headline')).toMatchObject({ value: 'First', changesetId: id });
+          expect(await draftOf(dflt, 'lab_link')).toMatchObject({ value: 'Second', changesetId: id });
+          expect(await draftOf(staging, 'lab_headline')).toBeUndefined();
+          expect(await draftOf(staging, 'lab_link')).toBeUndefined();
+          await page.act('cycleEnv');
+          expect(dcOf(page)).toBe('');
+          page.dom.window.close();
+        });
+
+        it('D46 two tabs of one profile are one editor: the second tab’s Save replaces the first tab’s draft with no confirm', async () => {
+          const stores = storesOf();
+          const one = await d9Page(stores);
+          const two = await d9Page(stores);
+          await one.page.act('key:lab_headline');
+          await one.page.type('text:lab_headline', 'Tab one');
+          await one.page.act('save');
+          await two.page.act('key:lab_headline');
+          await two.page.type('text:lab_headline', 'Tab two');
+          await two.page.act('save');
+          expect(confirmOf(two.page)).toBe('');
+          expect((await draftOf(stores['default'] as StoreAdapter, 'lab_headline'))?.value).toBe('Tab two');
+          one.page.dom.window.close();
+          two.page.dom.window.close();
+        });
+      });
+
+      // D9 marker: later describes go above this line.
+      it('force is never sent without the press: every draft POST across these cases carries it only after a Take over (8.4, stage 5)', () => {
+        let forced = 0;
+        for (const { page, presses } of audits) {
+          const drafts = page.sent
+            .map((r, i) => ({ i, path: r.path.split('?')[0], body: r.body as Record<string, unknown> | undefined }))
+            .filter((r) => r.path === `/s/${SITE_ID}/api/stet/draft`);
+          // The first draft POST each press answers: the one write a Take over makes.
+          const answers = presses.map((p) => drafts.find((r) => r.i >= p)?.i);
+          for (const r of drafts.filter((d) => d.body !== undefined && 'force' in d.body)) {
+            expect(r.body?.['force']).toBe(true);
+            expect(answers).toContain(r.i);
+          }
+          forced += drafts.filter((d) => d.body !== undefined && 'force' in d.body).length;
+        }
+        expect(audits.length).toBeGreaterThan(5);
+        expect(forced).toBeGreaterThan(0);
+      });
     });
   });
 
@@ -8028,7 +12381,9 @@ describe('the page', () => {
       expect(page.requested('/api/site/save')).toEqual([]);
       await page.act('save');
       await page.act('saveAnyway');
-      expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({ values: [{ key: 'home_page_title', locale: 'default', value: title }] });
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+        values: [{ key: 'home_page_title', locale: 'default', value: title, base: 'Psyon' }],
+      });
       expect(saveState(page)).toEqual(SAVED);
       page.dom.window.close();
     });
@@ -8134,6 +12489,47 @@ describe('the page', () => {
           });
         },
       });
+
+    it('names where a removed key was shown on a JavaScript host, and Restore stands (journey B22)', async () => {
+      const page = await paint({
+        routes: [
+          ['/api/site/history', 200, { commits: [{ sha: 'b22b22babc', short: 'b22b22b', author: 'nj-io', at: '2026-10-20T10:00:00Z', subject: 'lab: long copy removed' }] }],
+          ['/api/site/removed', 200, { keys: [
+            { key: 'lab_long', section: null, text: 'A long paragraph', places: [{ file: 'app/(marketing)/lab/page.tsx', line: 20, kind: 'text in app/(marketing)/lab/page.tsx' }] },
+            { key: 'lab_aside', section: null, text: 'An aside', places: [{ file: 'src/pages/lab.astro', line: 4, kind: 'paragraph' }, { file: 'src/pages/about.astro', line: 9, kind: 'headline' }] },
+            { key: 'lab_note', section: 'lab', text: 'A note', places: [] },
+          ] }],
+        ],
+      });
+      await page.act('history');
+      await page.act('commitOpen:b22b22babc');
+      const listed = docOf(page).querySelector('tr td[colspan="3"] .mono') as HTMLElement;
+      expect(listed.innerHTML.split('<br>').map((line) => new page.dom.window.DOMParser().parseFromString(line, 'text/html').body.textContent)).toEqual([
+        // The reader's fallback kind only names the file again, so the row leaves it out.
+        'lab_long was removed in b22b22b. It was shown at app/(marketing)/lab/page.tsx:20.',
+        'lab_aside was removed in b22b22b. It was shown at src/pages/lab.astro:4 (paragraph), src/pages/about.astro:9 (headline).',
+        'lab_note — lab — "A note"',
+      ]);
+      expect(docOf(page).querySelector('[data-act="restoreAsk"]')).not.toBeNull();
+      expect([...docOf(page).querySelectorAll('h3')].map((el) => el.textContent)).toContain('Commit history');
+      page.dom.window.close();
+    });
+
+    it('lists a store-backed site’s commits and the keys one removed, with no Restore', async () => {
+      const page = await paint({
+        site: siteBody({ mode: 'memory' }),
+        routes: [
+          ['/api/site/history', 200, { commits: [{ sha: 'cafe00dabc', short: 'cafe00d', author: 'nj-io', at: '2026-10-20T10:00:00Z', subject: 'remove farewell_notice' }] }],
+          ['/api/site/removed', 200, { keys: [{ key: 'farewell_notice', section: null, text: 'So long', places: [] }] }],
+        ],
+      });
+      await page.act('history');
+      await page.act('commitOpen:cafe00dabc');
+      expect((docOf(page).querySelector('tr td[colspan="3"] .mono') as HTMLElement).textContent).toBe('farewell_notice — "So long"');
+      expect(docOf(page).querySelector('[data-act="restoreAsk"]')).toBeNull();
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
 
     it('lists what a commit removed and restores it, handing back the markup (journey B22, restore)', async () => {
       const copied: string[] = [];
@@ -8302,13 +12698,13 @@ describe('the page', () => {
     it('reads Not run yet by host, and Run fills the card (journey C13)', async () => {
       const held = { reply: { state: 'none', elapsed: 0, lines: [], result: null } as unknown };
       const html = await card(htmlSite(), held);
-      expect(body(html)).toContain("Not run yet. Runs against the checkout's documents.");
+      expect(body(html)).toContain("Not run yet. Runs against the project's documents.");
       expect(docOf(html).querySelector('[data-act="auditRun"]')?.textContent).toBe('Run');
       held.reply = done(resultOf([indexPage()]));
       await html.act('auditRun');
       expect(lastStart(html)).toEqual({});
       const text = docOf(html).querySelector('.card')?.textContent ?? '';
-      expect(text).toContain("lighthouse 13.5.0 · mobile · the checkout's documents · 1 page · 4 s");
+      expect(text).toContain("lighthouse 13.5.0 · mobile · the project's documents · 1 page · 4 s");
       expect(text).toContain('index.html');
       const tiles = [...docOf(html).querySelectorAll('.lht > div')].map((tile) => [tile.querySelector('.lb')?.textContent, tile.querySelector('.bdg')?.textContent, tile.querySelector('.bdg')?.className]);
       expect(tiles).toEqual([
@@ -8830,5 +13226,410 @@ describe('the audit child (D10)', () => {
     const second = await pidFile(other.cwd);
     await stopEveryChild(closing.ctx);
     expect(await waitGone(second)).toBe(true);
+  });
+});
+
+describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
+  /** The mini project with a Next App tree: a page, a layout importing `@/components/Nav`, a second route importing a missing alias. */
+  function nextSite(): CliHost {
+    const host = snapshotHost();
+    write(host.cwd, 'package.json', JSON.stringify({ name: 'site', dependencies: { react: '^19' } }));
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./*'] } } }));
+    write(
+      host.cwd,
+      'app/layout.tsx',
+      "import { Nav } from '@/components/Nav';\nexport default function Layout({ children }: { children: unknown }) { return <html><body><Nav />{children}</body></html>; }\n",
+    );
+    write(
+      host.cwd,
+      'app/page.tsx',
+      "import { useState } from 'react';\nimport { copy } from '@/lib/content';\nexport default function Page() { useState(0); return <h1>{copy('hero_headline')}</h1>; }\n",
+    );
+    write(host.cwd, 'components/Nav.tsx', "import { copy } from '@/lib/content';\nexport const Nav = () => <nav>{copy('footer_links')}</nav>;\n");
+    write(
+      host.cwd,
+      'app/pricing/page.tsx',
+      "import { Table } from '@/missing';\nimport { copy } from '@/lib/content';\nexport default function Pricing() { return <Table>{copy('pricing_price')}</Table>; }\n",
+    );
+    return host;
+  }
+
+  it('answers each judged key with its state, the file count and the root', async () => {
+    const host = nextSite();
+    const { handler } = handlerOver([host.cwd]);
+    const body = await get(handler, `/api/site/usage${site(host)}`);
+    expect(body.keys).toEqual({
+      hero_headline: { state: 'read' },
+      hero_body: { state: 'not_found' },
+      footer_links: { state: 'read' },
+      contact_form_labels: { state: 'not_found' },
+      theme_mode: { state: 'not_found' },
+      blog_intro: { state: 'not_found' },
+      pricing_tier_name: { state: 'not_found' },
+      pricing_price: { state: 'read' },
+      farewell_notice: { state: 'not_found' },
+    });
+    expect(body).toMatchObject({ prefixes: [], causes: [], serverOnly: [], files: 4 });
+    expect(body.root).toMatch(/^stet-cli-[^/]+\/$/);
+  });
+
+  it('F8: no git the usage scan starts holds the run token: an fsmonitor hook sees it unset', async () => {
+    const host = nextSite();
+    const seen = join(tempDir('stet-fsmonitor-'), 'seen');
+    const hook = join(dirname(seen), 'fsmonitor.sh');
+    writeFileSync(hook, `#!/bin/sh\nprintf '%s\\n' "\${STET_DEV_TOKEN-unset}" >> ${JSON.stringify(seen)}\nexit 1\n`, { mode: 0o755 });
+    execFileSync('git', ['config', 'core.fsmonitor', hook], { cwd: host.cwd });
+    const { handler } = handlerOver([host.cwd]);
+    const held = process.env['STET_DEV_TOKEN'];
+    process.env['STET_DEV_TOKEN'] = 'the-run-token';
+    try {
+      const body = await get(handler, `/api/site/usage${site(host)}`);
+      expect(body.files).toBe(4);
+    } finally {
+      if (held === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held;
+    }
+    const lines = readFileSync(seen, 'utf8').trim().split('\n');
+    expect(lines.length).toBeGreaterThan(0);
+    expect(new Set(lines)).toEqual(new Set(['unset']));
+  });
+
+  // An addition beyond F8's fsmonitor case: it guards every git the site routes start, not only the one the hook reaches.
+  it('F8: every git the site and usage routes start runs without the run token', async () => {
+    const host = nextSite();
+    const real = execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim();
+    const shims = tempDir('stet-git-shim-');
+    const seen = join(shims, 'seen');
+    writeFileSync(join(shims, 'git'), `#!/bin/sh\nprintf '%s\\n' "\${STET_DEV_TOKEN-unset}" >> ${JSON.stringify(seen)}\nexec ${JSON.stringify(real)} "$@"\n`, { mode: 0o755 });
+    const { handler } = handlerOver([host.cwd]);
+    const held = { path: process.env['PATH'], token: process.env['STET_DEV_TOKEN'] };
+    process.env['PATH'] = `${shims}:${held.path ?? ''}`;
+    process.env['STET_DEV_TOKEN'] = 'the-run-token';
+    try {
+      await get(handler, `/api/site${site(host)}`);
+      await get(handler, `/api/site/usage${site(host)}`);
+    } finally {
+      process.env['PATH'] = held.path as string;
+      if (held.token === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held.token;
+    }
+    const lines = readFileSync(seen, 'utf8').trim().split('\n');
+    expect(lines.length).toBeGreaterThan(1);
+    expect(new Set(lines)).toEqual(new Set(['unset']));
+  });
+
+  it('a second request after one file is touched re-reads that file alone, and answers its new read', async () => {
+    const host = nextSite();
+    vi.resetModules();
+    const calls: string[] = [];
+    vi.doMock('../cli/key-reads.js', async (importOriginal) => {
+      const real = await importOriginal<typeof import('../cli/key-reads.js')>();
+      return {
+        ...real,
+        codeOf: (...args: Parameters<typeof real.codeOf>) => {
+          calls.push(args[1]);
+          return real.codeOf(...args);
+        },
+      };
+    });
+    try {
+      const fresh = await import('./helpers/dashboard-page.js');
+      const { handler } = fresh.handlerOver([host.cwd]);
+      const first = await get(handler, `/api/site/usage${site(host)}`);
+      expect(first.keys.footer_links).toEqual({ state: 'read' });
+      expect(calls.sort()).toEqual(['app/layout.tsx', 'app/page.tsx', 'app/pricing/page.tsx', 'components/Nav.tsx']);
+
+      // The same size, a later mtime: only the stamp's mtime tells it moved.
+      const nav = join(host.cwd, 'components/Nav.tsx');
+      const before = readFileSync(nav, 'utf8');
+      writeFileSync(nav, before.replace("copy('footer_links')", "copy('blog_intro'  )"));
+      expect(readFileSync(nav, 'utf8').length).toBe(before.length);
+      const later = new Date(Date.now() + 60_000);
+      utimesSync(nav, later, later);
+      calls.length = 0;
+      const second = await get(handler, `/api/site/usage${site(host)}`);
+      expect(calls).toEqual(['components/Nav.tsx']);
+      expect(second.keys.blog_intro).toEqual({ state: 'read' });
+      expect(second.keys.footer_links).toEqual({ state: 'not_found' });
+    } finally {
+      vi.doUnmock('../cli/key-reads.js');
+      vi.resetModules();
+    }
+  });
+
+  it('lists a Next route’s page, its layout and what they import through the alias, complete', async () => {
+    const host = nextSite();
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+      route: '/',
+      files: ['app/layout.tsx', 'app/page.tsx'],
+      keys: ['footer_links', 'hero_headline'],
+      complete: true,
+    });
+  });
+
+  it('an alias that resolves nowhere makes the route incomplete', async () => {
+    const host = nextSite();
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/pricing')}`)).toEqual({
+      route: '/pricing',
+      files: ['app/layout.tsx', 'app/pricing/page.tsx'],
+      keys: ['footer_links', 'pricing_price'],
+      complete: false,
+    });
+  });
+
+  const routeReadsOf = (handler: (r: Request) => Promise<Response>, host: CliHost, route = '/'): Promise<any> =>
+    get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent(route)}`);
+
+  it('F3a: a specifier resolved through baseUrl alone is followed', async () => {
+    const host = nextSite();
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.' } }));
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children}</body></html>; }\n');
+    write(host.cwd, 'app/page.tsx', "import { Nav } from 'components/Nav';\nexport default function Page() { return <Nav />; }\n");
+    write(host.cwd, 'components/Nav.tsx', "export const Nav = () => <nav>{'hero_headline'}</nav>;\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: ['hero_headline'], complete: true });
+  });
+
+  it('F3a: a specifier resolved through paths alone is followed, a package that resolves nowhere is not a boundary', async () => {
+    const host = nextSite();
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { 'ui/*': ['./components/*'] } } }));
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children}</body></html>; }\n');
+    write(host.cwd, 'components/Nav.tsx', "export const Nav = () => <nav>{'footer_links'}</nav>;\n");
+    write(host.cwd, 'app/page.tsx', "import { Nav } from 'ui/Nav';\nimport { useState } from 'react';\nexport default function Page() { useState(0); return <Nav />; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: ['footer_links'], complete: true });
+  });
+
+  it('F3b: a lazy import or a require in the closure makes the route incomplete', async () => {
+    for (const body of [
+      "import dynamic from 'next/dynamic';\nconst Nav = dynamic(() => import('@/components/Nav'));\nexport default function Page() { return <Nav />; }\n",
+      "const Nav = require('@/components/Nav').Nav;\nexport default function Page() { return <Nav />; }\n",
+    ]) {
+      const host = nextSite();
+      write(host.cwd, 'app/page.tsx', `${body}`);
+      const { handler } = handlerOver([host.cwd]);
+      expect((await routeReadsOf(handler, host)).complete, body).toBe(false);
+    }
+  });
+
+  it('F3b: the lazy import is found in a file the page reaches, not only the page', async () => {
+    const host = nextSite();
+    write(host.cwd, 'components/Nav.tsx', "export const Nav = () => { void import('./Menu'); return <nav />; };\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host)).complete).toBe(false);
+  });
+
+  it('F4: an import through a symlinked directory out of the checkout is a boundary, its keys unread', async () => {
+    const host = nextSite();
+    const outside = tempDir('stet-route-out-');
+    write(outside, 'Secret.tsx', "export const Secret = () => <p>{'hero_body'}</p>;\n");
+    symlinkSync(outside, join(host.cwd, 'linked'));
+    write(host.cwd, 'app/page.tsx', "import { Secret } from '../linked/Secret';\nexport default function Page() { return <Secret />; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.keys).not.toContain('hero_body');
+    expect(body.complete).toBe(false);
+  });
+
+  it('D65: a file over 5 MB in the closure is not read: the route is incomplete and its keys unread', async () => {
+    const host = nextSite();
+    const line = "export const x = () => <p>{'hero_body'}</p>;\n";
+    write(host.cwd, 'components/Big.tsx', line.repeat(Math.ceil((6 * 1024 * 1024) / line.length)));
+    write(host.cwd, 'app/page.tsx', "import { x } from '@/components/Big';\nexport default function Page() { return x(); }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const started = Date.now();
+    const body = await routeReadsOf(handler, host);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(body.keys).not.toContain('hero_body');
+    expect(body.complete).toBe(false);
+  });
+
+  it('F4: a symlinked directory inside the checkout is followed', async () => {
+    const host = nextSite();
+    write(host.cwd, 'shared/Banner.tsx', "export const Banner = () => <p>{'hero_body'}</p>;\n");
+    symlinkSync(join(host.cwd, 'shared'), join(host.cwd, 'linked'));
+    write(host.cwd, 'app/page.tsx', "import { Banner } from '../linked/Banner';\nexport default function Page() { return <Banner />; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: expect.arrayContaining(['hero_body']) });
+  });
+
+  it('F5: the generated modules the read path imports name no key of the route', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', "import { DEFAULTS } from '../content/defaults';\nexport const copy = (k: string) => (DEFAULTS.default as Record<string, string>)[k];\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.keys).toEqual(['footer_links', 'hero_headline']);
+    expect(body.complete).toBe(true);
+  });
+
+  it('F5: the read path, the descriptor, the snapshot and every codegen file are skipped, whatever header they carry', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', "import './labels';\nexport const copy = (k: string) => k;\nexport const own = 'blog_intro';\n");
+    write(host.cwd, 'lib/labels.ts', "export const L = 'theme_mode';\n");
+    write(host.cwd, 'content/keys.ts', "export const K = 'blog_intro';\n");
+    write(host.cwd, 'lib/gen.ts', "// generated by stet — source-hash: x\nexport const G = 'farewell_notice';\n");
+    write(host.cwd, 'app/page.tsx', "import { copy } from '@/lib/content';\nimport '../content/keys';\nimport '../lib/gen';\nexport default function Page() { return <h1>{copy('hero_headline')}</h1>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.keys).toEqual(['footer_links', 'hero_headline', 'theme_mode']);
+  });
+
+  it('F13 (r09): a file nested past the compiler recursion makes the route incomplete, and is answered', async () => {
+    const host = nextSite();
+    write(host.cwd, 'components/Deep.tsx', `export const d = ${'['.repeat(40000)}1${']'.repeat(40000)};\nexport const Deep = () => <b>{'hero_body'}</b>;\n`);
+    write(host.cwd, 'app/page.tsx', "import { Deep } from '@/components/Deep';\nexport default function Page() { return <Deep />; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toEqual({ route: '/', files: ['app/layout.tsx', 'app/page.tsx'], keys: [], complete: false });
+  });
+
+  it('F13: a file the walk reads but the key scan cannot walk makes the route incomplete, the other files’ keys kept', async () => {
+    const host = nextSite();
+    write(host.cwd, 'components/Deep.ts', `export const c = x${'.m()'.repeat(20000)};\nexport const named = 'hero_body';\n`);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      "import '@/components/Deep';\nimport { copy } from '@/lib/content';\nexport default function Page() { return <h1>{copy('hero_headline')}</h1>; }\n",
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.keys).toEqual(['footer_links', 'hero_headline']);
+    expect(body.complete).toBe(false);
+  });
+
+  it('D07: a file too deeply nested to search for a lazy import is taken to hold one', async () => {
+    const ts = await loadTypescript();
+    const deep = `export const c = x${'.m()'.repeat(20000)};\n// import('./later')\n`;
+    expect(importsLazily(ts, 'deep.ts', deep)).toBe(true);
+    expect(importsLazily(ts, 'plain.ts', "// import('./later')\nexport const a = 1;\n")).toBe(false);
+  });
+
+  it.each([
+    [
+      'r08: a scoped alias nothing declares',
+      {},
+      "import { Nav } from '@components/Nav';\nexport default function Page() { return <Nav />; }\n",
+    ],
+    [
+      'r07: an alias the tsconfig reaches through extends, which the route walk does not read',
+      {
+        'tsconfig.json': JSON.stringify({ extends: './tsconfig.base.json' }),
+        'tsconfig.base.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@components/*': ['./components/*'] } } }),
+      },
+      "import { Nav } from '@components/Nav';\nexport default function Page() { return <Nav />; }\n",
+    ],
+    ['a bare name that is no package of the project', {}, "import { Nav } from 'ui/Nav';\nexport default function Page() { return <Nav />; }\n"],
+  ])('F14 %s: the route is incomplete', async (_name, extra, page) => {
+    const host = nextSite();
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { paths: {} } }));
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children}</body></html>; }\n');
+    write(host.cwd, 'components/Nav.tsx', "export const Nav = () => <nav>{'footer_links'}</nav>;\n");
+    for (const [rel, text] of Object.entries(extra)) write(host.cwd, rel, text);
+    write(host.cwd, 'app/page.tsx', page);
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.complete).toBe(false);
+  });
+
+  it('F14: a package the project declares, has installed or gets from Node is no boundary', async () => {
+    const host = nextSite();
+    write(
+      host.cwd,
+      'package.json',
+      JSON.stringify({ name: 'site', dependencies: { react: '^19' }, devDependencies: { '@acme/ui': '1' }, peerDependencies: { zod: '3' }, optionalDependencies: { sharp: '1' } }),
+    );
+    write(host.cwd, 'node_modules/left-pad/index.js', 'module.exports = 1;\n');
+    write(host.cwd, 'node_modules/@scope/kit/index.js', 'module.exports = 1;\n');
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children}</body></html>; }\n');
+    write(
+      host.cwd,
+      'app/page.tsx',
+      [
+        "import { useState } from 'react';",
+        "import { Button } from '@acme/ui/button';",
+        "import { z } from 'zod';",
+        "import sharp from 'sharp';",
+        "import pad from 'left-pad';",
+        "import kit from '@scope/kit/deep/path';",
+        "import { readFileSync } from 'node:fs';",
+        "import { join } from 'path';",
+        "export default function Page() { void [useState, Button, z, sharp, pad, kit, readFileSync, join]; return <h1>{'hero_headline'}</h1>; }",
+        '',
+      ].join('\n'),
+    );
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: ['hero_headline'], complete: true });
+  });
+
+  it('PG01: a layout of another route group is not a frame of this route', async () => {
+    const host = nextSite();
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html>{children}</html>; }\n');
+    write(host.cwd, 'app/(marketing)/layout.tsx', "export default function Layout({ children }: { children: unknown }) { return <div>{'footer_links'}{children}</div>; }\n");
+    write(host.cwd, 'app/(shop)/layout.tsx', "export default function Layout({ children }: { children: unknown }) { return <div>{'theme_mode'}{children}</div>; }\n");
+    write(host.cwd, 'app/(marketing)/about/page.tsx', "export default function Page() { return <p>{'hero_headline'}</p>; }\n");
+    write(host.cwd, 'app/(shop)/cart/page.tsx', "export default function Page() { return <p>{'blog_intro'}</p>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host, '/about')).toEqual({
+      route: '/about',
+      files: ['app/(marketing)/about/page.tsx', 'app/(marketing)/layout.tsx', 'app/layout.tsx'],
+      keys: ['footer_links', 'hero_headline'],
+      complete: true,
+    });
+  });
+
+  it('PG02: a template.tsx is a frame of the pages under it', async () => {
+    const host = nextSite();
+    write(host.cwd, 'app/layout.tsx', 'export default function Layout({ children }: { children: unknown }) { return <html>{children}</html>; }\n');
+    write(host.cwd, 'app/template.tsx', "export default function Template({ children }: { children: unknown }) { return <div>{'footer_links'}{children}</div>; }\n");
+    write(host.cwd, 'app/page.tsx', "export default function Page() { return <p>{'hero_headline'}</p>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ files: ['app/layout.tsx', 'app/page.tsx', 'app/template.tsx'], keys: ['footer_links', 'hero_headline'] });
+  });
+
+  it('PG03: a Pages Router _document.tsx is a frame of every page', async () => {
+    const host = nextSite();
+    rmSync(join(host.cwd, 'app'), { recursive: true });
+    write(host.cwd, 'pages/_document.tsx', "export default function Document() { return <html>{'footer_links'}</html>; }\n");
+    write(host.cwd, 'pages/index.tsx', "export default function Page() { return <p>{'hero_headline'}</p>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ files: ['pages/_document.tsx', 'pages/index.tsx'], keys: ['footer_links', 'hero_headline'] });
+  });
+
+  it('N18: route-reads without a route is a usage error', async () => {
+    const host = nextSite();
+    const { handler } = handlerOver([host.cwd]);
+    const res = await handler(req(`/api/site/route-reads${site(host)}`));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'route is required' });
+  });
+
+  it('a Vite site answers no files', async () => {
+    const host = snapshotHost();
+    write(host.cwd, 'src/main.tsx', "import { copy } from '../lib/content';\ndocument.title = copy('hero_headline');\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+      route: '/',
+      files: [],
+      keys: [],
+      complete: false,
+    });
+  });
+
+  it('the html host answers the document’s marks', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const { handler } = handlerOver([host.cwd]);
+    const marks = await get(handler, `/api/site/marks${site(host)}`);
+    const expected = Object.entries(marks.keys as Record<string, string[]>)
+      .filter(([, files]) => files.includes('index.html'))
+      .map(([key]) => key)
+      .sort();
+    expect(expected.length).toBeGreaterThan(0);
+    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+      route: '/',
+      files: ['index.html'],
+      keys: expected,
+      complete: true,
+    });
   });
 });

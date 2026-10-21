@@ -1,0 +1,16 @@
+{
+  "keys": {
+    "tier_solo_name": {
+      "shape": "text"
+    },
+    "tier_team_name": {
+      "shape": "text"
+    },
+    "tier_solo_price": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

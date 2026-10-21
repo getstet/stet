@@ -273,4 +273,51 @@ describe('doctor — the wrapper-chain check', () => {
     expect(result.out).not.toContain('wrapper chain');
     expect(result.err).not.toContain('unsubscribe_url');
   });
+
+  it('finds a token that lives only in the frame file, which the template never imports (F6d, journey E19)', async () => {
+    const entry = MARKETING(['unsubscribe_url']);
+    const dir = project(
+      { welcome: { ...entry, render: { ...entry.render!, frame: { file: 'lib/email/base.ts', export: 'baseTemplate', args: ['preheader'] } } } },
+      { brand__footer_address: '1 Any Road' },
+    );
+    write(dir, 'lib/email/welcome.ts', "export const welcome = '<h1>Hello</h1>';\n");
+    write(dir, 'lib/email/base.ts', 'export const baseTemplate = (c: string): string => `${c}<a href="{{unsubscribe_url}}">Unsubscribe</a>`;\n');
+
+    const result = await doctor(dir);
+    expect(result.err).not.toContain('wrapperProvides');
+    expect(result.out).toContain('wrapper chain (welcome): 2 file(s), 1 declared token(s)');
+    expect(result.out).not.toContain('unfound');
+  });
+
+  it('walks a frame that is the pointer\'s own file once', async () => {
+    const entry = MARKETING(['unsubscribe_url']);
+    const dir = project(
+      { welcome: { ...entry, render: { ...entry.render!, frame: { file: entry.render!.file, export: 'shell' } } } },
+      { brand__footer_address: '1 Any Road' },
+    );
+    write(
+      dir,
+      'lib/email/welcome.ts',
+      "export const welcome = '<h1>Hello</h1>';\nexport const shell = (c: string): string => `${c}{{unsubscribe_url}}`;\n",
+    );
+
+    const result = await doctor(dir);
+    expect(result.out).toContain('wrapper chain (welcome): 1 file(s), 1 declared token(s)');
+  });
+
+  it('prints the containment line for a frame outside the project, and walks nothing', async () => {
+    const entry = MARKETING(['unsubscribe_url']);
+    const dir = project(
+      { welcome: { ...entry, render: { ...entry.render!, frame: { file: '../outside/base.ts', export: 'baseTemplate' } } } },
+      { brand__footer_address: '1 Any Road' },
+    );
+    write(dir, 'lib/email/welcome.ts', "export const welcome = '<h1>Hello</h1>';\n");
+
+    const result = await doctor(dir);
+    expect(result.out).toContain(
+      'wrapper chain (welcome): ../outside/base.ts is outside the project — a render pointer names a file inside it',
+    );
+    expect(result.out).not.toContain('wrapper chain (welcome): 1 file(s)');
+    expect(result.err).not.toContain('wrapperProvides');
+  });
 });

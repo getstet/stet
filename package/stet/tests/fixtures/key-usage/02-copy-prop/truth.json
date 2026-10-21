@@ -1,0 +1,7 @@
+{
+  "live": [
+    "hero_title",
+    "footer_note"
+  ],
+  "note": "copy.<key> / copyMap.<key> property reads"
+}

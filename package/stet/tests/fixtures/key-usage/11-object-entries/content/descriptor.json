@@ -1,0 +1,13 @@
+{
+  "keys": {
+    "faq_1": {
+      "shape": "text"
+    },
+    "faq_2": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

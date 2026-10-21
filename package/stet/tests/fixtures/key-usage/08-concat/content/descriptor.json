@@ -1,0 +1,16 @@
+{
+  "keys": {
+    "home_faq_1_question": {
+      "shape": "text"
+    },
+    "home_faq_2_question": {
+      "shape": "text"
+    },
+    "home_faq_1_answer": {
+      "shape": "text"
+    },
+    "footer_note": {
+      "shape": "text"
+    }
+  }
+}

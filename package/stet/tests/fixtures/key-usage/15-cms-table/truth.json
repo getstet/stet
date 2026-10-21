@@ -1,0 +1,6 @@
+{
+  "live": [
+    "hero_title"
+  ],
+  "note": "CMS-style lookup table in JSON (not code) naming the keys; read through copy(variable)"
+}

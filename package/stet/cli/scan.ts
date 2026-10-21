@@ -12,7 +12,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 
 import type * as TS from 'typescript';
 
@@ -23,6 +23,7 @@ import type { Descriptor, PageDef } from '../src/types.js';
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { writeJsonDeterministic } from './artifacts.js';
 import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isRegistryFile, proposeTemplates, templateExports, type ExtractSkip } from './email-extract.js';
 import { filesForGlobs } from './files.js';
 import { htmlBaseName, planHtmlRegister, proposeHtml } from './html-host.js';
 import { classifyAdoption, isRecord, planJsxRun, type Adoption } from './register-run.js';
@@ -37,6 +38,7 @@ import {
   mentionsToken,
   rendersToken,
   scanDialect,
+  scriptKindFor,
   scanModule,
   scanSource,
   type LocatedLiteral,
@@ -62,7 +64,7 @@ interface BaselineEntry {
 interface RawDescriptor {
   keys?: unknown;
   pages?: unknown;
-  templates?: Record<string, { slots?: string[]; render?: { file?: unknown } }>;
+  templates?: Record<string, { slots?: string[]; render?: { file?: unknown; frame?: { file?: unknown } } }>;
 }
 
 /**
@@ -461,6 +463,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     // The warns above print here too, but the severity promotion does NOT
     // apply: `--baseline` is the run that ACCEPTS the findings, and failing it
     // under a `fail` posture would block the only workflow that clears them.
+    await undeclaredTemplates(io, config, report, descriptorOnce());
     return report.emit(io, { json: flag(values, 'json') });
   }
 
@@ -480,6 +483,8 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   report.data('scan', { files: files.length, warned });
   // `fail` severity promotes the warnings to errors (exit 1); `warn` keeps exit 0.
   if (config.scan.severity === 'fail') report.promoteWarnings();
+  // R4's warn never fails, so it joins the report after the promotion.
+  await undeclaredTemplates(io, config, report, descriptorOnce());
   return report.emit(io, { json: flag(values, 'json') });
 }
 
@@ -547,6 +552,78 @@ async function unrenderedSlots(
         { at: { file }, slot: { template: name, name: slot } },
       );
     }
+  }
+}
+
+/**
+ * An email template no `templates` entry manages (R4): a file in the email
+ * surfaces exporting what `email extract` would propose — a function returning
+ * markup, or a string constant carrying it — that no entry's pointer names.
+ * The file an entry's frame names is the frame, not a template, and a registry
+ * holds subjects; neither is reported. It rides scan, so the hook prints it at
+ * the commit that adds the file, and it is a warn, so that commit lands.
+ *
+ * Read with the compiler alone: without it the pass is skipped, since scan
+ * already states the compiler's absence where a file needs it.
+ */
+async function undeclaredTemplates(
+  io: CliIo,
+  config: StetConfig,
+  report: Report,
+  descriptor: RawDescriptor | null,
+): Promise<void> {
+  // `stet check` owns an unreadable descriptor; scan reports literals.
+  if (descriptor === null) return;
+  let ts: typeof import('typescript');
+  try {
+    ts = await loadTypescript();
+  } catch {
+    return;
+  }
+  const templates = descriptor.templates ?? {};
+  const declared = new Set<unknown>();
+  const frames = new Set<unknown>();
+  for (const name of Object.keys(templates)) {
+    const render = Object.hasOwn(templates, name) ? templates[name]?.render : undefined;
+    // A hand-written pointer may spell a file with a leading `./`.
+    declared.add(typeof render?.file === 'string' ? posix.normalize(render.file) : undefined);
+    frames.add(typeof render?.frame?.file === 'string' ? posix.normalize(render.frame.file) : undefined);
+  }
+  const unmanaged: string[] = [];
+  for (const file of filesForGlobs(io.cwd, config.emailSurfaces)) {
+    if (!/\.(tsx|ts|jsx|js)$/.test(file) || declared.has(file) || frames.has(file) || isRegistryFile(file)) continue;
+    let source: string;
+    try {
+      source = readFileSync(join(io.cwd, file), 'utf8');
+    } catch {
+      continue;
+    }
+    const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
+    if (templateExports(ts, sf).length === 0) continue;
+    unmanaged.push(file);
+  }
+  if (unmanaged.length === 0) return;
+
+  // The advice is extract's own verdict: a file extract would skip is declared by
+  // hand, and telling its author to run extract sends them in a circle.
+  let skips: ExtractSkip[] = [];
+  try {
+    const proposed = { version: 1, keys: isRecord(descriptor.keys) ? descriptor.keys : {}, templates: isRecord(templates) ? (templates as Descriptor['templates']) : {} };
+    skips = (await proposeTemplates(io, config, proposed as Descriptor, config.emailSurfaces)).skips;
+  } catch {
+    // The warn is a courtesy: where extract's own read fails, the pinned advice stands.
+  }
+  for (const file of unmanaged) {
+    const skip = skips.find((s) => s.file === file);
+    report.warn(
+      'scan',
+      skip === undefined
+        ? `${file} exports a template stet does not manage — run stet email extract ${file}`
+        : `${file} exports a template stet does not manage — stet email extract skips it (${skip.detail}), ` +
+            'so declare it in the descriptor by hand',
+      undefined,
+      { at: { file } },
+    );
   }
 }
 

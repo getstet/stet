@@ -679,6 +679,23 @@ describe('store-postgrest, the wire shapes', () => {
     expect(sent[0]?.body).toEqual({ p_key: 'hero_headline', p_locale: 'de', p_project: 'wire' });
   });
 
+  it('maps a draft row’s editor and created_at onto the read row, and neither onto an active one (8.1)', async () => {
+    const raw = (over: Record<string, unknown>): Record<string, unknown> => ({
+      id: 1, key: 'lab_link', locale: 'default', target: 'web', state: 'published', is_active: true, value: 'Read the docs',
+      publish_at: null, editor: 'neil', label: null, note: null, published_by: 'neil', reverted_from: null, changeset_id: null,
+      created_at: '2026-10-19 09:00:00+00', published_at: '2026-10-19 09:01:00+00', ...over,
+    });
+    const { store } = recorder(() => [
+      raw({}),
+      raw({ id: 2, state: 'draft', is_active: false, value: 'Read the guide', editor: 'agent:claude', published_by: null, created_at: '2026-10-19 17:44:05.123+00', published_at: null }),
+    ]);
+    const rows = await store.read({ preview: true });
+    if (!Array.isArray(rows)) throw new Error('expected rows');
+    expect(rows[0]).not.toHaveProperty('editor');
+    expect(rows[0]).not.toHaveProperty('createdAt');
+    expect(rows[1]).toMatchObject({ status: 'draft', editor: 'agent:claude', createdAt: '2026-10-19T17:44:05.123Z' });
+  });
+
   it('carries changeset_id in every content_versions select', async () => {
     const { store, sent } = recorder(() => []);
     await store.read();

@@ -1,0 +1,6 @@
+{
+  "live": [
+    "home_title"
+  ],
+  "note": "next-intl-style useTranslations('home') + t('title'): no key name and no static prefix anywhere"
+}

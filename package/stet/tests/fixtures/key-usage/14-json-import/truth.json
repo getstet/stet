@@ -1,0 +1,7 @@
+{
+  "live": [
+    "hero_title",
+    "footer_note"
+  ],
+  "note": "snapshot JSON imported directly; one read by name, one by a variable index"
+}

@@ -1,0 +1,7 @@
+{
+  "live": [
+    "hero_title",
+    "footer_note"
+  ],
+  "note": "an array of key names, read in a loop"
+}

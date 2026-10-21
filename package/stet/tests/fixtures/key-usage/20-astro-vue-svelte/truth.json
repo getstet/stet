@@ -1,0 +1,10 @@
+{
+  "live": [
+    "hero_title",
+    "hero_sub",
+    "nav_label",
+    "cta_label",
+    "footer_note"
+  ],
+  "note": "template dialects: front matter, braces, a Vue bound attribute, a mustache, an HTML comment"
+}

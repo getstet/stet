@@ -237,7 +237,7 @@ describe('the preview proxy', () => {
     const up = await upstream();
     const proxy = await proxyTo(up);
     const reply = await get(proxy.port, '/page', proxy.host);
-    const tag = `<script src="${AGENT_PATH}" data-parent="${DASHBOARD}" data-channel="c1"></script>`;
+    const tag = `<script src="${AGENT_PATH}" data-parent="${DASHBOARD}" data-channel="c1" data-hold></script>`;
     expect(reply.body.toString('utf8')).toBe(PAGE.replace('</head>', `${tag}</head>`));
     expect(reply.headers['content-length']).not.toBe(String(Buffer.byteLength(PAGE)));
     // The agent itself, from the proxy's own path.
@@ -279,7 +279,7 @@ describe('the preview proxy', () => {
     const proxy = await proxyTo(up);
     const reply = await get(proxy.port, '/latin', proxy.host);
     const text = reply.body.toString('latin1');
-    const tag = /<script src="[^"]*" data-parent="[^"]*" data-channel="c1"><\/script>/.exec(text)?.[0] ?? '<none>';
+    const tag = /<script src="[^"]*" data-parent="[^"]*" data-channel="c1" data-hold><\/script>/.exec(text)?.[0] ?? '<none>';
     expect(Buffer.from(text.replace(tag, ''), 'latin1')).toEqual(LATIN);
   });
 
@@ -340,7 +340,7 @@ describe('the preview proxy', () => {
   });
 
   describe('pages, fragments, refused upgrades and a dev server that stops mid-page', () => {
-    const TAG = `<script src="${AGENT_PATH}" data-parent="${DASHBOARD}" data-channel="c1"></script>`;
+    const TAG = `<script src="${AGENT_PATH}" data-parent="${DASHBOARD}" data-channel="c1" data-hold></script>`;
 
     it('adds the agent to a page the frame loads, and passes a fragment the page fetches byte for byte', async () => {
       const up = await upstream();

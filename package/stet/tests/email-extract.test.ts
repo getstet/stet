@@ -12,21 +12,24 @@
  * rendering both sides.
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, symlinkSync } from 'node:fs';
+import { readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { check } from '../cli/check.js';
 import { proposeTemplates, runEmailExtract, type ProposalSet } from '../cli/email-extract.js';
 import { defaultConfig, loadConfig, type StetConfig } from '../cli/config.js';
+import { outsideLine, pointerRequest, renderTemplate, templateProps } from '../cli/email-render.js';
+import { runEmailVerify } from '../cli/email-verify.js';
 import { packageRoot } from '../cli/installed.js';
 import { runCli, type CliIo } from '../cli/main.js';
+import { runScan } from '../cli/scan.js';
 import { CliError, Report, UsageError } from '../cli/report.js';
 import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
-import type { Descriptor } from '../src/types.js';
+import type { Descriptor, KeyDef, TemplateDef } from '../src/types.js';
 import { cleanupEmailHosts, makeEmailHost, type EmailHost } from './helpers/email-host.js';
 
 afterAll(cleanupEmailHosts);
@@ -169,8 +172,9 @@ describe('extract — the string-template shape', () => {
     ]);
 
     // Every flattened key is written WITH its definition, `vars` naming exactly
-    // what the slot lifted — an undeclared `{{name}}` is a save-gate rejection.
-    expect(proposal?.keys['welcome__subject']).toEqual({ shape: 'text', target: 'html-email', vars: ['name'] });
+    // what the slot lifted — an undeclared `{{name}}` is a save-gate rejection —
+    // and `requires` the same names, so a value that drops one is refused too.
+    expect(proposal?.keys['welcome__subject']).toEqual({ shape: 'text', target: 'html-email', vars: ['name'], requires: ['name'] });
     expect(proposal?.keys['welcome__body']).toEqual({ shape: 'text', target: 'html-email' });
 
     // The shell: one interpolation per gap, the props type widened, and the
@@ -829,7 +833,7 @@ describe('extract --apply — the batch', () => {
     });
     // Every flattened key lands WITH its definition — a seeded `{{name}}` with
     // no `vars` declaring it is a save-gate rejection on the next editor save.
-    expect(descriptor.keys['welcome__subject']).toEqual({ shape: 'text', target: 'html-email', vars: ['name'] });
+    expect(descriptor.keys['welcome__subject']).toEqual({ shape: 'text', target: 'html-email', vars: ['name'], requires: ['name'] });
     expect(descriptor.keys['welcome__body']).toEqual({ shape: 'text', target: 'html-email' });
 
     const snapshot = readJson(host, 'content/defaults.json');
@@ -1248,5 +1252,428 @@ describe('extract — a skip never stops the walk', () => {
     expect(set.skips.map((s) => [s.file, s.reason])).toEqual([
       ['lib/email/templates/rich.ts', 'interleaved-markup'],
     ]);
+  });
+});
+
+// --- D4: string-constant templates, the registry subject, the frame ----------
+
+/** Mirra's frame: the content first, then an optional preheader and two defaulted parameters. */
+const MIRRA_BASE =
+  "const MIRRA_BRAND = { name: 'Mirra', color: '#2d6a4f' };\n" +
+  '\n' +
+  'export function baseTemplate(content: string, preheader?: string, shellWidth = 600, brand = MIRRA_BRAND): string {\n' +
+  '  return `<html><body style="color:${brand.color}"><span class="preheader">${preheader ?? \'\'}</span>` +\n' +
+  '    `<table width="${shellWidth}"><tr><td>${content}</td></tr></table><p>${brand.name}</p></body></html>`;\n' +
+  '}\n';
+
+/** Mirra's `welcome.ts` shape: markup-free constants above the one markup constant, `{{var}}` placeholders in it. */
+const MIRRA_WELCOME =
+  "export const WELCOME_BILLING_TRIAL = 'Your first 14 days are free.';\n" +
+  "export const WELCOME_PREHEADER = 'Your week, sorted.';\n" +
+  '\n' +
+  'export const welcomeContent = `\n' +
+  '  <h1>Welcome to Mirra</h1>\n' +
+  '  <p>Hi {{name}}, your week is sorted. Every plan you make lands in one place.</p>\n' +
+  '  <a href="{{loginUrl}}">Open your dashboard</a>\n' +
+  '`;\n';
+
+/** The registry in the templates' parent directory, as Mirra keeps it: subjects by template, beside the content. */
+const MIRRA_REGISTRY =
+  "import { welcomeContent } from './templates/welcome';\n" +
+  '\n' +
+  'export const emailRegistry = {\n' +
+  '  welcome: {\n' +
+  "    subject: 'Welcome to Mirra',\n" +
+  '    content: welcomeContent,\n' +
+  '  },\n' +
+  "  'trial-ending': {\n" +
+  "    subject: 'Your trial ends in {{days}} days',\n" +
+  "    content: '',\n" +
+  '  },\n' +
+  '};\n';
+
+const MIRRA_FRAME = 'lib/email/templates/base.ts#baseTemplate';
+
+/** The rewrite D4 pins for `MIRRA_WELCOME`: a function of one props object of the slot keys. */
+const MIRRA_REWRITTEN = MIRRA_WELCOME.replace(
+  'welcomeContent = `',
+  'welcomeContent = (props: { welcome__headline: string; welcome__body: string; welcome__cta_label: string }) => `',
+)
+  .replace('<h1>Welcome to Mirra</h1>', '<h1>${props.welcome__headline}</h1>')
+  .replace('<p>Hi {{name}}, your week is sorted. Every plan you make lands in one place.</p>', '<p>${props.welcome__body}</p>')
+  .replace('>Open your dashboard</a>', '>${props.welcome__cta_label}</a>');
+
+/** A project host committed to git, so `email verify` has a HEAD to compare against. */
+function committedProject(files: Record<string, string>): EmailHost {
+  const host = projectHost(files);
+  const git = (...args: string[]): void => {
+    execFileSync('git', args, { cwd: host.dir, stdio: 'pipe' });
+  };
+  git('init', '-q');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'stet test');
+  git('config', 'commit.gpgsign', 'false');
+  host.put('.gitignore', 'node_modules\n');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'the original templates');
+  return host;
+}
+
+async function verifyHost(host: EmailHost): Promise<{ code: number; out: string; err: string }> {
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = await runEmailVerify([], { cwd: host.dir, env: {}, stdout: (l) => out.push(l), stderr: (l) => err.push(l) });
+  return { code, out: out.join('\n'), err: err.join('\n') };
+}
+
+/** One declared template rendered through its pointer and the runner, with the props every render uses. */
+function renderDeclared(host: EmailHost, name: string): string {
+  const io: CliIo = { cwd: host.dir, env: {}, stdout: () => {}, stderr: () => {} };
+  const descriptor = readJson(host, 'content/descriptor.json') as unknown as Descriptor;
+  const snapshot = readJson(host, 'content/defaults.json') as { default: Record<string, unknown> };
+  const entry = descriptor.templates?.[name];
+  if (entry === undefined) throw new Error(`${name} is not declared`);
+  const props = templateProps(name, entry, (key) => snapshot.default[key]);
+  if ('missing' in props) throw new Error(props.missing);
+  const request = pointerRequest(host.dir, descriptor, name, props.values);
+  if (request === null) throw new Error(`${name} has no pointer`);
+  const rendered = renderTemplate(io, request);
+  if (!rendered.ok) throw new Error(`${rendered.reason}: ${rendered.detail}`);
+  return JSON.parse(rendered.result) as string;
+}
+
+describe('extract — a string-constant template (D4)', () => {
+  it('proposes the markup string constant and passes over the markup-free one', async () => {
+    const host = makeEmailHost({ deps: [] });
+    host.put(
+      'lib/email/templates/welcome.ts',
+      "export const WELCOME_BILLING_TRIAL = 'Your first 14 days are free.';\n" +
+        'export const welcomeContent = `<h1>Welcome to Mirra</h1><p>Hi {{name}}, your week is sorted.</p>`;\n',
+    );
+    const set = await propose(host, ['lib/email/templates/*.ts']);
+    expect(set.skips).toEqual([]);
+    expect(set.proposals.map((p) => [p.name, p.entry.render?.export])).toEqual([['welcome', 'welcomeContent']]);
+  });
+
+  it('skips two markup constants with no default as ambiguous-exports', async () => {
+    const host = makeEmailHost({ deps: [] });
+    host.put(
+      'lib/email/templates/pair.ts',
+      'export const one = `<p>One</p>`;\n' + "export const two = '<p>Two</p>';\n",
+    );
+    const set = await propose(host, ['lib/email/templates/*.ts']);
+    expect(set.skips.map((s) => s.reason)).toEqual(['ambiguous-exports']);
+  });
+
+  it('keeps each run’s {{var}}, seeds vars and requires, samples every variable and rewrites to a typed props function', async () => {
+    const host = makeEmailHost({ deps: [] });
+    host.put('lib/email/templates/welcome.ts', MIRRA_WELCOME);
+    const set = await propose(host, ['lib/email/templates/*.ts']);
+    expect(set.skips).toEqual([]);
+    const proposal = set.proposals[0];
+    expect(proposal?.slots).toEqual([
+      { slot: 'headline', key: 'welcome__headline', value: 'Welcome to Mirra', vars: [] },
+      {
+        slot: 'body',
+        key: 'welcome__body',
+        value: 'Hi {{name}}, your week is sorted. Every plan you make lands in one place.',
+        vars: ['name'],
+      },
+      { slot: 'cta_label', key: 'welcome__cta_label', value: 'Open your dashboard', vars: [] },
+    ]);
+    expect(proposal?.keys).toEqual({
+      welcome__headline: { shape: 'text', target: 'html-email' },
+      welcome__body: { shape: 'text', target: 'html-email', vars: ['name'], requires: ['name'] },
+      welcome__cta_label: { shape: 'text', target: 'html-email' },
+    });
+    // Every variable the literal carries, the shell's href included, sampled as a string.
+    expect(proposal?.entry.render).toEqual({
+      file: 'lib/email/templates/welcome.ts',
+      export: 'welcomeContent',
+      sampleProps: { name: 'sample-name', loginUrl: 'https://example.com/loginUrl' },
+      fill: true,
+    });
+    expect(proposal?.edited).toBe(MIRRA_REWRITTEN);
+    expect(typechecks(host, 'lib/email/templates/welcome.ts', proposal?.edited ?? '').output).toBe('');
+  });
+
+  it('leaves a run holding a ${…} substitution as shell with its note, and proposes the others', async () => {
+    const source =
+      "const BRAND = 'Mirra';\n" +
+      'export const welcomeContent = `<h1>Welcome to ${BRAND}</h1><p>Your week is sorted.</p>`;\n';
+    const host = makeEmailHost({ deps: [] });
+    host.put('lib/email/templates/welcome.ts', source);
+    const set = await propose(host, ['lib/email/templates/*.ts']);
+    const proposal = set.proposals[0];
+    expect(proposal?.slots.map((s) => s.key)).toEqual(['welcome__body']);
+    expect(proposal?.notes).toEqual([
+      `the run at offset ${source.indexOf('Welcome to')} interpolates \${…}, which a string template cannot pass as a prop — left as shell`,
+    ]);
+    expect(proposal?.edited).toContain('<h1>Welcome to ${BRAND}</h1><p>${props.welcome__body}</p>');
+  });
+
+  it('rewrites a JavaScript constant to an untyped props function', async () => {
+    const host = makeEmailHost({ deps: [] });
+    host.put('lib/email/templates/notice.js', 'export const noticeContent = `<p>Hi {{name}}</p>`;\n');
+    const proposal = (await propose(host, ['lib/email/templates/*.js'])).proposals[0];
+    expect(proposal?.edited).toBe('export const noticeContent = (props) => `<p>${props.notice__body}</p>`;\n');
+  });
+
+  it('leaves a constant whose rewrite would change it: a declared type, or a quoted string holding a backtick', async () => {
+    const host = makeEmailHost({ deps: [] });
+    host.put('lib/email/templates/typed.ts', 'export const typedContent: string = `<p>Hello there</p>`;\n');
+    host.put('lib/email/templates/ticked.ts', "export const tickedContent = '<p>Run `npm i` first</p>';\n");
+    host.put('lib/email/templates/cost.ts', "export const costContent = '<p>Cost ${price} now</p>';\n");
+    const set = await propose(host, ['lib/email/templates/*.ts']);
+    expect(set.proposals).toEqual([]);
+    expect(set.skips.map((s) => [s.file, s.reason])).toEqual([
+      ['lib/email/templates/cost.ts', 'no-template-export'],
+      ['lib/email/templates/ticked.ts', 'no-template-export'],
+      ['lib/email/templates/typed.ts', 'unwritable-props-type'],
+    ]);
+    const note = 'holds a backtick or ${, which reads differently once it is a template literal';
+    expect(set.skips[0]?.detail).toContain(note);
+    expect(set.skips[1]?.detail).toContain(note);
+  });
+
+  it('words the apply footer for each shape: props widened for a function, a string turned into a function for a constant', async () => {
+    const widened = 'the rewrite added the slot props to each template’s props type and changed no call site';
+    const rewrote = 'rewrote welcomeContent from a string into a function of its props — callers that use it as a string must call it';
+    const constant = await run(projectHost({ 'lib/email/templates/welcome.ts': MIRRA_WELCOME }), [...WALK, '--apply']);
+    expect(constant.out).toContain(rewrote);
+    expect(constant.out).not.toContain(widened);
+    const fn = await run(projectHost(WELCOME_HOST), [...WALK, '--apply']);
+    expect(fn.out).toContain(widened);
+    expect(fn.out).not.toContain('from a string into a function');
+    const both = await run(
+      projectHost({ ...WELCOME_HOST, 'lib/email/templates/trial-ending.ts': 'export const trialEndingContent = `<p>Your trial is ending.</p>`;\n' }),
+      [...WALK, '--apply'],
+    );
+    expect(both.out).toContain(widened);
+    expect(both.out).toContain('rewrote trialEndingContent from a string into a function of its props');
+  });
+
+  it('keeps a variable named __proto__ through the descriptor write, the render and verify (F5)', async () => {
+    const host = committedProject({
+      'lib/email/templates/proto.ts': 'export const protoContent = `<p>Hi {{__proto__}}, welcome aboard.</p>`;\n',
+    });
+    expect((await run(host, [...WALK, '--apply'])).code).toBe(0);
+    const descriptor = readJson(host, 'content/descriptor.json') as unknown as Descriptor;
+    const sample = descriptor.templates?.['proto']?.render?.sampleProps ?? {};
+    expect(Object.hasOwn(sample, '__proto__')).toBe(true);
+    expect(renderDeclared(host, 'proto')).toBe('<p>Hi sample-__proto__, welcome aboard.</p>');
+    const verified = await verifyHost(host);
+    expect(verified.out).toContain('proto: PASS');
+    expect(verified.code).toBe(0);
+  });
+
+  it('applies a single-quoted constant as a template literal that renders and verifies against HEAD (F6a end to end)', async () => {
+    const host = committedProject({
+      'lib/email/templates/welcome.ts': 'export const welcomeContent = \'<a href="{{url}}">{{name}}</a>\';\n',
+    });
+    const applied = await run(host, [...WALK, '--apply']);
+    expect(applied.code).toBe(0);
+    const shell = read(host, 'lib/email/templates/welcome.ts');
+    expect(shell).toBe(
+      'export const welcomeContent = (props: { welcome__cta_label: string }) => `<a href="{{url}}">${props.welcome__cta_label}</a>`;\n',
+    );
+    // The shell's own variable is filled from the sample props: the href is a URL, not `{{url}}`.
+    expect(renderDeclared(host, 'welcome')).toBe('<a href="https://example.com/url">sample-name</a>');
+    const verified = await verifyHost(host);
+    expect(verified.out).toContain('welcome: PASS');
+    expect(verified.code).toBe(0);
+    expect(tscHost(host, ['lib/email/templates/welcome.ts']).output).toBe('');
+  });
+
+  it('applies Mirra’s welcome, renders it through the runner and verifies against HEAD', async () => {
+    const host = committedProject({ 'lib/email/templates/welcome.ts': MIRRA_WELCOME });
+    expect((await run(host, [...WALK, '--apply'])).code).toBe(0);
+    expect(read(host, 'lib/email/templates/welcome.ts')).toBe(MIRRA_REWRITTEN);
+    const html = renderDeclared(host, 'welcome');
+    expect(html).toContain('<p>Hi sample-name, your week is sorted.');
+    expect(html).toContain('<a href="https://example.com/loginUrl">Open your dashboard</a>');
+    const verified = await verifyHost(host);
+    expect(verified.out).toContain('welcome: PASS');
+    expect(verified.code).toBe(0);
+    expect(tscHost(host, ['lib/email/templates/welcome.ts']).output).toBe('');
+  });
+});
+
+describe('extract — the registry subject and --frame (D4)', () => {
+  const MIRRA = {
+    'lib/email/registry.ts': MIRRA_REGISTRY,
+    'lib/email/templates/base.ts': MIRRA_BASE,
+    'lib/email/templates/welcome.ts': MIRRA_WELCOME,
+  };
+
+  it('proposes Mirra’s welcome with the registry subject, fill, the frame’s args and each slot’s requires (journey E19)', async () => {
+    const host = projectHost(MIRRA);
+    const json = await run(host, [...WALK, '--frame', MIRRA_FRAME, '--json']);
+    expect(json.code).toBe(0);
+    const payload = JSON.parse(json.out) as {
+      templates: Array<{ name: string; entry: TemplateDef; keys: Record<string, KeyDef>; values: Record<string, string> }>;
+      skips: unknown[];
+    };
+    // base.ts is the frame the run names, so it is no template of the run, proposed or skipped.
+    expect(payload.templates.map((t) => t.name)).toEqual(['welcome']);
+    expect(payload.skips).toEqual([]);
+    const welcome = payload.templates[0];
+    expect(welcome?.entry.slots).toEqual(['subject', 'headline', 'body', 'cta_label']);
+    expect(welcome?.values['welcome__subject']).toBe('Welcome to Mirra');
+    expect(welcome?.entry.render).toEqual({
+      file: 'lib/email/templates/welcome.ts',
+      export: 'welcomeContent',
+      sampleProps: { name: 'sample-name', loginUrl: 'https://example.com/loginUrl' },
+      fill: true,
+      frame: { file: 'lib/email/templates/base.ts', export: 'baseTemplate', args: ['preheader', 'shellWidth', 'brand'] },
+    });
+    expect(welcome?.keys).toEqual({
+      welcome__subject: { shape: 'text', target: 'html-email' },
+      welcome__headline: { shape: 'text', target: 'html-email' },
+      welcome__body: { shape: 'text', target: 'html-email', vars: ['name'], requires: ['name'] },
+      welcome__cta_label: { shape: 'text', target: 'html-email' },
+    });
+
+    // The review names the registry line the subject came from, and the send path that must read the slot.
+    const text = await run(host, [...WALK, '--frame', MIRRA_FRAME]);
+    expect(text.out).toContain(
+      'note: welcome__subject is seeded from lib/email/registry.ts:5, which stet leaves as it is — ' +
+        'the host’s send path must read welcome__subject in its place',
+    );
+  });
+
+  it('applies with the frame, renders at the frame’s default width, verifies, and never rewrites the registry', async () => {
+    const host = committedProject(MIRRA);
+    expect((await run(host, [...WALK, '--frame', MIRRA_FRAME, '--apply'])).code).toBe(0);
+    expect(read(host, 'lib/email/registry.ts')).toBe(MIRRA_REGISTRY);
+    const html = renderDeclared(host, 'welcome');
+    // A named variable the props lack is passed as undefined, so the defaulted parameters keep their defaults.
+    expect(html).toContain('<table width="600">');
+    expect(html).toContain('<p>Mirra</p></body></html>');
+    expect(html).toContain('<span class="preheader"></span>');
+    const verified = await verifyHost(host);
+    expect(verified.out).toContain('welcome: PASS');
+    expect(verified.code).toBe(0);
+  });
+
+  it('reads the member named by the file stem as written, and the template’s own directory first', async () => {
+    const host = projectHost({
+      ...MIRRA,
+      'lib/email/templates/trial-ending.ts': 'export const trialEndingContent = `<p>Your trial is ending.</p>`;\n',
+    });
+    const set = await propose(host, WALK);
+    const trial = set.proposals.find((p) => p.file === 'lib/email/templates/trial-ending.ts');
+    expect(trial?.slots[0]).toEqual({
+      slot: 'subject',
+      key: `${trial?.name ?? ''}__subject`,
+      value: 'Your trial ends in {{days}} days',
+      vars: ['days'],
+    });
+    // A subject's variable is sampled with the rest, so every render can substitute it.
+    expect(trial?.entry.render?.sampleProps).toEqual({ days: 'sample-days' });
+
+    host.put('lib/email/templates/registry.ts', "export const local = {\n  welcome: { subject: 'From the templates folder' },\n};\n");
+    const near = (await propose(host, WALK)).proposals.find((p) => p.name === 'welcome');
+    expect(near?.slots[0]?.value).toBe('From the templates folder');
+  });
+
+  it('falls back to the template name when the registry key is not the file stem as written', async () => {
+    const host = projectHost({
+      'lib/email/registry.ts': "export const emailRegistry = {\n  trial_ending: { subject: 'Your trial ends in {{days}} days' },\n};\n",
+      'lib/email/templates/trial-ending.ts': 'export const trialEndingContent = `<p>Your trial is ending.</p>`;\n',
+    });
+    const trial = (await propose(host, WALK)).proposals.find((p) => p.name === 'trial_ending');
+    expect(trial?.slots[0]).toMatchObject({ slot: 'subject', value: 'Your trial ends in {{days}} days', vars: ['days'] });
+  });
+
+  it('seeds "$all" for a destructured frame parameter, and no args for a frame that takes only the content', async () => {
+    const host = projectHost({
+      'lib/email/templates/welcome.ts': MIRRA_WELCOME,
+      'lib/email/frames.ts':
+        'export const shell = (c: string, { name }: { name: string }): string => `<div>${name}${c}</div>`;\n' +
+        'export function plain(c: string): string {\n  return `<div>${c}</div>`;\n}\n',
+    });
+    const frameOf = async (spec: string): Promise<unknown> => {
+      const result = await run(host, [...WALK, '--frame', spec, '--json']);
+      return (JSON.parse(result.out) as { templates: Array<{ entry: TemplateDef }> }).templates[0]?.entry.render?.frame;
+    };
+    expect(await frameOf('lib/email/frames.ts#shell')).toEqual({ file: 'lib/email/frames.ts', export: 'shell', args: '$all' });
+    expect(await frameOf('lib/email/frames.ts#plain')).toEqual({ file: 'lib/email/frames.ts', export: 'plain' });
+  });
+
+  it('refuses a frame whose parameters cannot be passed by name', async () => {
+    const host = projectHost({
+      'lib/email/templates/welcome.ts': MIRRA_WELCOME,
+      'lib/email/frames.ts':
+        'export const mixed = (c: string, pre: string, { name }: { name: string }): string => `${pre}${name}${c}`;\n',
+    });
+    await expect(run(host, [...WALK, '--frame', 'lib/email/frames.ts#mixed'])).rejects.toThrow(
+      new CliError('lib/email/frames.ts: mixed takes a parameter stet cannot pass by name — declare the frame and its args by hand'),
+    );
+  });
+
+  it('refuses a frame outside the project, named or reached through a symlink, and writes nothing', async () => {
+    const host = projectHost({ 'lib/email/templates/welcome.ts': MIRRA_WELCOME });
+    const outside = join(dirname(host.dir), `${basename(host.dir)}-outside.ts`);
+    writeFileSync(outside, 'export function plain(c: string): string {\n  return `<div>${c}</div>`;\n}\n');
+    try {
+      symlinkSync(outside, join(host.dir, 'lib/email/linked.ts'));
+      for (const [spec, shown] of [
+        [`../${basename(outside)}#plain`, `../${basename(outside)}`],
+        ['lib/email/linked.ts#plain', 'lib/email/linked.ts'],
+      ] as const) {
+        const out: string[] = [];
+        const io: CliIo = { cwd: host.dir, env: {}, stdout: (l) => out.push(l), stderr: (l) => out.push(l) };
+        await expect(runEmailExtract([...WALK, '--frame', spec, '--apply'], io)).rejects.toThrow(new CliError(outsideLine(shown)));
+        expect(out).toEqual([]);
+        expect(readJson(host, 'content/descriptor.json')['templates']).toEqual({});
+      }
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
+  it('stores a ./ frame path without the ./, and scan names the frame as a frame under either spelling', async () => {
+    const host = projectHost({
+      ...MIRRA,
+      'lib/email/templates/invoice-paid.ts': "export const invoicePaidContent = '<h1>Your invoice is paid</h1>';\n",
+    });
+    const applied = await run(host, [...WALK, '--frame', './lib/email/templates/base.ts#baseTemplate', '--apply', 'welcome']);
+    expect(applied.code).toBe(0);
+    const stored = readJson(host, 'content/descriptor.json') as unknown as Descriptor;
+    expect(stored.templates?.['welcome']?.render?.frame?.file).toBe('lib/email/templates/base.ts');
+
+    const undeclared = async (): Promise<string[]> => {
+      const err: string[] = [];
+      const io: CliIo = { cwd: host.dir, env: {}, stdout: () => {}, stderr: (l) => err.push(l) };
+      expect(await runScan([], io)).toBe(0);
+      return err.filter((l) => l.includes('does not manage'));
+    };
+    const only = ['warn: lib/email/templates/invoice-paid.ts exports a template stet does not manage — run stet email extract lib/email/templates/invoice-paid.ts'];
+    expect(await undeclared()).toEqual(only);
+    // A descriptor written by hand may spell the same files with a ./ as well.
+    const raw = JSON.parse(read(host, 'content/descriptor.json')) as { templates: Record<string, { render: { file: string; frame: { file: string } } }> };
+    const render = raw.templates['welcome']?.render;
+    if (render === undefined) throw new Error('welcome was not declared');
+    render.file = `./${render.file}`;
+    render.frame.file = `./${render.frame.file}`;
+    host.put('content/descriptor.json', JSON.stringify(raw));
+    expect(await undeclared()).toEqual(only);
+  });
+
+  it('refuses the run before any proposal when the frame export or file is missing', async () => {
+    const host = projectHost({
+      'lib/email/templates/welcome.ts': MIRRA_WELCOME,
+      'lib/email/frames.ts': 'export function plain(c: string): string {\n  return `<div>${c}</div>`;\n}\n',
+    });
+    const out: string[] = [];
+    const io: CliIo = { cwd: host.dir, env: {}, stdout: (l) => out.push(l), stderr: (l) => out.push(l) };
+    await expect(runEmailExtract([...WALK, '--frame', 'lib/email/frames.ts#nope'], io)).rejects.toThrow(
+      new CliError('lib/email/frames.ts: no exported function nope to frame the templates with'),
+    );
+    await expect(runEmailExtract([...WALK, '--frame', 'lib/email/gone.ts#plain'], io)).rejects.toThrow(
+      new CliError('lib/email/gone.ts: no exported function plain to frame the templates with'),
+    );
+    expect(out).toEqual([]);
   });
 });

@@ -92,3 +92,34 @@ describe('the memory store’s test hooks', () => {
     expect(await createMemoryStore({ project: 'elsewhere', db }).read()).toEqual([]);
   });
 });
+
+describe('a draft row names its author (8.1)', () => {
+  it('the keys read names the draft’s author and when it was first saved; the active row carries neither (journey B16)', async () => {
+    const store = createMemoryStore({ project: 'authored' });
+    store.seed([{ key: 'lab_link', value: 'Read the docs' }]);
+    expect(await store.saveDraft({ key: 'lab_link', value: 'Read the guide', target: 'web', editor: 'agent:claude' })).toEqual({ draftId: 2 });
+
+    const rows = await store.read({ preview: true });
+    if (!Array.isArray(rows)) throw new Error('expected rows');
+    const created = store.dump().find((r) => r.state === 'draft')?.created_at;
+    expect(rows).toEqual([
+      // The published row, exactly as before: no author, no birth time on this read.
+      { key: 'lab_link', locale: 'default', status: 'published', is_active: true, value: 'Read the docs', version: 1, target: 'web', publishAt: null, changesetId: null },
+      {
+        key: 'lab_link', locale: 'default', status: 'draft', is_active: false, value: 'Read the guide', version: 2, target: 'web', publishAt: null, changesetId: null,
+        editor: 'agent:claude', createdAt: new Date(created as string).toISOString(),
+      },
+    ]);
+    expect(rows[1]?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  });
+});
+
+describe('a draft held by another editor (8.4)', () => {
+  it('two dashboard editors with different names are different editors: the second Save without force is refused and writes nothing', async () => {
+    const store = createMemoryStore({ project: 'held' });
+    expect(await store.saveDraft({ key: 'lab_link', value: 'Neil’s words', target: 'web', editor: 'dashboard:neil' })).toEqual({ draftId: 1 });
+    const refused = await store.saveDraft({ key: 'lab_link', value: 'Ada’s words', target: 'web', editor: 'dashboard:ada' });
+    expect(refused).toMatchObject({ refused: true, incumbentEditor: 'dashboard:neil' });
+    expect(store.dump().filter((r) => r.state === 'draft').map((r) => r.value)).toEqual(['Neil’s words']);
+  });
+});

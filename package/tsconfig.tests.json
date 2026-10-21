@@ -7,5 +7,5 @@
     "sourceMap": false
   },
   "include": ["stet/tests", "stet/conformance"],
-  "exclude": ["stet/tests/fixtures/ts-host", "stet/tests/fixtures/closure-walk", "stet/tests/fixtures/vite-host"]
+  "exclude": ["stet/tests/fixtures/ts-host", "stet/tests/fixtures/closure-walk", "stet/tests/fixtures/vite-host", "stet/tests/fixtures/key-usage"]
 }

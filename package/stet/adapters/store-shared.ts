@@ -78,6 +78,9 @@ export function mapRow(r: SqlRow): StoreRow {
     target: r.target,
     publishAt: r.publish_at === null ? null : iso(r.publish_at),
     changesetId: r.changeset_id,
+    // A draft names who holds it and since when, so a surface can say whose
+    // draft a save would take over without a second read.
+    ...(r.state === 'draft' ? { editor: r.editor, createdAt: iso(r.created_at) } : {}),
   };
 }
 

@@ -1,0 +1,6 @@
+{
+  "live": [
+    "hero_title"
+  ],
+  "note": "useCopy() under a binding that is not `copy`"
+}

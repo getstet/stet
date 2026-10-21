@@ -1,0 +1,8 @@
+{
+  "live": [
+    "home_live_kicker",
+    "pricing_title",
+    "footer_note"
+  ],
+  "note": "a slice over three prefixes indexed by a variable: every declared key is under a prefix"
+}
