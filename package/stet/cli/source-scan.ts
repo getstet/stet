@@ -909,6 +909,15 @@ function jsxTextIgnored(ts: typeof import('typescript'), sf: TS.SourceFile, text
 }
 
 /**
+ * The largest source file the scans read, in bytes. The compiler holds a
+ * parse several hundred times a file's size, so a bundle or a vendored build
+ * that git tracks would freeze `stet dev` and can exhaust its memory; a
+ * hand-written source file is nowhere near it. A file past it is judged on its
+ * `stat` and never opened.
+ */
+export const MAX_SOURCE_BYTES = 5 * 1024 * 1024;
+
+/**
  * The parse kind by extension — a `.ts` mailer parsed as TSX mis-reads `<T>`.
  * Exported for `cli/email-extract.ts`, which parses the same host files for
  * their export shape and must not disagree with this walk about what they are.

@@ -12,6 +12,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
@@ -657,6 +658,113 @@ describe('renderTemplateAsync — the answers renderTemplate gives', () => {
     expect(blob.async).toEqual(blob.sync);
     expect(!blob.async.ok && blob.async.detail).toContain('too large');
   });
+
+  it('F6 (R5-2): a render that returns at once but leaves a grandchild holding the pipes is answered within the deadline plus the grace', async () => {
+    const host = makeEmailHost();
+    host.put(
+      'lib/email/leaves.ts',
+      "import { spawn } from 'node:child_process';\n" +
+        'export function leaves(): string {\n' +
+        "  spawn('sleep', ['12'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true }).unref();\n" +
+        "  return '<p>x</p>';\n" +
+        '}\n',
+    );
+    const started = Date.now();
+    const result = await renderTemplateAsync(io(host.dir), { hostDir: host.dir, file: host.path('lib/email/leaves.ts'), exportName: 'leaves', props: {} }, 2000);
+    expect(Date.now() - started).toBeLessThan(3500);
+    expect(result).toEqual({ ok: true, result: JSON.stringify('<p>x</p>') });
+  }, 30_000);
+
+  // An addition beyond R5-2: the deadline ends the template's children with it.
+  it('F6: the deadline ends the whole process group: a child the template started does not outlive it', async () => {
+    const host = makeEmailHost();
+    const pidFile = host.path('grandchild.pid');
+    host.put(
+      'lib/email/hangs.ts',
+      "import { spawn } from 'node:child_process';\n" +
+        "import { writeFileSync } from 'node:fs';\n" +
+        'export function hangs(): Promise<string> {\n' +
+        "  const child = spawn('sleep', ['30'], { stdio: ['ignore', 'inherit', 'inherit'] });\n" +
+        `  writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));\n` +
+        '  return new Promise(() => {});\n' +
+        '}\n',
+    );
+    const result = await renderTemplateAsync(io(host.dir), { hostDir: host.dir, file: host.path('lib/email/hangs.ts'), exportName: 'hangs', props: {} }, 1500);
+    expect(!result.ok && result.detail).toContain('did not finish within 1.5s');
+    const pid = Number(readFileSync(pidFile, 'utf8'));
+    const alive = (): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (let waited = 0; alive() && waited < 2000; waited += 100) await new Promise((resolve) => setTimeout(resolve, 100));
+    const survived = alive();
+    if (survived) process.kill(pid, 'SIGKILL');
+    expect(survived).toBe(false);
+  }, 30_000);
+
+  it('V4: a render in flight when this process exits takes its process group with it', async () => {
+    const host = makeEmailHost();
+    const pidFile = host.path('grandchild.pid');
+    host.put(
+      'lib/email/hangs.cjs',
+      "const { spawn } = require('node:child_process');\n" +
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(spawn('sleep', ['30'], { stdio: ['ignore', 'inherit', 'inherit'] }).pid));\n` +
+        'exports.hangs = () => new Promise(() => {});\n',
+    );
+    const script = [
+      `const { renderTemplateAsync } = await import(${JSON.stringify(pathToFileURL(join(packageRoot(), 'dist/cli/email-render.js')).href)});`,
+      `renderTemplateAsync({ cwd: ${JSON.stringify(host.dir)}, env: process.env, stdout() {}, stderr() {} }, { hostDir: ${JSON.stringify(host.dir)}, file: ${JSON.stringify(host.path('lib/email/hangs.cjs'))}, exportName: 'hangs', props: {} }, 30000);`,
+      'setTimeout(() => process.exit(0), 700);',
+    ].join('\n');
+    const ran = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10_000 });
+    expect(ran.status).toBe(0);
+    const pid = Number(readFileSync(pidFile, 'utf8'));
+    const alive = (): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (let waited = 0; alive() && waited < 1000; waited += 100) await new Promise((resolve) => setTimeout(resolve, 100));
+    const survived = alive();
+    if (survived) process.kill(pid, 'SIGKILL');
+    expect(survived).toBe(false);
+  }, 30_000);
+
+  it('F7 (R5-4): a send that went out is reported as sent although the host module keeps the event loop alive', async () => {
+    const host = makeEmailHost();
+    const log = host.path('sent.log');
+    host.put('lib/email/plain.ts', "export function plain(): string {\n  return '<p>x</p>';\n}\n");
+    host.put(
+      'lib/mail.ts',
+      "import { appendFileSync } from 'node:fs';\n" +
+        'setInterval(() => {}, 1000); // a pooled transport\n' +
+        'export async function sendMail(m: { to: string }): Promise<void> {\n' +
+        `  appendFileSync(${JSON.stringify(log)}, m.to + '\\n');\n` +
+        '}\n',
+    );
+    const started = Date.now();
+    const result = await renderTemplateAsync(
+      io(host.dir),
+      {
+        hostDir: host.dir,
+        file: host.path('lib/email/plain.ts'),
+        exportName: 'plain',
+        props: {},
+        send: { file: 'lib/mail.ts', export: 'sendMail', message: { to: 'a@b.test', subject: 's', template: 'plain' } },
+      },
+      2500,
+    );
+    expect(result).toEqual({ ok: true, result: JSON.stringify('<p>x</p>') });
+    expect(Date.now() - started).toBeLessThan(2500);
+    expect(readFileSync(log, 'utf8')).toBe('a@b.test\n');
+  }, 30_000);
 
   it('names its own deadline when a template never returns', async () => {
     const host = makeEmailHost();

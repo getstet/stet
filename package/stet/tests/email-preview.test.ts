@@ -416,10 +416,71 @@ describe('POST /api/site/email-preview', () => {
   });
 });
 
+describe('F4 (R5-5): a pointer with no extension is judged on the file Node loads', () => {
+  const LINE = (file: string): string => `${file} is outside the project — a render pointer names a file inside it`;
+  const edit = (host: PreviewHost, change: (render: Record<string, unknown>) => void): void => {
+    const descriptorPath = join(host.dir, 'content/descriptor.json');
+    const descriptor = JSON.parse(readFileSync(descriptorPath, 'utf8'));
+    change(descriptor.templates.welcome.render);
+    writeFileSync(descriptorPath, JSON.stringify(descriptor));
+  };
+
+  it('a pointer file whose .ts sibling is a symlink out of the project answers the containment line, and the outside file never runs', async () => {
+    const host = previewHost();
+    const mark = join(host.dir, 'spawned');
+    const out = outsideFile(host, `export function welcome(): string { require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); return '<p>outside ran</p>'; }\n`);
+    linkOut(host, 'lib/email/linked.ts', out.abs);
+    edit(host, (render) => (render['file'] = 'lib/email/linked'));
+    const { status, body } = await preview(host, { template: 'welcome' });
+    expect(status).toBe(200);
+    expect(body.failure).toEqual({ reason: 'not-renderable', detail: LINE('lib/email/linked') });
+    expect(existsSync(mark)).toBe(false);
+  });
+
+  it('a frame file with no extension, linked out of the project, is refused the same way', async () => {
+    const host = previewHost();
+    const mark = join(host.dir, 'spawned');
+    const out = outsideFile(host, `export function frame(h: string): string { require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); return h; }\n`);
+    linkOut(host, 'lib/email/shell.ts', out.abs);
+    edit(host, (render) => (render['frame'] = { file: 'lib/email/shell', export: 'frame' }));
+    const { body } = await preview(host, { template: 'welcome' });
+    expect(body.failure).toEqual({ reason: 'not-renderable', detail: LINE('lib/email/shell') });
+    expect(existsSync(mark)).toBe(false);
+  });
+
+  it('an extension-less pointer that stays inside the project still renders', async () => {
+    const host = previewHost();
+    edit(host, (render) => (render['file'] = 'lib/email/welcome'));
+    const { body } = await preview(host, { template: 'welcome' });
+    expect(body.html).toContain('<h1>');
+  });
+});
+
+describe('D66: an email subject is one line', () => {
+  const LINE = 'An email subject fits on one line. Remove the line break.';
+
+  it('a snapshot save of a subject holding a CR and LF is refused with the message, and nothing is written', async () => {
+    const host = previewHost();
+    const { handler } = handlerOver([host.dir]);
+    const before = readFileSync(join(host.dir, 'content/defaults.json'), 'utf8');
+    const res = await handler(
+      req(`/api/site/save?site=${encodeURIComponent(realpathSync(host.dir))}`, {
+        method: 'POST',
+        body: { values: [{ key: 'welcome__subject', value: 'Hi\r\nBcc: x@evil.test' }] },
+      }),
+    );
+    const body = (await res.json()) as { error: string; findings: Array<{ message: string }> };
+    expect(res.status).toBe(409);
+    expect(body.error).toBe('refused by the save gate');
+    expect(body.findings.map((f) => f.message)).toContain(`${LINE} (default)`);
+    expect(readFileSync(join(host.dir, 'content/defaults.json'), 'utf8')).toBe(before);
+  });
+});
+
 describe('a template that never returns', () => {
   const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-  it('F1: holds only its own request: another route of the dev server answers while it hangs', async () => {
+  it('F1 (R5-1): holds only its own request: a route of the same site answers while it hangs', async () => {
     const host = previewHost({
       template:
         'export function welcome(): Promise<string> {\n' +
@@ -428,13 +489,15 @@ describe('a template that never returns', () => {
         '}\n',
     });
     const { handler } = handlerOver([host.dir], { renderDeadlineMs: 3000 });
+    const site = encodeURIComponent(realpathSync(host.dir));
     const started = Date.now();
-    const hung = handler(
-      req(`/api/site/email-preview?site=${encodeURIComponent(realpathSync(host.dir))}`, { method: 'POST', body: { template: 'welcome' } }),
-    );
-    await sleep(1500);
-    const other = await handler(req('/api/workspace'));
+    const hung = handler(req(`/api/site/email-preview?site=${site}`, { method: 'POST', body: { template: 'welcome' } }));
+    await sleep(500);
+    // The same site: its routes share the site's queue, which a render must not hold.
+    const asked = Date.now();
+    const other = await handler(req(`/api/site?site=${site}`));
     expect(other.status).toBe(200);
+    expect(Date.now() - asked).toBeLessThan(1000);
     expect(Date.now() - started).toBeLessThan(2000);
     const answer = (await (await hung).json()) as { failure: { reason: string; detail: string } };
     expect(answer.failure.reason).toBe('render-threw');

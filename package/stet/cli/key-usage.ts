@@ -40,7 +40,7 @@ import { filesForGlobs } from './files.js';
 import { gitData, gitFiles } from './git.js';
 import { lineIndex } from './html-host.js';
 import { codeOf, within, type Span } from './key-reads.js';
-import { dialectOf, loadTypescript, packageNames, scriptKindFor } from './source-scan.js';
+import { dialectOf, loadTypescript, MAX_SOURCE_BYTES, packageNames, scriptKindFor } from './source-scan.js';
 import { insideCheckout } from './static-files.js';
 import type { Descriptor } from '../src/types.js';
 
@@ -68,7 +68,7 @@ export interface KeyUsage {
 export interface UsageCache {
   /** The declared key set the facts were read against; a change clears them. */
   keys: string;
-  files: Map<string, { stamp: string; facts: FileFacts | null }>;
+  files: Map<string, { stamp: string; facts: FileFacts | null | 'grew' }>;
 }
 
 export function usageCache(): UsageCache {
@@ -86,6 +86,9 @@ const MARK = /data-stet(?:-[a-z-]+)?\s*=\s*["']([a-z][a-z0-9_]*)["']/g;
 
 /** The cause a file too deeply nested to walk raises. */
 const UNREADABLE = 'too deeply nested to read';
+
+/** The cause a file past `MAX_SOURCE_BYTES` raises: it is never opened, so a key it names stays possible. */
+const TOO_LARGE = 'over 5 MB, so the scan skipped it';
 
 /** A cause's source text is cut here. */
 const CAUSE_TEXT = 40;
@@ -211,16 +214,18 @@ export async function keyUsage(
   // Step 1: the files, each read and parsed only where its stamp moved.
   const facts = new Map<string, FileFacts>();
   const listed = new Set<string>();
-  for (const { rel, stamp: fileStamp } of sourceFiles(cwd, config)) {
+  const { files: sources, tooLarge } = sourceFiles(cwd, config);
+  for (const { rel, stamp: fileStamp } of sources) {
     listed.add(rel);
     const held = cache.files.get(rel);
-    let found: FileFacts | null;
+    let found: FileFacts | null | 'grew';
     if (held !== undefined && held.stamp === fileStamp) found = held.facts;
     else {
       found = factsOf(ts, cwd, rel, declared, needles);
       cache.files.set(rel, { stamp: fileStamp, facts: found });
     }
-    if (found !== null) facts.set(rel, found);
+    if (found === 'grew') tooLarge.push(rel);
+    else if (found !== null) facts.set(rel, found);
   }
   for (const rel of [...cache.files.keys()]) if (!listed.has(rel)) cache.files.delete(rel);
 
@@ -331,7 +336,7 @@ export async function keyUsage(
   const dataRooted = (rel: string, scope: Scope, root: string): boolean =>
     scope.imports.some((i) => i.local === root && dataAccepts(rel)(i.spec));
   const prefixes: UsagePrefix[] = [];
-  const causes: UsageCause[] = [];
+  const causes: UsageCause[] = tooLarge.map((rel) => ({ text: TOO_LARGE, file: rel, line: 1 }));
   for (const [rel, file] of facts) {
     if (file.exempt) continue;
     if (file.unreadable === true) {
@@ -625,13 +630,16 @@ export const isGenerated = (text: string): boolean => text.startsWith(GENERATED)
  * ignore, filtered to source, with the skips that never hold a read: the files
  * stet owns (`ownFiles`), `.stet/`, a path that cannot be read, and a symlink
  * whose target lies outside the checkout. Where git cannot answer, the walk.
- * Each kept file carries its stamp.
+ * Each kept file carries its stamp. A file over `MAX_SOURCE_BYTES` is not kept
+ * and is not opened: it is listed in `tooLarge`, since a key it names would
+ * otherwise be called not found.
  */
-function sourceFiles(cwd: string, config: StetConfig): Array<{ rel: string; stamp: string }> {
+function sourceFiles(cwd: string, config: StetConfig): { files: Array<{ rel: string; stamp: string }>; tooLarge: string[] } {
   const listed = gitFiles(cwd, ['--cached', '--others', '--exclude-standard']);
   const paths = listed === null ? filesForGlobs(cwd, ['**/*']) : [...new Set(listed)].sort();
   const own = ownFiles(config);
   const out: Array<{ rel: string; stamp: string }> = [];
+  const tooLarge: string[] = [];
   for (const rel of paths) {
     if (!SOURCE.test(rel) || own.has(rel) || rel.startsWith('.stet/')) continue;
     const abs = join(cwd, rel);
@@ -646,9 +654,13 @@ function sourceFiles(cwd: string, config: StetConfig): Array<{ rel: string; stam
       continue; // listed by `--cached`, gone from the working tree
     }
     if (!stat.isFile()) continue;
+    if (stat.size > MAX_SOURCE_BYTES) {
+      tooLarge.push(rel);
+      continue;
+    }
     out.push({ rel, stamp: `${stat.size}:${stat.mtimeMs}` });
   }
-  return out;
+  return { files: out, tooLarge };
 }
 
 /** `cwd` relative to the repository's top, `/`-ended; the folder's own name where it is the top or git cannot say. */
@@ -705,14 +717,18 @@ const isStetPackage = (spec: string): boolean => spec === '@getstet/stet' || spe
  * One file's facts: its named keys, whether it is server code or exempt, its
  * re-exports, and per scope its imports and its binding reads, B1 and B2
  * settled as far as the file alone can. Null for a generated module or a file
- * that cannot be read.
+ * that cannot be read; `'grew'` for a file whose bytes passed the ceiling
+ * after the stat that let it through.
  */
-function factsOf(ts: typeof import('typescript'), cwd: string, rel: string, declared: ReadonlySet<string>, needles: PathNeedles): FileFacts | null {
+function factsOf(ts: typeof import('typescript'), cwd: string, rel: string, declared: ReadonlySet<string>, needles: PathNeedles): FileFacts | null | 'grew' {
   const abs = join(cwd, rel);
   let source: string;
   try {
     if (isGenerated(headOf(abs))) return null;
-    source = readFileSync(abs, 'utf8');
+    const bytes = readFileSync(abs);
+    // The file grew since the stat that passed it: skipped like one the stat caught.
+    if (bytes.length > MAX_SOURCE_BYTES) return 'grew';
+    source = bytes.toString('utf8');
   } catch {
     return null;
   }

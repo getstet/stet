@@ -1291,6 +1291,88 @@ describe('validation', () => {
     expect(await stale.run('check')).toBe(1);
     expect(stale.stderr()).toContain(LINE);
   });
+
+  it('Requirement: An email subject keeps to one line', async () => {
+    const MAIL = {
+      version: 1,
+      keys: { welcome__subject: { shape: 'text', target: 'html-email' }, welcome__headline: { shape: 'text', target: 'html-email' } },
+      templates: { welcome: { class: 'transactional', trigger: 'manual', slots: ['subject', 'headline'] } },
+    };
+    const LINE = 'An email subject fits on one line. Remove the line break.';
+    const HOSTILE = 'Hi\r\nBcc: x@evil.test';
+    const loaded = loadDescriptor(MAIL);
+
+    // Scenario: the save refuses a subject value holding CR or LF. The content gate names the one line; other keys keep their line breaks.
+    for (const value of [HOSTILE, 'Hi\nthere', 'Hi\rthere']) {
+      const verdict = validateSave(loaded, { key: 'welcome__subject', value });
+      expect(verdict.ok).toBe(false);
+      expect(verdict.findings.map((f) => f.message)).toEqual([LINE]);
+    }
+    expect(validateSave(loaded, { key: 'welcome__subject', value: 'Welcome aboard' }).ok).toBe(true);
+    expect(validateSave(loaded, { key: 'welcome__headline', value: 'Two\nlines' }).ok).toBe(true);
+
+    // The mount's draft route answers 422 with the line and stores nothing.
+    const TOKEN_ENV = 'STET_CONF_SUBJECT_TOKEN';
+    process.env[TOKEN_ENV] = 'sekret';
+    try {
+      const store = createMemoryStore({ project: 'walk' });
+      const handler = createStetHandler({ store, descriptor: loaded, auth: TOKEN_ENV });
+      const drafted = await handler.POST(
+        new Request('https://h/api/stet/draft', {
+          method: 'POST',
+          headers: { authorization: 'Bearer sekret', 'content-type': 'application/json' },
+          body: JSON.stringify({ key: 'welcome__subject', value: HOSTILE, editor: 'ed' }),
+        }),
+      );
+      expect(drafted.status).toBe(422);
+      expect(((await drafted.json()) as { error: string }).error).toContain(LINE);
+      expect(await store.read({ preview: true })).toEqual([]);
+    } finally {
+      delete process.env[TOKEN_ENV];
+    }
+
+    // `stet dev`'s save refuses it and writes nothing.
+    const site = makeCliHost({ config: {} });
+    withDescriptor(site, MAIL, { default: { welcome__subject: 'Welcome aboard', welcome__headline: 'Welcome' } });
+    const before = site.file('content/defaults.json');
+    const { handler: dev } = handlerOver([site.cwd]);
+    const saved = await dev(
+      req(`/api/site/save?site=${encodeURIComponent(realpathSync(site.cwd))}`, {
+        method: 'POST',
+        body: { values: [{ key: 'welcome__subject', value: HOSTILE }] },
+      }),
+    );
+    expect(saved.status).toBe(409);
+    expect(JSON.stringify(await saved.json())).toContain(LINE);
+    expect(site.file('content/defaults.json')).toBe(before);
+
+    // Scenario: the send path refuses such a subject before the host's send function runs.
+    const host = makeEmailHost();
+    const sent = host.path('sent.log');
+    host.put('lib/email/plain.ts', "export function plain(): string {\n  return '<p>x</p>';\n}\n");
+    host.put(
+      'lib/send.ts',
+      `export function sendTest(message: unknown): void {\n  require('node:fs').appendFileSync(${JSON.stringify(sent)}, JSON.stringify(message) + '\\n');\n}\n`,
+    );
+    const send = (subject: string | null): ReturnType<typeof renderTemplate> =>
+      renderTemplate(
+        { cwd: host.dir, env: process.env, stdout: () => {}, stderr: () => {} },
+        {
+          hostDir: host.dir,
+          file: host.path('lib/email/plain.ts'),
+          exportName: 'plain',
+          props: {},
+          send: { file: 'lib/send.ts', export: 'sendTest', message: { to: 'a@b.test', subject, template: 'welcome' } },
+        },
+      );
+    const refusedSend = send(HOSTILE);
+    expect(refusedSend.ok).toBe(false);
+    expect(!refusedSend.ok && refusedSend.reason).toBe('send-failed');
+    expect(!refusedSend.ok && refusedSend.detail).toBe('the subject has a line break, which an email header cannot hold');
+    expect(existsSync(sent)).toBe(false);
+    expect(send('Welcome aboard').ok).toBe(true);
+    expect(readFileSync(sent, 'utf8').trim().split('\n')).toHaveLength(1);
+  });
 });
 
 describe('targets', () => {

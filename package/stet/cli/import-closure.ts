@@ -11,7 +11,7 @@ import { dirname, join, resolve as resolvePath, sep } from 'node:path';
 import type * as TS from 'typescript';
 
 import { posixRelative } from './report.js';
-import { scriptKindFor } from './source-scan.js';
+import { MAX_SOURCE_BYTES, scriptKindFor } from './source-scan.js';
 
 /** How deep the walk goes before it stops following. */
 export const CHAIN_DEPTH = 10;
@@ -73,6 +73,11 @@ export function importClosure(
     const abs = join(cwd, rel);
     let text: string;
     try {
+      // A file past the ceiling is a file the walk did not read: a boundary.
+      if (statSync(abs).size > MAX_SOURCE_BYTES) {
+        boundary = true;
+        return;
+      }
       text = readFileSync(abs, 'utf8');
     } catch {
       boundary = true;

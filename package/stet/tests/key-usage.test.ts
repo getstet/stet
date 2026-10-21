@@ -1567,3 +1567,69 @@ describe('the survivors of the mutation pass: cases the code already answers', (
     expect(ran.stdout.trim()).toBe('2');
   });
 });
+
+describe('D65: a source file over 5 MB is skipped on its stat, and is a cause', () => {
+  const MIB = 1024 * 1024;
+  const SKIPPED = 'over 5 MB, so the scan skipped it';
+  /** Dense code: what a minified bundle costs the compiler. */
+  const dense = (bytes: number): string => {
+    const line = 'var a=function(){return {x:1,y:[1,2,3],z:"abc"}};\n';
+    return line.repeat(Math.ceil(bytes / line.length));
+  };
+
+  it('a 6 MB tracked file ends in under 2 s without large heap growth; every unnamed key is unknown, with the file as the cause', async () => {
+    const dir = host({ 'vendor.js': dense(6 * MIB) });
+    const heap = process.memoryUsage().heapUsed;
+    const started = Date.now();
+    const usage = await usageOf(dir);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(process.memoryUsage().heapUsed - heap).toBeLessThan(200 * MIB);
+    expect(usage.causes).toEqual([{ text: SKIPPED, file: 'vendor.js', line: 1 }]);
+    expect(states(usage)).toEqual({ hero_title: 'unknown', hero_sub: 'unknown', hero_cta: 'unknown', nav_label: 'unknown', footer_note: 'unknown' });
+    expect(usage.files).toBe(0);
+  });
+
+  it('a 4.9 MB file is still scanned', async () => {
+    const usage = await usageOf(host({ 'app/big.ts': `/*${' '.repeat(Math.floor(4.9 * MIB))}*/\nexport const n = 'hero_sub';\n` }));
+    expect(usage.causes).toEqual([]);
+    expect(stateOf(usage, 'hero_sub')).toBe('read');
+    expect(stateOf(usage, 'hero_cta')).toBe('not_found');
+  });
+
+  it('an untracked file git does not ignore is skipped too', async () => {
+    const dir = host({});
+    write(dir, 'public/vendor.js', dense(6 * MIB));
+    const usage = await usageOf(dir);
+    expect(usage.causes).toEqual([{ text: SKIPPED, file: 'public/vendor.js', line: 1 }]);
+    expect(stateOf(usage, 'hero_cta')).toBe('unknown');
+  });
+
+  it('a file git ignores is not a cause', async () => {
+    const dir = host({ '.gitignore': 'dist/\n' });
+    write(dir, 'dist/vendor.js', dense(6 * MIB));
+    const usage = await usageOf(dir);
+    expect(usage.causes).toEqual([]);
+    expect(stateOf(usage, 'hero_cta')).toBe('not_found');
+  });
+
+  it('a file that grew past the ceiling between the stat and the read is skipped like one the stat caught', async () => {
+    const dir = host({ 'app/grew.ts': "export const n = 'hero_sub';\n" });
+    vi.resetModules();
+    vi.doMock('node:fs', async (importOriginal) => {
+      const real = await importOriginal<typeof import('node:fs')>();
+      return { ...real, readFileSync: ((path: unknown, ...rest: unknown[]) => (String(path).endsWith('app/grew.ts') ? (typeof rest[0] === 'string' ? 'x'.repeat(5 * MIB + 1) : Buffer.alloc(5 * MIB + 1, 120)) : (real.readFileSync as (...a: unknown[]) => unknown)(path, ...rest))) as typeof real.readFileSync };
+    });
+    try {
+      const fresh = await import('../cli/key-usage.js');
+      const config = loadConfig(dir);
+      const descriptor = JSON.parse(readFileSync(join(dir, config.descriptorPath), 'utf8')) as Descriptor;
+      const usage = await fresh.keyUsage(dir, config, descriptor);
+      expect(usage.causes).toEqual([{ text: SKIPPED, file: 'app/grew.ts', line: 1 }]);
+      expect(stateOf(usage, 'hero_sub')).toBe('unknown');
+      expect(usage.files).toBe(0);
+    } finally {
+      vi.doUnmock('node:fs');
+      vi.resetModules();
+    }
+  });
+});

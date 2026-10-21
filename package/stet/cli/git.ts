@@ -117,10 +117,11 @@ export function gitStream(cwd: string, args: string[]): ChildProcessByStdio<Writ
  * `git ls-files -z <args>` in `cwd`, split on NUL: the paths git keeps, relative
  * to `cwd`. Null where git cannot be spawned or exits non-zero (no repository),
  * so a caller can tell "git answered nothing" from "git did not answer". Run
- * under `LC_ALL=C` with the caller's environment, as `email extract` and the
- * unread-key scan read it.
+ * under `LC_ALL=C`. The environment is the server's minus the run token, like
+ * every git here (a repository's `core.fsmonitor` hook is a script it supplies);
+ * `email extract` hands its own, the CLI's.
  */
-export function gitFiles(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env): string[] | null {
+export function gitFiles(cwd: string, args: string[], env: NodeJS.ProcessEnv = childEnv()): string[] | null {
   const result = spawnSync('git', ['ls-files', '-z', ...args], {
     cwd,
     env: { ...env, LC_ALL: 'C' },

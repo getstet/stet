@@ -24,7 +24,7 @@ const PROMOTIONAL = /(\d+\s*%|\bdiscount\b|\bsale\b)/i;
  */
 export const PLACEHOLDER = /<(\/?)(\d+)(\/?)>/g;
 
-export type FindingRule = 'limit' | 'vars' | 'requires' | 'class' | 'budget' | 'construct' | 'tags';
+export type FindingRule = 'limit' | 'vars' | 'requires' | 'class' | 'budget' | 'construct' | 'tags' | 'subject';
 
 export interface Finding {
   rule: FindingRule;
@@ -324,6 +324,29 @@ function tagFault(text: string, declared: number): string | null {
 }
 
 /**
+ * An email subject fits on one line. A template's `subject` slot (`<template>__subject`)
+ * holding a CR or LF is refused: a host that writes mail headers itself would send
+ * the text after the break as a header of its own (`Bcc:`). One finding per
+ * contained string, like the other value rules; a key that is not a template's
+ * subject is not checked.
+ */
+export function checkSubjectLine(d: Descriptor, key: string, value: unknown): Verdict {
+  const template = templateOf(d, key);
+  if (template === null || key !== `${template}__subject`) return { ok: true, findings: [] };
+  const findings: Finding[] = [];
+  for (const { path, text } of stringsOf(d, key, value)) {
+    if (!/[\r\n]/.test(text)) continue;
+    findings.push({
+      rule: 'subject',
+      severity: 'error',
+      key: path,
+      message: 'An email subject fits on one line. Remove the line break.',
+    });
+  }
+  return { ok: findings.length === 0, findings };
+}
+
+/**
  * The class gate. In scope = the template's declared slot values ∪ its
  * `wrapperProvides`. Siblings are caller-supplied, keyed by flattened key
  * (`welcome__subject`) and resolved draft-over-active before the call — core
@@ -505,6 +528,7 @@ export function validateSave(
     ...checkVars(d, candidate.key, candidate.value).findings,
     ...checkRequires(d, candidate.key, candidate.value).findings,
     ...checkTags(d, candidate.key, candidate.value).findings,
+    ...checkSubjectLine(d, candidate.key, candidate.value).findings,
   ];
 
   const template = templateOf(d, candidate.key);
@@ -536,10 +560,15 @@ export function validateSave(
   return { ok: !ordered.some((f) => f.severity === 'error'), findings: ordered };
 }
 
-/** The template a slot key belongs to, by declaration rather than by parsing. */
+/**
+ * The template a slot key belongs to, by declaration rather than by parsing.
+ * Where two declared names both prefix the key (`a` and `a__b` for
+ * `a__b__subject`), the longest one is the template.
+ */
 export function templateOf(d: Descriptor, key: string): string | null {
+  let found: string | null = null;
   for (const template of Object.keys(d.templates ?? {})) {
-    if (key.startsWith(`${template}__`)) return template;
+    if (key.startsWith(`${template}__`) && (found === null || template.length > found.length)) found = template;
   }
-  return null;
+  return found;
 }

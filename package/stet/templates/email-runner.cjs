@@ -76,14 +76,18 @@ if (hostDirArg === undefined || fileArg === undefined || exportName === undefine
   // `createRequire` throw ERR_INVALID_ARG_VALUE rather than resolve the host.
   const hostDir = path.resolve(hostDirArg);
   const file = path.resolve(fileArg);
-  // The exit is set after the promise settles: a render that awaits is still
+  // The exit comes after the promise settles: a render that awaits is still
   // running when this line is reached.
   void run(hostDir, file, exportName, propsJson, optsJson === undefined ? {} : JSON.parse(optsJson)).then((outcome) => {
-    // One writer, and no `process.exit` anywhere: stdout is a pipe here, so an
-    // immediate exit would truncate the render mid-write.
-    if (outcome.out !== undefined) process.stdout.write(outcome.out);
-    if (outcome.err !== undefined) process.stderr.write(outcome.err);
-    process.exitCode = outcome.code;
+    // One writer. The exit is explicit, and only once both streams have taken
+    // their bytes: stdout is a pipe here, so an immediate exit would truncate the
+    // render mid-write, and waiting for the event loop to empty would hold a
+    // send that already went out behind a host module that keeps it alive (a
+    // pooled transport's timer), until the seam's deadline reports it as failed.
+    const exit = () => process.exit(outcome.code);
+    const writeOut = () => (outcome.out === undefined ? exit() : process.stdout.write(outcome.out, exit));
+    if (outcome.err === undefined) writeOut();
+    else process.stderr.write(outcome.err, writeOut);
   });
 }
 
@@ -103,6 +107,8 @@ async function run(hostDir, file, exportName, propsJson, opts) {
     // Host code writes to stderr for the duration, so "nothing but the render on
     // stdout" holds by construction: a template with a `console.log` in it would
     // otherwise interleave its own line into the JSON the seam parses.
+    const outside = outsideRefusal(hostDir, fileArg, file, NOT_RENDERABLE);
+    if (outside !== null) return outside;
     const mod = await offStdout(() => require(file));
     // `Object.hasOwn`, not a bare index: `exportName` comes from the descriptor,
     // and a bare `mod['constructor']` would resolve Object.prototype's — a
@@ -178,7 +184,10 @@ async function run(hostDir, file, exportName, propsJson, opts) {
  * map of strings the frame wraps the `html` member and the others stay.
  */
 async function frameOf(hostDir, frame, result, props, file, exportName) {
-  const mod = await offStdout(() => require(path.resolve(hostDir, frame.file)));
+  const framePath = path.resolve(hostDir, frame.file);
+  const outside = outsideRefusal(hostDir, frame.file, framePath, NOT_RENDERABLE);
+  if (outside !== null) return outside;
+  const mod = await offStdout(() => require(framePath));
   const fn = Object.hasOwn(mod, frame.export) ? mod[frame.export] : undefined;
   if (typeof fn !== 'function') {
     return { code: EXPORT_NOT_FUNCTION, err: `${frame.file}: export ${JSON.stringify(frame.export)} is not a function` };
@@ -194,6 +203,21 @@ async function frameOf(hostDir, frame, result, props, file, exportName) {
   }
   const html = await offStdout(() => fn(result.html, ...rest));
   return typeof html === 'string' ? { result: { ...result, html } } : notString(frame, html);
+}
+
+/**
+ * The refusal for a file Node would load from outside the project, else null.
+ * The CLI judges the path as written before it spawns this process
+ * (`containedPointer`); that path may name no file at all (`lib/email/linked`,
+ * with `linked.ts` a symlink out of the project) while Node's resolver, with the
+ * transpile hooks installed, lands on one. So the file `require` will load is
+ * resolved here, and its real path judged against the project's. The line is
+ * `outsideLine`'s, the one every surface prints for an escaping file.
+ */
+function outsideRefusal(hostDir, written, abs, code) {
+  const rel = path.relative(fs.realpathSync(hostDir), fs.realpathSync(require.resolve(abs)));
+  if (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel)) return null;
+  return { code, err: `${written} is outside the project — a render pointer names a file inside it` };
 }
 
 /** A frame that returns anything but a string is never reported as a render. */
@@ -224,8 +248,15 @@ function fill(result, props) {
 async function sendOf(hostDir, send, result) {
   const html = typeof result === 'string' ? result : result.html;
   const subject = typeof result === 'string' || typeof result.subject !== 'string' ? send.message.subject : result.subject;
+  // A subject is one header line: a CR or LF would let the text after it become a header of its own.
+  if (typeof subject === 'string' && /[\r\n]/.test(subject)) {
+    return { code: SEND_FAILED, err: 'the subject has a line break, which an email header cannot hold' };
+  }
   try {
-    const mod = await offStdout(() => require(path.resolve(hostDir, send.file)));
+    const sendPath = path.resolve(hostDir, send.file);
+    const outside = outsideRefusal(hostDir, send.file, sendPath, SEND_FAILED);
+    if (outside !== null) return outside;
+    const mod = await offStdout(() => require(sendPath));
     const fn = Object.hasOwn(mod, send.export) ? mod[send.export] : undefined;
     if (typeof fn !== 'function') {
       return { code: SEND_FAILED, err: `${send.file}: export ${JSON.stringify(send.export)} is not a function` };

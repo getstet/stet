@@ -32,6 +32,7 @@ import { CONFIG_FILE } from './config.js';
 import { packageRoot } from './installed.js';
 import type { CliIo } from './main.js';
 import { CliError, Report } from './report.js';
+import { childEnv } from './workspace.js';
 
 export async function runHookInstall(args: string[], io: CliIo): Promise<number> {
   refuseEnv(args, 'hook install');
@@ -326,7 +327,7 @@ function entryAlive(common: string, entry: GateEntry): boolean {
 
 const git = (cwd: string, args: string[]): string =>
   // Only the trailing newline goes: a folder name may begin or end with a space.
-  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).replace(/\n$/, '');
+  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: childEnv() }).replace(/\n$/, '');
 
 /**
  * Where the checkout at `cwd` sits: git's common directory, its worktree (the
@@ -490,6 +491,7 @@ export function hooksDir(cwd: string): string | null {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: childEnv(),
     }).trim();
     return isAbsolute(out) ? out : resolvePath(cwd, out);
   } catch {

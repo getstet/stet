@@ -128,6 +128,8 @@ export interface DevContext {
   fetchImpl: typeof globalThis.fetch;
   children: Map<string, DevChild>;
   stores: Map<string, StoreAdapter>;
+  /** The adapters being opened, by the same key as `stores`, so concurrent requests share one open. */
+  opening?: Map<string, Promise<StoreAdapter>>;
   /** One promise chain per checkout, so this server's requests never interleave on one site. */
   queues: Map<string, Promise<unknown>>;
   /** The checkout `stet dev` was started in: the one site the process environment supplies connection variables to. */
@@ -259,7 +261,10 @@ function enqueue<T>(ctx: DevContext, path: string, fn: () => Promise<T>): Promis
 }
 
 /**
- * A route that names a site, run inside that site's queue.
+ * A route that names a site, run inside that site's queue, or outside it where
+ * `queued` is false: for a route that writes nothing to the checkout and may
+ * take as long as host code takes (a template render), so the site's other
+ * routes do not wait behind it.
  *
  * The path is resolved against the WORKSPACE first: a directory the operator
  * never added is 404 whatever else the request names, so the server cannot be
@@ -269,6 +274,7 @@ async function withSite(
   ctx: DevContext,
   url: URL,
   fn: (site: SiteState, entry: WorkspaceEntry) => Promise<Response>,
+  queued = true,
 ): Promise<Response> {
   const wanted = url.searchParams.get('site');
   const id = idSegment(url);
@@ -276,7 +282,7 @@ async function withSite(
     id === null ? site.path === wanted : siteId(site.path) === id,
   );
   if (entry === undefined) return json({ error: 'not a workspace site' }, 404);
-  return enqueue(ctx, entry.path, () => fn(loadSite(entry), entry));
+  return queued ? enqueue(ctx, entry.path, () => fn(loadSite(entry), entry)) : fn(loadSite(entry), entry);
 }
 
 /** The `<id>` of a `/s/<id>/…` path, or null where the path is not one. */
@@ -435,14 +441,14 @@ async function apiRoute(ctx: DevContext, req: Request, url: URL, route: string):
  * site's queue, so two requests against one checkout never interleave.
  */
 async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: string): Promise<Response> {
+  // The email preview runs host code and writes nothing: outside the queue.
+  if (req.method === 'POST' && route === 'site/email-preview') return withSite(ctx, url, (site) => emailPreview(ctx, req, site), false);
   return withSite(ctx, url, async (site, entry) => {
     switch (`${req.method} ${route}`) {
       case 'GET site':
         return await siteReply(site, entry, ctx.launched);
       case 'POST site/save':
-        return await save(ctx, req, site);
-      case 'POST site/email-preview':
-        return await emailPreview(ctx, req, site);
+        return await save(ctx, req, site, entry);
       case 'POST site/commit':
         return await commit(ctx, req, site);
       case 'POST site/push':
@@ -647,12 +653,18 @@ function liveBranchOf(cwd: string, remote: string): string | null {
  * now resolves to, so a headline edit that pushes a share description past its
  * limit is refused like the description itself.
  */
-async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
-  const ready = requireReady(site);
-  if (ready.mode !== 'snapshot') {
-    return json({ error: 'a store-backed site is edited through its mounted API — use Save draft' }, 409);
-  }
+async function save(ctx: DevContext, req: Request, site: SiteState, listed: WorkspaceEntry): Promise<Response> {
+  const refuseStoreBacked = (): Response =>
+    json({ error: 'a store-backed site is edited through its mounted API — use Save draft' }, 409);
+  if (requireReady(site).mode !== 'snapshot') return refuseStoreBacked();
   const body = await readJson(req);
+  // The site is read again now the body is in. A body streams in over however
+  // long the client takes, and the snapshot read before it may be older than an
+  // agent's write meanwhile: the stale check and the whole-file rewrite below
+  // both start from this read. Nothing after it awaits, so no other request
+  // interleaves with them.
+  const ready = requireReady(loadSite(listed));
+  if (ready.mode !== 'snapshot') return refuseStoreBacked();
   const values = body['values'] ?? [];
   const templates = body['templates'] ?? [];
   if (!Array.isArray(values) || !Array.isArray(templates) || values.length + templates.length === 0) {
@@ -1740,6 +1752,9 @@ function renderIo(ctx: DevContext, ready: Extract<SiteState, { state: 'ready' }>
  * the dashboard is not the site's production API.
  */
 async function mountRoute(ctx: DevContext, req: Request, url: URL): Promise<Response> {
+  // Render and test send run host code and write nothing to the checkout (the
+  // store's writes are the store's): they wait behind no other route of the site.
+  const queued = !RENDERING_ROUTES.has(url.pathname.split('/').filter(Boolean).pop() ?? '');
   return withSite(ctx, url, async (site) => {
     const ready = requireReady(site);
     const store = await storeOf(ctx, ready, envOf(url));
@@ -1760,8 +1775,11 @@ async function mountRoute(ctx: DevContext, req: Request, url: URL): Promise<Resp
     if (req.method === 'GET') return handler.GET(req);
     if (req.method === 'POST') return handler.POST(req);
     return json({ error: 'not found' }, 404);
-  });
+  }, queued);
 }
+
+/** The mounted API's routes that run a host template: the mount reads the last path segment. */
+const RENDERING_ROUTES = new Set(['render', 'test-send']);
 
 /**
  * The adapter for one site and one environment, built once and kept.
@@ -1782,9 +1800,21 @@ async function storeOf(
   const key = JSON.stringify([site.path, env ?? null]);
   const held = ctx.stores.get(key);
   if (held !== undefined) return held;
-  const store = await resolveStore(site.config, connectionEnv(site, ctx.launched), ctx.storeFor?.(site.path, env), env);
-  ctx.stores.set(key, store);
-  return store;
+  // Requests outside the site's queue (a render) can ask while another is still
+  // opening the adapter: they share the one open, so a second adapter, and a
+  // second pool, is never built.
+  const opening = (ctx.opening ??= new Map<string, Promise<StoreAdapter>>());
+  let building = opening.get(key);
+  if (building === undefined) {
+    building = resolveStore(site.config, connectionEnv(site, ctx.launched), ctx.storeFor?.(site.path, env), env)
+      .then((store) => {
+        ctx.stores.set(key, store);
+        return store;
+      })
+      .finally(() => opening.delete(key));
+    opening.set(key, building);
+  }
+  return building;
 }
 
 /**

@@ -396,6 +396,28 @@ describe('email test — send through the host’s function (D5)', () => {
     }
   });
 
+  it('D66: refuses a subject holding a line break at send, from the snapshot or from a map, and sends nothing', async () => {
+    const LINE = 'the subject has a line break, which an email header cannot hold';
+    // CRLF, a lone LF and a lone CR each end a header line.
+    for (const subject of ['Hi\r\nBcc: x@evil.test', 'Hi\nthere', 'Hi\rthere']) {
+      const snapshot = build({ snapshot: { default: { welcome__headline: 'Welcome', welcome__subject: subject } } });
+      const fromSnapshot = await snapshot.run('email', 'test', 'welcome', '--to', 'neil@example.com');
+      expect(fromSnapshot.code, JSON.stringify(subject)).toBe(1);
+      expect(fromSnapshot.err).toContain(LINE);
+      expect(existsSync(snapshot.sentMark)).toBe(false);
+    }
+
+    for (const literal of ["'A\\nB'", "'A\\rB'"]) {
+      const map = build({
+        templateSource: () => `export function welcome(): { subject: string; html: string } {\n  return { subject: ${literal}, html: '<p/>' };\n}\n`,
+      });
+      const fromMap = await map.run('email', 'test', 'welcome', '--to', 'neil@example.com');
+      expect(fromMap.code, literal).toBe(1);
+      expect(fromMap.err).toContain(LINE);
+      expect(existsSync(map.sentMark)).toBe(false);
+    }
+  });
+
   it('exits 1 with the host’s error when the send function throws (send-failed)', async () => {
     const built = build({
       sendSource: () => "export function sendTest(): void {\n  throw new Error('smtp is down');\n}\n",

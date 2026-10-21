@@ -165,12 +165,34 @@ export function renderTemplate(io: CliIo, request: RenderRequest): RenderResult 
   );
 }
 
+/** How long the pipes have to close after the runner exits on its own, when a process it started still holds them. */
+const PIPE_GRACE_MS = 1_000;
+
+/** The process groups of the renders in flight, ended with this process: a render's child is not in the terminal's group. */
+const groups = new Set<number>();
+let exitHooked = false;
+
+/** SIGKILL to a whole process group: the runner and everything it started that stayed in it. Never `kill(-0)`. */
+function killGroup(pid: number | undefined): void {
+  if (pid === undefined || pid === 0) return;
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    /* already gone */
+  }
+}
+
 /**
  * The same render, asynchronous: the contract of `renderTemplate` — same
- * command line, environment, output ceiling, deadline and SIGKILL, and never a
- * throw — for a caller that is a server. `spawnSync` would hold every route of
+ * command line, environment, output ceiling and deadline, and never a throw —
+ * for a caller that is a server. `spawnSync` would hold every route of
  * `stet dev` for as long as a template hangs. The deadline is an argument so a
  * fixture can reach it in a second; the callers take the default.
+ *
+ * The runner is started in a process group of its own and the deadline kills
+ * the group, so a child the template started does not outlive it. A runner that
+ * exits on its own has written its whole outcome, so the answer does not wait
+ * past `PIPE_GRACE_MS` for pipes a process it started still holds.
  */
 export function renderTemplateAsync(io: CliIo, request: RenderRequest, timeoutMs: number = RENDER_TIMEOUT_MS): Promise<RenderResult> {
   return new Promise((resolve) => {
@@ -178,22 +200,36 @@ export function renderTemplateAsync(io: CliIo, request: RenderRequest, timeoutMs
     const err: Buffer[] = [];
     let ceiling: NodeJS.ErrnoException | undefined;
     let settled = false;
+    let grace: NodeJS.Timeout | undefined;
     const done = (outcome: ChildOutcome): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(grace);
+      if (child.pid !== undefined) groups.delete(child.pid);
+      // Pipes a grandchild still holds are let go; the answer is already in the buffers.
+      child.stdout?.destroy();
+      child.stderr?.destroy();
       resolve(renderOutcome(outcome, timeoutMs));
     };
     const failed = (error: NodeJS.ErrnoException): void => done({ error, status: null, stdout: '', stderr: '' });
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(process.execPath, runnerArgv(request), { cwd: io.cwd, env: io.env, stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn(process.execPath, runnerArgv(request), { cwd: io.cwd, env: io.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true, windowsHide: true });
     } catch (error) {
       resolve(renderOutcome({ error: error as NodeJS.ErrnoException, status: null, stdout: '', stderr: '' }, timeoutMs));
       return;
     }
+    if (child.pid !== undefined) {
+      if (!exitHooked) {
+        exitHooked = true;
+        process.on('exit', () => groups.forEach(killGroup));
+      }
+      groups.add(child.pid);
+    }
     const stop = (error: NodeJS.ErrnoException): void => {
       ceiling ??= error;
+      killGroup(child.pid);
       child.kill('SIGKILL');
     };
     const timer = setTimeout(() => stop(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })), timeoutMs);
@@ -206,21 +242,22 @@ export function renderTemplateAsync(io: CliIo, request: RenderRequest, timeoutMs
         else into.push(chunk);
       };
     };
-    child.stdout?.on('data', collect(out));
-    child.stderr?.on('data', collect(err));
-    child.on('error', failed);
-    // A ceiling hit ends the answer with the child: pipes a grandchild holds open must not hold it.
-    child.on('exit', () => {
-      if (ceiling !== undefined) failed(ceiling);
-    });
-    child.on('close', (status) =>
+    const finish = (status: number | null): void =>
       done({
         ...(ceiling === undefined ? {} : { error: ceiling }),
         status,
         stdout: Buffer.concat(out).toString('utf8'),
         stderr: Buffer.concat(err).toString('utf8'),
-      }),
-    );
+      });
+    child.stdout?.on('data', collect(out));
+    child.stderr?.on('data', collect(err));
+    child.on('error', failed);
+    child.on('exit', (status) => {
+      // A ceiling hit ends the answer with the child: pipes a grandchild holds open must not hold it.
+      if (ceiling !== undefined) failed(ceiling);
+      else grace = setTimeout(() => finish(status), PIPE_GRACE_MS);
+    });
+    child.on('close', finish);
   });
 }
 

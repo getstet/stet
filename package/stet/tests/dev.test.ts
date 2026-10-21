@@ -38,7 +38,7 @@ import { closeFrames, frame as frameAgent, tick, type Framed } from './helpers/p
 import { cleanupCliHosts, fakeFetch, htmlFixture, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
 import { cleanupEmailHosts, makeEmailHost } from './helpers/email-host.js';
 import { handlerOver, NONCE, paintPage, req, TOKEN, type PaintedPage } from './helpers/dashboard-page.js';
-import { cleanupOutsideFiles, linkOut, outsideFile, previewHost, type PreviewHost } from './helpers/email-preview-host.js';
+import { cleanupOutsideFiles, linkOut, outsideFile, previewHost, SNAPSHOT, type PreviewHost } from './helpers/email-preview-host.js';
 import { runtimeImportClosure } from './helpers/source-roster.js';
 import { builtBinExists, installStetShim } from './helpers/stet-shim.js';
 import { writeJsonDeterministic } from '../cli/artifacts.js';
@@ -2305,6 +2305,79 @@ describe('the stale base on a snapshot save (D10, 9.1)', () => {
     Object.assign(snapshot.default, values);
     writeJsonDeterministic(file, snapshot);
   }
+
+  it('F3 (R5-6): an agent write that lands while the body is still arriving is stale, and no other key the agent wrote is reverted', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const body = JSON.stringify({
+      values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline', base: 'Never miss a post again.' }],
+    });
+    const enc = new TextEncoder();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(enc.encode(body.slice(0, 5)));
+        await gate;
+        controller.enqueue(enc.encode(body.slice(5)));
+        controller.close();
+      },
+    });
+    const pending = handler(
+      new Request(`http://127.0.0.1:4400/api/site/save${at(host)}`, {
+        method: 'POST',
+        headers: { host: '127.0.0.1:4400', authorization: `Bearer ${TOKEN}` },
+        body: stream,
+        duplex: 'half',
+      } as RequestInit),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    agentWrites(host.cwd, { hero_headline: 'The agent’s headline', pricing_price: '$18' });
+    const written = allForms(host.cwd);
+    release();
+    const res = await pending;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    expect(allForms(host.cwd)).toEqual(written);
+    expect(JSON.parse(host.file('content/defaults.json')).default.pricing_price).toBe('$18');
+  });
+
+  it('F3: a config turned store-backed while the body arrives is refused as store-backed, and nothing is written', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const body = JSON.stringify({ values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline' }] });
+    const enc = new TextEncoder();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(enc.encode(body.slice(0, 5)));
+        await gate;
+        controller.enqueue(enc.encode(body.slice(5)));
+        controller.close();
+      },
+    });
+    const pending = handler(
+      new Request(`http://127.0.0.1:4400/api/site/save${at(host)}`, {
+        method: 'POST',
+        headers: { host: '127.0.0.1:4400', authorization: `Bearer ${TOKEN}` },
+        body: stream,
+        duplex: 'half',
+      } as RequestInit),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const config = JSON.parse(host.file('stet.config.json'));
+    writeFileSync(join(host.cwd, 'stet.config.json'), JSON.stringify({ ...config, store: { adapter: 'memory' } }));
+    const written = allForms(host.cwd);
+    release();
+    const res = await pending;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'a store-backed site is edited through its mounted API — use Save draft' });
+    expect(allForms(host.cwd)).toEqual(written);
+  });
 
   it('refuses a key an agent wrote after the page loaded, naming it with the agent’s words, and Save mine over it then writes (journey B18)', async () => {
     const host = snapshotHost();
@@ -5302,6 +5375,23 @@ describe('the dashboard sends a test email through the host’s emailSend (D58)'
   );
 
   it(
+    'F4: an emailSend file with no extension whose sibling is a symlink out of the project runs nothing and answers the containment line',
+    withToken(async () => {
+      const host = sendHost();
+      const mark = join(host.dir, 'outside-ran');
+      const out = outsideFile(host, `require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); exports.sendTest = () => {};\n`);
+      linkOut(host, 'lib/linked.js', out.abs);
+      const config = JSON.parse(readFileSync(join(host.dir, 'stet.config.json'), 'utf8'));
+      writeFileSync(join(host.dir, 'stet.config.json'), JSON.stringify({ ...config, emailSend: { file: 'lib/linked', export: 'sendTest' } }));
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(500);
+      expect(reply.body['error']).toBe('lib/linked is outside the project — a render pointer names a file inside it');
+      expect(existsSync(mark)).toBe(false);
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
     'T6: a host send that throws answers its own error and records nothing',
     withToken(async () => {
       const host = sendHost({ file: 'lib/send.js', export: 'sendDown' });
@@ -5325,18 +5415,46 @@ describe('the dashboard sends a test email through the host’s emailSend (D58)'
     }),
   );
 
+  it(
+    'D66: a mount draft of a subject holding a line break is refused (422), and the stored draft is never written',
+    withToken(async () => {
+      const host = sendHost();
+      const store = createMemoryStore({ project: 'default' });
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const reply = await post(handler, mountOf(host, 'draft'), { editor: 'mallory', key: 'welcome__subject', value: 'Hi\r\nBcc: x@evil.test' });
+      expect(reply.status).toBe(422);
+      expect(String(reply.body['error'])).toContain('An email subject fits on one line. Remove the line break.');
+      expect(await store.read({ keys: ['welcome__subject'], preview: true })).toEqual([]);
+    }),
+  );
+
+  it(
+    'D66: a subject with a line break that arrives by a hand-edited snapshot is refused at send, and the sender is never called',
+    withToken(async () => {
+      const host = sendHost();
+      writeFileSync(
+        join(host.dir, 'content/defaults.json'),
+        JSON.stringify({ default: { ...SNAPSHOT, welcome__subject: 'Hi\r\nBcc: x@evil.test' } }),
+      );
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(500);
+      expect(String(reply.body['error'])).toContain('the subject has a line break, which an email header cannot hold');
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
   const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
   const HANG = 'export function welcome(): Promise<string> {\n  setInterval(() => {}, 1000);\n  return new Promise(() => {});\n}\n';
 
   it(
-    'F1: a mount render that never returns holds only its own request',
+    'F1: a mount render that never returns holds only its own request, not the site’s other routes',
     withToken(async () => {
       const host = previewHost({ config: { store: { adapter: 'memory' } }, template: HANG });
       const { handler } = handlerOver([host.dir], { renderDeadlineMs: 3000, storeFor: () => createMemoryStore({ project: 'default' }) });
       const started = Date.now();
       const hung = handler(req(mountOf(host, 'render') + '?template=welcome'));
-      await sleep(1500);
-      expect((await handler(req('/api/workspace'))).status).toBe(200);
+      await sleep(500);
+      expect((await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.dir))}`))).status).toBe(200);
       expect(Date.now() - started).toBeLessThan(2000);
       const answer = await hung;
       expect(answer.status).toBe(500);
@@ -5345,15 +5463,35 @@ describe('the dashboard sends a test email through the host’s emailSend (D58)'
     15_000,
   );
 
+  // An addition beyond R5-1: renders run outside the site's queue, so two can ask for the
+  // adapter while the first is still opening it. It guards a second pool being built.
   it(
-    'F1: a host send function that never returns holds only its own request',
+    'two renders asking at once open the site’s store once',
+    withToken(async () => {
+      const host = previewHost({ config: { store: { adapter: 'memory' } } });
+      const store = createMemoryStore({ project: 'default' });
+      let opened = 0;
+      const { handler } = handlerOver([host.dir], {
+        storeFor: () => {
+          opened += 1;
+          return store;
+        },
+      });
+      const replies = await Promise.all([1, 2, 3].map(() => handler(req(mountOf(host, 'render') + '?template=welcome'))));
+      expect(replies.map((r) => r.status)).toEqual([200, 200, 200]);
+      expect(opened).toBe(1);
+    }),
+  );
+
+  it(
+    'F1: a host send function that never returns holds only its own request, not the site’s other routes',
     withToken(async () => {
       const host = sendHost({ file: 'lib/send.js', export: 'sendHang' });
       const { handler } = handlerOver([host.dir], { renderDeadlineMs: 3000, storeFor: () => createMemoryStore({ project: 'default' }) });
       const started = Date.now();
       const hung = post(handler, mountOf(host, 'test-send'), { template: 'welcome', to: 'typed@example.test' });
-      await sleep(1500);
-      expect((await handler(req('/api/workspace'))).status).toBe(200);
+      await sleep(500);
+      expect((await handler(req(`/api/site?site=${encodeURIComponent(realpathSync(host.dir))}`))).status).toBe(200);
       expect(Date.now() - started).toBeLessThan(2000);
       const answer = await hung;
       expect(answer.status).toBe(500);
@@ -13135,6 +13273,51 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     expect(body.root).toMatch(/^stet-cli-[^/]+\/$/);
   });
 
+  it('F8: no git the usage scan starts holds the run token: an fsmonitor hook sees it unset', async () => {
+    const host = nextSite();
+    const seen = join(tempDir('stet-fsmonitor-'), 'seen');
+    const hook = join(dirname(seen), 'fsmonitor.sh');
+    writeFileSync(hook, `#!/bin/sh\nprintf '%s\\n' "\${STET_DEV_TOKEN-unset}" >> ${JSON.stringify(seen)}\nexit 1\n`, { mode: 0o755 });
+    execFileSync('git', ['config', 'core.fsmonitor', hook], { cwd: host.cwd });
+    const { handler } = handlerOver([host.cwd]);
+    const held = process.env['STET_DEV_TOKEN'];
+    process.env['STET_DEV_TOKEN'] = 'the-run-token';
+    try {
+      const body = await get(handler, `/api/site/usage${site(host)}`);
+      expect(body.files).toBe(4);
+    } finally {
+      if (held === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held;
+    }
+    const lines = readFileSync(seen, 'utf8').trim().split('\n');
+    expect(lines.length).toBeGreaterThan(0);
+    expect(new Set(lines)).toEqual(new Set(['unset']));
+  });
+
+  // An addition beyond F8's fsmonitor case: it guards every git the site routes start, not only the one the hook reaches.
+  it('F8: every git the site and usage routes start runs without the run token', async () => {
+    const host = nextSite();
+    const real = execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim();
+    const shims = tempDir('stet-git-shim-');
+    const seen = join(shims, 'seen');
+    writeFileSync(join(shims, 'git'), `#!/bin/sh\nprintf '%s\\n' "\${STET_DEV_TOKEN-unset}" >> ${JSON.stringify(seen)}\nexec ${JSON.stringify(real)} "$@"\n`, { mode: 0o755 });
+    const { handler } = handlerOver([host.cwd]);
+    const held = { path: process.env['PATH'], token: process.env['STET_DEV_TOKEN'] };
+    process.env['PATH'] = `${shims}:${held.path ?? ''}`;
+    process.env['STET_DEV_TOKEN'] = 'the-run-token';
+    try {
+      await get(handler, `/api/site${site(host)}`);
+      await get(handler, `/api/site/usage${site(host)}`);
+    } finally {
+      process.env['PATH'] = held.path as string;
+      if (held.token === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held.token;
+    }
+    const lines = readFileSync(seen, 'utf8').trim().split('\n');
+    expect(lines.length).toBeGreaterThan(1);
+    expect(new Set(lines)).toEqual(new Set(['unset']));
+  });
+
   it('a second request after one file is touched re-reads that file alone, and answers its new read', async () => {
     const host = nextSite();
     vi.resetModules();
@@ -13246,6 +13429,19 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     write(host.cwd, 'app/page.tsx', "import { Secret } from '../linked/Secret';\nexport default function Page() { return <Secret />; }\n");
     const { handler } = handlerOver([host.cwd]);
     const body = await routeReadsOf(handler, host);
+    expect(body.keys).not.toContain('hero_body');
+    expect(body.complete).toBe(false);
+  });
+
+  it('D65: a file over 5 MB in the closure is not read: the route is incomplete and its keys unread', async () => {
+    const host = nextSite();
+    const line = "export const x = () => <p>{'hero_body'}</p>;\n";
+    write(host.cwd, 'components/Big.tsx', line.repeat(Math.ceil((6 * 1024 * 1024) / line.length)));
+    write(host.cwd, 'app/page.tsx', "import { x } from '@/components/Big';\nexport default function Page() { return x(); }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const started = Date.now();
+    const body = await routeReadsOf(handler, host);
+    expect(Date.now() - started).toBeLessThan(2000);
     expect(body.keys).not.toContain('hero_body');
     expect(body.complete).toBe(false);
   });

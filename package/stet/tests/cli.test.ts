@@ -3710,6 +3710,29 @@ describe('list --json: the unread-key badge (D6, 5.6)', () => {
     ]);
   });
 
+  it('D65: a file over 5 MB is one cause and the unnamed keys are unknown, as in the dashboard’s usage', async () => {
+    const host = templateLiteralHost();
+    const line = 'var a=function(){return {x:1,y:[1,2,3],z:"abc"}};\n';
+    writeFileSync(join(host.cwd, 'lib/vendor.js'), line.repeat(Math.ceil((6 * 1024 * 1024) / line.length)));
+    spawnSync('git', ['add', '-A'], { cwd: host.cwd });
+    const { runCli } = await import('../cli/main.js');
+    const started = Date.now();
+    const { code, out } = await host.run(runCli, 'list', '--json');
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(code).toBe(0);
+    const answer = JSON.parse(out[out.length - 1] as string) as {
+      rows: Array<{ key: string; badge?: string }>;
+      usage: { causes: Array<{ text: string; file: string; line: number }> };
+    };
+    expect(answer.usage.causes).toEqual([{ text: 'over 5 MB, so the scan skipped it', file: 'lib/vendor.js', line: 1 }]);
+    expect(answer.rows.map((r) => [r.key, r.badge])).toEqual([
+      ['footer_note', 'unknown'],
+      ['tier_solo_name', 'unknown'],
+      ['tier_solo_price', 'unknown'],
+      ['tier_team_name', 'unknown'],
+    ]);
+  });
+
   it('RF11: a key named like an Object.prototype member gets its own badge, an excluded one none', async () => {
     const host = templateLiteralHost();
     const at = (rel: string): string => join(host.cwd, rel);
