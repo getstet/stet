@@ -2127,6 +2127,294 @@ const DERIVE_KEYS = {
   description: 'home_meta_description',
 };
 
+describe('the stale base on a snapshot save (D10, 9.1)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  /** Every file the save batch writes, as bytes: the forms plus the descriptor. */
+  const allForms = (cwd: string): Record<string, Buffer> => ({
+    ...forms(cwd),
+    'content/descriptor.json': readFileSync(join(cwd, 'content/descriptor.json')),
+    'content/resolved.ts': readFileSync(join(cwd, 'content/resolved.ts')),
+  });
+  /** An agent's write: the snapshot file edited on disk behind the page's back. */
+  function agentWrites(cwd: string, values: Record<string, unknown>): void {
+    const file = join(cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    Object.assign(snapshot.default, values);
+    writeJsonDeterministic(file, snapshot);
+  }
+
+  it('refuses a key an agent wrote after the page loaded, naming it with the agent’s words, and Save mine over it then writes (journey B18)', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    agentWrites(host.cwd, { hero_headline: 'The agent’s headline', pricing_price: '$18' });
+    const before = allForms(host.cwd);
+
+    const refused = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline', base: 'Never miss a post again.' }],
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body).toEqual({
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    expect(allForms(host.cwd)).toEqual(before);
+
+    // Save mine over it: the batch again, the stale key's base left out.
+    const mine = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline' }],
+    });
+    expect(mine.status).toBe(200);
+    expect(JSON.parse(host.file('content/defaults.json')).default.hero_headline).toBe('The editor’s headline');
+
+    // A key the agent left alone saves with no refusal, whatever else moved on disk.
+    const alone = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_body', locale: 'default', value: 'Follow {{handle}} from Telegram.', base: 'Follow {{handle}} without leaving Telegram.' }],
+    });
+    expect(alone.status).toBe(200);
+    expect(JSON.parse(host.file('content/defaults.json')).default.pricing_price).toBe('$18');
+  });
+
+  // Mutation guard: green on the first build by design; it fails when a base is
+  // compared as it arrives rather than by its canonical form.
+  it('reads a record whose fields arrive in another order as unchanged', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const saved = await post(handler, `/api/site/save${at(host)}`, {
+      values: [
+        {
+          key: 'contact_form_labels',
+          locale: 'default',
+          value: { heading: 'Say hello', submit: 'Send it' },
+          base: { submit: 'Send it', heading: 'Get in touch' },
+        },
+      ],
+    });
+    expect(saved.status).toBe(200);
+    expect(JSON.parse(host.file('content/defaults.json')).default.contact_form_labels.heading).toBe('Say hello');
+  });
+
+  // Mutation guard: green on the first build by design; it fails when a value
+  // sent without a base is checked against the disk anyway.
+  it('checks no value that carries no base', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    agentWrites(host.cwd, { hero_headline: 'The agent’s headline' });
+    const saved = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline' }],
+    });
+    expect(saved.status).toBe(200);
+  });
+
+  // Mutation guard: green on the first build by design; it fails when a key the
+  // disk does not hold reads as anything but the null base the page sends.
+  it('reads a key the disk does not hold as a null base, and a null base against a held value as stale', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    delete snapshot.default['farewell_notice'];
+    writeJsonDeterministic(file, snapshot);
+    const fresh = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'farewell_notice', locale: 'default', value: 'So long.', base: null }],
+    });
+    expect(fresh.status).toBe(200);
+    const held = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'hero_headline', locale: 'default', value: 'Mine', base: null }],
+    });
+    expect(held.status).toBe(409);
+    expect(held.body['stale']).toEqual([{ key: 'hero_headline', locale: 'default', disk: 'Never miss a post again.' }]);
+  });
+
+  // Mutation guard: green on the first build by design; it fails when the disk's
+  // value is looked up with `in`, which finds a member named like Object.prototype's own.
+  it('reads a declared key named like Object.prototype’s own, absent on disk, as a null base', async () => {
+    const host = snapshotHost((descriptor) => {
+      descriptor.keys['constructor'] = { shape: 'text', target: 'web' };
+    });
+    const { handler } = handlerOver([host.cwd]);
+    const saved = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'constructor', locale: 'default', value: 'A value', base: null }],
+    });
+    expect(saved.status).toBe(200);
+  });
+
+  it('writes nothing on a 409, the clean key of the batch included', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    agentWrites(host.cwd, { pricing_price: '$18' });
+    const before = allForms(host.cwd);
+    const refused = await post(handler, `/api/site/save${at(host)}`, {
+      values: [
+        { key: 'hero_headline', locale: 'default', value: 'Clean edit', base: 'Never miss a post again.' },
+        { key: 'pricing_price', locale: 'default', value: '$20', base: '$16' },
+      ],
+    });
+    expect(refused.status).toBe(409);
+    expect((refused.body['stale'] as Array<{ key: string }>).map((s) => s.key)).toEqual(['pricing_price']);
+    expect(allForms(host.cwd)).toEqual(before);
+  });
+
+  it('names a stale key before the gate can refuse it', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    agentWrites(host.cwd, { welcome__subject: 'Hello from the agent' });
+    const refused = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: 'welcome__subject', locale: 'default', value: 'x'.repeat(200), base: 'Welcome, {{handle}}' }],
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body).toEqual({
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'welcome__subject', locale: 'default', disk: 'Hello from the agent' }],
+    });
+  });
+});
+
+describe('GET /api/site/carries and Put back (D10, 9.2)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  type Carried = { keys: Array<{ key: string; locale: string; head?: unknown; now?: unknown }>; files: string[] };
+  const carried = async (handler: (r: Request) => Promise<Response>, host: CliHost): Promise<Carried> =>
+    (await (await handler(req(`/api/site/carries${at(host)}`))).json()) as Carried;
+
+  it('lists each key that differs from HEAD, and Put back saves HEAD’s value through the gate (journey B18)', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    for (const [key, value] of [['hero_headline', 'A saved headline'], ['pricing_price', '$18']]) {
+      expect((await post(handler, `/api/site/save${at(host)}`, { values: [{ key, locale: 'default', value }] })).status).toBe(200);
+    }
+    const panel = await carried(handler, host);
+    expect(panel.keys).toEqual([
+      { key: 'hero_headline', locale: 'default', head: 'Never miss a post again.', now: 'A saved headline' },
+      { key: 'pricing_price', locale: 'default', head: '$16', now: '$18' },
+    ]);
+    expect(panel.files).toEqual(['content/defaults.json', 'content/defaults.ts', 'content/resolved.ts']);
+
+    const price = panel.keys[1] as { key: string; locale: string; head: unknown; now: unknown };
+    const back = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: price.key, locale: price.locale, value: price.head, base: price.now }],
+    });
+    expect(back.status).toBe(200);
+    expect(JSON.parse(host.file('content/defaults.json')).default.pricing_price).toBe('$16');
+    expect((await carried(handler, host)).keys.map((k) => k.key)).toEqual(['hero_headline']);
+  });
+
+  it('refuses a Put back whose key changed on disk after the panel loaded, naming it', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'pricing_price', locale: 'default', value: '$18' }] });
+    const price = (await carried(handler, host)).keys[0] as { key: string; locale: string; head: unknown; now: unknown };
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    snapshot.default['pricing_price'] = '$19';
+    writeJsonDeterministic(file, snapshot);
+    const before = readFileSync(file);
+    const back = await post(handler, `/api/site/save${at(host)}`, {
+      values: [{ key: price.key, locale: price.locale, value: price.head, base: price.now }],
+    });
+    expect(back.status).toBe(409);
+    expect(back.body['stale']).toEqual([{ key: 'pricing_price', locale: 'default', disk: '$19' }]);
+    expect(readFileSync(file)).toEqual(before);
+  });
+
+  // Addition: guards `carries` comparing HEAD's value and the disk's by their
+  // canonical forms, so a record an agent rewrote with its fields in another
+  // order is not listed as a change.
+  it('lists no key whose record HEAD and the disk hold with their fields in another order', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    const labels = snapshot.default['contact_form_labels'] as Record<string, unknown>;
+    snapshot.default['contact_form_labels'] = Object.fromEntries(Object.entries(labels).reverse());
+    writeFileSync(file, `${JSON.stringify(snapshot, null, 2)}\n`);
+    expect(Object.keys(JSON.parse(readFileSync(file, 'utf8')).default.contact_form_labels)).not.toEqual(Object.keys(labels));
+    expect((await carried(handler, host)).keys).toEqual([]);
+  });
+
+  it('gives a key new since HEAD no head', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    // HEAD holds no value for farewell_notice; the editor gives it one.
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    delete snapshot.default['farewell_notice'];
+    writeJsonDeterministic(file, snapshot);
+    git(host.cwd, ['commit', '-qam', 'farewell_notice unset']);
+    await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'farewell_notice', locale: 'default', value: 'So long.' }] });
+    expect((await carried(handler, host)).keys).toEqual([{ key: 'farewell_notice', locale: 'default', now: 'So long.' }]);
+  });
+});
+
+describe('GET /api/site/key-history (D10, 9.3)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+
+  it('answers a snapshot key’s past values newest first, numbered oldest first (journey B25)', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    for (const value of ['Second headline', 'Third headline']) {
+      const saved = await post(handler, `/api/site/save${at(host)}`, { values: [{ key: 'hero_headline', value }] });
+      await post(handler, `/api/site/commit${at(host)}`, { files: saved.body['written'] as string[], keys: ['hero_headline'], message: value });
+    }
+    const body = (await (await handler(req(`/api/site/key-history${at(host)}&key=hero_headline&locale=default`))).json()) as {
+      versions: Array<{ n: number; short: string; author: string; value: unknown }>;
+    };
+    expect(body.versions.map((v) => [v.n, v.value, v.author])).toEqual([
+      [3, 'Third headline', 'dev'],
+      [2, 'Second headline', 'dev'],
+      [1, 'Never miss a post again.', 'dev'],
+    ]);
+    expect(body.versions[0]?.short).toMatch(/^[0-9a-f]{7,}$/);
+  });
+
+  it('skips a revision over the 64 MB parse cap, lists the rest and says some are too large', async () => {
+    const host = snapshotHost();
+    const file = join(host.cwd, 'content/defaults.json');
+    const snapshot = JSON.parse(readFileSync(file, 'utf8')) as { default: Record<string, unknown> };
+    for (const value of ['x'.repeat(64 * 1024 * 1024 + 1), 'Back to normal']) {
+      snapshot.default['hero_headline'] = value;
+      writeFileSync(file, JSON.stringify(snapshot));
+      git(host.cwd, ['commit', '-qam', 'edit']);
+    }
+    const { handler } = handlerOver([host.cwd]);
+    const res = await handler(req(`/api/site/key-history${at(host)}&key=hero_headline&locale=default`));
+    expect(await res.json()).toEqual({
+      versions: [
+        expect.objectContaining({ n: 2, value: 'Back to normal' }),
+        expect.objectContaining({ n: 1, value: 'Never miss a post again.' }),
+      ],
+      truncated: true,
+    });
+  });
+
+  it('refuses an undeclared key and a locale that is not enabled before git runs', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    for (const key of ['constructor', '__proto__', '../content/defaults.json', '/etc/passwd', '-n', '--output=/tmp/x']) {
+      const res = await handler(req(`/api/site/key-history${at(host)}&key=${encodeURIComponent(key)}&locale=default`));
+      expect(res.status, key).toBe(400);
+      expect(await res.json()).toEqual({ error: `undeclared key: ${key}` });
+    }
+    for (const locale of ['..', '/etc', '-p', '__proto__']) {
+      const res = await handler(req(`/api/site/key-history${at(host)}&key=hero_headline&locale=${encodeURIComponent(locale)}`));
+      expect(res.status, locale).toBe(400);
+    }
+  });
+
+  it('reads no snapshot outside the checkout, though the repository holds it', async () => {
+    // The checkout is a folder of its repository, and its config points the
+    // snapshot at a file beside the folder, which git would read.
+    const { top, cwd } = subfolderHost();
+    writeFileSync(join(top, 'secret.json'), readFileSync(join(cwd, 'content/defaults.json')));
+    git(top, ['add', 'secret.json']);
+    git(top, ['commit', '-qm', 'beside the checkout']);
+    const config = JSON.parse(readFileSync(join(cwd, 'stet.config.json'), 'utf8')) as Record<string, unknown>;
+    writeFileSync(join(cwd, 'stet.config.json'), JSON.stringify({ ...config, snapshotPath: '../secret.json' }));
+    const { handler } = handlerOver([cwd]);
+    const res = await handler(req(`/api/site/key-history?site=${encodeURIComponent(cwd)}&key=hero_headline&locale=default`));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ versions: [] });
+  });
+});
+
 describe('POST /api/site/commit and /push', () => {
   const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
   /** A handler over a fresh context holding just this checkout — a restart, in one call. */
@@ -3790,13 +4078,112 @@ describe('GET /api/site/history', () => {
     expect(body.commits.map((c) => c.subject)).toContain('the gone document');
   });
 
-  it('names the mount on a store-backed site', async () => {
+  it('lists a store-backed site’s commits as a snapshot site’s, with no repository answering none', async () => {
     const host = makeCliHost({ config: { project: 't', store: { adapter: 'memory' } } });
     const { handler } = handlerOver([host.cwd]);
     const body = await (
       await handler(req(`/api/site/history?site=${encodeURIComponent(realpathSync(host.cwd))}`))
     ).json();
-    expect(body).toEqual({ mount: `/s/${siteId(realpathSync(host.cwd))}/api/stet/history` });
+    expect(body).toEqual({ commits: [] });
+  });
+});
+
+describe('removed keys and commits on a JavaScript host and a store-backed site (D10, 9.4)', () => {
+  const at = (host: CliHost): string => `?site=${encodeURIComponent(realpathSync(host.cwd))}`;
+  const rev = (cwd: string, ref: string): string => git(cwd, ['rev-parse', ref]).out.trim();
+  const PAGE = 'app/(marketing)/lab/page.tsx';
+  /** The page at `<sha>^`: `farewell_notice` read in a paragraph on line 20, and named in a comment on line 3. */
+  const labPage = (): string =>
+    [
+      "import { copy } from '@/lib/content';",
+      '',
+      '// farewell_notice was the old footer line',
+      ...Array.from({ length: 13 }, () => ''),
+      'export default function Page() {',
+      '  return (',
+      '    <main>',
+      "      <p>{copy.get('farewell_notice')}</p>",
+      '    </main>',
+      '  );',
+      '}',
+      '',
+    ].join('\n');
+  /** One commit taking `key` (or each of several) out of the descriptor and the snapshot, and `page` written as given; answers its hash. */
+  function removeKey(cwd: string, key: string | string[], page?: string): string {
+    const gone = [key].flat();
+    for (const rel of ['content/descriptor.json', 'content/defaults.json']) {
+      const forms = JSON.parse(readFileSync(join(cwd, rel), 'utf8')) as { keys?: Record<string, unknown>; default?: Record<string, unknown> };
+      for (const name of gone) delete (forms.keys ?? forms.default ?? {})[name];
+      writeJsonDeterministic(join(cwd, rel), forms);
+    }
+    if (page !== undefined) write(cwd, PAGE, page);
+    git(cwd, ['add', '-A']);
+    git(cwd, ['commit', '-qm', `remove ${gone.join(' and ')}`]);
+    return rev(cwd, 'HEAD');
+  }
+
+  it('names where a removed key was shown on a Next host, at the commit’s parent (journey B22)', async () => {
+    const host = snapshotHost();
+    const config = JSON.parse(host.file('stet.config.json')) as Record<string, unknown>;
+    write(host.cwd, 'stet.config.json', JSON.stringify({ ...config, router: 'app', managedSurfaces: ['app/**/*.tsx'] }));
+    write(host.cwd, PAGE, labPage());
+    git(host.cwd, ['add', '-A']);
+    git(host.cwd, ['commit', '-qm', 'the lab page']);
+    const sha = removeKey(host.cwd, 'farewell_notice', labPage().replace("      <p>{copy.get('farewell_notice')}</p>\n", ''));
+    const { handler } = handlerOver([host.cwd]);
+    expect(await get(handler, `/api/site/removed${at(host)}&sha=${sha}`)).toEqual({
+      keys: [
+        {
+          key: 'farewell_notice',
+          section: null,
+          text: 'This channel is closing. Thanks for reading.',
+          places: [{ file: PAGE, line: 20, kind: `text in ${PAGE}` }],
+        },
+      ],
+    });
+  });
+
+  // Addition: guards the places read for a commit that removes several keys at
+  // once (git grep takes each key as its own `-e` pattern).
+  it('names where each of several removed keys was shown, in one commit', async () => {
+    const host = snapshotHost();
+    const config = JSON.parse(host.file('stet.config.json')) as Record<string, unknown>;
+    write(host.cwd, 'stet.config.json', JSON.stringify({ ...config, router: 'app', managedSurfaces: ['app/**/*.tsx'] }));
+    write(host.cwd, PAGE, labPage().replace("      <p>{copy.get('farewell_notice')}</p>\n", "      <p>{copy.get('farewell_notice')}</p>\n      <p>{copy.get('footer_links')}</p>\n"));
+    git(host.cwd, ['add', '-A']);
+    git(host.cwd, ['commit', '-qm', 'the lab page']);
+    const sha = removeKey(host.cwd, ['farewell_notice', 'footer_links'], labPage().replace("      <p>{copy.get('farewell_notice')}</p>\n", ''));
+    const { handler } = handlerOver([host.cwd]);
+    const listed = (await get(handler, `/api/site/removed${at(host)}&sha=${sha}`)) as { keys: Array<{ key: string; places: Array<{ file: string; line: number }> }> };
+    expect(listed.keys.map((k) => [k.key, k.places.map((p) => [p.file, p.line])])).toEqual([
+      ['farewell_notice', [[PAGE, 20]]],
+      ['footer_links', [[PAGE, 21]]],
+    ]);
+  });
+
+  it('lists the commits and the keys a commit removed on a store-backed site', async () => {
+    const host = makeCliHost({ config: { project: 't', store: { adapter: 'memory' } } });
+    gitInit(host.cwd);
+    const sha = removeKey(host.cwd, 'farewell_notice');
+    const { handler } = handlerOver([host.cwd]);
+    const history = (await get(handler, `/api/site/history${at(host)}`)) as { commits: Array<{ sha: string; subject: string }> };
+    expect(history.commits.map((c) => c.subject)).toEqual(['remove farewell_notice', 'base']);
+    expect(history.commits[0]?.sha).toBe(sha);
+    const listed = (await get(handler, `/api/site/removed${at(host)}&sha=${sha}`)) as { keys: Array<{ key: string; text: string }> };
+    expect(listed.keys.map((k) => [k.key, k.text])).toEqual([['farewell_notice', 'This channel is closing. Thanks for reading.']]);
+  });
+
+  // Mutation guard: green on the first build by design; it fails when a commit
+  // named like an option is handed to git as one.
+  it('refuses a commit named like an option, a range or a path before git reads it', async () => {
+    const host = snapshotHost();
+    const { handler } = handlerOver([host.cwd]);
+    const written = join(tempDir(), 'out.txt');
+    for (const sha of ['-n', `--output=${written}`, 'HEAD..HEAD', '/etc/passwd', '../content', '']) {
+      const res = await handler(req(`/api/site/removed${at(host)}&sha=${encodeURIComponent(sha)}`));
+      expect(res.status, sha).toBe(400);
+    }
+    expect(existsSync(written)).toBe(false);
   });
 });
 
@@ -5729,6 +6116,7 @@ describe('the page', () => {
       ['/api/site/dev-start', 200, { running: true, state: 'running', pid: 1234, command: 'npx astro dev', lines: [] }],
       ['/api/site/dev-stop', 200, { running: false, state: 'stopped', lines: [] }],
       ['/api/site/marks', 200, { documents: [], keys: {}, places: {} }],
+      ['/api/site/carries', 200, { keys: [], files: ['stet/defaults.json'] }],
       [`/s/${SITE_ID}/api/stet/recent`, 200, { rows: [{ id: 3, key: 'hero_headline', locale: 'default', status: 'published', value: 'Ship the copy', publishedAt: '2026-09-01T10:00:00Z' }], nextBeforeId: null }],
       [`/s/${SITE_ID}/api/stet/keys`, 200, { descriptor, rows: [{ key: 'hero_headline', locale: 'default', status: 'draft', value: 'Later', publishAt: '2026-09-09T09:00:00Z' }] }],
       [`/s/${SITE_ID}/api/stet/changes`, 200, { changes: [{ id: 2, name: 'September prices', note: 'the whole page', status: 'scheduled', authorKind: 'human', publishAt: '2026-09-30T09:00:00Z', createdAt: '2026-09-01T09:00:00Z', revertedAt: null }], nextBeforeId: null }],
@@ -6058,6 +6446,7 @@ describe('the page', () => {
       pending: [],
     });
     await page.act('commit');
+    await page.act('commitApply');
     expect(gitButtons(page)).toEqual([
       { label: 'Commit', blue: false, grey: true, title: null },
       { label: 'Push · 1 commit', blue: true, grey: false, title: null },
@@ -6120,9 +6509,233 @@ describe('the page', () => {
     await page.act('save');
     expect(page.dom.window.document.querySelector('#gitbar [data-act="commit"]')).not.toBeNull();
 
+    // Commit opens what the commit carries; its own Commit commits.
+    page.answer('/api/site/carries', 200, { keys: [], files: ['stet/defaults.json'] });
     await page.act('commit');
+    await page.act('commitApply');
     const body = page.sent.filter((r) => r.path.startsWith('/api/site/commit')).at(-1)?.body;
     expect(body).toEqual({ files: ['stet/defaults.json'] });
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('sends each value’s base, names a key changed on disk, and Use theirs or Save mine over it settles it (journey B18)', async () => {
+    const page = await paint();
+    const disk = { ...snapshot, default: { ...snapshot.default, hero_headline: 'The agent’s headline' } };
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'The editor’s headline');
+    await page.act('save');
+    const saves = (): unknown[] => page.sent.filter((r) => r.path.startsWith('/api/site/save')).map((r) => r.body);
+    const asks = (): string[] => [...page.dom.window.document.querySelectorAll('.term')].map((el) => el.textContent ?? '');
+    expect(saves().at(-1)).toEqual({ values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline', base: 'Ship the copy' }] });
+    expect(asks()).toContain('hero_headline changed on disk since you opened it: "The agent’s headline"');
+
+    // Save mine over it: the batch again, the stale key without its base.
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.act('saveMine:0');
+    expect(saves().at(-1)).toEqual({ values: [{ key: 'hero_headline', locale: 'default', value: 'The editor’s headline' }] });
+    expect(asks().filter((line) => line.includes('changed on disk'))).toEqual([]);
+
+    // Use theirs: the draft and its base dropped, and the disk's words read again.
+    page.answer('/api/site', 200, siteBody({ snapshot: disk }));
+    await page.type('text:hero_headline', 'A second try');
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    await page.act('save');
+    const reads = page.requested('/api/site?').length;
+    await page.act('useTheirs:0');
+    expect(page.requested('/api/site?').length).toBe(reads + 1);
+    expect(asks().filter((line) => line.includes('changed on disk'))).toEqual([]);
+    expect((page.dom.window.document.querySelector('[data-act="save"]') as HTMLButtonElement).disabled).toBe(true);
+    expect((page.dom.window.document.querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe(
+      'The agent’s headline',
+    );
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  // Mutation guard: green on the first build by design; it fails when Save mine
+  // over one stale key drops the bases of the others.
+  it('sends Save mine over one of two stale keys without its base and the other with its own', async () => {
+    const page = await paint();
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [
+        { key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' },
+        { key: 'hero_tone', locale: 'default', disk: 'loud' },
+      ],
+    });
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'The editor’s headline');
+    await page.act('key:hero_tone');
+    await page.change('enum:hero_tone', 'loud');
+    await page.act('save');
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_tone', locale: 'default', disk: 'loud' }],
+    });
+    await page.act('saveMine:0');
+    const values = (page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body as { values: unknown[] }).values;
+    expect(values).toEqual([
+      { key: 'hero_headline', locale: 'default', value: 'The editor’s headline' },
+      { key: 'hero_tone', locale: 'default', value: 'loud', base: 'calm' },
+    ]);
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  // Mutation guard: green on the first build by design; it fails when Use theirs
+  // leaves the dropped edit's base behind for the next edit of the key.
+  it('sends a fresh edit after Use theirs with the disk’s word as its base', async () => {
+    const page = await paint();
+    const disk = { ...snapshot, default: { ...snapshot.default, hero_headline: 'The agent’s headline' } };
+    page.answer('/api/site/save', 409, {
+      error: 'changed on disk since the page loaded',
+      stale: [{ key: 'hero_headline', locale: 'default', disk: 'The agent’s headline' }],
+    });
+    await page.act('key:hero_headline');
+    await page.type('text:hero_headline', 'The editor’s headline');
+    await page.act('save');
+    page.answer('/api/site', 200, siteBody({ snapshot: disk }));
+    await page.act('useTheirs:0');
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.type('text:hero_headline', 'A fresh try');
+    await page.act('save');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+      values: [{ key: 'hero_headline', locale: 'default', value: 'A fresh try', base: 'The agent’s headline' }],
+    });
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('reads what the commit carries again after a stale Put back, keeps its line, and sends the new now on the next press', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json'] }) });
+    const carries = (now: string): void =>
+      page.answer('/api/site/carries', 200, {
+        keys: [{ key: 'hero_headline', locale: 'default', head: 'Talk to sales today', now }],
+        files: ['stet/defaults.json'],
+      });
+    carries('Talk to us today');
+    await page.act('commit');
+    const doc = page.dom.window.document;
+    const reads = page.requested('/api/site/carries').length;
+
+    // The file changed again after the panel loaded: the refusal is shown over a panel read again.
+    page.answer('/api/site/save', 409, { error: 'changed on disk since the page loaded', stale: [{ key: 'hero_headline', locale: 'default', disk: 'Talk to the team' }] });
+    carries('Talk to the team');
+    await page.act('putBack:0');
+    expect(page.requested('/api/site/carries').length).toBe(reads + 1);
+    expect(doc.querySelector('#ask .err')?.textContent).toBe('hero_headline changed on disk since you opened it: "Talk to the team"');
+    expect([...doc.querySelectorAll('#ask .term')].map((el) => el.textContent)).toEqual(['Talk to [-sales today-] [+the team+]']);
+
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.act('putBack:0');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+      values: [{ key: 'hero_headline', locale: 'default', value: 'Talk to sales today', base: 'Talk to the team' }],
+    });
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('opens what the commit carries, and Put back saves HEAD’s value with the panel’s now as its base (journey B18)', async () => {
+    const page = await paint({ site: siteBody({ pending: ['stet/defaults.json', 'src/stet.ts'] }) });
+    page.answer('/api/site/carries', 200, {
+      keys: [
+        { key: 'hero_headline', locale: 'default', head: 'Talk to sales today', now: 'Talk to us today' },
+        { key: 'loose_key', locale: 'default', head: 'loose', now: 'tight' },
+        { key: 'unseeded_key', locale: 'default', now: 'A new value' },
+      ],
+      files: ['stet/defaults.json', 'src/stet.ts'],
+    });
+    await page.act('commit');
+    const doc = page.dom.window.document;
+    expect(doc.querySelector('#ask h3')?.textContent).toBe('What this commit carries · 3 keys · 2 files');
+    const terms = [...doc.querySelectorAll('#ask .term')].map((el) => el.textContent);
+    expect(terms).toEqual(['Talk to [-sales-] [+us+] today', '[-loose-] [+tight+]', 'A new value']);
+    // A key new since HEAD shows its value with no Put back.
+    expect([...doc.querySelectorAll('#ask [data-act^="putBack:"]')].map((el) => el.getAttribute('data-act'))).toEqual(['putBack:0', 'putBack:1']);
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/commit'))).toEqual([]);
+
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json', 'src/stet.ts'] });
+    page.answer('/api/site/carries', 200, {
+      keys: [{ key: 'hero_headline', locale: 'default', head: 'Talk to sales today', now: 'Talk to us today' }],
+      files: ['stet/defaults.json', 'src/stet.ts'],
+    });
+    await page.act('putBack:1');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+      values: [{ key: 'loose_key', locale: 'default', value: 'loose', base: 'tight' }],
+    });
+    expect(doc.querySelector('#ask h3')?.textContent).toBe('What this commit carries · 1 key · 2 files');
+    expect([...doc.querySelectorAll('#ask .term')].map((el) => el.textContent)).toEqual(['Talk to [-sales-] [+us+] today']);
+
+    // A disk change since the panel loaded: the refusal names the key and the panel stays.
+    page.answer('/api/site/save', 409, { error: 'changed on disk since the page loaded', stale: [{ key: 'hero_headline', locale: 'default', disk: 'Talk to the team' }] });
+    await page.act('putBack:0');
+    expect(doc.querySelector('#ask .err')?.textContent).toBe('hero_headline changed on disk since you opened it: "Talk to the team"');
+
+    await page.act('commitApply');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/commit')).at(-1)?.body).toEqual({ files: ['stet/defaults.json', 'src/stet.ts'] });
+    expect((doc.getElementById('ask') as HTMLElement).hidden).toBe(true);
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('lists a snapshot key’s past values from git, and Restore loads one as an unsaved edit (journey B25)', async () => {
+    const page = await paint();
+    page.answer('/api/site/key-history', 200, {
+      versions: [
+        { n: 3, commit: 'c'.repeat(40), short: 'ccccccc', date: '2026-10-03T09:00:00Z', author: 'Ada', value: 'Ship the copy' },
+        { n: 2, commit: 'b'.repeat(40), short: 'bbbbbbb', date: '2026-10-02T09:00:00Z', author: 'Grace', value: 'Ship it today' },
+        { n: 1, commit: 'a'.repeat(40), short: 'aaaaaaa', date: '2026-10-01T09:00:00Z', author: 'Ada', value: 'First words' },
+      ],
+    });
+    await page.act('key:hero_headline');
+    expect(page.requested('/api/site/key-history')).toEqual([
+      `/api/site/key-history?site=${encodeURIComponent('/checkouts/mini')}&key=hero_headline&locale=default`,
+    ]);
+    const doc = page.dom.window.document;
+    const card = doc.getElementById('keyhistory') as HTMLElement;
+    expect(card.querySelector('h3')?.textContent).toBe('Key history');
+    const lines = [...card.querySelectorAll('.hline')].map((el) => el.textContent ?? '');
+    expect(lines).toHaveLength(3);
+    expect(lines[2]).toMatch(/^v1 · aaaaaaa · 2026-10-0[12] \d\d:\d\d · Ada · First words$/);
+
+    // The third row, restored: the field holds its words, unsaved, and the save carries the stored value as its base.
+    await page.act('gitRestore:1');
+    expect((doc.querySelector('[data-act-input="text:hero_headline"]') as HTMLTextAreaElement).value).toBe('First words');
+    expect((doc.querySelector('[data-act="save"]') as HTMLButtonElement).disabled).toBe(false);
+    page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: ['stet/defaults.json'] });
+    await page.act('save');
+    expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+      values: [{ key: 'hero_headline', locale: 'default', value: 'First words', base: 'Ship the copy' }],
+    });
+    // The commit history card says what it lists.
+    expect([...doc.querySelectorAll('h3')].map((el) => el.textContent)).toContain('Commit history');
+    expect(page.errors).toEqual([]);
+    page.dom.window.close();
+  });
+
+  it('says some older versions are too large to show when git’s history was cut short', async () => {
+    const page = await paint();
+    page.answer('/api/site/key-history', 200, {
+      versions: [{ n: 1, commit: 'a'.repeat(40), short: 'aaaaaaa', date: '2026-10-01T09:00:00Z', author: 'Ada', value: 'First words' }],
+      truncated: true,
+    });
+    await page.act('key:hero_headline');
+    const card = page.dom.window.document.getElementById('keyhistory') as HTMLElement;
+    expect(card.querySelectorAll('.hline')).toHaveLength(1);
+    expect(card.querySelector('.note')?.textContent).toBe('Some older versions are too large to show.');
+
+    // Every version cut: the card still says so.
+    page.answer('/api/site/key-history', 200, { versions: [], truncated: true });
+    await page.act('key:hero_tone');
+    expect(page.dom.window.document.querySelector('#keyhistory .note')?.textContent).toBe('Some older versions are too large to show.');
     expect(page.errors).toEqual([]);
     page.dom.window.close();
   });
@@ -6234,6 +6847,7 @@ describe('the page', () => {
     });
     // No key selected: the card is the page's, not the editor's.
     await page.act('commit');
+    await page.act('commitApply');
     expect(card().hidden).toBe(false);
     expect(card().textContent).toContain("The commit was refused. Git's output is below.");
     expect(card().querySelector('.term')?.textContent).toBe('git commit failed\nerror: hook says no');
@@ -6249,6 +6863,7 @@ describe('the page', () => {
       pending: [],
     });
     await page.act('commit');
+    await page.act('commitApply');
     page.answer('/api/site/push', 409, { error: 'git push failed', output: 'fatal: No configured push destination.' });
     await page.act('push');
     expect(card().textContent).toContain("The push failed. Git's output is below.");
@@ -6275,6 +6890,7 @@ describe('the page', () => {
       '\u001b]8;;http://lint.example/rule\u0007see the rule\u001b]8;;\u0007 and \u001b]0;a title\u001b\\done';
     page.answer('/api/site/commit', 409, { error: 'git commit failed', output, pending: ['stet/defaults.json'] });
     await page.act('commit');
+    await page.act('commitApply');
     const card = doc.getElementById('giterr') as HTMLElement;
     expect(card.hidden).toBe(false);
     expect(card.querySelector('img, script, b')).toBeNull();
@@ -6294,10 +6910,12 @@ describe('the page', () => {
     const card = (): HTMLElement => docOf(page).getElementById('giterr') as HTMLElement;
     page.answer('/api/site/commit', 409, { error: 'git commit failed', output: 'no', pending: ['stet/defaults.json'] });
     await page.act('commit');
+    await page.act('commitApply');
     expect(card().hidden).toBe(false);
     // Held back, so the card is read while the commit is still in flight.
     page.answer('/api/site/commit', 409, { error: 'git commit failed', output: 'no', pending: ['stet/defaults.json'] }, 300);
     await page.act('commit');
+    await page.act('commitApply');
     expect(page.requested('/api/site/commit')).toHaveLength(2);
     expect(card().hidden).toBe(true);
     // The held reply lands before the window goes, so nothing paints into a closed page.
@@ -6857,7 +7475,7 @@ describe('the page', () => {
         expect(doc.querySelector('.cb .cnt')?.textContent).toBe(String(typed.length));
         await page.act('save');
         expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
-          values: [{ key: 'hero', locale: 'default', value: typed }],
+          values: [{ key: 'hero', locale: 'default', value: typed, base: HEADLINE }],
         });
         expect(page.dom.window.document.querySelector('style')?.textContent).toContain('.tagged textarea{display:block;');
         page.dom.window.close();
@@ -9989,7 +10607,9 @@ describe('the page', () => {
       expect(page.requested('/api/site/save')).toEqual([]);
       await page.act('save');
       await page.act('saveAnyway');
-      expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({ values: [{ key: 'home_page_title', locale: 'default', value: title }] });
+      expect(page.sent.filter((r) => r.path.startsWith('/api/site/save')).at(-1)?.body).toEqual({
+        values: [{ key: 'home_page_title', locale: 'default', value: title, base: 'Psyon' }],
+      });
       expect(saveState(page)).toEqual(SAVED);
       page.dom.window.close();
     });
@@ -10095,6 +10715,47 @@ describe('the page', () => {
           });
         },
       });
+
+    it('names where a removed key was shown on a JavaScript host, and Restore stands (journey B22)', async () => {
+      const page = await paint({
+        routes: [
+          ['/api/site/history', 200, { commits: [{ sha: 'b22b22babc', short: 'b22b22b', author: 'nj-io', at: '2026-10-20T10:00:00Z', subject: 'lab: long copy removed' }] }],
+          ['/api/site/removed', 200, { keys: [
+            { key: 'lab_long', section: null, text: 'A long paragraph', places: [{ file: 'app/(marketing)/lab/page.tsx', line: 20, kind: 'text in app/(marketing)/lab/page.tsx' }] },
+            { key: 'lab_aside', section: null, text: 'An aside', places: [{ file: 'src/pages/lab.astro', line: 4, kind: 'paragraph' }, { file: 'src/pages/about.astro', line: 9, kind: 'headline' }] },
+            { key: 'lab_note', section: 'lab', text: 'A note', places: [] },
+          ] }],
+        ],
+      });
+      await page.act('history');
+      await page.act('commitOpen:b22b22babc');
+      const listed = docOf(page).querySelector('tr td[colspan="3"] .mono') as HTMLElement;
+      expect(listed.innerHTML.split('<br>').map((line) => new page.dom.window.DOMParser().parseFromString(line, 'text/html').body.textContent)).toEqual([
+        // The reader's fallback kind only names the file again, so the row leaves it out.
+        'lab_long was removed in b22b22b. It was shown at app/(marketing)/lab/page.tsx:20.',
+        'lab_aside was removed in b22b22b. It was shown at src/pages/lab.astro:4 (paragraph), src/pages/about.astro:9 (headline).',
+        'lab_note — lab — "A note"',
+      ]);
+      expect(docOf(page).querySelector('[data-act="restoreAsk"]')).not.toBeNull();
+      expect([...docOf(page).querySelectorAll('h3')].map((el) => el.textContent)).toContain('Commit history');
+      page.dom.window.close();
+    });
+
+    it('lists a store-backed site’s commits and the keys one removed, with no Restore', async () => {
+      const page = await paint({
+        site: siteBody({ mode: 'memory' }),
+        routes: [
+          ['/api/site/history', 200, { commits: [{ sha: 'cafe00dabc', short: 'cafe00d', author: 'nj-io', at: '2026-10-20T10:00:00Z', subject: 'remove farewell_notice' }] }],
+          ['/api/site/removed', 200, { keys: [{ key: 'farewell_notice', section: null, text: 'So long', places: [] }] }],
+        ],
+      });
+      await page.act('history');
+      await page.act('commitOpen:cafe00dabc');
+      expect((docOf(page).querySelector('tr td[colspan="3"] .mono') as HTMLElement).textContent).toBe('farewell_notice — "So long"');
+      expect(docOf(page).querySelector('[data-act="restoreAsk"]')).toBeNull();
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
 
     it('lists what a commit removed and restores it, handing back the markup (journey B22, restore)', async () => {
       const copied: string[] = [];

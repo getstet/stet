@@ -13,13 +13,15 @@
  * dashboard's two reads over it — the uncommitted forms and the sequencer
  * check — are its first consumers, and `trackable`, the `check-ignore` probe,
  * reads through it. `gitFiles` is the file-list read `email extract` and the
- * unread-key scan share. The two ad hoc `execFileSync` calls elsewhere (`email
+ * unread-key scan share; `gitBytes` and `gitStream` the byte reads a key's
+ * history takes. The two ad hoc `execFileSync` calls elsewhere (`email
  * verify`'s `show` and `hooksDir`) still wait to move onto it.
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { basename, dirname, resolve as resolvePath } from 'node:path';
+import type { Readable, Writable } from 'node:stream';
 
 import { hooksDir } from './hook.js';
 import { childEnv } from './workspace.js';
@@ -75,6 +77,40 @@ export function gitData(cwd: string, args: string[]): { code: number; stdout: st
   });
   if (result.error !== undefined) return { code: 1, stdout: '' };
   return { code: result.status ?? 1, stdout: result.stdout ?? '' };
+}
+
+/**
+ * One git read whose answer is BYTES: stdout as a Buffer, `input` on stdin,
+ * under `LC_ALL=C` with `maxBuffer` the caller's ceiling. For output read by
+ * size — `cat-file --batch` counts each object in bytes, which a decoded string
+ * would count in characters. Never throws; a spawn that never ran answers code
+ * 1 and nothing.
+ */
+export function gitBytes(cwd: string, args: string[], opts: { input?: string; maxBuffer: number }): { code: number; stdout: Buffer } {
+  const result = spawnSync('git', args, {
+    cwd,
+    env: { ...childEnv(), GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' },
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: opts.maxBuffer,
+    ...(opts.input === undefined ? {} : { input: opts.input }),
+  });
+  if (result.error !== undefined) return { code: 1, stdout: Buffer.alloc(0) };
+  return { code: result.status ?? 1, stdout: result.stdout ?? Buffer.alloc(0) };
+}
+
+/**
+ * One git run whose stdout the caller reads as it arrives: the child, under
+ * `LC_ALL=C` and the same timeout as the buffered reads, with stderr dropped.
+ * For output with no ceiling worth buffering — a key's history reads every
+ * revision of a snapshot, which a site of any size makes larger than any cap.
+ */
+export function gitStream(cwd: string, args: string[]): ChildProcessByStdio<Writable, Readable, null> {
+  return spawn('git', args, {
+    cwd,
+    env: { ...childEnv(), GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' },
+    timeout: GIT_TIMEOUT_MS,
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
 }
 
 /**

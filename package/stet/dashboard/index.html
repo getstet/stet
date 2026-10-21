@@ -375,6 +375,12 @@ const S = {
   // and the markup it handed back, and a place being given its own key.
   same: null,
   overLimit: null,
+  // The keys a snapshot save found changed on disk since the edit began, each { key, locale, disk }, and the
+  // 'locale key' drafts Save mine over it resends without their base.
+  staleKeys: [],
+  mine: [],
+  // The header's Commit opened: what the commit carries ({ keys, files }) and a refused Put back's line.
+  commitPanel: null,
   publishAsk: false,
   previewLink: null,
   opened: null,
@@ -603,7 +609,7 @@ async function loadSite(path) {
   S.pending = [];
   S.message = '';
   S.removal = null;
-  S.same = null; S.overLimit = null; S.publishAsk = false; S.previewLink = null;
+  S.same = null; S.overLimit = null; S.staleKeys = []; S.mine = []; S.commitPanel = null; S.publishAsk = false; S.previewLink = null;
   S.opened = null; S.restoreAsk = false; S.markup = null; S.split = null;
   S.health = null; S.seo = null; S.audit = null; auditGen += 1; S.setup = null; S.verify = null;
   S.history = null; S.recent = null; S.preview = null; S.devlog = null;
@@ -691,10 +697,23 @@ async function loadRows() {
   locateKey(false);
   await loadKeyHistory();
 }
-/** The selected key's published versions, newest first, from the mount's `history`. */
+/**
+ * The selected key's past values, newest first: on a store-backed site its
+ * published versions from the mount's `history`; on a snapshot site the values
+ * git holds (`GET /api/site/key-history`). A derived key has none of its own.
+ */
 async function loadKeyHistory() {
-  if (!storeBacked() || S.sel === null) { S.keyHistory = null; return; }
+  if (!ready() || S.sel === null) { S.keyHistory = null; return; }
   const want = { path: S.path, env: S.env, key: S.sel, locale: S.locale };
+  if (!storeBacked()) {
+    const def = keyDef(want.key);
+    if (!def || def.derivesFrom !== undefined) { S.keyHistory = null; return; }
+    const res = await api('/api/site/key-history' + query() + '&key=' + encodeURIComponent(want.key) + '&locale=' + encodeURIComponent(want.locale));
+    if (want.path !== S.path || want.key !== S.sel || want.locale !== S.locale) return;
+    S.keyHistory = { key: want.key, locale: want.locale, versions: res.ok && Array.isArray(res.body.versions) ? res.body.versions : [], truncated: res.ok && res.body.truncated === true };
+    render();
+    return;
+  }
   const res = await api(mountPath('history', 'key=' + encodeURIComponent(want.key) + '&locale=' + encodeURIComponent(want.locale)));
   if (want.path !== S.path || want.env !== S.env || want.key !== S.sel || want.locale !== S.locale) return;
   S.keyHistory = { key: want.key, locale: want.locale, rows: res.ok && Array.isArray(res.body.rows) ? res.body.rows : [] };
@@ -1227,9 +1246,10 @@ function branchBar() {
   return '<span class="bdg">' + esc(git.branch + ' · preview') + '</span>' + preview + publish;
 }
 
-/** A question the header asked (Publish to live), under the header in the removal plan's shape. */
+/** A question the header asked (Commit's panel, Publish to live), under the header in the removal plan's shape. */
 function paintAsk() {
   const box = document.getElementById('ask');
+  if (S.commitPanel !== null && ready() && !storeBacked()) { box.hidden = false; box.innerHTML = commitPanel(); return; }
   const show = S.publishAsk && previewBranch();
   box.hidden = !show;
   if (!show) { box.innerHTML = ''; return; }
@@ -1240,6 +1260,58 @@ function paintAsk() {
     esc('Publish ' + git.branch + ' to ' + liveBranch() + '? ' + liveBranch() + ' is what ' + name + ' serves.') + '</div>' +
     '<div style="margin-top:8px"><button class="btn pri sm" data-act="publishLive">Publish</button>' +
     '<button class="btn sm" data-act="publishCancel">Cancel</button></div></div></div>';
+}
+
+/**
+ * What this commit carries: each key whose value differs from HEAD with its
+ * word diff and Put back where HEAD holds a value, then the files, then Commit.
+ */
+function commitPanel() {
+  const p = S.commitPanel;
+  const keys = Array.isArray(p.keys) ? p.keys : [];
+  const files = Array.isArray(p.files) ? p.files : [];
+  const named = new Set(keys.map((k) => k.key));
+  const rows = keys.map((k, i) => {
+    const was = own(k, 'head') ? shown(k.head) : '';
+    const is = own(k, 'now') ? shown(k.now) : '';
+    return '<div style="margin-bottom:8px"><div class="mono" style="font-size:11.5px">' +
+      esc(k.locale === S.site.config.locales.default ? k.key : k.key + ' · ' + k.locale) + '</div>' +
+      '<div class="term">' + esc(own(k, 'head') ? wordDiff(was, is) : is) + '</div>' +
+      (own(k, 'head') ? '<button class="btn sm" data-act="putBack:' + i + '">Put back</button>' : '') + '</div>';
+  }).join('');
+  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">' +
+    esc('What this commit carries · ' + plural(named.size, 'key') + ' · ' + plural(files.length, 'file')) + '</h3></div>' +
+    '<div class="cb">' + rows +
+    files.map((f) => '<div class="muted mono" style="font-size:11px">' + esc(f) + '</div>').join('') +
+    (p.error ? '<div class="err">' + esc(p.error) + '</div>' : '') +
+    '<div style="margin-top:8px"><button class="btn pri sm" data-act="commitApply"' + (files.length === 0 ? ' disabled' : '') + '>Commit</button>' +
+    '<button class="btn sm" data-act="commitCancel">Cancel</button></div></div></div>';
+}
+/** Two values word by word, an LCS over whitespace-split words: removed runs `[-…-]`, added runs `[+…+]`. */
+function wordDiff(a, b) {
+  const x = a.split(/\s+/).filter((w) => w !== '');
+  const y = b.split(/\s+/).filter((w) => w !== '');
+  const t = Array.from({ length: x.length + 1 }, () => new Array(y.length + 1).fill(0));
+  for (let i = x.length - 1; i >= 0; i -= 1) {
+    for (let j = y.length - 1; j >= 0; j -= 1) t[i][j] = x[i] === y[j] ? t[i + 1][j + 1] + 1 : Math.max(t[i + 1][j], t[i][j + 1]);
+  }
+  const out = [];
+  let del = [];
+  let ins = [];
+  const flush = () => {
+    if (del.length > 0) out.push('[-' + del.join(' ') + '-]');
+    if (ins.length > 0) out.push('[+' + ins.join(' ') + '+]');
+    del = []; ins = [];
+  };
+  let i = 0;
+  let j = 0;
+  while (i < x.length || j < y.length) {
+    if (i < x.length && j < y.length && x[i] === y[j]) { flush(); out.push(x[i]); i += 1; j += 1; }
+    else if (j < y.length && (i === x.length || t[i][j + 1] >= t[i + 1][j])) { ins.push(y[j]); j += 1; }
+    else { del.push(x[i]); i += 1; }
+  }
+  flush();
+  return out.join(' ');
 }
 
 // CSI sequences (colour, cursor) and OSC ones (a hyperlink or a title, ended by BEL or ESC backslash).
@@ -1505,7 +1577,7 @@ function clockShort(at) {
 
 function editorColumn() {
   return '<div style="display:flex;flex-direction:column;gap:11px;min-width:0">' + changeBar() + takeoverCard() +
-    '<div class="card">' + editorCard() + '</div>' + storeHistoryCard() +
+    '<div class="card">' + editorCard() + '</div>' + storeHistoryCard() + gitHistoryCard() +
     historyCard() + '</div>';
 }
 
@@ -1719,6 +1791,10 @@ function bar(id) {
   const over = S.overLimit
     ? ask(S.overLimit, '<button class="btn pri sm" data-act="saveAnyway">Save anyway</button>', 'saveCancel')
     : '';
+  const staleBox = S.staleKeys.map((k, i) => '<div class="cb"><div class="term">' +
+    esc(k.key + ' changed on disk since you opened it: "' + (k.disk === null ? '' : shown(k.disk)) + '"') + '</div>' +
+    '<div style="margin-top:8px"><button class="btn sm" data-act="useTheirs:' + i + '">Use theirs</button>' +
+    '<button class="btn pri sm" data-act="saveMine:' + i + '">Save mine over it</button></div></div>').join('');
   const split = S.split && S.split.key === id
     ? ask([S.split.at], '<button class="btn pri sm" data-act="splitApply">Split</button>', 'splitCancel',
       '<input class="in sm mono" style="margin-top:8px" value="' + esc(S.split.name) + '" data-act-input="splitName">')
@@ -1732,7 +1808,7 @@ function bar(id) {
     (storeBacked()
       ? '<button class="btn env" data-act="publish">Publish</button><button class="btn" data-act="discard">Discard</button>'
       : '') +
-    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button></div>' + aloneLine(id) + removal + same + over + split;
+    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button></div>' + aloneLine(id) + staleBox + removal + same + over + split;
 }
 
 /** A stamp as `YYYY-MM-DD HH:MM` on this machine's clock. */
@@ -1755,8 +1831,18 @@ function storeHistoryCard() {
       '<button class="btn sm" data-act="historyRestore:' + esc(r.id) + '">Restore</button>' +
       (name === null ? '' : '<button class="btn sm" data-act="previewChange:' + esc(r.changesetId) + '">Preview change</button>') + '</div>';
   }).join('');
-  return '<div class="card" id="keyhistory"><div class="ch"><h3 style="font-size:12.5px">History</h3></div>' +
+  return '<div class="card" id="keyhistory"><div class="ch"><h3 style="font-size:12.5px">Key history</h3></div>' +
     '<div class="cb">' + (h.error ? '<div class="err">' + esc(h.error) + '</div>' : '') + rows + '</div></div>';
+}
+/** Below the editor on a snapshot site: the selected key's past values from git, each with Restore, which loads it as an unsaved edit. */
+function gitHistoryCard() {
+  const h = S.keyHistory;
+  if (storeBacked() || h === null || h.key !== S.sel || !Array.isArray(h.versions) || (h.versions.length === 0 && !h.truncated)) return '';
+  const rows = h.versions.map((v) => '<div style="margin-bottom:6px"><div class="hline">' +
+    esc('v' + v.n + ' · ' + v.short + ' · ' + stampShort(v.date) + ' · ' + v.author + ' · ' + rowPreview(v.value)) + '</div>' +
+    '<button class="btn sm" data-act="gitRestore:' + esc(v.n) + '"' + (own(v, 'value') ? '' : ' disabled') + '>Restore</button></div>').join('');
+  return '<div class="card" id="keyhistory"><div class="ch"><h3 style="font-size:12.5px">Key history</h3></div>' +
+    '<div class="cb">' + rows + (h.truncated ? '<div class="note">Some older versions are too large to show.</div>' : '') + '</div></div>';
 }
 /** Restore: one past version published again, forward, its key checked against the version by the mount. */
 async function restoreVersion(id) {
@@ -1785,27 +1871,32 @@ function historyCard() {
   const rows = (S.history && S.history.commits) || [];
   const body = S.history === null
     ? '<div class="cb muted">Not loaded. <button class="btn sm" data-act="history">Load</button></div>'
-    : S.history.mount
-      ? '<div class="cb muted">This site is store-backed — its history is the store&rsquo;s, at ' +
-        '<span class="mono">' + esc(S.history.mount) + '</span>.</div>'
-      : commitTable(rows, S.history !== null, true);
-  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">History</h3>' +
+    : commitTable(rows, S.history !== null, true);
+  return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">Commit history</h3>' +
     '<span class="bdg">' + (htmlHost() ? 'the commits that touched the snapshot or the pages' : 'the commits that touched the snapshot') +
     '</span></div>' + body + markupPanel() + '</div>';
 }
-/** Under an opened History row: the keys its commit removed, each with its section and text, and Restore. */
+/**
+ * Under an opened History row: the keys its commit removed — on a JavaScript
+ * host where each was shown at the commit's parent, else its section and text —
+ * and Restore, which a store-backed site's commits do not offer.
+ */
 function removedRow(r) {
   const keys = S.opened.keys || [];
   if (keys.length === 0 && !S.opened.error) return '';
-  const lines = keys.map((k) => esc(k.key + (k.section ? ' — ' + k.section : '') + ' — "' + rowPreview(k.text) + '"'));
+  const lines = keys.map((k) => esc(Array.isArray(k.places) && k.places.length > 0
+    ? k.key + ' was removed in ' + r.short + '. It was shown at ' + k.places.map(removedPlace).join(', ') + '.'
+    : k.key + (k.section ? ' — ' + k.section : '') + ' — "' + rowPreview(k.text) + '"'));
   const ask = S.restoreAsk
     ? '<div class="term" style="margin-top:6px">' + esc('Restore the ' + plural(keys.length, 'key') + ' ' + r.short + ' removed?') + '</div>' +
       '<div style="margin-top:6px"><button class="btn pri sm" data-act="restoreApply">Restore</button>' +
       '<button class="btn sm" data-act="restoreCancel">Cancel</button></div>'
     : '<div style="margin-top:6px"><button class="btn sm" data-act="restoreAsk"' + (dirty() ? ' disabled' : '') + '>Restore</button></div>';
   return '<tr><td colspan="3"><div class="mono" style="font-size:11px">' + lines.join('<br>') + '</div>' +
-    (S.opened.error ? '<div class="err">' + esc(S.opened.error) + '</div>' : '') + (keys.length === 0 ? '' : ask) + '</td></tr>';
+    (S.opened.error ? '<div class="err">' + esc(S.opened.error) + '</div>' : '') + (keys.length === 0 || storeBacked() ? '' : ask) + '</td></tr>';
 }
+/** A removed key's place: `<file>:<line> (<kind>)`, the kind left out where it only names the file again. */
+const removedPlace = (p) => p.file + ':' + p.line + (p.kind === 'text in ' + p.file ? '' : ' (' + p.kind + ')');
 /** The markup a restore handed back, section by section, each with Copy markup. */
 function markupPanel() {
   if (!Array.isArray(S.markup) || S.markup.length === 0) return '';
@@ -3669,6 +3760,13 @@ const ACTIONS = {
     locateKey(false);
   },
   historyRestore: (el, id) => { void guard(restoreVersion(id)); },
+  gitRestore: (el, n) => {
+    const h = S.keyHistory;
+    const v = h === null || !Array.isArray(h.versions) ? undefined : h.versions.find((x) => String(x.n) === n);
+    if (!v || !own(v, 'value')) return;
+    setDraftIn(h.locale, h.key, v.value);
+    render();
+  },
   showView: (el, view) => {
     if (S.showing === null || S.showing.kind !== 'published') return;
     S.showing.view = view === 'current' ? 'current' : 'before';
@@ -3681,13 +3779,23 @@ const ACTIONS = {
   keepTheirs: () => { keepTheirs(); },
   publish: () => { void guard(mountWrite('publish')); },
   discard: () => { void guard(mountWrite('discard')); },
-  commit: () => { void guard(commit()); },
+  commit: () => { void guard(openCommitPanel()); },
+  commitApply: () => { S.commitPanel = null; void guard(commit()); },
+  commitCancel: () => { S.commitPanel = null; render(); },
+  putBack: (el, i) => { void guard(putBack(Number(i))); },
   push: () => { void guard(push()); },
   removePlan: (el, id) => { void guard(removeKey(id, false)); },
   sameLink: () => { void guard(linkThem()); },
   sameKeep: () => { S.same = null; render(); },
   saveAnyway: () => { S.overLimit = null; void guard(save(true)); },
   saveCancel: () => { S.overLimit = null; render(); },
+  useTheirs: (el, i) => { void guard(useTheirs(Number(i))); },
+  saveMine: (el, i) => {
+    const k = S.staleKeys[Number(i)];
+    if (!k) return;
+    S.mine = S.mine.concat([k.locale + ' ' + k.key]);
+    void guard(save(true));
+  },
   previewCheck: () => { void guard(loadPreviewLink()); },
   publishAsk: () => { S.publishAsk = true; render(); },
   publishCancel: () => { S.publishAsk = false; render(); },
@@ -3953,8 +4061,22 @@ async function save(anyway) {
     await loadRows();
     return;
   }
-  const res = await post('/api/site/save' + query(), Object.assign({ values: values }, templates.length === 0 ? {} : { templates: templates }));
+  // Each value carries the stored value its edit started from (§4.7), except a
+  // key Save mine over it is resending over the disk's words.
+  const sent = values.map((v) => {
+    const k = v.locale + ' ' + v.key;
+    return own(S.base, k) && !S.mine.includes(k) ? Object.assign({}, v, { base: S.base[k] }) : v;
+  });
+  const res = await post('/api/site/save' + query(), Object.assign({ values: sent }, templates.length === 0 ? {} : { templates: templates }));
   S.findings = res.body.findings || [];
+  if (res.status === 409 && Array.isArray(res.body.stale)) {
+    // Nothing was written: each clashing key waits for Use theirs or Save mine over it.
+    S.staleKeys = res.body.stale;
+    S.message = '';
+    render();
+    return;
+  }
+  S.staleKeys = []; S.mine = [];
   if (!res.ok) {
     // A refused save wrote nothing, so whatever was already pending still is.
     S.message = res.body.error || 'the save was refused';
@@ -4005,6 +4127,52 @@ function mergedSnapshot(values) {
   return next;
 }
 
+/** Use theirs: the stale key's draft and its base dropped, and the site read again so the disk's words show. */
+async function useTheirs(i) {
+  const k = S.staleKeys[i];
+  if (!k) return;
+  const held = k.locale + ' ' + k.key;
+  delete S.draft[held];
+  delete S.base[held];
+  S.staleKeys = S.staleKeys.filter((other) => other !== k);
+  draftChanged();
+  await refreshSite();
+}
+
+/** Commit pressed: what the commit carries, read from the checkout; `error` is the line a refused Put back leaves over the read again. */
+async function openCommitPanel(error = '') {
+  clearGitError();
+  const res = await api('/api/site/carries' + query());
+  S.commitPanel = res.ok ? { keys: res.body.keys, files: res.body.files, error: error } : { keys: [], files: S.pending, error: res.body.error || 'the change list could not be read' };
+  render();
+}
+/**
+ * Put back: HEAD's value saved through the stale check and the gate, its base
+ * the disk value the panel showed; the panel read again, after a stale refusal
+ * too, with the refusal's line kept.
+ */
+async function putBack(i) {
+  const p = S.commitPanel;
+  const k = p && Array.isArray(p.keys) ? p.keys[i] : undefined;
+  if (!k || !own(k, 'head')) return;
+  const res = await post('/api/site/save' + query(), { values: [{ key: k.key, locale: k.locale, value: k.head, base: own(k, 'now') ? k.now : null }] });
+  if (!res.ok) {
+    if (Array.isArray(res.body.stale)) {
+      // The file changed again: the panel is read afresh so the next press sends the new `now`, the line kept over it.
+      await openCommitPanel(res.body.stale.map((st) => st.key + ' changed on disk since you opened it: "' + (st.disk === null ? '' : shown(st.disk)) + '"').join('\n'));
+      return;
+    }
+    p.error = res.body.error || 'the save was refused';
+    render();
+    return;
+  }
+  if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
+  takeGit(res.body.at);
+  S.site.snapshot = mergedSnapshot([{ key: k.key, locale: k.locale, value: k.head }]);
+  await openCommitPanel();
+  await loadPreview(htmlHost() ? { reload: true } : undefined);
+}
+
 /** The committable files the last reply named, committed; the server titles the commit from the snapshot. */
 async function commit() {
   clearGitError();
@@ -4019,6 +4187,8 @@ async function commit() {
   tst('Committed ' + res.body.short + ' — ' + res.body.subject);
   S.pending = Array.isArray(res.body.pending) ? res.body.pending : [];
   takeGit(res.body.at);
+  // The commit is the key's newest past value.
+  void guard(loadKeyHistory());
   const entry = (ready() && S.site.entry) || {};
   if (entry.pushAfterCommit) await push();
   else render();

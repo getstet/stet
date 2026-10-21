@@ -56,6 +56,7 @@ import {
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
 import { closing, dialectCode, KEY_READ, openTag, within } from './key-reads.js';
+import { keyHistory } from './key-history.js';
 import { isGenerated, keyUsage, namedKeys, ownFiles, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
 import { applyPages, auditablePages, fileRoute, proposeForHost, routeFiles, servedRoute } from './pages.js';
@@ -449,6 +450,10 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await splitPlace(req, site);
       case 'GET site/history':
         return history(site);
+      case 'GET site/carries':
+        return carries(site);
+      case 'GET site/key-history':
+        return await keyHistoryReply(url, site);
       case 'GET site/removed':
         return removed(url, site);
       case 'POST site/restore':
@@ -601,18 +606,29 @@ async function save(ctx: DevContext, req: Request, site: SiteState): Promise<Res
   const descriptor = structuredClone(ready.descriptor);
   const next = structuredClone(ready.snapshot);
   const edits: Array<{ key: string; locale: string; value: unknown }> = [];
+  const stale: Array<{ key: string; locale: string; disk: unknown }> = [];
   for (const raw of values) {
-    if (typeof raw !== 'object' || raw === null) throw new UsageError('each value is { key, locale?, value }');
-    const entry = raw as { key?: unknown; locale?: unknown; value?: unknown };
+    if (typeof raw !== 'object' || raw === null) throw new UsageError('each value is { key, locale?, value, base? }');
+    const entry = raw as { key?: unknown; locale?: unknown; value?: unknown; base?: unknown };
     const key = typeof entry.key === 'string' ? entry.key : '';
     const locale = typeof entry.locale === 'string' ? entry.locale : config.locales.default;
     if (!Object.hasOwn(descriptor.keys, key)) return json({ error: `undeclared key: ${key}` }, 400);
     const from = descriptor.keys[key]?.derivesFrom;
     if (from !== undefined) return json({ error: `${key} derives from ${from} — edit its template instead` }, 400);
     if (!config.locales.enabled.includes(locale)) return json({ error: `locale ${locale} is not enabled` }, 400);
+    // The stored value the edit started from, against the disk's as this
+    // request read it: an agent's or another process's write since is never
+    // silently overwritten. A value sent without a base is not checked.
+    if (Object.hasOwn(entry, 'base')) {
+      const block = Object.hasOwn(ready.snapshot, locale) ? ready.snapshot[locale] : undefined;
+      const disk = block !== undefined && Object.hasOwn(block, key) ? block[key] : null;
+      if (JSON.stringify(canonicalize(disk)) !== JSON.stringify(canonicalize(entry.base ?? null))) stale.push({ key, locale, disk });
+    }
     (next[locale] ??= {})[key] = entry.value;
     edits.push({ key, locale, value: entry.value });
   }
+  // Before the gate, and nothing written: each clashing key is named with the disk's words.
+  if (stale.length > 0) return json({ error: 'changed on disk since the page loaded', stale }, 409);
   const retemplated: string[] = [];
   for (const raw of templates) {
     if (typeof raw !== 'object' || raw === null) throw new UsageError('each template is { key, tmpl }');
@@ -1237,12 +1253,12 @@ async function splitPlace(req: Request, site: SiteState): Promise<Response> {
 
 /**
  * The commits that touched the snapshot — and, on an html host, the documents
- * beside it. Git has no per-key history, and the page labels the table as what
- * it is. A store-backed site's history is the mount's.
+ * beside it, on a snapshot site and a store-backed one alike, since both keep
+ * their forms in git. A key's own past values are `key-history`'s, or on a
+ * store-backed site the mount's.
  */
 function history(site: SiteState): Response {
   const ready = requireReady(site);
-  if (ready.mode !== 'snapshot') return json({ mount: `/s/${ready.id}/api/stet/history` });
   // The globs go to git AS globs: an expanded file list is one argv entry per
   // document, which a static site of any size pushes past the argv limit.
   const paths = [
@@ -1266,6 +1282,49 @@ function history(site: SiteState): Response {
       return { sha, short, author, at, subject };
     });
   return json({ commits });
+}
+
+/**
+ * `GET site/carries` — what a commit would carry: each key and locale whose
+ * canonical value on disk differs from HEAD's snapshot, with `head` (absent for a
+ * key new since HEAD) and `now` (absent where the disk holds none), and the
+ * pending forms. Put back saves `head` with `now` as its base.
+ */
+function carries(site: SiteState): Response {
+  const ready = requireReady(site);
+  const committed: Snapshot = formsAt(ready, 'HEAD')?.snapshot ?? {};
+  const blockOf = (forms: Snapshot, locale: string): Record<string, unknown> => (Object.hasOwn(forms, locale) ? forms[locale] ?? {} : {});
+  const own = (block: Record<string, unknown>, key: string): unknown => (Object.hasOwn(block, key) ? block[key] : undefined);
+  const keys: Array<{ key: string; locale: string; head: unknown; now: unknown }> = [];
+  for (const locale of new Set([...Object.keys(committed), ...Object.keys(ready.snapshot)])) {
+    const was = blockOf(committed, locale);
+    const is = blockOf(ready.snapshot, locale);
+    for (const key of new Set([...Object.keys(was), ...Object.keys(is)])) {
+      const head = own(was, key);
+      const now = own(is, key);
+      if (JSON.stringify(canonicalize(head)) !== JSON.stringify(canonicalize(now))) keys.push({ key, locale, head, now });
+    }
+  }
+  keys.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.locale < b.locale ? -1 : a.locale > b.locale ? 1 : 0));
+  return json({ keys, files: pendingForms(ready) });
+}
+
+/**
+ * `GET site/key-history?key=&locale=` — one key's past values from git
+ * (`keyHistory`), newest first, each numbered `n` oldest first, and `truncated`
+ * where a revision was too large to parse. The key must be declared and the
+ * locale enabled; the snapshot path reaches git only where it names a file
+ * inside the checkout.
+ */
+async function keyHistoryReply(url: URL, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const key = url.searchParams.get('key') ?? '';
+  const locale = url.searchParams.get('locale') ?? ready.config.locales.default;
+  if (!Object.hasOwn(ready.descriptor.keys, key)) return json({ error: `undeclared key: ${key}` }, 400);
+  if (!ready.config.locales.enabled.includes(locale)) return json({ error: `locale ${locale} is not enabled` }, 400);
+  if (insideCheckout(ready.path, join(ready.path, ready.config.snapshotPath)) === null) return json({ versions: [] });
+  const { versions, truncated } = await keyHistory(ready.path, gitSpelling(ready.config.snapshotPath), key, locale);
+  return json({ versions: versions.map((version, i) => ({ n: versions.length - i, ...version })), ...(truncated ? { truncated } : {}) });
 }
 
 /** The forms a revision holds, or null where it holds no descriptor. */
@@ -1323,15 +1382,16 @@ function firstMarks(set: HtmlProposalSet, keys: readonly string[]): Map<string, 
  * `GET site/removed?sha=` — the keys a commit removed, each with the section
  * the naming rule gives its first mark in the document at `<sha>^` (the item
  * rule's word, read above a repeated item), else the entry's `section`, and its
- * default-locale text at `<sha>^`.
+ * default-locale text at `<sha>^`; on a JavaScript host, each with the places
+ * its reads had at `<sha>^`. A store-backed site's forms are in git too.
  */
 function removed(url: URL, site: SiteState): Response {
   const ready = requireReady(site);
-  if (ready.mode !== 'snapshot') return json({ keys: [] });
   const sha = commitOf(ready, url.searchParams.get('sha') ?? '');
   const { keys, before } = removedKeysOf(ready, sha);
   if (before === null || keys.length === 0) return json({ keys: [] });
   const marks = ready.host === 'html' ? firstMarks(documentsAt(ready, `${sha}^`), keys) : new Map<string, HtmlMark>();
+  const places = ready.host === 'html' ? null : placesAt(ready, `${sha}^`, before.descriptor, keys);
   const locale = ready.config.locales.default;
   return json({
     keys: keys.map((key) => {
@@ -1340,9 +1400,45 @@ function removed(url: URL, site: SiteState): Response {
         key,
         section: marks.get(key)?.sectionWord ?? before.descriptor.keys[key]?.section ?? null,
         text: typeof value === 'string' ? value : Array.isArray(value) ? value.join(', ') : '',
+        ...(places === null ? {} : { places: places.get(key) ?? [] }),
       };
     }),
   });
+}
+
+/**
+ * Where `keys` were read at `rev` on a JavaScript host: the managed surfaces'
+ * lines git finds naming any of them (`git grep -F`, as `:(glob)` pathspecs),
+ * each file read at `rev` by the marks route's reader, and a read kept where it
+ * names one of the keys on one of those lines.
+ */
+function placesAt(site: Ready, rev: string, descriptor: Descriptor, keys: readonly string[]): Map<string, Place[]> {
+  const out = new Map<string, Place[]>();
+  if (site.config.managedSurfaces.length === 0) return out;
+  const grep = gitData(site.path, [
+    'grep', '-n', '-I', '-F', '-z',
+    ...keys.flatMap((key) => ['-e', key]),
+    rev, '--',
+    ...site.config.managedSurfaces.map((glob) => `:(glob)${glob}`),
+  ]);
+  if (grep.code !== 0) return out;
+  // Each hit is `<rev>:<file>\0<line>\0<text>`.
+  const hits = new Map<string, Set<number>>();
+  for (const record of grep.stdout.split('\n')) {
+    const [name, line] = record.split('\0');
+    if (name === undefined || line === undefined || !name.startsWith(`${rev}:`)) continue;
+    const file = name.slice(rev.length + 1);
+    hits.set(file, (hits.get(file) ?? new Set()).add(Number(line)));
+  }
+  const wanted = new Set(keys);
+  for (const [file, lines] of [...hits].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    const shown = gitData(site.path, ['show', `${rev}:./${file}`]);
+    if (shown.code !== 0) continue;
+    for (const { key, place } of readsIn(file, shown.stdout, descriptor)) {
+      if (wanted.has(key) && lines.has(place.line)) out.set(key, [...(out.get(key) ?? []), place]);
+    }
+  }
+  return out;
 }
 
 /**
@@ -1909,41 +2005,52 @@ function keyReads(site: Ready): Record<string, Place[]> {
     } catch {
       continue;
     }
-    const dialect = dialectOf(file);
-    const lineAt = lineIndex(source);
-    // Markup stet cannot read — nesting deeper than the tokenizer's walk, say —
-    // leaves the file's reads with their file and line, and the route answers.
-    let document: Document | null = null;
-    try {
-      if (dialect === 'html') document = readDocument(file, source, dialect);
-      else if (dialect !== null && dialect !== 'mdx') {
-        const markup = selfClosedRaw(dialect === 'vue' ? vueMarkup(source) : source);
-        document = readDocument(file, maskExpressions(markup, dialect), dialect);
-      }
-    } catch {
-      document = null;
-    }
-    const code = dialect === null ? null : dialectCode(source, dialect);
-    const spans = code === null ? null : [...code.scripts, ...code.expressions];
-    for (const found of source.matchAll(KEY_READ)) {
-      const key = found[2] ?? found[4] ?? found[5] ?? '';
-      if (!Object.hasOwn(site.descriptor.keys, key)) continue;
-      const at = found.index;
-      if (spans !== null && !within(spans, at)) continue;
-      const place: KeyPlace & { head?: true } = { file, line: lineAt(at) };
-      if (document !== null && !document.blanked.slice(at, at + found[0].length).includes('\0')) {
-        try {
-          const element = elementAt(document.roots, at);
-          Object.assign(place, element);
-          if (element.tag !== undefined && isHeadKind(place)) place.head = true;
-        } catch {
-          document = null;
-        }
-      }
-      out.set(key, [...(out.get(key) ?? []), withKind(place)]);
-    }
+    for (const { key, place } of readsIn(file, source, site.descriptor)) out.set(key, [...(out.get(key) ?? []), place]);
   }
   return Object.fromEntries(out);
+}
+
+/**
+ * One file's reads of `descriptor`'s keys, each with its place and kind — the
+ * reader `keyReads` runs over the checkout, and `removed` over a revision's
+ * text.
+ */
+function readsIn(file: string, source: string, descriptor: Descriptor): Array<{ key: string; place: Place }> {
+  const reads: Array<{ key: string; place: Place }> = [];
+  const dialect = dialectOf(file);
+  const lineAt = lineIndex(source);
+  // Markup stet cannot read — nesting deeper than the tokenizer's walk, say —
+  // leaves the file's reads with their file and line, and the route answers.
+  let document: Document | null = null;
+  try {
+    if (dialect === 'html') document = readDocument(file, source, dialect);
+    else if (dialect !== null && dialect !== 'mdx') {
+      const markup = selfClosedRaw(dialect === 'vue' ? vueMarkup(source) : source);
+      document = readDocument(file, maskExpressions(markup, dialect), dialect);
+    }
+  } catch {
+    document = null;
+  }
+  const code = dialect === null ? null : dialectCode(source, dialect);
+  const spans = code === null ? null : [...code.scripts, ...code.expressions];
+  for (const found of source.matchAll(KEY_READ)) {
+    const key = found[2] ?? found[4] ?? found[5] ?? '';
+    if (!Object.hasOwn(descriptor.keys, key)) continue;
+    const at = found.index;
+    if (spans !== null && !within(spans, at)) continue;
+    const place: KeyPlace & { head?: true } = { file, line: lineAt(at) };
+    if (document !== null && !document.blanked.slice(at, at + found[0].length).includes('\0')) {
+      try {
+        const element = elementAt(document.roots, at);
+        Object.assign(place, element);
+        if (element.tag !== undefined && isHeadKind(place)) place.head = true;
+      } catch {
+        document = null;
+      }
+    }
+    reads.push({ key, place: withKind(place) });
+  }
+  return reads;
 }
 
 /**
