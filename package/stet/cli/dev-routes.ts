@@ -33,6 +33,7 @@ import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
+import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
 import { pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
 import { isBarePackage } from './email-extract.js';
 import { filesForGlobs, staticPrefix } from './files.js';
@@ -74,6 +75,7 @@ import {
   addSite,
   blockVariables,
   connectionEnv,
+  connectionNames,
   devDefaults,
   foreignConnectionNames,
   foregroundEnv,
@@ -140,6 +142,8 @@ export interface DevContext {
   auditCli?: string;
   /** Each site's unread-key facts, per file, kept between `usage` requests. */
   usage?: Map<string, UsageCache>;
+  /** Test seam: the deadline a host template render is killed at, in place of the render seam's own. */
+  renderDeadlineMs?: number;
 }
 
 /**
@@ -437,6 +441,8 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await siteReply(site, entry, ctx.launched);
       case 'POST site/save':
         return await save(ctx, req, site);
+      case 'POST site/email-preview':
+        return await emailPreview(ctx, req, site);
       case 'POST site/commit':
         return await commit(ctx, req, site);
       case 'POST site/push':
@@ -1691,6 +1697,39 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
 }
 
 /**
+ * The email preview: one declared template rendered through its render pointer
+ * with the request's drafts over the snapshot's words, or over the selected
+ * environment's drafts on a store-backed site. The reply is JSON — the markup is
+ * host code's output and travels as data, for a frame that runs no scripts — or
+ * `{ failure }` naming why nothing rendered.
+ */
+async function emailPreview(ctx: DevContext, req: Request, site: SiteState): Promise<Response> {
+  const ready = requireReady(site);
+  const body = await readJson(req);
+  const name = reqStr(body, 'template');
+  if (!Object.hasOwn(ready.descriptor.templates ?? {}, name)) return json({ error: `unknown template: ${name}` }, 400);
+  const locale = typeof body['locale'] === 'string' ? body['locale'] : ready.config.locales.default;
+  if (!ready.config.locales.enabled.includes(locale)) return json({ error: `locale ${locale} is not enabled` }, 400);
+  const sent = body['drafts'] ?? {};
+  if (typeof sent !== 'object' || sent === null || Array.isArray(sent)) throw new UsageError('drafts is { key: value }');
+  const env = typeof body['env'] === 'string' ? body['env'] : undefined;
+  const store = ready.mode === 'snapshot' ? null : await storeOf(ctx, ready, env);
+  const drafts = new Map(Object.entries(sent));
+  return json(await renderPreview(renderIo(ctx, ready), ready, store, { template: name, locale, drafts }, ctx.renderDeadlineMs));
+}
+
+/**
+ * The environment a host template renders in: the checkout's `.env` files and
+ * the base variables. No connection variable of any environment reaches host
+ * code, and the run token is out of it.
+ */
+function renderIo(ctx: DevContext, ready: Extract<SiteState, { state: 'ready' }>): CliIo {
+  const env = connectionEnv(ready, ctx.launched);
+  for (const name of [...connectionNames(ready.config), 'STET_DEV_TOKEN']) delete env[name];
+  return siteIo(ready.path, env, { out: [], err: [] });
+}
+
+/**
  * `/s/<id>/api/stet/<route>` — the package's own mounted handler over this
  * site's store.
  *
@@ -1703,10 +1742,20 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
 async function mountRoute(ctx: DevContext, req: Request, url: URL): Promise<Response> {
   return withSite(ctx, url, async (site) => {
     const ready = requireReady(site);
+    const store = await storeOf(ctx, ready, envOf(url));
+    // `stet dev` carries the compiler, so its mount renders through each template's
+    // pointer; `createStetHandler` itself reaches no child process. A test send is
+    // wired only where the config names the host's send function, and sends what
+    // this request's render produced.
+    const io = renderIo(ctx, ready);
+    const last: LastRender = { current: null };
+    const emailSend = ready.config.emailSend;
     const handler = createStetHandler({
-      store: await storeOf(ctx, ready, envOf(url)),
+      store,
       descriptor: ready.descriptor,
       auth: 'STET_DEV_TOKEN',
+      renderEmail: mountRenderer(io, ready, store, last, ctx.renderDeadlineMs),
+      ...(emailSend === undefined ? {} : { sendTest: mountSender(io, ready, emailSend, last, ctx.renderDeadlineMs) }),
     });
     if (req.method === 'GET') return handler.GET(req);
     if (req.method === 'POST') return handler.POST(req);

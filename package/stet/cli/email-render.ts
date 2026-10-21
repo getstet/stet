@@ -12,7 +12,7 @@
  * result (`{ subject, html }`) compare under one rule.
  */
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path';
 
@@ -111,10 +111,10 @@ const RENDER_TIMEOUT_MS = 30_000;
  * is started with. Reporting them as a thrown render sends the reader looking
  * for a stack trace their template never produced.
  */
-function ceilingDetail(error: NodeJS.ErrnoException): string {
+function ceilingDetail(error: NodeJS.ErrnoException, timeoutMs: number): string {
   if (error.code === 'ETIMEDOUT') {
     return (
-      `the render did not finish within ${RENDER_TIMEOUT_MS / 1000}s and the child was killed — ` +
+      `the render did not finish within ${timeoutMs / 1000}s and the child was killed — ` +
       'this template blocks when it is called (a network call, a wait on input, a loop that does not end). ' +
       'Render it behind a guard, or declare this entry without a render pointer so it is reported unverifiable'
     );
@@ -136,33 +136,108 @@ function ceilingDetail(error: NodeJS.ErrnoException): string {
   return error.message;
 }
 
-export function renderTemplate(io: CliIo, request: RenderRequest): RenderResult {
+/** The runner's command line for one request: the script, then its arguments. */
+function runnerArgv(request: RenderRequest): string[] {
   const runner = join(packageRoot(), 'templates', 'email-runner.cjs');
-  const child = spawnSync(
-    process.execPath,
-    [runner, request.hostDir, request.file, request.exportName, JSON.stringify(request.props), ...runnerOptions(request)],
-    {
-      cwd: io.cwd,
-      env: io.env,
-      encoding: 'utf8',
-      maxBuffer: MAX_OUTPUT,
-      timeout: RENDER_TIMEOUT_MS,
-      killSignal: 'SIGKILL',
-    },
-  );
+  return [runner, request.hostDir, request.file, request.exportName, JSON.stringify(request.props), ...runnerOptions(request)];
+}
 
+/** What a finished child leaves: the error `spawn` or a ceiling raised, else its exit status and what it wrote. */
+interface ChildOutcome {
+  error?: NodeJS.ErrnoException;
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+export function renderTemplate(io: CliIo, request: RenderRequest): RenderResult {
+  const child = spawnSync(process.execPath, runnerArgv(request), {
+    cwd: io.cwd,
+    env: io.env,
+    encoding: 'utf8',
+    maxBuffer: MAX_OUTPUT,
+    timeout: RENDER_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+  });
+  return renderOutcome(
+    { ...(child.error === undefined ? {} : { error: child.error as NodeJS.ErrnoException }), status: child.status, stdout: child.stdout ?? '', stderr: child.stderr ?? '' },
+    RENDER_TIMEOUT_MS,
+  );
+}
+
+/**
+ * The same render, asynchronous: the contract of `renderTemplate` — same
+ * command line, environment, output ceiling, deadline and SIGKILL, and never a
+ * throw — for a caller that is a server. `spawnSync` would hold every route of
+ * `stet dev` for as long as a template hangs. The deadline is an argument so a
+ * fixture can reach it in a second; the callers take the default.
+ */
+export function renderTemplateAsync(io: CliIo, request: RenderRequest, timeoutMs: number = RENDER_TIMEOUT_MS): Promise<RenderResult> {
+  return new Promise((resolve) => {
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let ceiling: NodeJS.ErrnoException | undefined;
+    let settled = false;
+    const done = (outcome: ChildOutcome): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(renderOutcome(outcome, timeoutMs));
+    };
+    const failed = (error: NodeJS.ErrnoException): void => done({ error, status: null, stdout: '', stderr: '' });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(process.execPath, runnerArgv(request), { cwd: io.cwd, env: io.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      resolve(renderOutcome({ error: error as NodeJS.ErrnoException, status: null, stdout: '', stderr: '' }, timeoutMs));
+      return;
+    }
+    const stop = (error: NodeJS.ErrnoException): void => {
+      ceiling ??= error;
+      child.kill('SIGKILL');
+    };
+    const timer = setTimeout(() => stop(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })), timeoutMs);
+    // `maxBuffer` is a ceiling per stream, as `spawnSync` applies it.
+    const collect = (into: Buffer[]): ((chunk: Buffer) => void) => {
+      let size = 0;
+      return (chunk) => {
+        size += chunk.length;
+        if (size > MAX_OUTPUT) stop(Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' }));
+        else into.push(chunk);
+      };
+    };
+    child.stdout?.on('data', collect(out));
+    child.stderr?.on('data', collect(err));
+    child.on('error', failed);
+    // A ceiling hit ends the answer with the child: pipes a grandchild holds open must not hold it.
+    child.on('exit', () => {
+      if (ceiling !== undefined) failed(ceiling);
+    });
+    child.on('close', (status) =>
+      done({
+        ...(ceiling === undefined ? {} : { error: ceiling }),
+        status,
+        stdout: Buffer.concat(out).toString('utf8'),
+        stderr: Buffer.concat(err).toString('utf8'),
+      }),
+    );
+  });
+}
+
+/** The exit table applied to a finished child: the one mapping both renders share. */
+function renderOutcome(child: ChildOutcome, timeoutMs: number): RenderResult {
   if (child.error !== undefined) {
     // Three failures arrive as an ERROR rather than an exit, and each names a
     // ceiling this seam owns. "The renderer threw" would send an adopter
     // reading a stack that does not exist for any of them.
-    return { ok: false, reason: 'render-threw', detail: ceilingDetail(child.error as NodeJS.ErrnoException) };
+    return { ok: false, reason: 'render-threw', detail: ceilingDetail(child.error, timeoutMs) };
   }
 
-  const stderr = (child.stderr ?? '').trim();
+  const stderr = child.stderr.trim();
   const status = child.status;
 
   if (status === 0) {
-    const out = (child.stdout ?? '').trim();
+    const out = child.stdout.trim();
     // The runner mutes host writes to stdout, so unparseable output means the
     // runner itself misbehaved — reported, never returned as a render.
     try {
@@ -267,6 +342,39 @@ export function templateProps(
     values[key] = substituted;
   }
   return { values };
+}
+
+/**
+ * The subject a template's email carries when it has no map subject of its own:
+ * the filled `subject` slot, else a declared `<name>__subject` key's resolved
+ * value (a key that is not a slot has no variables to fill); null where
+ * neither is text.
+ */
+export function slotSubject(
+  name: string,
+  entry: TemplateDef,
+  descriptor: Descriptor,
+  values: Record<string, unknown>,
+  valueOf: (key: string) => unknown,
+): string | null {
+  const subjectKey = `${name}__subject`;
+  const subject = entry.slots.includes('subject')
+    ? values[subjectKey]
+    : Object.hasOwn(descriptor.keys, subjectKey)
+      ? valueOf(subjectKey)
+      : undefined;
+  return typeof subject === 'string' ? subject : null;
+}
+
+/** The pointer's request with the host send function and the message around it: `email test` and the dashboard's Test send. */
+export function sendRequest(
+  probe: RenderRequest,
+  props: Record<string, unknown>,
+  name: string,
+  subject: string | null,
+  send: { file: string; export: string; to: string },
+): RenderRequest {
+  return { ...probe, props, send: { file: send.file, export: send.export, message: { to: send.to, subject, template: name } } };
 }
 
 /** The render request a declared template's pointer makes, props supplied by the caller; null without a pointer. */

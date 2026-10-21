@@ -118,6 +118,8 @@ body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-ev
 @media(max-width:760px){#main{display:flex;flex-direction:column}#main>*{min-width:0}.edcol{order:-1}.edcol>*{min-width:0}.edcard{order:-1}}
 /* On a short phone screen the frame is capped so it and the selected field fit together. */
 @media(max-width:760px){.devwrap{height:min(420px,calc(100vh - 230px));min-height:0}}
+@media(max-width:760px){[data-tpl] .ch h3,[data-tpl-meta] span{overflow-wrap:anywhere;min-width:0}}
+@media(max-width:760px){[data-tpl-send] .btn,[data-tpl-send] .in{min-height:36px}}
 .btn.amb{border-color:hsl(38 75% 45%);color:hsl(38 80% 38%);font-weight:700}
 [data-theme="dark"] .btn.amb{color:hsl(38 85% 62%)}
 .pg{border:1px solid hsl(var(--bd));border-radius:8px;overflow:hidden}
@@ -438,6 +440,11 @@ const S = {
   warn: null,
   moved: null,
   pageInfo: false,
+  // The Templates tab: the slot being edited, the frame's width preset, and each template's last render
+  // ({ html, subject, preheader, failure, ... }) under the project, environment and language it was made for.
+  tplKey: null,
+  tplWidth: 'desktop',
+  tpl: { ctx: '', byName: {} },
 };
 // What each site's censuses found, for the life of the tab.
 const SEEN = new Map();
@@ -578,7 +585,7 @@ function setDraftIn(loc, id, value) {
     if (!own(S.base, k)) S.base[k] = saved === undefined ? null : saved;
     S.draft[k] = value;
   }
-  draftChanged();
+  draftChanged(id);
 }
 function setDraft(id, value) { setDraftIn(S.locale, id, value); }
 /** A key's value with one list entry or record field replaced by `text`; the text itself for a plain value. */
@@ -640,6 +647,7 @@ async function loadSite(path) {
   S.census = null; S.hover = null; S.choose = null; S.usage = null; S.routeReads = null; routeReadsFor = null;
   S.unmanaged = null; S.warn = null; S.moved = null; S.pageInfo = false;
   S.unsavedOpen = false; S.leaveAsk = null; S.renaming = null;
+  S.tplKey = null; S.tpl = { ctx: '', byName: {} };
   // A new checkout is a new route field and a new frame, and ends any start
   // wait still running for the last one.
   paneGen += 1;
@@ -705,6 +713,7 @@ async function loadRows() {
   const res = await api(mountPath('keys'));
   if (path !== S.path || env !== S.env) return;
   S.rows = res.ok && Array.isArray(res.body.rows) ? res.body.rows : null;
+  queueTemplates();
   render();
   postCensus();
   locateKey(false);
@@ -1200,6 +1209,7 @@ function render() {
   paintAsk();
   document.getElementById('main').innerHTML = view();
   paintPane();
+  if (S.tab === 'Templates' && ready()) paintTemplates();
   restoreFocus();
 }
 
@@ -1463,6 +1473,7 @@ function paintDirty() {
   count.textContent = dirty() ? plural(edits(), 'unsaved edit') : '';
   // The list under the header follows the count.
   if (S.unsavedOpen) paintAsk();
+  paintUnsavedNotes();
 }
 
 const ENV_CLASSES = { default: 'local', prod: 'prod', production: 'prod', staging: 'staging', preview: 'preview' };
@@ -1714,7 +1725,7 @@ function editorCard() {
     : '';
 
   return head + '<div class="cb">' + fallback + field(id, def, value, max) +
-    findingsBlock(id) + '</div>' + bar(id);
+    findingsBlock(id) + '</div>' + saveBar(id);
 }
 
 /** Under the editor's header: what element the key is and where, what it derives from, and what derives from it. */
@@ -1868,7 +1879,7 @@ function sourceBlock(id) {
 
 /** What the last save said about this key, under the field it is about. */
 function findingsBlock(id) {
-  const mine = S.findings.filter((f) => f.key === id || (f.key || '').indexOf(id) === 0);
+  const mine = id === null ? S.findings : S.findings.filter((f) => f.key === id || (f.key || '').indexOf(id) === 0);
   if (mine.length === 0 && S.message === '') return '';
   return '<div id="refusal">' + (S.message ? '<div class="err">' + esc(S.message) + '</div>' : '') +
     (mine.length === 0 ? '' : '<ul class="findings">' + mine.map((f) =>
@@ -1885,10 +1896,13 @@ function clearRefusal() {
 }
 
 /**
- * The save bar: Save, Remove key and the removal plan. Commit and Push live in
- * the page header (`gitBar`), where they are visible with no key selected.
+ * The save bar: Save, Remove key and the removal plan, with the asks a save
+ * raises. It is the Content editor's and the Templates tab's alike, and its
+ * Save saves every draft; `id` is the selected key, or null where none is
+ * (Remove key needs one). Commit and Push live in the page header (`gitBar`),
+ * where they are visible with no key selected.
  */
-function bar(id) {
+function saveBar(id) {
   const removal = S.removal
     ? '<div class="cb"><div class="term">' + esc(S.removal.lines.join('\n')) + '</div>' +
       '<div style="margin-top:8px"><button class="btn dg sm" data-act="removeApply">Remove</button>' +
@@ -1909,7 +1923,7 @@ function bar(id) {
     esc(k.key + ' changed on disk since you opened it: "' + (k.disk === null ? '' : shown(k.disk)) + '"') + '</div>' +
     '<div style="margin-top:8px"><button class="btn sm" data-act="useTheirs:' + i + '">Use theirs</button>' +
     '<button class="btn pri sm" data-act="saveMine:' + i + '">Save mine over it</button></div></div>').join('');
-  const split = S.split && S.split.key === id
+  const split = S.split && (id === null || S.split.key === id)
     ? ask([S.split.at], '<button class="btn pri sm" data-act="splitApply">Split</button>', 'splitCancel',
       '<input class="in sm mono" style="margin-top:8px" value="' + esc(S.split.name) + '" data-act-input="splitName">')
     : '';
@@ -1922,7 +1936,8 @@ function bar(id) {
     (storeBacked()
       ? '<button class="btn env" data-act="publish">Publish</button><button class="btn" data-act="discard">Discard</button>'
       : '') +
-    '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button></div>' + aloneLine(id) + staleBox + removal + same + over + split;
+    (id === null ? '' : '<button class="btn dg sm" data-act="removePlan:' + esc(id) + '">Remove key</button>') +
+    '</div>' + (id === null ? '' : aloneLine(id)) + staleBox + removal + same + over + split;
 }
 
 /** A stamp as `YYYY-MM-DD HH:MM` on this machine's clock. */
@@ -2522,10 +2537,11 @@ function locateKey(scroll) {
   });
   postLayer();
 }
-function draftChanged() {
+function draftChanged(id) {
   clearTimeout(draftTimer);
   draftTimer = setTimeout(() => locateKey(false), DRAFT_MS);
   paintPaneCards();
+  queueTemplates(id);
 }
 /** A document loaded in the frame: it is asked to announce itself, and one that stays silent cannot be highlighted. */
 function previewLoaded() {
@@ -3330,15 +3346,232 @@ function vTemplates() {
         (verdict.detail ? ' <span class="muted">' + esc(verdict.detail) + '</span>' : '') : '<span class="muted">—</span>') +
       '</td></tr>' + slots;
   }).join('');
-  return '<div class="card"><div class="ch"><h3>Templates</h3>' +
+  const refusal = findingsBlock(null);
+  return '<div class="card" data-tpl-save>' + (refusal === '' ? '' : '<div class="cb">' + refusal + '</div>') + saveBar(null) + '</div>' +
+    '<div class="card"><div class="ch"><h3>Templates</h3>' +
     '<button class="btn sm" data-act="verify">Run</button></div>' +
     '<table><thead><tr><th style="width:170px">Template</th><th style="width:120px">Class</th><th>Verdict</th></tr></thead>' +
-    '<tbody>' + (rows || '<tr><td colspan="3" class="muted">No templates declared.</td></tr>') + '</tbody></table>' +
-    '<div class="bar"><span class="muted" style="font-size:11.5px">' +
-    (storeBacked()
-      ? 'The assembled preview is not built yet.'
-      : 'the assembled preview needs a store-backed site — a snapshot site has no render route') +
-    '</span></div></div>';
+    '<tbody>' + (rows || '<tr><td colspan="3" class="muted">No templates declared.</td></tr>') + '</tbody></table></div>' +
+    pointered().map(emailCard).join('');
+}
+
+// --- the email preview ---------------------------------------------------------
+// The server renders each template through its render pointer with the slot values wrapped in markers
+// (`POST /api/site/email-preview`); the page only places the markup it is handed in a frame that runs no
+// scripts and reads the clicks that frame holds.
+const TPL_WIDTHS = { desktop: 640, mobile: 375 };
+const TPL_WAIT_MS = 400;
+let tplTimer = null;
+const wiredFrames = new WeakSet();
+
+/** The templates that declare a render pointer, by name. */
+const pointered = () => {
+  const templates = (ready() && S.site.descriptor.templates) || {};
+  return Object.keys(templates).sort().filter((name) => !!templates[name].render);
+};
+const tplSlotKeys = (name) => (((S.site.descriptor.templates || {})[name] || {}).slots || []).map((slot) => name + '__' + slot);
+/** The template that owns a slot key, or null. */
+const tplOwner = (id) => pointered().find((name) => tplSlotKeys(name).indexOf(id) !== -1) || null;
+/** What a render is valid for: the project, the environment and the language. */
+const tplContext = () => S.path + '\n' + S.env + '\n' + S.locale;
+function tplEntry(name) {
+  if (S.tpl.ctx !== tplContext()) S.tpl = { ctx: tplContext(), byName: {} };
+  if (!own(S.tpl.byName, name)) S.tpl.byName[name] = { loading: false, stale: false, loaded: false, html: null, subject: '', preheader: '', failure: null, sendOpen: false, to: '', sending: false, sendMsg: '', sendBad: false };
+  return S.tpl.byName[name];
+}
+
+/** One template's card: Subject and Preview, the width presets, the email in its frame, the slot being edited. */
+function emailCard(name) {
+  return '<div class="card" data-tpl="' + esc(name) + '"><div class="ch"><h3>' + esc(name) + '</h3>' +
+    '<span class="tg">' + [['desktop', 'Desktop'], ['mobile', 'Mobile']].map((w) => '<button class="' + (S.tplWidth === w[0] ? 'on' : '') +
+      '" data-act="tplWidth:' + w[0] + '">' + w[1] + '</button>').join('') + '</span></div>' +
+    '<div data-tpl-meta="' + esc(name) + '">' + tplMeta(name) + '</div>' +
+    '<div class="cb"><div data-tpl-fail="' + esc(name) + '">' + tplFail(name) + '</div>' +
+    '<div data-tpl-box="' + esc(name) + '">' + tplFrame(name) + '</div>' +
+    '<p class="note">Images hosted on other sites don\'t show in this preview.</p>' +
+    (storeBacked() ? '<div data-tpl-send="' + esc(name) + '" style="margin-bottom:9px">' + tplSend(name) + '</div>' : '') +
+    '<div data-tpl-field="' + esc(name) + '">' + slotEditor(name) + '</div></div></div>';
+}
+/** `Subject <text>` and `Preview <text>`, each with its key, which selects the slot. */
+function tplMeta(name) {
+  const e = tplEntry(name);
+  const slots = tplSlotKeys(name);
+  const line = (label, text, slot) => '<div class="kline"><span><b>' + label + '</b> ' +
+    (text === '' || text === null ? '<span class="muted">(empty)</span>' : esc(text)) + '</span>' +
+    (slots.indexOf(name + '__' + slot) === -1 ? '' : '<span><button class="btn sm mono" data-act="tplSlot:' + esc(name + '__' + slot) + '">' +
+      esc(name + '__' + slot) + '</button></span>') + '</div>';
+  return line('Subject', e.loaded ? e.subject : '', 'subject') + line('Preview', e.loaded ? e.preheader : '', 'preheader');
+}
+function tplFail(name) {
+  const e = tplEntry(name);
+  if (e.failure) return '<div class="err">' + esc(e.failure.reason + ': ' + e.failure.detail) + '</div>';
+  return e.loaded ? '' : '<div class="muted" style="font-size:11.5px">Rendering…</div>';
+}
+/** The sandboxed frame: no scripts run in it, and the page reads its clicks. */
+function tplFrame(name) {
+  const e = tplEntry(name);
+  if (e.html === null || e.failure) return '';
+  return '<iframe sandbox="allow-same-origin" data-tpl-frame="' + esc(name) + '" title="' + esc('Email preview: ' + name) + '" srcdoc="' + esc(e.html) +
+    '" style="display:block;margin:0 auto;width:' + TPL_WIDTHS[S.tplWidth] + 'px;max-width:100%;height:' + (e.height || 320) +
+    'px;border:1px solid hsl(var(--bd));border-radius:6px;background:#fff"></iframe>';
+}
+/** Whether `to` can be sent to: an address with an `@` and no line break (the mount refuses one that has). */
+const tplToOk = (to) => to.indexOf('@') !== -1 && !/[\r\n]/.test(to);
+/** What a test send leaves out: the words typed and not yet saved. */
+const tplUnsaved = () => !dirty() ? '' : plural(edits(), 'unsaved edit') + (edits() === 1 ? ' is' : ' are') + ' not in this email.';
+/** A store-backed template's Test send: a button, then the address and Send; the host's own function sends the saved drafts. */
+function tplSend(name) {
+  const e = tplEntry(name);
+  const line = e.sendMsg === '' ? '' : '<div class="' + (e.sendBad ? 'err' : 'muted') + '" role="status" style="font-size:11.5px;margin-top:5px">' + esc(e.sendMsg) + '</div>';
+  if (!e.sendOpen) return '<button class="btn sm" data-act="tplSendOpen:' + esc(name) + '">Test send…</button>' + line;
+  return '<div class="derive"><input class="in sm" type="text" inputmode="email" autocomplete="off" spellcheck="false" aria-label="Send the test email to" value="' +
+    esc(e.to) + '" data-act-input="tplTo:' + esc(name) + '">' +
+    '<button class="btn pri sm" data-act="tplSendGo:' + esc(name) + '"' + (tplToOk(e.to) && !e.sending ? '' : ' disabled') + '>Send</button>' +
+    '<button class="btn sm" data-act="tplSendClose:' + esc(name) + '">Cancel</button></div>' +
+    '<p class="note" data-tpl-unsaved="' + esc(name) + '">' + esc(tplUnsaved()) + '</p>' + line;
+}
+function paintSend(name) {
+  const box = document.querySelector('[data-tpl-send="' + name.replace(/"/g, '') + '"]');
+  if (box !== null) box.innerHTML = tplSend(name);
+}
+/** The note under each open address field, which follows the unsaved count as words are typed. */
+function paintUnsavedNotes() {
+  for (const note of document.querySelectorAll('[data-tpl-unsaved]')) note.textContent = tplUnsaved();
+}
+async function tplSendTest(name) {
+  const e = tplEntry(name);
+  if (!tplToOk(e.to) || e.sending) return;
+  const to = e.to;
+  e.sending = true;
+  e.sendMsg = '';
+  paintSend(name);
+  let res;
+  try { res = await post(mountPath('test-send'), { template: name, to: to }); } finally { e.sending = false; }
+  e.sendBad = !res.ok;
+  e.sendMsg = res.ok ? 'Sent to ' + to + '.'
+    : res.status === 501 ? 'Test send needs emailSend in stet.config.json: the host function that sends one email, the same one `stet email test` uses.'
+    : res.body.error || 'the test send was refused';
+  paintSend(name);
+}
+/** The selected slot's field under the frame: `<key> · <n> / <max>`, then what the value must keep. */
+function slotEditor(name) {
+  const id = S.tplKey;
+  if (id === null || tplSlotKeys(name).indexOf(id) === -1) return '<p class="note">Click the text you want to change in the email.</p>';
+  const def = keyDef(id) || {};
+  const max = def.limits ? def.limits.max : null;
+  const held = valueOf(id);
+  const text = held === undefined ? '' : String(held);
+  const requires = def.requires || [];
+  return '<textarea class="in" rows="3" aria-label="' + esc(id) + '" data-act-input="text:' + esc(id) + '">' + esc(text) + '</textarea>' +
+    '<div style="margin-top:5px"><span class="mono">' + esc(id) + '</span> · <span class="cnt ' + (max !== null && text.length > max ? 'bad' : '') + '">' +
+    text.length + (max === null ? '' : ' / ' + max + (def.limits && def.limits.severity === 'hard' ? ' · hard' : '')) + '</span></div>' +
+    '<div class="muted" style="font-size:11.5px;margin-top:3px">requires: ' + (requires.length === 0 ? 'none' : esc(requires.join(', '))) + '</div>';
+}
+
+/** Marks the templates a draft of `id` touches (every template without one) for a render, and renders after the pause. */
+function queueTemplates(id) {
+  if (!ready() || S.site.descriptor.templates === undefined) return;
+  const hit = id === undefined ? pointered() : [tplOwner(id)].filter((name) => name !== null);
+  for (const name of hit) tplEntry(name).stale = true;
+  if (hit.length === 0 || S.tab !== 'Templates') return;
+  clearTimeout(tplTimer);
+  tplTimer = setTimeout(() => { tplTimer = null; fetchTemplates(); }, TPL_WAIT_MS);
+}
+/** After a paint of the tab: the frames wired, and every template never rendered, or stale with no pause pending, requested. */
+function paintTemplates() {
+  for (const frame of document.querySelectorAll('#main iframe[data-tpl-frame]')) wireFrame(frame);
+  for (const name of pointered()) {
+    const e = tplEntry(name);
+    if (!e.loading && (!e.loaded || (e.stale && tplTimer === null))) void guard(fetchTemplate(name));
+  }
+}
+function fetchTemplates() {
+  for (const name of pointered()) {
+    const e = tplEntry(name);
+    if (!e.loading && e.stale) void guard(fetchTemplate(name));
+  }
+}
+/** One template rendered by the server with the unsaved words of its slots, and painted where it stands. */
+async function fetchTemplate(name) {
+  const e = tplEntry(name);
+  e.loading = true;
+  e.stale = false;
+  const drafts = {};
+  for (const id of tplSlotKeys(name)) if (own(S.draft, S.locale + ' ' + id)) drafts[id] = S.draft[S.locale + ' ' + id];
+  const body = { template: name, locale: S.locale, drafts: drafts };
+  if (S.env !== 'default') body.env = S.env;
+  let res;
+  try { res = await post('/api/site/email-preview' + query(), body); } finally { e.loading = false; }
+  // `e` is the entry of the project, environment and language that asked: an answer for another one lands on an entry nothing shows.
+  e.loaded = true;
+  const ok = res.ok && typeof res.body.html === 'string';
+  e.failure = ok ? null : (res.body.failure || { reason: 'not-renderable', detail: res.body.error || 'the preview did not answer' });
+  if (ok) { e.html = res.body.html; e.subject = res.body.subject; e.preheader = res.body.preheader; }
+  paintTemplate(name);
+  // Words typed while it rendered are rendered next, once.
+  if (e.stale && tplTimer === null) void guard(fetchTemplate(name));
+}
+/** One card's parts repainted in place, so a field being typed in is never replaced. */
+function paintTemplate(name) {
+  const at = (part) => document.querySelector('[' + part + '="' + name.replace(/"/g, '') + '"]');
+  const meta = at('data-tpl-meta');
+  if (meta === null) return;
+  meta.innerHTML = tplMeta(name);
+  at('data-tpl-fail').innerHTML = tplFail(name);
+  const box = at('data-tpl-box');
+  const e = tplEntry(name);
+  const frame = box.querySelector('iframe');
+  if (e.html === null || e.failure) { box.innerHTML = ''; return; }
+  if (frame === null) { box.innerHTML = tplFrame(name); wireFrame(box.querySelector('iframe')); return; }
+  // The frame stays where it is: only its document is replaced, and it is wired again as it loads.
+  if (frame.getAttribute('srcdoc') !== e.html) frame.setAttribute('srcdoc', e.html);
+}
+/** The frame's clicks, read when its document loads: a click on text a slot wrote selects that slot. */
+function wireFrame(frame) {
+  if (frame === null || wiredFrames.has(frame)) return;
+  wiredFrames.add(frame);
+  const name = frame.getAttribute('data-tpl-frame');
+  frame.addEventListener('load', () => {
+    const doc = frame.contentDocument;
+    if (doc === null || doc.body === null) return;
+    const height = Math.max(120, doc.documentElement.scrollHeight);
+    tplEntry(name).height = height;
+    frame.style.height = height + 'px';
+    const style = doc.createElement('style');
+    style.setAttribute('data-stet-preview', '');
+    doc.head.appendChild(style);
+    paintSlotMark(frame);
+    doc.addEventListener('click', (event) => {
+      // A preview: a link inside it goes nowhere.
+      event.preventDefault();
+      const hit = event.target && event.target.closest ? event.target.closest('[data-stet]') : null;
+      // The marker is the email's own markup, so only a slot of this template is believed.
+      const key = hit === null ? null : hit.getAttribute('data-stet');
+      if (key !== null && tplSlotKeys(name).indexOf(key) !== -1) selectSlot(name, key);
+    });
+  });
+}
+/** The selected slot's text outlined in the frame, and every marked text showing it can be clicked. */
+function paintSlotMark(frame) {
+  const doc = frame.contentDocument;
+  const style = doc && doc.querySelector('style[data-stet-preview]');
+  if (!style) return;
+  style.textContent = '[data-stet]{cursor:pointer}[data-stet]:hover{outline:1px dashed #3b82f6;outline-offset:1px}' +
+    (S.tplKey === null ? '' : '[data-stet=' + JSON.stringify(S.tplKey) + ']{outline:2px solid #3b82f6;outline-offset:1px}');
+}
+/** A slot opened for editing under its frame; on a phone the field is scrolled into view with the tapped text kept on screen. */
+function selectSlot(name, key) {
+  S.tplKey = key;
+  for (const other of pointered()) {
+    const field = document.querySelector('[data-tpl-field="' + other + '"]');
+    if (field !== null) field.innerHTML = slotEditor(other);
+    const frame = document.querySelector('iframe[data-tpl-frame="' + other + '"]');
+    if (frame !== null) paintSlotMark(frame);
+  }
+  const field = fieldOf(key);
+  if (field === null) return;
+  if (typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
+  field.focus({ preventScroll: true });
 }
 
 // --- Brand -------------------------------------------------------------------
@@ -3350,8 +3583,7 @@ function vBrand() {
     keys.map((id) => '<tr><td class="mono">' + esc(id) + '</td><td>' +
       esc(String(shown(valueOf(id) === undefined ? '' : valueOf(id))).slice(0, 90)) + '</td>' +
       '<td><button class="btn sm" data-act="edit:' + esc(id) + '">Edit</button></td></tr>').join('') +
-    '</tbody></table><div class="bar"><span class="muted" style="font-size:11.5px">' +
-    'The email preview these values frame is not built yet.</span></div></div>';
+    '</tbody></table></div>';
 }
 
 // --- SEO ---------------------------------------------------------------------
@@ -3735,6 +3967,16 @@ function fxPacks() {
 // One entry per control. The delegated listeners below look a name up here and
 // call it with the element, the argument the attribute carried, and the event.
 const ACTIONS = {
+  tplSendOpen: (el, name) => { const e = tplEntry(name); e.sendOpen = true; e.sendMsg = ''; paintSend(name); },
+  tplSendClose: (el, name) => { const e = tplEntry(name); e.sendOpen = false; e.sendMsg = ''; paintSend(name); },
+  tplSendGo: (el, name) => { void guard(tplSendTest(name)); },
+  tplSlot: (el, key) => { const name = tplOwner(key); if (name !== null) selectSlot(name, key); },
+  tplWidth: (el, width) => {
+    if (!own(TPL_WIDTHS, width)) return;
+    S.tplWidth = width;
+    for (const frame of document.querySelectorAll('iframe[data-tpl-frame]')) frame.style.width = TPL_WIDTHS[width] + 'px';
+    for (const button of document.querySelectorAll('[data-act^="tplWidth:"]')) button.classList.toggle('on', button.getAttribute('data-act') === 'tplWidth:' + width);
+  },
   theme: () => {
     document.body.dataset.theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
   },
@@ -4087,6 +4329,12 @@ const ACTIONS_INPUT = {
   tmplBefore: (el, id) => { tmplEdit(id, { before: el.value }); },
   tmplAfter: (el, id) => { tmplEdit(id, { after: el.value }); },
   splitName: (el) => { if (S.split) S.split.name = el.value; },
+  tplTo: (el, name) => {
+    const e = tplEntry(name);
+    e.to = el.value;
+    const go = document.querySelector('[data-act="tplSendGo:' + name.replace(/"/g, '') + '"]');
+    if (go !== null) go.disabled = !tplToOk(e.to) || e.sending;
+  },
   changeName: (el) => { if (S.changeForm) S.changeForm.name = el.value; },
   changeNote: (el) => { if (S.changeForm) S.changeForm.note = el.value; },
   number: (el, id) => { clearRefusal(); setDraft(id, el.value === '' ? '' : Number(el.value)); paintRow(id); paintDirty(); },

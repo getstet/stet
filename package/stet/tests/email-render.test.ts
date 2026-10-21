@@ -15,7 +15,7 @@ import { join } from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
-import { containedPointer, renderTemplate, templateProps, type RenderRequest } from '../cli/email-render.js';
+import { containedPointer, renderTemplate, renderTemplateAsync, templateProps, type RenderRequest } from '../cli/email-render.js';
 import { packageRoot } from '../cli/installed.js';
 import type { CliIo } from '../cli/main.js';
 import { TS7_REFUSAL } from '../cli/source-scan.js';
@@ -628,5 +628,40 @@ describe('containedPointer — which pointer file lies outside the project', () 
     const host = makeEmailHost({ deps: [] });
     host.put('lib/email/tpl.ts', 'export const welcome = 1;\n');
     expect(containedPointer(host.dir, pointer('lib/email'))).toBeNull();
+  });
+});
+
+// An addition beyond the plan's cases: the dev server's asynchronous render shares the status mapping with the
+// synchronous one, and this is what keeps the two from answering differently.
+describe('renderTemplateAsync — the answers renderTemplate gives', () => {
+  const both = async (host: EmailHost, rel: string, exportName: string, props: Record<string, unknown> = {}) => {
+    const request: RenderRequest = { hostDir: host.dir, file: host.path(rel), exportName, props };
+    return { sync: renderTemplate(io(host.dir), request), async: await renderTemplateAsync(io(host.dir), request) };
+  };
+
+  it('answers the same for a render, a throw, the output ceiling and the argument ceiling', async () => {
+    const host = makeEmailHost();
+    host.put('lib/email/ok.ts', 'export function ok(p: { n: string }): string {\n  return `<p>${p.n}</p>`;\n}\n');
+    host.put('lib/email/boom.ts', "export function boom(): string {\n  throw new Error('kaput');\n}\n");
+    host.put('lib/email/huge.ts', 'export function huge(): string {\n  return "x".repeat(40 * 1024 * 1024);\n}\n');
+    const ok = await both(host, 'lib/email/ok.ts', 'ok', { n: 'Ada' });
+    expect(ok.async).toEqual(ok.sync);
+    expect(ok.async).toEqual({ ok: true, result: JSON.stringify('<p>Ada</p>') });
+    const boom = await both(host, 'lib/email/boom.ts', 'boom');
+    expect(boom.async).toEqual(boom.sync);
+    expect(!boom.async.ok && boom.async.reason).toBe('render-threw');
+    const huge = await both(host, 'lib/email/huge.ts', 'huge');
+    expect(huge.async).toEqual(huge.sync);
+    expect(!huge.async.ok && huge.async.detail).toContain('32MB');
+    const blob = await both(host, 'lib/email/ok.ts', 'ok', { n: 'x'.repeat(2 * 1024 * 1024) });
+    expect(blob.async).toEqual(blob.sync);
+    expect(!blob.async.ok && blob.async.detail).toContain('too large');
+  });
+
+  it('names its own deadline when a template never returns', async () => {
+    const host = makeEmailHost();
+    host.put('lib/email/hang.ts', 'export function hang(): Promise<string> {\n  setInterval(() => {}, 1000);\n  return new Promise(() => {});\n}\n');
+    const result = await renderTemplateAsync(io(host.dir), { hostDir: host.dir, file: host.path('lib/email/hang.ts'), exportName: 'hang', props: {} }, 1500);
+    expect(!result.ok && result.detail).toContain('did not finish within 1.5s');
   });
 });

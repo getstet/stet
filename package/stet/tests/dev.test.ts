@@ -38,9 +38,12 @@ import { closeFrames, frame as frameAgent, tick, type Framed } from './helpers/p
 import { cleanupCliHosts, fakeFetch, htmlFixture, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
 import { cleanupEmailHosts, makeEmailHost } from './helpers/email-host.js';
 import { handlerOver, NONCE, paintPage, req, TOKEN, type PaintedPage } from './helpers/dashboard-page.js';
+import { cleanupOutsideFiles, linkOut, outsideFile, previewHost, type PreviewHost } from './helpers/email-preview-host.js';
+import { runtimeImportClosure } from './helpers/source-roster.js';
 import { builtBinExists, installStetShim } from './helpers/stet-shim.js';
 import { writeJsonDeterministic } from '../cli/artifacts.js';
 import { check } from '../cli/check.js';
+import { mountRenderer, mountSender } from '../cli/email-preview.js';
 import { loadConfig } from '../cli/config.js';
 import { planDocuments } from '../cli/html-host.js';
 import { HEAD_KINDS, kindOf } from '../cli/key-names.js';
@@ -92,6 +95,7 @@ import {
 
 afterAll(cleanupCliHosts);
 afterAll(cleanupEmailHosts);
+afterAll(cleanupOutsideFiles);
 
 /** A temp directory that is not a checkout — for the paths a rule has to refuse. */
 function tempDir(prefix = 'stet-dev-'): string {
@@ -4663,23 +4667,23 @@ describe('GET /api/site/setup and /verify', () => {
 
 // --- the store-backed mount --------------------------------------------------
 
+/** The mount reads the run token from this process's own environment. */
+function withToken(fn: () => Promise<void>): () => Promise<void> {
+  return async () => {
+    const held = process.env['STET_DEV_TOKEN'];
+    process.env['STET_DEV_TOKEN'] = TOKEN;
+    try {
+      await fn();
+    } finally {
+      if (held === undefined) delete process.env['STET_DEV_TOKEN'];
+      else process.env['STET_DEV_TOKEN'] = held;
+    }
+  };
+}
+
 describe('the mounted API under /s/<id>/api/stet', () => {
   const mount = (host: CliHost, route: string, query = ''): string =>
     `/s/${siteId(realpathSync(host.cwd))}/api/stet/${route}${query}`;
-
-  /** The mount reads the run token from this process's own environment. */
-  function withToken(fn: () => Promise<void>): () => Promise<void> {
-    return async () => {
-      const held = process.env['STET_DEV_TOKEN'];
-      process.env['STET_DEV_TOKEN'] = TOKEN;
-      try {
-        await fn();
-      } finally {
-        if (held === undefined) delete process.env['STET_DEV_TOKEN'];
-        else process.env['STET_DEV_TOKEN'] = held;
-      }
-    };
-  }
 
   it(
     'answers keys and a draft behind the run token, and refuses a blank editor',
@@ -4995,6 +4999,382 @@ describe('the mounted API under /s/<id>/api/stet', () => {
     }
     // The run is over, so the credential it set is gone with it.
     expect(process.env['STET_DEV_TOKEN']).toBe(held);
+  });
+});
+
+describe('the mount renders email through the pointer in stet dev (D12, 11.3)', () => {
+  const mount = (host: { dir: string }, route: string, query = ''): string =>
+    `/s/${siteId(realpathSync(host.dir))}/api/stet/${route}${query}`;
+  const withDraft = async (headline: string): Promise<StoreAdapter> => {
+    const store = createMemoryStore({ project: 'default' });
+    await store.saveDraft({ key: 'welcome__headline', value: headline, target: 'html-email', editor: 't' });
+    return store;
+  };
+  const storeHost = (opts: Parameters<typeof previewHost>[0] = {}): PreviewHost =>
+    previewHost({ ...opts, config: { store: { adapter: 'memory' }, ...opts.config } });
+  /** The renderer over a host's forms, as `mountRoute` builds it, with its own store. */
+  const rendererOver = (host: PreviewHost, store: StoreAdapter): ReturnType<typeof mountRenderer> =>
+    mountRenderer(
+      { cwd: host.dir, env: {}, stdout: () => {}, stderr: () => {} },
+      {
+        path: host.dir,
+        descriptor: loadDescriptor(JSON.parse(readFileSync(join(host.dir, 'content/descriptor.json'), 'utf8'))),
+        snapshot: loadSnapshot(JSON.parse(readFileSync(join(host.dir, 'content/defaults.json'), 'utf8'))),
+      },
+      store,
+    );
+  const pointTo = (host: PreviewHost, edit: (render: Record<string, unknown>) => void): void => {
+    const path = join(host.dir, 'content/descriptor.json');
+    const descriptor = JSON.parse(readFileSync(path, 'utf8'));
+    edit(descriptor.templates.welcome.render);
+    writeFileSync(path, JSON.stringify(descriptor));
+  };
+
+  it(
+    'the render route renders a string template with the store’s draft',
+    withToken(async () => {
+      const host = storeHost();
+      const store = await withDraft('A headline from the store');
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const res = await handler(req(mount(host, 'render', '?template=welcome')));
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toContain('text/html');
+      const html = await res.text();
+      expect(html).toContain('<h1>A headline from the store</h1>');
+      // The sample props fill {{name}} and the mount's markup carries no preview marker.
+      expect(html).toContain('<p>Hi Ada</p>');
+      expect(html).not.toContain('data-stet');
+    }),
+  );
+
+  it(
+    'the render route falls to the snapshot for a slot with no stored row',
+    withToken(async () => {
+      const host = storeHost();
+      const store = createMemoryStore({ project: 'default' });
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const html = await (await handler(req(mount(host, 'render', '?template=welcome')))).text();
+      expect(html).toContain('<h1>Welcome to mirra</h1>');
+    }),
+  );
+
+  it('test-send renders with opts.override laid over the store values, key by key', async () => {
+    const host = storeHost();
+    const render = rendererOver(host, await withDraft('From the store'));
+    const html = await render('welcome', { override: { welcome__headline: 'From the override' } });
+    expect(html).toContain('<h1>From the override</h1>');
+    // A key the override does not name keeps the store's (or the snapshot's) value.
+    expect(html).toContain('<p>Your first week starts here</p>');
+    // An override that is not text is refused as the CLI's render refuses it.
+    await expect(render('welcome', { override: { welcome__headline: 5 } })).rejects.toThrow(/welcome__headline resolved to a number, not a string/);
+  });
+
+  it('rejects, naming the store’s message, when the store does not answer', async () => {
+    const host = storeHost();
+    const store = createMemoryStore({ project: 'default' });
+    const down = { ...store, read: async () => ({ storeError: true as const, message: 'connection refused' }) } as unknown as StoreAdapter;
+    await expect(rendererOver(host, down)('welcome')).rejects.toThrow('the store did not answer: connection refused');
+  });
+
+  it(
+    'a string map resolves its html member',
+    withToken(async () => {
+      const host = storeHost({
+        template: "export function welcome(p: Record<string, string>) { return { subject: 'S', html: '<b>' + p.welcome__headline + '</b>' }; }\n",
+      });
+      const { handler } = handlerOver([host.dir], { storeFor: () => createMemoryStore({ project: 'default' }) });
+      expect(await (await handler(req(mount(host, 'render', '?template=welcome')))).text()).toBe('<b>Welcome to mirra</b>');
+    }),
+  );
+
+  it('rejects a map with no html member, a runner failure and a slot with no value, each with its sentence', async () => {
+    const store = createMemoryStore({ project: 'default' });
+    const noHtml = rendererOver(storeHost({ template: "export function welcome() { return { subject: 'only' }; }\n" }), store);
+    await expect(noHtml('welcome')).rejects.toThrow('not-renderable: welcome renders a map with no html member — the email is its html');
+    const threw = rendererOver(storeHost({ template: "export function welcome(): string { throw new Error('kaput'); }\n" }), store);
+    await expect(threw('welcome')).rejects.toThrow(/^render-threw: .*kaput/s);
+    const gap = rendererOver(storeHost({ snapshot: { welcome__headline: 'x' } }), store);
+    await expect(gap('welcome')).rejects.toThrow(/welcome__subject/);
+  });
+
+  it(
+    'a render by version rejects: only the host’s own renderEmail can',
+    withToken(async () => {
+      const host = storeHost();
+      const store = createMemoryStore({ project: 'default' });
+      await expect(rendererOver(host, store)('welcome', { version: 3 })).rejects.toThrow("render by version needs the host's renderEmail");
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const res = await handler(req(mount(host, 'render', '?template=welcome&version=3')));
+      expect(res.status).toBe(500);
+      expect(((await res.json()) as { error: string }).error).toBe("render by version needs the host's renderEmail");
+    }),
+  );
+
+  it('rejects a template with no render pointer', async () => {
+    const host = storeHost();
+    const path = join(host.dir, 'content/descriptor.json');
+    const descriptor = JSON.parse(readFileSync(path, 'utf8'));
+    delete descriptor.templates.welcome.render;
+    writeFileSync(path, JSON.stringify(descriptor));
+    await expect(rendererOver(host, createMemoryStore({ project: 'default' }))('welcome')).rejects.toThrow(
+      'welcome has no render pointer — declare one, or render it through the host',
+    );
+  });
+
+  it(
+    'S3: a pointer ../../outside/tpl.ts rejects with the containment line and spawns nothing',
+    withToken(async () => {
+      const host = storeHost();
+      const mark = join(host.dir, 'spawned');
+      const out = outsideFile(
+        host,
+        `export function welcome(): string { require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); return '<p>outside</p>'; }\n`,
+      );
+      pointTo(host, (render) => (render['file'] = out.rel));
+      const line = `${out.rel} is outside the project — a render pointer names a file inside it`;
+      const store = createMemoryStore({ project: 'default' });
+      await expect(rendererOver(host, store)('welcome')).rejects.toThrow(line);
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      const res = await handler(req(mount(host, 'render', '?template=welcome')));
+      expect(((await res.json()) as { error: string }).error).toBe(line);
+      expect(existsSync(mark)).toBe(false);
+    }),
+  );
+
+  it('F6c: a template named after an Object.prototype member rejects with the no-render-pointer sentence', async () => {
+    const render = rendererOver(storeHost(), createMemoryStore({ project: 'default' }));
+    for (const name of ['constructor', '__proto__', 'toString']) {
+      await expect(render(name)).rejects.toThrow(`${name} has no render pointer — declare one, or render it through the host`);
+    }
+  });
+
+  it(
+    'F6d: a pointer that escapes the project never reaches the store, on the render route and on the renderer itself',
+    withToken(async () => {
+      const host = storeHost();
+      const out = outsideFile(host, "export function welcome(): string { return '<p>outside</p>'; }\n");
+      pointTo(host, (render) => (render['file'] = out.rel));
+      const base = createMemoryStore({ project: 'default' });
+      let reads = 0;
+      const counting = {
+        ...base,
+        read: async (...args: Parameters<StoreAdapter['read']>) => {
+          reads += 1;
+          return base.read(...args);
+        },
+      } as StoreAdapter;
+      await expect(rendererOver(host, counting)('welcome')).rejects.toThrow('is outside the project');
+      const { handler } = handlerOver([host.dir], { storeFor: () => counting });
+      const res = await handler(req(mount(host, 'render', '?template=welcome')));
+      expect(((await res.json()) as { error: string }).error).toContain('is outside the project');
+      const previewed = await handler(
+        req(`/api/site/email-preview?site=${encodeURIComponent(realpathSync(host.dir))}`, { method: 'POST', body: { template: 'welcome' } }),
+      );
+      expect(((await previewed.json()) as { failure: { detail: string } }).failure.detail).toContain('is outside the project');
+      expect(reads).toBe(0);
+    }),
+  );
+
+  it(
+    'a host’s own createStetHandler without renderEmail still answers 501, and its closure reaches no child process',
+    withToken(async () => {
+      const host = storeHost();
+      const handler = createStetHandler({
+        store: createMemoryStore({ project: 'default' }),
+        descriptor: loadDescriptor(JSON.parse(readFileSync(join(host.dir, 'content/descriptor.json'), 'utf8'))),
+        auth: 'STET_DEV_TOKEN',
+      });
+      const res = await handler.GET(req('/api/stet/render?template=welcome'));
+      expect(res.status).toBe(501);
+      expect(((await res.json()) as { error: string }).error).toBe('render is not wired');
+      const closure = runtimeImportClosure(new URL('../server/index.ts', import.meta.url));
+      expect(closure.bare.filter((spec) => /(^|:)child_process$/.test(spec))).toEqual([]);
+      expect(closure.modules.filter((m) => /^(cli|templates)\//.test(m))).toEqual([]);
+    }),
+  );
+});
+
+describe('the dashboard sends a test email through the host’s emailSend (D58)', () => {
+  const SEND =
+    "const { appendFileSync } = require('node:fs');\n" +
+    "const { join } = require('node:path');\n" +
+    "const log = join(__dirname, '..', 'sent.log');\n" +
+    "exports.sendTest = (message) => appendFileSync(log, JSON.stringify(message) + '\\n');\n" +
+    "exports.sendEnv = (message) => appendFileSync(log, JSON.stringify({ ...message, token: process.env.STET_DEV_TOKEN ?? 'unset' }) + '\\n');\n" +
+    "exports.sendDown = () => { throw new Error('smtp down'); };\n" +
+    "exports.sendHang = () => { setInterval(() => {}, 1000); return new Promise(() => {}); };\n";
+  const sendHost = (emailSend: { file: string; export: string } | null = { file: 'lib/send.js', export: 'sendTest' }): PreviewHost =>
+    previewHost({
+      config: { store: { adapter: 'memory' }, ...(emailSend === null ? {} : { emailSend }) },
+      files: { 'lib/send.js': SEND },
+    });
+  const mountOf = (host: PreviewHost, route: string): string => `/s/${siteId(realpathSync(host.dir))}/api/stet/${route}`;
+  const sentLog = (host: PreviewHost): Array<Record<string, any>> => {
+    const path = join(host.dir, 'sent.log');
+    return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [];
+  };
+  const withDraft = async (headline: string): Promise<StoreAdapter> => {
+    const store = createMemoryStore({ project: 'default' });
+    await store.saveDraft({ key: 'welcome__headline', value: headline, target: 'html-email', editor: 't' });
+    return store;
+  };
+  const send = (host: PreviewHost, store: StoreAdapter, body: Record<string, unknown> = { template: 'welcome', to: 'typed@example.test' }) => {
+    const { handler } = handlerOver([host.dir], { storeFor: () => store });
+    return post(handler, mountOf(host, 'test-send'), body);
+  };
+
+  it(
+    'T1: sends the store’s draft to the typed address through the host’s function, with the subject and template, and no marker',
+    withToken(async () => {
+      const host = sendHost();
+      const reply = await send(host, await withDraft('A drafted headline'));
+      expect(reply).toEqual({ status: 200, body: { sent: true } });
+      const lines = sentLog(host);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ to: 'typed@example.test', subject: 'Welcome aboard', template: 'welcome' });
+      expect(lines[0]?.['html']).toContain('<h1>A drafted headline</h1>');
+      expect(lines[0]?.['html']).not.toContain('data-stet');
+    }),
+  );
+
+  it(
+    'T2: without emailSend the route stays 501 and nothing is sent',
+    withToken(async () => {
+      const host = sendHost(null);
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(501);
+      expect(reply.body['error']).toBe('test-send is not wired');
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'T3: a recipient holding a line break is refused with nothing rendered and nothing sent',
+    withToken(async () => {
+      const host = sendHost();
+      const mark = join(host.dir, 'rendered');
+      writeFileSync(
+        join(host.dir, 'lib/email/welcome.ts'),
+        `export function welcome(): string { require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); return '<p>x</p>'; }\n`,
+      );
+      const reply = await send(host, await withDraft('x'), { template: 'welcome', to: 'a@example.test\r\nBcc: b@example.test' });
+      expect(reply.status).toBe(400);
+      expect(sentLog(host)).toEqual([]);
+      expect(existsSync(mark)).toBe(false);
+    }),
+  );
+
+  it(
+    'T4: rendering, reading the keys and saving a draft never send',
+    withToken(async () => {
+      const host = sendHost();
+      const store = await withDraft('x');
+      const { handler } = handlerOver([host.dir], { storeFor: () => store });
+      expect((await handler(req(mountOf(host, 'render') + '?template=welcome'))).status).toBe(200);
+      expect((await handler(req(mountOf(host, 'keys')))).status).toBe(200);
+      const drafted = await post(handler, mountOf(host, 'draft'), { editor: 't', key: 'welcome__headline', value: 'y' });
+      expect(drafted.status).toBe(200);
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'T5: an emailSend file outside the project, or a symlink out of it, answers the containment line and runs nothing',
+    withToken(async () => {
+      const host = sendHost();
+      const mark = join(host.dir, 'outside-ran');
+      const out = outsideFile(host, `require('node:fs').writeFileSync(${JSON.stringify(mark)}, 'x'); exports.sendTest = () => {};\n`);
+      const config = JSON.parse(readFileSync(join(host.dir, 'stet.config.json'), 'utf8'));
+      const store = await withDraft('x');
+      for (const [file, line] of [
+        [out.rel, `${out.rel} is outside the project — a render pointer names a file inside it`],
+        ['lib/linked.js', 'lib/linked.js is outside the project — a render pointer names a file inside it'],
+      ] as const) {
+        if (file === 'lib/linked.js') linkOut(host, file, out.abs);
+        writeFileSync(join(host.dir, 'stet.config.json'), JSON.stringify({ ...config, emailSend: { file, export: 'sendTest' } }));
+        const reply = await send(host, store);
+        expect(reply.status).toBe(500);
+        expect(reply.body['error']).toBe(line);
+      }
+      expect(existsSync(mark)).toBe(false);
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'T6: a host send that throws answers its own error and records nothing',
+    withToken(async () => {
+      const host = sendHost({ file: 'lib/send.js', export: 'sendDown' });
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(500);
+      expect(String(reply.body['error'])).toContain('smtp down');
+      // The host's own error as it stands, not a reason tag put in front of it.
+      expect(String(reply.body['error'])).not.toContain('send-failed');
+      expect(sentLog(host)).toEqual([]);
+    }),
+  );
+
+  it(
+    'T7: the host send function runs without the dashboard’s run token',
+    withToken(async () => {
+      const host = sendHost({ file: 'lib/send.js', export: 'sendEnv' });
+      const reply = await send(host, await withDraft('x'));
+      expect(reply.status).toBe(200);
+      expect(process.env['STET_DEV_TOKEN']).toBe(TOKEN);
+      expect(sentLog(host)[0]?.['token']).toBe('unset');
+    }),
+  );
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  const HANG = 'export function welcome(): Promise<string> {\n  setInterval(() => {}, 1000);\n  return new Promise(() => {});\n}\n';
+
+  it(
+    'F1: a mount render that never returns holds only its own request',
+    withToken(async () => {
+      const host = previewHost({ config: { store: { adapter: 'memory' } }, template: HANG });
+      const { handler } = handlerOver([host.dir], { renderDeadlineMs: 3000, storeFor: () => createMemoryStore({ project: 'default' }) });
+      const started = Date.now();
+      const hung = handler(req(mountOf(host, 'render') + '?template=welcome'));
+      await sleep(1500);
+      expect((await handler(req('/api/workspace'))).status).toBe(200);
+      expect(Date.now() - started).toBeLessThan(2000);
+      const answer = await hung;
+      expect(answer.status).toBe(500);
+      expect(((await answer.json()) as { error: string }).error).toContain('did not finish within 3s');
+    }),
+    15_000,
+  );
+
+  it(
+    'F1: a host send function that never returns holds only its own request',
+    withToken(async () => {
+      const host = sendHost({ file: 'lib/send.js', export: 'sendHang' });
+      const { handler } = handlerOver([host.dir], { renderDeadlineMs: 3000, storeFor: () => createMemoryStore({ project: 'default' }) });
+      const started = Date.now();
+      const hung = post(handler, mountOf(host, 'test-send'), { template: 'welcome', to: 'typed@example.test' });
+      await sleep(1500);
+      expect((await handler(req('/api/workspace'))).status).toBe(200);
+      expect(Date.now() - started).toBeLessThan(2000);
+      const answer = await hung;
+      expect(answer.status).toBe(500);
+      expect(String(answer.body['error'])).toContain('did not finish within 3s');
+      expect(sentLog(host)).toEqual([]);
+    }),
+    15_000,
+  );
+
+  // An addition beyond T1-T8: it guards the sender's own refusal when no render came before it in the request.
+  it('the sender refuses what was never rendered in its request, and sends nothing', async () => {
+    const host = sendHost();
+    const site = {
+      path: host.dir,
+      descriptor: loadDescriptor(JSON.parse(readFileSync(join(host.dir, 'content/descriptor.json'), 'utf8'))),
+      snapshot: loadSnapshot(JSON.parse(readFileSync(join(host.dir, 'content/defaults.json'), 'utf8'))),
+    };
+    const io = { cwd: host.dir, env: {}, stdout: () => {}, stderr: () => {} };
+    const sender = mountSender(io, site, { file: 'lib/send.js', export: 'sendTest' }, { current: null });
+    await expect(sender('<p>x</p>', 'me@example.test')).rejects.toThrow('nothing was rendered to send');
+    expect(sentLog(host)).toEqual([]);
   });
 });
 
@@ -7325,6 +7705,429 @@ describe('the page', () => {
     it('reads an environment the reply does not list as the dev server’s own store', async () => {
       const page = await paint({ site: store({ stores: {} }), preview: UP });
       expect(line(page)).toBe("The preview reads the dev server's own store, not default.");
+      page.dom.window.close();
+    });
+  });
+
+  // 11.2 — the email preview on the Templates tab
+  describe('the email preview (journey B4, 11.2)', () => {
+    const HEADLINE = 'welcome__headline';
+    const text = { shape: 'text', target: 'html-email' } as const;
+    const mailDescriptor: Descriptor = {
+      version: 1,
+      keys: {
+        [HEADLINE]: { ...text, limits: { max: 60, severity: 'advisory' } },
+        welcome__subject: text,
+        welcome__preheader: text,
+        welcome__greeting: { ...text, vars: ['name'], requires: ['name'] },
+      },
+      templates: {
+        welcome: {
+          class: 'transactional',
+          trigger: 'app-event',
+          slots: ['headline', 'subject', 'preheader', 'greeting'],
+          render: { file: 'lib/email/welcome.ts', export: 'welcome', sampleProps: { name: 'Ada' } },
+        },
+        receipt: { class: 'transactional', trigger: 'app-event', slots: [] },
+      },
+    };
+    const mailSnapshot = {
+      default: {
+        [HEADLINE]: 'Welcome to mirra',
+        welcome__subject: 'Welcome aboard',
+        welcome__preheader: '',
+        welcome__greeting: 'Hi {{name}}',
+      },
+    };
+    const mark = (key: string, value: string): string => `<span data-stet="${key}">${value}</span>`;
+    const mail = (headline = 'Welcome to mirra'): string =>
+      `<html><body><h1>${mark(HEADLINE, headline)}</h1><p>${mark('welcome__greeting', 'Hi Ada')}</p><a href="https://x.test/">link</a></body></html>`;
+    const reply = (html = mail(), over: Record<string, unknown> = {}): unknown => ({ html, subject: 'Welcome aboard', preheader: '', ...over });
+    const mailSite = (over: Record<string, unknown> = {}): Record<string, unknown> => siteBody({ descriptor: mailDescriptor, snapshot: mailSnapshot, ...over });
+    const previews = (page: Painted): Array<{ template: string; locale: string; drafts: Record<string, unknown>; env?: string }> =>
+      page.sent.filter((r) => r.path.startsWith('/api/site/email-preview')).map((r) => r.body as never);
+    const frameOf = (page: Painted): HTMLIFrameElement | null => docOf(page).querySelector('iframe[data-tpl-frame="welcome"]');
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    /** The Templates tab of a site whose preview answers `body`. */
+    async function open(body: unknown = reply(), site: Record<string, unknown> = mailSite()): Promise<Painted> {
+      const page = await paint({ site, routes: [['/api/site/email-preview', 200, body]] });
+      await page.act('tab:Templates');
+      if (frameOf(page) !== null) loadFrame(page);
+      return page;
+    }
+    /**
+     * jsdom does not load a frame's `srcdoc`, so the document a browser would load into it is put in its body,
+     * which leaves the listeners the page attached to that document where they are.
+     */
+    const loadFrame = (page: Painted): void => {
+      const frame = frameOf(page) as HTMLIFrameElement;
+      const parsed = new page.dom.window.DOMParser().parseFromString(frame.getAttribute('srcdoc') as string, 'text/html');
+      ((frame.contentDocument as Document).body as HTMLElement).innerHTML = parsed.body.innerHTML;
+      frame.dispatchEvent(new page.dom.window.Event('load'));
+    };
+    /** A click on a marked text inside the frame, as the dashboard's listener on the frame's document hears it. */
+    const clickIn = (page: Painted, selector: string): void => {
+      const doc = (frameOf(page) as HTMLIFrameElement).contentDocument as Document;
+      const hit = doc.querySelector(selector) as HTMLElement;
+      expect(hit, selector).not.toBeNull();
+      hit.dispatchEvent(new page.dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    };
+
+    it('shows each template with a pointer in a frame that runs no scripts, and says what it is rendered from', async () => {
+      const page = await open();
+      const doc = docOf(page);
+      expect(doc.querySelectorAll('[data-tpl]')).toHaveLength(1);
+      const frame = frameOf(page) as HTMLIFrameElement;
+      expect(frame.getAttribute('sandbox')).toBe('allow-same-origin');
+      expect(frame.getAttribute('srcdoc')).toBe(mail());
+      expect(doc.querySelector('[data-tpl="welcome"]')?.textContent).toContain("Images hosted on other sites don't show in this preview.");
+      // Subject and Preview with their keys, and (empty) where a slot is empty.
+      const meta = (doc.querySelector('[data-tpl-meta="welcome"]') as HTMLElement).textContent as string;
+      expect(meta).toContain('Subject Welcome aboard');
+      expect(meta).toContain('welcome__subject');
+      expect(meta).toContain('Preview (empty)');
+      expect(meta).toContain('welcome__preheader');
+      expect(previews(page)).toEqual([{ template: 'welcome', locale: 'default', drafts: {} }]);
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('the page adds nothing to the frame but a stylesheet and a click listener, and no other frame allows scripts and the dashboard’s origin together', async () => {
+      const page = await open();
+      for (const el of docOf(page).querySelectorAll('iframe')) {
+        const sandbox = el.getAttribute('sandbox') ?? '';
+        expect(sandbox.includes('allow-scripts') && sandbox.includes('allow-same-origin')).toBe(false);
+      }
+      const doc = (frameOf(page) as HTMLIFrameElement).contentDocument as Document;
+      expect(doc.querySelectorAll('script')).toHaveLength(0);
+      expect(doc.querySelectorAll('style')).toHaveLength(1);
+      expect(doc.querySelector('style')?.hasAttribute('data-stet-preview')).toBe(true);
+      expect(inlineHandlers(page.html())).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('Desktop and Mobile set the frame to 640 and 375 px', async () => {
+      const page = await open();
+      expect((frameOf(page) as HTMLIFrameElement).style.width).toBe('640px');
+      await page.act('tplWidth:mobile');
+      expect((frameOf(page) as HTMLIFrameElement).style.width).toBe('375px');
+      expect((frameOf(page) as HTMLIFrameElement).style.maxWidth).toBe('100%');
+      await page.act('tplWidth:desktop');
+      expect((frameOf(page) as HTMLIFrameElement).style.width).toBe('640px');
+      page.dom.window.close();
+    });
+
+    it('a click on rendered text opens the slot that wrote it, with its count and what it requires (journey B4)', async () => {
+      const page = await open();
+      const doc = docOf(page);
+      expect(doc.querySelector('[data-tpl-field="welcome"] textarea')).toBeNull();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      const field = doc.querySelector('[data-tpl-field="welcome"]') as HTMLElement;
+      expect((field.querySelector('textarea') as HTMLTextAreaElement).value).toBe('Welcome to mirra');
+      expect(field.textContent).toContain(`${HEADLINE} · 16 / 60`);
+      expect(field.textContent).toContain('requires: none');
+      clickIn(page, '[data-stet="welcome__greeting"]');
+      await page.settle();
+      expect(doc.querySelector('[data-tpl-field="welcome"]')?.textContent).toContain('requires: name');
+      expect((doc.querySelector('[data-tpl-field="welcome"] textarea') as HTMLTextAreaElement).value).toBe('Hi {{name}}');
+      page.dom.window.close();
+    });
+
+    it('a click on Subject’s key opens the subject slot, and a click on a link in the email goes nowhere', async () => {
+      const page = await open();
+      const doc = docOf(page);
+      await page.act('tplSlot:welcome__subject');
+      expect(doc.querySelector('[data-tpl-field="welcome"] textarea')?.getAttribute('data-act-input')).toBe('text:welcome__subject');
+      const link = ((frameOf(page) as HTMLIFrameElement).contentDocument as Document).querySelector('a') as HTMLElement;
+      const click = new page.dom.window.MouseEvent('click', { bubbles: true, cancelable: true });
+      link.dispatchEvent(click);
+      expect(click.defaultPrevented).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('believes only the slots of its own template: a marker the email forges selects nothing (S4)', async () => {
+      const forged = '<html><body>' + mark('constructor', 'a') + mark('brand__accent', 'b') + mark('welcome__nope', 'c') + '</body></html>';
+      const page = await open(reply(forged));
+      const sheet = ((frameOf(page) as HTMLIFrameElement).contentDocument as Document).querySelector('style[data-stet-preview]') as HTMLElement;
+      for (const key of ['constructor', 'brand__accent', 'welcome__nope']) {
+        clickIn(page, `[data-stet="${key}"]`);
+        await page.settle();
+        expect(docOf(page).querySelector('[data-tpl-field="welcome"] textarea')).toBeNull();
+        // Nothing of the forged name reaches the stylesheet the page keeps in the frame.
+        expect(sheet.textContent).not.toContain(key);
+      }
+      expect(page.errors).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('typing in the slot’s field renders again 400 ms after the last keystroke, with the draft', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      expect(previews(page)).toHaveLength(1);
+      page.answer('/api/site/email-preview', 200, reply(mail('Welcome back')));
+      await page.type(`text:${HEADLINE}`, 'Welcome ba');
+      await sleep(150);
+      await page.type(`text:${HEADLINE}`, 'Welcome back');
+      await sleep(250);
+      // 400 ms after the first keystroke, but 250 ms after the last: nothing yet.
+      expect(previews(page)).toHaveLength(1);
+      await sleep(300);
+      await page.settle();
+      expect(previews(page)).toHaveLength(2);
+      expect(previews(page)[1]?.drafts).toEqual({ [HEADLINE]: 'Welcome back' });
+      expect((frameOf(page) as HTMLIFrameElement).getAttribute('srcdoc')).toBe(mail('Welcome back'));
+      loadFrame(page);
+      expect(((frameOf(page) as HTMLIFrameElement).contentDocument as Document).querySelector('h1')?.textContent).toBe('Welcome back');
+      // The field being typed in keeps its words and the caret: the frame's repaint touches nothing else.
+      const typed = docOf(page).querySelector(`[data-act-input="text:${HEADLINE}"]`) as HTMLTextAreaElement;
+      expect(typed.value).toBe('Welcome back');
+      expect(docOf(page).activeElement === typed).toBe(true);
+      page.dom.window.close();
+    });
+
+    it('words typed while a render is in flight are rendered next, once, with the latest of them', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      page.answer('/api/site/email-preview', 200, reply(mail('OLD')), 600);
+      await page.type(`text:${HEADLINE}`, 'a');
+      await sleep(500);
+      page.answer('/api/site/email-preview', 200, reply(mail('NEW')), 0);
+      await page.type(`text:${HEADLINE}`, 'ab');
+      await sleep(1200);
+      await page.settle();
+      expect(previews(page).map((r) => r.drafts[HEADLINE])).toEqual([undefined, 'a', 'ab']);
+      expect((frameOf(page) as HTMLIFrameElement).getAttribute('srcdoc')).toBe(mail('NEW'));
+      page.dom.window.close();
+    });
+
+    it('renders again after a request that failed on the way', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      page.answer('/api/site/email-preview', 500, { error: 'the server stopped' });
+      await page.type(`text:${HEADLINE}`, 'x');
+      await sleep(500);
+      expect(docOf(page).querySelector('[data-tpl-fail="welcome"]')?.textContent).toBe('not-renderable: the server stopped');
+      // A request that never got an answer leaves the next one free to go.
+      page.answer('/api/site/email-preview', 200, () => { throw new Error('offline'); });
+      await page.type(`text:${HEADLINE}`, 'xx');
+      await sleep(500);
+      expect(page.toast()).toContain('offline');
+      page.answer('/api/site/email-preview', 200, reply(mail('Back again')));
+      await page.type(`text:${HEADLINE}`, 'xy');
+      await sleep(500);
+      expect(frameOf(page)?.getAttribute('srcdoc')).toBe(mail('Back again'));
+      expect(docOf(page).querySelector('[data-tpl-fail="welcome"]')?.textContent).toBe('');
+      page.dom.window.close();
+    });
+
+    it('answers a render that failed with its reason and detail, and shows no frame', async () => {
+      const page = await open({ failure: { reason: 'render-threw', detail: 'boom from the template' } });
+      expect(docOf(page).querySelector('[data-tpl-fail="welcome"]')?.textContent).toBe('render-threw: boom from the template');
+      expect(frameOf(page)).toBeNull();
+      page.dom.window.close();
+    });
+
+    it('sends the selected environment and language with the draft, and renders a snapshot-only site as well', async () => {
+      const snap = await open();
+      expect(previews(snap)[0]).not.toHaveProperty('env');
+      snap.dom.window.close();
+      const page = await open(reply(), mailSite({ mode: 'memory' }));
+      await page.act('cycleEnv');
+      await page.settle();
+      expect(previews(page).at(-1)?.env).toBe('staging');
+      await page.act('tab:Content');
+      await page.change('locale', 'de');
+      await page.act('tab:Templates');
+      expect(previews(page).at(-1)?.locale).toBe('de');
+      page.dom.window.close();
+    });
+
+    // --- the fix round: what the first build left unproved ---------------------
+
+    const run = (page: Painted, code: string): unknown => (page.dom.window as unknown as { eval: (code: string) => unknown }).eval(code);
+    const TEST_SEND = `/s/${SITE_ID}/api/stet/test-send`;
+    const sends = (page: Painted): Array<{ path: string; body: unknown }> => page.sent.filter((r) => r.path.startsWith(TEST_SEND));
+    /** The Templates tab of a store-backed site, whose test send answers `answer`. */
+    async function openStored(answer: [number, unknown] = [200, { sent: true }]): Promise<Painted> {
+      const page = await paint({
+        site: mailSite({ mode: 'memory' }),
+        routes: [['/api/site/email-preview', 200, reply()], [TEST_SEND, answer[0], answer[1]]],
+      });
+      await page.act('tab:Templates');
+      loadFrame(page);
+      return page;
+    }
+    const field = (page: Painted, act: string): HTMLInputElement => docOf(page).querySelector(`[data-act-input="${act}"]`) as HTMLInputElement;
+    const press = (page: Painted, act: string): HTMLButtonElement | null => docOf(page).querySelector(`[data-act="${act}"]`);
+
+    it('F6a: painting the tab again while a render is pending asks for it once', async () => {
+      const page = await paint({ site: mailSite(), routes: [['/api/site/email-preview', 200, reply(), 600]] });
+      await page.act('tab:Templates');
+      run(page, 'render(); render();');
+      await page.settle();
+      expect(previews(page)).toHaveLength(1);
+      await sleep(700);
+      page.dom.window.close();
+    });
+
+    it('F6b: once rendered, toggling the unsaved list or repainting the tab asks for nothing more', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      await page.type(`text:${HEADLINE}`, 'Edited');
+      await sleep(600);
+      await page.settle();
+      const before = previews(page).length;
+      expect(before).toBe(2);
+      await page.act('unsaved');
+      await page.act('unsaved');
+      run(page, 'render();');
+      await page.act('tab:Content');
+      await page.act('tab:Templates');
+      await sleep(600);
+      expect(previews(page)).toHaveLength(before);
+      page.dom.window.close();
+    });
+
+    it('F8: at 360 px the email card’s name and the Subject and Preview text break inside the card', async () => {
+      const page = await open();
+      const css = [...docOf(page).querySelectorAll('style')].map((el) => el.textContent ?? '').join('\n').replace(/\s+/g, ' ');
+      expect(css).toMatch(/@media\(max-width:760px\)\{[^}]*\[data-tpl\] \.ch h3[^{]*\{[^}]*overflow-wrap:anywhere/);
+      expect(css).toMatch(/@media\(max-width:760px\)\{[^}]*\[data-tpl-meta\] span[^{]*\{[^}]*overflow-wrap:anywhere/);
+      page.dom.window.close();
+    });
+
+    // An addition beyond T1-T8: the send row's controls are touch targets at a phone's width.
+    it('T8: at 360 px the Test send controls are 36 px tall', async () => {
+      const page = await open();
+      const css = [...docOf(page).querySelectorAll('style')].map((el) => el.textContent ?? '').join('\n').replace(/\s+/g, ' ');
+      expect(css).toMatch(/@media\(max-width:760px\)\{\[data-tpl-send\] \.btn,\[data-tpl-send\] \.in\{[^}]*min-height:36px/);
+      page.dom.window.close();
+    });
+
+    it('F10: the Brand tab says nothing of an email preview that is not built', async () => {
+      const brand = { ...mailDescriptor, keys: { ...mailDescriptor.keys, brand__accent: { shape: 'text', target: 'html-email' } } } as Descriptor;
+      const page = await paint({ site: mailSite({ descriptor: brand, snapshot: { default: { ...mailSnapshot.default, brand__accent: '#fff' } } }) });
+      await page.act('tab:Brand');
+      expect(docOf(page).querySelector('#main')?.textContent).toContain('brand__accent');
+      expect(page.html()).not.toContain('not built yet');
+      page.dom.window.close();
+    });
+
+    it('D62: the Templates tab carries Save, which saves the drafts typed there; Remove key stays on the Content editor', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      page.answer('/api/site/save', 200, { written: ['stet/defaults.json'], unchanged: [], findings: [], at: {}, pending: [] });
+      await page.type(`text:${HEADLINE}`, 'Welcome back');
+      expect(press(page, 'save')).not.toBeNull();
+      expect(docOf(page).querySelector('[data-act^="removePlan:"]')).toBeNull();
+      await page.act('save');
+      const saves = page.sent.filter((r) => r.path.startsWith('/api/site/save'));
+      expect(saves).toHaveLength(1);
+      expect((saves[0]?.body as { values: unknown[] }).values).toMatchObject([{ key: HEADLINE, locale: 'default', value: 'Welcome back' }]);
+      await page.act('tab:Content');
+      await page.act(`key:${HEADLINE}`);
+      expect(press(page, `removePlan:${HEADLINE}`)).not.toBeNull();
+      page.dom.window.close();
+    });
+
+    it('D62: an over-limit value asks Save anyway on the Templates tab, and a refused save says why there', async () => {
+      const page = await open();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      await page.type(`text:${HEADLINE}`, 'x'.repeat(71));
+      await page.act('save');
+      expect(press(page, 'saveAnyway')).not.toBeNull();
+      expect(docOf(page).querySelector('[data-tpl-save]')?.textContent).toContain('Over the 60-character limit');
+      await page.act('saveAnyway');
+      expect(docOf(page).querySelector('[data-tpl-save] #refusal')?.textContent).toContain('refused by the save gate');
+      page.dom.window.close();
+    });
+
+    it('D62: on a store-backed site the Templates tab’s Save saves every draft to the store', async () => {
+      const page = await openStored();
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      await page.type(`text:${HEADLINE}`, 'Stored words');
+      expect(press(page, 'save')?.textContent).toBe('Save draft');
+      await page.act('save');
+      const drafts = page.sent.filter((r) => r.path.startsWith(`/s/${SITE_ID}/api/stet/draft`));
+      expect(drafts.map((r) => (r.body as { key: string; value: string }).value)).toEqual(['Stored words']);
+      page.dom.window.close();
+    });
+
+    it('T8: a store-backed card offers Test send…; a snapshot site’s card does not', async () => {
+      const stored = await openStored();
+      expect(press(stored, 'tplSendOpen:welcome')?.textContent).toBe('Test send…');
+      expect(field(stored, 'tplTo:welcome')).toBeNull();
+      stored.dom.window.close();
+      const snapshot = await open();
+      expect(docOf(snapshot).querySelector('[data-act^="tplSendOpen:"]')).toBeNull();
+      snapshot.dom.window.close();
+    });
+
+    it('T8: the address starts empty, Send waits for an @ and no line break, and typing posts nothing', async () => {
+      const page = await openStored();
+      await page.act('tplSendOpen:welcome');
+      expect(field(page, 'tplTo:welcome').value).toBe('');
+      expect(press(page, 'tplSendGo:welcome')?.disabled).toBe(true);
+      for (const [typed, enabled] of [['me', false], ['me@example.test', true], ['', false]] as const) {
+        await page.type('tplTo:welcome', typed);
+        expect(press(page, 'tplSendGo:welcome')?.disabled, JSON.stringify(typed)).toBe(!enabled);
+      }
+      // A text field strips line breaks on its own; the page's rule does not rely on that.
+      expect(run(page, 'tplToOk("me@example.test\\r\\nBcc: x@example.test")')).toBe(false);
+      expect(run(page, 'tplToOk("me@example.test")')).toBe(true);
+      run(page, 'render();');
+      await page.settle();
+      expect(sends(page)).toEqual([]);
+      page.dom.window.close();
+    });
+
+    it('T8: Send posts exactly the template and the address to the mount’s test-send, and says where it went', async () => {
+      const page = await openStored();
+      await page.act('tplSendOpen:welcome');
+      await page.type('tplTo:welcome', 'me@example.test');
+      await page.act('tplSendGo:welcome');
+      expect(sends(page)).toEqual([{ path: TEST_SEND, body: { template: 'welcome', to: 'me@example.test' } }]);
+      expect(docOf(page).querySelector('[data-tpl-send="welcome"]')?.textContent).toContain('Sent to me@example.test.');
+      page.dom.window.close();
+    });
+
+    it('T8: without emailSend (501) the page says what to add; any other refusal shows the server’s sentence', async () => {
+      const none = await openStored([501, { error: 'test-send is not wired' }]);
+      await none.act('tplSendOpen:welcome');
+      await none.type('tplTo:welcome', 'me@example.test');
+      await none.act('tplSendGo:welcome');
+      expect(docOf(none).querySelector('[data-tpl-send="welcome"]')?.textContent).toContain(
+        'Test send needs emailSend in stet.config.json: the host function that sends one email, the same one `stet email test` uses.',
+      );
+      none.dom.window.close();
+      const down = await openStored([500, { error: 'smtp down' }]);
+      await down.act('tplSendOpen:welcome');
+      await down.type('tplTo:welcome', 'me@example.test');
+      await down.act('tplSendGo:welcome');
+      expect(docOf(down).querySelector('[data-tpl-send="welcome"]')?.textContent).toContain('smtp down');
+      expect(docOf(down).querySelector('[data-tpl-send="welcome"] .err')).not.toBeNull();
+      down.dom.window.close();
+    });
+
+    it('T8: unsaved edits are named as not in the email, pluralised as the header does', async () => {
+      const page = await openStored();
+      await page.act('tplSendOpen:welcome');
+      const note = (): string => docOf(page).querySelector('[data-tpl-unsaved="welcome"]')?.textContent ?? '';
+      expect(note()).toBe('');
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      await page.type(`text:${HEADLINE}`, 'one');
+      expect(note()).toBe('1 unsaved edit is not in this email.');
+      run(page, 'setDraft("welcome__subject", "two"); paintDirty();');
+      expect(note()).toBe('2 unsaved edits are not in this email.');
       page.dom.window.close();
     });
   });

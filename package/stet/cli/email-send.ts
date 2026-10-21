@@ -22,6 +22,8 @@ import {
   outsideLine,
   pointerRequest,
   renderTemplate,
+  sendRequest,
+  slotSubject,
   templateProps,
   type RenderRequest,
 } from './email-render.js';
@@ -154,27 +156,9 @@ async function renderEmail(
     return null;
   }
 
-  const subjectKey = `${name}__subject`;
-  // A subject that is a slot is the filled one `templateProps` holds; one that is
-  // declared as a key and not a slot has no variables to fill.
-  const slotSubject = entry.slots.includes('subject')
-    ? props.values[subjectKey]
-    : Object.hasOwn(descriptor.keys, subjectKey)
-      ? valueOf(subjectKey)
-      : undefined;
-  const request: RenderRequest = {
-    ...probe,
-    props: props.values,
-    ...(opts.send === undefined
-      ? {}
-      : {
-          send: {
-            file: opts.send.file,
-            export: opts.send.export,
-            message: { to: opts.send.to, subject: typeof slotSubject === 'string' ? slotSubject : null, template: name },
-          },
-        }),
-  };
+  const subject = slotSubject(name, entry, descriptor, props.values, valueOf);
+  const request: RenderRequest =
+    opts.send === undefined ? { ...probe, props: props.values } : sendRequest(probe, props.values, name, subject, opts.send);
 
   const rendered = renderTemplate(io, request);
   if (!rendered.ok) {
@@ -191,5 +175,5 @@ async function renderEmail(
     return null;
   }
   const mapSubject = typeof result === 'string' ? undefined : result['subject'];
-  return { html, subject: typeof mapSubject === 'string' ? mapSubject : typeof slotSubject === 'string' ? slotSubject : null };
+  return { html, subject: typeof mapSubject === 'string' ? mapSubject : subject };
 }
