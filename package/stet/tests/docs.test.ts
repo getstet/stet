@@ -75,3 +75,14 @@ describe('the Lighthouse docs', () => {
     expect(seoCheck).toContain('2,467 bytes raw and 315 bytes\ngzipped');
   });
 });
+
+describe('the README dashboard section', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const dashboard = readme.slice(readme.indexOf('\n## Dashboard\n'), readme.indexOf('\n## The store, when you want one'));
+
+  it('states what the server binds and who holds the token before the first subsection', () => {
+    const binds = dashboard.indexOf('The server binds `127.0.0.1` and nothing else');
+    expect(binds).toBeGreaterThan(-1);
+    expect(binds).toBeLessThan(dashboard.indexOf('\n### '));
+  });
+});

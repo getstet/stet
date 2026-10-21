@@ -114,7 +114,7 @@ body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-ev
 #giterr{margin:10px 16px 0}
 #panetools{flex-wrap:wrap}
 @media(max-width:760px){.shell{grid-template-columns:minmax(0,1fr)}.side{border-right:0;border-bottom:1px solid hsl(var(--sbd))}.tg button{padding:4px 8px}}
-/* Under 760 px the selected key's editor sits directly under the preview, and the key list follows it, so a tap and its field share one screen. */
+/* At 760 px and narrower the selected key's editor sits directly under the preview, and the key list follows it, so a tap and its field share one screen. */
 @media(max-width:760px){#main{display:flex;flex-direction:column}#main>*{min-width:0}.edcol{order:-1}.edcol>*{min-width:0}.edcard{order:-1}}
 /* On a short phone screen the frame is capped so it and the selected field fit together. */
 @media(max-width:760px){.devwrap{height:min(420px,calc(100vh - 230px));min-height:0}}
@@ -2069,7 +2069,7 @@ function fitFrame() {
   // The frame ends where the window does, less the pane card's 1 px border and
   // the Content tab's 14 px bottom padding, so the pane never scrolls the page.
   const top = box.getBoundingClientRect().top + window.scrollY;
-  // Under 760 px the stylesheet sets the height.
+  // At 760 px and narrower the stylesheet sets the height.
   box.style.height = window.innerWidth <= 760 ? '' : Math.max(420, Math.floor(window.innerHeight - top - 15)) + 'px';
   const fit = frameFit(box.clientWidth, S.width);
   frame.style.width = fit.width + 'px';
@@ -2836,7 +2836,7 @@ const currentRoute = () => (S.moved === null ? S.route : S.moved);
 // checked: a key the descriptor declares (own property), the open edit's own
 // locale and entry, an entry the key's value holds.
 const NARROW_PX = 760;
-const narrow = () => window.innerWidth < NARROW_PX;
+const narrow = () => window.innerWidth <= NARROW_PX;
 const declared = (key) => typeof key === 'string' && ready() && own(S.site.descriptor.keys, key);
 /** A list entry's index or a record field's name, or none. */
 const isEntry = (value) => value === undefined || typeof value === 'string' || (Number.isInteger(value) && value >= 0);
@@ -3192,7 +3192,7 @@ function paintPageInfo() {
 
 /**
  * The page's text box over the frame (fork 2): the raw value of the key, its
- * entry or its attribute, `{{name}}` tokens as written. Under 760 px the
+ * entry or its attribute, `{{name}}` tokens as written. At 760 px and narrower the
  * column's own field takes the edit instead (fork 15).
  */
 function openPopover(key, loc, entry, rect) {
