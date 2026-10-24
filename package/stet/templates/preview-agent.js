@@ -8,6 +8,11 @@
 // channel on every message it sends so the dashboard can tell it from a page
 // the frame navigated to, and never sees the run token. No dependencies; it
 // runs in any page.
+//
+// Messages from the dashboard: hello, locate, clear, census, reads (the keys a
+// file of the open page reads, so the census matches only those), layer, mode,
+// edit, end. Messages to it: ready, located, census, hover, pick, unmanaged,
+// out (the pointer left the frame), rect, typed, edited, key, moved, bye.
 (function () {
   'use strict';
   var script = document.currentScript;
@@ -622,7 +627,9 @@
     ['twitter:title', 'meta[name="twitter:title"],meta[property="twitter:title"]'],
     ['twitter:description', 'meta[name="twitter:description"],meta[property="twitter:description"]'],
   ];
-  var index = null; // the last census payload's matchers, built once per payload (`censusIndex`)
+  var payload = null; // the last census payload's keys (`censusKeys`)
+  var reads = null;   // the open route's reads from the dashboard: { route, keys: Set }, or null where it cannot tell
+  var index = null;   // the matchers over `payload`, rebuilt when the payload or the reads that apply change (`buildIndex`)
   var hits = new Map(); // element → [{ key, attr, by, node?, entry?, weak? }], what hover and click read
 
   /** The first run of letters and digits in `text`, or null. */
@@ -639,17 +646,26 @@
    * of CONTAINED_MIN or more characters, each list longest text first. A value
    * that is all variables matches nothing.
    */
-  function censusIndex(keys) {
+  function censusIndex(keys, allowed) {
     var whole = new Map();
     var patterns = new Map();
     var loose = [];
     var declared = new Set();
+    var lines = new Map(); // a line of a value written over several lines → true, so the walk notes where it stands
+    var multi = [];        // [{ key, entry, lines }]: each such value, its non-empty lines normalized
     keys.forEach(function (k) {
+      // Every key stays declared, so a mark always names it; only the keys the page reads are matched by text.
       declared.add(k.key);
+      if (allowed !== null && !allowed.has(k.key)) return;
       var add = function (texts, entry) {
         texts.forEach(function (text) {
           var plain = plainOf(text);
           if (plain === '') return;
+          var split = String(text).split('\n').map(plainOf).filter(function (line) { return line !== ''; });
+          if (split.length > 1 && !split.some(function (line) { return /\{\{/.test(line); })) {
+            multi.push({ key: k.key, entry: entry, lines: split });
+            split.forEach(function (line) { lines.set(line, true); });
+          }
           if (/\{\{/.test(plain)) {
             var literal = norm(plain.replace(/\{\{\s*[\w.]+\s*\}\}/g, ' '));
             if (literal === '') return;
@@ -714,7 +730,15 @@
       return bucket === undefined ? loose : loose.concat(bucket);
     }
 
-    return { whole: whole, patternsFor: patternsFor, containedIn: containedIn, declared: declared };
+    return { whole: whole, patternsFor: patternsFor, containedIn: containedIn, declared: declared, lines: lines, multi: multi };
+  }
+
+  /** The reads that apply to the page the frame shows: the dashboard's, for this path; else none. */
+  function readsHere() {
+    return reads !== null && reads.route === location.pathname ? reads.keys : null;
+  }
+  function buildIndex() {
+    index = payload === null ? null : censusIndex(payload, readsHere());
   }
 
   /** The page's own text and attribute values where this script's swap still stands in them. */
@@ -753,6 +777,15 @@
     var shown = new Set();             // the whole texts the page shows
     var head = [];
     var page = pageValues();
+    var lineAt = new Map(); // a line → [{ el, node? }], the deepest places whose whole text is that line
+    var lineCount = Object.create(null); // key → how many times every line of its value stands on the page
+    var noteLine = function (text, el, node) {
+      if (!index.lines.has(text)) return;
+      var at = lineAt.get(text);
+      if (at === undefined) lineAt.set(text, (at = []));
+      if (at.some(function (c) { return el.contains(c.el); })) return;
+      at.push(node === undefined ? { el: el } : { el: el, node: node });
+    };
     var record = function (el, hit) {
       var list = hits.get(el);
       if (list === undefined) hits.set(el, (list = []));
@@ -795,7 +828,9 @@
         if (!parent || SKIP[parent.tagName]) continue;
         var data = page.text(node);
         var t = norm(data);
-        if (t === '' || wholeHits(parent, t, { node: node })) continue;
+        if (t === '') continue;
+        noteLine(t, parent, node);
+        if (wholeHits(parent, t, { node: node })) continue;
         var matched = false;
         var candidates = index.patternsFor(t);
         for (var p = 0; p < candidates.length; p += 1) {
@@ -826,6 +861,7 @@
         var el = all[i];
         if (SKIP[el.tagName] || el.firstElementChild === null) continue;
         var text = norm(withBreaks.has(el) ? textWithBreaks(el) : el.textContent);
+        noteLine(text, el);
         var list = whole.get(text);
         if (list === undefined) continue;
         list.forEach(function (h) {
@@ -837,6 +873,24 @@
           record(el, hit);
         });
       }
+      // A value written over several lines, each in its own element: found line by line where no
+      // whole text, pattern or contained match found the key, and only where every line stands.
+      // The keys those stages found are taken first, so a key's later entries are matched like its first.
+      var foundBefore = new Set(Object.keys(places));
+      index.multi.forEach(function (m) {
+        if (foundBefore.has(m.key)) return;
+        var at = m.lines.map(function (line) { return lineAt.get(line) || []; });
+        if (at.some(function (list) { return list.length === 0; })) return;
+        at.forEach(function (list, i) {
+          list.forEach(function (c) {
+            var hit = { key: m.key, attr: null, by: 'line', line: i, weak: weakText(m.lines[i]) };
+            if (c.node !== undefined) hit.node = c.node;
+            if (m.entry !== undefined) hit.entry = m.entry;
+            record(c.el, hit);
+          });
+        });
+        lineCount[m.key] = (lineCount[m.key] || 0) + Math.min.apply(null, at.map(function (list) { return list.length; }));
+      });
       var title = document.querySelector('title');
       if (title !== null && wholeHits(title, norm(document.title), {})) whole.get(norm(document.title)).forEach(function (h) { head.push({ key: h.key, where: 'title' }); });
       HEAD_METAS.forEach(function (meta) {
@@ -858,7 +912,7 @@
     var found = Object.create(null);
     var weak = [];
     for (var key in places) {
-      found[key] = places[key].size;
+      found[key] = lineCount[key] !== undefined ? lineCount[key] : places[key].size;
       if (strong[key] !== true) weak.push(key);
     }
     var ambiguous = [];
@@ -950,6 +1004,28 @@
     }
   }
 
+  /** Whether the editor can see `el`: it has a box, it is visible, and neither it nor any ancestor is fully transparent. */
+  function seen(el) {
+    if (el.getClientRects().length === 0 || getComputedStyle(el).visibility !== 'visible') return false;
+    for (var up = el; up !== null; up = up.parentElement) if (getComputedStyle(up).opacity === '0') return false;
+    return true;
+  }
+
+  /**
+   * What the pointer is on, as the editor sees it: the topmost element at the
+   * event's point that `seen` allows, so a transparent or hidden element stacked
+   * over visible copy never takes the hover or the click. A key-made click
+   * (`detail` 0) and a browser that cannot list the stack keep the event's target;
+   * a point where nothing is seen names nothing.
+   */
+  function visibleAt(event) {
+    if ((event.type === 'click' && event.detail === 0) || typeof document.elementsFromPoint !== 'function') return event.target;
+    var stack = document.elementsFromPoint(event.clientX, event.clientY);
+    if (stack.length === 0) return event.target;
+    for (var i = 0; i < stack.length; i += 1) if (seen(stack[i])) return stack[i];
+    return null;
+  }
+
   function insideEdit(target) {
     return edit !== null && target instanceof Node && edit.el.contains(target);
   }
@@ -969,13 +1045,13 @@
     event.stopImmediatePropagation();
     if (insideEdit(event.target)) return;
     if (event.type === 'click' || event.type === 'dblclick') clickAt = { x: event.clientX, y: event.clientY };
-    if (event.type === 'click') pickAt(event.target, false);
-    else if (event.type === 'dblclick') pickAt(event.target, true);
+    if (event.type === 'click') pickAt(visibleAt(event), false);
+    else if (event.type === 'dblclick') pickAt(visibleAt(event), true);
   }
 
   function onOver(event) {
     if (insideEdit(event.target)) return;
-    var at = hitsAt(event.target);
+    var at = hitsAt(visibleAt(event));
     var el = at === null ? null : at.el;
     if (el === hoverEl) return;
     setHover(el);
@@ -989,13 +1065,21 @@
     });
   }
 
+  // The pointer leaving the frame — a mouse or a pen; a touch pointer leaves at every lift — takes the hover ring off and says so.
+  function onOut(event) {
+    if (event.relatedTarget !== null || event.pointerType === 'touch') return;
+    setHover(null);
+    tell({ stet: 'out' });
+  }
+
   /**
    * A click on copy selects it: `pick` with each hit, `again` for a second
-   * click on the selected element or a double click. A click on text no key
-   * matches sends `unmanaged`. A click outside the element under edit ends
-   * the edit, kept, before anything is sent.
+   * click on the selected element or a double click, `key` for a pick made
+   * by Enter. A click on text no key matches sends `unmanaged`. A click
+   * outside the element under edit ends the edit, kept, before anything is
+   * sent.
    */
-  function pickAt(target, again) {
+  function pickAt(target, again, byKey) {
     end('keep');
     var at = hitsAt(target);
     if (at === null) {
@@ -1007,7 +1091,9 @@
     if (at.el === selEl) again = true;
     select(at.el);
     if (again) againEl = at.el;
-    tell({ stet: 'pick', keys: keysOf(at, true), tag: at.el.tagName.toLowerCase(), rect: rectOf(at.el), again: again });
+    var pick = { stet: 'pick', keys: keysOf(at, true), tag: at.el.tagName.toLowerCase(), rect: rectOf(at.el), again: again };
+    if (byKey) pick.key = true;
+    tell(pick);
   }
 
   /** Whether keys pressed at `target` are typing: an input, a textarea, a select or editable content. */
@@ -1037,7 +1123,7 @@
       event.preventDefault();
       againEl = null;
       clickAt = null;
-      pickAt(selEl, true);
+      pickAt(selEl, true, true);
     }
   }
 
@@ -1048,6 +1134,7 @@
     PRESSES.forEach(function (type) { window[method](type, onPress, true); });
     BLOCKED.forEach(function (type) { window[method](type, onBlocked, true); });
     window[method]('pointerover', onOver, true);
+    window[method]('pointerout', onOut, true);
     if (mode === 'use') {
       end('keep');
       setHover(null);
@@ -1127,6 +1214,31 @@
     el[method]('focusout', onEditFocusOut);
   }
 
+  /**
+   * A collapsed caret in `el`: where the last click landed when that point is
+   * inside it, else after its last character. Nothing is selected, so typing
+   * inserts.
+   */
+  function caretAt(el) {
+    var range = null;
+    if (clickAt !== null && typeof document.caretPositionFromPoint === 'function') {
+      var at = document.caretPositionFromPoint(clickAt.x, clickAt.y);
+      if (at !== null && el.contains(at.offsetNode)) { range = document.createRange(); range.setStart(at.offsetNode, at.offset); }
+    } else if (clickAt !== null && typeof document.caretRangeFromPoint === 'function') {
+      var hit = document.caretRangeFromPoint(clickAt.x, clickAt.y);
+      if (hit !== null && el.contains(hit.startContainer)) range = hit;
+    }
+    if (range === null) {
+      range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+    }
+    range.collapse(true);
+    var selection = getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
   function startInplace(el, node, key, locale, entry, oneLine) {
     var nodes = Array.prototype.slice.call(el.childNodes);
     edit = {
@@ -1145,11 +1257,7 @@
     editListeners(el, 'addEventListener');
     window.focus();
     el.focus();
-    var range = document.createRange();
-    range.selectNodeContents(el);
-    var selection = getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
+    caretAt(el);
   }
 
   /** The island the last click landed on, where the browser can say where text sits; undefined for a key press or a click on no run. */
@@ -1201,11 +1309,7 @@
     var first = islandAtClick(islands) || islands.filter(function (island) { return norm(island.textContent) !== ''; })[0] || islands[0];
     if (first === undefined) return;
     first.focus();
-    var range = document.createRange();
-    range.selectNodeContents(first);
-    var selection = getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
+    caretAt(first);
   }
 
   // Condition 3. The browser edits the DOM, runs the microtask checkpoint (the
@@ -1447,7 +1551,12 @@
     if (!hydrated) return;
     if (data.stet === 'locate' && typeof data.key === 'string' && Array.isArray(data.texts)) locate(data, data.scroll === true);
     else if (data.stet === 'clear') { last = null; end('keep'); clear(); clearLayer(); select(null); declined = []; }
-    else if (data.stet === 'census' && Array.isArray(data.keys)) { index = censusIndex(censusKeys(data.keys)); runCensus(); }
+    else if (data.stet === 'census' && Array.isArray(data.keys)) { payload = censusKeys(data.keys); buildIndex(); runCensus(); }
+    else if (data.stet === 'reads' && typeof data.route === 'string' && (data.keys === null || isTexts(data.keys))) {
+      reads = data.keys === null ? null : { route: data.route, keys: new Set(data.keys) };
+      buildIndex();
+      runCensus();
+    }
     else if (data.stet === 'layer' && Array.isArray(data.drafts)) layer(layerDrafts(data.drafts));
     else if (data.stet === 'mode' && (data.mode === 'edit' || data.mode === 'use')) setMode(data.mode);
     else if (data.stet === 'edit' && editRequest(data)) beginEdit(data);
@@ -1470,6 +1579,8 @@
     var now = location.pathname + location.search;
     if (now === route) return;
     route = now;
+    // The reads were the last path's: until the dashboard sends this one's, every key is matched.
+    buildIndex();
     tell({ stet: 'moved', how: how, route: now });
     clearTimeout(censusSoon);
     censusSoon = setTimeout(runCensus, 200);

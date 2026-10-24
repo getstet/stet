@@ -1151,10 +1151,11 @@ describe('the in-place edit (6.4)', () => {
   }
   const typedValues = (framed: Framed): unknown[] => sentOf(framed, 'typed').map((m) => m['value']);
 
-  it('starts with the element’s whole text selected', async () => {
+  it('starts with a collapsed caret, nothing selected', async () => {
     const { framed, btn } = await buttonEdit();
-    const range = (framed.win.getSelection() as Selection).getRangeAt(0);
-    expect([range.startContainer, range.startOffset, range.endContainer, range.endOffset]).toEqual([btn, 0, btn, btn.childNodes.length]);
+    // jsdom has no click point to ask the caret of: the caret stands after the last character.
+    const selection = framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.anchorNode === btn, selection.anchorOffset]).toEqual([true, true, btn.childNodes.length]);
     expect(framed.doc.activeElement).toBe(btn);
     expect(btn.getAttribute('spellcheck')).toBe('false');
   });
@@ -1845,5 +1846,467 @@ describe('an edit on an element showing a draft (additions)', () => {
     framed.send({ stet: 'clear' });
     await tick();
     expect(h1.textContent).toBe('Start free trial');
+  });
+});
+
+describe('fix-preview-editing (8o)', () => {
+  const MouseInit = (init: MouseEventInit): MouseEventInit => ({ bubbles: true, cancelable: true, ...init });
+  /** A pointer event on `el`, and the tick its message to the dashboard needs. */
+  async function over(framed: Framed, el: Element, type = 'pointerover', init: MouseEventInit = {}): Promise<void> {
+    el.dispatchEvent(new framed.win.MouseEvent(type, MouseInit(init)));
+    await tick();
+  }
+  /** A click on `el` and the tick its pick needs. */
+  async function clicked(framed: Framed, el: Element, init: MouseEventInit = {}): Promise<void> {
+    press(framed, el, 'click', init);
+    await tick();
+  }
+  /** The census as the agent last answered it, after `reads` for `route` (T2). */
+  async function readsOf(framed: Framed, route: string, keys: string[] | null): Promise<Message | undefined> {
+    framed.send({ stet: 'reads', route, keys });
+    await tick();
+    return lastOf(framed, 'census');
+  }
+  const stub = (framed: Framed, name: string, fn: unknown): void => {
+    (framed.doc as unknown as Record<string, unknown>)[name] = fn;
+  };
+  const hitKeys = (message: Message | undefined): unknown[] | undefined => (message?.['keys'] as Message[] | undefined)?.map((k) => k['key']);
+
+  describe('the route’s reads narrow the census (D2)', () => {
+    const PAGE_TWO = '<h3 id="c">Custody</h3><a id="n">Pricing</a>';
+    const TWO: CensusKey[] = [
+      { key: 'nav_custody', texts: ['Custody'] },
+      { key: 'nav_pricing', texts: ['Pricing'] },
+    ];
+
+    it('T2.1: reads narrow the census to the keys a file of the page reads', async () => {
+      const framed = await frame(PAGE_TWO);
+      const first = await censusOf(framed, TWO);
+      expect(first?.['found']).toEqual({ nav_custody: 1, nav_pricing: 1 });
+      const reply = await readsOf(framed, first?.['route'] as string, ['nav_pricing']);
+      expect(reply?.['found']).toEqual({ nav_pricing: 1 });
+    });
+
+    it('T2.2 (guard): reads for another path, and after a navigation, match every key', async () => {
+      const framed = await frame(PAGE_TWO, 'c1', '', AGENT, { url: 'http://127.0.0.1:5173/lab' });
+      await censusOf(framed, TWO);
+      expect((await readsOf(framed, '/elsewhere', ['nav_pricing']))?.['found']).toEqual({ nav_custody: 1, nav_pricing: 1 });
+      // This path's reads apply until the app navigates; the new path's census matches every key again.
+      await readsOf(framed, '/lab', ['nav_pricing']);
+      framed.win.history.pushState(null, '', '/x');
+      await tick(300);
+      expect(lastOf(framed, 'census')?.['found']).toEqual({ nav_custody: 1, nav_pricing: 1 });
+    });
+
+    it('T2.3 (guard): a mark stands whatever the reads name', async () => {
+      const framed = await frame('<h1 id="h" data-stet="hero_title">Title words</h1>');
+      await censusOf(framed, [{ key: 'hero_title', texts: ['Title words'] }]);
+      const reply = await readsOf(framed, framed.win.location.pathname, []);
+      expect(reply?.['found']).toEqual({ hero_title: 1 });
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('h') as Element);
+      expect(lastOf(framed, 'pick')?.['keys']).toMatchObject([{ key: 'hero_title', by: 'mark' }]);
+    });
+
+    it('T2.4: a key no file reads is no chooser, and a click names the one that is read', async () => {
+      const framed = await frame('<a id="n">Pricing</a>');
+      const keys: CensusKey[] = [
+        { key: 'nav_pricing', texts: ['Pricing'] },
+        { key: 'footer_pricing', texts: ['Pricing'] },
+      ];
+      const first = await censusOf(framed, keys);
+      expect(first?.['ambiguous']).toEqual([['nav_pricing', 'footer_pricing']]);
+      const reply = await readsOf(framed, first?.['route'] as string, ['nav_pricing']);
+      expect(reply?.['ambiguous']).toEqual([]);
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('n') as Element);
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['nav_pricing']);
+    });
+
+    it('reads that arrive before the census narrow the first census', async () => {
+      const framed = await frame(PAGE_TWO);
+      const route = framed.win.location.pathname;
+      const before = framed.sent.length;
+      framed.send({ stet: 'reads', route, keys: ['nav_pricing'] });
+      await tick();
+      expect(framed.sent.slice(before)).toEqual([]);
+      expect((await censusOf(framed, TWO))?.['found']).toEqual({ nav_pricing: 1 });
+    });
+
+    it('the last reads win, and null lifts the narrowing', async () => {
+      const framed = await frame(PAGE_TWO);
+      const route = framed.win.location.pathname;
+      await censusOf(framed, TWO);
+      expect((await readsOf(framed, route, ['nav_pricing']))?.['found']).toEqual({ nav_pricing: 1 });
+      expect((await readsOf(framed, route, ['nav_custody']))?.['found']).toEqual({ nav_custody: 1 });
+      expect((await readsOf(framed, route, []))?.['found']).toEqual({});
+      expect((await readsOf(framed, route, null))?.['found']).toEqual({ nav_custody: 1, nav_pricing: 1 });
+    });
+
+    it('takes no reads from another origin, or from the page itself', async () => {
+      const framed = await frame(PAGE_TWO);
+      const first = await censusOf(framed, TWO);
+      const before = framed.sent.length;
+      framed.send({ stet: 'reads', route: first?.['route'], keys: [] }, 'http://evil.example', undefined);
+      framed.send({ stet: 'reads', route: first?.['route'], keys: [] }, DASHBOARD, framed.win);
+      framed.send({ stet: 'reads', route: first?.['route'], keys: 'nav_pricing' });
+      await tick();
+      expect(framed.sent.slice(before)).toEqual([]);
+    });
+  });
+
+  describe('a value written over two lines (D4)', () => {
+    const SUFFIX: CensusKey[] = [{ key: 'hero_suffix', texts: ['across your sites\nin seconds.'] }];
+    const TWO_LINES = '<h1><span>Change the</span> <span id="a">across your sites</span><span id="b">in seconds.</span></h1>';
+
+    it('T4.1: two lines are found once, and hover names the key', async () => {
+      const framed = await frame(TWO_LINES);
+      expect((await censusOf(framed, SUFFIX))?.['found']).toEqual({ hero_suffix: 1 });
+      await setMode(framed, 'edit');
+      await over(framed, framed.doc.getElementById('b') as Element);
+      expect(lastOf(framed, 'hover')?.['keys']).toEqual([{ key: 'hero_suffix', attr: null, by: 'line' }]);
+    });
+
+    it('T4.2 (guard): one line alone is no match', async () => {
+      const framed = await frame('<p><span>across your sites</span></p>');
+      expect((await censusOf(framed, SUFFIX))?.['found']).toEqual({});
+    });
+
+    it('T4.3 (guard): a value found whole is not matched line by line', async () => {
+      const framed = await frame(TWO_LINES + '<p id="whole">across your sites in seconds.</p>');
+      expect((await censusOf(framed, SUFFIX))?.['found']).toEqual({ hero_suffix: 1 });
+      await setMode(framed, 'edit');
+      await over(framed, framed.doc.getElementById('whole') as Element);
+      expect(lastOf(framed, 'hover')?.['keys']).toEqual([{ key: 'hero_suffix', attr: null, by: 'whole' }]);
+      await over(framed, framed.doc.getElementById('b') as Element);
+      expect(lastOf(framed, 'hover')?.['keys']).toEqual([]);
+    });
+
+    it('T4.4: a line hit is never typed in place', async () => {
+      const framed = await frame(TWO_LINES);
+      await censusOf(framed, SUFFIX);
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('a') as Element);
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'hero_suffix', attr: null, by: 'line', inplace: false }]);
+    });
+
+    it('a line that is also another key’s whole text is still a line of the two-line value', async () => {
+      const framed = await frame(TWO_LINES);
+      const reply = await censusOf(framed, [...SUFFIX, { key: 'across', texts: ['across your sites'] }]);
+      expect(reply?.['found']).toEqual({ across: 1, hero_suffix: 1 });
+    });
+
+    it('a line standing in nested wrappers is one place, not several', async () => {
+      const framed = await frame(
+        '<h1><div><span id="a">across your sites</span></div><div><span id="b">in seconds.</span></div></h1>',
+      );
+      expect((await censusOf(framed, SUFFIX))?.['found']).toEqual({ hero_suffix: 1 });
+    });
+
+    it('lines split across inline elements match, numbered tags included', async () => {
+      const framed = await frame('<p><span id="a">Hello <b>big</b></span><span id="b">world</span></p>');
+      expect((await censusOf(framed, [{ key: 'k', texts: ['Hello <1>big</1>\nworld'] }]))?.['found']).toEqual({ k: 1 });
+    });
+
+    it('two short lines make a weak match', async () => {
+      const framed = await frame('<p><span>Go</span><span>On</span></p>');
+      const reply = await censusOf(framed, [{ key: 'w', texts: ['Go\nOn'] }]);
+      expect(reply?.['found']).toEqual({ w: 1 });
+      expect(reply?.['weak']).toEqual(['w']);
+    });
+
+    it('a key the route’s files do not read is not matched line by line', async () => {
+      const framed = await frame(TWO_LINES);
+      const first = await censusOf(framed, SUFFIX);
+      expect((await readsOf(framed, first?.['route'] as string, []))?.['found']).toEqual({});
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('b') as Element);
+      expect(lastOf(framed, 'unmanaged')).toBeTruthy();
+      expect(sentOf(framed, 'pick')).toEqual([]);
+    });
+
+    it('every entry of a key written over two lines is matched, not only the first', async () => {
+      const framed = await frame(
+        '<p><i id="a1">alpha one</i><i id="a2">alpha two</i></p><p><i id="b1">beta one</i><i id="b2">beta two</i></p>',
+      );
+      const reply = await censusOf(framed, [
+        { key: 'k', texts: [], parts: [{ entry: 0, texts: ['alpha one\nalpha two'] }, { entry: 1, texts: ['beta one\nbeta two'] }] },
+      ]);
+      expect(reply?.['entries']).toEqual({ k: [0, 1] });
+      expect(reply?.['found']).toEqual({ k: 2 });
+    });
+  });
+
+  describe('the visible word takes the click (D5)', () => {
+    const KEYS: CensusKey[] = [
+      { key: 'k_under', texts: ['site copy'] },
+      { key: 'k_top', texts: ['content'] },
+    ];
+    async function stacked(body: string, stack: (get: (id: string) => Element) => Element[]): Promise<Framed> {
+      const framed = await frame(body);
+      const get = (id: string): Element => framed.doc.getElementById(id) as Element;
+      stub(framed, 'elementsFromPoint', () => stack(get));
+      await censusOf(framed, KEYS);
+      await setMode(framed, 'edit');
+      return framed;
+    }
+    const click = (framed: Framed, id: string, init: MouseEventInit = { detail: 1 }): Promise<void> =>
+      clicked(framed, framed.doc.getElementById(id) as Element, { clientX: 5, clientY: 5, ...init });
+
+    it('T5.1: a transparent word stacked over a visible one gives the click to the visible one', async () => {
+      const framed = await stacked('<h1><span id="under">site copy</span><span id="top" style="opacity:0">content</span></h1>', (get) => [get('top'), get('under')]);
+      await click(framed, 'top');
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_under']);
+      await over(framed, framed.doc.getElementById('top') as Element);
+      expect(hitKeys(lastOf(framed, 'hover'))).toEqual(['k_under']);
+    });
+
+    it('T5.2: an element under a transparent ancestor is skipped', async () => {
+      const framed = await stacked(
+        '<h1><span id="under">site copy</span><div style="opacity:0"><span id="top">content</span></div></h1>',
+        (get) => [get('top'), get('under')],
+      );
+      await click(framed, 'top');
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_under']);
+    });
+
+    it('T5.3: visibility:hidden and no box are skipped', async () => {
+      const framed = await stacked(
+        '<h1><span id="under">site copy</span><span id="gone" hidden>content</span><span id="top" style="visibility:hidden">content</span></h1>',
+        (get) => [get('top'), get('gone'), get('under')],
+      );
+      await click(framed, 'top');
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_under']);
+    });
+
+    it('nothing in the stack seen names nothing', async () => {
+      const framed = await stacked(
+        '<h1><span id="top" style="opacity:0">content</span><span id="u" style="visibility:hidden">site copy</span></h1>',
+        (get) => [get('top'), get('u')],
+      );
+      await click(framed, 'top');
+      expect(sentOf(framed, 'pick')).toEqual([]);
+      expect(sentOf(framed, 'unmanaged')).toEqual([]);
+    });
+
+    it('an empty stack keeps the event’s target', async () => {
+      const framed = await stacked('<h1><span id="top">content</span></h1>', () => []);
+      await click(framed, 'top');
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_top']);
+    });
+
+    it('a double click goes through the stack too', async () => {
+      const framed = await stacked(
+        '<h1><span id="under">site copy</span><span id="top" style="opacity:0">content</span></h1>',
+        (get) => [get('top'), get('under')],
+      );
+      press(framed, framed.doc.getElementById('top') as Element, 'dblclick', { clientX: 5, clientY: 5, detail: 2 });
+      await tick();
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_under']);
+    });
+
+    it('T5.4 (guard): a click made by a key keeps its target', async () => {
+      const framed = await stacked('<h1><span id="under">site copy</span><span id="top" style="opacity:0">content</span></h1>', (get) => [get('under')]);
+      await click(framed, 'top', { detail: 0 });
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_top']);
+    });
+  });
+
+  describe('the pointer leaving the frame (D6)', () => {
+    const TWO_P = '<p id="p">Ship copy today</p><p id="q">Another line of copy</p>';
+    const KEYS: CensusKey[] = [
+      { key: 'k_p', texts: ['Ship copy today'] },
+      { key: 'k_q', texts: ['Another line of copy'] },
+    ];
+    const ringed = (el: Element | null): string => (el as HTMLElement).style.boxShadow;
+
+    it('T6.1: leaving clears the ring and says out', async () => {
+      const framed = await frame(TWO_P);
+      await censusOf(framed, KEYS);
+      await setMode(framed, 'edit');
+      const p = framed.doc.getElementById('p') as HTMLElement;
+      await over(framed, p);
+      expect(ringed(p)).not.toBe('');
+      await over(framed, p, 'pointerout', { relatedTarget: null });
+      await tick();
+      expect(ringed(p)).toBe('');
+      expect(sentOf(framed, 'out')).toHaveLength(1);
+    });
+
+    it('T6.2 (guard): moving inside the page sends nothing, and the ring moves as before', async () => {
+      const framed = await frame(TWO_P);
+      await censusOf(framed, KEYS);
+      await setMode(framed, 'edit');
+      const p = framed.doc.getElementById('p') as HTMLElement;
+      const q = framed.doc.getElementById('q') as HTMLElement;
+      await over(framed, p);
+      await over(framed, p, 'pointerout', { relatedTarget: q });
+      await over(framed, q);
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(0);
+      expect([ringed(p), ringed(q) === '']).toEqual(['', false]);
+    });
+
+    it('T6.3 (guard): a touch lift sends nothing', async () => {
+      const framed = await frame(TWO_P);
+      await censusOf(framed, KEYS);
+      await setMode(framed, 'edit');
+      const p = framed.doc.getElementById('p') as HTMLElement;
+      await over(framed, p);
+      const lift = new framed.win.MouseEvent('pointerout', MouseInit({ relatedTarget: null }));
+      Object.defineProperty(lift, 'pointerType', { value: 'touch' });
+      p.dispatchEvent(lift);
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(0);
+    });
+
+    it('a pen leaving says out, and Use mode listens to nothing', async () => {
+      const framed = await frame(TWO_P);
+      await censusOf(framed, KEYS);
+      const p = framed.doc.getElementById('p') as HTMLElement;
+      const leave = (pointerType?: string): void => {
+        const event = new framed.win.MouseEvent('pointerout', MouseInit({ relatedTarget: null }));
+        if (pointerType !== undefined) Object.defineProperty(event, 'pointerType', { value: pointerType });
+        p.dispatchEvent(event);
+      };
+      leave();
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(0);
+      await setMode(framed, 'edit');
+      leave('pen');
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(1);
+      await setMode(framed, 'use');
+      leave();
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(1);
+    });
+  });
+
+  describe('the caret where the editor clicked (D7)', () => {
+    const textOf = (el: Element): Text => el.firstChild as Text;
+    function caretStubs(framed: Framed, node: Text, ranged: number, positioned?: number): void {
+      stub(framed, 'caretRangeFromPoint', () => {
+        const range = framed.doc.createRange();
+        range.setStart(node, ranged);
+        return range;
+      });
+      if (positioned !== undefined) stub(framed, 'caretPositionFromPoint', () => ({ offsetNode: node, offset: positioned }));
+    }
+    /** Whether the selection is collapsed, whether it stands in `node`, and its offset. */
+    const selected = (framed: Framed, node: Node): [boolean, boolean, number] => {
+      const sel = framed.win.getSelection() as Selection;
+      return [sel.isCollapsed, sel.anchorNode === node, sel.anchorOffset];
+    };
+
+    it('T7.1: the caret is collapsed where the click landed', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      const btn = framed.doc.getElementById('btn') as HTMLElement;
+      caretStubs(framed, textOf(btn), 5);
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, btn, { clientX: 30, clientY: 8, detail: 1 });
+      await clicked(framed, btn, { clientX: 30, clientY: 8, detail: 2 });
+      framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+      await tick();
+      expect(selected(framed, textOf(btn))).toEqual([true, true, 5]);
+    });
+
+    it('T7.2: caretPositionFromPoint is preferred where both exist', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      const btn = framed.doc.getElementById('btn') as HTMLElement;
+      caretStubs(framed, textOf(btn), 5, 3);
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, btn, { clientX: 30, clientY: 8, detail: 1 });
+      framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+      await tick();
+      expect(selected(framed, textOf(btn))).toEqual([true, true, 3]);
+    });
+
+    it('T7.3: Enter starts the edit at the end of the text', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      const btn = framed.doc.getElementById('btn') as HTMLElement;
+      caretStubs(framed, textOf(btn), 5);
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, btn, { clientX: 30, clientY: 8, detail: 1 });
+      key(framed, framed.doc.body, { key: 'Enter' });
+      await tick();
+      framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+      await tick();
+      expect(selected(framed, btn)).toEqual([true, true, btn.childNodes.length]);
+    });
+
+    it('a caret point outside the element falls back to the end, by either API', async () => {
+      for (const api of ['caretPositionFromPoint', 'caretRangeFromPoint']) {
+        const framed = await frame('<button id="btn">Start free trial</button><p id="o">Other words</p>');
+        const btn = framed.doc.getElementById('btn') as HTMLElement;
+        const other = textOf(framed.doc.getElementById('o') as Element);
+        if (api === 'caretPositionFromPoint') stub(framed, api, () => ({ offsetNode: other, offset: 2 }));
+        else
+          stub(framed, api, () => {
+            const range = framed.doc.createRange();
+            range.setStart(other, 2);
+            return range;
+          });
+        await censusOf(framed, BUTTON);
+        await setMode(framed, 'edit');
+        await clicked(framed, btn, { clientX: 3, clientY: 3, detail: 1 });
+        framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+        await tick();
+        expect(selected(framed, btn), api).toEqual([true, true, btn.childNodes.length]);
+        closeFrames();
+      }
+    });
+
+    it('an Enter-started edit has no click point to ask for, and lands at the end', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      const btn = framed.doc.getElementById('btn') as HTMLElement;
+      caretStubs(framed, textOf(btn), 3, 3);
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, btn, { clientX: 3, clientY: 3, detail: 1 });
+      key(framed, framed.doc.body, { key: 'Enter' });
+      await tick();
+      framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+      await tick();
+      expect(selected(framed, btn)).toEqual([true, true, btn.childNodes.length]);
+    });
+
+    it('T7.4: the runs form puts the caret inside the island that was clicked', async () => {
+      const framed = await frame('<h1 data-stet="hero">Your site’s words<span class="tail"> in one place.</span></h1>');
+      const RECTS: Record<string, { left: number; right: number }> = { 'Your site’s words': { left: 0, right: 100 }, ' in one place.': { left: 100, right: 200 } };
+      (framed.win.Range.prototype as unknown as { getClientRects: (this: Range) => unknown[] }).getClientRects = function (this: Range) {
+        const rect = RECTS[this.commonAncestorContainer.textContent ?? ''];
+        return rect === undefined ? [] : [{ ...rect, top: 0, bottom: 20 }];
+      };
+      const h1 = framed.doc.querySelector('h1') as HTMLElement;
+      const tail = (h1.querySelector('.tail') as Element).firstChild as Text;
+      caretStubs(framed, tail, 4);
+      await censusOf(framed, [{ key: 'hero', texts: ['Your site’s words<1> in one place.</1>'] }]);
+      await setMode(framed, 'edit');
+      await clicked(framed, h1, { clientX: 150, clientY: 10, detail: 1 });
+      framed.send({ stet: 'edit', key: 'hero', locale: 'default', form: 'runs', oneLine: true });
+      await tick();
+      const islands = [...h1.querySelectorAll('[data-stet-island]')];
+      expect(islands).toHaveLength(2);
+      expect(selected(framed, tail)).toEqual([true, true, 4]);
+      expect((framed.win.getSelection() as Selection).anchorNode?.parentElement).toBe(islands[1]);
+    });
+  });
+
+  describe('an Enter pick is marked (D1, Starts)', () => {
+    it('T1.11: a pick made by Enter carries key: true, a click’s carries none', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('btn') as Element);
+      expect(lastOf(framed, 'pick')).not.toHaveProperty('key');
+      key(framed, framed.doc.body, { key: 'Enter' });
+      await tick();
+      expect(sentOf(framed, 'pick')).toHaveLength(2);
+      expect(lastOf(framed, 'pick')).toMatchObject({ key: true, again: true });
+    });
   });
 });

@@ -11481,10 +11481,10 @@ describe('preview-editing', () => {
       return { framed, btn, node };
     };
 
-    // Typing in place on a React page: the whole text selected, typing replaces it, Enter keeps it, React's nodes come back.
+    // Typing in place on a React page: a collapsed caret, nothing selected, typing inserts, Enter keeps it, React's nodes come back.
     const typing = await buttonEdit();
-    const range = (typing.framed.win.getSelection() as Selection).getRangeAt(0);
-    expect([range.startContainer, range.startOffset, range.endContainer, range.endOffset]).toEqual([typing.btn, 0, typing.btn, typing.btn.childNodes.length]);
+    const selection = typing.framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.anchorNode, selection.anchorOffset]).toEqual([true, typing.btn, typing.btn.childNodes.length]);
     expect(typing.btn.getAttribute('contenteditable')).toBe('plaintext-only');
     typing.btn.textContent = 'Try it free';
     typing.btn.dispatchEvent(new typing.framed.win.InputEvent('input', { inputType: 'insertText', bubbles: true }));
