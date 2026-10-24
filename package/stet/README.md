@@ -148,10 +148,10 @@ The preview pane has an `Edit | Use` switch, set to Edit when the Content tab
 opens. In Edit, hovering copy rings it and names its key, and a click selects
 that key; the page's own handlers do not run, so a link does not navigate and a
 button does not fire. In Use the page behaves as it does without stet. E
-switches between the two when focus is in no field.
+switches between the two when focus is in no field. Words count as a key only where a file of the open page reads that key; where stet cannot tell, any text that matches a key can be picked, and the pane says so.
 
 A second click, a double click or Enter on selected copy edits the text where
-it stands, with the whole text selected so typing replaces it. Enter keeps the
+it stands, with the caret where you clicked. Typing in the page shows a count only near the key's limit. Enter keeps the
 edit and Esc puts the text back. Copy that shares its element with other text,
 a value carrying `{{name}}`, an attribute such as alt text, and every tap at a
 viewport 760 px wide or narrower open the dashboard's field instead, with the
@@ -251,6 +251,8 @@ stdlib-only Python helper ships in the package.
 Node.js 22 or later; `stet audit lighthouse` needs 22.19 or later, Google Chrome, and three dev dependencies a plain install leaves out:
 `npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. stet installs its own copy of TypeScript 5 (about 24 MB) for
 scanning, adoption, key badges and the preview's page checks, so it works with whatever TypeScript the project has, or none.
+
+Upgrading from 0.8.0: a project that installed typescript only for stet can remove it.
 
 Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
 selfsigned because the lockfile holds them. To drop them, delete their node_modules/ entries from package-lock.json
