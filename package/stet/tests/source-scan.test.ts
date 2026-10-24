@@ -16,6 +16,7 @@ import {
   rendersToken,
   scanDialect,
   scanModule,
+  SCHEME_SPECIFIER,
   scanSource,
   undecodedEntity,
 } from '../cli/source-scan.js';
@@ -151,6 +152,16 @@ describe('proposeKey', () => {
     const key = proposeKey('a'.repeat(55));
     expect(key).toBe('a'.repeat(40));
     expect(KEY_REGEX.test(key)).toBe(true);
+  });
+});
+
+describe('SCHEME_SPECIFIER', () => {
+  it.each(['node:fs', 'astro:assets', 'virtual:uno.css', 'https://x.test/a.js', 'data:text/javascript,1'])('%s is a scheme', (spec) => {
+    expect(SCHEME_SPECIFIER.test(spec)).toBe(true);
+  });
+
+  it.each(['@scope/x:y', 'react', './a:b', 'C:\\foo'])('%s is not a scheme', (spec) => {
+    expect(SCHEME_SPECIFIER.test(spec)).toBe(false);
   });
 });
 

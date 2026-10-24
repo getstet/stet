@@ -58,7 +58,7 @@ import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
 import { closing, dialectCode, KEY_READ, nonCodeOf, openTag, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
-import { isGenerated, keyUsage, namedKeys, ownFiles, usageCache, type UsageCache } from './key-usage.js';
+import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
 import { applyPages, auditablePages, fileRoute, proposeForHost, routeFiles, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
@@ -490,7 +490,7 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
       case 'GET site/usage':
         return await usage(ctx, site);
       case 'GET site/route-reads':
-        return await routeReads(url, site);
+        return await routeReads(ctx, url, site);
       case 'POST site/dev-start':
         return await devStart(ctx, site, entry);
       case 'POST site/dev-stop':
@@ -602,7 +602,7 @@ async function previewReads(site: Ready, env: NodeJS.ProcessEnv): Promise<{ snap
 /**
  * Whether `text` holds `value` as a quoted string outside every comment. The
  * comments are the TypeScript scanner's (`nonCodeOf`), so a `//` inside a
- * string is not one. Without `typescript` installed the text is read as it is.
+ * string is not one. Where stet's own `typescript` does not load the text is read as it is.
  */
 async function holdsLiteral(file: string, text: string, value: string): Promise<boolean> {
   const literals = ["'", '"', '`'].map((quote) => quote + value + quote);
@@ -2013,20 +2013,27 @@ function marks(site: SiteState): Response {
  */
 async function usage(ctx: DevContext, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
+  return json(await keyUsage(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path)));
+}
+
+/** A site's file facts, kept in `ctx` between requests: the usage and the route reads read through the same cache. */
+function usageCacheOf(ctx: DevContext, path: string): UsageCache {
   const caches = (ctx.usage ??= new Map());
-  const cache = caches.get(ready.path) ?? usageCache();
-  caches.set(ready.path, cache);
-  return json(await keyUsage(ready.path, ready.config, ready.descriptor, cache));
+  const cache = caches.get(path) ?? usageCache();
+  caches.set(path, cache);
+  return cache;
 }
 
 /**
  * The keys one route's files read: on the static-HTML host the marks of the
- * document served at the route; on a JavaScript host the keys named in the
- * route's page files (`routeFiles`) and everything they import, through the
- * host's path aliases. `complete` is false where the walk met a file it could
- * not follow or the route maps to no file.
+ * document served at the route; on a JavaScript host the reads `siteReads`
+ * settles for the route's page files (`routeFiles`) and everything they import,
+ * through the host's path aliases: the keys each file names, and every declared
+ * key under a prefix it reads. `complete` is false where the walk met a file it
+ * could not follow, a file reads a key stet cannot name (a cause), loads
+ * modules lazily, or the route maps to no file.
  */
-async function routeReads(url: URL, site: SiteState): Promise<Response> {
+async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
   const route = url.searchParams.get('route');
   if (route === null) throw new UsageError('route is required');
@@ -2052,6 +2059,8 @@ async function routeReads(url: URL, site: SiteState): Promise<Response> {
       const found = probeFile(ready.path, candidate);
       if (found !== null) return found;
     }
+    // A scheme the host's own `paths` declare is an alias that maps nowhere, not a module the framework provides.
+    if (mappings !== null && declaresAlias(spec, mappings.paths)) return null;
     return isBarePackage(spec) && packages(spec) ? undefined : null;
   };
   // A file nested past the compiler's recursion cannot be walked: the route
@@ -2063,16 +2072,24 @@ async function routeReads(url: URL, site: SiteState): Promise<Response> {
     if (!(error instanceof RangeError)) throw error;
     return json({ route, files, keys: [], complete: false });
   }
-  const declared = new Set(Object.keys(ready.descriptor.keys));
+  const declaredKeys = Object.keys(ready.descriptor.keys);
+  const declared = new Set(declaredKeys);
   const own = ownFiles(ready.config);
+  const reads = await siteReads(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path));
   const keys = new Set<string>();
   let complete = !chain.boundary;
   for (const file of chain.files) {
     // The files stet writes name every key, and read none.
     if (own.has(file.rel) || isGenerated(file.text)) continue;
+    const read = reads.files.get(file.rel);
+    // A source file the scan did not read (ignored by git, reached through a symlinked folder):
+    // its names count, and its reads are not known.
+    if (read === undefined && isSourceFile(file.rel)) complete = false;
     try {
-      for (const key of namedKeys(ts, file.rel, file.text, declared)) keys.add(key);
-      if (importsLazily(ts, file.rel, file.text)) complete = false;
+      for (const key of read === undefined ? namedKeys(ts, file.rel, file.text, declared) : read.named) keys.add(key);
+      // A prefix read reads every declared key under it; a read the scan cannot settle reads keys stet cannot name.
+      for (const p of read?.prefixes ?? []) for (const key of declaredKeys) if (key.startsWith(p.prefix)) keys.add(key);
+      if ((read !== undefined && read.causes.length > 0) || importsLazily(ts, file.rel, file.text)) complete = false;
     } catch (error) {
       if (!(error instanceof RangeError)) throw error;
       complete = false;
@@ -2081,12 +2098,22 @@ async function routeReads(url: URL, site: SiteState): Promise<Response> {
   return json({ route, files, keys: [...keys].sort(), complete });
 }
 
-/** Whether a file holds a dynamic `import()` or a `require()` call: a module the walk would not see. */
+/**
+ * Whether a file holds a dynamic `import()`, a `require()` call or a glob import
+ * (`import.meta.glob(…)`, `Astro.glob(…)`): a module the walk would not see.
+ */
 export function importsLazily(ts: typeof import('typescript'), rel: string, text: string): boolean {
-  if (!/\b(?:import|require)\s*\(/.test(text)) return false;
+  if (!/\b(?:import|require)\s*\(|\bimport\.meta\.glob|\bAstro\.glob/.test(text)) return false;
   const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
+  const globbed = (callee: TS.Expression): boolean =>
+    ts.isPropertyAccessExpression(callee) &&
+    callee.name.text === 'glob' &&
+    (ts.isMetaProperty(callee.expression) || (ts.isIdentifier(callee.expression) && callee.expression.text === 'Astro'));
   const found = (node: TS.Node): boolean =>
-    (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) ||
+    (ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require') ||
+        globbed(node.expression))) ||
     ts.forEachChild(node, found) === true;
   try {
     return found(sf);

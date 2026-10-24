@@ -62,7 +62,7 @@ import { GATE_LINE, HOOK_BEFORE_0_3_1, SHARED_GATE_LINE, runHookInstall } from '
 import { refuseDanglingReferences } from '../cli/remove.js';
 import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
 import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
-import { TS7_REFUSAL } from '../cli/source-scan.js';
+import { TS_BROKEN } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { MARKETING, chainProject, doctor as doctorOf, write as writeChain } from '../tests/helpers/chain-project.js';
 import { cleanupOutsideFiles, outsideFile, previewHost } from '../tests/helpers/email-preview-host.js';
@@ -977,11 +977,18 @@ describe('content-read', () => {
     // loaded only under `stet audit lighthouse`: no entry a host runs reaches
     // them, the read entries, the mount and the four store adapters among them.
     const auditOnly = ['lighthouse', 'chrome-launcher', 'selfsigned', 'puppeteer-core'];
+    // `typescript` is stet's own dependency, loaded only by the source tools:
+    // the same eight entries stay free of it, so no host bundle carries the compiler.
+    const toolOnly = ['typescript'];
     for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts', '../server/index.ts', '../adapters/store-memory.ts', '../adapters/store-snapshot.ts', '../adapters/store-pg.ts', '../adapters/store-postgrest.ts']) {
       const closure = runtimeImportClosure(new URL(entry, import.meta.url));
       expect({ entry, audit: closure.bare.filter((spec) => auditOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
         entry,
         audit: [],
+      });
+      expect({ entry, tool: closure.bare.filter((spec) => toolOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
+        entry,
+        tool: [],
       });
     }
 
@@ -5527,7 +5534,7 @@ describe('cli', () => {
   });
 
   it.skipIf(!builtBinExists())('Requirement: doctor names the compiler scan and register need', async () => {
-    const NOT_INSTALLED = 'typescript: not installed — stet scan and stet register read src/copy.ts with it; npm i -D typescript';
+    const NOT_LOADED = 'stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet. stet scan and stet register read src/copy.ts with it';
     /** An Astro host whose `.astro` surfaces are dialect files and whose copy modules only the compiler reads. */
     const astro = (copyModules: string[]): CliHost => {
       const host = makeCliHost({
@@ -5547,19 +5554,19 @@ describe('cli', () => {
 
     const installed = astro(['src/copy.ts']);
     expect(await installed.run('doctor')).toBe(0);
-    expect(`${installed.stdout()}\n${installed.stderr()}`).not.toContain('typescript:');
+    expect(`${installed.stdout()}\n${installed.stderr()}`).not.toContain(TS_BROKEN);
 
     const missing = doctor(astro(['src/copy.ts']), { hideTypescript: true });
     expect(missing.code).toBe(0);
-    expect(missing.text).toContain(NOT_INSTALLED);
+    expect(missing.text).toContain(NOT_LOADED);
 
     const dialectOnly = doctor(astro([]), { hideTypescript: true });
     expect(dialectOnly.code).toBe(0);
-    expect(dialectOnly.text).not.toContain('typescript:');
+    expect(dialectOnly.text).not.toContain(TS_BROKEN);
 
     const broken = doctor(astro(['src/copy.ts']), { breakTypescript: true });
     expect(broken.code).toBe(0);
-    expect(broken.text).toContain(NOT_INSTALLED);
+    expect(broken.text).toContain(NOT_LOADED);
   });
 
   /** A host with one declared, pointered template `welcome`, a recording send function and the given store. */
@@ -6619,16 +6626,16 @@ describe('adoption', () => {
     expect(await bare.run('scan')).toBe(0);
     expect(bare.stderr()).toBe('');
 
-    // The scanner is the TypeScript 5 compiler API, and it says so. TS7's npm
-    // package exposes version constants at its root and no compiler at all, so
-    // a 7.x resolution is refused by name rather than crashing somewhere
-    // further in — and the peer range (`>=5 <7`) states the same fact.
-    expect(TS7_REFUSAL).toContain('typescript 7 is not yet supported');
-    expect(TS7_REFUSAL).toContain('install typescript@5');
-    const peers = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    // The scanner is the TypeScript 5 compiler API, and stet ships its own
+    // copy: a dependency at a 5.x range, no peer. A copy that does not load is
+    // a broken install, and the one line says to reinstall stet.
+    expect(TS_BROKEN).toContain('reinstall stet: npm i @getstet/stet');
+    const shipped = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+      dependencies: Record<string, string>;
       peerDependencies: Record<string, string>;
     };
-    expect(peers.peerDependencies['typescript']).toBe('>=5 <7');
+    expect(shipped.dependencies['typescript']).toBe('^5.6.0');
+    expect(shipped.peerDependencies['typescript']).toBeUndefined();
 
     // The declared-slot check rides the same walk. A slot whose flattened key
     // has left the file that renders it is copy the dashboard still offers an
@@ -8961,8 +8968,8 @@ describe('dashboard', () => {
     expect(await host.run('pages', 'scan', '--apply')).toBe(0);
     const page = await served(host.cwd);
     const doc = page.dom.window.document;
-    expect([...doc.querySelectorAll('#gsel option')].map((option) => option.textContent)).toEqual(['home — page', 'SEO']);
-    expect((doc.getElementById('gsel') as HTMLSelectElement).value).toBe('page:home');
+    expect([...doc.querySelectorAll('#gsel option')].map((option) => option.textContent)).toEqual(['All keys', 'This page', 'home — page', 'SEO']);
+    expect((doc.getElementById('gsel') as HTMLSelectElement).value).toBe('all');
     // The SEO group holds exactly the keys every mark of which is a head text.
     const marks = (await call(handlerOver([host.cwd]).handler, `/api/site/marks${siteOf(host.cwd)}`)).body;
     const head = Object.keys(marks.places as Record<string, Array<{ head?: true }>>)
@@ -9302,9 +9309,10 @@ describe('dashboard', () => {
       page.dom.window.close();
       return at;
     };
-    expect(await opens('/about.html?x=1')).toEqual({ group: 'page:about', route: '/about.html?x=1', loads: 1 });
-    expect(await opens('/')).toEqual({ group: 'page:home', route: '/', loads: 1 });
-    expect(await opens('/retired.html')).toEqual({ group: 'page:about', route: '/about.html', loads: 1 });
+    // The route is chosen through the groups; the list opens on every key.
+    expect(await opens('/about.html?x=1')).toEqual({ group: 'all', route: '/about.html?x=1', loads: 1 });
+    expect(await opens('/')).toEqual({ group: 'all', route: '/', loads: 1 });
+    expect(await opens('/retired.html')).toEqual({ group: 'all', route: '/about.html', loads: 1 });
   });
 
   it('Requirement: The header shows the branch, the preview link and Publish to live', async () => {
@@ -10224,11 +10232,13 @@ describe('dashboard', () => {
       },
     });
     await agent.pick([{ key: 'lab_button' }]);
-    // The tap selects, scrolls the field into view with the tapped element kept on screen, and opens no popover.
-    expect(scrolled).toContain('text:lab_button {"block":"nearest"}');
+    // The tap selects and opens no popover; the field is not scrolled to, so the frame under the finger stays put.
+    expect(scrolled).toEqual([]);
     expect(evalIn(page, 'S.popover')).toBeNull();
-    // A second tap on the selected key opens the column's field, not the popover.
+    // A second tap on the selected key focuses the column's field and scrolls it into view, the tapped element kept on screen.
     await agent.pick([{ key: 'lab_button' }], { again: true });
+    expect(scrolled).toEqual(['text:lab_button {"block":"nearest"}']);
+    expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_button');
     expect(evalIn(page, 'S.popover')).toBeNull();
     expect(evalIn(page, 'S.edit')).toBeNull();
     // The editor sits directly under the preview, the key list after it, every card of the column one column wide.
@@ -11214,7 +11224,7 @@ describe('key-usage', () => {
       ].join('\n'),
     );
 
-    // Without `typescript` the rows carry no badge, `usage` is null and the install line is among the findings.
+    // Without stet's own `typescript` the rows carry no badge, `usage` is null and the reinstall line is among the findings.
     const noCompiler = hostOver();
     vi.resetModules();
     vi.doMock('typescript', () =>
@@ -11233,7 +11243,7 @@ describe('key-usage', () => {
       expect(bareAnswer.rows.every((r) => !('badge' in r))).toBe(true);
       expect(bareAnswer.usage).toBeNull();
       expect(bareAnswer.findings).toEqual([
-        expect.objectContaining({ level: 'warn', message: "stet needs 'typescript' to read your source — install it as a dev dependency: npm i -D typescript" }),
+        expect.objectContaining({ level: 'warn', message: 'stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet' }),
       ]);
     } finally {
       vi.doUnmock('typescript');
@@ -11481,10 +11491,10 @@ describe('preview-editing', () => {
       return { framed, btn, node };
     };
 
-    // Typing in place on a React page: the whole text selected, typing replaces it, Enter keeps it, React's nodes come back.
+    // Typing in place on a React page: a collapsed caret, nothing selected, typing inserts, Enter keeps it, React's nodes come back.
     const typing = await buttonEdit();
-    const range = (typing.framed.win.getSelection() as Selection).getRangeAt(0);
-    expect([range.startContainer, range.startOffset, range.endContainer, range.endOffset]).toEqual([typing.btn, 0, typing.btn, typing.btn.childNodes.length]);
+    const selection = typing.framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.anchorNode, selection.anchorOffset]).toEqual([true, typing.btn, typing.btn.childNodes.length]);
     expect(typing.btn.getAttribute('contenteditable')).toBe('plaintext-only');
     typing.btn.textContent = 'Try it free';
     typing.btn.dispatchEvent(new typing.framed.win.InputEvent('input', { inputType: 'insertText', bubbles: true }));
@@ -11693,7 +11703,7 @@ describe('preview-editing', () => {
     expect(idOf(framed, 'close').getAttribute('aria-label')).toBe('Begin');
     bridge.page.dom.window.close();
 
-    // A tap at phone width: no popover, the key is selected, the column's field scrolled into view and typed in.
+    // A tap at phone width: no popover, the key is selected; a second tap scrolls the column's field into view, focused, and it is typed in.
     const scrolled: string[] = [];
     const phone = await bridged({
       site: labSite(),
@@ -11706,8 +11716,10 @@ describe('preview-editing', () => {
     });
     await phone.agent.pick([{ key: 'lab_button' }]);
     expect(selected(phone.page)).toBe('lab_button');
-    expect(scrolled).toContain('text:lab_button');
+    // The first tap scrolls nothing; the second focuses the field and scrolls it into view.
+    expect(scrolled).toEqual([]);
     await phone.agent.pick([{ key: 'lab_button' }], { again: true });
+    expect(scrolled).toEqual(['text:lab_button']);
     expect(phone.agent.sent('edit')).toEqual([]);
     expect(popover(phone.page).hidden).toBe(true);
     expect(docOf(phone.page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_button');

@@ -13,6 +13,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { runEmailExtract } from '../cli/email-extract.js';
 import { runScan } from '../cli/scan.js';
+import { TS_BROKEN } from '../cli/source-scan.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { cleanupEmailHosts, makeEmailHost } from './helpers/email-host.js';
 import { cleanupCliHosts, makeHtmlHost } from '../conformance/cli-host.js';
@@ -2005,7 +2006,7 @@ describe('runScan — an email template no entry manages', () => {
       const { CliError } = await import('../cli/report.js');
       return {
         ...(await importOriginal<typeof import('../cli/source-scan.js')>()),
-        loadTypescript: () => Promise.reject(new CliError("stet needs 'typescript' to read your source")),
+        loadTypescript: () => Promise.reject(new CliError(TS_BROKEN)),
       };
     });
     try {

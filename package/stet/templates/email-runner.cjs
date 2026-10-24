@@ -5,10 +5,10 @@
  * `packageRoot()`. It runs in a CHILD process, one render per invocation, so a
  * template that crashes fails itself and the walk continues.
  *
- * Everything it renders with is the HOST's: `typescript` transpiles `.ts`/`.tsx`
- * on require, so every import resolves from the host's own `node_modules`, and a
- * React element result renders through the host's `react-dom/server`. stet adds
- * no dependency of its own and forks no resolver.
+ * stet's own `typescript` transpiles `.ts`/`.tsx` on require, whatever
+ * TypeScript the host has; every import resolves from the host's own
+ * `node_modules`, and a React element result renders through the host's
+ * `react-dom/server`. It forks no resolver.
  *
  * Usage: node email-runner.cjs <hostDir> <file> <exportName> <propsJson> [<optsJson>]
  * `optsJson` is `{ frame?, fill?, send? }`: the pointer's frame and fill, and
@@ -31,30 +31,18 @@ const { createRequire } = require('module');
  */
 const OK = 0;
 const EXPORT_NOT_FUNCTION = 2;
-const TS7_UNSUPPORTED = 3;
+const COMPILER_MISSING = 3;
 const MISSING_DEPENDENCY = 4;
 const RENDER_THREW = 5;
 const NOT_RENDERABLE = 6;
 const SEND_FAILED = 7;
 
 /**
- * The same refusal `loadTypescript` gives (`cli/source-scan.ts`'s `TS7_REFUSAL`,
- * which a shipped asset cannot import — a test asserts the two agree).
- * TypeScript 7's package root exports version constants only — no
- * `transpileModule`, no `createSourceFile` — so a host on 7.x is refused by name
- * rather than crashing on a missing function.
+ * The same refusal `loadTypescript` gives (`cli/source-scan.ts`'s `TS_BROKEN`,
+ * which a shipped asset cannot import — a test asserts the two agree): stet's
+ * own `typescript` did not load, or carries no compiler API.
  */
-const TS7_MESSAGE =
-  "stet's source tools use the TypeScript 5 compiler API — typescript 7 is not yet supported; install typescript@5 as a devDependency";
-
-/**
- * What a specifier that is neither relative nor a package name gets appended to
- * its resolution failure: the runner maps ONE alias form, and the remedy names
- * both ways out rather than leaving an adopter to guess at stet's resolver.
- */
-/** The install line `loadTypescript` gives, verbatim — one answer, two places. */
-const TYPESCRIPT_INSTALL =
-  "stet needs 'typescript' to read your source — install it as a dev dependency: npm i -D typescript";
+const TS_BROKEN = "stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet";
 
 /**
  * The prefix a line on stderr carries when the render SUCCEEDED and there is
@@ -64,6 +52,11 @@ const TYPESCRIPT_INSTALL =
  */
 const NOTE = 'stet-note: ';
 
+/**
+ * What a specifier that is neither relative nor a package name gets appended to
+ * its resolution failure: the runner maps ONE alias form, and the remedy names
+ * both ways out rather than leaving an adopter to guess at stet's resolver.
+ */
 const ALIAS_REMEDY =
   'stet renders through Node\'s own resolver plus one alias form: a single-wildcard "paths" entry declared in the app root\'s own tsconfig.json ("@/*": ["./src/*"]). Rewrite this import as a relative path, or declare the template without a render pointer.';
 
@@ -95,10 +88,16 @@ if (hostDirArg === undefined || fileArg === undefined || exportName === undefine
 async function run(hostDir, file, exportName, propsJson, opts) {
   try {
     const hostRequire = createRequire(path.join(hostDir, 'package.json'));
-    const ts = hostRequire('typescript');
-    // Refused BEFORE any require hook is installed — a half-hooked process that
-    // then fails to compile would report the wrong reason.
-    if (typeof ts.transpileModule !== 'function') return { code: TS7_UNSUPPORTED, err: TS7_MESSAGE };
+    // stet's own compiler, resolved from this file, whatever the host installs. Refused
+    // BEFORE any require hook is installed — a half-hooked process that then fails to
+    // compile would report the wrong reason.
+    let ts;
+    try {
+      ts = require('typescript');
+    } catch {
+      return { code: COMPILER_MISSING, err: TS_BROKEN };
+    }
+    if (typeof ts.transpileModule !== 'function') return { code: COMPILER_MISSING, err: TS_BROKEN };
 
     installAliasResolver(aliasMappings(ts, hostDir));
     installTranspileHooks(ts);
@@ -276,10 +275,6 @@ function classify(error) {
     const message = messageOf(error);
     const found = /Cannot find module '([^']*)'/.exec(message);
     const spec = found === null ? undefined : found[1];
-    // `typescript` is the one missing module with an install line rather than a
-    // remedy — the same line `loadTypescript` gives, so a host missing the
-    // compiler hears one answer from every stet command that parses source.
-    if (spec === 'typescript') return { code: MISSING_DEPENDENCY, err: `${message}\n${TYPESCRIPT_INSTALL}` };
     const aliased = spec !== undefined && !isRelative(spec) && !isBarePackage(spec);
     return { code: MISSING_DEPENDENCY, err: aliased ? `${message}\n${ALIAS_REMEDY}` : message };
   }

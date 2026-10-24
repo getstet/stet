@@ -118,6 +118,15 @@ body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-ev
 @media(max-width:760px){#main{display:flex;flex-direction:column}#main>*{min-width:0}.edcol{order:-1}.edcol>*{min-width:0}.edcard{order:-1}}
 /* On a short phone screen the frame is capped so it and the selected field fit together. */
 @media(max-width:760px){.devwrap{height:min(420px,calc(100vh - 230px));min-height:0}}
+/* At 760 px and narrower the lines a pick changes sit under the preview, so a tap never moves the frame. */
+@media(max-width:760px){#pane{display:flex;flex-direction:column}#panetop{order:1}}
+/* Wider, they sit above it: the note keeps one line for itself, and the block holds its height while the pointer is in the frame.
+   One line plus the note's own 6 px top and bottom padding, since the page boxes border-box (`*{box-sizing:border-box}`). */
+@media(min-width:761px){#panenote{min-height:calc(1lh + 12px)}}
+@media(max-width:760px){#gitbar .btn,.hdr [data-act="theme"],[data-act="addSite"]{min-height:36px}}
+/* At 760 px and narrower, with a project open, the sidebar is one row that opens the list. */
+#sidetoggle{display:none}
+@media(max-width:760px){.shell.picked #sidetoggle{display:block;width:100%;min-height:36px;text-align:left;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.shell.picked:not(.sideopen) .side>:not(#sidetoggle){display:none}.shell.picked .side{padding:6px 9px}}
 @media(max-width:760px){[data-tpl] .ch h3,[data-tpl-meta] span{overflow-wrap:anywhere;min-width:0}}
 @media(max-width:760px){[data-tpl-send] .btn,[data-tpl-send] .in{min-height:36px}}
 .btn.amb{border-color:hsl(38 75% 45%);color:hsl(38 80% 38%);font-weight:700}
@@ -223,7 +232,9 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
 .bdg.wr{white-space:normal;overflow-wrap:anywhere}
 .cnt.amb{color:hsl(var(--am));font-weight:600}
 #panenote>div+div{margin-top:3px}
-#panepick,#paneinfo{padding:6px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px}
+#paneinfo{padding:6px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px}
+#panepick{position:fixed;z-index:21;max-width:calc(100vw - 16px);background:hsl(var(--card));border:1px solid hsl(var(--bd));
+ border-radius:var(--r);box-shadow:0 6px 24px hsl(0 0% 0% / .18);padding:8px;font-size:11.5px}
 #panepick .btn{margin:5px 5px 0 0}
 #paneinfo .hl{margin-bottom:3px}
 #paneinfo .cards{padding:6px 0 0;border-bottom:0}
@@ -239,6 +250,7 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
 <body data-theme="light">
 <div class="shell" id="shell">
   <aside class="side">
+    <button class="it" id="sidetoggle" data-act="sideToggle" aria-expanded="false"></button>
     <div class="brand"><div class="m">s</div><b>stet</b></div>
     <div class="edsub" id="edsub"></div>
     <div class="lbl">Projects</div><div id="projs"></div>
@@ -267,12 +279,13 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
     <div class="tabs" id="tabs"></div>
     <div class="wrap" id="work"><div id="main"></div>
       <div id="grip" role="separator" aria-orientation="vertical" aria-controls="main" tabindex="0" aria-label="Resize the key column" title="Drag to resize the key column. Double-click to restore its width."></div>
-      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="paneenv" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="paneshow" hidden></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="panepick" hidden></div><div id="paneinfo" hidden></div><div id="panecards" hidden></div><div id="panebody"></div></section></div>
+      <section class="card pane" id="pane" hidden><div id="panehead"></div><div id="panetop"><div id="paneenv" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="paneshow" hidden></div><div id="panenote" class="muted" style="font-size:11.5px;padding:6px 12px" hidden></div><div id="paneinfo" hidden></div><div id="panecards" hidden></div></div><div id="panebody"></div></section></div>
   </main>
 </div>
 <div id="tst"></div>
 <div id="hoverlabel" hidden></div>
 <div id="counter" class="cnt" hidden></div>
+<div id="panepick" hidden></div>
 <div id="popover" hidden><div class="ph"><span class="mono" id="popkey"></span><span class="cnt" id="popcount"></span></div>
   <textarea class="in" id="poptext" rows="2"></textarea>
   <div class="muted">Enter keeps it · Esc puts it back</div></div>
@@ -402,7 +415,13 @@ const S = {
   tmpl: {},
   route: '/',
   keysOpen: true,
+  // At 760 px and narrower with a project open, whether the sidebar's list is open.
+  sideOpen: false,
   width: 'desktop',
+  // The width preset picked at 760 px or narrower, for this tab; until one is, Mobile.
+  narrowWidth: null,
+  // The path the frame's agent last reported (`ready`, `census`), as the agent spells it.
+  frameRoute: null,
   starting: null,
   stopping: false,
   gitError: null,
@@ -622,6 +641,7 @@ async function loadSite(path) {
   endEdit();
   closePopover();
   S.path = path;
+  S.sideOpen = false;
   history.replaceState(null, '', siteUrl(path));
   dropDrafts();
   S.findings = [];
@@ -645,6 +665,7 @@ async function loadSite(path) {
   S.saveCheck = null;
   S.confirmed = new Set();
   S.census = null; S.hover = null; S.choose = null; S.usage = null; S.routeReads = null; routeReadsFor = null;
+  S.frameRoute = null; readsPending = false; releaseFrame(false);
   S.unmanaged = null; S.warn = null; S.moved = null; S.pageInfo = false;
   S.unsavedOpen = false; S.leaveAsk = null; S.renaming = null;
   S.tplKey = null; S.tpl = { ctx: '', byName: {} };
@@ -675,6 +696,8 @@ async function loadSite(path) {
     } else {
       S.route = (S.group === null ? null : groupRoute(S.group)) || remembered;
     }
+    // The route was chosen through the groups; the list opens on every key.
+    S.group = 'all';
   }
   render();
   if (storeBacked()) void guard(loadRows());
@@ -999,14 +1022,17 @@ async function refreshSite() {
   const gen = auditGen;
   const res = await api('/api/site' + query());
   if (gen !== auditGen) return;
+  const keysBefore = ready() ? Object.keys(S.site.descriptor.keys).join('\n') : null;
   S.site = res.body;
   S.pending = Array.isArray(S.site.pending) ? S.site.pending : [];
   S.health = null; S.seo = null;
   if (ready()) {
     await loadMarks();
     if (gen !== auditGen) return;
-    if (S.group !== null && !groups().some((g) => g.id === S.group)) S.group = firstGroup();
+    if (S.group !== null && !listChoices().some((g) => g.id === S.group)) S.group = 'all';
     if (S.sel !== null && !own(S.site.descriptor.keys, S.sel)) S.sel = null;
+    // A key added or removed changes which keys the open page's files read: they are asked again.
+    if (S.frameRoute !== null && keysBefore !== Object.keys(S.site.descriptor.keys).join('\n')) void guard(loadRouteReads(framePath()));
   }
   render();
 }
@@ -1119,8 +1145,25 @@ function groups() {
   return out;
 }
 function keysInGroup(id) {
+  if (id === 'all') return ready() ? Object.keys(S.site.descriptor.keys).sort() : [];
+  if (id === 'page') return pageKeys();
   const group = groups().find((g) => g.id === id);
   return group ? group.keys : [];
+}
+/** The selector's choices: every key, the open page's, then the groups. */
+const listChoices = () => [{ id: 'all', label: 'All keys' }, { id: 'page', label: 'This page' }].concat(groups());
+/**
+ * The keys of the page the preview shows: those its files read, where the route
+ * reads answered for it, and those the last census found on it.
+ */
+function pageKeys() {
+  if (!ready()) return [];
+  const here = framePath();
+  const keys = new Set();
+  const reads = S.routeReads;
+  if (reads !== null && reads.route === here) for (const key of reads.keys) if (declared(key)) keys.add(key);
+  if (S.census !== null && routePath(shownRoute(S.census.route)) === here) for (const key of Object.keys(S.census.found)) keys.add(key);
+  return [...keys].sort();
 }
 /** The group a site opens on: its visible text's, the SEO group only where no other group exists. */
 const firstGroup = () => (groups().find((g) => g.id !== 'seo') || groups()[0] || { id: null }).id;
@@ -1172,6 +1215,15 @@ function render() {
       (open ? '<div class="rf"><input class="in sm" value="' + esc(S.renaming.value) + '" data-act-input="renameName">' +
         '<button class="btn sm pri" style="margin-top:5px;width:100%" data-act="renameSave">Save</button></div>' : '') + '</div>';
   }).join('');
+
+  // The phone-width row names the open project and opens the list.
+  const current = S.sites.find((s) => s.path === S.path);
+  const shell = document.getElementById('shell');
+  shell.classList.toggle('picked', current !== undefined);
+  shell.classList.toggle('sideopen', S.sideOpen);
+  const toggle = document.getElementById('sidetoggle');
+  toggle.textContent = current === undefined ? '' : 'Project: ' + siteLabel(current) + ' ▾';
+  toggle.setAttribute('aria-expanded', String(S.sideOpen));
 
   for (const t of MACHINE_TABS) {
     const b = document.getElementById('n-' + t);
@@ -1526,17 +1578,17 @@ function vContent() {
 function keyList() {
   const items = listedKeys();
   const locales = ready() ? S.site.config.locales.enabled : ['default'];
-  const all = groups();
+  const all = listChoices();
   // While a query is set the list spans every group, so each row names its own
   // and the selector has nothing to select.
-  const selector = all.length > 1 && !S.q
+  const selector = !S.q
     ? chooser('group', all.map((g) => g.id), S.group, 'gsel', undefined, all.map((g) => g.label))
     : '';
   const localeSelector = locales.length > 1 ? chooser('locale', locales, S.locale, 'lsel') : '';
   const line = siteLine();
   return '<div class="card"><div class="ch" style="display:block">' +
     '<div style="display:flex;justify-content:space-between;align-items:center"><h3>Keys</h3>' +
-    '<span class="bdg">' + items.length + '</span></div>' + selector + localeSelector +
+    '<span class="bdg" id="keycount">' + items.length + '</span></div>' + selector + localeSelector +
     '<input class="in sm" id="ksearch" style="margin-top:6px" placeholder="Search…" value="' + esc(S.q) + '" data-act-input="search"></div>' +
     (line === '' ? '' : '<p class="note" id="siteline" style="margin:8px 12px">' + esc(line) + '</p>') +
     '<div class="scroll" id="keyrows">' + keyRows(items) + '</div></div>';
@@ -1572,7 +1624,10 @@ let keyRowsShown = { box: null, html: '' };
 function paintKeyRows() {
   const box = document.getElementById('keyrows');
   if (!box || !ready()) return;
-  const html = keyRows(listedKeys());
+  const items = listedKeys();
+  const count = document.getElementById('keycount');
+  if (count) count.textContent = String(items.length);
+  const html = keyRows(items);
   if (box === keyRowsShown.box && html === keyRowsShown.html) return;
   box.innerHTML = html;
   keyRowsShown = { box: box, html: html };
@@ -2071,7 +2126,7 @@ function fitFrame() {
   const top = box.getBoundingClientRect().top + window.scrollY;
   // At 760 px and narrower the stylesheet sets the height.
   box.style.height = window.innerWidth <= 760 ? '' : Math.max(420, Math.floor(window.innerHeight - top - 15)) + 'px';
-  const fit = frameFit(box.clientWidth, S.width);
+  const fit = frameFit(box.clientWidth, framePreset());
   frame.style.width = fit.width + 'px';
   frame.style.height = Math.round(box.clientHeight / fit.scale) + 'px';
   frame.style.left = fit.left + 'px';
@@ -2080,6 +2135,15 @@ function fitFrame() {
   if (readout) readout.textContent = fit.scale === 1 ? fit.width + ' px' : fit.width + ' px at ' + Math.round(fit.scale * 100) + '%';
 }
 window.addEventListener('resize', fitFrame);
+/** The preset the frame renders at: at 760 px or narrower Mobile, until the editor picks another there. */
+const framePreset = () => (narrow() ? S.narrowWidth || 'mobile' : S.width);
+let wasNarrow = window.innerWidth <= 760;
+// Crossing 760 px changes which preset is lit.
+window.addEventListener('resize', () => {
+  if ((window.innerWidth <= 760) === wasNarrow) return;
+  wasNarrow = !wasNarrow;
+  if (ready() && S.tab === 'Content') { paintPaneHead(); fitFrame(); }
+});
 
 /** What the pane body shows. */
 function paneState() {
@@ -2222,7 +2286,7 @@ function paneTools() {
   return '<div class="tg">' + [['edit', 'Edit'], ['use', 'Use']].map((m) => '<button class="' + (S.mode === m[0] ? 'on' : '') +
       '" data-act="mode:' + m[0] + '">' + m[1] + '</button>').join('') + '</div>' +
     '<button class="btn sm' + (S.pageInfo ? ' pri' : '') + '" data-act="pageInfo">Page info</button>' +
-    '<div class="tg">' + PRESETS.map((preset) => '<button class="' + (S.width === preset[0] ? 'on' : '') +
+    '<div class="tg">' + PRESETS.map((preset) => '<button class="' + (framePreset() === preset[0] ? 'on' : '') +
       '" data-act="width:' + preset[0] + '">' + preset[1] + '</button>').join('') + '</div>' +
     '<span class="muted mono" style="font-size:11px" id="panewidth"></span>' +
     '<button class="btn sm" data-act="previewLoad">Reload</button>' +
@@ -2295,11 +2359,15 @@ async function loadPreview(opts) {
  * as checked for the badge, and never warns that no file reads a key.
  */
 let routeReadsFor = null; // the route the last reads were asked for, so a census asks once per route
+let readsPending = false; // a reads request is out, so the pane does not yet say stet cannot tell
 async function loadRouteReads(route) {
   const path = S.path;
   routeReadsFor = routePath(route);
+  readsPending = true;
   const res = await api('/api/site/route-reads' + query() + '&route=' + encodeURIComponent(route));
-  if (path !== S.path) return;
+  // An answer for a route the frame has left is dropped: the newest request is the one that clears `readsPending` and sets the reads.
+  if (path !== S.path || routeReadsFor !== routePath(route)) return;
+  readsPending = false;
   const reads = res.ok && res.body && Array.isArray(res.body.keys) ? res.body : null;
   S.routeReads = reads === null ? null : { route: routePath(route), keys: reads.keys, complete: reads.complete === true };
   if (reads !== null) {
@@ -2308,7 +2376,59 @@ async function loadRouteReads(route) {
   }
   paintKeyRows();
   paintPaneNote();
+  postReads();
 }
+
+/**
+ * The open route's reads, sent to the agent so its census matches only the keys
+ * a file of the page reads: the keys where the reads are complete and are this
+ * page's, else none, and the agent matches every key as before.
+ */
+function postReads() {
+  if (S.frameRoute === null) return;
+  const reads = S.routeReads;
+  const keys = reads !== null && reads.complete && reads.route === framePath() ? reads.keys.filter(declared) : null;
+  postToPreview({ stet: 'reads', route: S.frameRoute, keys: keys });
+}
+/** Whether the open page's census ran with every key because its reads are incomplete or failed. */
+function readsUnknown() {
+  if (readsPending || S.census === null || S.mode !== 'edit' || paneState() !== 'frame') return false;
+  const reads = S.routeReads;
+  return !(reads !== null && reads.complete && reads.route === framePath());
+}
+
+// --- the frame holds still under the pointer ----------------------------------
+// From the first hover, pick or click on text in the frame until the pointer
+// leaves it, nothing moves the frame: the field a pick names is scrolled to
+// when the pointer leaves (`out`) or the field takes focus, the key column
+// opens then, and the lines above the frame keep the height they had, the
+// note's first line in a slot of its own. At 760 px and narrower those lines
+// sit under the frame, so nothing is held there.
+let frameHold = null; // { scroll: { id, entry } | null, keys: boolean }
+function holdFrame() {
+  if (frameHold !== null) return;
+  frameHold = { scroll: null, keys: false };
+  const top = document.getElementById('panetop');
+  if (!narrow()) { top.style.height = top.offsetHeight + 'px'; top.style.overflow = 'hidden'; }
+}
+/** The hold ends; `scroll` (the pointer left the frame) also brings the picked field into view. */
+function releaseFrame(scroll) {
+  if (frameHold === null) return;
+  const h = frameHold;
+  frameHold = null;
+  const top = document.getElementById('panetop');
+  top.style.height = '';
+  top.style.overflow = '';
+  if (h.keys && !S.keysOpen) { showKeys(); render(); }
+  if (scroll && h.scroll !== null && S.sel === h.scroll.id && S.edit === null && S.popover === null) {
+    const field = fieldOf(h.scroll.id, h.scroll.entry);
+    if (field !== null && typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
+  }
+  paintPopover();
+  paintPanePick();
+}
+// A press anywhere in the dashboard ends the hold; it never scrolls to the field, so what the press lands on stays put.
+document.addEventListener('pointerdown', () => { releaseFrame(false); }, true);
 
 const STATIC_ROUTE = /^\/[^\[\]:*]*$/;
 /** Where a key renders, when stet knows: the document its mark sits in, else the first static page its entry names. */
@@ -2594,10 +2714,16 @@ window.addEventListener('message', (event) => {
   if (!data || typeof data !== 'object' || data.channel !== S.preview.channel) return;
   if (data.stet === 'bye') {
     agentReady = false;
+    releaseFrame(false);
+    // The page is going: its next census asks the reads again, since a reload can follow an edit to its source.
+    routeReadsFor = null;
   } else if (data.stet === 'ready') {
     agentReady = true;
     clearTimeout(agentTimer);
+    S.frameRoute = typeof data.route === 'string' ? data.route : null;
     postToPreview({ stet: 'mode', mode: S.mode });
+    // The reads first, so the first census already matches only the keys this page reads.
+    postReads();
     postCensus();
     if (S.located && S.located.unavailable) S.located = null;
     if (S.saveCheck) verifyNow();
@@ -2658,12 +2784,20 @@ window.addEventListener('message', (event) => {
   } else if (data.stet === 'key' && data.which === 'escape') {
     endSelection();
   } else if (data.stet === 'pick') {
+    // A pick by Enter holds nothing: the pointer may be outside the frame, and no `out` would end it.
+    if (data.key !== true) holdFrame();
     onPick(data);
   } else if (data.stet === 'hover') {
+    holdFrame();
     onHover(data);
+  } else if (data.stet === 'out') {
+    S.hover = null;
+    paintHover();
+    releaseFrame(true);
   } else if (data.stet === 'rect') {
     onRect(data);
   } else if (data.stet === 'unmanaged') {
+    holdFrame();
     onUnmanaged(data);
   } else if (data.stet === 'census') {
     onCensus(data);
@@ -2711,7 +2845,9 @@ function paintPaneNote() {
       lines.push('Key prefixes read without naming each key: ' + prefixes.map((p) => p.prefix + ' (' + p.file + ':' + p.line + ')').join(', '));
     }
   }
-  note.hidden = lines.length === 0;
+  if (readsUnknown()) lines.push('stet could not work out which keys this page reads, so any text that matches a key can be picked.');
+  // Above the frame the note keeps its one-line slot, empty or not.
+  note.hidden = lines.length === 0 && (narrow() || paneState() !== 'frame');
   note.innerHTML = lines.map((line) => '<div>' + esc(line) + '</div>').join('');
 }
 const WHERE = {
@@ -2827,6 +2963,8 @@ function shownRoute(route) {
 }
 /** The route the frame shows: where the app moved to, else the route field's. */
 const currentRoute = () => (S.moved === null ? S.route : S.moved);
+/** The route the frame shows, as routePath spells it: the agent's last report, else the route field's. */
+const framePath = () => routePath(S.frameRoute === null ? currentRoute() : shownRoute(S.frameRoute));
 
 // --- editing from the preview (D8) ------------------------------------------------
 // The agent reports what the editor points at, clicks and types in the page;
@@ -2837,6 +2975,8 @@ const currentRoute = () => (S.moved === null ? S.route : S.moved);
 // locale and entry, an entry the key's value holds.
 const NARROW_PX = 760;
 const narrow = () => window.innerWidth <= NARROW_PX;
+/** A touch screen: its primary pointer is coarse. A tap there follows the phone rule at any width. */
+const touchScreen = () => typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
 const declared = (key) => typeof key === 'string' && ready() && own(S.site.descriptor.keys, key);
 /** A list entry's index or a record field's name, or none. */
 const isEntry = (value) => value === undefined || typeof value === 'string' || (Number.isInteger(value) && value >= 0);
@@ -2922,11 +3062,12 @@ function choosePick(hit, again, rect) {
   const key = hit.key;
   // A key found by its text on a route whose files are all read, and none names it.
   const reads = S.routeReads;
-  S.warn = hit.by !== 'mark' && reads !== null && reads.complete && reads.route === routePath(currentRoute()) &&
+  S.warn = hit.by !== 'mark' && reads !== null && reads.complete && reads.route === framePath() &&
     reads.keys.indexOf(key) === -1 ? key : null;
   selectFromFrame(key, hit.entry);
   if (!again) return;
-  if (narrow()) { focusField(key, hit.entry); return; }
+  // At phone width, and on a touch screen at any width, the second tap focuses the field, which only then scrolls into view.
+  if (narrow() || touchScreen()) { focusField(key, hit.entry); return; }
   if (!entryHeld(key, hit.entry)) return;
   if (hit.attr === null && hit.inplace) {
     const form = hit.by === 'mark' ? 'runs' : 'inplace';
@@ -2946,12 +3087,15 @@ function selectFromFrame(id, entry) {
     S.findings = [];
     S.located = null;
     if (!S.q && keysInGroup(S.group).indexOf(id) === -1) S.group = groupOf(id);
-    showKeys();
+    // While the pointer is in the frame the column opens only once the hold ends.
+    if (frameHold !== null) frameHold.keys = frameHold.keys || !S.keysOpen;
+    else showKeys();
     render();
     locateKey(false);
   } else {
     paintPaneNote();
   }
+  if (frameHold !== null) { frameHold.scroll = { id: id, entry: entry }; return; }
   const field = fieldOf(id, entry);
   if (field !== null && typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
 }
@@ -2969,6 +3113,7 @@ function fieldOf(id, entry) {
 }
 /** The field focused where it stands once scrolled the least distance into view, so the tapped element stays on screen too. */
 function focusField(id, entry) {
+  releaseFrame(false);
   const field = fieldOf(id, entry);
   if (field === null) return;
   if (typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
@@ -3005,10 +3150,11 @@ function endEdit() {
 }
 /** Edit or Use: in Use the page has its clicks back, and an open edit ends kept. */
 function setMode(next) {
-  if (next === 'use') { endEdit(); closePopover(); S.hover = null; paintHover(); }
+  if (next === 'use') { endEdit(); closePopover(); S.hover = null; paintHover(); releaseFrame(false); }
   S.mode = next;
   postToPreview({ stet: 'mode', mode: next });
-  if (ready() && S.tab === 'Content') paintPaneHead();
+  // The note's line that stet cannot tell which keys the page reads is Edit's alone.
+  if (ready() && S.tab === 'Content') { paintPaneHead(); paintPaneNote(); }
 }
 /** The frame's Escape with no edit open: the selection ends. */
 function endSelection() {
@@ -3093,6 +3239,7 @@ function onRect(data) {
   if (rect === null) return;
   if (S.edit !== null) S.edit.rect = rect;
   if (S.popover !== null) S.popover.rect = rect;
+  if (S.choose !== null) { S.choose.rect = rect; paintPanePick(); }
   paintPopover();
 }
 function onUnmanaged(data) {
@@ -3105,7 +3252,7 @@ function onUnmanaged(data) {
 /** The keys the open route's files read that the last census did not find on the page, in the descriptor's order. */
 function unfoundKeys() {
   const reads = S.routeReads;
-  if (reads === null || reads.route !== routePath(currentRoute())) return [];
+  if (reads === null || reads.route !== framePath()) return [];
   const found = S.census !== null ? S.census.found : {};
   return Object.keys(S.site.descriptor.keys).filter((key) => reads.keys.indexOf(key) !== -1 && !own(found, key));
 }
@@ -3124,6 +3271,7 @@ function onCensus(data) {
     .filter((h) => h && typeof h === 'object' && declared(h.key) && typeof h.where === 'string' && own(HEAD_WHERE, h.where))
     .map((h) => ({ key: h.key, where: h.where }));
   S.census = { found: found, head: head, route: data.route };
+  S.frameRoute = data.route;
   const route = routePath(shownRoute(data.route));
   for (const key of Object.keys(found)) S.seen.keys.add(key);
   S.seen.routes.add(route);
@@ -3136,6 +3284,7 @@ function onCensus(data) {
 function onMoved(data) {
   if (typeof data.route !== 'string') return;
   S.moved = shownRoute(data.route);
+  S.frameRoute = data.route.replace(/[?#].*$/, ''); // the agent compares `location.pathname`
   if (ready() && S.tab === 'Content') paintPaneHead();
   void guard(loadRouteReads(routePath(S.moved)));
 }
@@ -3147,13 +3296,14 @@ function headOnly(id) {
   return at.map((h) => HEAD_WHERE[h.where]).filter((kind, i, all) => all.indexOf(kind) === i);
 }
 
-/** Two keys show the clicked words: each a button. */
+/** Two keys show the clicked words: each a button, in a box over the frame under the clicked element, so nothing in the dashboard moves. */
 function paintPanePick() {
   const box = document.getElementById('panepick');
   const c = S.choose;
   box.hidden = c === null;
   box.innerHTML = c === null ? '' : '<div>Two keys show these words. Which one?</div>' +
     c.keys.map((key) => '<button class="btn sm mono" data-act="choose:' + esc(key) + '">' + esc(key) + '</button>').join('');
+  if (c !== null) placeAt(box, c.rect, 'below');
 }
 
 /** The open page's head copy as keys: the marks of its document on the html host, the census's head matches elsewhere. */
@@ -3223,8 +3373,10 @@ function paintPopover() {
   }
   const counter = document.getElementById('counter');
   const e = S.edit;
-  counter.hidden = e === null;
-  if (e !== null) {
+  // By the text typed in place the count shows only near the limit: from 90 % of it, the point it turns amber.
+  const near = e !== null && nearLimit(e.key, entryText(e.key, e.locale, e.entry));
+  counter.hidden = !near;
+  if (near) {
     paintCount(counter, e.key, entryText(e.key, e.locale, e.entry));
     placeAt(counter, e.rect, 'end');
   }
@@ -3234,14 +3386,24 @@ function paintPopover() {
  * text, an entry's own. Grey, amber from 90 % of the limit, and past it red,
  * saying what Save does with it.
  */
+/** The length the counter counts: a tagged value's plain text, else the text. */
+function countOf(id, text) {
+  const def = keyDef(id) || {};
+  return def.tags !== undefined ? deriveText('{v}', text, true).length : text.length;
+}
+/** Whether a key with a limit is within 10 % of it, or over it. */
+function nearLimit(id, text) {
+  const def = keyDef(id) || {};
+  return def.limits !== undefined && def.limits !== null && countOf(id, text) >= Math.ceil(0.9 * def.limits.max);
+}
 function paintCount(el, id, text) {
   const def = keyDef(id) || {};
   const max = def.limits ? def.limits.max : null;
-  const n = def.tags !== undefined ? deriveText('{v}', text, true).length : text.length;
+  const n = countOf(id, text);
   const over = max !== null && n > max;
   el.textContent = max === null ? String(n)
     : n + ' / ' + max + (!over ? '' : def.limits.severity === 'hard' ? ' · Save refuses this' : ' · Save asks first');
-  el.className = 'cnt' + (over ? ' bad' : max !== null && n >= Math.ceil(0.9 * max) ? ' amb' : '');
+  el.className = 'cnt' + (over ? ' bad' : nearLimit(id, text) ? ' amb' : '');
 }
 /** A frame element's box as the dashboard shows it, through the frame's own scale. */
 function projected(rect) {
@@ -3547,7 +3709,14 @@ function wireFrame(frame) {
       const hit = event.target && event.target.closest ? event.target.closest('[data-stet]') : null;
       // The marker is the email's own markup, so only a slot of this template is believed.
       const key = hit === null ? null : hit.getAttribute('data-stet');
-      if (key !== null && tplSlotKeys(name).indexOf(key) !== -1) selectSlot(name, key);
+      if (key !== null && tplSlotKeys(name).indexOf(key) !== -1) selectSlot(name, key, event.pointerType === 'touch');
+    });
+    // A mouse click's field is scrolled to once the pointer leaves the email.
+    doc.addEventListener('pointerout', (event) => {
+      if (event.relatedTarget !== null || event.pointerType === 'touch' || slotScroll === null) return;
+      const field = fieldOf(slotScroll);
+      slotScroll = null;
+      if (field !== null && typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
     });
   });
 }
@@ -3560,7 +3729,8 @@ function paintSlotMark(frame) {
     (S.tplKey === null ? '' : '[data-stet=' + JSON.stringify(S.tplKey) + ']{outline:2px solid #3b82f6;outline-offset:1px}');
 }
 /** A slot opened for editing under its frame; on a phone the field is scrolled into view with the tapped text kept on screen. */
-function selectSlot(name, key) {
+let slotScroll = null; // the slot whose field waits for the pointer to leave the email before it is scrolled to
+function selectSlot(name, key, touch) {
   S.tplKey = key;
   for (const other of pointered()) {
     const field = document.querySelector('[data-tpl-field="' + other + '"]');
@@ -3570,8 +3740,10 @@ function selectSlot(name, key) {
   }
   const field = fieldOf(key);
   if (field === null) return;
-  if (typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
   field.focus({ preventScroll: true });
+  // A tap leaves nothing under a pointer, so its field comes into view at once.
+  slotScroll = touch ? null : key;
+  if (touch && typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
 }
 
 // --- Brand -------------------------------------------------------------------
@@ -4001,6 +4173,7 @@ const ACTIONS = {
     void guard(startAudit(Object.assign({ fix: true, pages: [page] }, lh.targetKind === 'url' ? { url: lh.target } : {})));
   },
   site: (el, path) => { leaveFor(path); },
+  sideToggle: () => { S.sideOpen = !S.sideOpen; render(); },
   unsaved: () => { S.unsavedOpen = !S.unsavedOpen; paintAsk(); },
   undoEdit: (el, arg) => { const cut = arg.indexOf(' '); undoEdit(arg.slice(0, cut), arg.slice(cut + 1)); },
   undoTmpl: (el, id) => { undoTmpl(id); },
@@ -4067,8 +4240,9 @@ const ACTIONS = {
     render();
   },
   width: (el, preset) => {
-    S.width = preset;
-    writeStore('stet.preview.width', preset);
+    // A pick at phone width lasts for the tab; a wider one is remembered.
+    if (narrow()) S.narrowWidth = preset;
+    else { S.width = preset; writeStore('stet.preview.width', preset); }
     // A width only restyles the frame; it never rebuilds it.
     paintPane();
   },
@@ -4402,7 +4576,7 @@ function softCount(el, id) {
 
 function groupOf(id) {
   for (const group of groups()) if (group.keys.indexOf(id) !== -1) return group.id;
-  return firstGroup();
+  return 'all';
 }
 
 /** The key column opened, and remembered open. */
@@ -5006,6 +5180,8 @@ function dispatch(table, event) {
 
 const shell = document.getElementById('shell');
 shell.addEventListener('click', (event) => dispatch(ACTIONS, event));
+// The chooser floats over the frame outside the shell, beside the popover; its buttons are actions too.
+document.getElementById('panepick').addEventListener('click', (event) => dispatch(ACTIONS, event));
 // A scroll does not bubble; captured, it keeps a tagged field's mirror under its text.
 shell.addEventListener('scroll', (event) => {
   const el = event.target;

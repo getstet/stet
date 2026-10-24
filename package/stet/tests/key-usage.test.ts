@@ -922,6 +922,31 @@ describe('a file too deeply nested to read (F2)', () => {
   });
 });
 
+describe('a read whose argument picks between key names (8o L5)', () => {
+  const page = (body: string): Record<string, string> => ({ 'app/page.tsx': `import { copy } from '@/lib/content';\nexport default function P({ a, b, k }: { a: boolean; b: boolean; k: string }) { return <p>{${body}}</p>; }\n` });
+
+  it.each([
+    ['two literal arms', "copy(a ? 'hero_title' : 'hero_sub')", ['hero_title', 'hero_sub']],
+    ['a ternary in the else arm', "copy(a ? 'hero_title' : b ? 'hero_sub' : 'hero_cta')", ['hero_title', 'hero_sub', 'hero_cta']],
+    ['an element access of the map', "copy[a ? 'hero_title' : 'hero_sub']", ['hero_title', 'hero_sub']],
+  ])('%s: each key is read and no cause stands', async (_name, read, keys) => {
+    const usage = await usageOf(host(page(read)));
+    expect(usage.causes).toEqual([]);
+    for (const key of keys) expect(stateOf(usage, key)).toBe('read');
+    expect(stateOf(usage, 'footer_note')).toBe('not_found');
+  });
+
+  it.each([
+    ['a variable arm', "copy(a ? 'hero_title' : k)"],
+    ['a template arm', 'copy(a ? `hero_${k}` : \'hero_sub\')'],
+    ['a variable in a nested arm', "copy(a ? 'hero_title' : b ? k : 'hero_sub')"],
+  ])('%s: the read is a cause', async (_name, read) => {
+    const usage = await usageOf(host(page(read)));
+    expect(usage.causes).toHaveLength(1);
+    expect(stateOf(usage, 'footer_note')).toBe('unknown');
+  });
+});
+
 describe('B1 does not place a constant the code mutates (F15)', () => {
   it.each([
     ['s03: a pushed array', "const KEYS = ['hero_title'];\nexport const add = (k: string) => KEYS.push(k);\nexport const all = () => KEYS.map((k) => copy(k));", 'copy(k)'],

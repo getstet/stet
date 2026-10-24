@@ -13,11 +13,11 @@
  * dialects by stripping a file down to its prose; it proposes no keys, because
  * nothing text-level can tell an attribute from content.
  *
- * The parsing walks load `typescript` lazily (a host whose surfaces are `.tsx`
- * already has it), so this module carries no eager runtime `typescript` import —
- * only the erased type-only one — and the read path never pulls it in. The
- * dialect detector is compiler-free entirely: it runs on the typescript-less
- * hosts `eject` serves, and its answers do not change under TypeScript 7.
+ * The parsing walks load stet's own `typescript` lazily, so this module carries
+ * no eager runtime `typescript` import — only the erased type-only one — and
+ * the read path never pulls it in. The dialect detector is compiler-free
+ * entirely: it runs where the compiler does not load, and the host's
+ * TypeScript version is not read at all.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
@@ -104,42 +104,33 @@ function stripDotSlash(value: string): string {
 }
 
 /**
- * The refusal a host on TypeScript 7 gets. TS7's package root exports version
- * constants and nothing else — the compiler API moved behind `typescript/
- * unstable/*` — so every source tool here would fail on a missing function
- * rather than on a version. The peer range says the same thing (`>=5 <7`), and
- * `templates/email-runner.cjs` gives this identical string from its own exit-3
- * path, the runner being a standalone asset that cannot import it.
+ * The refusal where stet's own `typescript` does not load: a missing, broken or
+ * replaced install. `templates/email-runner.cjs` gives this identical string
+ * from its own exit-3 path, the runner being a standalone asset that cannot
+ * import it.
  */
-export const TS7_REFUSAL =
-  "stet's source tools use the TypeScript 5 compiler API — typescript 7 is not yet supported; install typescript@5 as a devDependency";
+export const TS_BROKEN = "stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet";
 
 /**
- * The `typescript` compiler, imported only on the path that parses TSX.
+ * The `typescript` compiler stet depends on, imported only on the paths that
+ * parse source, so the read path and every command that parses nothing never
+ * load it (the read-path closure guard holds the first).
  *
- * `typescript` is an OPTIONAL peer dependency (`scan`/`register`/`eject` are its
- * only callers; the read path never touches it), so a static import would make
- * every command fail at module load on the default install. Any host whose
- * managed surfaces are `.tsx` already has `typescript` in its own toolchain, so
- * this uses theirs rather than bundling a second copy. Mirrors `store.ts`'s
- * `loadPgAdapter`.
- *
- * A resolution that carries no compiler API is refused by version rather than
- * used: `createSourceFile` is what every walk below calls first, so its absence
- * is the whole diagnosis.
+ * `typescript` is a dependency at a 5.x range, so the copy this import resolves
+ * is stet's own whatever the host installs: npm nests it under stet where the
+ * host's own `typescript` is outside the range, TypeScript 7 included. A
+ * resolution that fails, or that carries no compiler API (`createSourceFile` is
+ * what every walk below calls first), is a broken install.
  */
 export async function loadTypescript(): Promise<typeof import('typescript')> {
   let ts: typeof import('typescript');
   try {
     ts = await import('typescript');
   } catch (error) {
-    if (moduleNotFound(error, 'typescript')) {
-      // Named for no one command: scan, register and eject all parse TSX.
-      throw new CliError("stet needs 'typescript' to read your source — install it as a dev dependency: npm i -D typescript");
-    }
+    if (moduleNotFound(error, 'typescript')) throw new CliError(TS_BROKEN);
     throw error;
   }
-  if (typeof ts.createSourceFile !== 'function') throw new CliError(TS7_REFUSAL);
+  if (typeof ts.createSourceFile !== 'function') throw new CliError(TS_BROKEN);
   return ts;
 }
 
@@ -1939,8 +1930,8 @@ export function blankNonMarkup(source: string, dialect: Dialect): string {
 
 /**
  * The template-dialect detector — pure text, and deliberately compiler-free, so
- * it works on the typescript-less hosts `eject` now serves and its answers do
- * not change under TypeScript 7.
+ * it works where the compiler does not load (`eject` serves such an install) and
+ * the host's TypeScript version is not read at all.
  *
  * The strip order is load-bearing: comments go before tags, or the tag strip
  * eats `<!--` and `-->` and leaks the comment's prose as copy. What survives is
@@ -2116,11 +2107,15 @@ export function carriesToken(
   return tokenInCode(ts, file, source, token, true);
 }
 
+/** A specifier that opens with a URL scheme (`node:fs`, `astro:assets`, `virtual:…`): a module the runtime or the framework provides, never a file of the host's source. */
+export const SCHEME_SPECIFIER = /^[a-z][a-z0-9+.-]*:/;
+
 /**
  * Whether a bare specifier names a package of the project at `cwd`: its name
  * (`react`, `@scope/name`) is among the `package.json` dependencies of any
  * kind, a folder of `node_modules` here or in a folder above (a hoisted
- * install), or a built-in module of Node.
+ * install), a built-in module of Node, or a module a URL scheme names
+ * (`SCHEME_SPECIFIER`).
  */
 export function packageNames(cwd: string): (spec: string) => boolean {
   const declared = new Set<string>();
@@ -2134,7 +2129,7 @@ export function packageNames(cwd: string): (spec: string) => boolean {
     // no manifest, or one that is not JSON: only the installed packages count
   }
   return (spec) => {
-    if (spec.startsWith('node:')) return true;
+    if (SCHEME_SPECIFIER.test(spec)) return true;
     const segments = spec.split('/');
     const name = segments.slice(0, spec.startsWith('@') ? 2 : 1).join('/');
     if (declared.has(name) || builtinModules.includes(name)) return true;
