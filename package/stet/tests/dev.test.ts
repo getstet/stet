@@ -13494,7 +13494,7 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     );
     const { handler } = handlerOver([host.cwd]);
     const body = await routeReadsOf(handler, host);
-    expect(body.keys).toEqual(['footer_links', 'hero_headline']);
+    expect(body.keys).toEqual(['footer_links', 'hero_body', 'hero_headline']);
     expect(body.complete).toBe(false);
   });
 
@@ -13614,6 +13614,166 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
       keys: [],
       complete: false,
     });
+  });
+
+  // 8o D2b: the route reads resolve TypeScript's spellings and skip framework modules.
+  const astroPage = (host: CliHost, page: string, files: Record<string, string> = {}): void => {
+    for (const [rel, text] of Object.entries(files)) write(host.cwd, rel, text);
+    write(host.cwd, 'src/pages/custody.astro', page);
+  };
+
+  it('T2b.3 an Astro route answers complete: a .js specifier reaches the generated module’s source, astro:assets is not host source', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport Fonts from '../components/Fonts.astro';\nimport { title } from '../copy';\n---\n<Fonts /><h1>{title}</h1>\n", {
+      'src/copy.ts': "import type { Key } from '../content/keys.js';\nexport const copy = (k: Key | string): string => String(k);\nexport const title = copy('hero_headline');\n",
+      'src/components/Fonts.astro': "---\nimport { Font } from 'astro:assets';\n---\n<Font />\n",
+    });
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host, '/custody');
+    expect([body.complete, body.keys]).toEqual([true, ['hero_headline']]);
+  });
+
+  it('T2b.4 guard: an unknown bare alias still ends the walk', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport X from 'missing-alias/x';\n---\n<h1>x</h1>\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  it('T2b.5 guard: a path alias spelled with a colon resolves through the mapping first', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport { title } from 'app:copy';\n---\n<h1>{title}</h1>\n", {
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { 'app:*': ['src/*'] } } }),
+      'src/copy.ts': "export const copy = (k: string): string => k;\nexport const title = copy('hero_headline');\n",
+    });
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host, '/custody');
+    expect([body.complete, body.keys]).toEqual([true, ['hero_headline']]);
+  });
+
+  // 8o D2c (R9): the route reads take each file's reads from key-usage's walk.
+  const plainLayout = 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children as any}</body></html>; }\n';
+
+  it('T2c.1 a prefix read counts every key under it, and the route stays complete', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      "import { copy } from '../lib/content';\nconst tiers = ['tier_name', 'price'];\nexport default function Page() { return <ul>{tiers.map((t) => <li key={t}>{copy(`pricing_${t}`)}</li>)}</ul>; }\n",
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([true, ['pricing_price', 'pricing_tier_name']]);
+  });
+
+  it('T2c.2 a read key-usage cannot settle (a cause) answers incomplete', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'components/T.tsx', "import { copy } from '../lib/content';\nexport const T = ({ k }: { k: string }) => <b>{copy(k)}</b>;\n");
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      "import { T } from '../components/T';\nconst pick = (n: number) => ['hero', 'body'][n];\nexport default function Page() { return <T k={`${pick(0)}_headline`} />; }\n",
+    );
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host)).complete).toBe(false);
+  });
+
+  it('T2c.3 a page that loads modules through import.meta.glob answers incomplete', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nconst mods = import.meta.glob('../data/*.ts', { eager: true });\n---\n<h1>{Object.keys(mods).length}</h1>\n", {
+      'src/data/a.ts': "export const t = 'hero_headline';\n",
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  it('T2c.4 guard: Astro.glob answers incomplete too', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nconst posts = await Astro.glob('../posts/*.md');\n---\n<h1>{posts.length}</h1>\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  it('a prefix read adds only the keys under its own prefix', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, 'components/Other.tsx', "import { copy } from '../lib/content';\nexport const O = ({ t }: { t: string }) => <i>{copy(`hero_${t}`)}</i>;\n");
+    write(host.cwd, 'app/page.tsx', "import { copy } from '../lib/content';\nimport { O } from '../components/Other';\nexport default function Page({ t }: { t: string }) { return <i>{copy(`pricing_${t}`)}{O}</i>; }\n");
+    write(host.cwd, 'other/Elsewhere.tsx', "import { copy } from '../lib/content';\nexport const E = ({ t }: { t: string }) => <i>{copy(`blog_${t}`)}</i>;\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([true, ['hero_body', 'hero_headline', 'pricing_price', 'pricing_tier_name']]);
+  });
+
+  it('a read key-usage cannot settle in a file outside the closure leaves the route complete', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, 'app/page.tsx', "import { copy } from '../lib/content';\nexport default function Page() { return <i>{copy('hero_body')}</i>; }\n");
+    write(host.cwd, 'components/Other.tsx', "import { copy } from '../lib/content';\nexport const O = ({ k }: { k: string }) => <i>{copy(k)}</i>;\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([true, ['hero_body']]);
+  });
+
+  it('a typed import.meta.glob answers incomplete', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nconst m = import.meta.glob<Record<string, unknown>>('../data/*.ts');\n---\n<h1>x</h1>\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  it('a closure source file git ignores answers incomplete, its names kept', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, '.gitignore', 'components/Ignored.tsx\n');
+    write(host.cwd, 'components/Ignored.tsx', "export const I = 'hero_body';\n");
+    write(host.cwd, 'app/page.tsx', "import { I } from '../components/Ignored';\nexport default function Page() { return <i>{I}</i>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([false, ['hero_body']]);
+  });
+
+  it('a module another scheme names (virtual:) is not host source', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport 'virtual:uno.css';\n---\n<h1>x</h1>\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(true);
+  });
+
+  it('an alias the host declares that maps to no file ends the walk', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport X from 'app:Missing';\n---\n<h1>x</h1>\n", {
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { 'app:*': ['src/*'] } } }),
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  // 8o L5: a ternary of key names reads both.
+  it('a copy() whose argument picks between two key names answers complete with both keys', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, 'app/page.tsx', "import { copy } from '../lib/content';\nexport default function Page({ a }: { a: boolean }) { return <i>{copy(a ? 'blog_intro' : 'hero_body')}</i>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([true, ['blog_intro', 'hero_body']]);
+  });
+
+  it('a copy() whose argument picks between a key name and a variable answers incomplete', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, 'app/page.tsx', "import { copy } from '../lib/content';\nexport default function Page({ a, k }: { a: boolean; k: string }) { return <i>{copy(a ? 'hero_body' : k)}</i>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host)).complete).toBe(false);
   });
 
   it('the html host answers the document’s marks', async () => {

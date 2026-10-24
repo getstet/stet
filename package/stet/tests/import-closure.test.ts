@@ -101,4 +101,47 @@ describe('importClosure', () => {
     expect(eleven.files).toHaveLength(11);
     expect(eleven.boundary).toBe(true);
   });
+
+  // 8o D2b (T2b.1): TypeScript's ESM spelling reaches the source behind it.
+  it('T2b.1 a .js / .mjs specifier reaches its .ts / .mts source', () => {
+    const dir = project({
+      'content/keys.ts': 'export const k = 1;\n',
+      'src/lib.mts': 'export const m = 1;\n',
+      'src/copy.ts': "import { k } from '../content/keys.js';\nimport { m } from './lib.mjs';\nexport const c = k + m;\n",
+    });
+    const chain = importClosure(ts, dir, ['src/copy.ts']);
+    expect(chain.boundary).toBe(false);
+    expect(rels(chain).sort()).toEqual(['content/keys.ts', 'src/copy.ts', 'src/lib.mts']);
+  });
+
+  it('T2b.2 guard: a real .js file wins over the .ts beside it', () => {
+    const dir = project({
+      'keys.js': 'export const k = 1;\n',
+      'keys.ts': 'export const k = 2;\n',
+      'copy.ts': "import { k } from './keys.js';\nexport const c = k;\n",
+    });
+    const chain = importClosure(ts, dir, ['copy.ts']);
+    expect(rels(chain)).toEqual(['copy.ts', 'keys.js']);
+  });
+
+  it('a .js specifier reaches .tsx and a .cjs one reaches .cts', () => {
+    const dir = project({
+      'a.tsx': 'export const a = 1;\n',
+      'b.cts': 'export const b = 1;\n',
+      'copy.ts': "import { a } from './a.js';\nimport { b } from './b.cjs';\nexport const c = a + b;\n",
+    });
+    const chain = importClosure(ts, dir, ['copy.ts']);
+    expect(chain.boundary).toBe(false);
+    expect(rels(chain).sort()).toEqual(['a.tsx', 'b.cts', 'copy.ts']);
+  });
+
+  it('a .jsx specifier reaches .tsx, as Vite resolves it', () => {
+    const dir = project({
+      'b.tsx': 'export const b = 1;\n',
+      'copy.ts': "import { b } from './b.jsx';\nexport const c = b;\n",
+    });
+    const chain = importClosure(ts, dir, ['copy.ts']);
+    expect(chain.boundary).toBe(false);
+    expect(rels(chain).sort()).toEqual(['b.tsx', 'copy.ts']);
+  });
 });

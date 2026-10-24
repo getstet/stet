@@ -2116,11 +2116,15 @@ export function carriesToken(
   return tokenInCode(ts, file, source, token, true);
 }
 
+/** A specifier that opens with a URL scheme (`node:fs`, `astro:assets`, `virtual:…`): a module the runtime or the framework provides, never a file of the host's source. */
+export const SCHEME_SPECIFIER = /^[a-z][a-z0-9+.-]*:/;
+
 /**
  * Whether a bare specifier names a package of the project at `cwd`: its name
  * (`react`, `@scope/name`) is among the `package.json` dependencies of any
  * kind, a folder of `node_modules` here or in a folder above (a hoisted
- * install), or a built-in module of Node.
+ * install), a built-in module of Node, or a module a URL scheme names
+ * (`SCHEME_SPECIFIER`).
  */
 export function packageNames(cwd: string): (spec: string) => boolean {
   const declared = new Set<string>();
@@ -2134,7 +2138,7 @@ export function packageNames(cwd: string): (spec: string) => boolean {
     // no manifest, or one that is not JSON: only the installed packages count
   }
   return (spec) => {
-    if (spec.startsWith('node:')) return true;
+    if (SCHEME_SPECIFIER.test(spec)) return true;
     const segments = spec.split('/');
     const name = segments.slice(0, spec.startsWith('@') ? 2 : 1).join('/');
     if (declared.has(name) || builtinModules.includes(name)) return true;
