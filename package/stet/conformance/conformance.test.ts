@@ -8961,8 +8961,8 @@ describe('dashboard', () => {
     expect(await host.run('pages', 'scan', '--apply')).toBe(0);
     const page = await served(host.cwd);
     const doc = page.dom.window.document;
-    expect([...doc.querySelectorAll('#gsel option')].map((option) => option.textContent)).toEqual(['home — page', 'SEO']);
-    expect((doc.getElementById('gsel') as HTMLSelectElement).value).toBe('page:home');
+    expect([...doc.querySelectorAll('#gsel option')].map((option) => option.textContent)).toEqual(['All keys', 'This page', 'home — page', 'SEO']);
+    expect((doc.getElementById('gsel') as HTMLSelectElement).value).toBe('all');
     // The SEO group holds exactly the keys every mark of which is a head text.
     const marks = (await call(handlerOver([host.cwd]).handler, `/api/site/marks${siteOf(host.cwd)}`)).body;
     const head = Object.keys(marks.places as Record<string, Array<{ head?: true }>>)
@@ -9302,9 +9302,10 @@ describe('dashboard', () => {
       page.dom.window.close();
       return at;
     };
-    expect(await opens('/about.html?x=1')).toEqual({ group: 'page:about', route: '/about.html?x=1', loads: 1 });
-    expect(await opens('/')).toEqual({ group: 'page:home', route: '/', loads: 1 });
-    expect(await opens('/retired.html')).toEqual({ group: 'page:about', route: '/about.html', loads: 1 });
+    // The route is chosen through the groups; the list opens on every key.
+    expect(await opens('/about.html?x=1')).toEqual({ group: 'all', route: '/about.html?x=1', loads: 1 });
+    expect(await opens('/')).toEqual({ group: 'all', route: '/', loads: 1 });
+    expect(await opens('/retired.html')).toEqual({ group: 'all', route: '/about.html', loads: 1 });
   });
 
   it('Requirement: The header shows the branch, the preview link and Publish to live', async () => {
@@ -10224,11 +10225,13 @@ describe('dashboard', () => {
       },
     });
     await agent.pick([{ key: 'lab_button' }]);
-    // The tap selects, scrolls the field into view with the tapped element kept on screen, and opens no popover.
-    expect(scrolled).toContain('text:lab_button {"block":"nearest"}');
+    // The tap selects and opens no popover; the field is not scrolled to, so the frame under the finger stays put.
+    expect(scrolled).toEqual([]);
     expect(evalIn(page, 'S.popover')).toBeNull();
-    // A second tap on the selected key opens the column's field, not the popover.
+    // A second tap on the selected key focuses the column's field and scrolls it into view, the tapped element kept on screen.
     await agent.pick([{ key: 'lab_button' }], { again: true });
+    expect(scrolled).toEqual(['text:lab_button {"block":"nearest"}']);
+    expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_button');
     expect(evalIn(page, 'S.popover')).toBeNull();
     expect(evalIn(page, 'S.edit')).toBeNull();
     // The editor sits directly under the preview, the key list after it, every card of the column one column wide.
@@ -11693,7 +11696,7 @@ describe('preview-editing', () => {
     expect(idOf(framed, 'close').getAttribute('aria-label')).toBe('Begin');
     bridge.page.dom.window.close();
 
-    // A tap at phone width: no popover, the key is selected, the column's field scrolled into view and typed in.
+    // A tap at phone width: no popover, the key is selected; a second tap scrolls the column's field into view, focused, and it is typed in.
     const scrolled: string[] = [];
     const phone = await bridged({
       site: labSite(),
@@ -11706,8 +11709,10 @@ describe('preview-editing', () => {
     });
     await phone.agent.pick([{ key: 'lab_button' }]);
     expect(selected(phone.page)).toBe('lab_button');
-    expect(scrolled).toContain('text:lab_button');
+    // The first tap scrolls nothing; the second focuses the field and scrolls it into view.
+    expect(scrolled).toEqual([]);
     await phone.agent.pick([{ key: 'lab_button' }], { again: true });
+    expect(scrolled).toEqual(['text:lab_button']);
     expect(phone.agent.sent('edit')).toEqual([]);
     expect(popover(phone.page).hidden).toBe(true);
     expect(docOf(phone.page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_button');
