@@ -602,7 +602,7 @@ async function previewReads(site: Ready, env: NodeJS.ProcessEnv): Promise<{ snap
 /**
  * Whether `text` holds `value` as a quoted string outside every comment. The
  * comments are the TypeScript scanner's (`nonCodeOf`), so a `//` inside a
- * string is not one. Without `typescript` installed the text is read as it is.
+ * string is not one. Where stet's own `typescript` does not load the text is read as it is.
  */
 async function holdsLiteral(file: string, text: string, value: string): Promise<boolean> {
   const literals = ["'", '"', '`'].map((quote) => quote + value + quote);

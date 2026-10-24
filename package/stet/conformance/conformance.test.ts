@@ -62,7 +62,7 @@ import { GATE_LINE, HOOK_BEFORE_0_3_1, SHARED_GATE_LINE, runHookInstall } from '
 import { refuseDanglingReferences } from '../cli/remove.js';
 import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
 import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
-import { TS7_REFUSAL } from '../cli/source-scan.js';
+import { TS_BROKEN } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { MARKETING, chainProject, doctor as doctorOf, write as writeChain } from '../tests/helpers/chain-project.js';
 import { cleanupOutsideFiles, outsideFile, previewHost } from '../tests/helpers/email-preview-host.js';
@@ -977,11 +977,18 @@ describe('content-read', () => {
     // loaded only under `stet audit lighthouse`: no entry a host runs reaches
     // them, the read entries, the mount and the four store adapters among them.
     const auditOnly = ['lighthouse', 'chrome-launcher', 'selfsigned', 'puppeteer-core'];
+    // `typescript` is stet's own dependency, loaded only by the source tools:
+    // the same eight entries stay free of it, so no host bundle carries the compiler.
+    const toolOnly = ['typescript'];
     for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts', '../server/index.ts', '../adapters/store-memory.ts', '../adapters/store-snapshot.ts', '../adapters/store-pg.ts', '../adapters/store-postgrest.ts']) {
       const closure = runtimeImportClosure(new URL(entry, import.meta.url));
       expect({ entry, audit: closure.bare.filter((spec) => auditOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
         entry,
         audit: [],
+      });
+      expect({ entry, tool: closure.bare.filter((spec) => toolOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
+        entry,
+        tool: [],
       });
     }
 
@@ -5527,7 +5534,7 @@ describe('cli', () => {
   });
 
   it.skipIf(!builtBinExists())('Requirement: doctor names the compiler scan and register need', async () => {
-    const NOT_INSTALLED = 'typescript: not installed — stet scan and stet register read src/copy.ts with it; npm i -D typescript';
+    const NOT_LOADED = 'stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet. stet scan and stet register read src/copy.ts with it';
     /** An Astro host whose `.astro` surfaces are dialect files and whose copy modules only the compiler reads. */
     const astro = (copyModules: string[]): CliHost => {
       const host = makeCliHost({
@@ -5547,19 +5554,19 @@ describe('cli', () => {
 
     const installed = astro(['src/copy.ts']);
     expect(await installed.run('doctor')).toBe(0);
-    expect(`${installed.stdout()}\n${installed.stderr()}`).not.toContain('typescript:');
+    expect(`${installed.stdout()}\n${installed.stderr()}`).not.toContain(TS_BROKEN);
 
     const missing = doctor(astro(['src/copy.ts']), { hideTypescript: true });
     expect(missing.code).toBe(0);
-    expect(missing.text).toContain(NOT_INSTALLED);
+    expect(missing.text).toContain(NOT_LOADED);
 
     const dialectOnly = doctor(astro([]), { hideTypescript: true });
     expect(dialectOnly.code).toBe(0);
-    expect(dialectOnly.text).not.toContain('typescript:');
+    expect(dialectOnly.text).not.toContain(TS_BROKEN);
 
     const broken = doctor(astro(['src/copy.ts']), { breakTypescript: true });
     expect(broken.code).toBe(0);
-    expect(broken.text).toContain(NOT_INSTALLED);
+    expect(broken.text).toContain(NOT_LOADED);
   });
 
   /** A host with one declared, pointered template `welcome`, a recording send function and the given store. */
@@ -6619,16 +6626,16 @@ describe('adoption', () => {
     expect(await bare.run('scan')).toBe(0);
     expect(bare.stderr()).toBe('');
 
-    // The scanner is the TypeScript 5 compiler API, and it says so. TS7's npm
-    // package exposes version constants at its root and no compiler at all, so
-    // a 7.x resolution is refused by name rather than crashing somewhere
-    // further in — and the peer range (`>=5 <7`) states the same fact.
-    expect(TS7_REFUSAL).toContain('typescript 7 is not yet supported');
-    expect(TS7_REFUSAL).toContain('install typescript@5');
-    const peers = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    // The scanner is the TypeScript 5 compiler API, and stet ships its own
+    // copy: a dependency at a 5.x range, no peer. A copy that does not load is
+    // a broken install, and the one line says to reinstall stet.
+    expect(TS_BROKEN).toContain('reinstall stet: npm i @getstet/stet');
+    const shipped = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+      dependencies: Record<string, string>;
       peerDependencies: Record<string, string>;
     };
-    expect(peers.peerDependencies['typescript']).toBe('>=5 <7');
+    expect(shipped.dependencies['typescript']).toBe('^5.6.0');
+    expect(shipped.peerDependencies['typescript']).toBeUndefined();
 
     // The declared-slot check rides the same walk. A slot whose flattened key
     // has left the file that renders it is copy the dashboard still offers an
@@ -11217,7 +11224,7 @@ describe('key-usage', () => {
       ].join('\n'),
     );
 
-    // Without `typescript` the rows carry no badge, `usage` is null and the install line is among the findings.
+    // Without stet's own `typescript` the rows carry no badge, `usage` is null and the reinstall line is among the findings.
     const noCompiler = hostOver();
     vi.resetModules();
     vi.doMock('typescript', () =>
@@ -11236,7 +11243,7 @@ describe('key-usage', () => {
       expect(bareAnswer.rows.every((r) => !('badge' in r))).toBe(true);
       expect(bareAnswer.usage).toBeNull();
       expect(bareAnswer.findings).toEqual([
-        expect.objectContaining({ level: 'warn', message: "stet needs 'typescript' to read your source — install it as a dev dependency: npm i -D typescript" }),
+        expect.objectContaining({ level: 'warn', message: 'stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet' }),
       ]);
     } finally {
       vi.doUnmock('typescript');

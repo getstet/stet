@@ -61,7 +61,7 @@ import { walk } from './pages.js';
 import { CliError, Report, collapseLines, posixRelative } from './report.js';
 import { applyFileEdits, dominantEol, formatDiff, unRewriteFile, type Edit } from './rewrite.js';
 import { filesForGlobs } from './scan.js';
-import { TS7_REFUSAL, isDialectFile, loadTypescript, matchGlob, scanSource, scriptKindFor } from './source-scan.js';
+import { isDialectFile, loadTypescript, matchGlob, scanSource, scriptKindFor } from './source-scan.js';
 import { isStoreBacked } from './store.js';
 
 const HISTORY_FILE = 'stet-history.json';
@@ -129,17 +129,15 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       try {
         ts = await loadTypescript();
       } catch (error) {
-        // A resolved-but-API-less typescript is a different fault with its own
-        // remedy; only an ABSENT compiler routes to the count-and-refuse path.
-        if (!(error instanceof CliError) || error.message === TS7_REFUSAL) throw error;
+        if (!(error instanceof CliError)) throw error;
         if (write) {
           throw new CliError(
             `eject --write cannot reverse the accessor calls without typescript: ${importers.length} ` +
-              'file(s) import stet or the read path. Install it (npm i -D typescript) and re-run',
+              'file(s) import stet or the read path. Reinstall stet (npm i @getstet/stet) and re-run',
           );
         }
         report.line(
-          'un-rewrite: unverifiable — typescript is not installed ' +
+          "un-rewrite: unverifiable — stet's TypeScript compiler did not load " +
             `(${importers.length} file(s) import the accessor)`,
         );
       }

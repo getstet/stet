@@ -5,8 +5,9 @@
  * and a mis-mapped exit sends them after the wrong thing.
  *
  * The hosts are real directories with real `node_modules`: the runner resolves
- * `typescript` and `react-dom/server` from the HOST, which is the whole point of
- * the design, so a fixture that faked either would prove nothing.
+ * `react-dom/server` and every module a template imports from the HOST, and
+ * transpiles with stet's own `typescript`, which is the whole point of the
+ * design, so a fixture that faked either would prove nothing.
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -19,7 +20,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import { containedPointer, renderTemplate, renderTemplateAsync, templateProps, type RenderRequest } from '../cli/email-render.js';
 import { packageRoot } from '../cli/installed.js';
 import type { CliIo } from '../cli/main.js';
-import { TS7_REFUSAL } from '../cli/source-scan.js';
+import { TS_BROKEN } from '../cli/source-scan.js';
 import type { TemplateDef } from '../src/types.js';
 import { cleanupEmailHosts, makeEmailHost, type EmailHost } from './helpers/email-host.js';
 
@@ -228,14 +229,73 @@ describe('renderTemplate — every failure reason, produced', () => {
     expect(!result.ok && result.detail).toContain('react-dom/server');
   });
 
-  it('ts7-unsupported: a typescript exposing version constants only is refused by name', () => {
+  it('renders through stet’s own typescript where the host’s is TypeScript 7', () => {
+    // TypeScript 7's package root exports version constants and no compiler API.
+    // The runner never reads the host's copy, so the host's version is no fault.
     const host = makeEmailHost({ deps: [] });
     host.put('node_modules/typescript/package.json', '{ "name": "typescript", "version": "7.0.2", "main": "index.js" }\n');
     host.put('node_modules/typescript/index.js', "module.exports = { version: '7.0.2', versionMajorMinor: '7.0' };\n");
-    host.put('lib/email/welcome.ts', STRING_TEMPLATE);
-    const result = render(host, 'lib/email/welcome.ts', 'welcome');
-    expect(!result.ok && result.reason).toBe('ts7-unsupported');
-    expect(!result.ok && result.detail).toBe(TS7_REFUSAL);
+    host.put('lib/email/ok.ts', "export function ok(): string {\n  return '<p>ok</p>';\n}\n");
+    const result = render(host, 'lib/email/ok.ts', 'ok');
+    expect(result.ok).toBe(true);
+    expect(result.ok && JSON.parse(result.result)).toBe('<p>ok</p>');
+  });
+
+  it('never calls the host’s typescript, whatever its version or API', () => {
+    // A TypeScript 5 stub that carries `transpileModule` and throws from it: a
+    // runner that tried the host's copy first, even only where it looks usable,
+    // would fail this render, so the pass proves the host's compiler is not asked.
+    const host = makeEmailHost({ deps: [] });
+    host.put('node_modules/typescript/package.json', '{ "name": "typescript", "version": "5.0.0", "main": "index.js" }\n');
+    host.put(
+      'node_modules/typescript/index.js',
+      "module.exports = { version: '5.0.0', transpileModule() { throw new Error('host compiler used'); } };\n",
+    );
+    host.put('lib/email/ok.ts', "export function ok(): string {\n  return '<p>ok</p>';\n}\n");
+    const result = render(host, 'lib/email/ok.ts', 'ok');
+    expect(result.ok).toBe(true);
+    expect(result.ok && JSON.parse(result.result)).toBe('<p>ok</p>');
+  });
+
+  describe('compiler-missing: stet’s own typescript does not load', () => {
+    const cleanups: string[] = [];
+    afterAll(() => {
+      for (const dir of cleanups) rmSync(dir, { recursive: true, force: true });
+    });
+    // `--require` preload that answers `require('typescript')` the way a deleted
+    // or replaced install does. Only the runner requires it, and only by that
+    // name, so nothing else in the child is touched.
+    const preload = (host: EmailHost, answer: string): CliIo => {
+      const dir = mkdtempSync(join(tmpdir(), 'stet-no-ts-'));
+      const file = join(dir, 'hide-typescript.cjs');
+      writeFileSync(
+        file,
+        "const Module = require('module');\nconst load = Module._load;\n" +
+          "Module._load = function (request) {\n  if (request === 'typescript') " +
+          `${answer};\n  return load.apply(this, arguments);\n};\n`,
+      );
+      cleanups.push(dir);
+      return { ...io(host.dir), env: { ...process.env, NODE_OPTIONS: `--require ${JSON.stringify(file)}` } };
+    };
+    const request = (host: EmailHost): RenderRequest => {
+      host.put('lib/email/welcome.ts', STRING_TEMPLATE);
+      return { hostDir: host.dir, file: host.path('lib/email/welcome.ts'), exportName: 'welcome', props: {} };
+    };
+
+    it('a copy with no transpileModule is the reinstall line', () => {
+      const host = makeEmailHost();
+      const result = renderTemplate(preload(host, "return { version: '7.0.2', versionMajorMinor: '7.0' }"), request(host));
+      expect(!result.ok && result.reason).toBe('compiler-missing');
+      expect(!result.ok && result.detail).toBe(TS_BROKEN);
+    });
+
+    it('a copy that does not resolve is the same line', () => {
+      const host = makeEmailHost();
+      const answer = "throw Object.assign(new Error(\"Cannot find module 'typescript'\"), { code: 'MODULE_NOT_FOUND' })";
+      const result = renderTemplate(preload(host, answer), request(host));
+      expect(!result.ok && result.reason).toBe('compiler-missing');
+      expect(!result.ok && result.detail).toBe(TS_BROKEN);
+    });
   });
 });
 
@@ -288,12 +348,15 @@ describe('renderTemplate — module resolution', () => {
     expect(result.ok && result.result).not.toContain('planted');
   });
 
-  it('names the install line when the host has no typescript at all', () => {
+  it('renders where the host has no typescript at all', () => {
     const host = makeEmailHost({ deps: [] });
     host.put('lib/email/welcome.ts', STRING_TEMPLATE);
-    const result = render(host, 'lib/email/welcome.ts', 'welcome');
-    expect(!result.ok && result.reason).toBe('missing-dependency');
-    expect(!result.ok && result.detail).toContain('npm i -D typescript');
+    const result = render(host, 'lib/email/welcome.ts', 'welcome', { name: 'Ada', loginUrl: 'https://x.test' });
+    expect(result.ok).toBe(true);
+    expect(result.ok && JSON.parse(result.result)).toEqual({
+      subject: 'Welcome, Ada',
+      html: '<h1>Good to see you, Ada</h1><a href="https://x.test">Open</a>',
+    });
   });
 
   it('names the stray bytes when a template writes past the muting', () => {
@@ -324,11 +387,12 @@ describe('renderTemplate — module resolution', () => {
 });
 
 describe('the runner asset', () => {
-  it('carries the same TypeScript 7 refusal the scanner does', () => {
+  it('carries the same broken-install line the scanner does', () => {
     // The runner is a shipped `.cjs` and cannot import the constant, so the one
     // string lives twice by necessity — this is what keeps the two copies equal.
     const runner = readFileSync(join(packageRoot(), 'templates', 'email-runner.cjs'), 'utf8');
-    expect(runner).toContain(TS7_REFUSAL);
+    expect(TS_BROKEN).toBeTypeOf('string');
+    expect(runner).toContain(TS_BROKEN);
   });
 });
 

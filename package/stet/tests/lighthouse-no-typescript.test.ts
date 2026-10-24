@@ -1,10 +1,10 @@
 /**
- * `stet audit lighthouse` where the optional `typescript` peer is not there.
+ * `stet audit lighthouse` where stet's own `typescript` does not load.
  *
  * Its own file because `vi.mock` is file-scoped and shadows any real resolution
  * (`eject-no-typescript.test.ts` stands alone for the same reason). The
  * footprint line for a mount no client reads cannot say whether `stet upgrade`
- * takes the mount out, so it names the install that lets upgrade decide.
+ * takes the mount out, so it gives the reinstall line.
  */
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,6 +19,7 @@ vi.mock('typescript', () => {
 });
 
 import { runCli, type CliIo } from '../cli/main.js';
+import { TS_BROKEN } from '../cli/source-scan.js';
 import { cleanLhr, fakeLighthouse } from './helpers/lighthouse.js';
 
 function write(dir: string, rel: string, text: string): void {
@@ -27,7 +28,7 @@ function write(dir: string, rel: string, text: string): void {
 }
 
 describe('stet audit lighthouse — the footprint without typescript', () => {
-  it('says to install typescript for a mount no client reads, and not that the mount is not the one stet init wrote', async () => {
+  it('gives the reinstall line for a mount no client reads, and not that the mount is not the one stet init wrote', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'stet-lighthouse-nots-'));
     write(cwd, 'stet.config.json', JSON.stringify({ project: 't', managedSurfaces: ['app/**/*.tsx'] }));
     write(cwd, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {}, pages: { home: { route: '/' } } }));
@@ -50,7 +51,7 @@ describe('stet audit lighthouse — the footprint without typescript', () => {
     };
     expect(await runCli(['audit', 'lighthouse', '--url', 'http://127.0.0.1:3999/'], io)).toBe(0);
     const text = out.join('\n');
-    expect(text).toContain('stet  app/layout.tsx mounts CopyProvider and no client reads — install typescript, then stet upgrade can unmount it');
+    expect(text).toContain(`stet  app/layout.tsx mounts CopyProvider and no client reads — ${TS_BROKEN}`);
     expect(text).not.toContain('not the one stet init wrote');
   });
 });

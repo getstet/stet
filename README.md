@@ -249,8 +249,8 @@ stdlib-only Python helper ships in the package.
 ## Requirements
 
 Node.js 22 or later; `stet audit lighthouse` needs 22.19 or later, Google Chrome, and three dev dependencies a plain install leaves out:
-`npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. Scanning and adoption use the TypeScript compiler API, so
-projects using those commands need `typescript` 5 or 6 as a dev dependency.
+`npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. stet installs its own copy of TypeScript 5 (about 24 MB) for
+scanning, adoption, key badges and the preview's page checks, so it works with whatever TypeScript the project has, or none.
 
 Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
 selfsigned because the lockfile holds them. To drop them, delete their node_modules/ entries from package-lock.json

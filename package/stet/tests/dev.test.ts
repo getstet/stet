@@ -3437,7 +3437,7 @@ describe('the committable files', () => {
         const before = head(t.cwd);
         const refused = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
         expect(refused.status).toBe(409);
-        expect(String(refused.body['output'])).toContain("stet needs 'typescript' to read your source");
+        expect(String(refused.body['output'])).toContain('stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet');
         expect(refused.body['pending']).toEqual(t.written);
         expect(head(t.cwd)).toBe(before);
       },

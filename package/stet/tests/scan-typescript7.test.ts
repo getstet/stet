@@ -1,11 +1,12 @@
 /**
- * `stet scan` where the resolved `typescript` is 7.x, whose package root exports
- * version constants and no compiler API. Its own file for the same reason
+ * `stet scan` where the resolved `typescript` carries no compiler API (TypeScript
+ * 7's package root exports version constants only). stet ships its own 5.x, so
+ * this is a broken install. Its own file for the same reason
  * `load-typescript-ts7.test.ts` is: `vi.mock` is file-scoped, and the absent
  * shape and this one need different factories.
  *
  * The refusal reaches scan the same way an absence does — as a finding through
- * the report — and it carries the version message verbatim, so the host reads
+ * the report — and it carries the reinstall line verbatim, so the host reads
  * the remedy rather than a crash somewhere further in.
  */
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -18,7 +19,7 @@ vi.mock('typescript', () => ({ version: '7.0.2', versionMajorMinor: '7.0', creat
 
 import { runScan } from '../cli/scan.js';
 import type { CliIo } from '../cli/main.js';
-import { TS7_REFUSAL } from '../cli/source-scan.js';
+import { TS_BROKEN } from '../cli/source-scan.js';
 
 function write(dir: string, rel: string, text: string): void {
   const path = join(dir, rel);
@@ -32,7 +33,7 @@ interface Captured extends CliIo {
 }
 
 describe('runScan — a typescript with no compiler API', () => {
-  it('carries the TypeScript 7 refusal as the finding, verbatim', async () => {
+  it('carries the reinstall line as the finding, verbatim', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'stet-scan-ts7-'));
     write(
       dir,
@@ -50,7 +51,8 @@ describe('runScan — a typescript with no compiler API', () => {
     const err: string[] = [];
     const cap: Captured = { cwd: dir, env: {}, stdout: (l) => out.push(l), stderr: (l) => err.push(l), out, err };
     expect(await runScan([], cap)).toBe(1);
-    expect(err.join('\n')).toContain(TS7_REFUSAL);
+    expect(TS_BROKEN).toBe('stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet');
+    expect(err.join('\n')).toContain('stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet');
     expect(out.join('\n')).toContain('app/page.tsx: not scanned — typescript is unavailable');
   });
 });

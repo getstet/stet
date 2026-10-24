@@ -1,5 +1,5 @@
 /**
- * `stet scan` where the optional `typescript` peer is not there.
+ * `stet scan` where stet's own `typescript` is not there (a deleted install).
  *
  * Its own file because `vi.mock` is file-scoped and shadows ANY real
  * resolution, which is also why the TypeScript 7 shape stands alone in
@@ -62,7 +62,7 @@ function io(dir: string): Captured {
 
 const ASTRO = '---\nconst title = "Home";\n---\n<h1>{title}</h1>\n<p>Your week, sorted</p>\n';
 
-describe('runScan — typescript absent', () => {
+describe('runScan — stet’s typescript absent', () => {
   it('reports the refusal THROUGH the report, with every other warn still emitted', async () => {
     const dir = project({
       managedSurfaces: ['src/**/*.astro', 'app/**/*.tsx', 'lib/**/*.ts'],
@@ -74,7 +74,7 @@ describe('runScan — typescript absent', () => {
     // the report rather than as an escaping throw.
     expect(await runScan([], cap)).toBe(1);
     const findings = cap.err.join('\n');
-    expect(findings).toContain("stet needs 'typescript' to read your source");
+    expect(findings).toContain('stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet');
     // The dialect detector never touches a compiler, so its warns live…
     expect(findings).toContain('src/pages/index.astro:5 possible copy "Your week, sorted"');
     // …and so does the dead-glob line, which the escaping throw used to discard.
@@ -117,7 +117,7 @@ describe('runScan — typescript absent', () => {
     write(dir, 'app/page.tsx', 'export default function Page() {\n  return <h1>Managed copy</h1>;\n}\n');
     const cap = io(dir);
     expect(await runScan(['--baseline'], cap)).toBe(1);
-    expect(cap.err.join('\n')).toContain("stet needs 'typescript' to read your source");
+    expect(cap.err.join('\n')).toContain('stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet');
   });
 });
 
