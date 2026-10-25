@@ -1094,6 +1094,91 @@ describe('Edit mode (6.3)', () => {
     expect(sentOf(framed, 'pick').map((m) => m['again'])).toEqual([false, true, true]);
   });
 
+  it('R14: a click on text no key matches takes the ring off the selected copy and sends deselect, then unmanaged', async () => {
+    const { framed } = await handlerPage();
+    await setMode(framed, 'edit');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    press(framed, btn, 'click');
+    expect(btn.style.boxShadow).not.toBe('');
+    press(framed, framed.doc.getElementById('plain') as HTMLElement, 'click');
+    await tick();
+    expect(btn.style.boxShadow).toBe('');
+    expect(framed.sent.map((m) => m['stet']).filter((t) => t === 'pick' || t === 'deselect' || t === 'unmanaged')).toEqual(['pick', 'deselect', 'unmanaged']);
+  });
+
+  it('R14: a click on a container with no text of its own deselects and sends no unmanaged', async () => {
+    const { framed } = await handlerPage();
+    await setMode(framed, 'edit');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    press(framed, btn, 'click');
+    press(framed, framed.doc.body, 'click');
+    await tick();
+    expect(btn.style.boxShadow).toBe('');
+    expect(sentOf(framed, 'deselect')).toEqual([{ stet: 'deselect', channel: 'c1' }]);
+    expect(sentOf(framed, 'unmanaged')).toEqual([]);
+  });
+
+  it('R14: a click on no key’s copy ends an in-place edit kept, before it deselects', async () => {
+    const framed = await frame('<button id="btn">Start free trial</button><p id="plain">Text no key holds</p>');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    const node = btn.firstChild as Text;
+    await editOn(framed, btn, BUTTON, 'lab_button');
+    caret(framed, node, node.length);
+    await typeAtEnd(framed, btn, node, 'x');
+    press(framed, framed.doc.getElementById('plain') as HTMLElement, 'click');
+    await tick();
+    expect(btn.hasAttribute('contenteditable')).toBe(false);
+    expect(btn.style.boxShadow).toBe('');
+    expect(framed.sent.map((m) => m['stet']).filter((t) => t === 'edited' || t === 'deselect')).toEqual(['edited', 'deselect']);
+    expect(lastOf(framed, 'edited')).toMatchObject({ how: 'keep' });
+  });
+
+  it('R15: a second click that follows a native word selection sends the word and where it starts in the element’s text', async () => {
+    const { framed } = await handlerPage();
+    await setMode(framed, 'edit');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    const node = btn.firstChild as Text;
+    press(framed, btn, 'click', { detail: 1 });
+    (framed.win.getSelection() as Selection).setBaseAndExtent(node, 6, node, 10);
+    press(framed, btn, 'click', { detail: 2 });
+    // A collapsed selection, or one outside the element, sends nothing.
+    (framed.win.getSelection() as Selection).collapse(node, 3);
+    press(framed, btn, 'click', { detail: 3 });
+    (framed.win.getSelection() as Selection).selectAllChildren(framed.doc.getElementById('plain') as HTMLElement);
+    press(framed, btn, 'click', { detail: 4 });
+    await tick();
+    const picks = sentOf(framed, 'pick');
+    expect(picks[0]).not.toHaveProperty('sel');
+    expect(picks[1]?.['sel']).toEqual({ text: 'free', offset: 6 });
+    expect(picks[2]).not.toHaveProperty('sel');
+    expect(picks[3]).not.toHaveProperty('sel');
+  });
+
+  it('R15: an in-place edit started with a word selected inside the element keeps the word selected; typing replaces it', async () => {
+    const framed = await frame('<button id="btn">Start free trial</button><p id="other">Other words</p>');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    const node = btn.firstChild as Text;
+    (framed.win.getSelection() as Selection).setBaseAndExtent(node, 6, node, 10);
+    await editOn(framed, btn, BUTTON, 'lab_button');
+    const selection = framed.win.getSelection() as Selection;
+    expect(btn.getAttribute('contenteditable')).toBe('plaintext-only');
+    expect([selection.isCollapsed, selection.toString()]).toEqual([false, 'free']);
+    await keystroke(framed, btn, () => {
+      node.data = 'Start Z trial';
+    });
+    await tick();
+    expect(sentOf(framed, 'typed').map((m) => m['value'])).toEqual(['Start Z trial']);
+  });
+
+  it('R15: a selection outside the element does not stop the caret from being placed', async () => {
+    const framed = await frame('<button id="btn">Start free trial</button><p id="other">Other words</p>');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    (framed.win.getSelection() as Selection).selectAllChildren(framed.doc.getElementById('other') as HTMLElement);
+    await editOn(framed, btn, BUTTON, 'lab_button');
+    const selection = framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.anchorNode === btn]).toEqual([true, true]);
+  });
+
   it('sends the selected element’s box when the frame scrolls, at most once a frame', async () => {
     const { framed } = await handlerPage();
     await setMode(framed, 'edit');
@@ -1555,6 +1640,32 @@ describe('the runs form on the html host (6.6)', () => {
     await tick();
     expect(lastOf(framed, 'edited')).toMatchObject({ key: 'hero', how: 'keep', proposed: true });
     expect(h1.innerHTML).toBe(before);
+  });
+
+  it('R15: a word selected inside one run when the edit starts stays selected in that run’s island; typing replaces it', async () => {
+    const framed = await frame(HEADLINE);
+    const h1 = framed.doc.querySelector('h1') as HTMLElement;
+    const tail = (framed.doc.querySelector('.tail') as HTMLElement).firstChild as Text;
+    (framed.win.getSelection() as Selection).setBaseAndExtent(tail, 4, tail, 7);
+    await editOn(framed, h1, HERO, 'hero', { form: 'runs' });
+    const islands = [...h1.querySelectorAll('[data-stet-island]')] as HTMLElement[];
+    const selection = framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.toString(), framed.doc.activeElement === islands[1]]).toEqual([false, 'one', true]);
+    await keystroke(framed, islands[1] as HTMLElement, () => {
+      tail.data = ' in Z place.';
+    });
+    await tick();
+    expect(lastOf(framed, 'typed')?.['value']).toBe('Your site’s words<1> in Z place.</1>');
+  });
+
+  it('R15: a selection that spans two runs does not stop the caret from being placed', async () => {
+    const framed = await frame(HEADLINE);
+    const h1 = framed.doc.querySelector('h1') as HTMLElement;
+    const head = h1.firstChild as Text;
+    const tail = (framed.doc.querySelector('.tail') as HTMLElement).firstChild as Text;
+    (framed.win.getSelection() as Selection).setBaseAndExtent(head, 5, tail, 3);
+    await editOn(framed, h1, HERO, 'hero', { form: 'runs' });
+    expect((framed.win.getSelection() as Selection).isCollapsed).toBe(true);
   });
 
   it('keeps a Backspace at an island’s start and a Delete at its end out of the markup beside it', async () => {

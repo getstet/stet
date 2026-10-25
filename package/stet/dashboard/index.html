@@ -2796,6 +2796,9 @@ window.addEventListener('message', (event) => {
     releaseFrame(true);
   } else if (data.stet === 'rect') {
     onRect(data);
+  } else if (data.stet === 'deselect') {
+    holdFrame();
+    onDeselect();
   } else if (data.stet === 'unmanaged') {
     holdFrame();
     onUnmanaged(data);
@@ -3053,12 +3056,12 @@ function onPick(data) {
   S.unmanaged = null;
   closePopover();
   const keys = hits.map((h) => h.key).filter((key, i, all) => all.indexOf(key) === i);
-  S.choose = keys.length > 1 ? { keys: keys, hits: hits, again: again, rect: rect } : null;
+  S.choose = keys.length > 1 ? { keys: keys, hits: hits, again: again, rect: rect, sel: data.sel } : null;
   paintPanePick();
   if (S.choose !== null) { paintPaneNote(); return; }
-  choosePick(hits.find((h) => h.inplace && h.attr === null) || hits[0], again, rect);
+  choosePick(hits.find((h) => h.inplace && h.attr === null) || hits[0], again, rect, data.sel);
 }
-function choosePick(hit, again, rect) {
+function choosePick(hit, again, rect, sel) {
   const key = hit.key;
   // A key found by its text on a route whose files are all read, and none names it.
   const reads = S.routeReads;
@@ -3076,7 +3079,7 @@ function choosePick(hit, again, rect) {
     S.edit = { key: key, locale: S.locale, entry: hit.entry, form: form, before: S.draft[S.locale + ' ' + key], rect: rect };
     paintPopover();
   } else {
-    openPopover(key, S.locale, hit.entry, rect);
+    openPopover(key, S.locale, hit.entry, rect, hit.attr === null ? sel : undefined);
   }
 }
 /** The key a frame click named, selected as a pick from the list is, its field scrolled into view; the pane stays where it is. */
@@ -3242,6 +3245,14 @@ function onRect(data) {
   if (S.choose !== null) { S.choose.rect = rect; paintPanePick(); }
   paintPopover();
 }
+/** A click in the frame on no key's copy: the selection ends as Escape ends it, unsaved edits kept, and an earlier note goes. */
+function onDeselect() {
+  if (S.sel !== null || S.popover !== null || S.choose !== null) endSelection();
+  if (S.unmanaged !== null) {
+    S.unmanaged = null;
+    paintPaneNote();
+  }
+}
 function onUnmanaged(data) {
   if (typeof data.text !== 'string') return;
   S.unmanaged = { text: data.text.slice(0, 120) };
@@ -3345,7 +3356,7 @@ function paintPageInfo() {
  * entry or its attribute, `{{name}}` tokens as written. At 760 px and narrower the
  * column's own field takes the edit instead (fork 15).
  */
-function openPopover(key, loc, entry, rect) {
+function openPopover(key, loc, entry, rect, sel) {
   if (narrow()) { focusField(key, entry); return; }
   S.popover = { key: key, locale: loc, entry: entry, rect: rect, before: S.draft[loc + ' ' + key], redrawn: false };
   // The field over the frame holds the caret: no repaint puts it back on a column field.
@@ -3355,6 +3366,24 @@ function openPopover(key, loc, entry, rect) {
   text.setAttribute('aria-label', key);
   paintPopover();
   text.focus();
+  const range = selectionIn(text.value, sel) || { start: text.value.length, end: text.value.length };
+  text.setSelectionRange(range.start, range.end);
+}
+/**
+ * Where the word a double click selected sits in the field's value: its only
+ * occurrence, else the one nearest where it started in the element's text;
+ * null when no word was selected or the value does not hold it.
+ */
+function selectionIn(value, sel) {
+  if (!sel || typeof sel.text !== 'string' || !Number.isInteger(sel.offset)) return null;
+  for (const word of [sel.text, sel.text.trim()]) {
+    const at = [];
+    for (let i = word === '' ? -1 : value.indexOf(word); i !== -1; i = value.indexOf(word, i + 1)) at.push(i);
+    if (at.length === 0) continue;
+    const start = at.reduce((best, i) => (Math.abs(i - sel.offset) < Math.abs(best - sel.offset) ? i : best));
+    return { start: start, end: start + word.length };
+  }
+  return null;
 }
 function closePopover() {
   if (S.popover === null) return;
@@ -4261,7 +4290,7 @@ const ACTIONS = {
     S.choose = null;
     paintPanePick();
     // Words two keys share are never typed in place: the chosen key opens in the field.
-    choosePick(Object.assign({}, hit, { inplace: false }), c.again, c.rect);
+    choosePick(Object.assign({}, hit, { inplace: false }), c.again, c.rect, c.sel);
   },
   cycleEnv: () => {
     const names = ((ready() && S.site.environments) || []).map((e) => e.name);

@@ -9994,6 +9994,70 @@ describe('the page', () => {
         page.dom.window.close();
       });
 
+      it('R15: a double click’s selected word is selected in the field over the frame, so typing replaces it', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const greeting = { key: 'lab_greeting', by: 'pattern', inplace: false };
+        const range = (): [number, number] => [poptext(page).selectionStart, poptext(page).selectionEnd];
+        // 'Welcome back, {{name}}.': the word occurs once.
+        await agent.pick([greeting], { again: true, sel: { text: 'back', offset: 8 } });
+        expect(range()).toEqual([8, 12]);
+        await typeInto(page, poptext(page), 'to be or not to be');
+        await press(page, poptext(page), 'Enter');
+        // Several occurrences: the one nearest where the word sat in the element.
+        await agent.pick([greeting], { again: true, sel: { text: 'be', offset: 14 } });
+        expect(range()).toEqual([16, 18]);
+        await press(page, poptext(page), 'Enter');
+        await agent.pick([greeting], { again: true, sel: { text: 'be', offset: 2 } });
+        expect(range()).toEqual([3, 5]);
+        await press(page, poptext(page), 'Enter');
+        // A trailing space the browser selected with the word is not part of it.
+        await agent.pick([greeting], { again: true, sel: { text: 'be\n', offset: 14 } });
+        expect(range()).toEqual([16, 18]);
+        await press(page, poptext(page), 'Enter');
+        // Not in the value, or no selection: the caret at the end.
+        await agent.pick([greeting], { again: true, sel: { text: 'missing', offset: 0 } });
+        expect(range()).toEqual([18, 18]);
+        await press(page, poptext(page), 'Enter');
+        await agent.pick([greeting], { again: true });
+        expect(range()).toEqual([18, 18]);
+        page.dom.window.close();
+      });
+
+      it('R15: the word selected by a double click survives the chooser of two keys', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }], { again: true, sel: { text: 'oo', offset: 1 } });
+        await page.act('choose:loose_key');
+        expect([poptext(page).selectionStart, poptext(page).selectionEnd]).toEqual([1, 3]);
+        page.dom.window.close();
+      });
+
+      it('R14: a click in the frame on no key’s copy ends the selection as Escape does: the edit box closes, unsaved edits stay, the ring goes', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+        await typeInto(page, poptext(page), 'Welcome, {{name}}.');
+        expect(popover(page).hidden).toBe(false);
+        const clears = agent.sent('clear').length;
+        await agent.tell({ stet: 'deselect' });
+        expect(popover(page).hidden).toBe(true);
+        expect(selected(page)).toBe('');
+        expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+        expect(agent.sent('clear').length).toBeGreaterThan(clears);
+        page.dom.window.close();
+      });
+
+      it('R14: deselect, then unmanaged, keeps the note for text no key matches; deselect alone takes an earlier note away', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }]);
+        expect(selected(page)).toBe('hero_headline');
+        await agent.tell({ stet: 'deselect' });
+        await agent.tell({ stet: 'unmanaged', text: 'Docs', tag: 'a' });
+        expect(selected(page)).toBe('');
+        expect(lines(page)[0]).toBe('No key matches this text.');
+        await agent.tell({ stet: 'deselect' });
+        expect(lines(page)).not.toContain('No key matches this text.');
+        page.dom.window.close();
+      });
+
       it('starts an in-place edit on a second pick under the selector’s locale, and ends an open edit before a pick of another key (7.2)', async () => {
         const { page, agent } = await bridged();
         await page.change('locale', 'de');

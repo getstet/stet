@@ -12,7 +12,8 @@
 // Messages from the dashboard: hello, locate, clear, census, reads (the keys a
 // file of the open page reads, so the census matches only those), layer, mode,
 // edit, end. Messages to it: ready, located, census, hover, pick, unmanaged,
-// out (the pointer left the frame), rect, typed, edited, key, moved, bye.
+// deselect (a click on no key's copy), out (the pointer left the frame), rect,
+// typed, edited, key, moved, bye.
 (function () {
   'use strict';
   var script = document.currentScript;
@@ -1075,16 +1076,22 @@
   /**
    * A click on copy selects it: `pick` with each hit, `again` for a second
    * click on the selected element or a double click, `key` for a pick made
-   * by Enter. A click on text no key matches sends `unmanaged`. A click
-   * outside the element under edit ends the edit, kept, before anything is
-   * sent.
+   * by Enter, and `sel` (the text a double click selected and where it
+   * starts in the element's text) when one did. A click on no key's copy
+   * takes the ring off and sends `deselect`; when the element under the
+   * click has text of its own it also sends `unmanaged`. A click outside the
+   * element under edit ends the edit, kept, before anything is sent.
    */
   function pickAt(target, again, byKey) {
     end('keep');
     var at = hitsAt(target);
     if (at === null) {
-      var text = target && target.nodeType === 1 ? norm(target.textContent || '').slice(0, 120) : '';
-      if (text !== '') tell({ stet: 'unmanaged', text: text, tag: target.tagName.toLowerCase() });
+      select(null);
+      tell({ stet: 'deselect' });
+      if (target && target.nodeType === 1 && hasOwnText(target)) {
+        var text = norm(target.textContent || '').slice(0, 120);
+        if (text !== '') tell({ stet: 'unmanaged', text: text, tag: target.tagName.toLowerCase() });
+      }
       return;
     }
     if (again && againEl === at.el) return;
@@ -1093,7 +1100,29 @@
     if (again) againEl = at.el;
     var pick = { stet: 'pick', keys: keysOf(at, true), tag: at.el.tagName.toLowerCase(), rect: rectOf(at.el), again: again };
     if (byKey) pick.key = true;
+    else if (again) {
+      var sel = selectedIn(at.el);
+      if (sel !== null) pick.sel = sel;
+    }
     tell(pick);
+  }
+
+  /** Whether `el` has a text node of its own with a letter or digit, so a click on it is on copy and not on the space around it. */
+  function hasOwnText(el) {
+    for (var c = el.firstChild; c; c = c.nextSibling) if (c.nodeType === 3 && /[\p{L}\p{N}]/u.test(c.data)) return true;
+    return false;
+  }
+
+  /** The page's selection when it is not collapsed and lies inside `el`: its text, and where it starts in the element's text. Null otherwise. */
+  function selectedIn(el) {
+    var selection = getSelection();
+    if (selection === null || selection.rangeCount === 0 || selection.isCollapsed) return null;
+    var range = selection.getRangeAt(0);
+    if (!el.contains(range.commonAncestorContainer)) return null;
+    var before = document.createRange();
+    before.selectNodeContents(el);
+    before.setEnd(range.startContainer, range.startOffset);
+    return { text: range.toString(), offset: before.toString().length };
   }
 
   /** Whether keys pressed at `target` are typing: an input, a textarea, a select or editable content. */
@@ -1255,9 +1284,13 @@
     el.setAttribute('contenteditable', 'plaintext-only');
     el.setAttribute('spellcheck', 'false');
     editListeners(el, 'addEventListener');
+    // A double click's word stays selected, so typing replaces it; any other start puts a caret where the click landed.
+    var word = selectedIn(el) === null ? null : getSelection().getRangeAt(0).cloneRange();
     window.focus();
     el.focus();
-    caretAt(el);
+    if (word === null) { caretAt(el); return; }
+    getSelection().removeAllRanges();
+    getSelection().addRange(word);
   }
 
   /** The island the last click landed on, where the browser can say where text sits; undefined for a key press or a click on no run. */
@@ -1280,6 +1313,7 @@
    * first island with text.
    */
   function startRuns(el, key, locale, entry, oneLine) {
+    var word = wordIn(el);
     var nodes = [];
     var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
     for (var node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node);
@@ -1306,10 +1340,27 @@
     edit.observer.observe(el, { childList: true, characterData: true, subtree: true });
     editListeners(el, 'addEventListener');
     window.focus();
-    var first = islandAtClick(islands) || islands.filter(function (island) { return norm(island.textContent) !== ''; })[0] || islands[0];
+    // A double click's word stays selected in its island, so typing replaces it; the wrapping moved its text node, so the range is made again.
+    var first = (word !== null && islands[nodes.indexOf(word.node)]) || islandAtClick(islands) ||
+      islands.filter(function (island) { return norm(island.textContent) !== ''; })[0] || islands[0];
     if (first === undefined) return;
     first.focus();
-    caretAt(first);
+    if (word === null || nodes.indexOf(word.node) === -1) { caretAt(first); return; }
+    var range = document.createRange();
+    range.setStart(word.node, word.start);
+    range.setEnd(word.node, word.end);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+  }
+
+  /** The page's non-collapsed selection when it lies inside one text node of `el`: that node and the offsets. Null otherwise. */
+  function wordIn(el) {
+    var selection = getSelection();
+    if (selection === null || selection.rangeCount === 0 || selection.isCollapsed) return null;
+    var range = selection.getRangeAt(0);
+    var node = range.startContainer;
+    if (node !== range.endContainer || node.nodeType !== 3 || !el.contains(node)) return null;
+    return { node: node, start: range.startOffset, end: range.endOffset };
   }
 
   // Condition 3. The browser edits the DOM, runs the microtask checkpoint (the
