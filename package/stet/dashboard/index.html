@@ -3370,9 +3370,10 @@ function openPopover(key, loc, entry, rect, sel) {
   text.setSelectionRange(range.start, range.end);
 }
 /**
- * Where the word a double click selected sits in the field's value: its only
- * occurrence, else the one nearest where it started in the element's text;
- * null when no word was selected or the value does not hold it.
+ * Where the word a double click selected sits in the field's value: the
+ * occurrence with the same ordinal it had in the element's text, else the one
+ * nearest where it started there; null when no word was selected or the value
+ * does not hold it.
  */
 function selectionIn(value, sel) {
   if (!sel || typeof sel.text !== 'string' || !Number.isInteger(sel.offset)) return null;
@@ -3380,7 +3381,9 @@ function selectionIn(value, sel) {
     const at = [];
     for (let i = word === '' ? -1 : value.indexOf(word); i !== -1; i = value.indexOf(word, i + 1)) at.push(i);
     if (at.length === 0) continue;
-    const start = at.reduce((best, i) => (Math.abs(i - sel.offset) < Math.abs(best - sel.offset) ? i : best));
+    const start = Number.isInteger(sel.nth) && sel.nth >= 0 && at.length > sel.nth
+      ? at[sel.nth]
+      : at.reduce((best, i) => (Math.abs(i - sel.offset) < Math.abs(best - sel.offset) ? i : best));
     return { start: start, end: start + word.length };
   }
   return null;

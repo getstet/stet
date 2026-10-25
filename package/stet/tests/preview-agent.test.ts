@@ -1133,13 +1133,16 @@ describe('Edit mode (6.3)', () => {
     expect(lastOf(framed, 'edited')).toMatchObject({ how: 'keep' });
   });
 
-  it('R15: a second click that follows a native word selection sends the word and where it starts in the element’s text', async () => {
+  it('R15: a second click that follows a native word selection sends the word, where it starts in the element’s text and how many of it came before', async () => {
     const { framed } = await handlerPage();
     await setMode(framed, 'edit');
     const btn = framed.doc.getElementById('btn') as HTMLElement;
     const node = btn.firstChild as Text;
     press(framed, btn, 'click', { detail: 1 });
     (framed.win.getSelection() as Selection).setBaseAndExtent(node, 6, node, 10);
+    press(framed, btn, 'click', { detail: 2 });
+    // A word the element holds more than once also says how many came before it.
+    (framed.win.getSelection() as Selection).setBaseAndExtent(node, 12, node, 13);
     press(framed, btn, 'click', { detail: 2 });
     // A collapsed selection, or one outside the element, sends nothing.
     (framed.win.getSelection() as Selection).collapse(node, 3);
@@ -1149,9 +1152,10 @@ describe('Edit mode (6.3)', () => {
     await tick();
     const picks = sentOf(framed, 'pick');
     expect(picks[0]).not.toHaveProperty('sel');
-    expect(picks[1]?.['sel']).toEqual({ text: 'free', offset: 6 });
-    expect(picks[2]).not.toHaveProperty('sel');
+    expect(picks[1]?.['sel']).toEqual({ text: 'free', offset: 6, nth: 0 });
+    expect(picks[2]?.['sel']).toEqual({ text: 'r', offset: 12, nth: 2 });
     expect(picks[3]).not.toHaveProperty('sel');
+    expect(picks[4]).not.toHaveProperty('sel');
   });
 
   it('R15: an in-place edit started with a word selected inside the element keeps the word selected; typing replaces it', async () => {

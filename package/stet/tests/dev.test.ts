@@ -10023,6 +10023,36 @@ describe('the page', () => {
         page.dom.window.close();
       });
 
+      it('R15: a word the value holds twice is selected at the ordinal it had in the element, tokens in the value or not', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const greeting = { key: 'lab_greeting', by: 'pattern', inplace: false };
+        const range = (): [number, number] => [poptext(page).selectionStart, poptext(page).selectionEnd];
+        await agent.pick([greeting], { again: true });
+        await typeInto(page, poptext(page), '{{count}} items and {{count}} items');
+        await press(page, poptext(page), 'Enter');
+        // The element shows '12 items and 12 items': its offsets drift from the value's.
+        await agent.pick([greeting], { again: true, sel: { text: 'items', offset: 16, nth: 1 } });
+        expect(range()).toEqual([30, 35]);
+        await press(page, poptext(page), 'Enter');
+        await agent.pick([greeting], { again: true, sel: { text: 'items', offset: 3, nth: 0 } });
+        expect(range()).toEqual([10, 15]);
+        await press(page, poptext(page), 'Enter');
+        // An ordinal the value does not reach falls back to the nearest occurrence.
+        await agent.pick([greeting], { again: true, sel: { text: 'items', offset: 28, nth: 5 } });
+        expect(range()).toEqual([30, 35]);
+        page.dom.window.close();
+      });
+
+      it('R15: a word selected in the element’s text is not looked for in an attribute’s value; the caret goes to the end', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const attr = { key: 'lab_greeting', by: 'attr', inplace: false, attr: 'alt' };
+        await agent.pick([attr], { again: true, sel: { text: 'back', offset: 8, nth: 0 } });
+        const value = poptext(page).value;
+        expect(value).toContain('back');
+        expect([poptext(page).selectionStart, poptext(page).selectionEnd]).toEqual([value.length, value.length]);
+        page.dom.window.close();
+      });
+
       it('R15: the word selected by a double click survives the chooser of two keys', async () => {
         const { page, agent } = await bridged();
         await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }], { again: true, sel: { text: 'oo', offset: 1 } });

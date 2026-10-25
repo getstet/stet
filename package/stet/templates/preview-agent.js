@@ -1077,7 +1077,7 @@
    * A click on copy selects it: `pick` with each hit, `again` for a second
    * click on the selected element or a double click, `key` for a pick made
    * by Enter, and `sel` (the text a double click selected and where it
-   * starts in the element's text) when one did. A click on no key's copy
+   * starts in the element's text, and how many earlier occurrences of it the element holds) when one did. A click on no key's copy
    * takes the ring off and sends `deselect`; when the element under the
    * click has text of its own it also sends `unmanaged`. A click outside the
    * element under edit ends the edit, kept, before anything is sent.
@@ -1113,7 +1113,11 @@
     return false;
   }
 
-  /** The page's selection when it is not collapsed and lies inside `el`: its text, and where it starts in the element's text. Null otherwise. */
+  /**
+   * The page's selection when it is not collapsed and lies inside `el`: its
+   * text, where it starts in the element's text, and `nth`, how many earlier
+   * occurrences of that text the element holds. Null otherwise.
+   */
   function selectedIn(el) {
     var selection = getSelection();
     if (selection === null || selection.rangeCount === 0 || selection.isCollapsed) return null;
@@ -1122,7 +1126,11 @@
     var before = document.createRange();
     before.selectNodeContents(el);
     before.setEnd(range.startContainer, range.startOffset);
-    return { text: range.toString(), offset: before.toString().length };
+    var text = range.toString();
+    var offset = before.toString().length;
+    var nth = 0;
+    for (var at = (el.textContent || '').indexOf(text); text !== '' && at !== -1 && at < offset; at = (el.textContent || '').indexOf(text, at + 1)) nth++;
+    return { text: text, offset: offset, nth: nth };
   }
 
   /** Whether keys pressed at `target` are typing: an input, a textarea, a select or editable content. */
