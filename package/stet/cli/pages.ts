@@ -9,8 +9,8 @@
  * lands in a named skip instead.
  *
  * The detector reads directory entries and file names; under `pages scan`, a
- * markdown page's frontmatter block is the one content read, and only when
- * seeding is on. Adoption's never-read boundary holds where it is stated —
+ * markdown page's frontmatter block and an Astro page's `<title>` and
+ * description are the content reads, and only when seeding is on. Adoption's never-read boundary holds where it is stated —
  * `scan`'s drift warn calls the detector with no seed option — and the tree
  * walked is the framework's own rather than a glob's: a glob gate would drop
  * the very endpoints the taxonomy has to report.
@@ -31,7 +31,9 @@
  * and blank real copy at exit 0.
  *
  * `--apply` writes one batch: the page records, their two scaffolded SEO keys,
- * the empty defaults and the regenerated codegen files. Atomicity here is
+ * the empty defaults (or the words an Astro page or a markdown page seeds), the
+ * Astro page files rewritten to read their keys, and the regenerated codegen
+ * files. Atomicity here is
  * correctness rather than hygiene — a page record whose keys did not land makes
  * the descriptor unloadable, and so does a key naming a page record that did
  * not, so the whole host bricks at `descriptorOf` in either direction.
@@ -44,14 +46,17 @@ import { headLimitsFor, route as normalizeRoute } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, type Descriptor, type PageDef } from '../src/types.js';
 import { flag, parse, positionalsAround, refuseEnv } from './args.js';
-import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
+import { asUpdate, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
+import { componentCache, readableAs, readAstroHead, astroHeadEdits, rereadsClean, type AstroHead } from './astro-rewrite.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, refuseUnresolvableAlias, type StetConfig } from './config.js';
 import { filesForGlobs, walk } from './files.js';
 import { proposeHtml } from './html-host.js';
 import { NAME_PART, wordsOf } from './key-names.js';
 import type { CliIo } from './main.js';
 import { clip, plural, posixRelative, CliError, Report, UsageError } from './report.js';
+import { applyFileEdits } from './rewrite.js';
+import { loadTypescript } from './source-scan.js';
 import { servableFile } from './static-files.js';
 
 // --- The dirent walk --------------------------------------------------------
@@ -198,13 +203,17 @@ export interface PageProposal {
    * nothing for it.
    */
   bound?: { title?: string; description?: string };
+  /** An Astro page's title and description as the page writes them, where seeding is on: each field's seed and site, or the reason it cannot be bound. */
+  astroHead?: AstroHead;
 }
 
 export interface PageProposalSet {
   proposals: PageProposal[];
   skips: PageSkip[];
-  /** Declared html pages whose empty title or description takes the key their file now marks for it. */
+  /** Declared pages whose empty title or description takes the key their file marks (html) or the words and binding their page holds (Astro). */
   fills: PageFill[];
+  /** The compiler the Astro reads and edits ran under, handed to the apply. */
+  compiler?: typeof import('typescript');
 }
 
 /** One empty SEO slot of a declared page, and the key its marked element carries. */
@@ -214,6 +223,8 @@ export interface PageFill {
   file: string;
   field: 'title' | 'description';
   key: string;
+  /** An Astro page's reading, where the fill seeds the key from the page and binds the page to it. */
+  astroHead?: AstroHead;
 }
 
 /** The remedy behind most skips: the descriptor is the registry, and a hand-written page is first-class. */
@@ -265,6 +276,8 @@ export function proposePages(
     /** Read each html page's MARKS and bind its title and description to them. */
     bind?: boolean;
     config?: Pick<StetConfig, 'managedSurfaces'>;
+    /** Read each `.astro` page's title and description, under `seed`. */
+    astro?: { ts: typeof import('typescript'); config: StetConfig };
   } = {},
 ): PageProposalSet {
   // Every arm's files in ONE path-sorted union. Walk order is what decides
@@ -305,6 +318,19 @@ export function proposePages(
   for (const [name, def] of Object.entries(declared.pages)) {
     if (typeof def?.route === 'string') declaredRoutes.set(normalizeRoute(def.route), name);
   }
+
+  // An `.astro` page's head, read once under seeding and shared by its proposal or its fills.
+  const components = componentCache();
+  const heads = new Map<string, AstroHead>();
+  const headOf = (file: string): AstroHead | undefined => {
+    if (options.seed !== true || options.astro === undefined || extensionOf(file) !== '.astro') return undefined;
+    const held = heads.get(file);
+    if (held !== undefined) return held;
+    const { ts, config } = options.astro;
+    const head = readAstroHead(ts, cwd, config, file, readFileSync(join(cwd, file), 'utf8'), components);
+    heads.set(file, head);
+    return head;
+  };
 
   const proposals: PageProposal[] = [];
   const skips: PageSkip[] = [];
@@ -357,6 +383,15 @@ export function proposePages(
         const now = held[field];
         if (key === undefined || (typeof now === 'string' && now !== '')) continue;
         fills.push({ page: declaredAt, route, file, field, key });
+      }
+      // An Astro page takes the same fill from its own words: the slot's committed value is empty and the page writes the field as a literal.
+      for (const field of ['title', 'description'] as const) {
+        const key = held[field];
+        if (typeof key !== 'string' || !Object.hasOwn(declared.keys, key) || declared.values[key] !== '') continue;
+        const head = headOf(file);
+        const read = head?.[field];
+        if (head?.plan === undefined || read === undefined || !('site' in read) || !readableAs(key, head.plan.form)) continue;
+        fills.push({ page: declaredAt, route, file, field, key, astroHead: head });
       }
       // The seed rides the same read on the page that OWNS this route: a file
       // and the key it seeded diverging is the one thing a seed can hide, so
@@ -419,6 +454,16 @@ export function proposePages(
       const seed = readFrontmatter(join(cwd, proposal.file));
       if (seed) proposal.seed = seed;
     }
+    const head = headOf(file);
+    if (head !== undefined) {
+      proposal.astroHead = head;
+      const seed: { title?: string; description?: string } = {};
+      for (const field of ['title', 'description'] as const) {
+        const read = head[field];
+        if (read !== undefined && 'seed' in read) seed[field] = read.seed;
+      }
+      if (Object.keys(seed).length > 0) proposal.seed = seed;
+    }
     // Always set on the html arm, empty included: its presence is what tells
     // the print and the apply that this page binds rather than scaffolds.
     if (arm === 'html') proposal.bound = bound.get(file) ?? {};
@@ -435,7 +480,7 @@ export function proposePages(
     if (parent !== undefined) proposal.parent = parent;
   }
 
-  return { proposals, skips, fills };
+  return { proposals, skips, fills, ...(options.astro === undefined ? {} : { compiler: options.astro.ts }) };
 }
 
 /**
@@ -896,7 +941,7 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io, { json });
 
-  const set = proposeForHost(io.cwd, config, descriptor);
+  const set = proposeForHost(io.cwd, config, descriptor, await pagesCompiler(io.cwd, config));
   if (set === null) {
     report.line('pages scan: no routing convention detected — expected src/pages, app/ or pages/');
     return report.emit(io, { json });
@@ -933,6 +978,7 @@ export function proposeForHost(
   cwd: string,
   config: StetConfig,
   descriptor: Descriptor,
+  ts?: typeof import('typescript'),
 ): PageProposalSet | null {
   const roots = detectPagesRoots(cwd, { html: isHtmlHost(config) });
   if (roots.length === 0) return null;
@@ -944,8 +990,16 @@ export function proposeForHost(
       keys: descriptor.keys,
       values: committedValues(cwd, config),
     },
-    { seed: true, bind: true, config },
+    { seed: true, bind: true, config, ...(ts === undefined ? {} : { astro: { ts, config } }) },
   );
+}
+
+/**
+ * The compiler an Astro tree's page reads need, loaded only where the host has
+ * one, so every other host runs `pages scan` as it did without it.
+ */
+export async function pagesCompiler(cwd: string, config: StetConfig): Promise<typeof import('typescript') | undefined> {
+  return detectPagesRoots(cwd, { html: isHtmlHost(config) }).some((root) => root.arm === 'astro') ? loadTypescript() : undefined;
 }
 
 /**
@@ -982,7 +1036,14 @@ function seoKeys(name: string): { title: string; description: string } {
 
 /** One fill in the plan's words. */
 function fillLine(fill: PageFill): string {
-  return `${fill.file}: fills the ${fill.field} with ${fill.key}`;
+  return fill.astroHead === undefined
+    ? `${fill.file}: fills the ${fill.field} with ${fill.key}`
+    : `${fill.file}: fills the ${fill.field} from the page and binds it to ${fill.key}`;
+}
+
+/** A proposal or a fill as `--json` carries it: the Astro reading is the apply's, not the payload's. */
+function payloadOf<T extends { astroHead?: AstroHead }>({ astroHead: _, ...rest }: T): Omit<T, 'astroHead'> {
+  return rest;
 }
 
 /**
@@ -1006,7 +1067,8 @@ function printPages(report: Report, set: PageProposalSet, fills: boolean): void 
       }
       continue;
     }
-    const origin = proposal.seed === undefined ? 'scaffolded empty' : 'seeded from frontmatter';
+    const origin =
+      proposal.seed === undefined ? 'scaffolded empty' : proposal.astroHead === undefined ? 'seeded from frontmatter' : 'seeded from the page';
     report.line(`  seo: ${keys.title}, ${keys.description} — ${origin}`);
     // The value the apply is about to write, shown before it lands: a seed is
     // the host's own copy, and copy stet is about to commit is copy the
@@ -1015,14 +1077,21 @@ function printPages(report: Report, set: PageProposalSet, fills: boolean): void 
       const value = proposal.seed?.[field];
       if (value !== undefined) report.line(`  ${field}: "${clip(value, SEED_EXCERPT)}"`);
     }
+    // A field the page writes where stet cannot bind it scaffolds empty and says whose hand step it is.
+    for (const field of ['title', 'description'] as const) {
+      const read = proposal.astroHead?.[field];
+      if (read !== undefined && 'skip' in read) {
+        report.line(`  ${field}: ${proposal.file} writes it where stet cannot bind it (${read.skip}) — bind ${keys[field]} by hand`);
+      }
+    }
   }
   if (fills) for (const fill of set.fills) report.line(fillLine(fill));
   for (const skip of set.skips) {
     report.warn('pages', `${skip.file}: skipped (${skip.reason}) — ${skip.detail}; ${skip.remedy}`);
   }
-  report.data('pages', set.proposals);
+  report.data('pages', set.proposals.map(payloadOf));
   report.data('skips', set.skips);
-  report.data('fills', set.fills);
+  report.data('fills', set.fills.map(payloadOf));
 }
 
 /**
@@ -1083,7 +1152,7 @@ export function applyPages(
   set: PageProposalSet,
   names: string[],
   report: Report,
-): void {
+): string[] {
   const chosen = selectPages(set, names);
   const values = (snapshot[config.locales.default] ??= {});
   const pages = (descriptor.pages ??= {});
@@ -1098,6 +1167,9 @@ export function applyPages(
     const def = descriptor.keys[fill.key];
     if (def !== undefined && !(def.pages ?? []).includes(fill.page)) def.pages = [...(def.pages ?? []), fill.page];
     filled.push(fill);
+    // An Astro page fills the key from its own words; the binding is planned with the proposals' below.
+    const read = fill.astroHead?.[fill.field];
+    if (read !== undefined && 'seed' in read) values[fill.key] = read.seed;
   }
 
   // The records that actually LANDED. The plans are built from this list, so a
@@ -1189,13 +1261,16 @@ export function applyPages(
 
   if (landed.length === 0 && backfilled === 0 && filled.length === 0) {
     report.line('pages scan: nothing to propose');
-    return;
+    return [];
   }
+
+  // The Astro pages: each page file rewritten to read the keys it seeded, written in the same batch as the keys.
+  const { writes: pageWrites, unbound } = astroPageWrites(cwd, config, set, landed, filled, report);
 
   let written: string[] = [];
   let unchanged: string[] = [];
   try {
-    ({ written, unchanged } = writePlanned(planRepoForms(cwd, config, descriptor, snapshot, report)));
+    ({ written, unchanged } = writePlanned([...planRepoForms(cwd, config, descriptor, snapshot, report), ...pageWrites]));
   } catch (error) {
     rethrowBatchFailure('pages scan --apply', error);
   }
@@ -1203,8 +1278,8 @@ export function applyPages(
   for (const label of unchanged) report.line(`${label}: already current`);
   for (const label of written) report.line(`wrote ${label}`);
   if (backfilled > 0) report.line(`backfilled parent on ${backfilled} page(s)`);
-  for (const fill of filled) report.line(fillLine(fill));
-  if (landed.length === 0) return;
+  for (const fill of filled) if (!unbound.has(fill.file)) report.line(fillLine(fill));
+  if (landed.length === 0) return written;
   // The html arm's own close: this run scaffolded nothing and seeded nothing,
   // so today's two lines would both be zero. What matters instead is how many
   // fields bound and how many pages still lack one.
@@ -1221,7 +1296,7 @@ export function applyPages(
         `bound ${plural(fields, 'field')}; ` +
         `${plural(short, 'page')} ${short === 1 ? 'lacks' : 'lack'} a marked title or description — stet seo check names them`,
     );
-    return;
+    return written;
   }
   report.line(`declared ${landed.length} page(s), scaffolded ${landed.length * 2} key(s); next: stet seo check`);
   // The red this run just created, announced rather than met at the next
@@ -1234,10 +1309,71 @@ export function applyPages(
     landed.filter((proposal) => values[seoKeys(proposal.name)[field]] === '').length;
   const titles = empty('title');
   const descriptions = empty('description');
-  report.line(
-    titles === 0 && descriptions === 0
-      ? 'seo check will report nothing new — the scaffolded values were seeded from frontmatter'
-      : `seo check will now report ${titles} more missing titles and ${descriptions} more missing descriptions — ` +
+  const fromPage = landed.some((proposal) => proposal.astroHead !== undefined && proposal.seed !== undefined);
+  if (titles === 0 && descriptions === 0) {
+    if (!fromPage) report.line('seo check will report nothing new — the scaffolded values were seeded from frontmatter');
+  } else {
+    report.line(
+      `seo check will now report ${titles} more missing titles and ${descriptions} more missing descriptions — ` +
         'write the empty values and re-run stet seo check',
-  );
+    );
+  }
+  return written;
+}
+
+/**
+ * The Astro page files the run rewrites, as batch writes: each landed
+ * proposal's seeded fields and each fill, bound to the key it seeded, through
+ * register's leaf, insertion and read-back. A page whose rewrite does not read
+ * back keeps every byte and its keys keep the page's words, and its file is
+ * answered in `unbound`. The import's specifier is checked before anything is
+ * written, as register checks it.
+ */
+function astroPageWrites(
+  cwd: string,
+  config: StetConfig,
+  set: PageProposalSet,
+  landed: PageProposal[],
+  filled: PageFill[],
+  report: Report,
+): { writes: WritePlan[]; unbound: Set<string> } {
+  const pages = new Map<string, { head: AstroHead; bound: Array<{ field: 'title' | 'description'; key: string }> }>();
+  const bind = (file: string, head: AstroHead, field: 'title' | 'description', key: string): void => {
+    const read = head[field];
+    if (read === undefined || !('site' in read)) return;
+    const page = pages.get(file) ?? { head, bound: [] };
+    page.bound.push({ field, key });
+    pages.set(file, page);
+  };
+  for (const proposal of landed) {
+    if (proposal.astroHead === undefined) continue;
+    const keys = seoKeys(proposal.name);
+    for (const field of ['title', 'description'] as const) bind(proposal.file, proposal.astroHead, field, keys[field]);
+  }
+  for (const fill of filled) {
+    if (fill.astroHead !== undefined) bind(fill.file, fill.astroHead, fill.field, fill.key);
+  }
+  const ts = set.compiler;
+  const unbound = new Set<string>();
+  if (ts === undefined || pages.size === 0) return { writes: [], unbound };
+  if ([...pages.values()].some((page) => page.head.plan?.insert != null)) refuseUnresolvableAlias(cwd, config);
+  const writes: WritePlan[] = [];
+  for (const [file, { head, bound }] of pages) {
+    const source = readFileSync(join(cwd, file), 'utf8');
+    const { edits, reads } = astroHeadEdits(source, file, head, bound);
+    const after = applyFileEdits(source, edits);
+    let clean: boolean;
+    try {
+      clean = rereadsClean(ts, file, source, after, reads, 0);
+    } catch {
+      clean = false;
+    }
+    if (!clean) {
+      report.line(`${file}: the page's title and description were seeded but not bound (the rewrite did not read back cleanly) — bind them by hand`);
+      unbound.add(file);
+      continue;
+    }
+    writes.push(asUpdate(planWrite(join(cwd, file), after, file)));
+  }
+  return { writes, unbound };
 }

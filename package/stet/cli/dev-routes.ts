@@ -16,7 +16,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, existsSync, openSync, readFileSync, utimesSync } from 'node:fs';
 import { dirname, join, posix } from 'node:path';
 
@@ -61,7 +61,7 @@ import { codeOf, dialectCode, KEY_READ, nonCodeOf, within, type Span } from './k
 import { keyHistory } from './key-history.js';
 import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
-import { applyPages, auditablePages, fileRoute, proposeForHost, routeFiles, servedRoute } from './pages.js';
+import { applyPages, auditablePages, fileRoute, pagesCompiler, proposeForHost, routeFiles, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
@@ -1056,19 +1056,54 @@ function gitSpelling(path: string): string {
  */
 function pendingForms(site: Ready): string[] {
   const { files, globs } = stetFormPaths(site);
+  const recorded = hostWritten(site);
   // Git reads a glob its own way (`[` is a class to git and a character to
   // stet; `**` beside a name is a plain `*` to git), so git is asked only for
   // the folders the globs walk, as literal paths, and stet's own matcher picks
   // the documents.
   const roots = [...new Set(globs.map(staticPrefix))].map((root) => (root === '' ? '.' : `:(literal)${root}`));
-  const changed = uncommittedPaths(site.path, [...files, ...roots]).filter(
-    (file) => files.includes(file) || globs.some((glob) => matchGlob(glob, file)),
-  );
+  const asked = uncommittedPaths(site.path, [...files, ...roots, ...[...recorded.keys()].map((file) => `:(literal)${file}`)]);
+  forgetHostWrites(site, asked);
+  const changed = asked.filter((file) => files.includes(file) || globs.some((glob) => matchGlob(glob, file)) || recorded.has(file));
   // A document that cannot be read is left out, so one unreadable file never
   // stops the site opening.
   const readable = changed.filter((file) => files.includes(file) || canRead(join(site.path, file)));
   const accepted = stetWrittenForms(site, readable);
-  return readable.filter((file) => accepted.has(file));
+  // A host file stet's own route wrote is committable while its bytes are still the ones stet wrote.
+  return readable.filter((file) => accepted.has(file) || (recorded.has(file) && hashOf(site, file) === recorded.get(file)));
+}
+
+/** The host source files stet's own routes wrote this run, by site path: each file and the sha256 of the bytes written. Lost when `stet dev` restarts. */
+const hostWrites = new Map<string, Map<string, string>>();
+
+function hashOf(site: Ready, file: string): string | null {
+  try {
+    return createHash('sha256').update(readFileSync(join(site.path, file))).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function hostWritten(site: Ready): Map<string, string> {
+  return hostWrites.get(site.path) ?? new Map();
+}
+
+/** Records the files a route of this server just wrote, each with the bytes now on disk; a file that already differed from HEAD before the write carries edits that are not stet's and is left out. */
+function recordHostWrites(site: Ready, labels: string[], dirtyBefore: string[]): void {
+  const held = hostWrites.get(site.path) ?? new Map<string, string>();
+  for (const file of labels) {
+    if (dirtyBefore.includes(file)) continue;
+    const hash = hashOf(site, file);
+    if (hash !== null) held.set(file, hash);
+  }
+  hostWrites.set(site.path, held);
+}
+
+/** Drops a record whose file git no longer reports as differing from HEAD: it was committed, or put back. */
+function forgetHostWrites(site: Ready, differing: string[]): void {
+  const held = hostWrites.get(site.path);
+  if (held === undefined) return;
+  for (const file of [...held.keys()]) if (!differing.includes(file)) held.delete(file);
 }
 
 /** Opened, not asked: `access()` answers readable on some mounts (virtiofs, ACLs) where `open()` fails. */
@@ -1295,11 +1330,13 @@ function applyKeyMove(
   label: string,
 ): { written: string[]; touched: string | null; at: GitState; pending: string[] } {
   const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, new Report()).filter((p) => p.status !== 'unchanged');
+  const dirtyBefore = uncommittedPaths(ready.path, changed.map((p) => `:(literal)${p.label}`));
   try {
     writePlanned(changed);
   } catch (error) {
     rethrowBatchFailure(label, error);
   }
+  recordHostWrites(ready, changed.map((p) => p.label), dirtyBefore);
   return { written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) };
 }
 
@@ -2931,14 +2968,16 @@ async function declarePages(req: Request, site: SiteState): Promise<Response> {
   const raw = body['names'];
   const names = Array.isArray(raw) ? raw.map((name) => String(name)) : [];
 
-  const set = proposeForHost(ready.path, ready.config, ready.descriptor);
+  const set = proposeForHost(ready.path, ready.config, ready.descriptor, await pagesCompiler(ready.path, ready.config));
   if (set === null) {
     return json({ error: 'no routing convention detected — expected src/pages, app/ or pages/' }, 400);
   }
   const report = new Report();
-  applyPages(ready.path, ready.config, ready.descriptor, ready.snapshot, set, names, report);
+  const dirtyBefore = uncommittedPaths(ready.path, ['.']);
+  const written = applyPages(ready.path, ready.config, ready.descriptor, ready.snapshot, set, names, report);
+  recordHostWrites(ready, written, dirtyBefore);
   const touched = touchReadPath(ready);
-  return json({ lines: linesOf(report), findings: report.findings, touched, at: gitState(ready.path) });
+  return json({ lines: linesOf(report), findings: report.findings, written, touched, at: gitState(ready.path) });
 }
 
 /**

@@ -127,6 +127,7 @@ const MIXED = 'shown in the page and in its head';
 const REBOUND = 'copy is rebound here';
 const CANNOT_TELL = 'stet cannot tell how copy reads keys in this file';
 const PAGES_SCAN = 'SEO text — adopt it with stet pages scan';
+const EXPRESSION = 'written as an expression';
 
 /** The elements whose text is code, a field's value, a graphic or a slot's fallback, never copy stet rewrites. */
 const SKIP_TAGS = new Set(['code', 'kbd', 'samp', 'textarea', 'svg', 'math', 'slot']);
@@ -617,7 +618,7 @@ function reaches(pattern: Step[], path: Step[]): boolean {
 // --- The one-hop component read --------------------------------------------
 
 /** What a component makes of one prop: shown, shown in its head, both, or a reason it is listed. */
-type PropVerdict = { kind: 'display' } | { kind: 'head'; head: HeadKind } | { kind: 'skip'; reason: string };
+type PropVerdict = { kind: 'display' } | { kind: 'head'; head: HeadKind } | { kind: 'skip'; reason: string; heads?: HeadKind[] };
 
 /** The `.astro` file a component tag resolves to, one hop through the front matter's default import, or null. */
 function componentFile(ts: typeof import('typescript'), cwd: string, r: Reading, tag: string): string | null {
@@ -711,10 +712,12 @@ function readProp(ts: typeof import('typescript'), c: Reading | null, prop: stri
 
 /** A value's verdict from its non-test uses: code lists it, a head use beside a display lists it, a head use alone takes its kind, a display alone rewrites it. */
 function verdictOf(uses: Use[]): PropVerdict {
-  if (uses.some((u) => u.kind === 'code')) return { kind: 'skip', reason: IN_CODE };
   const display = uses.some((u) => u.kind === 'display');
   const heads = uses.filter((u) => u.kind === 'head');
-  if (display && heads.length > 0) return { kind: 'skip', reason: MIXED };
+  // A listed prop names the head kinds it reaches, which `pages scan` reads to say why it cannot bind one.
+  const reached = [...new Set(heads.map((u) => u.head as HeadKind))];
+  if (uses.some((u) => u.kind === 'code')) return { kind: 'skip', reason: IN_CODE, ...(reached.length > 0 ? { heads: reached } : {}) };
+  if (display && heads.length > 0) return { kind: 'skip', reason: MIXED, heads: reached };
   if (heads.length > 0) {
     const kinds = new Set(heads.map((u) => u.head));
     return { kind: 'head', head: kinds.has('title') ? 'title' : kinds.has('description') ? 'description' : 'other' };
@@ -1001,7 +1004,7 @@ function textCandidates(ctx: Context): void {
       if (head.title) {
         // The page's own title is pages scan's to bind.
         const shape = masked.includes('{')
-          ? 'written as an expression'
+          ? EXPRESSION
           : (entityReason(raw) ?? (masked.includes('\0') || nearest !== firstTitle || el.segments.length !== 1 ? UNFOLLOWED : null));
         ctx.refuse(start, end, pageField(ctx, 'title', shape));
         continue;
@@ -1184,7 +1187,7 @@ function braceTextCandidates(ctx: Context): void {
       const attrs = readAttrs(inside, open.start + 1 + open.name.length, inside.slice(open.start + 1 + open.name.length, open.end - 1));
       const head = pathHead([...path, { tag: open.name.toLowerCase() }]);
       if (head.title) {
-        ctx.refuse(start, end, pageField(ctx, 'title', 'written as an expression'));
+        ctx.refuse(start, end, pageField(ctx, 'title', EXPRESSION));
         continue;
       }
       const around = [...path.map((e) => ({ name: sourceTag(r, e), attrs: e.attrs })), { name: open.name, attrs }];
@@ -1280,7 +1283,7 @@ function dataCandidates(ctx: Context, data: DialectFinding[]): void {
     }
     if (heads.some((u) => u.head !== 'other')) {
       const field = heads.some((u) => u.head === 'title') ? 'title' : 'description';
-      ctx.refuse(start, end, pageField(ctx, field, ctx.page === undefined ? null : 'written as an expression'));
+      ctx.refuse(start, end, pageField(ctx, field, ctx.page === undefined ? null : EXPRESSION));
       continue;
     }
     const first = shown[0] ?? heads[0];
@@ -1404,6 +1407,173 @@ function constUses(ctx: Context, declared: TS.VariableDeclaration & { name: TS.I
     }
   }
   return { uses: uses.filter((u) => u.kind !== 'test') };
+}
+
+// --- A page's title and description (D17) ----------------------------------
+
+/** Where a page writes a SEO field: a literal in the page, or a quoted prop it passes to a layout. Offsets are into the source, a byte-order mark counted. */
+export type AstroSeoSite =
+  | { kind: 'text'; pos: number; end: number; raw: string }
+  | { kind: 'attr'; pos: number; end: number; raw: string }
+  | { kind: 'prop'; pos: number; end: number; raw: string; component: string; prop: string };
+
+/** One field's seed and the site that binds it, or the reason it cannot be bound. */
+type AstroSeoRead = { seed: string; site: AstroSeoSite } | { skip: string };
+
+/** An Astro page's SEO text: each field's seed and the edit that binds it, or the reason it cannot; and how the page reads a key. */
+export interface AstroHead {
+  title?: AstroSeoRead;
+  description?: AstroSeoRead;
+  /** The page's binding, form and import insertion: what `astroEdits` takes. Absent where the page cannot be read or bound at all. */
+  plan?: AstroPlan;
+}
+
+type SeoField = 'title' | 'description';
+
+/**
+ * The page's own `<title>` and description, or the quoted prop it passes to a
+ * layout that renders one there, each as a site `pages scan` binds or the reason
+ * it cannot. The same shapes D14 lists as `SEO text — adopt it with stet pages
+ * scan` answer a site here.
+ */
+export function readAstroHead(ts: typeof import('typescript'), cwd: string, config: StetConfig, file: string, source: string, cache: ComponentCache = componentCache()): AstroHead {
+  const none = (reason: string): AstroHead => ({ title: { skip: reason }, description: { skip: reason } });
+  try {
+    const read = readAstro(ts, file, source);
+    if ('fault' in read) return none(read.fault);
+    const bound = bindingOf(ts, cwd, config, read, source);
+    if ('fault' in bound) return none(bound.fault);
+    const plan: AstroPlan = { form: bound.form, insert: bound.insert, richInsert: null, skips: [], structured: [] };
+    return { title: seoRead(ts, cwd, read, 'title', cache), description: seoRead(ts, cwd, read, 'description', cache), plan };
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    return none('markup stet cannot pair');
+  }
+}
+
+function seoRead(ts: typeof import('typescript'), cwd: string, r: Reading, field: SeoField, cache: ComponentCache): AstroSeoRead {
+  const own = field === 'title' ? ownTitle(r) : ownDescription(r);
+  // The first prop a layout renders there, else what a slot or a layout sets.
+  let prop: AstroSeoRead | null = null;
+  let slotted = false;
+  const visit = (el: Element): void => {
+    const tag = sourceTag(r, el);
+    const target = componentName(tag) ? componentFile(ts, cwd, r, tag) : null;
+    if (target !== null) {
+      for (const attr of el.attrs) {
+        if (prop !== null || attr.name === 'slot' || nonCopyProp(attr.name)) continue;
+        const name = r.page.slice(attr.start, attr.start + attr.name.length);
+        const verdict = propVerdict(ts, cwd, target, name, cache);
+        const reaches = verdict.kind === 'head' ? verdict.head === field : verdict.kind === 'skip' && verdict.heads?.includes(field) === true;
+        if (!reaches) continue;
+        if (verdict.kind === 'skip') prop = { skip: verdict.reason };
+        else if (!attr.quoted) prop = { skip: EXPRESSION };
+        else {
+          const raw = r.page.slice(attr.valueStart - 1, attr.valueEnd + 1);
+          prop = { seed: raw.slice(1, -1), site: { kind: 'prop', pos: attr.valueStart - 1 + r.bom, end: attr.valueEnd + 1 + r.bom, raw, component: tag, prop: name } };
+        }
+      }
+    }
+    const slot = el.attrs.find((a) => a.name === 'slot' && a.quoted);
+    const parent = r.parents.get(el);
+    if (field === 'title' && slot !== undefined && parent !== undefined) {
+      const holder = componentFile(ts, cwd, r, sourceTag(r, parent));
+      const c = holder === null ? null : readComponent(ts, cwd, holder, cache);
+      if (c !== null && slotSite(c, slot.value) === 'title') slotted = true;
+    }
+    for (const child of el.children) visit(child);
+  };
+  for (const root of r.document.roots) visit(root);
+  // A page that writes its own `<title>` and passes one to its layout shows the layout's: neither is bound.
+  if (own !== null) return field === 'title' && 'site' in own && prop !== null ? { skip: UNFOLLOWED } : own;
+  if (prop !== null) return prop;
+  if (slotted || layoutSets(ts, cwd, r, field, cache)) return { skip: UNFOLLOWED };
+  return { skip: `the page sets no ${field}` };
+}
+
+/** The first `<title>` outside an `<svg>`, as a site, a reason, or null where the page holds none. */
+function ownTitle(r: Reading): AstroSeoRead | null {
+  const title = firstOf(r, (el, path) => el.tag === 'title' && !pathHead(path).svg);
+  if (title === undefined) return null;
+  const segment = title.segments[0];
+  if (title.segments.length === 0) return { skip: 'the page sets no title' };
+  if (title.segments.length !== 1 || segment === undefined || 'tag' in segment) return { skip: UNFOLLOWED };
+  const lead = (LEAD.exec(segment.text)?.[0] ?? '').length;
+  const trail = (TRAIL.exec(segment.text)?.[0] ?? '').length;
+  const start = segment.start + lead;
+  const end = segment.end - trail;
+  if (end <= start) return { skip: 'the page sets no title' };
+  const masked = segment.text.slice(lead, segment.text.length - trail);
+  const raw = r.page.slice(start, end);
+  if (masked.includes('{')) return { skip: EXPRESSION };
+  const entity = entityReason(raw);
+  if (entity !== undefined) return { skip: entity };
+  if (masked.includes('\0')) return { skip: UNFOLLOWED };
+  return { seed: textOf(raw), site: { kind: 'text', pos: start + r.bom, end: end + r.bom, raw } };
+}
+
+/** The first `<meta name="description">`, as a site, a reason, or null where the page holds none. */
+function ownDescription(r: Reading): AstroSeoRead | null {
+  const meta = firstOf(r, (el) => el.tag === 'meta' && attrOf(el, 'name')?.toLowerCase() === 'description');
+  if (meta === undefined) return null;
+  const content = meta.attrs.find((a) => a.name === 'content');
+  if (content === undefined || (content.quoted && content.value === '')) return { skip: 'the page sets no description' };
+  if (!content.quoted) return { skip: EXPRESSION };
+  // The parsed value has its braces blanked: the seed is read from the page itself.
+  const value = r.page.slice(content.valueStart, content.valueEnd);
+  const entity = entityReason(value);
+  if (entity !== undefined) return { skip: entity };
+  return {
+    seed: decodeEntities(value),
+    site: { kind: 'attr', pos: content.valueStart - 1 + r.bom, end: content.valueEnd + 1 + r.bom, raw: r.page.slice(content.valueStart - 1, content.valueEnd + 1) },
+  };
+}
+
+/** Whether a component the page renders writes the field as a literal of its own: the page does not set it and cannot bind it. */
+function layoutSets(ts: typeof import('typescript'), cwd: string, r: Reading, field: SeoField, cache: ComponentCache): boolean {
+  let sets = false;
+  const visit = (el: Element): void => {
+    const tag = sourceTag(r, el);
+    const target = componentName(tag) ? componentFile(ts, cwd, r, tag) : null;
+    const c = target === null ? null : readComponent(ts, cwd, target, cache);
+    const own = c === null ? null : field === 'title' ? ownTitle(c) : ownDescription(c);
+    if (own !== null && 'site' in own) sets = true;
+    for (const child of el.children) visit(child);
+  };
+  for (const root of r.document.roots) visit(root);
+  return sets;
+}
+
+/** The edits that bind a page's seeded fields to their keys, and the reads the read-back checks. */
+export function astroHeadEdits(
+  source: string,
+  file: string,
+  head: AstroHead,
+  bound: Array<{ field: SeoField; key: string }>,
+): ReturnType<typeof astroEdits> {
+  const plan = head.plan;
+  if (plan === undefined) return { edits: [], reads: [] };
+  const landed = bound.flatMap(({ field, key }) => {
+    const read = head[field];
+    if (read === undefined || !('site' in read)) return [];
+    const { site } = read;
+    const literal: LocatedLiteral = {
+      file,
+      pos: site.pos,
+      end: site.end,
+      raw: site.raw,
+      text: read.seed,
+      context: site.kind === 'text' ? 'astro-text' : 'astro-attr',
+      shape: 'astro',
+      proposedKey: key,
+      enclosingBodyPos: null,
+      copyBinding: plan.insert === null ? 'stet' : 'none',
+      accessorImported: plan.insert === null,
+      importInsertPos: plan.insert?.pos ?? 0,
+    };
+    return [{ literal, key }];
+  });
+  return astroEdits(source, plan, landed);
 }
 
 // --- The leaf and the read-back ---------------------------------------------

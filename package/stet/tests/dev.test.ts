@@ -10,6 +10,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import {
+  appendFileSync,
   chmodSync,
   cpSync,
   existsSync,
@@ -4585,6 +4586,70 @@ describe('POST /api/site/pages/declare', () => {
     expect(saved.status).toBe(200);
     const cleared = await get(handler, `/api/site/seo${site(host)}`);
     expect((cleared.seo.seo as Array<any>).some((f) => f.rule === 'missing-title' && f.page === 'about')).toBe(false);
+  });
+
+  describe('the page files its own write changed (PD14)', () => {
+    /** An Astro host whose about page writes its own title and description, committed. */
+    function seoHost(): CliHost {
+      const host = astroHost(['about.astro']);
+      writeFileSync(
+        join(host.cwd, 'stet.config.json'),
+        JSON.stringify(
+          { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },
+          null,
+          2,
+        ),
+      );
+      write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }));
+      write(host.cwd, 'src/lib/content.ts', 'export const copyMap: Record<string, string> = {};\n');
+      write(
+        host.cwd,
+        'src/pages/about.astro',
+        '<html><head><title>About us</title><meta name="description" content="Who we are." /></head><body><h1>x</h1></body></html>\n',
+      );
+      git(host.cwd, ['add', '-A']);
+      git(host.cwd, ['commit', '-qm', 'pages']);
+      return host;
+    }
+    const status = (host: CliHost): string => git(host.cwd, ['status', '--porcelain']).out;
+
+    it('commits the page file Declare pages rewrote, with the keys', async () => {
+      const host = seoHost();
+      const { handler } = handlerOver([host.cwd]);
+      const declared = await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+      expect(declared.status).toBe(200);
+      expect(declared.body['written']).toContain('src/pages/about.astro');
+      const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+      expect(pending).toContain('src/pages/about.astro');
+      const made = await post(handler, `/api/site/commit${site(host)}`, { files: pending });
+      expect(made.status).toBe(200);
+      expect(status(host)).toBe('');
+    });
+
+    it('leaves out a page file that had uncommitted edits before Declare pages wrote to it', async () => {
+      const host = seoHost();
+      appendFileSync(join(host.cwd, 'src/pages/about.astro'), '<!-- by hand -->\n');
+      const { handler } = handlerOver([host.cwd]);
+      await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+      const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+      expect(pending).not.toContain('src/pages/about.astro');
+      const made = await post(handler, `/api/site/commit${site(host)}`, { files: pending });
+      expect(made.status).toBe(200);
+      expect(status(host).trim()).toBe('M src/pages/about.astro');
+    });
+
+    it('leaves out a page file edited by hand after Declare pages', async () => {
+      const host = seoHost();
+      const { handler } = handlerOver([host.cwd]);
+      await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+      appendFileSync(join(host.cwd, 'src/pages/about.astro'), '<!-- by hand -->\n');
+      const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+      expect(pending).not.toContain('src/pages/about.astro');
+      expect(pending).toContain('content/descriptor.json');
+      const made = await post(handler, `/api/site/commit${site(host)}`, { files: pending });
+      expect(made.status).toBe(200);
+      expect(status(host).trim()).toBe('M src/pages/about.astro');
+    });
   });
 
   it('declares every proposal where no names are given', async () => {

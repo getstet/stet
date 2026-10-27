@@ -630,6 +630,32 @@ function matchPathsEntry(
   return best === null ? null : { dests: best.dests, star: best.star };
 }
 
+/**
+ * The import `register` and `pages scan --apply` are about to write into host
+ * source has to resolve. `init` records `readPath.import` from a probe that may have found no alias at
+ * all and defaulted to `@/lib/content`; applying a rewrite around that
+ * specifier leaves every touched file importing a path that maps nowhere, and
+ * the host learns at its next build. The diff-only path never guards — a
+ * printed diff misleads nobody.
+ */
+export function refuseUnresolvableAlias(cwd: string, config: StetConfig): void {
+  const spec = config.readPath.import;
+  // Alias-shaped only: an `@scope/pkg` npm name starts with `@` but not `@/`,
+  // and relative and bare specifiers resolve without any mapping.
+  if (!spec.startsWith('@/') && !spec.startsWith('~/')) return;
+  // Covered means RESOLVED ONTO THE READ PATH, never merely prefix-matched: a
+  // host declaring `@/*: ['./src/*']` with its read path at `lib/content.ts`
+  // matches the prefix and lands somewhere else entirely, and every rewritten
+  // file would import a module that is not there.
+  const target = normalizeNoExt(join(cwd, config.readPath.file));
+  if (resolveSpecifier(spec, config.readPath.file, cwd, pathAliasMappings(cwd)).includes(target)) return;
+  throw new CliError(
+    `readPath.import is '${spec}', but no tsconfig/jsconfig path mapping in this project resolves it to ` +
+      `${config.readPath.file} (extends not followed) — every rewritten file would import a path that ` +
+      `resolves nowhere. Declare the alias in the project file, or edit readPath.import in ${CONFIG_FILE}`,
+  );
+}
+
 /** A path with its module extension dropped — how two specifiers for one file compare. */
 export function normalizeNoExt(path: string): string {
   return path.replace(/\.(tsx?|jsx?|json)$/, '');

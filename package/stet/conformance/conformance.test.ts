@@ -7456,6 +7456,54 @@ describe('adoption', () => {
     expect(host.stdout()).toContain('register: nothing to adopt');
   });
 
+  it("Requirement: pages scan declares routes by confirmation, never inference — an Astro page's title and description are seeded and bound (journey A14)", async () => {
+    const host = makeCliHost({
+      config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },
+    });
+    const pricing =
+      '<html><head><title>stet — pricing</title><meta name="description" content="Pay for the projects you run." /></head><body><h1>Plans</h1></body></html>\n';
+    const files: Record<string, string> = {
+      'content/descriptor.json': JSON.stringify({ version: 1, keys: {} }),
+      'content/defaults.json': JSON.stringify({ default: {} }),
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }),
+      'src/lib/content.ts': 'export const copyMap: Record<string, string> = {};\n',
+      'src/copy.ts': "import { copyMap } from '@/lib/content';\nexport const copy = copyMap;\n",
+      'src/layouts/Base.astro':
+        '---\nconst { title } = Astro.props;\n---\n<html><head><title>{title}</title><meta name="description" content="Shared words for every page" /></head><body><slot /></body></html>\n',
+      'src/pages/pricing.astro': pricing,
+      'src/pages/identities/index.astro':
+        '---\nimport { copy } from "../../copy";\nimport Base from "../../layouts/Base.astro";\n---\n<Base title="Brand options"><h1>{copy.eyebrow}</h1></Base>\n',
+    };
+    for (const [rel, text] of Object.entries(files)) {
+      mkdirSync(dirname(join(host.cwd, rel)), { recursive: true });
+      writeFileSync(join(host.cwd, rel), text);
+    }
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('  seo: seo_pricing_title, seo_pricing_desc — seeded from the page');
+    expect(host.file('src/pages/pricing.astro')).toBe(pricing);
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain(
+      '  description: src/pages/identities/index.astro writes it where stet cannot bind it (shown where stet cannot follow) — bind seo_identities_desc by hand',
+    );
+    const values = loadSnapshot(JSON.parse(host.file('content/defaults.json')))['default'] ?? {};
+    expect(values['seo_pricing_title']).toBe('stet — pricing');
+    expect(values['seo_pricing_desc']).toBe('Pay for the projects you run.');
+    expect(values['seo_identities_title']).toBe('Brand options');
+    expect(values['seo_identities_desc']).toBe('');
+    // A page that bound no `copy` gets the read path's import; one reading through a copy module adds none.
+    expect(host.file('src/pages/pricing.astro')).toBe(
+      "---\nimport { copy } from '@/lib/content';\n---\n" +
+        '<html><head><title>{copy(\'seo_pricing_title\')}</title><meta name="description" content={copy(\'seo_pricing_desc\')} /></head><body><h1>Plans</h1></body></html>\n',
+    );
+    expect(host.file('src/pages/identities/index.astro')).toContain('<Base title={copy.seo_identities_title}>');
+    // A second run proposes nothing and moves no page.
+    const pages = ['src/pages/pricing.astro', 'src/pages/identities/index.astro'].map((rel) => host.file(rel));
+    host.out.length = 0;
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain('pages scan: nothing to propose');
+    expect(['src/pages/pricing.astro', 'src/pages/identities/index.astro'].map((rel) => host.file(rel))).toEqual(pages);
+  });
+
   it('Requirement: register applies an edited naming plan', async () => {
     type Plan = { made: Record<string, string>; keys: Array<Record<string, unknown> & { proposed: string }> };
     const planOf = (host: { file(rel: string): string }): Plan => JSON.parse(host.file('naming.json')) as Plan;
