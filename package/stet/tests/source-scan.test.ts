@@ -911,6 +911,13 @@ describe('scanDialect — what the markup holds beside its text (D13)', () => {
     expect(scanDialect('a.vue', '<template><Hero heading="Words for everyone" /><input placeholder="Your email" /></template>', 'vue').map((f) => f.text)).toEqual(['Words for everyone', 'Your email']);
   });
 
+  it('reads the copy attributes of tags inside a content brace, and leaves an expression value (PD8)', () => {
+    expect(texts('{flag && <img alt="Brace alt words" src="/x.png">}')).toEqual(['Brace alt words']);
+    expect(texts('{[1, 2].map((i) => <a title="Brace title words">Brace link words</a>)}')).toEqual(['Brace title words', 'Brace link words']);
+    expect(texts('{flag && <img alt={flag ? "Dynamic alt words" : "Other alt words"} src="/x.png">}')).toEqual([]);
+    expect(texts('{flag && <img alt="" src="/x.png">}')).toEqual([]);
+  });
+
   it('finds the markup inside a content brace, and only its words (T13.4)', () => {
     expect(texts('{flags.changelog && <a class="i" href="/changelog">Changelog</a>}')).toEqual(['Changelog']);
     expect(texts('{groups.map((group) => (<p>{group.heading}</p>))}')).toEqual([]);
@@ -1127,6 +1134,14 @@ describe('scan gaps — fix round (D13)', () => {
     it('does not join under a pre, line by line', () => {
       expect(texts('<pre><code><span class="p">$</span> npx x init\n<span class="m">wrote a.json</span>\n<span class="m">wrote b.json</span></code></pre>')).toEqual(['npx x init', 'wrote a.json', 'wrote b.json']);
       expect(texts('<p>Run <code>npx x init</code> and answer</p>')).toEqual(['Run npx x init and answer']);
+    });
+
+    it('joins a sentence after an is:raw sample whose braces are code (F1)', () => {
+      const raw = '<div><pre is:raw><code><span class="add">+export default function Home() {const copy = useCopy();</span><span>{copy(\'home_page_headline\')}</span></code></pre></div>\n';
+      expect(texts(`${raw}<p>Keys are named by page and role. To give one a name of your own, <code>rename</code> moves it everywhere at once.</p>\n`).slice(-1)).toEqual([
+        'Keys are named by page and role. To give one a name of your own, rename moves it everywhere at once.',
+      ]);
+      expect(texts(`${raw}<ul><li><a href="/x">Quickstart</a> — install, first key</li></ul>\n`).slice(-1)).toEqual(['Quickstart — install, first key']);
     });
 
     describe('a number that decorates a line (PD1)', () => {

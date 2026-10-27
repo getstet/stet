@@ -52,11 +52,14 @@ import {
   FRONTMATTER,
   markupBraces,
   maskExpressions,
-  openTag,
+  markupTags,
+  openTagAttrs,
+  rawSpans,
   readAttrs,
   selfClosedRaw,
   VOID_ELEMENTS,
   type Dialect,
+  type MarkupTag,
   type Span as MarkupSpan,
 } from './markup.js';
 import { CliError } from './report.js';
@@ -173,8 +176,10 @@ function moduleNotFound(error: unknown, pkg: string): boolean {
  * rewrite engine may ever see. The three module shapes are record-only: a copy
  * module's literals are adopted into the descriptor and left where they are, and
  * `register`'s runtime guard enumerates on this to keep them out of `planRewrite`.
+ * `'astro'` is the Astro rewriter's (`astro-rewrite.ts`), edited by its own leaf
+ * and refused by `planRewrite` as a module shape is.
  */
-export type LiteralShape = 'jsx' | 'property' | 'template' | 'plain';
+export type LiteralShape = 'jsx' | 'property' | 'template' | 'plain' | 'astro';
 
 /** A located copy literal a re-scan could still surface (unkeyed). */
 export interface LocatedLiteral {
@@ -185,7 +190,7 @@ export interface LocatedLiteral {
   raw: string;
   /** The unquoted, entity-decoded copy — seeds the default and derives the key. jsx-text is also whitespace-collapsed; jsx-attr keeps its significant whitespace; send-arg is a plain string literal (no entities). */
   text: string;
-  context: 'jsx-text' | 'jsx-attr' | 'send-arg' | 'module';
+  context: 'jsx-text' | 'jsx-attr' | 'send-arg' | 'module' | 'astro-text' | 'astro-attr' | 'astro-data' | 'astro-rich';
   shape: LiteralShape;
   /**
    * The name a new key would take before the run numbers it: a JSX literal's
@@ -206,6 +211,10 @@ export interface LocatedLiteral {
   accessorImported: boolean;
   /** The offset to insert the accessor import at: max(directive-prologue end, last-import end), so it lands AFTER `'use client'`. */
   importInsertPos: number;
+  /** A head text the place alone does not name (an Astro feed link's `title`): it reuses no declared key and shares only with head texts. */
+  inHead?: true;
+  /** The placeholder tags a sentence key declares. */
+  tags?: number;
 }
 
 /** A copy string the scanner recognizes as i18n's — reported, never rewritten. */
@@ -283,7 +292,7 @@ export interface ScanResult {
 }
 
 /** The JSX attributes that carry copy — every other attribute is structural. */
-const COPY_ATTRS = new Set(['alt', 'title', 'placeholder', 'aria-label', 'label', 'caption', 'summary', 'content']);
+export const COPY_ATTRS = new Set(['alt', 'title', 'placeholder', 'aria-label', 'label', 'caption', 'summary', 'content']);
 
 /** Prop names that configure a component rather than carry its words. */
 export const STRUCTURAL_NAMES = new Set(['class', 'classname', 'style', 'id', 'key', 'ref', 'slot', 'href', 'src', 'srcset', 'sizes', 'to', 'as', 'name', 'type', 'variant', 'size', 'kind', 'tone', 'color', 'hue', 'flag', 'icon', 'lang', 'dir', 'role', 'rel', 'target', 'width', 'height', 'loading', 'decoding', 'media', 'method', 'action', 'for', 'form', 'value', 'url', 'path', 'slug', 'img', 'image']);
@@ -980,6 +989,15 @@ function jsxTextIgnored(ts: typeof import('typescript'), sf: TS.SourceFile, text
 export const MAX_SOURCE_BYTES = 5 * 1024 * 1024;
 
 /**
+ * A parsed file's syntax errors. `parseDiagnostics` is an internal `SourceFile`
+ * field, read through one typed reach (no `any`): every parse-error gate calls
+ * this, and a file with any is report-only, never rewritten.
+ */
+export function parseDiagnosticsOf(sf: TS.SourceFile): readonly TS.Diagnostic[] {
+  return (sf as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics ?? [];
+}
+
+/**
  * The parse kind by extension — a `.ts` mailer parsed as TSX mis-reads `<T>`.
  * Exported for `cli/email-extract.ts`, which parses the same host files for
  * their export shape and must not disagree with this walk about what they are.
@@ -1044,12 +1062,8 @@ export async function scanSource(
     claimed: [],
   };
 
-  // The parse-error gate. `parseDiagnostics` is an internal `SourceFile` field —
-  // read via a typed reach, no `any` — and any syntax error makes the file
-  // report-only: a file the compiler could not parse is never rewritten.
-  const diagnostics =
-    (sf as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics ?? [];
-  if (diagnostics.length > 0) return { ...empty, parseErrors: true };
+  // The parse-error gate: any syntax error makes the file report-only.
+  if (parseDiagnosticsOf(sf).length > 0) return { ...empty, parseErrors: true };
 
   // The directive prologue and the imports — a top-level pass. `hasUseClient`,
   // the import-insert offset, the stet-import drop spans and `accessorImported`
@@ -1654,9 +1668,7 @@ export async function scanModule(
 
   // The same parse-error gate `scanSource` uses: a file the compiler could not
   // read is reported and left alone.
-  const diagnostics =
-    (sf as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics ?? [];
-  if (diagnostics.length > 0) return { ...result, literals: [], parseErrors: true };
+  if (parseDiagnosticsOf(sf).length > 0) return { ...result, literals: [], parseErrors: true };
 
   // The directive prologue. `'use client'` is an instruction to the bundler, and
   // it sits in exactly the position an ordinary top-level string would.
@@ -1968,35 +1980,6 @@ function isCodeSpillover(text: string): boolean {
  */
 export const INLINE = new Set(['a', 'abbr', 'b', 'bdi', 'bdo', 'cite', 'code', 'data', 'del', 'dfn', 'em', 'i', 'ins', 'kbd', 'mark', 'q', 's', 'samp', 'small', 'span', 'strong', 'sub', 'sup', 'time', 'u', 'var']);
 
-/** One open or close tag read out of a dialect's markup. `name` is the source spelling. */
-interface MarkupTag {
-  start: number;
-  end: number;
-  name: string;
-  close: boolean;
-  selfClosing: boolean;
-}
-
-/**
- * Every tag of `markup`, each ended by `openTag` (a close tag by `closing`), so
- * a brace or a quote inside a tag never ends it early.
- */
-function markupTags(markup: string): MarkupTag[] {
-  const tags: MarkupTag[] = [];
-  for (let i = 0; i < markup.length; i++) {
-    if (markup[i] !== '<') continue;
-    const next = markup[i + 1] ?? '';
-    const close = next === '/' && /[A-Za-z]/.test(markup[i + 2] ?? '');
-    if (!close && !/[A-Za-z]/.test(next)) continue;
-    const open = close ? null : openTag(markup, i);
-    const end = open === null ? closing(markup, i, '>') : open.end;
-    const name = /^<\/?([A-Za-z][\w:.-]*)/.exec(markup.slice(i, end))?.[1] ?? '';
-    tags.push({ start: i, end, name, close, selfClosing: open?.selfClosing ?? false });
-    i = Math.max(i + 1, end) - 1;
-  }
-  return tags;
-}
-
 /**
  * The markup the tag passes read: the source with every `{…}` expression's
  * inside masked, so a quote inside `onclick={`…`}` opens nothing, and every
@@ -2004,7 +1987,12 @@ function markupTags(markup: string): MarkupTag[] {
  * too. Every offset stays put.
  */
 function markupOf(source: string, work: string, dialect: Dialect): string {
-  const masked = maskExpressions(selfClosedRaw(source), dialect);
+  // An `is:raw` element's braces are text Astro prints, never an expression: left
+  // in, one opens an expression that swallows the tags up to a distant `}` and
+  // the inline join loses its parent.
+  const raw = dialect === 'astro' ? rawSpans(source) : [];
+  const unbraced = raw.reduce((text, { start, end }) => text.slice(0, start) + text.slice(start, end).replace(/[{}]/g, ' ') + text.slice(end), source);
+  const masked = maskExpressions(selfClosedRaw(unbraced), dialect);
   let out = '';
   for (let i = 0; i < masked.length; i++) out += work[i] === '\0' ? '\0' : (masked[i] as string);
   return out;
@@ -2146,7 +2134,8 @@ function attributeFindings(file: string, source: string, markup: string, tags: M
 
 /**
  * The words between two tags inside an Astro content brace
- * (`{flags.changelog && <a href="/changelog">Changelog</a>}`), where the brace
+ * (`{flags.changelog && <a href="/changelog">Changelog</a>}`) and the copy
+ * attributes of the HTML tags in it, where the brace
  * is also one `dialectCode` reads (a raw element's braces are text). Text
  * before the first tag or after the last is code; a run holding braces,
  * `=>`, `&&`, `||` or `;`, or opening or closing with a parenthesis, is code too.
@@ -2160,6 +2149,15 @@ function braceFindings(file: string, source: string, work: string): DialectFindi
     const inside = work.slice(base, brace.end - 1);
     if (!/<[A-Za-z]/.test(inside)) continue;
     const tags = markupTags(inside);
+    // A copy attribute of an HTML element in the brace, as outside one; a value that is an expression is code.
+    for (const tag of tags) {
+      if (tag.close || componentName(tag.name)) continue;
+      for (const attr of openTagAttrs(inside, tag, base)) {
+        if (!attr.quoted || !COPY_ATTRS.has(attr.name)) continue;
+        const text = collapseWhitespace(decodeEntities(source.slice(attr.valueStart, attr.valueEnd)));
+        if (text !== '') found.push({ file, pos: attr.valueStart, text });
+      }
+    }
     for (let k = 0; k + 1 < tags.length; k++) {
       const from = (tags[k] as MarkupTag).end;
       const run = inside.slice(from, (tags[k + 1] as MarkupTag).start);
@@ -2314,15 +2312,15 @@ export function astroFindings(
   file: string,
   source: string,
 ): { markup: DialectFinding[]; data: DialectFinding[] | null } {
-  const markup = scanDialect(file, source, 'astro');
   const bom = source.charCodeAt(0) === 0xfeff ? 1 : 0;
+  // Read past a byte-order mark, as Astro builds such a page: its front matter is front matter.
+  const markup = scanDialect(file, source.slice(bom), 'astro').map((finding) => ({ ...finding, pos: finding.pos + bom }));
   const body = FRONTMATTER.exec(source.slice(bom));
   if (body === null) return { markup, data: [] };
   if (ts === null) return { markup, data: /\bconst\b/.test(body[0]) ? null : [] };
   const open = bom + body[0].indexOf('\n') + 1;
   const sf = ts.createSourceFile(file, source.slice(open, bom + body[0].lastIndexOf('\n')), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const diagnostics = (sf as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics ?? [];
-  if (diagnostics.length > 0) return { markup, data: [] };
+  if (parseDiagnosticsOf(sf).length > 0) return { markup, data: [] };
   const page = source.slice(bom);
   // A brace on a wiring attribute (`class={variants[v]}`) shows no data.
   const braces = markupBraces(page, 'astro')

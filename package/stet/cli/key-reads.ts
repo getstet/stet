@@ -34,7 +34,7 @@ import type * as TS from 'typescript';
 import { normalizeNoExt, pathAliasMappings, resolveSpecifier } from './config.js';
 import { lineIndex } from './html-host.js';
 import { dialectCode, openTag, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
-import { scriptKindFor } from './source-scan.js';
+import { parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 
 /**
  * A read of a key: `copy.get('<key>')`, `copy('<key>')` or `get('<key>')`, and
@@ -409,19 +409,40 @@ export function parsesAsExpression(ts: typeof import('typescript'), dialect: Dia
   return parsesAsOne(ts, inner) || (dialect === 'astro' && parsesAsOne(ts, asJsx(inner)));
 }
 
+/**
+ * An Astro brace's inside as one TSX expression — as written, or as JSX spells
+ * it — or null where neither parses as one. The root expression is
+ * `braceRoot`'s. `asJsx` changes lengths, so the tree is read for its shape and
+ * its names: no offset in it is a source offset, and no edit is placed from it.
+ */
+export function braceTree(ts: typeof import('typescript'), brace: string): TS.SourceFile | null {
+  const inner = brace.slice(1, -1).replace(/^\s*\.\.\./, '');
+  return parseOne(ts, inner, true) ?? parseOne(ts, asJsx(inner), true);
+}
+
+/** The expression a `braceTree` holds. */
+export function braceRoot(ts: typeof import('typescript'), tree: TS.SourceFile): TS.Expression {
+  const only = tree.statements[0] as TS.ExpressionStatement;
+  return (only.expression as TS.ParenthesizedExpression).expression;
+}
+
 /** Whether `inner` parses as one TypeScript expression; a lone comment counts, closed. */
 function parsesAsOne(ts: typeof import('typescript'), inner: string): boolean {
   if (inner.replace(/\/\*[\s\S]*?\*\//g, '').trim() === '') return !/\/\*(?![\s\S]*\*\/)/.test(inner);
-  const sf = ts.createSourceFile('brace.tsx', `(${inner}\n)`, ts.ScriptTarget.Latest, false, ts.ScriptKind.TSX);
-  const diagnostics = (sf as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics ?? [];
+  return parseOne(ts, inner, false) !== null;
+}
+
+/** `inner` parsed as one parenthesized TSX expression, or null where it is not one. */
+function parseOne(ts: typeof import('typescript'), inner: string, parents: boolean): TS.SourceFile | null {
+  const sf = ts.createSourceFile('brace.tsx', `(${inner}\n)`, ts.ScriptTarget.Latest, parents, ts.ScriptKind.TSX);
   const only = sf.statements[0];
-  return (
-    diagnostics.length === 0 &&
+  const one =
+    parseDiagnosticsOf(sf).length === 0 &&
     sf.statements.length === 1 &&
     only !== undefined &&
     ts.isExpressionStatement(only) &&
-    ts.isParenthesizedExpression(only.expression)
-  );
+    ts.isParenthesizedExpression(only.expression);
+  return one ? sf : null;
 }
 
 /**

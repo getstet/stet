@@ -46,8 +46,9 @@ export function planRewrite(
   // walk's findings and nothing else: the context ternary at the leaf is not
   // exhaustive, so a copy-module finding reaching it would write a JSX-brace
   // rewrite into a `.ts` file — no compile error, no failing type, the host's
-  // own source silently corrupted. `LocatedLiteral` carries all four shapes, so
-  // the type system cannot catch it and only a runtime check can. It throws
+  // own source silently corrupted, and an Astro finding has its own leaf.
+  // `LocatedLiteral` carries every shape, so the type system cannot catch it
+  // and only a runtime check can. It throws
   // rather than reporting: arriving here is a bug in stet, and a bug keeps its
   // stack. Ordered above the staleness guard so a wrong-shape literal is
   // refused as the wrong shape, never misreported as a stale span — which would
@@ -55,7 +56,9 @@ export function planRewrite(
   if (located.shape !== 'jsx') {
     throw new Error(
       `stet internal: a ${located.shape}-shaped finding in ${located.file} reached the rewrite path — ` +
-        'module findings are adopted as record and are never rewritten',
+        (located.shape === 'astro'
+          ? 'an Astro finding is rewritten by astroLeaf alone'
+          : 'module findings are adopted as record and are never rewritten'),
     );
   }
 

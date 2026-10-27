@@ -776,17 +776,7 @@ export function pageOfFile(
   pages: Record<string, PageDef> | undefined,
   options: { html?: boolean; declaredOnly?: boolean } = {},
 ): string | undefined {
-  let route: string | undefined;
-  for (const root of detectPagesRoots(cwd, options)) {
-    const prefix = root.root === '' ? '' : `${root.root}/`;
-    if (!file.startsWith(prefix)) continue;
-    const rel = file.slice(prefix.length);
-    const read = armRead(root.arm, rel);
-    if (read !== null && 'route' in read) {
-      route = read.route;
-      break;
-    }
-  }
+  const route = routeOfFile(cwd, file, options);
   if (route === undefined) return undefined;
   // Compared in `seo`'s normalized form, where `/` is the empty string.
   const at = normalizeRoute(route);
@@ -797,6 +787,17 @@ export function pageOfFile(
   // `declaredOnly` answers a declared page or nothing: the audit maps one document to one page.
   if (options.declaredOnly === true) return undefined;
   return route === '/' ? 'home' : (normalize(route) ?? undefined);
+}
+
+/** The static route the host's routing convention serves a file at, or `undefined` for a file that serves none. */
+export function routeOfFile(cwd: string, file: string, options: { html?: boolean } = {}): string | undefined {
+  for (const root of detectPagesRoots(cwd, options)) {
+    const prefix = root.root === '' ? '' : `${root.root}/`;
+    if (!file.startsWith(prefix)) continue;
+    const read = armRead(root.arm, file.slice(prefix.length));
+    if (read !== null && 'route' in read) return read.route;
+  }
+  return undefined;
 }
 
 /** A static-HTML document's page word, `page` where it serves no page: the name register and scan both read. */

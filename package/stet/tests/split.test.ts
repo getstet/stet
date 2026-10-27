@@ -12,6 +12,8 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
+import { loadConfig } from '../cli/config.js';
+import { proposedSplitName } from '../cli/split.js';
 import { cleanupCliHosts, makeCliHost, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
 
 afterAll(cleanupCliHosts);
@@ -194,5 +196,64 @@ describe('stet split — a JavaScript host', () => {
     expect(await host.run('split', 'home_hero_link_text', 'home_footer_link_text', '--at', 'app/page.tsx:44', '--write')).toBe(1);
     expect(host.stderr()).toContain('app/page.tsx:44 reads "home_hero_link_text" in a form stet cannot rewrite');
     expect(readFileSync(join(host.cwd, 'app/page.tsx'), 'utf8')).toBe(before);
+  });
+});
+
+describe('stet split — the reads the Astro rewriter wrote (R27, T14.19)', () => {
+  /** An Astro host whose pages read keys by property through `src/copy.ts`; two files hold one new text. */
+  function astro(): CliHost {
+    const host = makeCliHost({
+      config: {
+        project: 't',
+        router: 'astro',
+        managedSurfaces: ['src/**/*.astro'],
+        copyModules: ['src/copy.ts'],
+        readPath: { file: 'src/lib/content.ts', import: '@/lib/content' },
+      },
+    });
+    const files: Record<string, string> = {
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }),
+      'src/lib/content.ts': 'export const copyMap: Record<string, string> = {};\n',
+      'src/copy.ts': "import { copyMap } from '@/lib/content';\nexport const copy = copyMap;\n",
+      'src/components/Head.astro': '---\nconst { label } = Astro.props;\n---\n<span>{label}</span>\n',
+      'src/pages/index.astro':
+        '---\nimport { copy } from "../copy";\nimport Head from "../components/Head.astro";\n---\n<p>{copy.hero_headline}</p>\n<h3>Shared install words</h3>\n' +
+        '<button title="Copy the command">x</button>\n<Head label="Capability words" />\n',
+      'src/pages/docs.astro': '---\nimport { copy } from "../copy";\n---\n<p>{copy.hero_headline}</p>\n<h3>Shared install words</h3>\n',
+    };
+    for (const [rel, text] of Object.entries(files)) {
+      mkdirSync(dirname(join(host.cwd, rel)), { recursive: true });
+      writeFileSync(join(host.cwd, rel), text);
+    }
+    return host;
+  }
+
+  it("moves the follower's read alone, from the terminal, and names each rewritten place as register did", async () => {
+    const host = astro();
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const key = Object.entries(values(host)['default'] as Record<string, unknown>).find(([, v]) => v === 'Shared install words')?.[0] as string;
+    expect(host.file('src/pages/docs.astro')).toContain(`<h3>{copy.${key}}</h3>`);
+    expect(host.file('src/pages/index.astro')).toContain(`<h3>{copy.${key}}</h3>`);
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as Descriptor;
+    // The names register gave: by the element, by the attribute, by the prop.
+    const name = (at: string, line: number, k: string): Promise<string | null> => proposedSplitName(host.cwd, loadConfig(host.cwd), descriptor, k, { file: at, line });
+    // The home page leads a shared key (PD13).
+    expect(key).toBe('home_page_headline');
+    expect([await name('src/pages/docs.astro', 5, key), await name('src/pages/index.astro', 6, key)]).toEqual(['docs_page_headline', 'home_page_headline_2']);
+    const title = /title=\{copy\.(\w+)\}/.exec(host.file('src/pages/index.astro'))?.[1] as string;
+    const label = /label=\{copy\.(\w+)\}/.exec(host.file('src/pages/index.astro'))?.[1] as string;
+    expect([await name('src/pages/index.astro', 7, title), await name('src/pages/index.astro', 8, label)]).toEqual([`${title}_2`, `${label}_2`]);
+
+    clear(host);
+    expect(await host.run('split', key, 'home_install_headline', '--at', 'src/pages/index.astro:6', '--write')).toBe(0);
+    expect(host.file('src/pages/index.astro')).toContain('<h3>{copy.home_install_headline}</h3>');
+    expect(host.file('src/pages/docs.astro')).toContain(`<h3>{copy.${key}}</h3>`);
+    expect((values(host)['default'] as Record<string, unknown>)['home_install_headline']).toBe('Shared install words');
+
+    // rename --propose names a rewritten Astro read like a JSX one.
+    clear(host);
+    expect(await host.run('rename', '--propose', 'names.json')).toBe(0);
+    const plan = JSON.parse(host.file('names.json')) as { keys: Array<{ old: string; key: string; places: string[] }> };
+    expect(plan.keys.find((e) => e.old === 'home_install_headline')).toMatchObject({ key: 'home_page_headline', places: [expect.stringMatching(/^src\/pages\/index\.astro:6 /)] });
   });
 });

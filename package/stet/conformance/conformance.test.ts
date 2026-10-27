@@ -27,7 +27,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
@@ -6953,22 +6953,22 @@ describe('adoption', () => {
     expect(listed.filter((l) => /^src\/pages\/p\d\.tsx: could not be parsed/.test(l))).toHaveLength(4);
     expect(listed.join('\n')).not.toContain('run with --verbose to list them');
 
-    // A template-dialect file is named, never parsed and never counted among the refusals.
-    const astro = makeAdoptionHost();
-    expect(await astro.run('init', '--yes')).toBe(0);
-    const astroConfig = JSON.parse(astro.file('stet.config.json'));
-    astro.write('stet.config.json', JSON.stringify({ ...astroConfig, managedSurfaces: ['src/pages/**/*.astro'] }, null, 2));
-    astro.write('src/pages/index.astro', '---\nconst t = 1;\n---\n<h1>Chapter one</h1>\n');
-    const beforeDialect = astro.out.length;
-    expect(await astro.run('register', '--from', 'scan')).toBe(0);
-    const one = astro.out.slice(beforeDialect);
-    expect(one).toContain("src/pages/index.astro: .astro is not rewritten — place copy('<key>') by hand");
+    // A `.vue`, `.svelte` or `.mdx` file is named, never parsed and never counted among the refusals.
+    const dialect = makeAdoptionHost();
+    expect(await dialect.run('init', '--yes')).toBe(0);
+    const dialectConfig = JSON.parse(dialect.file('stet.config.json'));
+    dialect.write('stet.config.json', JSON.stringify({ ...dialectConfig, managedSurfaces: ['src/pages/**/*.vue'] }, null, 2));
+    dialect.write('src/pages/index.vue', '<template>\n  <h1>Chapter one</h1>\n</template>\n');
+    const beforeDialect = dialect.out.length;
+    expect(await dialect.run('register', '--from', 'scan')).toBe(0);
+    const one = dialect.out.slice(beforeDialect);
+    expect(one).toContain("src/pages/index.vue: .vue is not rewritten — place copy('<key>') by hand");
     expect(one.join('\n')).not.toContain('could not be parsed');
-    for (let i = 1; i < 5; i++) astro.write(`src/pages/p${i}.astro`, '<h1>Another chapter</h1>\n');
-    const beforeFive = astro.out.length;
-    expect(await astro.run('register', '--from', 'scan')).toBe(0);
-    expect(astro.out.slice(beforeFive)).toContain(
-      "5 files are not rewritten (.astro) — place copy('<key>') by hand; run with --verbose to list them",
+    for (let i = 1; i < 5; i++) dialect.write(`src/pages/p${i}.vue`, '<template><h1>Another chapter</h1></template>\n');
+    const beforeFive = dialect.out.length;
+    expect(await dialect.run('register', '--from', 'scan')).toBe(0);
+    expect(dialect.out.slice(beforeFive)).toContain(
+      "5 files are not rewritten (.vue) — place copy('<key>') by hand; run with --verbose to list them",
     );
 
     // On the static-HTML host the ONE edit is the mark, and the plain run writes
@@ -7409,6 +7409,51 @@ describe('adoption', () => {
     existing.out.length = 0;
     expect(await existing.run('register', '--from', 'scan', '--write')).toBe(0);
     expect(existing.stdout()).toContain('register: nothing to adopt');
+  });
+
+  it("Requirement: register adds a key and rewrites the consuming leaf — an Astro page's copy becomes key reads (journey A14)", async () => {
+    const host = makeCliHost({
+      config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },
+    });
+    const files: Record<string, string> = {
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }),
+      'src/lib/content.ts': 'export const copyMap: Record<string, string> = {};\n',
+      'src/copy.ts': "import { copyMap } from '@/lib/content';\nexport const copy = copyMap;\n",
+      'src/components/SectionHead.astro': '---\nconst { label } = Astro.props;\n---\n<span>{label}</span>\n',
+      'src/pages/index.astro': [
+        '---',
+        'import { copy } from "../copy";',
+        'import SectionHead from "../components/SectionHead.astro";',
+        'const surfaces = [{ label: "Site copy" }];',
+        '---',
+        '<html><head><title>Pricing</title></head><body>',
+        '<p>{copy.hero_headline}</p>',
+        '<h3>Fixing a word</h3>',
+        '<button title="Copy">x</button>',
+        '<SectionHead label="Capabilities" />',
+        '{surfaces.map((s) => <h3>{s.label}</h3>)}',
+        '<code>t("hero_headline")</code>',
+        '</body></html>',
+        '',
+      ].join('\n'),
+    };
+    for (const [rel, text] of Object.entries(files)) {
+      mkdirSync(dirname(join(host.cwd, rel)), { recursive: true });
+      writeFileSync(join(host.cwd, rel), text);
+    }
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const page = host.file('src/pages/index.astro');
+    expect(page).toMatch(/<h3>\{copy\.\w+\}<\/h3>/);
+    expect(page).toMatch(/<button title=\{copy\.\w+\}>x<\/button>/);
+    expect(page).toMatch(/<SectionHead label=\{copy\.\w+\} \/>/);
+    expect(page).toMatch(/const surfaces = \[\{ label: copy\.\w+ \}\];/);
+    expect(page).toContain('<code>t("hero_headline")</code>');
+    expect(page).toContain('<title>Pricing</title>');
+    expect(host.out).toContain('src/pages/index.astro:12 "t(\\"hero_headline\\")" not rewritten (inside <code>) — adopt by hand');
+    expect(host.out).toContain('src/pages/index.astro:6 "Pricing" not rewritten (SEO text — adopt it with stet pages scan) — adopt by hand');
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.stdout()).toContain('register: nothing to adopt');
   });
 
   it('Requirement: register applies an edited naming plan', async () => {

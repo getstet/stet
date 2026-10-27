@@ -40,7 +40,7 @@ import { filesForGlobs } from './files.js';
 import { gitData, gitFiles } from './git.js';
 import { lineIndex } from './html-host.js';
 import { codeOf, within, type Span } from './key-reads.js';
-import { dialectOf, loadTypescript, MAX_SOURCE_BYTES, packageNames, scriptKindFor } from './source-scan.js';
+import { dialectOf, loadTypescript, MAX_SOURCE_BYTES, packageNames, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 import { insideCheckout } from './static-files.js';
 import type { Descriptor } from '../src/types.js';
 
@@ -831,7 +831,7 @@ function readFacts(ts: typeof import('typescript'), rel: string, source: string,
     for (const span of code.code) {
       if (regionStarts.has(span.start)) continue;
       const sf = source[span.start] === '{' ? trees.get(span.start + 1) : undefined;
-      const clean = sf !== undefined && ((sf as TS.SourceFile & { parseDiagnostics?: unknown[] }).parseDiagnostics ?? []).length === 0;
+      const clean = sf !== undefined && parseDiagnosticsOf(sf).length === 0;
       if (clean) markup.push({ sf, base: span.start + 1 });
       else scanned.push(span);
     }

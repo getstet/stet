@@ -580,7 +580,7 @@ function readBack(value: string): string {
 }
 
 /** A raw slice as text: blanked spans removed, runs collapsed, entities decoded. */
-function textOf(raw: string): string {
+export function textOf(raw: string): string {
   return decodeEntities(collapseAscii(raw.replace(/\0/g, '')));
 }
 
@@ -1009,7 +1009,7 @@ function* sectionChain(el: Element | undefined, parents: Map<Element, Element>):
 }
 
 /** What the naming rule gives an element: its section word, the repeated item it sits in, its role and the section's element. */
-interface Naming {
+export interface Naming {
   sectionWord: string | null;
   item?: string;
   role: string;
@@ -1021,7 +1021,7 @@ interface Naming {
  * mark's for `rename --propose`. Inside a repeated item the section is the one
  * above the outermost item; outside one, a heading takes P4's role.
  */
-function namingOf(el: Element, parents: Map<Element, Element>, items: (at: Element) => ItemNode, place: Place): Naming {
+export function namingOf(el: Element, parents: Map<Element, Element>, items: (at: Element) => ItemNode, place: Place): Naming {
   const up: Element[] = [];
   for (let at: Element | undefined = el; at !== undefined; at = parents.get(at)) up.push(at);
   const role = roleOf(place);
@@ -1038,7 +1038,7 @@ function namingOf(el: Element, parents: Map<Element, Element>, items: (at: Eleme
 }
 
 /** The item rule's reads over one document, over key-names' `itemReader`: a text is a key element or a copy attribute. */
-function htmlItems(parents: Map<Element, Element>, texts: ReadonlySet<Element>): (at: Element) => ItemNode {
+export function htmlItems(parents: Map<Element, Element>, texts: ReadonlySet<Element>): (at: Element) => ItemNode {
   return itemReader<Element>({
     parentOf: (n) => parents.get(n),
     childrenOf: (n) => n.children,

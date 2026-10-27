@@ -38,6 +38,7 @@ import type { Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
 import { ENV_OPTION, flag, parse, text as argText } from './args.js';
+import { astroReads } from './astro-rewrite.js';
 import {
   asUpdate,
   planJson,
@@ -333,8 +334,19 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
     }
   } else {
     for (const rel of filesForGlobs(io.cwd, config.managedSurfaces)) {
-      if (dialectOf(rel) !== null) continue;
       const page = pageOfFile(io.cwd, rel, descriptor.pages);
+      if (dialectOf(rel) === 'astro') {
+        // An Astro file's reads are named by the rewriter that writes them.
+        const source = readFileSync(join(io.cwd, rel), 'utf8');
+        for (const read of astroReads(await loadTypescript(), io.cwd, config, rel, source, page)) {
+          if (!eligible(read.key)) continue;
+          const had = placed.get(read.key);
+          if (had !== undefined) had.places.push(read.place);
+          else placed.set(read.key, { base: read.base, section: read.section, places: [read.place] });
+        }
+        continue;
+      }
+      if (dialectOf(rel) !== null) continue;
       const result = await scanSource(rel, readFileSync(join(io.cwd, rel), 'utf8'), {
         readPathImport: config.readPath.import,
         ...(page === undefined ? {} : { page }),

@@ -13,18 +13,20 @@ import { basename, join } from 'node:path';
 import { keyDefOf, pageKeyReferences } from '../src/descriptor.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, EMAIL_TARGET, type Descriptor, type Target } from '../src/types.js';
+import { astroEdits, componentCache, planAstroFile, readableAs, rereadsClean, type AstroPlan } from './astro-rewrite.js';
 import type { StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { heldTextOf } from './html-host.js';
 import { isHeadKind, numberNames } from './key-names.js';
-import { pageOfFile } from './pages.js';
+import { pageOfFile, routeOfFile } from './pages.js';
 import { planMount, type MountPlan } from './provider-mount.js';
 import { lineCol, type Report } from './report.js';
-import { planRewrite } from './rewrite.js';
+import { applyFileEdits, planRewrite } from './rewrite.js';
 import {
   componentName,
   dialectOf,
   isJsxFile,
+  loadTypescript,
   matchGlob,
   nonCopyProp,
   scanModule,
@@ -123,23 +125,27 @@ export function sharedTextIndex(descriptor: Descriptor, snapshot: Snapshot): Map
 export interface JsxRun {
   /** The files pass one parsed, by path — scan's loop reads these instead of parsing again. */
   parsed: Map<string, ScanResult | null>;
-  /** The files it adopts from, with their literals, as register's pass two reads them. */
-  adoptable: Array<{ file: string; source: string; literals: LocatedLiteral[]; target: Target; kind: 'server' | 'client' }>;
+  /** The files it adopts from, with their literals, as register's pass two reads them; an `.astro` file carries its plan. */
+  adoptable: Array<{ file: string; source: string; literals: LocatedLiteral[]; target: Target; kind: 'server' | 'client'; astro?: AstroPlan }>;
   /** The name each adoptable literal takes, numbered or reused (D2). */
   nameOf: Map<LocatedLiteral, string>;
   /** Literals that reuse a declared key (D2); their name is in `nameOf`. */
   reused: Set<LocatedLiteral>;
   /**
-   * Each literal whose text an earlier literal of the run carries — the same
-   * target, both visible text or both head texts — and that earlier literal:
-   * one key, the leader's. A leader may be one the run refused, which leaves
+   * Each literal whose text a leading literal of the run carries — the same
+   * target, both visible text or both head texts — and that leading literal
+   * (`leadingOrder`): one key, the leader's. A leader may be one the run refused, which leaves
    * its followers unadopted with it; a follower's name, where its leader has
    * one, is the leader's in `nameOf`.
    */
   sharedWith: Map<LocatedLiteral, LocatedLiteral>;
   refusals: string[];
-  /** Template-dialect files in the managed surfaces: read by scan's dialect walk, never parsed or rewritten here. */
+  /** Template-dialect files in the managed surfaces other than `.astro`: read by scan's dialect walk, never parsed or rewritten here. */
   dialectFiles: string[];
+  /** The `.astro` findings this pass does not rewrite, each with its reason, in run order. */
+  astroSkips: Array<{ file: string; line: number; text: string; reason: string }>;
+  /** Each `application/ld+json` script of an `.astro` file: listed, never rewritten. */
+  structured: Array<{ file: string; line: number }>;
   /** Display strings in the module-scope data of JSX files: reported, never rewritten. */
   dataFindings: Array<{ file: string; line: number; text: string }>;
   /** The copy-module walk's results and property names, which the naming reserves. */
@@ -173,6 +179,10 @@ export async function planJsxRun(input: {
   const refusals: string[] = [];
   const dialectFiles: string[] = [];
   const dataFindings: JsxRun['dataFindings'] = [];
+  const astroSkips: JsxRun['astroSkips'] = [];
+  const structured: JsxRun['structured'] = [];
+  const components = componentCache();
+  let ts: typeof import('typescript') | undefined;
 
   // The text each declared web `text` key holds, as the descriptor stood before
   // the run: a literal whose text a key already holds reads that key rather
@@ -181,6 +191,10 @@ export async function planJsxRun(input: {
   // email literal never reads one.
   const index = sharedTextIndex(descriptor, snapshot);
   const reuseOf = new Map<LocatedLiteral, string>();
+  // The declared key a literal reads in place of a new one: web text only, and
+  // never for a head text, which a visible key's edit must not retitle (R32).
+  const reuseFor = (literal: LocatedLiteral, target: Target): string | undefined =>
+    target === DEFAULT_TARGET && !isHeadLiteral(literal) ? index.get(literal.text)?.[0] : undefined;
 
   // Pass one: every surface parsed and classified before any literal is named,
   // so a role that repeats across the run is numbered across it. Every literal
@@ -189,6 +203,61 @@ export async function planJsxRun(input: {
   const located: Array<{ literal: LocatedLiteral; target: Target }> = [];
   let mount: 'mounted' | MountPlan | null | undefined;
   for (const file of filesForGlobs(cwd, config.managedSurfaces)) {
+    if (dialectOf(file) === 'astro') {
+      // An Astro file is read by its own rewriter: what it proves safe joins the run, the rest is listed.
+      parsed.set(file, null);
+      ts ??= await loadTypescript();
+      const source = readFileSync(join(cwd, file), 'utf8');
+      const page = pageOfFile(cwd, file, descriptor.pages);
+      const { literals: found, plan } = planAstroFile({ ts, cwd, config, file, source, page, cache: components });
+      const listed = (literal: { pos: number; text: string }, reason: string): void => {
+        astroSkips.push({ file, line: lineCol(source, literal.pos).line, text: literal.text, reason });
+      };
+      for (const skip of plan.skips) listed(skip, skip.reason);
+      for (const pos of plan.structured) structured.push({ file, line: lineCol(source, pos).line });
+      const target = targetFor(file, config);
+      // A key that is no identifier cannot be read as `copy.<key>`: that literal alone is listed.
+      const candidates = found.filter((literal) => {
+        const key = reuseFor(literal, target) ?? literal.proposedKey;
+        if (readableAs(key, plan.form)) return true;
+        listed(literal, `${key} cannot be read as copy.${key}`);
+        return false;
+      });
+      for (const literal of candidates) located.push({ literal, target });
+      const literals = candidates.filter((literal) => {
+        if (reuseFor(literal, target) !== undefined) return true;
+        return validateUnnamed({
+          descriptor,
+          snapshot,
+          placeholder: '\u0001',
+          def: { shape: 'text', target },
+          stored: literal.text,
+          value: literal.text,
+          report,
+          name: literal.proposedKey,
+          keep: false,
+        });
+      });
+      if (literals.length === 0) continue;
+      // The whole file read back with the names this pass gives; any doubt keeps every byte.
+      const { edits, reads } = astroEdits(source, plan, literals.map((literal) => ({ literal, key: reuseFor(literal, target) ?? literal.proposedKey })));
+      let clean: boolean;
+      try {
+        clean = rereadsClean(ts, file, source, applyFileEdits(source, edits), reads, 0);
+      } catch {
+        clean = false;
+      }
+      if (!clean) {
+        for (const literal of literals) listed(literal, 'the rewrite did not read back cleanly');
+        continue;
+      }
+      for (const literal of literals) {
+        const reuse = reuseFor(literal, target);
+        if (reuse !== undefined) reuseOf.set(literal, reuse);
+      }
+      adoptable.push({ file, source, literals, target, kind: 'server', astro: plan });
+      continue;
+    }
     if (dialectOf(file) !== null) {
       // A template dialect is read by scan's dialect walk and never rewritten: its copy is placed by hand.
       dialectFiles.push(file);
@@ -243,7 +312,7 @@ export async function planJsxRun(input: {
     // A literal a declared key already holds skips the gate — its value is
     // declared — and only its rewrite is proven.
     const literals = candidates.filter((literal) => {
-      const reuse = target === DEFAULT_TARGET ? index.get(literal.text)?.[0] : undefined;
+      const reuse = reuseFor(literal, target);
       if (reuse === undefined) {
         const passed = validateUnnamed({
           descriptor,
@@ -283,15 +352,19 @@ export async function planJsxRun(input: {
     }
   }
 
-  // Identical text within the run is one key (stage-0 finding 14): the first
-  // literal carrying it, in run order, is named, and each later one reads that
-  // key. A head text never shares with visible text, and a literal a declared
+  // Identical text within the run is one key (stage-0 finding 14): the leading
+  // literal carrying it is named, and each other one reads that key. A head text never shares with visible text, and a literal a declared
   // key already holds reads that key instead.
   const sharedWith = new Map<LocatedLiteral, LocatedLiteral>();
   const first = new Map<string, LocatedLiteral>();
-  for (const { literal, target } of located) {
-    if (reuseOf.has(literal) || (target === DEFAULT_TARGET && index.has(literal.text))) continue;
-    const head = literal.place !== undefined && isHeadKind(literal.place);
+  // The leader names the key: the one on the home page first, then on the
+  // shallowest route, then in a file serving none; the file path breaks a tie,
+  // and run order the rest.
+  const byLeading = leadingOrder(cwd);
+  const leading = [...located].sort((a, b) => byLeading(a.literal.file, b.literal.file));
+  for (const { literal, target } of leading) {
+    if (reuseOf.has(literal) || reuseFor(literal, target) !== undefined) continue;
+    const head = isHeadLiteral(literal);
     const slot = `${target}\u0000${head ? 'head' : 'body'}\u0000${literal.text}`;
     const leader = first.get(slot);
     if (leader === undefined) first.set(slot, literal);
@@ -320,12 +393,40 @@ export async function planJsxRun(input: {
     sharedWith,
     refusals,
     dialectFiles,
+    astroSkips,
+    structured,
     dataFindings,
     modules,
     propertyNames,
     ...(typeof mount === 'object' && mount !== null ? { mount } : {}),
     ...(mount === null ? { mountUnlocated: true as const } : {}),
   };
+}
+
+/**
+ * The order a shared key's leader is chosen in, over two files: the home page
+ * first, then the shallowest route, then a file that serves none, the file path
+ * breaking a tie. `register` meets files in this order, so a leader's key has
+ * landed when its followers are met.
+ */
+export function leadingOrder(cwd: string): (a: string, b: string) => number {
+  const ranks = new Map<string, number>();
+  const rankOf = (file: string): number => {
+    let rank = ranks.get(file);
+    if (rank === undefined) {
+      const route = routeOfFile(cwd, file);
+      // The depth is a count of segments, far below the tier's weight.
+      rank = route === undefined ? 2e6 : route === '/' ? 0 : 1e6 + route.split('/').filter(Boolean).length;
+      ranks.set(file, rank);
+    }
+    return rank;
+  };
+  return (a, b) => rankOf(a) - rankOf(b) || (a < b ? -1 : a > b ? 1 : 0);
+}
+
+/** Whether a literal is a head text: its place names one, or the Astro rewriter found it in `<head>`. */
+export function isHeadLiteral(literal: LocatedLiteral): boolean {
+  return (literal.place !== undefined && isHeadKind(literal.place)) || literal.inHead === true;
 }
 
 /** The accessor kind, or null when an un-directived App-Router component is ambiguous. */

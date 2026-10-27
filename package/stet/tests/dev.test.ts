@@ -14787,4 +14787,56 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     const body = await routeRendersOf(handler, host);
     expect([body.complete, body.renders]).toEqual([true, { pricing_price: [[{ tag: 'h3', classes: [] }, { tag: 'main', classes: null }]] }]);
   });
+  /**
+   * The Astro host register rewrites (D14): pages read keys by property through
+   * the declared copy module `src/copy.ts`, and `hero_install` holds the
+   * terminal's words.
+   */
+  function rewritable(page: string): CliHost {
+    const host = astroHost(['index.astro']);
+    write(
+      host.cwd,
+      'stet.config.json',
+      JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'], readPath: { file: 'lib/content.ts', import: '@/lib/content' } }, null, 2),
+    );
+    write(host.cwd, 'src/copy.ts', 'export const copy: Record<string, string> = {};\n');
+    write(host.cwd, 'src/pages/index.astro', page);
+    const descriptor = loadDescriptor(JSON.parse(readFileSync(join(host.cwd, 'content/descriptor.json'), 'utf8')));
+    descriptor.keys['hero_install'] = { shape: 'text', target: 'web' };
+    writeJsonDeterministic(join(host.cwd, 'content/descriptor.json'), descriptor);
+    const snapshot = loadSnapshot(JSON.parse(readFileSync(join(host.cwd, 'content/defaults.json'), 'utf8')));
+    (snapshot['default'] as Record<string, unknown>)['hero_install'] = 'npx x init';
+    writeJsonDeterministic(join(host.cwd, 'content/defaults.json'), snapshot);
+    return host;
+  }
+  const TERMINAL =
+    '---\nimport { copy } from "../copy";\n---\n<main>\n<div class="term"><span class="w">npx x init</span></div>\n<div class="box"><span class="install">{copy.hero_install}</span></div>\n</main>\n';
+
+  it('T14.16: the route reads place a text register rewrote: both its sites render the key, and nothing is coincident', async () => {
+    const host = rewritable(TERMINAL);
+    const { handler } = handlerOver([host.cwd]);
+    const before = await routeRendersOf(handler, host);
+    expect([before.coincident, before.renders.hero_install]).toEqual([['hero_install'], [[{ tag: 'span', classes: ['install'] }, { tag: 'div', classes: null }]]]);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.file('src/pages/index.astro')).toContain('<span class="w">{copy.hero_install}</span>');
+    const after = await routeRendersOf(handler, host);
+    expect([after.coincident, after.renders.hero_install]).toEqual([
+      [],
+      [
+        [{ tag: 'span', classes: ['w'] }, { tag: 'div', classes: null }],
+        [{ tag: 'span', classes: ['install'] }, { tag: 'div', classes: null }],
+      ],
+    ]);
+  });
+
+  it('T14.19: site/split proposes a name for an Astro place and, given it, moves that read alone', async () => {
+    const host = rewritable(TERMINAL);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const { handler } = handlerOver([host.cwd]);
+    const asked = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_install', at: 'src/pages/index.astro:5' });
+    expect([asked.status, asked.body]).toEqual([200, { proposed: 'home_page_span' }]);
+    const split = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_install', at: 'src/pages/index.astro:5', name: 'home_page_span' });
+    expect([split.status, split.body['key']]).toEqual([200, 'home_page_span']);
+    expect(host.file('src/pages/index.astro')).toContain('<span class="w">{copy.home_page_span}</span></div>\n<div class="box"><span class="install">{copy.hero_install}</span>');
+  });
 });

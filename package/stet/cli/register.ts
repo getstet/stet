@@ -21,6 +21,7 @@ import { headLimitsFor } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { parse, flag, text as argText, noPositionals } from './args.js';
+import { astroEdits, readableAs, rereadsClean } from './astro-rewrite.js';
 import {
   asUpdate,
   planJson,
@@ -56,11 +57,11 @@ import {
 } from './key-plan.js';
 import { htmlPageOf } from './pages.js';
 import type { CliIo } from './main.js';
-import { clip, collapseLines, plural, CliError, HostTextReport, Report, UsageError } from './report.js';
+import { clip, collapseLines, lineCol, plural, CliError, HostTextReport, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff, planRewrite, type Edit } from './rewrite.js';
 import { printProviderSnippet } from './provider-mount.js';
-import { classifyAdoption, planJsxRun, targetFor } from './register-run.js';
-import type { LocatedLiteral } from './source-scan.js';
+import { classifyAdoption, leadingOrder, planJsxRun, targetFor } from './register-run.js';
+import { loadTypescript, type LocatedLiteral } from './source-scan.js';
 import { validateValue } from './validate.js';
 
 export async function runRegister(args: string[], io: CliIo): Promise<number> {
@@ -134,7 +135,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report,
     ...(forcedKind === undefined ? {} : { forcedKind }),
   });
-  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, dataFindings, modules, propertyNames, mount } = jsxRun;
+  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, astroSkips, structured, dataFindings, modules, propertyNames, mount } = jsxRun;
   // The fallback warns named the layout; the snippet names the edit, once.
   if (jsxRun.mountUnlocated && config.rootLayout !== undefined && config.router !== 'astro') {
     report.line(`${config.rootLayout}: could not locate the wrap point unambiguously — mount the CopyProvider by hand:`);
@@ -171,32 +172,56 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   // Only a run that applies writes anything: without it, every host writes nothing.
   const applying = write && !planOnly;
 
-  // Pass two: each file's literals keyed and rewritten. A leader comes before
-  // its followers in run order, so the key it lands under is known when they
-  // are met; a leader that did not land leaves its followers unrewritten. Every
-  // file's edits are built before any diff prints: the mount joins the layout's
-  // list only where a client rewrite landed.
+  // Pass two: each file's literals keyed and rewritten. Files are met in the
+  // order a shared key's leader is chosen in, so the key a leader lands under
+  // is known when its followers are met; a leader that did not land leaves its
+  // followers unrewritten. Every file's edits are built before any diff prints
+  // (the mount joins the layout's list only where a client rewrite landed), and
+  // the entries return to run order.
   const landed = new Map<LocatedLiteral, string>();
-  const entries: Array<{ file: string; source: string; edits: Edit[]; lines: string[] }> = [];
+  const built: Array<{ index: number; entry: { file: string; source: string; edits: Edit[]; lines: string[] }; skipped: string[] }> = [];
+  const byLeading = leadingOrder(io.cwd);
+  const met = adoptable.map((item, index) => ({ item, index })).sort((a, b) => byLeading(a.item.file, b.item.file) || a.index - b.index);
+  // The texts pass two leaves as written, each with its reason, after pass one's.
+  const notRewritten = astroSkips.map((s) => notRewrittenLine(s.file, s.line, s.text, s.reason));
   let clientEdited = 0;
   let serverEdited = 0;
-  for (const { file, source, literals, target, kind } of adoptable) {
+  for (const {
+    item: { file, source, literals, target, kind, astro },
+    index,
+  } of met) {
     const edits: Edit[] = [];
     const lines: string[] = [];
+    const skipped: string[] = [];
+    // An Astro file's literals land together: their edits and the read-back are the file's.
+    const astroLanded: Array<{ literal: LocatedLiteral; key: string }> = [];
+    const leaf = (literal: LocatedLiteral, key: string): void => {
+      if (astro === undefined) edits.push(...planRewrite(source, literal, key, kind, config.readPath.import).edits);
+      else astroLanded.push({ literal, key });
+    };
+    const unreadable = (literal: LocatedLiteral, key: string): boolean => {
+      if (astro === undefined || readableAs(key, astro.form)) return false;
+      skipped.push(notRewrittenLine(file, lineCol(source, literal.pos).line, literal.text, `${key} cannot be read as copy.${key}`));
+      return true;
+    };
     for (const literal of literals) {
       const proposed = nameOf.get(literal) as string;
       const leader = sharedWith.get(literal);
       if (leader !== undefined) {
         const key = landed.get(leader);
-        if (key === undefined) continue;
-        edits.push(...planRewrite(source, literal, key, kind, config.readPath.import).edits);
+        if (key === undefined) {
+          skipped.push(notRewrittenLine(file, lineCol(source, literal.pos).line, literal.text, 'the text it shares was not rewritten'));
+          continue;
+        }
+        if (unreadable(literal, key)) continue;
+        leaf(literal, key);
         shared += 1;
         lines.push(`${file}: shares ${key} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
         continue;
       }
       if (reusedLiterals.has(literal)) {
         // No entry, no value: the key already holds this text.
-        edits.push(...planRewrite(source, literal, proposed, kind, config.readPath.import).edits);
+        leaf(literal, proposed);
         reused += 1;
         lines.push(`${file}: reuses ${proposed} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
         continue;
@@ -204,6 +229,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       const choice = chosen?.(proposed);
       if (choice?.adopt === false) continue;
       const key = choice?.key ?? proposed;
+      if (unreadable(literal, key)) continue;
       const section = (choice?.section === undefined ? literal.sectionWord : choice.section) ?? undefined;
       // A head text carries its SEO bound as an advisory limit.
       const limits = literal.place !== undefined && isHeadKind(literal.place) ? headLimitsFor([roleOf(literal.place)]) : undefined;
@@ -218,16 +244,27 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       };
       (snapshot['default'] ??= {})[key] = literal.text;
       // Pass one gated the text and proved the rewrite; neither reads the name.
-      const planned = planRewrite(source, literal, key, kind, config.readPath.import);
-      edits.push(...planned.edits);
+      leaf(literal, key);
       added += 1;
       landed.set(literal, key);
     }
+    if (astro !== undefined) {
+      const planned = astroEdits(source, astro, astroLanded);
+      edits.push(...planned.edits);
+      // Pass one read the file back with its own names; a failure with the final ones is stet's.
+      if (planned.edits.length > 0 && !rereadsClean(await loadTypescript(), file, source, applyFileEdits(source, planned.edits), planned.reads, 0)) {
+        throw new CliError(`stet internal: ${file} did not read back cleanly after register planned it — nothing written`);
+      }
+    }
 
     if (edits.length > 0 && kind === 'client') clientEdited += 1;
-    if (edits.length > 0 && kind === 'server') serverEdited += 1;
-    entries.push({ file, source, edits, lines });
+    // Only a file that imports the read path needs the specifier to resolve.
+    if (edits.length > 0 && kind === 'server' && (astro === undefined || astro.insert !== null)) serverEdited += 1;
+    built.push({ index, entry: { file, source, edits, lines }, skipped });
   }
+  built.sort((a, b) => a.index - b.index);
+  const entries = built.map((b) => b.entry);
+  notRewritten.push(...built.flatMap((b) => b.skipped));
   // The mount, where a client rewrite landed: into the layout's own list where
   // the run rewrites the layout too, else a list of its own in file order.
   if (mount !== undefined && clientEdited > 0) {
@@ -317,6 +354,14 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   )) {
     report.line(line);
   }
+  for (const line of collapseLines(
+    notRewritten,
+    `${notRewritten.length} texts not rewritten — adopt by hand; run with --verbose to list them`,
+    verbose,
+  )) {
+    report.line(line);
+  }
+  for (const { file, line } of structured) report.line(`${file}:${line}: structured data — edit it in the file`);
   for (const line of collapseLines(
     dataFindings.map((f) => `${f.file}:${f.line}: ${JSON.stringify(clip(f.text, ADOPTED_EXCERPT))} sits in data — place copy('<key>') by hand`),
     `${dataFindings.length} strings in data (arrays and objects) are not rewritten — place copy('<key>') by hand; run with --verbose to list them`,
@@ -415,6 +460,11 @@ function pendingLine(run: { planOnly: boolean; added: number; printedDiffs: numb
 
 /** Enough of an adopted default to recognize it on the line that reports it. */
 const ADOPTED_EXCERPT = 60;
+
+/** A text register leaves as written, with the rule that left it. */
+function notRewrittenLine(file: string, line: number, text: string, reason: string): string {
+  return `${file}:${line} ${JSON.stringify(clip(text, ADOPTED_EXCERPT))} not rewritten (${reason}) — adopt by hand`;
+}
 
 /**
  * `register` on the static-HTML host: every located proposal becomes a key and

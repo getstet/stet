@@ -36,12 +36,15 @@ vi.mock('../cli/artifacts.js', async (importOriginal) => {
   };
 });
 
+import { astroReads } from '../cli/astro-rewrite.js';
+import { loadConfig } from '../cli/config.js';
 import { runRegister } from '../cli/register.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { planDocuments, planHtmlRegister } from '../cli/html-host.js';
 import { packageRoot } from '../cli/installed.js';
 import { fileHash } from '../cli/key-plan.js';
 import { Report } from '../cli/report.js';
+import { loadTypescript } from '../cli/source-scan.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
 import { cleanupCliHosts, makeHtmlHost } from '../conformance/cli-host.js';
@@ -1090,41 +1093,41 @@ describe('runRegister — the parse-refusal wall', () => {
 });
 
 describe('runRegister — template-dialect files (F46)', () => {
-  /** An Astro host: its whole managed surface is `.astro`. */
-  function astroHost(count: number): string {
-    const dir = project({ managedSurfaces: ['src/**/*.astro'], copyModules: [] });
-    write(dir, 'src/pages/index.astro', '---\nconst t = 1;\n---\n<h1>Chapter one</h1>\n');
-    for (let i = 1; i < count; i++) write(dir, `src/pages/p${i}.astro`, '<h1>Another chapter</h1>\n');
+  /** A Vue host: its whole managed surface is `.vue`, `.svelte` and `.mdx`, which register never rewrites (an `.astro` file has its own rewriter). */
+  function dialectHost(count: number): string {
+    const dir = project({ managedSurfaces: ['src/**/*.vue', 'src/**/*.svelte', 'src/**/*.mdx'], copyModules: [] });
+    write(dir, 'src/pages/index.vue', '<template>\n  <h1>Chapter one</h1>\n</template>\n');
+    for (let i = 1; i < count; i++) write(dir, `src/pages/p${i}.${['svelte', 'mdx', 'vue'][i % 3] as string}`, '<h1>Another chapter</h1>\n');
     return dir;
   }
 
-  it('names one .astro page with its hand step, and no parse line', async () => {
-    const cap = io(astroHost(1));
+  it('names one .vue page with its hand step, and no parse line', async () => {
+    const cap = io(dialectHost(1));
     expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
-    expect(cap.out).toContain("src/pages/index.astro: .astro is not rewritten — place copy('<key>') by hand");
+    expect(cap.out).toContain("src/pages/index.vue: .vue is not rewritten — place copy('<key>') by hand");
     expect(cap.out.join('\n')).not.toContain('could not be parsed');
   });
 
   it('collapses five to one line, and --verbose lists the five', async () => {
-    const dir = astroHost(5);
+    const dir = dialectHost(5);
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
     expect(cap.out.filter((l) => l.includes('not rewritten'))).toEqual([
-      "5 files are not rewritten (.astro) — place copy('<key>') by hand; run with --verbose to list them",
+      "5 files are not rewritten (.mdx, .svelte, .vue) — place copy('<key>') by hand; run with --verbose to list them",
     ]);
     const verbose = io(dir);
     expect(await runRegister(['--from', 'scan', '--verbose'], verbose)).toBe(0);
-    expect(verbose.out.filter((l) => /^src\/pages\/.*\.astro: \.astro is not rewritten/.test(l))).toHaveLength(5);
+    expect(verbose.out.filter((l) => /^src\/pages\/.*: \.(vue|svelte|mdx) is not rewritten/.test(l))).toHaveLength(5);
   });
 
   it('still refuses a genuinely broken .tsx with the parse line', async () => {
-    const dir = project({ managedSurfaces: ['src/**/*.tsx', 'src/**/*.astro'], copyModules: [] });
+    const dir = project({ managedSurfaces: ['src/**/*.tsx', 'src/**/*.vue'], copyModules: [] });
     write(dir, 'src/pages/broken.tsx', 'export default function P() {\n  return <h1>Chapter</h1\n}\n');
-    write(dir, 'src/pages/index.astro', '<h1>Chapter one</h1>\n');
+    write(dir, 'src/pages/index.vue', '<template><h1>Chapter one</h1></template>\n');
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
     expect(cap.out).toContain('src/pages/broken.tsx: could not be parsed cleanly — reported, not adopted');
-    expect(cap.out).toContain("src/pages/index.astro: .astro is not rewritten — place copy('<key>') by hand");
+    expect(cap.out).toContain("src/pages/index.vue: .vue is not rewritten — place copy('<key>') by hand");
   });
 });
 
@@ -1980,17 +1983,18 @@ describe('register shares JSX text within a run', () => {
 
   it('leaves a follower unrewritten where its leader was refused', async () => {
     const dir = project({ layout: UNLOCATABLE_LAYOUT });
-    // Run order is file order: the client component's literal leads, and with the
+    // The home page's literal leads: it is a client component, and with the
     // CopyProvider mount unlocatable its rewrite is refused.
-    write(dir, 'app/components/Cta.tsx', CLIENT_WIDGET('<a href="#contact">Start a conversation</a>'));
-    write(dir, 'app/page.tsx', 'export default function Page() {\n  return <main><h1>Your data, sorted</h1><a href="#c">Start a conversation</a></main>;\n}\n');
+    write(dir, 'app/page.tsx', CLIENT_WIDGET('<a href="#contact">Start a conversation</a>'));
+    write(dir, 'app/other/page.tsx', 'export default function Page() {\n  return <main><h1>Your data, sorted</h1><a href="#c">Start a conversation</a></main>;\n}\n');
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
-    const page = read(dir, 'app/page.tsx');
+    const page = read(dir, 'app/other/page.tsx');
     expect(page).toContain('<a href="#c">Start a conversation</a>');
     const declared = Object.keys(descriptor(dir).keys);
     for (const key of readsIn(page)) expect(declared).toContain(key);
-    expect(cap.out.join('\n')).not.toContain('shares');
+    expect(cap.out.join('\n')).not.toMatch(/: shares /);
+    expect(cap.out).toContain('app/other/page.tsx:2 "Start a conversation" not rewritten (the text it shares was not rewritten) — adopt by hand');
     expect(await runCli(['check'], io(dir))).toBe(0);
   });
 
@@ -2913,5 +2917,660 @@ describe('register gives head keys their SEO bound', () => {
     const title = Object.keys(keys).find((key) => key.endsWith('page_title')) as string;
     expect(keys[title]?.limits).toEqual(ADVISORY(60));
     expect(Object.values(keys).filter((def) => def.limits !== undefined)).toHaveLength(1);
+  });
+});
+
+/**
+ * A temp Astro host: `src/**\/*.astro` managed, the read path at
+ * `src/lib/content.ts` imported as `@/lib/content` through its `paths` mapping,
+ * and `src/copy.ts` a declared copy module re-exporting the map, as the
+ * reference host's is. `keys` are declared web text keys with their values.
+ */
+function astroSite(
+  files: Record<string, string>,
+  opts: { keys?: Record<string, string>; tsconfig?: Record<string, unknown> | null; managedSurfaces?: string[] } = {},
+): string {
+  const dir = mkdtempSync(join(tmpdir(), 'stet-astro-'));
+  const tsconfig = opts.tsconfig === undefined ? { compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } } : opts.tsconfig;
+  if (tsconfig !== null) write(dir, 'tsconfig.json', JSON.stringify(tsconfig, null, 2));
+  write(
+    dir,
+    'stet.config.json',
+    JSON.stringify({
+      project: 't',
+      managedSurfaces: opts.managedSurfaces ?? ['src/**/*.astro'],
+      emailSurfaces: [],
+      copyModules: ['src/copy.ts'],
+      readPath: { file: 'src/lib/content.ts', import: '@/lib/content' },
+      router: 'astro',
+      descriptorPath: 'content/descriptor.json',
+      snapshotPath: 'content/defaults.json',
+    }),
+  );
+  const keys = opts.keys ?? {};
+  write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: Object.fromEntries(Object.keys(keys).map((k) => [k, { shape: 'text', target: 'web' }])) }));
+  write(dir, 'content/defaults.json', JSON.stringify({ default: keys }));
+  write(dir, 'src/lib/content.ts', 'export const copy = (key: string): string => key;\nexport const copyMap: Record<string, string> = {};\n');
+  write(dir, 'src/copy.ts', "import { copyMap } from '@/lib/content';\nexport const copy = copyMap;\n");
+  for (const [rel, text] of Object.entries(files)) write(dir, rel, text);
+  return dir;
+}
+
+/** A page that reads keys by property through the declared copy module. */
+const BY_PROPERTY = (body: string, front = ''): string => `---\nimport { copy } from "../copy";\n${front}---\n<p>{copy.hero_sub}</p>\n${body}`;
+/** A page that imports the read path's accessor and reads nothing yet. */
+const BY_CALL = (body: string, front = ''): string => `---\nimport { copy } from '@/lib/content';\n${front}---\n${body}`;
+
+/** The not-rewritten lines a run printed, by file, text and reason. */
+const notRewritten = (cap: Captured): string[] => cap.out.filter((l) => l.includes(' not rewritten ('));
+
+describe('register — the Astro rewriter (D14)', () => {
+  it('reads by property, by call, or through an inserted import, as the file reads keys (T14.1)', async () => {
+    const dir = astroSite(
+      {
+        'src/pages/index.astro': BY_PROPERTY('<h3>Fixing a word</h3>\n<p>Short promise text</p>\n'),
+        'src/pages/call.astro': BY_CALL('<h3>Calling a word</h3>\n'),
+        'src/pages/imports.astro': "---\nimport Card from '../components/Card.astro';\n---\n<h3>Importing a word</h3>\n",
+        'src/pages/plain.astro': '---\nconst n = 1;\n---\n<h3>Plain front word</h3>\n',
+        'src/pages/bare.astro': '<h3>Fenceless word here</h3>\n',
+        'src/pages/noted.astro': "---\nimport x from './x'; // note\n---\n<h3>Noted word here</h3>\n",
+        'src/pages/four.astro': BY_PROPERTY('<h1>Not found here</h1>\n<p>Find another way</p>\n'),
+      },
+      { keys: { hero_sub: 'Sub words', '404_title': 'Not found here' } },
+    );
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const index = read(dir, 'src/pages/index.astro');
+    expect(index).toMatch(/^---\nimport \{ copy \} from "\.\.\/copy";\n---\n<p>\{copy\.hero_sub\}<\/p>\n<h3>\{copy\.home_[a-z0-9_]+\}<\/h3>\n<p>\{copy\.home_[a-z0-9_]+\}<\/p>\n$/);
+    expect(read(dir, 'src/pages/call.astro')).toMatch(/^---\nimport \{ copy \} from '@\/lib\/content';\n---\n<h3>\{copy\('call_[a-z0-9_]+'\)\}<\/h3>\n$/);
+    expect(read(dir, 'src/pages/imports.astro')).toMatch(
+      /^---\nimport Card from '\.\.\/components\/Card\.astro';\nimport \{ copy \} from '@\/lib\/content';\n---\n<h3>\{copy\('imports_[a-z0-9_]+'\)\}<\/h3>\n$/,
+    );
+    expect(read(dir, 'src/pages/plain.astro')).toMatch(/^---\nimport \{ copy \} from '@\/lib\/content';\nconst n = 1;\n---\n<h3>\{copy\('plain_[a-z0-9_]+'\)\}<\/h3>\n$/);
+    expect(read(dir, 'src/pages/bare.astro')).toMatch(/^---\nimport \{ copy \} from '@\/lib\/content';\n---\n<h3>\{copy\('bare_[a-z0-9_]+'\)\}<\/h3>\n$/);
+    expect(read(dir, 'src/pages/noted.astro')).toMatch(
+      /^---\nimport x from '\.\/x'; \/\/ note\nimport \{ copy \} from '@\/lib\/content';\n---\n<h3>\{copy\('noted_[a-z0-9_]+'\)\}<\/h3>\n$/,
+    );
+    // A digit-led key cannot be read as a property: that literal alone is listed (N7).
+    const four = read(dir, 'src/pages/four.astro');
+    expect(four).toContain('<h1>Not found here</h1>');
+    expect(four).toMatch(/<p>\{copy\.\w+\}<\/p>/);
+    expect(notRewritten(cap)).toContain('src/pages/four.astro:5 "Not found here" not rewritten (404_title cannot be read as copy.404_title) — adopt by hand');
+    const values = defaults(dir).default;
+    expect(Object.values(values)).toEqual(expect.arrayContaining(['Fixing a word', 'Calling a word', 'Importing a word', 'Fenceless word here', 'Find another way']));
+  });
+
+  it('rewrites the copy attributes of an HTML element and refuses entities it cannot read (T14.2)', async () => {
+    const page = BY_PROPERTY(
+      [
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        '<button title="Copy" class="b" id="c">x</button>',
+        '<button aria-label="Copy install command">y</button>',
+        '<img alt="A team" src="/t.png"><img alt="" src="/d.png">',
+        '<input placeholder="Your email">',
+        '<a href="/docs" title="Tom &amp; Jerry">z</a>',
+        '<a href="/a" title="&check; done">z</a>',
+        '<a href="/b" title="AT&amp T">z</a>',
+        '<p>&copy 2026 Acme</p>',
+        '',
+      ].join('\n'),
+    );
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toContain('<meta name="viewport" content="width=device-width, initial-scale=1">');
+    expect(out).toMatch(/<button title=\{copy\.\w+\} class="b" id="c">x<\/button>/);
+    expect(out).toMatch(/<button aria-label=\{copy\.\w+\}>y<\/button>/);
+    expect(out).toMatch(/<img alt=\{copy\.\w+\} src="\/t\.png"><img alt="" src="\/d\.png">/);
+    expect(out).toMatch(/<input placeholder=\{copy\.\w+\}>/);
+    expect(out).toMatch(/<a href="\/docs" title=\{copy\.\w+\}>z<\/a>/);
+    expect(Object.values(defaults(dir).default)).toContain('Tom & Jerry');
+    expect(out).toContain('<a href="/a" title="&check; done">z</a>');
+    expect(out).toContain('<a href="/b" title="AT&amp T">z</a>');
+    expect(out).toContain('<p>&copy 2026 Acme</p>');
+    expect(notRewritten(cap)).toEqual([
+      'src/pages/index.astro:11 "&check; done" not rewritten (an entity stet cannot read: &check;) — adopt by hand',
+      'src/pages/index.astro:12 "AT&amp T" not rewritten (an entity stet cannot read: &amp T) — adopt by hand',
+      'src/pages/index.astro:13 "&copy 2026 Acme" not rewritten (an entity stet cannot read: &copy 20) — adopt by hand',
+    ]);
+  });
+
+  it('follows a component prop one hop and rewrites it only where every use displays it (T14.3)', async () => {
+    const component = (body: string, front = ''): string => `---\n${front}const { label } = Astro.props;\n---\n${body}\n`;
+    const imports = ['Head', 'Tab', 'Btn', 'Wrap', 'Cls', 'Tpl', 'Direct', 'Spread'].map((c) => `import ${c} from "../components/${c}.astro";`).join('\n');
+    const dir = astroSite(
+      {
+        'src/components/Head.astro':
+          '---\ninterface Props { label: string; sub?: string }\nconst { label, sub, flag, href } = Astro.props;\n---\n' +
+          '<div style={`--f: ${flag}`}><span>{label}</span>{sub && <p>{sub}</p>}<a href={href}>go</a></div>\n',
+        'src/components/Tab.astro': component('<a id={label}>{label}</a>'),
+        'src/components/Btn.astro': component('<button data-tab={label}>{label}</button>'),
+        'src/components/Wrap.astro': component('<Inner text={label} /><p>{label}</p>', 'import Inner from "./Inner.astro";\n'),
+        'src/components/Cls.astro': component('<p class={label}>{label}</p>'),
+        'src/components/Tpl.astro': component('<p>{`${label}!`}</p>'),
+        'src/components/Direct.astro': '---\nconst x = 1;\n---\n<h2>{Astro.props.label}</h2>\n',
+        'src/components/Spread.astro': component('<div {...Astro.props}>{label}</div>'),
+        'src/components/Island.tsx': 'export default function Island(p: { label: string }) { return <b>{p.label}</b>; }\n',
+        'src/pages/index.astro': BY_PROPERTY(
+          [
+            '<Head label="Capabilities" sub="One registry holds them all" flag="var(--x)" href="/docs" />',
+            '<Tab label="Tab words here" />',
+            '<Btn label="Button words here" />',
+            '<Wrap label="Wrapped words here" />',
+            '<Cls label="Class words here" />',
+            '<Tpl label="Template words here" />',
+            '<Direct label="Direct words here" />',
+            '<Spread label="Spread words here" />',
+            '<Island label="Island words here" client:load />',
+            '<Head aria-describedby="hint error" testID="login button" event="Signup started" />',
+            '<Head label="Tom &amp; Jerry" />',
+            '',
+          ].join('\n'),
+          `${imports}\nimport Island from "../components/Island.tsx";\n`,
+        ),
+      },
+      { keys: { hero_sub: 'Sub words' } },
+    );
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toMatch(/<Head label=\{copy\.\w+\} sub=\{copy\.\w+\} flag="var\(--x\)" href="\/docs" \/>/);
+    expect(out).toMatch(/<Head label=\{copy\.\w+\} \/>/);
+    expect(Object.values(defaults(dir).default)).toEqual(expect.arrayContaining(['Capabilities', 'One registry holds them all', 'Tom &amp; Jerry']));
+    expect(out).toContain('<Head aria-describedby="hint error" testID="login button" event="Signup started" />');
+    const listed = notRewritten(cap).map((l) => l.replace(/^src\/pages\/index\.astro:\d+ /, ''));
+    expect(listed).toEqual([
+      '"Tab words here" not rewritten (used in code) — adopt by hand',
+      '"Button words here" not rewritten (used in code) — adopt by hand',
+      '"Wrapped words here" not rewritten (used in code) — adopt by hand',
+      '"Class words here" not rewritten (used in code) — adopt by hand',
+      '"Template words here" not rewritten (used in code) — adopt by hand',
+      '"Direct words here" not rewritten (shown where stet cannot follow) — adopt by hand',
+      '"Spread words here" not rewritten (shown where stet cannot follow) — adopt by hand',
+      '"Island words here" not rewritten (shown where stet cannot follow) — adopt by hand',
+      '"hint error" not rewritten (a prop stet does not rewrite) — adopt by hand',
+      '"login button" not rewritten (a prop stet does not rewrite) — adopt by hand',
+      '"Signup started" not rewritten (a prop stet does not rewrite) — adopt by hand',
+    ]);
+    for (const text of ['Tab words here', 'Button words here', 'Wrapped words here', 'Class words here', 'Template words here', 'Direct words here', 'Spread words here', 'Island words here']) {
+      expect(out).toContain(`label="${text}"`);
+    }
+  });
+
+  it('rewrites the whole content of one element inside a content brace, and nothing an attribute prints (T14.4)', async () => {
+    const page = BY_PROPERTY(
+      [
+        '{flags.changelog && <a class="i" href="/changelog">Changelog</a>}',
+        '{flag && <p>Run <b>this</b> now</p>}',
+        '',
+        '<div set:html={`<p>Welcome back</p>`} />',
+        '',
+      ].join('\n'),
+      'const flags = { changelog: true };\nconst flag = true;\n',
+    );
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toMatch(/\{flags\.changelog && <a class="i" href="\/changelog">\{copy\.\w+\}<\/a>\}/);
+    expect(out).toContain('{flag && <p>Run <b>this</b> now</p>}');
+    expect(out).toContain('<div set:html={`<p>Welcome back</p>`} />');
+    expect(notRewritten(cap)).toEqual(expect.arrayContaining([
+      'src/pages/index.astro:8 "Run" not rewritten (a sentence with markup inside an expression) — adopt by hand',
+      'src/pages/index.astro:8 "this" not rewritten (a sentence with markup inside an expression) — adopt by hand',
+    ]));
+  });
+
+  it('rewrites the copy attributes of tags inside a content brace (T14.4, PD8)', async () => {
+    const page = BY_PROPERTY(
+      ['{flag && <img alt="Brace alt words" src="/x.png">}', '{[1, 2].map((i) => <a href="/x" title="Brace title words">{i}</a>)}', '{flag && <img alt={flag ? "Dynamic alt words" : "Other alt words"} src="/y.png">}', ''].join('\n'),
+      'const flag = true;\n',
+    );
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toMatch(/\{flag && <img alt=\{copy\.\w+\} src="\/x\.png">\}/);
+    expect(out).toMatch(/\{\[1, 2\]\.map\(\(i\) => <a href="\/x" title=\{copy\.\w+\}>\{i\}<\/a>\)\}/);
+    expect(out).toContain('<img alt={flag ? "Dynamic alt words" : "Other alt words"} src="/y.png">');
+    const values = Object.values(defaults(dir).default);
+    expect(values).toEqual(expect.arrayContaining(['Brace alt words', 'Brace title words']));
+    expect(values).not.toContain('Dynamic alt words');
+    expect(notRewritten(cap)).toEqual([]);
+    // The rewritten reads keep the names register gave them when renamed from the dashboard or `rename --propose`.
+    const keys = Object.entries(defaults(dir).default).filter(([, v]) => v === 'Brace alt words' || v === 'Brace title words');
+    const proposed = astroReads(await loadTypescript(), dir, loadConfig(dir), 'src/pages/index.astro', out, 'home').filter((x) => keys.some(([k]) => k === x.key));
+    expect(proposed.map((x) => x.base).sort()).toEqual(keys.map(([k]) => k).sort());
+  });
+
+  it('leaves a sentence with inline markup as written until its key lands (T14.5)', async () => {
+    const page = BY_PROPERTY('<p>Install: run <b>npx x init</b> and answer.</p>\n');
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    expect(read(dir, 'src/pages/index.astro')).toBe(page);
+    expect(notRewritten(cap)).toEqual(['src/pages/index.astro:5 "Install: run npx x init and answer." not rewritten (stet cannot place this text) — adopt by hand']);
+  });
+
+  it('rewrites front-matter data only where every use is traced to a display (T14.6)', async () => {
+    const front = [
+      'const surfaces = [',
+      '  { id: "a", label: "Site copy", note: "Every page holds words" },',
+      '  { id: "b", label: "Email slots", note: "Every email holds words" },',
+      '];',
+      'const flags = { changelog: true };',
+      'const groups = [',
+      '  { h: "Product", links: [["Cloud waitlist", "/waitlist"], ...(flags.changelog ? [["Changelog", "/changelog"]] : []), ["All features", "/features"]] },',
+      '];',
+      'const tiers = [{ label: "Tier words here" }];',
+      'const a1 = ["First const words"] as const;',
+      'export const a2 = ["Second const words"];',
+      'const a3 = ["Third const words"];',
+      'const n3 = a3.length;',
+      'const a4 = ["Fourth const words"];',
+      'const a5 = [{ a: "Fifth const words", b: "Sixth const words" }];',
+      'const g2 = [{ links: [["Seventh const words", "/seven"]] }];',
+      'const g3 = [{ t: "Ninth const words", links: [{ t: "Tenth const words" }] }];',
+      '',
+    ].join('\n');
+    const body = [
+      '{surfaces.map((s) => (<a id={"x-" + s.id}><h3>{s.label}</h3><p>{s.note}</p></a>))}',
+      '{groups.map((g) => (<div><p class="colhead">{g.h}</p>{g.links.map(([label, href]) => <a href={href}>{label}</a>)}</div>))}',
+      '{tiers.map((t) => t.label === "SEO" && <h3>{t.label}</h3>)}',
+      '{a1.map((x) => <p>{x}</p>)}',
+      '{a2.map((x) => <p>{x}</p>)}',
+      '{a3.map((x) => <p>{x}</p>)}',
+      '<List items={a4} />',
+      '{a5.map((s) => <p>{n3 ? s.a : s.b}</p>)}',
+      '{g2.map((g) => g.links.map((g) => <a href={g[0]}>{g[0]}</a>))}',
+      // The inner `g` is its own binding: its code use is the link's, never the heading's (N13).
+      '{g3.map((g) => <div><h3>{g.t}</h3>{g.links.map((g) => <a href={g.t}>x</a>)}</div>)}',
+      '',
+    ].join('\n\n');
+    const page = BY_PROPERTY(body, front);
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toMatch(/\{ id: "a", label: copy\.\w+, note: copy\.\w+ \},/);
+    expect(out).toMatch(/\{ h: copy\.\w+, links: \[\[copy\.\w+, "\/waitlist"\], \.\.\.\(flags\.changelog \? \[\[copy\.\w+, "\/changelog"\]\] : \[\]\), \[copy\.\w+, "\/features"\]\] \},/);
+    expect(out).toMatch(/const g3 = \[\{ t: copy\.\w+, links: \[\{ t: "Tenth const words" \}\] \}\];/);
+    expect(out.slice(out.indexOf('---', 3))).toBe(page.slice(page.indexOf('---', 3)));
+    const listed = notRewritten(cap).map((l) => l.replace(/^src\/pages\/index\.astro:\d+ /, '')).filter((l) => l.includes('words'));
+    expect(listed).toEqual([
+      '"Tier words here" not rewritten (used in code) — adopt by hand',
+      '"First const words" not rewritten (used in code) — adopt by hand',
+      '"Second const words" not rewritten (used in code) — adopt by hand',
+      '"Third const words" not rewritten (used in code) — adopt by hand',
+      '"Fourth const words" not rewritten (used in code) — adopt by hand',
+      '"Fifth const words" not rewritten (used in code) — adopt by hand',
+      '"Sixth const words" not rewritten (used in code) — adopt by hand',
+      '"Seventh const words" not rewritten (used in code) — adopt by hand',
+      '"Tenth const words" not rewritten (used in code) — adopt by hand',
+    ]);
+  });
+
+  it('lists every text in a context it cannot rewrite safely, and rewrites the rest (T14.7)', async () => {
+    const dir = astroSite(
+      {
+        'src/components/Slug.astro': '---\nconst t = await Astro.slots.render("default");\n---\n<h2 id={t} title={t}>{t}</h2>\n',
+        'src/components/Card.astro': '---\nconst c = 1;\n---\n<div><slot /></div>\n',
+        'src/styles/x.css': '.y { white-space: pre; }\n',
+        'src/pages/index.astro': BY_PROPERTY(
+          [
+            '<pre>Preformatted words here</pre>',
+            '<code>Code words here</code>',
+            '<kbd>Keyboard words here</kbd>',
+            '<textarea>Area words here</textarea>',
+            '<svg><text>Graphic words here</text></svg>',
+            '<slot>fallback words</slot>',
+            '<div is:raw>Raw words here</div>',
+            '<div set:html={html}>Fallback words here</div>',
+            '<p>Hello {name}, welcome</p>',
+            '<p>two  spaces</p>',
+            '<p>a&nbsp;b</p>',
+            '<Card>Plain words</Card>',
+            "<Slug>Don't panic</Slug>",
+            '',
+          ].join('\n'),
+          'import Card from "../components/Card.astro";\nimport Slug from "../components/Slug.astro";\nconst html = "";\nconst name = "x";\n',
+        ),
+        'src/pages/wrap.astro': BY_PROPERTY('<p>two  spaces</p>\n<p class="t">one\n  <b>x</b></p>\n<style>.t { white-space: pre-wrap; }</style>\n'),
+        'src/pages/css.astro': BY_PROPERTY('<p>two  spaces</p>\n', 'import "../styles/x.css";\n'),
+      },
+      { keys: { hero_sub: 'Sub words' } },
+    );
+    const before = read(dir, 'src/pages/index.astro');
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(notRewritten(cap)).toEqual([
+      'src/pages/css.astro:6 "two spaces" not rewritten (spacing the page may show) — adopt by hand',
+      'src/pages/index.astro:9 "Preformatted words here" not rewritten (inside <pre>) — adopt by hand',
+      'src/pages/index.astro:10 "Code words here" not rewritten (inside <code>) — adopt by hand',
+      'src/pages/index.astro:11 "Keyboard words here" not rewritten (inside <kbd>) — adopt by hand',
+      'src/pages/index.astro:12 "Area words here" not rewritten (inside <textarea>) — adopt by hand',
+      'src/pages/index.astro:13 "Graphic words here" not rewritten (inside <svg>) — adopt by hand',
+      'src/pages/index.astro:14 "fallback words" not rewritten (inside <slot>) — adopt by hand',
+      'src/pages/index.astro:15 "Raw words here" not rewritten (inside an element with is:raw) — adopt by hand',
+      'src/pages/index.astro:16 "Fallback words here" not rewritten (inside an element with set:html) — adopt by hand',
+      'src/pages/index.astro:17 "Hello" not rewritten (beside an expression) — adopt by hand',
+      'src/pages/index.astro:17 ", welcome" not rewritten (beside an expression) — adopt by hand',
+      'src/pages/index.astro:21 "Don\'t panic" not rewritten (shown where stet cannot follow) — adopt by hand',
+      'src/pages/wrap.astro:5 "two spaces" not rewritten (spacing the page may show) — adopt by hand',
+      'src/pages/wrap.astro:6 "one x" not rewritten (spacing the page may show) — adopt by hand',
+    ]);
+    const lines = (text: string): string[] => text.split('\n');
+    const changed = lines(out).filter((line, i) => line !== lines(before)[i]);
+    expect(changed).toEqual([expect.stringMatching(/^<p>\{copy\.\w+\}<\/p>$/), expect.stringMatching(/^<p>\{copy\.\w+\}<\/p>$/), expect.stringMatching(/^<Card>\{copy\.\w+\}<\/Card>$/)]);
+    expect(Object.values(defaults(dir).default)).toEqual(expect.arrayContaining(['two spaces', 'a\u00a0b', 'Plain words']));
+  });
+
+  it('reads the copy binding and the form from the front matter and the markup braces alone (T14.8)', async () => {
+    const files = {
+      'src/pages/foreign.astro': "---\nimport copy from 'copy-to-clipboard';\n---\n<h3>Foreign words here</h3>\n<button title=\"Copy it now\">x</button>\n",
+      'src/pages/unread.astro': '---\nimport { copy } from "../copy";\n---\n<h3>Module words here</h3>\n',
+      'src/pages/both.astro': BY_PROPERTY("<p>{copy('b')}</p>\n<h3>Both forms here</h3>\n"),
+      'src/pages/param.astro': '---\nconst items = [1];\n---\n{items.map((copy) => <p>{copy.t}</p>)}\n<h3>Parameter words here</h3>\n',
+      'src/pages/rebound.astro': BY_PROPERTY(
+        '{items.map((copy) => <li>Read more</li>)}\n\n{items.map(({ copy }) => <a title="Open">Read the docs</a>)}\n\n<h3>Other words here</h3>\n',
+        'const items = [1];\n',
+      ),
+      'src/pages/adopt.astro': "<h3>Words for adopting</h3>\n<pre is:raw><code>{copy('home_page_headline')}</code></pre>\n",
+      'src/pages/script.astro': BY_CALL("<h3>Script words here</h3>\n<script>const copy = document.querySelector('#c'); copy.addEventListener('click', f)</script>\n"),
+      'src/pages/front.astro': BY_CALL('<h3>Front words here</h3>\n', 'const t = copy.k;\n'),
+    };
+    const dir = astroSite(files, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    for (const rel of ['src/pages/foreign.astro', 'src/pages/unread.astro', 'src/pages/both.astro', 'src/pages/param.astro', 'src/pages/front.astro']) {
+      expect(read(dir, rel)).toBe(files[rel as keyof typeof files]);
+    }
+    const listed = notRewritten(cap);
+    expect(listed).toEqual(
+      expect.arrayContaining([
+        'src/pages/foreign.astro:4 "Foreign words here" not rewritten (a foreign copy is bound in this file) — adopt by hand',
+        'src/pages/foreign.astro:5 "Copy it now" not rewritten (a foreign copy is bound in this file) — adopt by hand',
+        'src/pages/unread.astro:4 "Module words here" not rewritten (stet cannot tell how copy reads keys in this file) — adopt by hand',
+        'src/pages/both.astro:6 "Both forms here" not rewritten (stet cannot tell how copy reads keys in this file) — adopt by hand',
+        'src/pages/param.astro:5 "Parameter words here" not rewritten (stet cannot tell how copy reads keys in this file) — adopt by hand',
+        'src/pages/rebound.astro:6 "Read more" not rewritten (copy is rebound here) — adopt by hand',
+        'src/pages/rebound.astro:8 "Read the docs" not rewritten (copy is rebound here) — adopt by hand',
+        'src/pages/front.astro:5 "Front words here" not rewritten (stet cannot tell how copy reads keys in this file) — adopt by hand',
+      ]),
+    );
+    const rebound = read(dir, 'src/pages/rebound.astro');
+    expect(rebound).toContain('{items.map((copy) => <li>Read more</li>)}\n\n{items.map(({ copy }) => <a title="Open">Read the docs</a>)}');
+    expect(rebound).toMatch(/<h3>\{copy\.\w+\}<\/h3>/);
+    expect(read(dir, 'src/pages/adopt.astro')).toMatch(
+      /^---\nimport \{ copy \} from '@\/lib\/content';\n---\n<h3>\{copy\('adopt_[a-z0-9_]+'\)\}<\/h3>\n<pre is:raw><code>\{copy\('home_page_headline'\)\}<\/code><\/pre>\n$/,
+    );
+    expect(read(dir, 'src/pages/script.astro')).toMatch(/<h3>\{copy\('script_[a-z0-9_]+'\)\}<\/h3>\n<script>const copy = document/);
+  });
+
+  it("keeps every byte outside its spans, past a byte-order mark, in the file's own line endings (T14.9)", async () => {
+    const crlf = '﻿<html>\r\n<body>\r\n<h3>Fixing a word</h3>\r\n</body>\r\n</html>\r\n';
+    const bom = '﻿---\r\nimport { copy } from "../copy";\r\n---\r\n<p>{copy.hero_sub}</p>\r\n<h3>Byte order words</h3>\r\n';
+    const dir = astroSite({ 'src/pages/crlf.astro': crlf, 'src/pages/bom.astro': bom }, { keys: { hero_sub: 'Sub words' } });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const out = read(dir, 'src/pages/crlf.astro');
+    expect(out).toMatch(/^﻿---\r\nimport \{ copy \} from '@\/lib\/content';\r\n---\r\n<html>\r\n<body>\r\n<h3>\{copy\('crlf_[a-z0-9_]+'\)\}<\/h3>\r\n<\/body>\r\n<\/html>\r\n$/);
+    expect(read(dir, 'src/pages/bom.astro')).toMatch(/^﻿---\r\nimport \{ copy \} from "\.\.\/copy";\r\n---\r\n<p>\{copy\.hero_sub\}<\/p>\r\n<h3>\{copy\.bom_[a-z0-9_]+\}<\/h3>\r\n$/);
+    const second = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], second)).toBe(0);
+    expect(second.out.at(-1)).toBe('register: nothing to adopt');
+  });
+
+  it('lists every finding of a file whose markup does not pair, and keeps its bytes (T14.10)', async () => {
+    const page = BY_PROPERTY('<div><p>Fault words here</div>\n');
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'src/pages/index.astro')).toBe(page);
+    expect(notRewritten(cap)).toEqual(['src/pages/index.astro:5 "Fault words here" not rewritten (markup stet cannot pair) — adopt by hand']);
+  });
+
+  it('pairs the markup around an is:raw sample whose tags do not close (T14.10, F2)', async () => {
+    const page = BY_PROPERTY('<div is:raw><span class="p">$ go</div>\n<h2>Heading after raw words</h2>\n');
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'src/pages/index.astro')).toMatch(/<div is:raw><span class="p">\$ go<\/div>\n<h2>\{copy\.\w+\}<\/h2>\n$/);
+    expect(notRewritten(cap).filter((l) => l.includes('markup stet cannot pair'))).toEqual([]);
+  });
+
+  it('lists a document nested past the stack, keeps its bytes, and leaves scan running (T14.10, F3)', async () => {
+    const depth = 3000;
+    const page = BY_PROPERTY(`${'<div>'.repeat(depth)}<p>Deep nest words</p>${'</div>'.repeat(depth)}\n`);
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'src/pages/index.astro')).toBe(page);
+    expect(notRewritten(cap).some((l) => l.includes('"Deep nest words"') && l.includes('(markup stet cannot pair)'))).toBe(true);
+    expect(await runCli(['scan'], io(dir))).toBe(0);
+  });
+
+  it('reads a file whose front matter is empty (F11)', async () => {
+    const dir = astroSite({ 'src/pages/index.astro': '---\n---\n<h1>Empty fence words</h1>\n' }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'src/pages/index.astro')).toMatch(/^---\nimport \{ copy \} from '@\/lib\/content';\n---\n<h1>\{copy\('\w+'\)\}<\/h1>\n$/);
+    expect(notRewritten(cap)).toEqual([]);
+  });
+
+  it('links identical texts across files into one key, and keeps a head text apart (T14.11)', async () => {
+    const dir = astroSite(
+      {
+        'src/pages/index.astro': BY_PROPERTY('<span class="w">npx x init</span>\n<p>Shared tip words</p>\n<b>Twice in one file</b>\n<i>Twice in one file</i>\n'),
+        'src/components/Tip.tsx': 'export default function Tip() {\n  return <p>Shared tip words</p>;\n}\n',
+      },
+      { keys: { hero_sub: 'Sub words', hero_install: 'npx x init' }, managedSurfaces: ['src/**/*.astro', 'src/**/*.tsx'] },
+    );
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--kind', 'server'], cap)).toBe(0);
+    const page = read(dir, 'src/pages/index.astro');
+    expect(cap.out).toContain('src/pages/index.astro: reuses hero_install = npx x init');
+    expect(page).toContain('<span class="w">{copy.hero_install}</span>');
+    const tipKey = Object.entries(defaults(dir).default).filter(([, v]) => v === 'Shared tip words').map(([k]) => k);
+    expect(tipKey).toHaveLength(1);
+    expect(cap.out.filter((l) => l.includes(`shares ${tipKey[0]} = Shared tip words`))).toHaveLength(1);
+    expect(read(dir, 'src/components/Tip.tsx')).toContain(`{copy('${tipKey[0]}')}`);
+    expect(page).toContain(`<p>{copy.${tipKey[0]}}</p>`);
+    const twice = Object.entries(defaults(dir).default).filter(([, v]) => v === 'Twice in one file').map(([k]) => k);
+    expect(twice).toHaveLength(1);
+    expect(cap.out).toContain(`src/pages/index.astro: shares ${twice[0]} = Twice in one file`);
+
+    // A head text never reads a visible key (R32).
+    const app = project({ keys: { nav_pricing: { shape: 'text', target: 'web' } }, defaults: { nav_pricing: 'Pricing' } });
+    write(app, 'app/page.tsx', SERVER_PAGE('<><title>Pricing</title><a href="/p">Pricing</a></>'));
+    const jsx = io(app);
+    expect(await runRegister(['--from', 'scan', '--write'], jsx)).toBe(0);
+    const written = read(app, 'app/page.tsx');
+    expect(written).toMatch(/<title>\{copy\('home_page_title'\)\}<\/title>/);
+    expect(written).toContain(`<a href="/p">{copy('nav_pricing')}</a>`);
+    expect(defaults(app).default['home_page_title']).toBe('Pricing');
+  });
+
+  it('names a shared key after the home page, then the shallowest route, then the file path (PD13)', async () => {
+    const dir = astroSite(
+      {
+        'src/pages/gallery.astro': BY_CALL('<button>For developers</button>\n<p>Shared tie words</p>\n'),
+        'src/pages/index.astro': BY_CALL('<button>For developers</button>\n'),
+        'src/pages/about/team.astro': BY_CALL('<p>Shared deep words</p>\n'),
+        'src/pages/zeta.astro': BY_CALL('<p>Shared deep words</p>\n<p>Shared tie words</p>\n<p>Shared part words</p>\n'),
+        'src/components/Part.astro': BY_CALL('<p>Shared part words</p>\n'),
+      },
+      { keys: { hero_sub: 'Sub words' } },
+    );
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(notRewritten(cap)).toEqual([]);
+    const keyOf = (text: string): string[] => Object.entries(defaults(dir).default).filter(([, v]) => v === text).map(([k]) => k);
+    // The home page, then the shallowest route (zeta over about/team), then the file path (gallery over zeta), a route before a component.
+    expect(keyOf('For developers')).toEqual([expect.stringMatching(/^home_/)]);
+    expect(keyOf('Shared deep words')).toEqual([expect.stringMatching(/^zeta_/)]);
+    expect(keyOf('Shared tie words')).toEqual([expect.stringMatching(/^gallery_/)]);
+    expect(keyOf('Shared part words')).toEqual([expect.stringMatching(/^zeta_/)]);
+    // The followers, met before their leader's file in path order, read the leader's key.
+    expect(read(dir, 'src/pages/gallery.astro')).toContain(`<button>{copy('${keyOf('For developers')[0]}')}</button>`);
+    expect(read(dir, 'src/components/Part.astro')).toContain(`<p>{copy('${keyOf('Shared part words')[0]}')}</p>`);
+
+    const app = project();
+    write(app, 'app/gallery/page.tsx', SERVER_PAGE('<button>For developers</button>'));
+    write(app, 'app/page.tsx', SERVER_PAGE('<button>For developers</button>'));
+    expect(await runRegister(['--from', 'scan', '--write'], io(app))).toBe(0);
+    const shared = Object.entries(defaults(app).default).filter(([, v]) => v === 'For developers').map(([k]) => k);
+    expect(shared).toEqual([expect.stringMatching(/^home_/)]);
+    expect(read(app, 'app/gallery/page.tsx')).toContain(`{copy('${shared[0]}')}`);
+  });
+
+  it('adopts nothing the second time, and scan reports none of the rewritten texts (T14.12)', async () => {
+    const dir = astroSite(
+      {
+        'src/components/Head.astro': '---\nconst { label, sub } = Astro.props;\n---\n<span>{label}</span>{sub && <p>{sub}</p>}\n',
+        'src/pages/index.astro': BY_PROPERTY(
+          '<h3>Fixing a word</h3>\n<button title="Copy install command">x</button>\n<Head label="Capabilities" sub="One registry holds them all" />\n' +
+            '{flags.changelog && <a class="i" href="/changelog">Changelog</a>}\n\n{surfaces.map((s) => <h3>{s.label}</h3>)}\n',
+          'import Head from "../components/Head.astro";\nconst flags = { changelog: true };\nconst surfaces = [{ label: "Site copy" }];\n',
+        ),
+        'src/pages/bare.astro': '<h3>Fenceless word here</h3>\n',
+      },
+      { keys: { hero_sub: 'Sub words' } },
+    );
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const after = { index: read(dir, 'src/pages/index.astro'), bare: read(dir, 'src/pages/bare.astro') };
+    const second = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], second)).toBe(0);
+    expect(second.out.at(-1)).toBe('register: nothing to adopt');
+    expect({ index: read(dir, 'src/pages/index.astro'), bare: read(dir, 'src/pages/bare.astro') }).toEqual(after);
+    const scan = io(dir);
+    await runCli(['scan'], scan);
+    const said = [...scan.out, ...scan.err].join('\n');
+    for (const text of ['Fixing a word', 'Copy install command', 'Capabilities', 'One registry holds them all', 'Changelog', 'Site copy', 'Fenceless word here']) {
+      expect(said).not.toContain(text);
+    }
+  });
+
+  it('rewrites only what scan reported: a template is listed, code spillover is neither rewritten nor listed (T14.13)', async () => {
+    const page = BY_PROPERTY('<template><p>Template words here</p></template>\n<nav>{prev && (\n  <a href={prev.href}>Previous page</a>\n)}</nav>\n', 'const prev = null;\n');
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toContain('<template><p>Template words here</p></template>\n<nav>{prev && (\n');
+    expect(notRewritten(cap)).toEqual(['src/pages/index.astro:6 "Template words here" not rewritten (inside <template>) — adopt by hand']);
+  });
+
+  it('shows its diffs without --write, lists its keys in a plan, and leaves a planned-out text (T14.14)', async () => {
+    const page = BY_PROPERTY('<h3>Fixing a word</h3>\n<p>Short promise text</p>\n');
+    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const forms = [read(dir, 'content/descriptor.json'), read(dir, 'content/defaults.json')];
+    const dry = io(dir);
+    expect(await runRegister(['--from', 'scan'], dry)).toBe(0);
+    expect(dry.out.join('\n')).toContain('+++ b/src/pages/index.astro');
+    expect(dry.out.at(-1)).toBe('register: run with --write to add 2 keys and apply the leaf edits');
+    expect([read(dir, 'src/pages/index.astro'), read(dir, 'content/descriptor.json'), read(dir, 'content/defaults.json')]).toEqual([page, ...forms]);
+    expect(await runCli(['register', '--from', 'scan', '--plan-out', 'naming.json'], io(dir))).toBe(0);
+    const plan = JSON.parse(read(dir, 'naming.json')) as { keys: Array<Record<string, unknown>> };
+    expect(plan.keys.map((e) => [e['text'], e['places']])).toEqual([
+      ['Fixing a word', [expect.stringMatching(/^src\/pages\/index\.astro:5 /)]],
+      ['Short promise text', [expect.stringMatching(/^src\/pages\/index\.astro:6 /)]],
+    ]);
+    (plan.keys[0] as Record<string, unknown>)['adopt'] = false;
+    writeFileSync(join(dir, 'naming.json'), JSON.stringify(plan, null, 2));
+    expect(await runCli(['register', '--from', 'scan', '--plan', 'naming.json', '--write'], io(dir))).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toContain('<h3>Fixing a word</h3>');
+    expect(out).toMatch(/<p>\{copy\.\w+\}<\/p>/);
+  });
+
+  it('refuses an inserting run whose import resolves nowhere, writing nothing (T14.15)', async () => {
+    const page = '<h3>Fenceless word here</h3>\n';
+    const dir = astroSite({ 'src/pages/bare.astro': page }, { tsconfig: null });
+    const forms = [read(dir, 'content/descriptor.json'), read(dir, 'content/defaults.json')];
+    await expect(runRegister(['--from', 'scan', '--write'], io(dir))).rejects.toThrow(/readPath\.import is '@\/lib\/content'/);
+    expect([read(dir, 'src/pages/bare.astro'), read(dir, 'content/descriptor.json'), read(dir, 'content/defaults.json')]).toEqual([page, ...forms]);
+  });
+
+  it('lists a follower whose leader was not rewritten, on Astro and JSX alike (T14.17)', async () => {
+    // The first file's markup holds a brace that does not parse, so its rewrite does not read back.
+    const dir = astroSite({ 'src/pages/a.astro': '<h3>Shared words here</h3>\n<p>{1 +}</p>\n', 'src/pages/b.astro': '<h3>Shared words here</h3>\n' });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'src/pages/b.astro')).toBe('<h3>Shared words here</h3>\n');
+    expect(notRewritten(cap)).toEqual([
+      'src/pages/a.astro:1 "Shared words here" not rewritten (the rewrite did not read back cleanly) — adopt by hand',
+      'src/pages/b.astro:1 "Shared words here" not rewritten (the text it shares was not rewritten) — adopt by hand',
+    ]);
+
+    const planned = astroSite({ 'src/pages/a.astro': '<h3>Planned words here</h3>\n', 'src/pages/b.astro': '<h3>Planned words here</h3>\n' });
+    expect(await runCli(['register', '--from', 'scan', '--plan-out', 'naming.json'], io(planned))).toBe(0);
+    const plan = JSON.parse(read(planned, 'naming.json')) as { keys: Array<Record<string, unknown>> };
+    (plan.keys[0] as Record<string, unknown>)['adopt'] = false;
+    writeFileSync(join(planned, 'naming.json'), JSON.stringify(plan, null, 2));
+    const out = io(planned);
+    expect(await runCli(['register', '--from', 'scan', '--plan', 'naming.json', '--write'], out)).toBe(0);
+    expect(read(planned, 'src/pages/b.astro')).toBe('<h3>Planned words here</h3>\n');
+    expect(notRewritten(out)).toEqual(['src/pages/b.astro:1 "Planned words here" not rewritten (the text it shares was not rewritten) — adopt by hand']);
+
+    // A JSX leader the rewrite refuses (a foreign copy) leaves its follower with the same line.
+    const jsx = project({ managedSurfaces: ['components/**/*.tsx'] });
+    write(jsx, 'components/A.tsx', "import copy from 'copy-to-clipboard';\nexport default function A() {\n  return <p>The footer line.</p>;\n}\n");
+    write(jsx, 'components/B.tsx', 'export default function B() {\n  return <p>The footer line.</p>;\n}\n');
+    const both = io(jsx);
+    expect(await runRegister(['--from', 'scan', '--write', '--kind', 'server'], both)).toBe(0);
+    expect(read(jsx, 'components/B.tsx')).not.toContain('copy(');
+    expect(notRewritten(both)).toEqual(['components/B.tsx:2 "The footer line." not rewritten (the text it shares was not rewritten) — adopt by hand']);
+  });
+
+  it('lists the page title and description for pages scan, and keeps other head text apart from visible keys (T14.18)', async () => {
+    const dir = astroSite(
+      {
+        'src/layouts/Base.astro':
+          '---\nconst { title } = Astro.props;\n---\n<html><head><title>{title}</title><meta name="description" content="Shared layout words"></head><body><slot /></body></html>\n',
+        'src/layouts/Slotted.astro': '---\nconst x = 1;\n---\n<html><head><title><slot name="title" /></title></head><body><slot /></body></html>\n',
+        'src/components/Share.astro':
+          '---\nconst { t, u } = Astro.props;\n---\n<p>{t}</p>\n<meta property="og:title" content={t} />\n<meta property="og:url" content={u} />\n<p>{u}</p>\n',
+        'src/pages/pricing.astro':
+          '---\nimport Share from "../components/Share.astro";\n---\n<html><head><title>Pricing plans</title><meta name="description" content="Plain words">' +
+          '<meta property="og:title" content="Share this page"><meta name="twitter:description" content="Short words here">' +
+          '<link rel="alternate" title="stet changelog" href="/rss.xml"></head>\n<body>\n<h1>Pricing words here</h1>\n<script type="application/ld+json">{"a": 1}</script>\n' +
+          '<svg><title>Close menu</title></svg>\n<Share t="Shown both ways" u="Two words" />\n</body></html>\n',
+        'src/pages/plans.astro': '---\nimport Base from "../layouts/Base.astro";\n---\n<Base title="Pricing plans"><h1>Plans words here</h1></Base>\n',
+        'src/pages/changes.astro': '---\nconst x = "y";\n---\n<html><head><title>{`stet — ${x}`}</title></head><body><h1>Changes words here</h1></body></html>\n',
+        'src/pages/slotted.astro':
+          '---\nimport Slotted from "../layouts/Slotted.astro";\nimport Lost from "../layouts/Lost.astro";\n---\n<Slotted><Fragment slot="title">Slotted title words</Fragment></Slotted>\n' +
+          '<Lost><Fragment slot="title">Lost title words</Fragment></Lost>\n',
+      },
+      { keys: { nav_changelog: 'stet changelog' } },
+    );
+    const before = read(dir, 'src/pages/pricing.astro');
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const listed = notRewritten(cap);
+    expect(listed).toEqual(
+      expect.arrayContaining([
+        'src/layouts/Base.astro:4 "Shared layout words" not rewritten (a page description stet pages scan cannot bind: set in a layout every page shares) — adopt by hand',
+        'src/pages/pricing.astro:4 "Pricing plans" not rewritten (SEO text — adopt it with stet pages scan) — adopt by hand',
+        'src/pages/pricing.astro:4 "Plain words" not rewritten (SEO text — adopt it with stet pages scan) — adopt by hand',
+        'src/pages/pricing.astro:9 "Shown both ways" not rewritten (shown in the page and in its head) — adopt by hand',
+        'src/pages/pricing.astro:9 "Two words" not rewritten (used in code) — adopt by hand',
+        'src/pages/plans.astro:4 "Pricing plans" not rewritten (SEO text — adopt it with stet pages scan) — adopt by hand',
+        'src/pages/changes.astro:4 "{`stet — $" not rewritten (a page title stet pages scan cannot bind: written as an expression) — adopt by hand',
+        'src/pages/slotted.astro:5 "Slotted title words" not rewritten (a page title stet pages scan cannot bind: shown where stet cannot follow) — adopt by hand',
+        'src/pages/slotted.astro:6 "Lost title words" not rewritten (shown where stet cannot follow) — adopt by hand',
+      ]),
+    );
+    expect(cap.out).toContain('src/pages/pricing.astro:7: structured data — edit it in the file');
+    const out = read(dir, 'src/pages/pricing.astro');
+    expect(out).toContain('<title>Pricing plans</title><meta name="description" content="Plain words">');
+    expect(out).toMatch(/<meta property="og:title" content=\{copy\('\w+'\)\}><meta name="twitter:description" content=\{copy\('\w+'\)\}><link rel="alternate" title=\{copy\('\w+'\)\} href="\/rss\.xml">/);
+    expect(out).not.toContain('nav_changelog');
+    expect(out).toContain('<script type="application/ld+json">{"a": 1}</script>');
+    expect(out).toMatch(/<svg><title>\{copy\('\w+'\)\}<\/title><\/svg>/);
+    const holding = Object.entries(defaults(dir).default).filter(([, v]) => v === 'stet changelog').map(([k]) => k);
+    expect(holding).toHaveLength(2);
+    expect(holding).toContain('nav_changelog');
   });
 });

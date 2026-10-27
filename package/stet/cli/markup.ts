@@ -11,7 +11,7 @@
 /** The template dialects — files the TypeScript compiler refuses and the text detector reads instead. */
 export type Dialect = 'astro' | 'vue' | 'svelte' | 'mdx' | 'html';
 
-export const FRONTMATTER = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?=\r?\n|$)/;
+export const FRONTMATTER = /^---[ \t]*\r?\n(?:[\s\S]*?\r?\n)?---[ \t]*(?=\r?\n|$)/;
 const SCRIPT_OR_STYLE = /<(script|style)\b[^>]*>[\s\S]*?<\/\1[ \t]*>/gi;
 export const CODE_FENCE = /^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[^\n]*$/gm;
 export const ESM_LINE = /^[ \t]*(?:import|export)\b[^\n]*$/gm;
@@ -115,6 +115,47 @@ export function closing(source: string, from: number, close: '>' | '}'): number 
     } else if (ch === '>' && close === '>' && depth === 0) return i + 1;
   }
   return source.length;
+}
+
+/** One open or close tag read out of a dialect's markup. `name` is the source spelling. */
+export interface MarkupTag {
+  start: number;
+  end: number;
+  name: string;
+  close: boolean;
+  selfClosing: boolean;
+}
+
+/**
+ * Every tag of `markup`, each ended by `openTag` (a close tag by `closing`), so
+ * a brace or a quote inside a tag never ends it early.
+ */
+export function markupTags(markup: string): MarkupTag[] {
+  const tags: MarkupTag[] = [];
+  for (let i = 0; i < markup.length; i++) {
+    if (markup[i] !== '<') continue;
+    const next = markup[i + 1] ?? '';
+    const close = next === '/' && /[A-Za-z]/.test(markup[i + 2] ?? '');
+    if (!close && !/[A-Za-z]/.test(next)) continue;
+    const open = close ? null : openTag(markup, i);
+    const end = open === null ? closing(markup, i, '>') : open.end;
+    const name = /^<\/?([A-Za-z][\w:.-]*)/.exec(markup.slice(i, end))?.[1] ?? '';
+    tags.push({ start: i, end, name, close, selfClosing: open?.selfClosing ?? false });
+    i = Math.max(i + 1, end) - 1;
+  }
+  return tags;
+}
+
+/**
+ * The attributes of the open `tag`, read out of `markup` (offset `offset` into
+ * the file it was cut from), a braced value masked first so a quote inside it
+ * opens nothing. Offsets are exact; a masked value's text is read from the
+ * source, never from `.value`.
+ */
+export function openTagAttrs(markup: string, tag: MarkupTag, offset = 0): HtmlAttr[] {
+  const base = tag.start + 1 + tag.name.length;
+  const run = markup.slice(base, markup.charAt(tag.end - 1) === '>' ? tag.end - 1 : tag.end);
+  return readAttrs(markup, offset + base, maskExpressions(run, 'astro'));
 }
 
 /** The HTML elements that take no close tag: Astro reads `<br>` as JSX reads `<br />`. */
@@ -238,6 +279,41 @@ const RAW_ATTR: Partial<Record<Dialect, RegExp>> = {
   vue: /\sv-pre(?=[\s/>=])/,
 };
 
+/** Whether an open tag carries the dialect's raw attribute: the attribute itself, never the words of a quoted value (`title="… is:raw …"`). */
+function carriesRaw(tag: string, dialect: Dialect): boolean {
+  return RAW_ATTR[dialect]?.test(tag.replace(/(=\s*)(["'])[\s\S]*?\2/g, '$1""')) ?? false;
+}
+
+/**
+ * The content of each Astro element carrying `is:raw`: text Astro prints as
+ * written, a code sample's braces included. Astro ends a raw element at the
+ * first close tag of its name, as `dialectCode` reads it.
+ */
+export function rawSpans(page: string): Span[] {
+  const blanked = blankNonMarkup(page, 'astro');
+  const lower = page.toLowerCase();
+  const out: Span[] = [];
+  for (const m of page.matchAll(/<([A-Za-z][\w:.-]*)/g)) {
+    if (blanked.charAt(m.index) === '\0' || out.some((s) => s.start <= m.index && m.index < s.end)) continue;
+    const tag = openTag(page, m.index);
+    if (tag.selfClosing || !carriesRaw(page.slice(m.index, tag.end), 'astro')) continue;
+    const close = lower.indexOf(`</${tag.name}`, tag.end);
+    out.push({ start: tag.end, end: close === -1 ? page.length : close });
+  }
+  return out;
+}
+
+/** An Astro page with every raw element's content blanked to spaces, its newlines kept: what the markup readers read. Every offset stays put. */
+export function unraw(page: string): string {
+  let out = '';
+  let from = 0;
+  for (const span of rawSpans(page)) {
+    out += page.slice(from, span.start) + page.slice(span.start, span.end).replace(/[^\n]/g, ' ');
+    from = span.end;
+  }
+  return out + page.slice(from);
+}
+
 /**
  * The code spans of a template dialect's source, at the markup level. Front
  * matter, script bodies and MDX's ESM lines are TypeScript regions, returned
@@ -286,7 +362,6 @@ export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]
   }
   pass(BOGUS_COMMENT);
 
-  const raw = RAW_ATTR[dialect];
   const lower = source.toLowerCase();
   const n = source.length;
   let i = 0;
@@ -323,8 +398,7 @@ export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]
         i = close === -1 ? n : closing(source, close, '>');
         continue;
       }
-      // The attribute itself, never the words of a quoted value (`title="… is:raw …"`).
-      if (raw !== undefined && raw.test(tag.replace(/(=\s*)(["'])[\s\S]*?\2/g, '$1""')) && !selfClosing) {
+      if (carriesRaw(tag, dialect) && !selfClosing) {
         // Astro ends a raw element at the first close tag of its name, a nested
         // one included (checked with astro build); Vue's parser nests, so
         // `v-pre` ends at the close tag that balances it.
