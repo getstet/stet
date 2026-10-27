@@ -4119,8 +4119,12 @@ function vSetup() {
       esc((ready() && S.site.previewDefault) || '') + '" data-act-change="entryPreview">' +
       '<div class="muted" style="font-size:11px;margin-top:3px">Runs after npm run build for stet audit lighthouse --build; ' +
       '{port} and PORT carry the port, and the server must listen on 127.0.0.1</div>';
+  const nameField = '<div class="muted" style="font-size:11px">Project name</div>' +
+    '<input class="in sm" id="projname" value="' + esc(entry.name || '') + '" placeholder="' + esc(S.site ? S.site.folder || S.site.name : '') +
+    '" data-act-change="entryName">' +
+    '<div class="muted" style="font-size:11px;margin:3px 0 9px">Shown in this dashboard only; the folder keeps its name. Leave it empty to show the folder\'s name.</div>';
   const workspace = !S.site ? '' : '<div class="card"><div class="ch"><h3>' + esc(S.site.name) + '</h3>' +
-    '<span class="bdg mono">' + esc(S.site.path) + '</span></div><div class="cb">' + devFields +
+    '<span class="bdg mono">' + esc(S.site.path) + '</span></div><div class="cb">' + nameField + devFields +
     '<label style="display:flex;gap:7px;align-items:center;margin-top:9px;font-size:12px">' +
     '<input type="checkbox"' + (entry.pushAfterCommit ? ' checked' : '') + ' data-act-change="entryPush">Push after commit</label>' +
     '<div style="margin-top:10px"><button class="btn sm dg" data-act="removeSite">Remove this project</button></div>' +
@@ -4531,6 +4535,7 @@ const ACTIONS_CHANGE = {
   // An open edit ends kept under its own locale before the selector moves (F3).
   locale: (el) => { endEdit(); closePopover(); S.locale = el.value; render(); postCensus(); void guard(loadKeyHistory()); },
   enum: (el, id) => { setDraft(id, el.value); render(); },
+  entryName: (el) => { void guard(renameProject(S.path, el.value)); },
   entryDev: (el) => { void guard(updateEntry({ dev: el.value })); },
   entryCommand: (el) => { void guard(updateEntry({ devCommand: el.value })); },
   entryPreview: (el) => { void guard(updateEntry({ previewCommand: el.value })); },
@@ -5108,20 +5113,31 @@ async function loadDevLog() {
   S.devlog = (await api('/api/site/dev-log' + query())).body;
 }
 
-/** The open Rename field's name sent to the workspace: the server trims it, and an empty one clears it. */
+/** The open Rename field's name sent to the workspace; a refused name leaves the field open. */
 async function saveRename() {
   const r = S.renaming;
   if (r === null) return;
-  const res = await post('/api/workspace/update', { path: r.path, name: r.value });
-  if (!res.ok) { tst(res.body.error || 'the name was refused'); return; }
-  S.renaming = null;
+  if (await renameProject(r.path, r.value)) S.renaming = null;
+  render();
+}
+
+/** A project's display name sent to the workspace: the server trims it, and an empty one clears it. True once saved. */
+async function renameProject(path, name) {
+  const res = await post('/api/workspace/update', { path: path, name: name });
+  if (!res.ok) { tst(res.body.error || 'the name was refused'); return false; }
   if (Array.isArray(res.body.sites)) S.sites = res.body.sites;
-  const row = S.sites.find((s) => s.path === r.path);
-  if (row !== undefined && S.site !== null && S.path === r.path) {
+  const row = S.sites.find((s) => s.path === path);
+  if (row !== undefined && S.site !== null && S.path === path) {
     S.site.name = row.name;
     if (row.folder === undefined) delete S.site.folder; else S.site.folder = row.folder;
+    const trimmed = name.trim();
+    const entry = Object.assign({}, S.site.entry);
+    if (trimmed === '') delete entry.name; else entry.name = trimmed;
+    S.site.entry = entry;
   }
+  tst('Saved.');
   render();
+  return true;
 }
 
 async function updateEntry(patch) {

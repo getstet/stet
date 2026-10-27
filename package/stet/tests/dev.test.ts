@@ -7718,6 +7718,52 @@ describe('the page', () => {
       page.dom.window.close();
     });
 
+    // D19 — the project's name in Setup (T19.1, T19.3)
+    describe('Setup names the project (D19)', () => {
+      const setupHeading = (page: Painted): string =>
+        [...docOf(page).querySelectorAll('.card .ch h3')].map((h) => h.textContent ?? '').find((t) => t !== 'Attribution' && !t.startsWith('Pending')) ?? '';
+      const projname = (page: Painted): HTMLInputElement => docOf(page).getElementById('projname') as HTMLInputElement;
+
+      it('shows the field first with the folder as its placeholder, and renames through workspace/update', async () => {
+        const page = await paint();
+        await page.act('tab:Setup');
+        expect(projname(page).value).toBe('');
+        expect(projname(page).placeholder).toBe('mini');
+        expect(painted(page)).toContain('Shown in this dashboard only; the folder keeps its name. Leave it empty to show the folder\'s name.');
+        expect((projname(page).closest('.cb') as HTMLElement).querySelector('input')?.id).toBe('projname');
+
+        page.answer('/api/workspace/update', 200, { sites: [miniRow({ name: 'Marketing site', folder: 'mini' })] });
+        await page.change('entryName', 'Marketing site');
+        expect(updates(page)).toEqual([{ path: '/checkouts/mini', name: 'Marketing site' }]);
+        expect(labels(page)[0]).toEqual(['Marketing site', 'mini', 'snapshot-only · 11 keys', 'js host · astro']);
+        expect(setupHeading(page)).toBe('Marketing site');
+        expect(docOf(page).getElementById('sidetoggle')?.textContent).toContain('Marketing site');
+        expect(projname(page).value).toBe('Marketing site');
+        expect(projname(page).placeholder).toBe('mini');
+
+        page.answer('/api/workspace/update', 200, { sites: [miniRow()] });
+        await page.change('entryName', '');
+        expect(updates(page).at(-1)).toEqual({ path: '/checkouts/mini', name: '' });
+        expect(labels(page)[0]?.[0]).toBe('mini');
+        expect(setupHeading(page)).toBe('mini');
+        expect(docOf(page).getElementById('sidetoggle')?.textContent).toContain('mini');
+        expect(projname(page).value).toBe('');
+        expect(page.errors).toEqual([]);
+        page.dom.window.close();
+      });
+
+      it('shows a refused name and leaves every label as it was', async () => {
+        const page = await paint();
+        await page.act('tab:Setup');
+        page.answer('/api/workspace/update', 400, { error: 'the name was refused' });
+        await page.change('entryName', 'Marketing site');
+        expect(page.toast()).toBe('the name was refused');
+        expect(labels(page)[0]?.[0]).toBe('mini');
+        expect(setupHeading(page)).toBe('mini');
+        page.dom.window.close();
+      });
+    });
+
     it('tells two unnamed twins apart by folder, and never extends a name', async () => {
       const page = await paint({
         sites: [
