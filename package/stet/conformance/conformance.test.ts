@@ -990,6 +990,8 @@ describe('content-read', () => {
         entry,
         tool: [],
       });
+      // The dev tools stay on their side: render sites live in `cli/`, the matching in the preview agent (D12).
+      expect({ entry, dev: closure.modules.filter((m) => m.startsWith('cli/') || m.startsWith('templates/')) }).toEqual({ entry, dev: [] });
     }
 
     // The server accessor's subpath carries no client code: no provider module, no `react` at all.

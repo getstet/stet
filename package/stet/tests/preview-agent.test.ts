@@ -2424,4 +2424,190 @@ describe('fix-preview-editing (8o)', () => {
       expect(lastOf(framed, 'pick')).toMatchObject({ key: true, again: true });
     });
   });
+
+  describe('a match counts only where the key renders (D12)', () => {
+    /** `value` rebuilt in the frame's realm, as a structured clone from the dashboard arrives. */
+    const inFrame = (framed: Framed, value: unknown): any => framed.win.JSON.parse(JSON.stringify(value));
+    /** The census for `keys`, then the route's reads with `extra` (D12's `renders` and `coincident`); the census the reads bring. */
+    async function placed(framed: Framed, keys: CensusKey[], extra: Message, read: string[] | null = keys.map((k) => k.key)): Promise<Message | undefined> {
+      const first = await censusOf(framed, keys);
+      framed.send(inFrame(framed, { stet: 'reads', route: first?.['route'], keys: read, ...extra }));
+      await tick();
+      return lastOf(framed, 'census');
+    }
+    const site = (...levels: Array<[string, string[] | null]>): Message[] => levels.map(([tag, classes]) => ({ tag, classes }));
+    const INSTALL_PAGE = '<span id="i" class="install">npx x</span><span id="w" class="w">npx x</span>';
+    const INSTALL: CensusKey[] = [{ key: 'hero_install', texts: ['npx x'] }];
+    const INSTALL_READS = { renders: { hero_install: [site(['span', ['install']])] }, coincident: ['hero_install'] };
+    const byId = (framed: Framed, id: string): Element => framed.doc.getElementById(id) as Element;
+
+    it('T12.8: the class at level 0 decides; a pick where the key stands is sure, a click elsewhere names no key', async () => {
+      const framed = await frame(INSTALL_PAGE);
+      expect((await placed(framed, INSTALL, INSTALL_READS))?.['found']).toEqual({ hero_install: 1 });
+      await setMode(framed, 'edit');
+      await over(framed, byId(framed, 'i'));
+      expect(hitKeys(lastOf(framed, 'hover'))).toEqual(['hero_install']);
+      await over(framed, byId(framed, 'w'));
+      expect(lastOf(framed, 'hover')?.['keys']).toEqual([]);
+      await clicked(framed, byId(framed, 'i'));
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'hero_install', attr: null, by: 'whole', inplace: true, sure: true }]);
+      const before = framed.sent.length;
+      await clicked(framed, byId(framed, 'w'));
+      expect(framed.sent.slice(before).map((m) => m['stet'])).toEqual(['deselect', 'unmanaged']);
+    });
+
+    it('T12.8: any one of the classes the source writes is enough (a script took one off)', async () => {
+      const framed = await frame(INSTALL_PAGE);
+      const reply = await placed(framed, INSTALL, { renders: { hero_install: [site(['span', ['install', 'on']])] }, coincident: ['hero_install'] });
+      expect(reply?.['found']).toEqual({ hero_install: 1 });
+    });
+
+    const TITLES = '<div><h3 id="d">Site copy</h3></div><span><h3 id="s">Site copy</h3></span>';
+    const TITLE: CensusKey[] = [{ key: 'bento_1_t', texts: ['Site copy'] }];
+    const TITLE_SITE = { bento_1_t: [site(['h3', null], ['div', null])] };
+
+    it('T12.9: the parent’s tag decides', async () => {
+      const framed = await frame(TITLES);
+      expect((await placed(framed, TITLE, { renders: TITLE_SITE, coincident: ['bento_1_t'] }))?.['found']).toEqual({ bento_1_t: 1 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'd'));
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['bento_1_t']);
+      const before = framed.sent.length;
+      await clicked(framed, byId(framed, 's'));
+      expect(framed.sent.slice(before).map((m) => m['stet'])).toEqual(['deselect', 'unmanaged']);
+    });
+
+    it('T12.10: where nothing stands, every match stays and none is sure', async () => {
+      const framed = await frame(TITLES);
+      expect((await placed(framed, TITLE, { renders: { bento_1_t: [site(['em', null])] }, coincident: ['bento_1_t'] }))?.['found']).toEqual({ bento_1_t: 2 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'd'));
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'bento_1_t', attr: null, by: 'whole', inplace: true }]);
+      await clicked(framed, byId(framed, 's'));
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'bento_1_t', attr: null, by: 'whole', inplace: true }]);
+    });
+
+    it('T12.11: an attribute hit keeps the key placed, and the text hit elsewhere goes', async () => {
+      const framed = await frame('<img id="m" alt="Hello"><p id="p">Hello</p>');
+      expect((await placed(framed, [{ key: 'k', texts: ['Hello'] }], { renders: { k: [] }, coincident: ['k'] }))?.['found']).toEqual({ k: 1 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'm'));
+      expect(lastOf(framed, 'pick')?.['keys']).toMatchObject([{ key: 'k', attr: 'alt' }]);
+      const before = framed.sent.length;
+      await clicked(framed, byId(framed, 'p'));
+      expect(framed.sent.slice(before).map((m) => m['stet'])).toEqual(['deselect', 'unmanaged']);
+    });
+
+    it('T12.12: the parser’s tbody is passed over', async () => {
+      const keys: CensusKey[] = [{ key: 'k', texts: ['Hi there'] }];
+      // A cell's own parent is its row.
+      let framed = await frame('<table><tbody><tr><td>Hi there</td></tr></tbody></table><p>Hi there</p>');
+      expect((await placed(framed, keys, { renders: { k: [site(['td', null], ['tr', null])] }, coincident: ['k'] }))?.['found']).toEqual({ k: 1 });
+      // A row the source writes in its table stands though the parser put a tbody between them.
+      framed = await frame('<table><tr id="r"><td>Hi</td> <td>there</td></tr></table><p id="p">Hi there</p>');
+      expect((await placed(framed, keys, { renders: { k: [site(['tr', null], ['table', null])] }, coincident: ['k'] }))?.['found']).toEqual({ k: 1 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'r'));
+      expect(lastOf(framed, 'pick')?.['keys']).toMatchObject([{ key: 'k', sure: true }]);
+    });
+
+    it('T12.13: a dropped twin, per element', async () => {
+      const framed = await frame('<nav><a id="n">Pricing</a></nav><footer><a id="f">Pricing</a></footer>');
+      const keys: CensusKey[] = [
+        { key: 'nav_pricing', texts: ['Pricing'] },
+        { key: 'tier_pricing', texts: ['Pricing'] },
+      ];
+      const reply = await placed(framed, keys, { renders: { nav_pricing: [site(['a', null], ['nav', null])] }, coincident: ['nav_pricing'] });
+      expect(reply?.['found']).toEqual({ nav_pricing: 1, tier_pricing: 2 });
+      await setMode(framed, 'edit');
+      await over(framed, byId(framed, 'n'));
+      expect(hitKeys(lastOf(framed, 'hover'))).toEqual(['nav_pricing', 'tier_pricing']);
+      await over(framed, byId(framed, 'f'));
+      expect(hitKeys(lastOf(framed, 'hover'))).toEqual(['tier_pricing']);
+    });
+
+    it('T12.14 guard: no sites, no change', async () => {
+      const PAGE_TWO = '<h3 id="c">Custody</h3><a id="n">Pricing</a>';
+      const TWO: CensusKey[] = [
+        { key: 'nav_custody', texts: ['Custody'] },
+        { key: 'nav_pricing', texts: ['Pricing'] },
+      ];
+      const alone = await placed(await frame(PAGE_TWO), TWO, {}, ['nav_pricing']);
+      expect(alone?.['found']).toEqual({ nav_pricing: 1 });
+      expect(await placed(await frame(PAGE_TWO), TWO, { renders: {}, coincident: [] }, ['nav_pricing'])).toEqual(alone);
+      expect(await placed(await frame(PAGE_TWO), TWO, { renders: null, coincident: null }, ['nav_pricing'])).toEqual(alone);
+    });
+
+    it('T12.15 guard: a malformed renders is ignored and the keys still narrow; a dotted or underscored tag is accepted; constructor is a key like any other', async () => {
+      const PAGE = INSTALL_PAGE + '<p>Other</p>';
+      const KEYS: CensusKey[] = [...INSTALL, { key: 'other', texts: ['Other'] }];
+      const read = ['hero_install'];
+      // A site of three levels is malformed, so it drops nothing; on this page it would stand at the first span and drop the second.
+      const deep = '<main><div><span class="install">npx x</span></div></main><span class="w">npx x</span>';
+      const renders = { hero_install: [site(['span', ['install']], ['div', null], ['main', null])] };
+      expect((await placed(await frame(deep), KEYS, { renders, coincident: ['hero_install'] }, read))?.['found']).toEqual({ hero_install: 2 });
+      // A map whose prototype is not Object.prototype.
+      const framed = await frame(PAGE);
+      const first = await censusOf(framed, KEYS);
+      const message = inFrame(framed, { stet: 'reads', route: first?.['route'], keys: read, coincident: ['hero_install'] });
+      const odd = framed.win.Object.create(new framed.win.Object());
+      odd.hero_install = inFrame(framed, [site(['span', ['install']])]);
+      message.renders = odd;
+      framed.send(message);
+      await tick();
+      expect(lastOf(framed, 'census')?.['found']).toEqual({ hero_install: 2 });
+      // Tags HTML allows in a custom element's name.
+      const dotted = { hero_install: [site(['span', ['install']])], other: [site(['my.el', null]), site(['x_y', null])] };
+      expect((await placed(await frame(PAGE), KEYS, { renders: dotted, coincident: ['hero_install'] }, read))?.['found']).toEqual({ hero_install: 1 });
+      // An own key named constructor is matched by its own sites; absent, it never reads the prototype's.
+      const named: CensusKey[] = [{ key: 'constructor', texts: ['npx x'] }];
+      const own = { renders: { constructor: [site(['span', ['install']])] }, coincident: ['constructor'] };
+      expect((await placed(await frame(INSTALL_PAGE), named, own))?.['found']).toEqual({ constructor: 1 });
+      const absent = { renders: { hero_install: [site(['span', ['install']])] }, coincident: ['constructor'] };
+      expect((await placed(await frame(INSTALL_PAGE), named, absent))?.['found']).toEqual({ constructor: 2 });
+    });
+
+    it('T12.20: a key not coincident keeps every match, and those that stand are sure', async () => {
+      const framed = await frame(TITLES);
+      expect((await placed(framed, TITLE, { renders: TITLE_SITE, coincident: [] }))?.['found']).toEqual({ bento_1_t: 2 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'd'));
+      expect(lastOf(framed, 'pick')?.['keys']).toMatchObject([{ key: 'bento_1_t', sure: true }]);
+      await clicked(framed, byId(framed, 's'));
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'bento_1_t', attr: null, by: 'whole', inplace: true }]);
+    });
+
+    it('T12.21: a chain the tree builder re-parented stands as the page parses it', async () => {
+      const framed = await frame('<p><div><span>Hello</span></div></p><h3>Hello</h3><em>Hello</em>');
+      const renders = { k: [site(['span', null], ['div', null]), site(['h3', null], ['body', null])] };
+      expect((await placed(framed, [{ key: 'k', texts: ['Hello'] }], { renders, coincident: ['k'] }))?.['found']).toEqual({ k: 2 });
+    });
+
+    it('T12.22: a draft is painted only where the key stands; locate outlines every match', async () => {
+      const framed = await frame(INSTALL_PAGE);
+      await placed(framed, INSTALL, INSTALL_READS);
+      framed.send({ stet: 'layer', drafts: [{ key: 'hero_install', texts: ['npx x'], draft: 'npm i stet' }] });
+      await tick();
+      expect([byId(framed, 'i').textContent, byId(framed, 'w').textContent]).toEqual(['npm i stet', 'npx x']);
+      framed.send({ stet: 'layer', drafts: [] });
+      await tick();
+      const answer = await framed.locate({ key: 'hero_install', texts: ['npx x'], draft: 'npm i stet' });
+      expect(answer).toMatchObject({ found: 2, draft: 'shown' });
+      expect([byId(framed, 'i'), byId(framed, 'w')].map((el) => [el.textContent, (el as HTMLElement).style.outline])).toEqual([
+        ['npm i stet', SOLID],
+        ['npx x', SOLID],
+      ]);
+
+      const loose = await frame(INSTALL_PAGE);
+      await placed(loose, INSTALL, { ...INSTALL_READS, coincident: [] });
+      await loose.locate({ key: 'hero_install', texts: ['npx x'], draft: 'npm i stet' });
+      expect([byId(loose, 'i').textContent, byId(loose, 'w').textContent]).toEqual(['npm i stet', 'npm i stet']);
+    });
+
+    it('T12.23: a head match is never dropped and never stands', async () => {
+      const framed = await frame('<p>Hello</p>', 'c1', '<title>Hello</title>');
+      const reply = await placed(framed, [{ key: 'k', texts: ['Hello'] }], { renders: { k: [site(['em', null])] }, coincident: ['k'] });
+      expect([reply?.['found'], reply?.['head']]).toEqual([{ k: 2 }, [{ key: 'k', where: 'title' }]]);
+    });
+  });
 });

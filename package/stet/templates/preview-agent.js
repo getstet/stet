@@ -10,10 +10,12 @@
 // runs in any page.
 //
 // Messages from the dashboard: hello, locate, clear, census, reads (the keys a
-// file of the open page reads, so the census matches only those), layer, mode,
-// edit, end. Messages to it: ready, located, census, hover, pick, unmanaged,
-// deselect (a click on no key's copy), out (the pointer left the frame), rect,
-// typed, edited, key, moved, bye.
+// file of the open page reads, so the census matches only those, with
+// `renders`, where the source writes each key into an element's text, and
+// `coincident`, the keys whose words a file of the page also writes as text),
+// layer, mode, edit, end. Messages to it: ready, located, census, hover, pick,
+// unmanaged, deselect (a click on no key's copy), out (the pointer left the
+// frame), rect, typed, edited, key, moved, bye.
 (function () {
   'use strict';
   var script = document.currentScript;
@@ -510,8 +512,11 @@
     var texts = request.texts || [];
     var draft = typeof request.draft === 'string' ? request.draft : null;
     // A derived key is shown where its source renders: the page names the source's mark.
-    var found = find(typeof request.mark === 'string' ? request.mark : request.key, texts, draft);
+    var name = typeof request.mark === 'string' ? request.mark : request.key;
+    var found = find(name, texts, draft);
     var hits = found.hits;
+    // Every hit is outlined (R6); the draft goes only where the key stands (R18).
+    var painted = paintable(name, found);
     var by = found.by;
     // A draft mapped piece by piece: one line per hit, else the whole draft.
     var pieces = found.pieces;
@@ -529,7 +534,7 @@
         hit.el.style.outlineOffset = '2px';
       }
       var piece = pieces !== null ? pieces[hit.index] : draft;
-      if (!mapped || touchesEdit(hit.el)) return;
+      if (!mapped || touchesEdit(hit.el) || painted.indexOf(hit) === -1) return;
       // A tagged draft maps only onto the element its key is marked on; text found inside more text waits for Save.
       var done = hit.pattern
         ? !tagged && draftContained(hit, piece, swapped)
@@ -602,7 +607,8 @@
       var found = find(d.key, d.texts, d.draft);
       if (found.unmapped) return;
       var tagged = typeof d.tags === 'number';
-      found.hits.forEach(function (hit) {
+      // A draft is painted only where its key stands (R18).
+      paintable(d.key, found).forEach(function (hit) {
         if (touchesEdit(hit.el) || held(hit, swapped)) return;
         var piece = found.pieces !== null ? found.pieces[hit.index] : d.draft;
         if (hit.pattern) { if (!tagged) draftContained(hit, piece, layered); }
@@ -629,7 +635,7 @@
     ['twitter:description', 'meta[name="twitter:description"],meta[property="twitter:description"]'],
   ];
   var payload = null; // the last census payload's keys (`censusKeys`)
-  var reads = null;   // the open route's reads from the dashboard: { route, keys: Set }, or null where it cannot tell
+  var reads = null;   // the open route's reads from the dashboard: { route, keys: Set, renders: Map or null, coincident: Set }, or null where it cannot tell
   var index = null;   // the matchers over `payload`, rebuilt when the payload or the reads that apply change (`buildIndex`)
   var hits = new Map(); // element → [{ key, attr, by, node?, entry?, weak? }], what hover and click read
 
@@ -741,6 +747,50 @@
   function buildIndex() {
     index = payload === null ? null : censusIndex(payload, readsHere());
   }
+  /** The render sites that apply to the page the frame shows, or null. */
+  function rendersHere() {
+    return reads !== null && reads.route === location.pathname ? reads.renders : null;
+  }
+  /**
+   * Whether `el` stands where a site says: each level's tag, from `el` up, and at
+   * the first level one of the classes the source writes, where it writes any. A
+   * `<tbody>` the HTML parser inserted between a table and its row is passed over.
+   */
+  function standsAt(el, sites) {
+    return sites.some(function (site) {
+      var at = el;
+      for (var i = 0; i < site.length; i += 1) {
+        if (at !== null && at.tagName === 'TBODY' && site[i].tag !== 'tbody') at = at.parentElement;
+        if (at === null || at.tagName.toLowerCase() !== site[i].tag) return false;
+        var cls = site[i].classes;
+        if (i === 0 && cls !== null && cls.length > 0 && !cls.some(function (c) { return at.classList.contains(c); })) return false;
+        at = at.parentElement;
+      }
+      return true;
+    });
+  }
+  /**
+   * Of one key's hits (`{ el, attr, by }`), the ones a box or a draft uses
+   * (D12, R18, R21). Where the reads place the key and its words are written as
+   * text on the route, a text hit in the page's body stays only where a site
+   * says, once one hit stands: a body text hit standing where a site says, or an
+   * attribute or mark hit in the body. A hit outside the body (`<title>`, a
+   * `<meta>`) always stays and never counts as standing. Every hit stays otherwise.
+   */
+  function placedHits(key, list) {
+    var renders = rendersHere();
+    var sites = renders === null ? undefined : renders.get(key);
+    if (sites === undefined || !reads.coincident.has(key)) return list;
+    var inBody = function (h) { return document.body !== null && document.body.contains(h.el); };
+    var text = function (h) { return h.attr === null && h.by !== 'mark' && inBody(h); };
+    var stands = list.some(function (h) { return text(h) ? standsAt(h.el, sites) : inBody(h); });
+    return stands ? list.filter(function (h) { return !text(h) || standsAt(h.el, sites); }) : list;
+  }
+  /** The hits of `find`'s answer a draft of `key` is painted into. */
+  function paintable(key, found) {
+    var items = found.hits.map(function (hit) { return { el: hit.el, attr: hit.attr || null, by: found.by, hit: hit }; });
+    return placedHits(key, items).map(function (t) { return t.hit; });
+  }
 
   /** The page's own text and attribute values where this script's swap still stands in them. */
   function pageValues() {
@@ -797,6 +847,23 @@
         var at = entries[hit.key] || (entries[hit.key] = []);
         if (at.indexOf(hit.entry) === -1) at.push(hit.entry);
       }
+    };
+    // A key's places, strength and entries rebuilt from the hits it keeps, as `record` builds them.
+    var settleKey = function (key) {
+      delete places[key];
+      delete strong[key];
+      delete entries[key];
+      hits.forEach(function (held, el) {
+        held.forEach(function (hit) {
+          if (hit.key !== key) return;
+          (places[key] || (places[key] = new Set())).add(el);
+          if (!hit.weak) strong[key] = true;
+          if (hit.entry !== undefined) {
+            var at = entries[key] || (entries[key] = []);
+            if (at.indexOf(hit.entry) === -1) at.push(hit.entry);
+          }
+        });
+      });
     };
     var wholeHits = function (el, text, extra) {
       var list = whole.get(text);
@@ -910,6 +977,27 @@
         }
       }
     }
+    // Where the reads say where a key is written, its text hits stand only there (D12): a coincident
+    // key loses the hits that stand elsewhere, and every placed key's standing hits are sure.
+    var renders = rendersHere();
+    if (renders !== null) renders.forEach(function (sites, key) {
+      var list = [];
+      hits.forEach(function (held, el) {
+        held.forEach(function (hit) { if (hit.key === key) list.push({ el: el, attr: hit.attr, by: hit.by, hit: hit }); });
+      });
+      var kept = placedHits(key, list);
+      list.forEach(function (t) {
+        if (kept.indexOf(t) === -1) {
+          var held = hits.get(t.el);
+          held.splice(held.indexOf(t.hit), 1);
+          if (held.length === 0) hits.delete(t.el);
+          if (lineCount[key] !== undefined) delete lineCount[key];
+          return;
+        }
+        if (t.attr === null && t.by !== 'mark' && standsAt(t.el, sites)) t.hit.sure = true;
+      });
+      if (kept.length < list.length) settleKey(key);
+    });
     var found = Object.create(null);
     var weak = [];
     for (var key in places) {
@@ -919,7 +1007,8 @@
     var ambiguous = [];
     shown.forEach(function (text) {
       var keys = [];
-      whole.get(text).forEach(function (h) { if (keys.indexOf(h.key) === -1) keys.push(h.key); });
+      // A key the settle pass took off every place it stood shares the text nowhere.
+      whole.get(text).forEach(function (h) { if (keys.indexOf(h.key) === -1 && places[h.key] !== undefined) keys.push(h.key); });
       if (keys.length > 1) ambiguous.push(keys);
     });
     return { stet: 'census', found: found, entries: entries, ambiguous: ambiguous, weak: weak, head: head, route: location.pathname };
@@ -966,12 +1055,15 @@
     var keys = [];
     at.hits.forEach(function (hit) {
       var id = hit.key + ' ' + hit.attr + ' ' + hit.entry;
-      if (seen.indexOf(id) !== -1) return;
+      var had = seen.indexOf(id);
+      // A hit standing where the source writes its key makes the pick sure (D12).
+      if (had !== -1) { if (full && hit.sure === true) keys[had].sure = true; return; }
       seen.push(id);
       var key = { key: hit.key, attr: hit.attr, by: hit.by };
       if (full) {
         if (hit.entry !== undefined) key.entry = hit.entry;
         key.inplace = inplaceHit(at.el, hit);
+        if (hit.sure === true) key.sure = true;
       }
       keys.push(key);
     });
@@ -1545,6 +1637,27 @@
   // ---- Messages from the dashboard ----
 
   var isTexts = function (value) { return Array.isArray(value) && value.every(function (t) { return typeof t === 'string'; }); };
+  /** A key → render sites map as the dashboard sends it: a plain object of arrays of one or two `{ tag, classes }` levels. */
+  function isRenders(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+    var proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return false;
+    return Object.keys(value).every(function (key) {
+      var sites = value[key];
+      return Array.isArray(sites) && sites.every(function (site) {
+        return Array.isArray(site) && site.length >= 1 && site.length <= 2 && site.every(function (level) {
+          return level !== null && typeof level === 'object' && typeof level.tag === 'string' && /^[a-z][a-z0-9._-]*$/.test(level.tag) &&
+            (level.classes === null || isTexts(level.classes));
+        });
+      });
+    });
+  }
+  /** The sites as a Map over the object's own keys, so `constructor` or `__proto__` never answer from the prototype. */
+  function rendersMap(value) {
+    var map = new Map();
+    if (value) Object.keys(value).forEach(function (key) { map.set(key, value[key]); });
+    return map;
+  }
   // A list entry's index or a record field's name.
   var isEntry = function (value) {
     return typeof value === 'string' || (typeof value === 'number' && Number.isInteger(value) && value >= 0);
@@ -1612,7 +1725,14 @@
     else if (data.stet === 'clear') { last = null; end('keep'); clear(); clearLayer(); select(null); declined = []; }
     else if (data.stet === 'census' && Array.isArray(data.keys)) { payload = censusKeys(data.keys); buildIndex(); runCensus(); }
     else if (data.stet === 'reads' && typeof data.route === 'string' && (data.keys === null || isTexts(data.keys))) {
-      reads = data.keys === null ? null : { route: data.route, keys: new Set(data.keys) };
+      // Sites or coincident keys of the wrong shape cost the placing, never the narrowing.
+      var placing = isRenders(data.renders) && isTexts(data.coincident);
+      reads = data.keys === null ? null : {
+        route: data.route,
+        keys: new Set(data.keys),
+        renders: placing ? rendersMap(data.renders) : null,
+        coincident: placing ? new Set(data.coincident) : new Set(),
+      };
       buildIndex();
       runCensus();
     }

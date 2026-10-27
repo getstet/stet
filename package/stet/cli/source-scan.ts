@@ -45,7 +45,10 @@ import {
   type Place,
   type SectionNode,
 } from './key-names.js';
+import { blankNonMarkup, type Dialect } from './markup.js';
 import { CliError } from './report.js';
+// The markup layer's names this module's importers read from here.
+export { BOGUS_COMMENT, blankNonMarkup, CDATA_SECTION, CODE_FENCE, ESM_LINE, FRONTMATTER, HTML_COMMENT, type Dialect } from './markup.js';
 
 // `managedSurfaces` speaks a two-token glob — a single star for one path segment
 // and a double star for any run of segments, including none. No glob dependency
@@ -1798,9 +1801,6 @@ export function isJsxFile(name: string): boolean {
   return name.endsWith('.tsx') || name.endsWith('.jsx');
 }
 
-/** The template dialects — files the TypeScript compiler refuses and the text detector reads instead. */
-export type Dialect = 'astro' | 'vue' | 'svelte' | 'mdx' | 'html';
-
 /**
  * The ONE dialect-extension test. `eject` reads it for the files it sweeps for
  * imports without parsing, and `scan` for the files it text-detects rather than
@@ -1838,21 +1838,6 @@ export interface DialectFinding {
   text: string;
 }
 
-export const FRONTMATTER = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?=\r?\n|$)/;
-const SCRIPT_OR_STYLE = /<(script|style)\b[^>]*>[\s\S]*?<\/\1[ \t]*>/gi;
-export const CODE_FENCE = /^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[^\n]*$/gm;
-export const ESM_LINE = /^[ \t]*(?:import|export)\b[^\n]*$/gm;
-/** `<![CDATA[ … ]]>` — its body may carry `>`, so it is matched to the real terminator. */
-export const CDATA_SECTION = /<!\[CDATA\[[\s\S]*?\]\]>/g;
-
-/**
- * The remaining bogus-comment forms — a processing instruction (`<? … ?>`), a
- * markup declaration and the doctype (`<! … >`). HTML terminates each at the
- * first `>`, and so does this.
- */
-export const BOGUS_COMMENT = /<[?!][^>]*>/g;
-
-export const HTML_COMMENT = /<!--[\s\S]*?-->/g;
 /**
  * A tag, whose body cannot contain another `<`. The looser `<[^>]*>` treats a
  * bare `<` in prose as a tag opening and swallows everything up to the real
@@ -1889,43 +1874,6 @@ const BRACED = /\{[^{}]*\}/g;
  */
 function isCodeSpillover(text: string): boolean {
   return (text.startsWith('{') || text.startsWith('}')) && !/['"`]/.test(text);
-}
-
-/**
- * Everything that is not markup, blanked — comments, script and style bodies,
- * code fences, an MDX ESM line and (on `astro`/`mdx` alone) the front matter.
- * `.html` keeps no front matter: three leading dashes on a page are prose.
- *
- * Blanked material becomes NUL rather than going away, so every surviving
- * character keeps its original offset and a reported line is the real one. It
- * doubles as the run delimiter: two labels either side of a stripped tag are two
- * findings, not one.
- *
- * `scanDialect` calls this and then strips tags and braces; the static-HTML
- * locator calls it and reads the TAGS the strip would have eaten. The two can
- * never disagree about what was blanked, because there is one blanking.
- */
-export function blankNonMarkup(source: string, dialect: Dialect): string {
-  let work = source;
-  const strip = (pattern: RegExp): void => {
-    work = work.replace(pattern, (match) => match.replace(/[^\n]/g, '\0'));
-  };
-
-  if (dialect === 'astro' || dialect === 'mdx') strip(FRONTMATTER);
-  // Script and style blocks go for every dialect: a `<script>` body is code
-  // wherever it is written, and MDX admits one as readily as a `.vue` does.
-  strip(SCRIPT_OR_STYLE);
-  strip(CODE_FENCE);
-  if (dialect === 'mdx') strip(ESM_LINE);
-  strip(HTML_COMMENT);
-  // The other bogus-comment forms, blanked for every dialect on the same rule as
-  // a comment: a browser renders none of them as text, so a run beside one is
-  // never adopted. Without this the tokenizer — which matches `<[A-Za-z]` alone —
-  // reads the construct as prose, and the first regeneration would print it on
-  // the page escaped. CDATA goes first: its body may hold a bare `>`.
-  strip(CDATA_SECTION);
-  strip(BOGUS_COMMENT);
-  return work;
 }
 
 /**

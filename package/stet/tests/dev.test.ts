@@ -5996,7 +5996,7 @@ describe('GET /api/site/marks', () => {
       expect(took).toBeLessThan(200);
     });
 
-    it('answers a read inside markup too deep for the walk with its file and line', async () => {
+    it('answers a read inside markup nested deeper than a recursive walk reaches with its file, line and element', async () => {
       const host = readsHost({
         'src/deep.astro': '<div>'.repeat(5000) + "{copy.get('hero_headline')}" + '</div>'.repeat(5000) + '\n',
       });
@@ -6004,7 +6004,7 @@ describe('GET /api/site/marks', () => {
       const res = await handler(req(`/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`));
       expect(res.status).toBe(200);
       expect(((await res.json()) as { places: Record<string, unknown[]> }).places['hero_headline']).toEqual([
-        { file: 'src/deep.astro', line: 1, kind: 'text in src/deep.astro' },
+        { file: 'src/deep.astro', line: 1, tag: 'div', kind: 'text in <div>' },
       ]);
     });
 
@@ -10528,8 +10528,8 @@ describe('the page', () => {
             'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)',
           ]);
           expect(await noteOf(page, 'blind_key')).toEqual([LINE, 'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)']);
-          expect(page.html()).not.toContain('can’t tell');
-          expect(page.html()).not.toContain("can't tell");
+          expect(docOf(page).getElementById('shell')?.textContent).not.toContain('can’t tell');
+          expect(docOf(page).getElementById('shell')?.textContent).not.toContain("can't tell");
           page.dom.window.close();
         });
 
@@ -11007,9 +11007,9 @@ describe('the page', () => {
           // The pane's own request is still out when the agent announces itself and its census lands.
           const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }, 400]] });
           await agent.census({ found: {} });
-          expect(agent.sent('reads')).toEqual([{ stet: 'reads', route: '/', keys: null }]);
+          expect(agent.sent('reads')).toEqual([{ stet: 'reads', route: '/', keys: null, renders: null, coincident: null }]);
           await wait(500); await page.settle();
-          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: ['hero_headline'] });
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: ['hero_headline'], renders: {}, coincident: [] });
           page.dom.window.close();
         });
 
@@ -11038,7 +11038,7 @@ describe('the page', () => {
           await agent.ready('/');
           await agent.census({ found: {} });
           await wait(50); await page.settle();
-          expect({ asked, last: agent.sent('reads').at(-1) }).toEqual({ asked: 2, last: { stet: 'reads', route: '/', keys: ['hero_headline', 'loose_key'] } });
+          expect({ asked, last: agent.sent('reads').at(-1) }).toEqual({ asked: 2, last: { stet: 'reads', route: '/', keys: ['hero_headline', 'loose_key'], renders: {}, coincident: [] } });
           page.dom.window.close();
         });
 
@@ -11065,7 +11065,7 @@ describe('the page', () => {
           await agent.census({ found: {}, route: '/pricing' });
           await wait(50); await page.settle();
           const state = JSON.parse(evalIn(page, 'JSON.stringify({ unknown: readsUnknown(), page: pageKeys() })') as string);
-          expect({ state, sent: agent.sent('reads').at(-1) }).toEqual({ state: { unknown: false, page: ['loose_key'] }, sent: { stet: 'reads', route: '/pricing', keys: ['loose_key'] } });
+          expect({ state, sent: agent.sent('reads').at(-1) }).toEqual({ state: { unknown: false, page: ['loose_key'] }, sent: { stet: 'reads', route: '/pricing', keys: ['loose_key'], renders: {}, coincident: [] } });
           page.dom.window.close();
         });
 
@@ -11076,7 +11076,51 @@ describe('the page', () => {
           page.answer('/api/site/route-reads', 200, { route: '/pricing', files: ['app/pricing/page.tsx'], keys: ['loose_key'], complete: true });
           await agent.moved('/pricing?tier=pro');
           await wait(50); await page.settle();
-          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/pricing', keys: ['loose_key'] });
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/pricing', keys: ['loose_key'], renders: {}, coincident: [] });
+          page.dom.window.close();
+        });
+
+        // D12 — the sites reach the agent, and a pick stet cannot place says so
+        it('sends the route’s render sites and coincident keys with its reads, or none where the reads are incomplete (T12.16)', async () => {
+          const renders = { hero_headline: [[{ tag: 'h1', classes: [] }]] };
+          const { page, agent } = await bridged({
+            routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['hero_headline'], complete: true, renders, coincident: ['hero_headline'] }]],
+          });
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: ['hero_headline'], renders, coincident: ['hero_headline'] });
+          page.answer('/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['hero_headline'], complete: false, renders, coincident: ['hero_headline'] });
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/');
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: null, renders: null, coincident: null });
+          page.dom.window.close();
+        });
+
+        it('says a text shown in several places may not all come from the key, only for a pick stet could not place (T12.17)', async () => {
+          const UNSURE = "This text shows in 3 places. stet can't tell which of them come from loose_key; saving changes only those.";
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: true }]] });
+          await agent.census({ found: { loose_key: 3 } });
+          await wait(50); await page.settle();
+          await agent.pick([{ key: 'loose_key' }]);
+          expect(lines(page)).toContain(UNSURE);
+          await agent.pick([{ key: 'loose_key', sure: true }]);
+          expect(lines(page).join(' ')).not.toContain('places. stet');
+          await agent.census({ found: { loose_key: 1 } });
+          await agent.pick([{ key: 'loose_key' }]);
+          expect(lines(page).join(' ')).not.toContain('places. stet');
+          await agent.census({ found: { loose_key: 3 } });
+          page.answer('/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: false });
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/');
+          await agent.census({ found: { loose_key: 3 } });
+          await wait(50); await page.settle();
+          await agent.pick([{ key: 'loose_key' }]);
+          expect(lines(page).join(' ')).not.toContain('places. stet');
+          expect(lines(page).at(-1)).toBe(UNKNOWN);
           page.dom.window.close();
         });
 
@@ -11186,10 +11230,10 @@ describe('the page', () => {
           await agent.ready('/b');
           await agent.census({ found: {}, route: '/b' });
           await wait(60); await page.settle();
-          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/b', keys: ['loose_key'] });
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/b', keys: ['loose_key'], renders: {}, coincident: [] });
           await wait(500); await page.settle();
           expect(evalIn(page, 'S.routeReads.route')).toBe('/b');
-          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/b', keys: ['loose_key'] });
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/b', keys: ['loose_key'], renders: {}, coincident: [] });
           expect(lines(page)).not.toContain(UNKNOWN);
           page.dom.window.close();
         });
@@ -11284,11 +11328,11 @@ describe('the page', () => {
           const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }]] });
           await agent.census({ found: {} });
           await wait(50); await page.settle();
-          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: ['hero_headline'] });
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: ['hero_headline'], renders: {}, coincident: [] });
           await agent.tell({ stet: 'bye' });
           await agent.load();
           await agent.ready('/pricing');
-          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/pricing', keys: null });
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/pricing', keys: null, renders: null, coincident: null });
           page.dom.window.close();
         });
 
@@ -13933,6 +13977,17 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     return host;
   }
 
+  /** The route's reads without D12's render sites, which `routeRendersOf` answers alone. */
+  const routeReadsOf = async (handler: (r: Request) => Promise<Response>, host: CliHost, route = '/'): Promise<any> => {
+    const { renders: _renders, coincident: _coincident, ...body } = await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent(route)}`);
+    return body;
+  };
+  /** The route's render sites and coincident keys (D12). */
+  const routeRendersOf = async (handler: (r: Request) => Promise<Response>, host: CliHost, route = '/'): Promise<any> => {
+    const body = await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent(route)}`);
+    return { complete: body.complete, renders: body.renders, coincident: body.coincident };
+  };
+
   it('answers each judged key with its state, the file count and the root', async () => {
     const host = nextSite();
     const { handler } = handlerOver([host.cwd]);
@@ -14039,7 +14094,7 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
   it('lists a Next route’s page, its layout and what they import through the alias, complete', async () => {
     const host = nextSite();
     const { handler } = handlerOver([host.cwd]);
-    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+    expect(await routeReadsOf(handler, host)).toEqual({
       route: '/',
       files: ['app/layout.tsx', 'app/page.tsx'],
       keys: ['footer_links', 'hero_headline'],
@@ -14050,16 +14105,13 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
   it('an alias that resolves nowhere makes the route incomplete', async () => {
     const host = nextSite();
     const { handler } = handlerOver([host.cwd]);
-    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/pricing')}`)).toEqual({
+    expect(await routeReadsOf(handler, host, '/pricing')).toEqual({
       route: '/pricing',
       files: ['app/layout.tsx', 'app/pricing/page.tsx'],
       keys: ['footer_links', 'pricing_price'],
       complete: false,
     });
   });
-
-  const routeReadsOf = (handler: (r: Request) => Promise<Response>, host: CliHost, route = '/'): Promise<any> =>
-    get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent(route)}`);
 
   it('F3a: a specifier resolved through baseUrl alone is followed', async () => {
     const host = nextSite();
@@ -14287,7 +14339,7 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     const host = snapshotHost();
     write(host.cwd, 'src/main.tsx', "import { copy } from '../lib/content';\ndocument.title = copy('hero_headline');\n");
     const { handler } = handlerOver([host.cwd]);
-    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+    expect(await routeReadsOf(handler, host)).toEqual({
       route: '/',
       files: [],
       keys: [],
@@ -14464,11 +14516,229 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
       .map(([key]) => key)
       .sort();
     expect(expected.length).toBeGreaterThan(0);
-    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+    expect(await routeReadsOf(handler, host)).toEqual({
       route: '/',
       files: ['index.html'],
       keys: expected,
       complete: true,
     });
+  });
+
+  // 8o D12: the route reads say where each key renders.
+  /** An Astro host whose `/` is `page`, with `files` beside it and the snapshot's `values` over the fixture's. */
+  function placedSite(page: string, files: Record<string, string> = {}, values: Record<string, string> = {}): CliHost {
+    const host = astroHost(['index.astro']);
+    for (const [rel, text] of Object.entries(files)) write(host.cwd, rel, text);
+    write(host.cwd, 'src/pages/index.astro', page);
+    if (Object.keys(values).length > 0) {
+      const at = join(host.cwd, 'content/defaults.json');
+      const snapshot = loadSnapshot(JSON.parse(readFileSync(at, 'utf8')));
+      Object.assign(snapshot['default'] as Record<string, unknown>, values);
+      writeJsonDeterministic(at, snapshot);
+      writeFileSync(join(host.cwd, 'content/defaults.ts'), generateDefaultsModule(snapshot));
+    }
+    return host;
+  }
+  const FRONT = '---\nimport { copy } from "../../lib/content";\n---\n';
+
+  it('T12.1 Astro direct reads are sites; an attribute read is inert', async () => {
+    const host = placedSite(
+      FRONT + '<main><div class="acts"><span class="install">{copy.hero_headline}<button onclick={`x(${copy.hero_headline})`}>c</button></span></div></main>\n',
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, body.renders.hero_headline]).toEqual([true, [[{ tag: 'span', classes: ['install'] }, { tag: 'div', classes: null }]]]);
+  });
+
+  it.each([
+    ['a front-matter read', '---\nimport { copy } from "../../lib/content";\nconst t = copy.hero_headline;\n---\n<main><h1>{copy.hero_headline}</h1><p>{t}</p></main>\n'],
+    ['a read in a nested brace', FRONT + '<main><h1>{copy.hero_headline}</h1>{Math.random() > 1 && <a>{copy.hero_headline}</a>}</main>\n'],
+    ['a brace holding more than the read', FRONT + '<main><h1>{copy.hero_headline}</h1><p>{copy.hero_headline.toUpperCase()}</p></main>\n'],
+    ['a component attribute', FRONT + '<main><h1>{copy.hero_headline}</h1><Head label={copy.hero_headline} /></main>\n'],
+    ['a component’s content', FRONT + '<main><h1>{copy.hero_headline}</h1><Card>{copy.hero_headline}</Card></main>\n'],
+    ['set:html', FRONT + '<main><h1>{copy.hero_headline}</h1><div set:html={copy.hero_headline} /></main>\n'],
+    ['a prefix read', '---\nimport { copy } from "../../lib/content";\nconst part = "headline";\n---\n<main><h1>{copy.hero_headline}</h1><p>{copy(`hero_${part}`)}</p></main>\n'],
+  ])('T12.2 %s opens the key', async (_name, page) => {
+    // A direct read of another key on the page is placed: the file was read.
+    const host = placedSite(page.replace('</main>', '<b>{copy.pricing_price}</b></main>'));
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, Object.keys(body.renders)]).toEqual([true, ['pricing_price']]);
+  });
+
+  it('T12.3 one open read opens the key across files', async () => {
+    const host = placedSite(
+      '---\nimport { copy } from "../../lib/content";\nimport Accent from "../components/Accent.astro";\n---\n<main><h1>{copy.hero_headline}</h1><b>{copy.pricing_price}</b><Accent /></main>\n',
+      { 'src/components/Accent.astro': '---\nimport { copy } from "../../lib/content";\nconst accent = (s: string) => s;\n---\n<em>{accent(copy.hero_headline)}</em>\n' },
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, Object.keys(body.renders)]).toEqual([true, ['pricing_price']]);
+  });
+
+  it('T12.4 the chain’s classes: level 0 static or computed, the climb stops at a component', async () => {
+    const host = nextSite();
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      [
+        "import { copy } from '@/lib/content';",
+        "const s = { x: 'y' };",
+        'const Card = ({ children }: { children: unknown }) => <div>{children as any}</div>;',
+        'export default function Page() {',
+        "  return <main><section><p className=\"lede\">{copy('hero_headline')}</p></section><i className={s.x}>{copy('pricing_price')}</i><Card><b>{copy('pricing_tier_name')}</b></Card></main>;",
+        '}',
+        '',
+      ].join('\n'),
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, body.renders]).toEqual([
+      true,
+      {
+        hero_headline: [[{ tag: 'p', classes: ['lede'] }, { tag: 'section', classes: null }]],
+        pricing_price: [[{ tag: 'i', classes: null }, { tag: 'main', classes: null }]],
+        pricing_tier_name: [[{ tag: 'b', classes: [] }]],
+      },
+    ]);
+    const astro = placedSite(FRONT + '<main><p class:list={["a", Math.random()]}>{copy.hero_headline}</p></main>\n');
+    const other = handlerOver([astro.cwd]).handler;
+    expect((await routeRendersOf(other, astro)).renders.hero_headline).toEqual([[{ tag: 'p', classes: null }, { tag: 'main', classes: null }]]);
+  });
+
+  it('T12.5 guard: incomplete reads carry no sites', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nconst mods = import.meta.glob('../data/*.ts', { eager: true });\n---\n<h1>{Object.keys(mods).length}</h1>\n", {
+      'src/data/a.ts': "export const t = 'hero_headline';\n",
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeRendersOf(handler, host, '/custody')).toEqual({ complete: false, renders: {}, coincident: [] });
+  });
+
+  it('T12.5: a complete route carries the sites the same page would (the M12.10 control)', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, FRONT + '<main><h1>{copy.hero_headline}</h1></main>\n');
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeRendersOf(handler, host, '/custody')).renders).toHaveProperty('hero_headline');
+    astroPage(host, '---\nimport { copy } from "../../lib/content";\nconst mods = import.meta.glob("../data/*.ts");\n---\n<main><h1>{copy.hero_headline}</h1></main>\n');
+    expect(await routeRendersOf(handler, host, '/custody')).toEqual({ complete: false, renders: {}, coincident: [] });
+  });
+
+  it('T12.6 a faulted document opens its reads', async () => {
+    const host = placedSite(FRONT + '<main><div><p>{copy.hero_headline}</p></main>\n');
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect(body.complete).toBe(true);
+    expect(body.renders).not.toHaveProperty('hero_headline');
+  });
+
+  it('T12.7 guard: the html host carries no sites', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeRendersOf(handler, host)).toEqual({ complete: true, renders: {}, coincident: [] });
+  });
+
+  it('T12.19 a read KEY_READ does not see opens the key (F1)', async () => {
+    const host = placedSite(
+      [
+        '---',
+        'import { copy } from "../../lib/content";',
+        'const t = copy;',
+        '---',
+        '<html><body><main>',
+        '<div class="cell"><h3>{copy.hero_headline}</h3></div>',
+        '<ul><li>{copy["hero_headline"]}</li></ul>',
+        '<p class="lede">{t.pricing_tier_name}</p><h3>{copy.pricing_tier_name}</h3>',
+        '<b>{copy.pricing_price}</b>',
+        '</main></body></html>',
+        '',
+      ].join('\n'),
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect(body.complete).toBe(true);
+    expect(Object.keys(body.renders)).toEqual(['pricing_price']);
+
+    const next = nextSite();
+    write(next.cwd, 'app/layout.tsx', plainLayout);
+    write(next.cwd, 'package.json', JSON.stringify({ name: 'site', dependencies: { react: '^19', '@getstet/stet': '1' } }));
+    write(
+      next.cwd,
+      'app/page.tsx',
+      "import { copy } from '@/lib/content';\nimport { useCopy } from '@getstet/stet/react';\nexport default function Page() { const t = useCopy(); return <main><p>{t('hero_headline')}</p><h3>{copy('hero_headline')}</h3><b>{copy('pricing_price')}</b></main>; }\n",
+    );
+    const other = handlerOver([next.cwd]).handler;
+    const tsx = await routeRendersOf(other, next);
+    expect([tsx.complete, Object.keys(tsx.renders)]).toEqual([true, ['pricing_price']]);
+  });
+
+  it('T12.20 only a key whose words a route file writes as text is coincident (R21, N17)', async () => {
+    const host = placedSite(
+      [
+        '---',
+        'import { copy } from "../../lib/content";',
+        'import { pkg } from "@getstet/stet";',
+        'import Promo from "../components/Promo.astro";',
+        'import "../copy";',
+        '---',
+        '<main><h1>{copy.hero_headline}</h1><b>{copy.pricing_tier_name}</b><i>{copy.pricing_price}</i><em>{copy.brand__name}</em><Promo /><s>{pkg}</s></main>',
+        '',
+      ].join('\n'),
+      {
+        'package.json': JSON.stringify({ name: 'site', dependencies: { '@getstet/stet': '1' } }),
+        'stet.config.json': JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'] }, null, 2),
+        'src/components/Promo.astro': '<aside><p>Never miss a post again.</p></aside>\n',
+        'src/copy.ts': 'export const labels = { price: "$16" };\n',
+      },
+      { brand__name: 'stet' },
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect(body.complete).toBe(true);
+    expect(Object.keys(body.renders).sort()).toEqual(['brand__name', 'hero_headline', 'pricing_price', 'pricing_tier_name']);
+    expect(body.coincident).toEqual(['hero_headline']);
+  });
+
+  it('T12.21 the tree builder’s re-parenting ends the chain (F3)', async () => {
+    const host = placedSite(FRONT + '<main><p><div><span>{copy.hero_headline}</span></div></p><p><div>{copy.pricing_price}</div></p></main>\n');
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.renders.hero_headline, body.renders.pricing_price]).toEqual([
+      [[{ tag: 'span', classes: [] }, { tag: 'div', classes: null }]],
+      [[{ tag: 'div', classes: [] }]],
+    ]);
+  });
+
+  it('T12.21 (F1, an addition): markup the tree builder repairs past the parent opens the key', async () => {
+    const host = placedSite(
+      FRONT +
+        '<main><p><span><div>{copy.hero_headline}</div></span></p><ul><li><li>{copy.pricing_price}</li></li></ul><section><b>{copy.pricing_tier_name}</b></section></main>\n',
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, Object.keys(body.renders)]).toEqual([true, ['pricing_tier_name']]);
+
+    const next = nextSite();
+    write(next.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      next.cwd,
+      'app/page.tsx',
+      "import { copy } from '@/lib/content';\nexport default function Page() { return <main><p><span><div>{copy('hero_headline')}</div></span></p><ul><li><li>{copy('pricing_price')}</li></li></ul><section><b>{copy('pricing_tier_name')}</b></section></main>; }\n",
+    );
+    const other = handlerOver([next.cwd]).handler;
+    const tsx = await routeRendersOf(other, next);
+    expect([tsx.complete, Object.keys(tsx.renders)]).toEqual([true, ['pricing_tier_name']]);
+  });
+
+  it('T12.26 (F3, an addition): a code sample in an is:raw block is no read and no render site', async () => {
+    // The shape of the reference host's docs/adopt.astro: a diff sample quoting copy('…') in a raw <pre>.
+    const host = placedSite(
+      FRONT +
+        '<main><h3>{copy.pricing_price}</h3>\n<pre is:raw><code><span class="add">+      &lt;h1&gt;{copy(\'pricing_price\')}&lt;/h1&gt;</span>\n<span class="add">+      &lt;p&gt;{copy(\'hero_headline\')}&lt;/p&gt;</span></code></pre></main>\n',
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, body.renders]).toEqual([true, { pricing_price: [[{ tag: 'h3', classes: [] }, { tag: 'main', classes: null }]] }]);
   });
 });

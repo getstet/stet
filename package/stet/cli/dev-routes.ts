@@ -53,10 +53,11 @@ import {
   type Element,
   type HtmlMark,
   type HtmlProposalSet,
+  wordBoundedIndex,
 } from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
-import { closing, dialectCode, KEY_READ, nonCodeOf, openTag, within, type Span } from './key-reads.js';
+import { codeOf, dialectCode, KEY_READ, nonCodeOf, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
 import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
@@ -66,7 +67,8 @@ import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
-import { blankNonMarkup, dialectOf, loadTypescript, matchGlob, packageNames, scriptKindFor, type Dialect } from './source-scan.js';
+import { elementPath, markupBraces, maskExpressions, selfClosedRaw } from './markup.js';
+import { collapseWhitespace, decodeEntities, dialectOf, loadTypescript, matchGlob, packageNames, scriptKindFor } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -2037,13 +2039,13 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
   const ready = requireReady(site);
   const route = url.searchParams.get('route');
   if (route === null) throw new UsageError('route is required');
-  const unmapped = { route, files: [], keys: [], complete: false };
+  const unmapped = { route, files: [], keys: [], complete: false, renders: {}, coincident: [] };
   if (ready.host === 'html') {
     const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
     const document = set.documents.find((d) => normalizeRoute(servedRoute(d.file)) === normalizeRoute(route));
     if (document === undefined) return json(unmapped);
     const keys = [...new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key))].sort();
-    return json({ route, files: [document.file], keys, complete: true });
+    return json({ route, files: [document.file], keys, complete: true, renders: {}, coincident: [] });
   }
   const files = routeFiles(ready.path, route, ready.config);
   if (files === null) return json(unmapped);
@@ -2070,7 +2072,7 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
     chain = importClosure(ts, ready.path, files, alias, (rel) => insideCheckout(ready.path, join(ready.path, rel)) !== null);
   } catch (error) {
     if (!(error instanceof RangeError)) throw error;
-    return json({ route, files, keys: [], complete: false });
+    return json({ route, files, keys: [], complete: false, renders: {}, coincident: [] });
   }
   const declaredKeys = Object.keys(ready.descriptor.keys);
   const declared = new Set(declaredKeys);
@@ -2095,7 +2097,40 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
       complete = false;
     }
   }
-  return json({ route, files, keys: [...keys].sort(), complete });
+  // Where each key the route reads is written into an element's text: a key every read of which stet can place (D12).
+  const sites = new Map<string, SiteLevel[][]>();
+  const open = new Set<string>();
+  if (complete) {
+    for (const file of chain.files) {
+      if (own.has(file.rel) || isGenerated(file.text)) continue;
+      const read = reads.files.get(file.rel);
+      const named = read === undefined ? namedKeys(ts, file.rel, file.text, declared) : new Set(read.named);
+      for (const p of read?.prefixes ?? []) for (const key of declaredKeys) if (key.startsWith(p.prefix)) open.add(key);
+      let placed: FileSites | null = null;
+      try {
+        placed = PLACED.test(file.rel) ? renderSites(ts, file.rel, file.text, declared) : null;
+      } catch (error) {
+        if (!(error instanceof RangeError)) throw error;
+      }
+      for (const key of named) {
+        const at = placed?.get(key);
+        // A read stet cannot place, or a file whose reads it does not place at all: the key is open on this route.
+        if (at === undefined || at.open) open.add(key);
+        else sites.set(key, [...(sites.get(key) ?? []), ...at.sites]);
+      }
+    }
+  }
+  const renders = complete ? Object.fromEntries([...sites].filter(([key]) => !open.has(key) && keys.has(key))) : {};
+  // A placed key whose words a file of the route writes as text: one of its matches may be that text (R21).
+  const copyModule = (rel: string): boolean => ready.config.copyModules.some((glob) => matchGlob(glob, rel));
+  const texts = chain.files.filter((file) => !own.has(file.rel) && !isGenerated(file.text) && !copyModule(file.rel)).map((file) => flatText(file.text));
+  const coincident = Object.keys(renders)
+    .filter((key) => {
+      const value = heldTextOf(ready.descriptor, ready.snapshot, key);
+      return value !== null && flatText(value) !== '' && texts.some((text) => wordBoundedIndex(text, flatText(value), JOINS_WORD) !== -1);
+    })
+    .sort();
+  return json({ route, files, keys: [...keys].sort(), complete, renders, coincident });
 }
 
 /**
@@ -2211,53 +2246,6 @@ function readsIn(file: string, source: string, descriptor: Descriptor): Array<{ 
 }
 
 /**
- * A template dialect's markup with the inside of every `{…}` expression masked
- * with `_`, its outer braces and newlines kept: `content={copy.get('k')}` then
- * reads as one unquoted attribute value, where the quotes inside the expression
- * would otherwise end the attribute and the tag early. A brace opens only in the
- * markup `blankNonMarkup` leaves, so a `'{'` in frontmatter or a script opens
- * nothing, and ends where `closing` says, as the rename reads it. Every offset
- * stays put.
- */
-function maskExpressions(source: string, dialect: Dialect): string {
-  const markup = blankNonMarkup(source, dialect);
-  let out = '';
-  let from = 0;
-  for (let i = 0; i < source.length; i++) {
-    if (source[i] !== '{' || markup[i] === '\0') continue;
-    // The brace ends where `closing` says, as the rename's walk reads it.
-    const end = closing(source, i, '}');
-    out += source.slice(from, i + 1) + source.slice(i + 1, Math.max(i + 1, end - 1)).replace(/[^\n]/g, '_');
-    from = Math.max(i + 1, end - 1);
-    i = from - 1;
-  }
-  return out + source.slice(from);
-}
-
-/**
- * A template dialect's source with each self-closing `<script … />` and
- * `<style … />` blanked as a script body is: in a dialect the element has no
- * body, so the next close tag of its name must not end it and swallow the
- * markup between. The tag is read by `openTag`, as `dialectCode` reads it.
- * Every offset stays put.
- */
-function selfClosedRaw(source: string): string {
-  const spans: Array<{ start: number; end: number }> = [];
-  for (const m of source.matchAll(/<(?:script|style)\b/gi)) {
-    const tag = openTag(source, m.index);
-    if (tag.selfClosing) spans.push({ start: m.index, end: tag.end });
-  }
-  let out = '';
-  let from = 0;
-  for (const { start, end } of spans) {
-    if (start < from) continue;
-    out += source.slice(from, start) + source.slice(start, end).replace(/[^\n]/g, '\0');
-    from = end;
-  }
-  return out + source.slice(from);
-}
-
-/**
  * A `.vue` file with its top-level `<template>` open and close tags blanked to
  * spaces. The tokenizer reads `<template>` as opaque, as HTML defines it; in a
  * single-file component it is the markup itself. Every offset stays put.
@@ -2281,26 +2269,264 @@ function vueMarkup(source: string): string {
  * does: its tag, the attribute's name, and for a `<meta>`'s `content` the meta's
  * `name` or `property`, so a head read on a JavaScript host reads as its kind.
  */
-function elementAt(
-  roots: Element[],
-  at: number,
-  inSvg = false,
-): { tag?: string; attr?: string; meta?: string; svg?: true } {
-  for (const el of roots) {
-    if (at < el.openStart || at >= el.closeEnd) continue;
-    if (at < el.openEnd) {
-      const attr = el.attrs.find((a) => a.start <= at && at < a.end);
-      if (attr === undefined) return {};
-      const meta = attr.name === 'content' ? metaCopyName(el) : null;
-      return { tag: el.tag, attr: attr.name, ...(meta === null ? {} : { meta }) };
-    }
-    if (el.opaque) return {};
-    // A `<title>` inside an `<svg>` names the graphic, as on the static-HTML host.
-    const inner = elementAt(el.children, at, inSvg || el.tag === 'svg');
-    return inner.tag === undefined ? { tag: el.tag, ...(inSvg ? { svg: true as const } : {}) } : inner;
+function elementAt(roots: Element[], at: number): { tag?: string; attr?: string; meta?: string; svg?: true } {
+  const path = elementPath(roots, at);
+  const el = path[path.length - 1];
+  if (el === undefined) return {};
+  if (at < el.openEnd) {
+    const attr = el.attrs.find((a) => a.start <= at && at < a.end);
+    if (attr === undefined) return {};
+    const meta = attr.name === 'content' ? metaCopyName(el) : null;
+    return { tag: el.tag, attr: attr.name, ...(meta === null ? {} : { meta }) };
   }
-  return {};
+  if (el.opaque) return {};
+  // A `<title>` inside an `<svg>` names the graphic, as on the static-HTML host.
+  return { tag: el.tag, ...(path.slice(0, -1).some((up) => up.tag === 'svg') ? { svg: true as const } : {}) };
 }
+
+/** One level of where a key's value lands: the element's tag, and at the first level the classes its source writes (null where they are computed). */
+export interface SiteLevel {
+  tag: string;
+  classes: string[] | null;
+}
+/** A file's reads of each key: the render sites of its reads that write the value as an element's text, or `open` where any read is one stet cannot place. */
+export type FileSites = Map<string, { sites: SiteLevel[][]; open: boolean }>;
+
+/** The files whose reads `renderSites` places: Astro and the TypeScript family. A Vue, Svelte or MDX read is open. */
+const PLACED = /\.(?:astro|[cm]?[jt]sx?)$/;
+
+/** The children that close an open `p` in the browser's tree builder: everything that is not phrasing content (WHATWG "close a p element"). */
+const CLOSES_P = new Set([
+  'address', 'article', 'aside', 'blockquote', 'details', 'dialog', 'div', 'dl', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'main', 'menu', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'ul',
+]);
+/** The children a table part holds as written; the tree builder moves any other. */
+const TABLE_CHILDREN: Readonly<Record<string, readonly string[]>> = {
+  table: ['caption', 'colgroup', 'thead', 'tbody', 'tfoot', 'tr'],
+  thead: ['tr'],
+  tbody: ['tr'],
+  tfoot: ['tr'],
+  tr: ['td', 'th'],
+};
+const HEADING = /^h[1-6]$/;
+
+/** Whether the browser's tree builder closes or re-parents `parent` above `child`, so the source's nesting is not the page's. */
+function reparents(parent: string, child: string): boolean {
+  if (parent === 'p') return CLOSES_P.has(child);
+  if (HEADING.test(parent)) return HEADING.test(child);
+  if (parent === 'a' || parent === 'button' || parent === 'form') return child === parent;
+  const allowed = TABLE_CHILDREN[parent];
+  return allowed !== undefined && !allowed.includes(child);
+}
+
+/** The kinds of tag one tag closes when it opens inside it as written, each with the ancestors that make the inner tag a new scope instead. */
+const SELF_CLOSING: readonly { outer: readonly string[]; inner: readonly string[]; scope: readonly string[] }[] = [
+  { outer: ['li'], inner: ['li'], scope: ['ul', 'ol', 'menu'] },
+  { outer: ['dd', 'dt'], inner: ['dd', 'dt'], scope: ['dl'] },
+  { outer: ['option'], inner: ['option', 'optgroup'], scope: [] },
+  { outer: ['optgroup'], inner: ['optgroup'], scope: [] },
+  { outer: ['td', 'th'], inner: ['td', 'th'], scope: ['table'] },
+];
+/** Where a table part sits as written; the tree builder drops it, or moves it, under any other parent. */
+const TABLE_HOMES: Readonly<Record<string, readonly string[]>> = {
+  caption: ['table'],
+  colgroup: ['table'],
+  thead: ['table'],
+  tbody: ['table'],
+  tfoot: ['table'],
+  tr: ['table', 'thead', 'tbody', 'tfoot'],
+  td: ['tr'],
+  th: ['tr'],
+};
+
+/**
+ * Whether the tree builder repairs the markup along an element path (outermost
+ * first, null for a level that is not plain HTML) so the last element's place
+ * is not the source's: an ancestor it closes, or one it rebuilds, further up
+ * than the parent. The parent and child pairs `reparents` ends the chain at
+ * are not repairs here.
+ */
+function misnested(path: readonly (string | null)[]): boolean {
+  for (let j = 1; j < path.length; j += 1) {
+    const inner = path[j];
+    if (inner === null || inner === undefined) continue;
+    const parent = path[j - 1];
+    const home = TABLE_HOMES[inner];
+    if (home !== undefined && parent !== null && parent !== undefined && !home.includes(parent)) return true;
+    for (let i = j - 1; i >= 0; i -= 1) {
+      const outer = path[i];
+      if (outer === null || outer === undefined) continue;
+      const between = path.slice(i + 1, j);
+      if (
+        SELF_CLOSING.some((c) => c.outer.includes(outer) && c.inner.includes(inner) && !between.some((t) => t !== null && c.scope.includes(t))) ||
+        (i < j - 1 && reparents(outer, inner) && !TABLE_CHILDREN[outer])
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Where one read lands: an element's text (its chain, innermost first), an attribute, or somewhere stet cannot place. */
+type Placement = SiteLevel[] | 'inert' | 'open';
+
+/**
+ * Where each read of a declared key in one file of a route writes the key's
+ * value (D12): a read straight into an HTML element's text is a render site,
+ * the element's tag and classes and its parent's tag; a read into an HTML
+ * element's attribute is inert; any other read (front matter, a helper call, a
+ * component's prop or content, nested markup) opens the key. A key the file
+ * names more often than `KEY_READ` matches it (an alias, a destructure, a
+ * bracket, a key held in a variable) is open too. Throws a `RangeError` on
+ * markup nested past the compiler.
+ */
+export function renderSites(ts: typeof import('typescript'), file: string, source: string, declared: ReadonlySet<string>): FileSites {
+  const out: FileSites = new Map();
+  const code = codeOf(ts, file, source, dialectOf(file));
+  if (code === null) return out;
+  const inCode = (at: number): boolean => within(code.code, at) && !within(code.nonCode, at);
+  const place = file.endsWith('.astro') ? astroPlacement(file, source) : jsxPlacement(ts, file, source);
+  const classified = new Map<string, number>();
+  for (const found of source.matchAll(KEY_READ)) {
+    const key = found[2] ?? found[4] ?? found[5] ?? '';
+    // A read form in prose or a comment reads nothing.
+    if (!declared.has(key) || !inCode(found.index)) continue;
+    classified.set(key, (classified.get(key) ?? 0) + 1);
+    const at = place(found);
+    const entry = out.get(key) ?? { sites: [], open: false };
+    if (at === 'open') entry.open = true;
+    else if (at !== 'inert') entry.sites.push(at);
+    out.set(key, entry);
+  }
+  // A key named more often in the file's code than its classified reads is also read in a form they do not cover.
+  for (const [key, entry] of out) {
+    if (entry.open) continue;
+    let named = 0;
+    for (const m of source.matchAll(new RegExp(`(?<![\\w$])${key}(?![\\w$])`, 'g'))) if (inCode(m.index)) named += 1;
+    if (named > (classified.get(key) ?? 0)) entry.open = true;
+  }
+  return out;
+}
+
+/** An Astro element the page renders as itself: a lowercase source tag that is no slot, template, fragment or dotted name. */
+function htmlElement(source: string, el: Element): boolean {
+  return /[a-z]/.test(source[el.openStart + 1] ?? '') && !['slot', 'template', 'fragment'].includes(el.tag) && !el.tag.includes('.');
+}
+
+/** An Astro element's static classes: `[]` with no `class`, null where `class:list`, a braced `class` or a spread computes them. */
+function astroClasses(el: Element): string[] | null {
+  if (el.attrs.some((a) => a.name === 'class:list' || a.name.startsWith('{'))) return null;
+  const cls = el.attrs.find((a) => a.name === 'class');
+  if (cls === undefined) return [];
+  return !cls.quoted && cls.value.startsWith('{') ? null : cls.value.split(/\s+/).filter((c) => c !== '');
+}
+
+/** Each read of an Astro file placed by the markup around it. */
+function astroPlacement(file: string, source: string): (found: RegExpExecArray) => Placement {
+  const markup = selfClosedRaw(source);
+  const document = readDocument(file, maskExpressions(markup, 'astro'), 'astro');
+  const braces = markupBraces(markup, 'astro');
+  return (found) => {
+    if (document.faults.length > 0) return 'open';
+    const m = found.index;
+    const brace = braces.find((b) => b.start < m && m < b.end);
+    if (brace === undefined) return 'open';
+    const path = elementPath(document.roots, m);
+    const el = path[path.length - 1];
+    if (el === undefined) return 'open';
+    if (brace.inTag) {
+      if (m >= el.openEnd) return 'open';
+      const attr = el.attrs.find((a) => a.start <= m && m < a.end);
+      const printed = attr === undefined || attr.name.startsWith('{') || attr.name === 'set:html' || attr.name === 'set:text';
+      return htmlElement(source, el) && !printed ? 'inert' : 'open';
+    }
+    if (el.opaque || brace.start < el.openEnd || brace.end > el.contentEnd || !htmlElement(source, el)) return 'open';
+    // The brace's inside is the read alone: `{copy.k}`, `{ copy('k') }`.
+    const inner = source.slice(brace.start + 1, brace.end - 1);
+    const at = m - brace.start - 1;
+    const rest = found[5] !== undefined ? /^\s*$/ : /^\s*\)\s*$/;
+    if (!/^\s*$/.test(inner.slice(0, at)) || !rest.test(inner.slice(at + found[0].length))) return 'open';
+    if (misnested(path.map((up) => (htmlElement(source, up) ? up.tag : null)))) return 'open';
+    const chain: SiteLevel[] = [{ tag: el.tag, classes: astroClasses(el) }];
+    const parent = path[path.length - 2];
+    if (parent !== undefined && htmlElement(source, parent) && !reparents(parent.tag, el.tag)) chain.push({ tag: parent.tag, classes: null });
+    return chain;
+  };
+}
+
+/** Each read of a TypeScript-family file placed by the JSX around it. */
+function jsxPlacement(ts: typeof import('typescript'), file: string, source: string): (found: RegExpExecArray) => Placement {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
+  type Tagged = TS.JsxOpeningElement | TS.JsxSelfClosingElement;
+  const intrinsic = (el: Tagged): boolean => ts.isIdentifier(el.tagName) && /^[a-z]/.test(el.tagName.text);
+  const classes = (el: Tagged): string[] | null => {
+    let out: string[] | null = [];
+    for (const attr of el.attributes.properties) {
+      if (ts.isJsxSpreadAttribute(attr)) return null;
+      const name = attr.name.getText(sf);
+      if (name !== 'className' && name !== 'class') continue;
+      const value = attr.initializer !== undefined && ts.isJsxExpression(attr.initializer) ? attr.initializer.expression : attr.initializer;
+      out = value !== undefined && (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) ? value.text.split(/\s+/).filter((c) => c !== '') : null;
+    }
+    return out;
+  };
+  // The nodes a climb from one element to the next passes through: what renders a child element in place.
+  const passes = (node: TS.Node): boolean =>
+    ts.isJsxExpression(node) ||
+    ts.isJsxFragment(node) ||
+    ts.isParenthesizedExpression(node) ||
+    ts.isConditionalExpression(node) ||
+    (ts.isBinaryExpression(node) &&
+      [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken].includes(node.operatorToken.kind));
+  return (found) => {
+    const m = found.index;
+    const end = m + found[0].length;
+    let node: TS.Node = sf;
+    for (let next: TS.Node | undefined = sf; next !== undefined; ) {
+      node = next;
+      next = ts.forEachChild(node, (child) => (child.getStart(sf) <= m && end <= child.end ? child : undefined));
+    }
+    // The read itself: the call `copy('k')` or the access `copy.k`.
+    const call = found[5] === undefined;
+    let read: TS.Node | undefined = node;
+    while (read !== undefined && !(call ? ts.isCallExpression(read) && read.getStart(sf) === m : ts.isPropertyAccessExpression(read) && read.getStart(sf) === m && read.end === end)) {
+      read = read.parent;
+    }
+    if (read === undefined) return 'open';
+    const holder = read.parent;
+    if (ts.isJsxExpression(holder) && holder.dotDotDotToken === undefined && ts.isJsxElement(holder.parent) && intrinsic(holder.parent.openingElement)) {
+      const el = holder.parent;
+      const tag = (el.openingElement.tagName as TS.Identifier).text.toLowerCase();
+      const chain: SiteLevel[] = [{ tag, classes: classes(el.openingElement) }];
+      // The elements above, nearest first: a tag for an HTML element, null for a component.
+      const above: (string | null)[] = [];
+      for (let up: TS.Node = el.parent; ; up = up.parent) {
+        while (passes(up)) up = up.parent;
+        if (!ts.isJsxElement(up)) break;
+        above.push(intrinsic(up.openingElement) ? (up.openingElement.tagName as TS.Identifier).text.toLowerCase() : null);
+      }
+      if (misnested([...above].reverse().concat(tag))) return 'open';
+      const parent = above[0];
+      if (parent !== null && parent !== undefined && !reparents(parent, tag)) chain.push({ tag: parent, classes: null });
+      return chain;
+    }
+    // An attribute of an HTML element, with no element or function between it and the read.
+    for (let up: TS.Node = holder; !ts.isSourceFile(up); up = up.parent) {
+      if (ts.isJsxAttribute(up)) {
+        const name = up.name.getText(sf);
+        return intrinsic(up.parent.parent) && name !== 'dangerouslySetInnerHTML' && name !== 'children' ? 'inert' : 'open';
+      }
+      if (ts.isJsxElement(up) || ts.isJsxSelfClosingElement(up) || ts.isJsxFragment(up) || ts.isFunctionLike(up)) return 'open';
+    }
+    return 'open';
+  };
+}
+
+/** Text as a page shows it, for the coincidence test: entities decoded, whitespace collapsed. */
+const flatText = (text: string): string => collapseWhitespace(decodeEntities(text));
+/** What continues a word for the coincidence test: a letter or digit, or a character that joins a name, path or package (`@getstet/stet`). */
+const JOINS_WORD = /[\p{L}\p{N}_$@/]/u;
 
 /** A route that names a scheme rather than a path — `https:`, `javascript:`, `file:`. */
 const ABSOLUTE_ROUTE = /^[a-z][a-z0-9+.-]*:/i;

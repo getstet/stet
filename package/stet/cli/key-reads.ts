@@ -33,16 +33,8 @@ import type * as TS from 'typescript';
 
 import { normalizeNoExt, pathAliasMappings, resolveSpecifier } from './config.js';
 import { lineIndex } from './html-host.js';
-import {
-  BOGUS_COMMENT,
-  CDATA_SECTION,
-  CODE_FENCE,
-  ESM_LINE,
-  FRONTMATTER,
-  HTML_COMMENT,
-  scriptKindFor,
-  type Dialect,
-} from './source-scan.js';
+import { BOGUS_COMMENT, CDATA_SECTION, closing, CODE_FENCE, ESM_LINE, FRONTMATTER, HTML_COMMENT, openTag, VOID_ELEMENTS, type Dialect } from './markup.js';
+import { scriptKindFor } from './source-scan.js';
 
 /**
  * A read of a key: `copy.get('<key>')`, `copy('<key>')` or `get('<key>')`, and
@@ -73,18 +65,6 @@ const RAW_ATTR: Partial<Record<Dialect, RegExp>> = {
   astro: /\sis:raw(?=[\s/>=])/,
   vue: /\sv-pre(?=[\s/>=])/,
 };
-
-/**
- * The open tag at `i` (its `<`): where it ends, as `closing` reads it, its name
- * lowercased, and whether it closes itself (`<script … />`), in which case a
- * template dialect gives its element no body. The one reading of an open tag
- * `dialectCode` and the dashboard's marks route share.
- */
-export function openTag(source: string, i: number): { end: number; name: string; selfClosing: boolean } {
-  const end = closing(source, i, '>');
-  const tag = source.slice(i, end);
-  return { end, name: (/^<([A-Za-z][\w:.-]*)/.exec(tag)?.[1] ?? '').toLowerCase(), selfClosing: /\/\s*>$/.test(tag) };
-}
 
 /**
  * The code spans of a template dialect's source, at the markup level. Front
@@ -260,47 +240,6 @@ function tagCode(source: string, start: number, end: number, dialect: Dialect, b
   }
   if (end > from) out.push({ start: from, end });
   return out;
-}
-
-/**
- * The offset just past the `>` or `}` that closes the construct opening at
- * `from` — quote-aware, comment-aware inside a brace, and counting nested
- * braces, so `alt={`a > b`}` and `{ {a: 1} }` close where they do and a `}` in a
- * brace's comment closes nothing. The one brace matcher: the rename's walk and
- * the dashboard's marks route both end a brace here.
- */
-export function closing(source: string, from: number, close: '>' | '}'): number {
-  let depth = 0;
-  let quote: string | null = null;
-  for (let i = from; i < source.length; i++) {
-    const ch = source[i] as string;
-    if (quote !== null) {
-      if (ch === '\\') i += 1;
-      else if (ch === quote) quote = null;
-      continue;
-    }
-    if (depth > 0 && ch === '/' && (source[i + 1] === '*' || (source[i + 1] === '/' && source[i - 1] !== ':'))) {
-      // A comment inside an expression: a brace or quote in it closes nothing.
-      const end = source[i + 1] === '*' ? source.indexOf('*/', i + 2) : source.indexOf('\n', i + 2);
-      i = end === -1 ? source.length : source[i + 1] === '*' ? end + 1 : end - 1;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === '`') {
-      // In a tag, a quote opens only an attribute value; in a brace, any string
-      // — but a quote right after a letter is JSX text's apostrophe (`We're`),
-      // which JavaScript never writes. A backtick there is a tagged template
-      // (`t\`Hi\``), a string like any other.
-      if (depth > 0 && ch !== '`' && /[A-Za-z0-9]/.test(source[i - 1] ?? '')) continue;
-      if (close === '}' || depth > 0 || /=\s*$/.test(source.slice(Math.max(from, i - 8), i))) quote = ch;
-      continue;
-    }
-    if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (close === '}' && depth === 0) return i + 1;
-    } else if (ch === '>' && close === '>' && depth === 0) return i + 1;
-  }
-  return source.length;
 }
 
 export function within(spans: Span[], at: number): boolean {
@@ -682,9 +621,6 @@ function parsesAsOne(ts: typeof import('typescript'), inner: string): boolean {
     ts.isParenthesizedExpression(only.expression)
   );
 }
-
-/** The HTML elements that take no close tag: Astro reads `<br>` as JSX reads `<br />`. */
-const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
 
 /**
  * An attribute's value: quoted or braced as JSX writes it, or unquoted as HTML

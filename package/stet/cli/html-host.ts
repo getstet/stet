@@ -1861,12 +1861,16 @@ const DERIVE_MIN = 12;
 /** A letter or a digit: what a word boundary may not cut through. */
 const WORD_CHAR = /[\p{L}\p{N}]/u;
 
-/** The first occurrence of `part` in `text` with no letter or digit against either end, or -1. */
-function wordBoundedIndex(text: string, part: string): number {
+/**
+ * The first occurrence of `part` in `text` with no letter or digit against either
+ * end, or -1; `joins` names the characters that continue a word where a caller
+ * reads more than letters and digits as one.
+ */
+export function wordBoundedIndex(text: string, part: string, joins: RegExp = WORD_CHAR): number {
   for (let at = text.indexOf(part); at !== -1; at = text.indexOf(part, at + 1)) {
     const before = at === 0 ? '' : text.charAt(at - 1);
     const after = text.charAt(at + part.length);
-    if (!WORD_CHAR.test(before) && !WORD_CHAR.test(after)) return at;
+    if (!joins.test(before) && !joins.test(after)) return at;
   }
   return -1;
 }

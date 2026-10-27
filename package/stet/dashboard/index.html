@@ -452,11 +452,12 @@ const S = {
   choose: null,
   popover: null,
   // The unread-key scan, the open route's reads, a click on text no key matches,
-  // the key a pick warned about, the route the app moved to, and Page info's panel.
+  // the key a pick warned about, the text a pick could not place, the route the app moved to, and Page info's panel.
   usage: null,
   routeReads: null,
   unmanaged: null,
   warn: null,
+  unsure: null,
   moved: null,
   pageInfo: false,
   // The Templates tab: the slot being edited, the frame's width preset, and each template's last render
@@ -666,7 +667,7 @@ async function loadSite(path) {
   S.confirmed = new Set();
   S.census = null; S.hover = null; S.choose = null; S.usage = null; S.routeReads = null; routeReadsFor = null;
   S.frameRoute = null; readsPending = false; releaseFrame(false);
-  S.unmanaged = null; S.warn = null; S.moved = null; S.pageInfo = false;
+  S.unmanaged = null; S.warn = null; S.unsure = null; S.moved = null; S.pageInfo = false;
   S.unsavedOpen = false; S.leaveAsk = null; S.renaming = null;
   S.tplKey = null; S.tpl = { ctx: '', byName: {} };
   // A new checkout is a new route field and a new frame, and ends any start
@@ -2369,7 +2370,10 @@ async function loadRouteReads(route) {
   if (path !== S.path || routeReadsFor !== routePath(route)) return;
   readsPending = false;
   const reads = res.ok && res.body && Array.isArray(res.body.keys) ? res.body : null;
-  S.routeReads = reads === null ? null : { route: routePath(route), keys: reads.keys, complete: reads.complete === true };
+  // Where each key renders and which keys the route's files also write as text (D12), for the agent to place matches by.
+  const renders = reads !== null && reads.renders !== null && typeof reads.renders === 'object' && !Array.isArray(reads.renders) ? reads.renders : {};
+  const coincident = reads !== null && Array.isArray(reads.coincident) && reads.coincident.every((k) => typeof k === 'string') ? reads.coincident : [];
+  S.routeReads = reads === null ? null : { route: routePath(route), keys: reads.keys, complete: reads.complete === true, renders: renders, coincident: coincident };
   if (reads !== null) {
     if (reads.complete === true) S.seen.read.add(routePath(route));
     else S.seen.read.delete(routePath(route));
@@ -2388,7 +2392,7 @@ function postReads() {
   if (S.frameRoute === null) return;
   const reads = S.routeReads;
   const keys = reads !== null && reads.complete && reads.route === framePath() ? reads.keys.filter(declared) : null;
-  postToPreview({ stet: 'reads', route: S.frameRoute, keys: keys });
+  postToPreview({ stet: 'reads', route: S.frameRoute, keys: keys, renders: keys === null ? null : reads.renders, coincident: keys === null ? null : reads.coincident });
 }
 /** Whether the open page's census ran with every key because its reads are incomplete or failed. */
 function readsUnknown() {
@@ -2839,6 +2843,7 @@ function paintPaneNote() {
     else if (at && at.key === S.sel && at.draft === 'after-save') line = 'This draft is shown after Save.';
     if (line !== '') lines.push(line);
     if (S.warn === S.sel) lines.push('This text matches ' + S.sel + ', but no file on this page reads that key — saving may not change it.');
+    if (S.unsure !== null && S.unsure.key === S.sel) lines.push('This text shows in ' + S.unsure.n + " places. stet can't tell which of them come from " + S.sel + '; saving changes only those.');
     const badge = badgeOf(S.sel);
     if (badge !== null) {
       lines.push(...badge.note);
@@ -3017,7 +3022,7 @@ function hitsOf(keys) {
   for (const k of keys) {
     if (!k || typeof k !== 'object' || !declared(k.key) || !isEntry(k.entry)) continue;
     if (k.attr !== null && k.attr !== undefined && typeof k.attr !== 'string') continue;
-    out.push({ key: k.key, attr: typeof k.attr === 'string' ? k.attr : null, by: typeof k.by === 'string' ? k.by : '', entry: k.entry, inplace: k.inplace === true });
+    out.push({ key: k.key, attr: typeof k.attr === 'string' ? k.attr : null, by: typeof k.by === 'string' ? k.by : '', entry: k.entry, inplace: k.inplace === true, sure: k.sure === true });
   }
   return out;
 }
@@ -3067,6 +3072,9 @@ function choosePick(hit, again, rect, sel) {
   const reads = S.routeReads;
   S.warn = hit.by !== 'mark' && reads !== null && reads.complete && reads.route === framePath() &&
     reads.keys.indexOf(key) === -1 ? key : null;
+  // A text match on a page whose reads are complete, of a key stet could not place, shown in more than one place.
+  S.unsure = hit.attr === null && hit.by !== 'mark' && hit.sure !== true && S.warn === null && reads !== null && reads.complete &&
+    reads.route === framePath() && S.census !== null && own(S.census.found, key) && S.census.found[key] > 1 ? { key: key, n: S.census.found[key] } : null;
   selectFromFrame(key, hit.entry);
   if (!again) return;
   // At phone width, and on a touch screen at any width, the second tap focuses the field, which only then scrolls into view.
@@ -3165,6 +3173,7 @@ function endSelection() {
   S.choose = null;
   S.unmanaged = null;
   S.warn = null;
+  S.unsure = null;
   closePopover();
   render();
   locateKey(false);
@@ -4250,6 +4259,7 @@ const ACTIONS = {
     S.findings = [];
     S.located = null;
     S.warn = null;
+    S.unsure = null;
     S.unmanaged = null;
     S.choose = null;
     closePopover();
