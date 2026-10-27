@@ -6586,9 +6586,8 @@ describe('adoption', () => {
     expect(spilled).not.toContain('next ?');
     // The quoted brace-opener survives, and it is real page-title copy.
     expect(spilled).toContain('possible copy "{`stet changelog — $"');
-    // The inline-tag split, both halves, stated rather than silently repaired.
-    expect(spilled).toContain('possible copy "Managed"');
-    expect(spilled).toContain('possible copy "sending"');
+    // A sentence split by an inline tag is one finding.
+    expect(spilled).toContain('possible copy "Managed sending"');
 
     // ONE ignore comment silencing a WHOLE copy module is named — file, comment
     // line and count — on the LINE channel, with the exit unmoved even under a

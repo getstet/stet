@@ -33,6 +33,7 @@ import { targetAdapter } from '../src/targets/adapter.js';
 import { DEFAULT_TARGET, type Descriptor, type KeyDef } from '../src/types.js';
 import { headLimitsFor } from '../src/seo.js';
 import { plainOf } from '../src/validate.js';
+import { readAttrs, type HtmlAttr } from './markup.js';
 import { CliError, Report } from './report.js';
 import {
   baseName,
@@ -62,6 +63,7 @@ import {
   qualifiesAsCopy,
   undecodedEntity,
 } from './source-scan.js';
+export type { HtmlAttr } from './markup.js';
 
 // --- The grammar ------------------------------------------------------------
 
@@ -77,9 +79,6 @@ import {
  */
 const TAG_TOKEN =
   /<(\/?)([A-Za-z][A-Za-z0-9:-]*)((?:\s+[^\s"'=<>/]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*(\/?)>/g;
-
-/** One attribute inside a tag's attribute run. Match indices give the value's own offsets. */
-const ATTR = /([^\s"'=<>/]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?/gd;
 
 /** Elements that never have content, so they close themselves. */
 const VOID = new Set([
@@ -153,20 +152,6 @@ const MARK_IN_SOURCE = /\bdata-stet(-[a-z-]+)?\s*=/g;
 const MARK_WITH_VALUE = /\s*data-stet(?:-[a-z-]+)?="[^"]*"/g;
 
 // --- What the reader yields -------------------------------------------------
-
-export interface HtmlAttr {
-  /** Lower-cased. */
-  name: string;
-  /** The raw slice between the quotes, or the bare run of an unquoted value. */
-  value: string;
-  quoted: boolean;
-  /** Absolute offsets INSIDE the quotes, so a replacement never touches them. */
-  valueStart: number;
-  valueEnd: number;
-  /** The attribute's whole span, its name included. */
-  start: number;
-  end: number;
-}
 
 export interface TextSegment {
   text: string;
@@ -547,45 +532,6 @@ function fillDescendants(root: Element): void {
     }
     el.descendants = flat;
   }
-}
-
-/** One tag's attributes, with absolute offsets for the value inside its quotes. */
-function readAttrs(source: string, base: number, run: string): HtmlAttr[] {
-  const attrs: HtmlAttr[] = [];
-  ATTR.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = ATTR.exec(run)) !== null) {
-    const name = (match[1] as string).toLowerCase();
-    const raw = match[2];
-    const start = base + match.index;
-    if (raw === undefined) {
-      attrs.push({
-        name,
-        value: '',
-        quoted: false,
-        valueStart: start + (match[1] as string).length,
-        valueEnd: start + (match[1] as string).length,
-        start,
-        end: start + match[0].length,
-      });
-      continue;
-    }
-    const span = match.indices?.[2];
-    const rawStart = span === undefined ? start + match[0].indexOf(raw) : base + span[0];
-    const rawEnd = span === undefined ? rawStart + raw.length : base + span[1];
-    const quote = raw.charAt(0);
-    const quoted = quote === '"' || quote === "'";
-    attrs.push({
-      name,
-      value: quoted ? raw.slice(1, -1) : raw,
-      quoted,
-      valueStart: quoted ? rawStart + 1 : rawStart,
-      valueEnd: quoted ? rawEnd - 1 : rawEnd,
-      start,
-      end: start + match[0].length,
-    });
-  }
-  return attrs;
 }
 
 // --- The value --------------------------------------------------------------

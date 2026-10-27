@@ -31,6 +31,7 @@ import type { CliIo } from './main.js';
 import { detectPagesRoots, htmlPageOf, pageOfFile, proposePages } from './pages.js';
 import { CliError, clip, lineCol, plural, posixRelative, Report } from './report.js';
 import {
+  astroFindings,
   dialectOf,
   isJsxFile,
   loadTypescript,
@@ -50,8 +51,8 @@ const LITERAL_EXCERPT = 60;
 
 interface BaselineEntry {
   file: string;
-  /** A literal's own context, plus `'dialect'` — the text detector's, which no `LocatedLiteral` can carry. */
-  context: LocatedLiteral['context'] | 'dialect' | 'html';
+  /** A literal's own context, plus `'dialect'` — the text detector's, which no `LocatedLiteral` can carry — and `'data'`, the display strings of module-scope data. */
+  context: LocatedLiteral['context'] | 'dialect' | 'data' | 'html';
   text: string;
 }
 
@@ -285,18 +286,29 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
       continue;
     }
     if (dialect !== null) {
-      for (const found of scanDialect(file, source, dialect)) {
-        if (baselined({ file, context: 'dialect', text: found.text })) continue;
-        const { line } = lineCol(source, found.pos);
+      // An Astro file's front matter is read through the compiler, its markup
+      // never; where the compiler is missing the markup is still reported.
+      const astro = dialect === 'astro' ? astroFindings(compilerRefusal === null ? await loadTypescript() : null, file, source) : null;
+      const found = [
+        ...(astro === null ? scanDialect(file, source, dialect) : astro.markup).map((finding) => ({ finding, context: 'dialect' as const })),
+        ...(astro?.data ?? []).map((finding) => ({ finding, context: 'data' as const })),
+      ];
+      for (const { finding, context } of found) {
+        if (baselined({ file, context, text: finding.text })) continue;
+        const { line } = lineCol(source, finding.pos);
         // No proposed key: nothing text-level can tell an attribute from
         // content, and a guessed key poisons the registry register would trust.
         report.warn(
           'scan',
-          `${file}:${line} possible copy ${JSON.stringify(clip(found.text, LITERAL_EXCERPT))}`,
+          `${file}:${line} possible copy ${JSON.stringify(clip(finding.text, LITERAL_EXCERPT))}`,
           undefined,
           { at: { file, line } },
         );
         warned += 1;
+      }
+      if (astro !== null && astro.data === null) {
+        neededCompiler = true;
+        report.line(`${file}: front matter not scanned — typescript is unavailable`);
       }
       continue;
     }
@@ -335,6 +347,13 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
       }
       handoff = { sourceFile: result.sourceFile, claimed: result.claimed };
       i18nLines(file, source, result.i18nSkips);
+      // Display strings in module-scope data: reported like the dialects' text, no key proposed.
+      for (const found of result.data) {
+        if (baselined({ file, context: 'data', text: found.text })) continue;
+        const { line } = lineCol(source, found.pos);
+        report.warn('scan', `${file}:${line} possible copy ${JSON.stringify(clip(found.text, LITERAL_EXCERPT))}`, undefined, { at: { file, line } });
+        warned += 1;
+      }
       for (const literal of result.literals) {
         if (baselined({ file, context: literal.context, text: literal.text })) continue;
         const { line, col } = lineCol(source, literal.pos);

@@ -19,12 +19,14 @@ import { heldTextOf } from './html-host.js';
 import { isHeadKind, numberNames } from './key-names.js';
 import { pageOfFile } from './pages.js';
 import { planMount, type MountPlan } from './provider-mount.js';
-import type { Report } from './report.js';
+import { lineCol, type Report } from './report.js';
 import { planRewrite } from './rewrite.js';
 import {
+  componentName,
   dialectOf,
   isJsxFile,
   matchGlob,
+  nonCopyProp,
   scanModule,
   scanSource,
   type LocatedLiteral,
@@ -138,6 +140,8 @@ export interface JsxRun {
   refusals: string[];
   /** Template-dialect files in the managed surfaces: read by scan's dialect walk, never parsed or rewritten here. */
   dialectFiles: string[];
+  /** Display strings in the module-scope data of JSX files: reported, never rewritten. */
+  dataFindings: Array<{ file: string; line: number; text: string }>;
   /** The copy-module walk's results and property names, which the naming reserves. */
   modules: Map<string, ModuleScanResult>;
   propertyNames: Map<string, string>;
@@ -168,6 +172,7 @@ export async function planJsxRun(input: {
   // meet, and the parsed map above already yields a single refusal per file.
   const refusals: string[] = [];
   const dialectFiles: string[] = [];
+  const dataFindings: JsxRun['dataFindings'] = [];
 
   // The text each declared web `text` key holds, as the descriptor stood before
   // the run: a literal whose text a key already holds reads that key rather
@@ -204,10 +209,18 @@ export async function planJsxRun(input: {
     // Recorded BEFORE the early returns below: this walk classified the file's
     // JSX positions whether or not it went on to adopt any of them.
     parsed.set(file, result);
-    if (result.literals.length === 0) continue;
+    for (const found of result.data) dataFindings.push({ file, line: lineCol(source, found.pos).line, text: found.text });
+    // A component's prop that carries words no visitor reads (`aria-*`, a test id, an event name) is
+    // reported and left, and it takes no part in the run: no name, no key to share.
+    const candidates = result.literals.filter((literal) => {
+      if (literal.context !== 'jsx-attr' || literal.place?.attr === undefined || !componentName(literal.place.tag) || !nonCopyProp(literal.place.attr)) return true;
+      report.warn('scan', `${file}: ${JSON.stringify(literal.proposedKey)} ${skipReason('non-copy-prop')} — adopt by hand`);
+      return false;
+    });
+    if (candidates.length === 0) continue;
 
     const target = targetFor(file, config);
-    for (const literal of result.literals) located.push({ literal, target });
+    for (const literal of candidates) located.push({ literal, target });
     const kind = kindFor(file, result.hasUseClient, config, forcedKind);
     if (kind === null) {
       report.warn('scan', `${file}: ambiguous — an un-directived App-Router component; re-run with --kind server|client`);
@@ -216,7 +229,7 @@ export async function planJsxRun(input: {
     // The first client-kind file asks for the mount once; the answer holds for the run.
     if (kind === 'client' && mount === undefined) mount = await planMount(cwd, config);
     if (kind === 'client' && mount === null) {
-      for (const literal of result.literals) {
+      for (const literal of candidates) {
         report.warn(
           'scan',
           `${file}: ${JSON.stringify(literal.proposedKey)} needs a client rewrite, but the CopyProvider mount could not be located in ` +
@@ -229,7 +242,7 @@ export async function planJsxRun(input: {
     // no name, so a run's numbers have no gaps. Neither depends on the key's name.
     // A literal a declared key already holds skips the gate — its value is
     // declared — and only its rewrite is proven.
-    const literals = result.literals.filter((literal) => {
+    const literals = candidates.filter((literal) => {
       const reuse = target === DEFAULT_TARGET ? index.get(literal.text)?.[0] : undefined;
       if (reuse === undefined) {
         const passed = validateUnnamed({
@@ -307,6 +320,7 @@ export async function planJsxRun(input: {
     sharedWith,
     refusals,
     dialectFiles,
+    dataFindings,
     modules,
     propertyNames,
     ...(typeof mount === 'object' && mount !== null ? { mount } : {}),
@@ -348,7 +362,8 @@ export function targetFor(file: string, config: StetConfig): Target {
   return config.emailSurfaces.some((g) => matchGlob(g, file)) ? EMAIL_TARGET : DEFAULT_TARGET;
 }
 
-function skipReason(skip: 'no-component-body' | 'copy-collision'): string {
+function skipReason(skip: 'no-component-body' | 'copy-collision' | 'non-copy-prop'): string {
+  if (skip === 'non-copy-prop') return 'is a prop stet does not rewrite (aria-*, testid, event)';
   return skip === 'copy-collision'
     ? 'a foreign `copy` is already bound in scope'
     : 'a client literal with no enclosing component body';

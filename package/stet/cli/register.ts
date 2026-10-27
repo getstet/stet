@@ -134,7 +134,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report,
     ...(forcedKind === undefined ? {} : { forcedKind }),
   });
-  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, modules, propertyNames, mount } = jsxRun;
+  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, dataFindings, modules, propertyNames, mount } = jsxRun;
   // The fallback warns named the layout; the snippet names the edit, once.
   if (jsxRun.mountUnlocated && config.rootLayout !== undefined && config.router !== 'astro') {
     report.line(`${config.rootLayout}: could not locate the wrap point unambiguously — mount the CopyProvider by hand:`);
@@ -313,6 +313,13 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   for (const line of collapseLines(
     dialectFiles.map((f) => `${f}: ${f.slice(f.lastIndexOf('.'))} is not rewritten — place copy('<key>') by hand`),
     `${dialectFiles.length} files are not rewritten (${extensions.join(', ')}) — place copy('<key>') by hand; run with --verbose to list them`,
+    verbose,
+  )) {
+    report.line(line);
+  }
+  for (const line of collapseLines(
+    dataFindings.map((f) => `${f.file}:${f.line}: ${JSON.stringify(clip(f.text, ADOPTED_EXCERPT))} sits in data — place copy('<key>') by hand`),
+    `${dataFindings.length} strings in data (arrays and objects) are not rewritten — place copy('<key>') by hand; run with --verbose to list them`,
     verbose,
   )) {
     report.line(line);

@@ -45,7 +45,20 @@ import {
   type Place,
   type SectionNode,
 } from './key-names.js';
-import { blankNonMarkup, type Dialect } from './markup.js';
+import {
+  blankNonMarkup,
+  closing,
+  dialectCode,
+  FRONTMATTER,
+  markupBraces,
+  maskExpressions,
+  openTag,
+  readAttrs,
+  selfClosedRaw,
+  VOID_ELEMENTS,
+  type Dialect,
+  type Span as MarkupSpan,
+} from './markup.js';
 import { CliError } from './report.js';
 // The markup layer's names this module's importers read from here.
 export { BOGUS_COMMENT, blankNonMarkup, CDATA_SECTION, CODE_FENCE, ESM_LINE, FRONTMATTER, HTML_COMMENT, type Dialect } from './markup.js';
@@ -249,6 +262,8 @@ export interface ScanResult {
   resolvedMapDeclSpans: Span[];
   i18nSkips: I18nSkip[];
   parseErrors: boolean;
+  /** Display strings in module-scope data (`dataLiterals`): reported, never rewritten. */
+  data: DialectFinding[];
   /**
    * The parse itself, so a file BOTH declarations match is parsed once: the
    * copy-module walk runs over this rather than building a second tree.
@@ -269,6 +284,59 @@ export interface ScanResult {
 
 /** The JSX attributes that carry copy — every other attribute is structural. */
 const COPY_ATTRS = new Set(['alt', 'title', 'placeholder', 'aria-label', 'label', 'caption', 'summary', 'content']);
+
+/** Prop names that configure a component rather than carry its words. */
+export const STRUCTURAL_NAMES = new Set(['class', 'classname', 'style', 'id', 'key', 'ref', 'slot', 'href', 'src', 'srcset', 'sizes', 'to', 'as', 'name', 'type', 'variant', 'size', 'kind', 'tone', 'color', 'hue', 'flag', 'icon', 'lang', 'dir', 'role', 'rel', 'target', 'width', 'height', 'loading', 'decoding', 'media', 'method', 'action', 'for', 'form', 'value', 'url', 'path', 'slug', 'img', 'image']);
+
+/** The structural names whose object value still holds words (`media: { caption }`). */
+const OBJECT_COPY_NAMES = new Set(['media', 'img', 'image', 'icon']);
+
+/**
+ * Component props that wire the page rather than carry words — a layout choice,
+ * a gradient, a font. Props only: a data field of the same name (`format:
+ * "Plain text"`) is copy, so `STRUCTURAL_NAMES`, which the data walk reads, leaves them out. A name
+ * that can carry a job title or a caption (`position`) is not here.
+ */
+const WIRING_PROPS = new Set(['gradient', 'align', 'justify', 'mode', 'theme', 'direction', 'layout', 'sort', 'order', 'columns', 'pattern', 'query', 'locale', 'format', 'font', 'transition', 'animation', 'easing']);
+
+/** A prop named for what it wires (`wrapperClass`, `iconColor`, `heroUrl`), in any case: Astro attribute names reach here lowercased. */
+const WIRING_SUFFIX = /.(?:class|classes|classname|style|styles|url|href|src|path|ref|variant|color)$/i;
+
+/**
+ * An event handler prop: camelCase (`onClick`) or, where the case is lost, a DOM
+ * event name (`onclick`). A bare `on` prefix is no test, so `only`, `once` and `online` stay copy.
+ */
+const EVENT_PROP = /^on(?:[A-Z]|(?:click|dblclick|change|input|submit|reset|focus|blur|invalid|select|toggle|load|error|scroll|resize|wheel|copy|cut|paste|drop|drag(?:start|end|enter|leave|over)?|key(?:down|up|press)|mouse(?:down|up|over|out|enter|leave|move)|pointer(?:down|up|move|enter|leave|over|out|cancel)|touch(?:start|end|move|cancel))$)/;
+
+/**
+ * Whether a tag's attribute only wires the page, so a name inside its braces
+ * (`class={variants[v]}`) shows no data: a structural name, a namespaced one
+ * (`class:list`), `data-…` or an event.
+ */
+function structuralAttr(name: string): boolean {
+  return STRUCTURAL_NAMES.has(name.toLowerCase()) || name.includes(':') || /^data-/i.test(name) || EVENT_PROP.test(name);
+}
+
+/**
+ * Whether a component's string prop reads as words: a name that is not
+ * structural, not a wiring prop, not namespaced (`client:load`, `set:html`), not
+ * `data-…` or an event (`onClick`), and a value of two or more words that is no path or URL.
+ */
+export function componentProse(name: string, value: string): boolean {
+  if (structuralAttr(name) || WIRING_PROPS.has(name.toLowerCase()) || WIRING_SUFFIX.test(name)) return false;
+  const text = value.trim();
+  return /\s/.test(text) && qualifiesAsCopy(text) && !/^(?:\/|#|\.\.?\/)|:\/\//.test(text);
+}
+
+/** A prop name that carries words no visitor reads: reported by scan, never rewritten (L20). */
+export function nonCopyProp(name: string): boolean {
+  return /^aria-(?!label$)/i.test(name) || /^(?:testid|data-testid|event|eventname)$/i.test(name);
+}
+
+/** Whether a JSX or Astro tag name is a component: an uppercase first letter or a property access. */
+export function componentName(tag: string | undefined): boolean {
+  return tag !== undefined && (/^[A-Z]/.test(tag) || tag.includes('.'));
+}
 
 /** Structural `send()` object fields — routing and body wiring, never copy. */
 const SEND_DENY = new Set(['from', 'to', 'cc', 'bcc', 'replyTo', 'reply_to', 'html', 'react', 'headers', 'attachments']);
@@ -971,6 +1039,7 @@ export async function scanSource(
     resolvedMapDeclSpans: [],
     i18nSkips: [],
     parseErrors: false,
+    data: [],
     sourceFile: sf,
     claimed: [],
   };
@@ -1279,6 +1348,12 @@ export async function scanSource(
     partials.push({ pos, end: lit.end, raw: source.slice(pos, lit.end), text: lit.text, context: 'send-arg', enclosingBodyPos: enclosingComponentBodyPos(lit), copyBinding: copyBindingAt(lit), ...placeOf(lit, undefined) });
   };
 
+  const jsxNames = new Set<string>();
+  const collectNames = (node: TS.Node): void => {
+    if (ts.isIdentifier(node)) jsxNames.add(node.text);
+    ts.forEachChild(node, collectNames);
+  };
+
   const visit = (node: TS.Node): void => {
     if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
@@ -1372,9 +1447,12 @@ export async function scanSource(
       claimed.push({ pos: node.getStart(sf), end: node.end });
       const name = node.name.getText(sf);
       const init = node.initializer;
-      // An empty `alt` declares a decorative image: no copy, no key.
-      if (COPY_ATTRS.has(name) && init && ts.isStringLiteral(init) && !(name === 'alt' && init.text === '') && !insideI18nElement(ts, sf, node)) {
-        const element = elementOfAttr(node);
+      // An empty `alt` declares a decorative image: no copy, no key. A component's
+      // string prop is copy where it reads as words (`componentProse`), the Astro
+      // detector's own predicate.
+      const element = elementOfAttr(node);
+      const component = element !== undefined && componentName(jsxTagName(ts, sf, element));
+      if (init && ts.isStringLiteral(init) && (COPY_ATTRS.has(name) || (component && componentProse(name, init.text))) && !(name === 'alt' && init.text === '') && !insideI18nElement(ts, sf, node)) {
         if (!element || !hasJsxIgnoreBefore(ts, sf, element)) {
           // Decode entities so the seeded default matches what render shows —
           // after adopt the value is served via `alt={copy('key')}`, an
@@ -1386,6 +1464,9 @@ export async function scanSource(
         }
       }
     }
+
+    // The names a rendered expression mentions: module data is shown where one of them is its name.
+    if (ts.isJsxExpression(node) && !(ts.isJsxAttribute(node.parent) && structuralAttr(node.parent.name.getText(sf)))) collectNames(node);
 
     ts.forEachChild(node, visit);
   };
@@ -1446,7 +1527,9 @@ export async function scanSource(
     importInsertPos,
   }));
 
-  return { file, hasUseClient, literals, accessorCalls, stetImportSpans, copyDeclSpans, resolvedMapDeclSpans, i18nSkips, parseErrors: false, sourceFile: sf, claimed };
+  const data = dataLiterals(ts, sf, 0, (name) => jsxNames.has(name));
+
+  return { file, hasUseClient, literals, accessorCalls, stetImportSpans, copyDeclSpans, resolvedMapDeclSpans, i18nSkips, parseErrors: false, data, sourceFile: sf, claimed };
 }
 
 /**
@@ -1877,6 +1960,219 @@ function isCodeSpillover(text: string): boolean {
 }
 
 /**
+ * The inline tags of one sentence (R29, J12): every inline element but `br` and
+ * `wbr`, lowercase source names only. A component is never inline; `br`, `wbr`
+ * and the interactive and embedded elements (`button`, `input`, `select`,
+ * `textarea`, `img`, `svg`, `iframe`) break a sentence. D16's sentence keys
+ * carry exactly this set.
+ */
+export const INLINE = new Set(['a', 'abbr', 'b', 'bdi', 'bdo', 'cite', 'code', 'data', 'del', 'dfn', 'em', 'i', 'ins', 'kbd', 'mark', 'q', 's', 'samp', 'small', 'span', 'strong', 'sub', 'sup', 'time', 'u', 'var']);
+
+/** One open or close tag read out of a dialect's markup. `name` is the source spelling. */
+interface MarkupTag {
+  start: number;
+  end: number;
+  name: string;
+  close: boolean;
+  selfClosing: boolean;
+}
+
+/**
+ * Every tag of `markup`, each ended by `openTag` (a close tag by `closing`), so
+ * a brace or a quote inside a tag never ends it early.
+ */
+function markupTags(markup: string): MarkupTag[] {
+  const tags: MarkupTag[] = [];
+  for (let i = 0; i < markup.length; i++) {
+    if (markup[i] !== '<') continue;
+    const next = markup[i + 1] ?? '';
+    const close = next === '/' && /[A-Za-z]/.test(markup[i + 2] ?? '');
+    if (!close && !/[A-Za-z]/.test(next)) continue;
+    const open = close ? null : openTag(markup, i);
+    const end = open === null ? closing(markup, i, '>') : open.end;
+    const name = /^<\/?([A-Za-z][\w:.-]*)/.exec(markup.slice(i, end))?.[1] ?? '';
+    tags.push({ start: i, end, name, close, selfClosing: open?.selfClosing ?? false });
+    i = Math.max(i + 1, end) - 1;
+  }
+  return tags;
+}
+
+/**
+ * The markup the tag passes read: the source with every `{…}` expression's
+ * inside masked, so a quote inside `onclick={`…`}` opens nothing, and every
+ * character `work` blanked (a comment, a script, the front matter) blank here
+ * too. Every offset stays put.
+ */
+function markupOf(source: string, work: string, dialect: Dialect): string {
+  const masked = maskExpressions(selfClosedRaw(source), dialect);
+  let out = '';
+  for (let i = 0; i < masked.length; i++) out += work[i] === '\0' ? '\0' : (masked[i] as string);
+  return out;
+}
+
+/** Text with a letter or a digit in it, once its entities are decoded (`&nbsp;` and `&#123;` hold neither). */
+const HAS_WORD = /[\p{L}\p{N}]/u;
+
+/** A bare number — a step counter (`01`), an ordinal (`2.`, `3)`) or a footnote mark (`1`). */
+const COUNTER = /^\p{N}+[.):]?$/u;
+
+/** `markup` as the reader sees its text: tags dropped, entities decoded. */
+const plainText = (markup: string): string => decodeEntities(markup.replace(/<[^>]*>/g, ''));
+
+/**
+ * Whether an inline element is page decoration rather than part of the sentence
+ * around it: its `content` is a bare number, and the parent's text on one side
+ * of it (`before`, `after`: the markup up to the parent's edge) holds no letter
+ * or digit, so the number leads or trails its line. `Scan your components` stays
+ * the words; `Price: <b>5</b> per month` and `✓ wrote a.json` keep their marks.
+ * The one rule scan's inline join and the JSX sentence builder share.
+ */
+export function isDecorativeCounter(content: string, before: string, after: string): boolean {
+  if (!COUNTER.test(plainText(content).trim())) return false;
+  return !HAS_WORD.test(plainText(before)) || !HAS_WORD.test(plainText(after));
+}
+
+/**
+ * The inline tags that join a sentence: each tag of `INLINE`, open and close, whose
+ * parent element holds direct text with a letter or digit. One stack walk: a
+ * close tag pops to the nearest open element of its name, a void or
+ * self-closing tag pushes nothing, and text at the top of the file belongs to
+ * the file.
+ */
+function inlineSpans(markup: string, tags: MarkupTag[]): MarkupSpan[] {
+  interface Open {
+    name: string;
+    parent: number;
+    /** Whether the element holds direct text with a letter or a digit. */
+    text: boolean;
+    selfClosing: boolean;
+    /** Whether a `pre` encloses it: a code sample's lines are not one sentence. */
+    pre: boolean;
+    /** The offsets of its content: after the open tag, and at the close tag (the end of the markup if none). */
+    contentStart: number;
+    contentEnd: number;
+    spans: MarkupSpan[];
+  }
+  const elements: Open[] = [];
+  const stack: number[] = [];
+  let root = false;
+  const noteText = (from: number, to: number): void => {
+    if (to <= from || !HAS_WORD.test(decodeEntities(markup.slice(from, to)))) return;
+    const top = stack.at(-1);
+    if (top === undefined) root = true;
+    else (elements[top] as Open).text = true;
+  };
+  let at = 0;
+  for (const tag of tags) {
+    noteText(at, tag.start);
+    at = tag.end;
+    if (tag.close) {
+      for (let j = stack.length - 1; j >= 0; j--) {
+        const open = elements[stack[j] as number] as Open;
+        if (open.name !== tag.name) continue;
+        open.spans.push({ start: tag.start, end: tag.end });
+        for (const popped of stack.slice(j)) (elements[popped] as Open).contentEnd = tag.start;
+        stack.length = j;
+        break;
+      }
+      continue;
+    }
+    const parent = stack.at(-1) ?? -1;
+    const empty = tag.selfClosing || VOID_ELEMENTS.has(tag.name);
+    elements.push({
+      name: tag.name,
+      parent,
+      text: false,
+      selfClosing: tag.selfClosing,
+      pre: stack.some((i) => (elements[i] as Open).name === 'pre'),
+      contentStart: tag.end,
+      contentEnd: empty ? tag.end : markup.length,
+      spans: [{ start: tag.start, end: tag.end }],
+    });
+    if (!empty) stack.push(elements.length - 1);
+  }
+  noteText(at, markup.length);
+  // The parent's content, around an element: the whole markup for a top-level one.
+  const around = (el: Open, from: number, to: number): [string, string] => [markup.slice(from, el.spans[0]?.start), markup.slice(el.spans.at(-1)?.end, to)];
+  const decorates = (el: Open): boolean => {
+    const parent = el.parent < 0 ? undefined : (elements[el.parent] as Open);
+    const [before, after] = around(el, parent?.contentStart ?? 0, parent?.contentEnd ?? markup.length);
+    return isDecorativeCounter(markup.slice(el.contentStart, el.contentEnd), before, after);
+  };
+  return elements
+    .filter((el) => INLINE.has(el.name) && !el.selfClosing && !el.pre && (el.parent < 0 ? root : (elements[el.parent] as Open).text) && !decorates(el))
+    .flatMap((el) => el.spans);
+}
+
+/** Replaces each span of `text` with spaces, keeping its newlines. */
+function blankSpans(text: string, spans: MarkupSpan[]): string {
+  let out = '';
+  let from = 0;
+  for (const span of [...spans].sort((a, b) => a.start - b.start)) {
+    if (span.start < from) continue;
+    out += text.slice(from, span.start) + text.slice(span.start, span.end).replace(/[^\n]/g, ' ');
+    from = span.end;
+  }
+  return out + text.slice(from);
+}
+
+/**
+ * The quoted attributes of a dialect's tags that carry words: a name of
+ * `COPY_ATTRS` (`content` only on a `<meta>` whose `name` or `property` is
+ * copy, as the static-HTML host reads it), or any prop of a component that
+ * reads as words (`componentProse`). A finding sits at its value's first
+ * character, the text entity-decoded and collapsed.
+ */
+function attributeFindings(file: string, source: string, markup: string, tags: MarkupTag[]): DialectFinding[] {
+  const found: DialectFinding[] = [];
+  for (const tag of tags) {
+    if (tag.close) continue;
+    const base = tag.start + 1 + tag.name.length;
+    const attrs = readAttrs(markup, base, markup.slice(base, markup.charAt(tag.end - 1) === '>' ? tag.end - 1 : tag.end));
+    const component = componentName(tag.name);
+    for (const attr of attrs) {
+      if (!attr.quoted) continue;
+      const text = collapseWhitespace(decodeEntities(source.slice(attr.valueStart, attr.valueEnd)));
+      if (text === '') continue;
+      const copy =
+        attr.name === 'content'
+          ? tag.name === 'meta' && metaCopyNameOf('meta', (name) => attrs.find((a) => a.name === name)?.value) !== null
+          : COPY_ATTRS.has(attr.name);
+      if (copy || (component && componentProse(attr.name, text))) found.push({ file, pos: attr.valueStart, text });
+    }
+  }
+  return found;
+}
+
+/**
+ * The words between two tags inside an Astro content brace
+ * (`{flags.changelog && <a href="/changelog">Changelog</a>}`), where the brace
+ * is also one `dialectCode` reads (a raw element's braces are text). Text
+ * before the first tag or after the last is code; a run holding braces,
+ * `=>`, `&&`, `||` or `;`, or opening or closing with a parenthesis, is code too.
+ */
+function braceFindings(file: string, source: string, work: string): DialectFinding[] {
+  const found: DialectFinding[] = [];
+  const code = dialectCode(source, 'astro').braces;
+  for (const brace of markupBraces(selfClosedRaw(source), 'astro')) {
+    if (brace.inTag || !code.some((c) => c.start === brace.start)) continue;
+    const base = brace.start + 1;
+    const inside = work.slice(base, brace.end - 1);
+    if (!/<[A-Za-z]/.test(inside)) continue;
+    const tags = markupTags(inside);
+    for (let k = 0; k + 1 < tags.length; k++) {
+      const from = (tags[k] as MarkupTag).end;
+      const run = inside.slice(from, (tags[k + 1] as MarkupTag).start);
+      const text = run.trim();
+      if (text === '' || run.includes('\0') || !qualifiesAsCopy(text)) continue;
+      if (/[{};]|=>|&&|\|\|/.test(text) || /^[()]|[()]$/.test(text)) continue;
+      found.push({ file, pos: base + from + (run.length - run.trimStart().length), text });
+    }
+  }
+  return found;
+}
+
+/**
  * The template-dialect detector — pure text, and deliberately compiler-free, so
  * it works where the compiler does not load (`eject` serves such an install) and
  * the host's TypeScript version is not read at all.
@@ -1885,30 +2181,46 @@ function isCodeSpillover(text: string): boolean {
  * eats `<!--` and `-->` and leaks the comment's prose as copy. What survives is
  * prose candidates, and a run qualifies on the same bar the module walk uses.
  *
- * Two limits ride it, both stated rather than silent. Attribute values die with
- * the tag strip — the JSX path's COPY attributes (`alt`, `title`,
- * `placeholder`, `aria-label`) are exactly what a text detector cannot see —
- * and frontmatter and script blocks are stripped whole, so copy a component
- * declares in its frontmatter const is not found here.
+ * Three reads come before the strip, each over the markup with its expressions
+ * masked: the quoted attributes of each tag (`attributeFindings`), the words
+ * between tags inside a content brace (`braceFindings`), and the inline tags
+ * that join a sentence — those of `INLINE` whose parent holds text of its own
+ * are blanked to spaces, so `run <b>npx x init</b> and answer` is one finding
+ * rather than three. Every other tag still ends a run.
+ *
+ * One limit rides it, stated rather than silent: frontmatter and script blocks
+ * are stripped whole, so a frontmatter const's strings are `astroFindings`'
+ * to read, through the compiler.
  */
 export function scanDialect(file: string, source: string, dialect: Dialect): DialectFinding[] {
   let work = blankNonMarkup(source, dialect);
+  const markup = markupOf(source, work, dialect);
+  const tags = markupTags(markup);
+  const found = attributeFindings(file, source, markup, tags);
+  if (dialect === 'astro') found.push(...braceFindings(file, source, work));
+  const joined = inlineSpans(markup, tags);
+  work = blankSpans(work, joined);
   const strip = (pattern: RegExp): void => {
     work = work.replace(pattern, (match) => match.replace(/[^\n]/g, '\0'));
   };
   strip(TAG);
   strip(BRACED);
 
-  const findings: DialectFinding[] = [];
   let start = -1;
   const flush = (end: number): void => {
     if (start < 0) return;
     const from = start;
     start = -1;
     const run = work.slice(from, end);
-    const text = run.trim();
+    // A run that crossed a joined tag reads from the source with those tags
+    // removed, so `foo<b>bar</b>` is `foobar`, as the page shows it.
+    const crossed = joined.filter((span) => span.start < end && span.end > from);
+    const text =
+      crossed.length === 0
+        ? run.trim()
+        : collapseWhitespace(decodeEntities(removeSpans(source, from, end, crossed)));
     if (text !== '' && !isCodeSpillover(text) && qualifiesAsCopy(text)) {
-      findings.push({ file, pos: from + (run.length - run.trimStart().length), text });
+      found.push({ file, pos: from + (run.length - run.trimStart().length), text });
     }
   };
   for (let i = 0; i < work.length; i++) {
@@ -1920,7 +2232,107 @@ export function scanDialect(file: string, source: string, dialect: Dialect): Dia
     if (start < 0) start = i;
   }
   flush(work.length);
-  return findings;
+  // In file order; the one text two passes both reach is one finding.
+  found.sort((a, b) => a.pos - b.pos);
+  return found.filter((finding, i) => i === 0 || finding.pos !== (found[i - 1] as DialectFinding).pos);
+}
+
+/** `source[from, end)` with each span cut out. */
+function removeSpans(source: string, from: number, end: number, spans: MarkupSpan[]): string {
+  let out = '';
+  let at = from;
+  for (const span of [...spans].sort((a, b) => a.start - b.start)) {
+    out += source.slice(at, Math.max(at, span.start));
+    at = Math.max(at, Math.min(span.end, end));
+  }
+  return out + source.slice(at, end);
+}
+
+/**
+ * String literals a file's module-scope data holds as words, where the data is
+ * shown (`shown(name)`): the top-level `const` statements (exported or not)
+ * with plain-identifier declarations and no ignore marker before them. The
+ * walk enters the initializer through `as const`, `satisfies`, parentheses,
+ * array elements, spreads, both arms of a conditional and the values of an
+ * object's properties whose name is not structural (an object under `media`,
+ * `img`, `image` or `icon` is still read by its own property names); a call,
+ * a function, an identifier, a property access or a template with
+ * substitutions ends it.
+ * `base` is the region's offset in its file.
+ */
+export function dataLiterals(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+  base: number,
+  shown: (name: string) => boolean,
+): DialectFinding[] {
+  const found: DialectFinding[] = [];
+  const walk = (node: TS.Node): void => {
+    if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node) || ts.isParenthesizedExpression(node) || ts.isSpreadElement(node)) {
+      walk(node.expression);
+    } else if (ts.isArrayLiteralExpression(node)) {
+      for (const element of node.elements) walk(element);
+    } else if (ts.isConditionalExpression(node)) {
+      walk(node.whenTrue);
+      walk(node.whenFalse);
+    } else if (ts.isObjectLiteralExpression(node)) {
+      for (const property of node.properties) {
+        if (!ts.isPropertyAssignment(property)) continue;
+        const name = propName(ts, property.name);
+        // A structural name keeps its own string out, but an object under a media
+        // name (`media: { kind: "code", caption: "stet scan output" }`) is read by its own names.
+        if (name === undefined || !STRUCTURAL_NAMES.has(name.toLowerCase()) || (ts.isObjectLiteralExpression(property.initializer) && OBJECT_COPY_NAMES.has(name.toLowerCase()))) walk(property.initializer);
+      }
+    } else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      const text = node.text;
+      if (qualifiesAsCopy(text) && !/^(?:\/|#|\.\.?\/|[\w.-]+\.\w{2,4}$)|:\/\//.test(text) && (/\s/.test(text) || /^\p{Lu}/u.test(text))) {
+        found.push({ file: sf.fileName, pos: node.getStart(sf) + base, text });
+      }
+    }
+  };
+  for (const statement of sf.statements) {
+    if (!ts.isVariableStatement(statement) || (statement.declarationList.flags & ts.NodeFlags.Const) === 0) continue;
+    const marked = (ts.getLeadingCommentRanges(sf.text, statement.getFullStart()) ?? []).some((r) => sf.text.slice(r.pos, r.end).includes(IGNORE_MARKER));
+    if (marked) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (ts.isIdentifier(declaration.name) && declaration.initializer !== undefined && shown(declaration.name.text)) walk(declaration.initializer);
+    }
+  }
+  return found;
+}
+
+/**
+ * An Astro file's findings, the one reading scan and register share: the
+ * markup detector's, and its front matter's data where the compiler is at hand
+ * (`null` where it is not and the front matter holds a `const`). The front
+ * matter is read at offset 1 after a byte-order mark; a body that does not
+ * parse yields no data. A name is shown where a top-level brace of the markup,
+ * in an element's content or on an attribute that is not wiring, mentions it.
+ */
+export function astroFindings(
+  ts: typeof import('typescript') | null,
+  file: string,
+  source: string,
+): { markup: DialectFinding[]; data: DialectFinding[] | null } {
+  const markup = scanDialect(file, source, 'astro');
+  const bom = source.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const body = FRONTMATTER.exec(source.slice(bom));
+  if (body === null) return { markup, data: [] };
+  if (ts === null) return { markup, data: /\bconst\b/.test(body[0]) ? null : [] };
+  const open = bom + body[0].indexOf('\n') + 1;
+  const sf = ts.createSourceFile(file, source.slice(open, bom + body[0].lastIndexOf('\n')), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const diagnostics = (sf as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics ?? [];
+  if (diagnostics.length > 0) return { markup, data: [] };
+  const page = source.slice(bom);
+  // A brace on a wiring attribute (`class={variants[v]}`) shows no data.
+  const braces = markupBraces(page, 'astro')
+    .filter((brace) => {
+      if (!brace.inTag) return true;
+      const attr = /([\w:.-]+)\s*=\s*$/.exec(page.slice(0, brace.start))?.[1];
+      return attr === undefined || !structuralAttr(attr);
+    })
+    .map((brace) => page.slice(brace.start, brace.end));
+  return { markup, data: dataLiterals(ts, sf, open, (name) => braces.some((text) => mentionsToken(text, name))) };
 }
 
 /** Whether the newline at `i` closes a paragraph — the next line is blank, or the text ends. */

@@ -61,6 +61,8 @@ function io(dir: string): Captured {
 }
 
 const ASTRO = '---\nconst title = "Home";\n---\n<h1>{title}</h1>\n<p>Your week, sorted</p>\n';
+/** An Astro page whose front matter holds imports only: nothing in it needs the compiler. */
+const ASTRO_MARKUP = '---\nimport Layout from "../layouts/Layout.astro";\n---\n<h1>Welcome home</h1>\n<p>Your week, sorted</p>\n';
 
 describe('runScan — stet’s typescript absent', () => {
   it('reports the refusal THROUGH the report, with every other warn still emitted', async () => {
@@ -90,7 +92,7 @@ describe('runScan — stet’s typescript absent', () => {
 
   it('scans a dialect-only host with no compiler at all, and exits 0', async () => {
     const dir = project({ managedSurfaces: ['src/**/*.astro'] });
-    write(dir, 'src/pages/index.astro', ASTRO);
+    write(dir, 'src/pages/index.astro', ASTRO_MARKUP);
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
     const findings = cap.err.join('\n');
@@ -98,6 +100,16 @@ describe('runScan — stet’s typescript absent', () => {
     // No file needed the compiler, so no refusal is raised — this host is the
     // one the text detector exists for.
     expect(findings).not.toContain('typescript');
+  });
+
+  it('reports an Astro page\'s markup and says its front matter was not scanned (T13.11)', async () => {
+    const dir = project({ managedSurfaces: ['src/**/*.astro'] });
+    write(dir, 'src/pages/index.astro', '---\nconst steps = [{ label: "Pick a key" }];\n---\n{steps.map((s) => <h3>{s.label}</h3>)}\n<p>Your week, sorted</p>\n');
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(1);
+    expect(cap.err.join('\n')).toContain('possible copy "Your week, sorted"');
+    expect(cap.out).toContain('src/pages/index.astro: front matter not scanned — typescript is unavailable');
+    expect(cap.err.join('\n')).toContain('stet could not load the TypeScript compiler it ships with');
   });
 
   it('leaves a bare repo silent and green', async () => {
@@ -133,7 +145,7 @@ describe('scan names nothing through a compiler that is not there (F54)', () => 
     });
     write(dir, 'content/descriptor.json', JSON.stringify({ version: 1, keys: {} }));
     write(dir, 'content/defaults.json', JSON.stringify({ default: {} }));
-    write(dir, 'src/pages/index.astro', '---\nconst title = "Home";\n---\n<h1>{title}</h1>\n<p>Your week, sorted</p>\n');
+    write(dir, 'src/pages/index.astro', ASTRO_MARKUP);
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
     expect(cap.err.join('\n')).toContain('possible copy "Your week, sorted"');

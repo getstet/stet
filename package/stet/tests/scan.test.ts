@@ -959,13 +959,13 @@ import { flags } from "../../site-config";
 `;
 
 describe('runScan — template dialects', () => {
-  it('reads the real SiteNav shape: 11 labels at their own lines, nothing else', async () => {
+  it('reads the real SiteNav shape: 14 labels at their own lines, nothing else', async () => {
     const dir = project({ managedSurfaces: ['src/**/*.astro'] });
     write(dir, 'src/components/SiteNav.astro', SITE_NAV);
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
     const findings = cap.err.filter((l) => l.includes('possible copy'));
-    expect(findings).toHaveLength(11);
+    expect(findings).toHaveLength(14);
     // The labels, at the lines they are actually written on.
     expect(cap.err.join('\n')).toContain('src/components/SiteNav.astro:11 possible copy "stet"');
     expect(cap.err.join('\n')).toContain('src/components/SiteNav.astro:12 possible copy "Features"');
@@ -978,19 +978,22 @@ describe('runScan — template dialects', () => {
     for (const absent of ['site-config', 'border-bottom', 'querySelector', 'font-weight', 'burger', '/features']) {
       expect(cap.err.join('\n')).not.toContain(absent);
     }
-    // The two documented misses, stated rather than discovered later: an
-    // attribute value dies with the tag strip, and a label inside a braced
-    // expression dies with the expression.
-    expect(cap.err.join('\n')).not.toContain('Toggle navigation');
-    expect(cap.err.join('\n')).not.toContain('Changelog');
+    // The attribute value and the label inside a braced expression are read too.
+    expect(cap.err.join('\n')).toContain('src/components/SiteNav.astro:19 possible copy "Toggle navigation"');
+    expect(cap.err.join('\n')).toContain('src/components/SiteNav.astro:12 possible copy "Features"');
+    expect(cap.err.filter((l) => l.includes('possible copy "Changelog"'))).toEqual([
+      'warn: src/components/SiteNav.astro:15 possible copy "Changelog"',
+      'warn: src/components/SiteNav.astro:27 possible copy "Changelog"',
+    ]);
 
-    // The baseline is position-free, so the repeated labels collapse: 11 warns
-    // are 6 entries — stet, Features, Docs, Pricing, GitHub, Get started.
+    // The baseline is position-free, so the repeated labels collapse: 14 warns
+    // are 8 entries — stet, Features, Docs, Pricing, Changelog, GitHub, Get
+    // started, Toggle navigation.
     expect(await runScan(['--baseline'], io(dir))).toBe(0);
     const entries = JSON.parse(readFileSync(join(dir, '.stet/scan-baseline.json'), 'utf8')) as {
       context: string;
     }[];
-    expect(entries).toHaveLength(6);
+    expect(entries).toHaveLength(8);
     expect(entries.every((e) => e.context === 'dialect')).toBe(true);
     // And a re-run is silent, so the detector's own findings are acceptable.
     const after = io(dir);
@@ -1174,9 +1177,10 @@ describe('runScan — template dialects', () => {
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
     const findings = cap.err.filter((l) => l.includes('possible copy'));
-    expect(findings).toHaveLength(3);
+    expect(findings).toHaveLength(4);
     const all = cap.err.join('\n');
     expect(all).toContain('possible copy "Browse the chapters in order"');
+    expect(all).toContain('possible copy "Chapters"');
     expect(all).toContain('possible copy "Previous"');
     expect(all).toContain('possible copy "Next"');
     // Neither half of the conditional is anybody's copy.
@@ -1250,19 +1254,16 @@ describe('runScan — template dialects', () => {
     expect(cap.err.join('\n')).toContain('possible copy "{[\\"glyph\\", \\"proof\\", \\"hover\\"].map((v) => ("');
   });
 
-  it('still splits a sentence at an inline tag — the stated limit, not a filtered shape', async () => {
-    // Rejoining runs across a stripped tag needs an adjacency heuristic, and an
-    // adjacency heuristic joins unrelated text — two labels either side of a
-    // stripped element are two findings by design. The split stays; it is
-    // written down here so it is a known limit rather than a later discovery.
+  it('reads a sentence split by an inline tag as one finding', async () => {
+    // The parent holds text of its own, so its inline children join it; two
+    // labels either side of a tag whose parent holds none stay two findings.
     const dir = project({ managedSurfaces: ['src/**/*.astro'] });
     write(dir, 'src/pages/index.astro', '---\nconst t = 1;\n---\n<p>Managed <em>sending</em></p>\n');
     const cap = io(dir);
     expect(await runScan([], cap)).toBe(0);
     const findings = cap.err.filter((l) => l.includes('possible copy'));
-    expect(findings).toHaveLength(2);
-    expect(cap.err.join('\n')).toContain('possible copy "Managed"');
-    expect(cap.err.join('\n')).toContain('possible copy "sending"');
+    expect(findings).toHaveLength(1);
+    expect(cap.err.join('\n')).toContain('possible copy "Managed sending"');
   });
 
   it('rides the severity contract — a fail posture fails on dialect warns', async () => {
@@ -2018,5 +2019,37 @@ describe('runScan — an email template no entry manages', () => {
       vi.doUnmock('../cli/source-scan.js');
       vi.resetModules();
     }
+  });
+});
+
+describe('runScan — display strings in module data (D13)', () => {
+  const DATA_PAGE =
+    'const items = [{ title: "Fixing a word" }];\n' + COMPONENT('<ul>{items.map((i) => <h3>{i.title}</h3>)}</ul>');
+
+  it('warns a rendered string in module data, without a proposed key (T13.8)', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', DATA_PAGE);
+    const cap = io(dir);
+    expect(await runScan([], cap)).toBe(0);
+    expect(cap.err).toContain('warn: app/page.tsx:1 possible copy "Fixing a word"');
+  });
+
+  it('is silenced by a baseline entry under the data context, and --baseline writes one (T13.9)', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', DATA_PAGE);
+    expect(await runScan(['--baseline'], io(dir))).toBe(0);
+    const entries = JSON.parse(readFileSync(join(dir, '.stet/scan-baseline.json'), 'utf8')) as Array<{ file: string; context: string; text: string }>;
+    expect(entries).toEqual([{ file: 'app/page.tsx', context: 'data', text: 'Fixing a word' }]);
+    const after = io(dir);
+    expect(await runScan([], after)).toBe(0);
+    expect(after.err.join('\n')).not.toContain('Fixing a word');
+  });
+
+  it('reads an Astro front matter\'s data under the data context (T13.2, T13.9)', async () => {
+    const dir = project({ managedSurfaces: ['src/**/*.astro'] });
+    write(dir, 'src/pages/index.astro', '---\nconst steps = [{ label: "Pick a key" }];\n---\n{steps.map((s) => <h3>{s.label}</h3>)}\n');
+    expect(await runScan(['--baseline'], io(dir))).toBe(0);
+    const entries = JSON.parse(readFileSync(join(dir, '.stet/scan-baseline.json'), 'utf8')) as Array<{ context: string; text: string }>;
+    expect(entries).toEqual([expect.objectContaining({ context: 'data', text: 'Pick a key' })]);
   });
 });

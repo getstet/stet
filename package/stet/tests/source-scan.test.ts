@@ -6,9 +6,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  astroFindings,
   blankNonMarkup,
   carriesToken,
   decodeEntities,
+  INLINE,
   loadTypescript,
   matchGlob,
   mentionsToken,
@@ -875,4 +877,275 @@ describe('JSX role names', () => {
       expect(found[0]?.item).toBe(row.item);
     });
   }
+});
+
+describe('scanDialect — what the markup holds beside its text (D13)', () => {
+  const texts = (source: string): string[] => scanDialect('a.astro', source, 'astro').map((f) => f.text);
+
+  it("finds a tag's copy attributes and a component's prose props at their values (T13.1)", () => {
+    const source = [
+      '<SectionHead label="Capabilities" flag="var(--x)" sub="One registry holds them all" variant="primary" hint="/docs/intro" eyebrow="Overview" />',
+      '<button title="Copy">Go</button>',
+      '<button onClick={() => go()} title="Save">Go</button>',
+      '<a title="Next > Previous" href="/x">Go</a>',
+      '<meta name="viewport" content="width=device-width, initial-scale=1">',
+      '<meta name="description" content="Plain words here">',
+    ].join('\n');
+    const found = scanDialect('a.astro', source, 'astro');
+    // Each attribute is a finding at its value, in file order; `flag`, `variant`, `hint` and the one-word `eyebrow` are no copy.
+    const attrs = ['Capabilities', 'One registry holds them all', 'Copy', 'Save', 'Next > Previous', 'Plain words here'];
+    expect(found.filter((f) => attrs.includes(f.text)).map((f) => f.text)).toEqual(attrs);
+    for (const f of found.filter((f) => attrs.includes(f.text))) {
+      expect(source.slice(f.pos, f.pos + f.text.length)).toBe(f.text);
+      expect(source.slice(f.pos - 1, f.pos)).toBe('"');
+    }
+    const all = found.map((f) => f.text).join('\n');
+    for (const absent of ['var(--x)', 'primary', '/docs/intro', 'Overview', 'width=device-width']) expect(all).not.toContain(absent);
+  });
+
+  it('keeps the viewport meta out and an empty alt out (T13.1)', () => {
+    expect(texts('<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, follow"><img alt="" src="/a.png"><img alt="A team photo" src="/b.png">')).toEqual(['A team photo']);
+  });
+
+  it('reads the attributes of a dialect other than Astro the same way (T13.1)', () => {
+    expect(scanDialect('a.vue', '<template><Hero heading="Words for everyone" /><input placeholder="Your email" /></template>', 'vue').map((f) => f.text)).toEqual(['Words for everyone', 'Your email']);
+  });
+
+  it('finds the markup inside a content brace, and only its words (T13.4)', () => {
+    expect(texts('{flags.changelog && <a class="i" href="/changelog">Changelog</a>}')).toEqual(['Changelog']);
+    expect(texts('{groups.map((group) => (<p>{group.heading}</p>))}')).toEqual([]);
+    expect(texts('{x ? "a" : "b"}')).toEqual([]);
+    expect(texts('<div set:html={`<p>Welcome back</p>`} />').join('\n')).not.toContain('Welcome back');
+  });
+
+  it('reads one sentence with its inline tags dropped, and only one (T13.5)', () => {
+    expect(texts('<p>Install: run <b>npx x init</b> and answer.</p>')).toEqual(['Install: run npx x init and answer.']);
+    expect(texts('<p>One</p><div>Two words</div>')).toEqual(['One', 'Two words']);
+    expect(texts('<div class="term"><span class="l"><span class="p">$</span> <span class="w">npx x init</span></span><span class="l">next line here</span></div>')).toEqual(['npx x init', 'next line here']);
+    expect(texts('<div><a>Docs page</a>\n<a>Pricing page</a></div>')).toEqual(['Docs page', 'Pricing page']);
+    // A parent whose own text is no word (`&nbsp;`, an entity for a brace) does not join its children.
+    expect(texts('<span class="l"><span class="p">$</span>&nbsp;<span class="w">npx x</span></span>')).toContain('npx x');
+    expect(texts('<span class="l"><span class="k">"default"</span>: &#123;</span>')).toContain('"default"');
+    // A line with words of its own joins its inline children.
+    expect(texts('<span class="l"><span class="k">draft v7 saved</span> · nobody&#39;s live copy changed</span>')).toEqual(["draft v7 saved · nobody's live copy changed"]);
+    expect(texts('<p>foo<b>bar</b> baz</p>')).toEqual(['foobar baz']);
+    // A brace inside the sentence still breaks it: an expression is not copy.
+    expect(texts('<p>Hello <b>{name}</b> there again</p>')).toEqual(['Hello', 'there again']);
+  });
+
+  it('keeps a declared name as copy (T13.6)', () => {
+    expect(texts('---\nimport SiteNav from "./SiteNav.astro";\n---\n<h2>SiteNav</h2>\n<h2>GitHub</h2>')).toEqual(['SiteNav', 'GitHub']);
+  });
+
+  it('leaves a raw sample alone, breaks a sentence at a br, and joins del and ins (T13.13)', () => {
+    expect(texts('<h3>Words here</h3><pre is:raw><code>{flag && <a>Sample link</a>}</code></pre>')).toEqual(['Words here']);
+    expect(texts('<p>One line<br>two words</p>')).toEqual(['One line', 'two words']);
+    expect(texts('<p>Was <del>old</del> <ins>new</ins> words</p>')).toEqual(['Was old new words']);
+  });
+
+  it('names the inline set once (T13.5, T13.13)', () => {
+    expect(INLINE.has('span') && INLINE.has('del') && INLINE.has('ins')).toBe(true);
+    expect(INLINE.has('br') || INLINE.has('wbr') || INLINE.has('button') || INLINE.has('img')).toBe(false);
+  });
+});
+
+describe('astroFindings — the front matter\'s display data (D13)', () => {
+  const dataOf = async (source: string): Promise<Array<{ text: string; at: string }>> => {
+    const found = astroFindings(await loadTypescript(), 'a.astro', source);
+    return (found.data ?? []).map((f) => ({ text: f.text, at: source.slice(f.pos, f.pos + 1) }));
+  };
+
+  it("reports a shown const's words at their opening quote, and not an unused one (T13.2)", async () => {
+    const front = '---\nconst surfaces = [{ id: "Site copy id", label: "Site copy", note: "Typed keys, limits.", href: "/docs", img: "/p.webp" }];\n---\n';
+    expect(await dataOf(`${front}{surfaces.map((s) => <h3>{s.label}</h3>)}`)).toEqual([
+      { text: 'Site copy', at: '"' },
+      { text: 'Typed keys, limits.', at: '"' },
+    ]);
+    expect(await dataOf(`${front}<h3>Plain</h3>`)).toEqual([]);
+  });
+
+  it('reads tuples and a conditional spread, not the paths (T13.3)', async () => {
+    const source =
+      '---\nconst groups = [{ h: "Features", links: [["Email slots", "/features#e"], ["llms.txt", "/llms.txt"]] }, ...(flag ? [["Changelog", "/changelog"]] : [])];\n---\n{groups.map((g) => <p>{g.h}</p>)}';
+    expect((await dataOf(source)).map((f) => f.text)).toEqual(['Features', 'Email slots', 'Changelog']);
+  });
+
+  it('reads an object under a structural name by its own names', async () => {
+    const source = '---\nconst uses = [{ title: "Fixing a word", media: { kind: "code", caption: "stet scan output", src: "/a.webp" } }];\n---\n{uses.map((u) => <p>{u.title}</p>)}';
+    expect((await dataOf(source)).map((f) => f.text)).toEqual(['Fixing a word', 'stet scan output']);
+  });
+
+  it('skips a string a call, a template or an ignore marker keeps out', async () => {
+    const source =
+      '---\nconst a = ["First words", t("Second words"), `Third ${x} words`];\n// stet-ignore-next-line\nconst b = ["Fourth words"];\nlet c = ["Fifth words"];\n---\n{a}{b}{c}';
+    expect((await dataOf(source)).map((f) => f.text)).toEqual(['First words']);
+  });
+
+  it('counts a front matter after a byte-order mark (T13.14)', async () => {
+    const source = '﻿---\nconst surfaces = [{ label: "Site copy" }];\n---\n{surfaces.map((s) => <h3>{s.label}</h3>)}';
+    const found = astroFindings(await loadTypescript(), 'a.astro', source).data ?? [];
+    expect(found.map((f) => f.text)).toEqual(['Site copy']);
+    expect(source.slice((found[0] as { pos: number }).pos, (found[0] as { pos: number }).pos + 11)).toBe('"Site copy"');
+  });
+
+  it('reports nothing for a front matter that does not parse, and null without the compiler', async () => {
+    expect((await dataOf('---\nconst a = [ "Broken words" ;\n---\n{a}')).length).toBe(0);
+    expect(astroFindings(null, 'a.astro', '---\nconst a = "Some words";\n---\n{a}').data).toBeNull();
+    expect(astroFindings(null, 'a.astro', '<p>Some words</p>').data).toEqual([]);
+    // A front matter with no `const` needs no compiler.
+    expect(astroFindings(null, 'a.astro', '---\nimport Layout from "./Layout.astro";\n---\n<p>Some words</p>').data).toEqual([]);
+  });
+});
+
+describe('scanSource — a component\'s prose props and module data (D13)', () => {
+  const tsx = (body: string): Promise<Awaited<ReturnType<typeof scanSource>>> => scan('app/page.tsx', body);
+
+  it("reports a component's multi-word string prop as a jsx-attr literal (T13.7)", async () => {
+    const r = await tsx('export default function P() {\n  return <SectionHead sub="One registry holds them all" variant="primary" hint="/docs" eyebrow="Overview" />;\n}\n');
+    expect(r.literals.map((l) => [l.context, l.place?.attr, l.text])).toEqual([['jsx-attr', 'sub', 'One registry holds them all']]);
+  });
+
+  it('keeps a plain element\'s prose attribute out (T13.7)', async () => {
+    const r = await tsx('export default function P() {\n  return <div data-x="two words here" className="a b" />;\n}\n');
+    expect(r.literals).toEqual([]);
+  });
+
+  it('reports a component\'s non-copy props as literals too (T13.12)', async () => {
+    const r = await tsx('export default function P() {\n  return <Field aria-describedby="hint error" testID="login button" event="Signup started" sub="One registry holds them all" />;\n}\n');
+    expect(r.literals.map((l) => l.place?.attr)).toEqual(['aria-describedby', 'testID', 'event', 'sub']);
+  });
+
+  it('reports module data that is rendered, with the opening quote as its position (T13.8)', async () => {
+    const source = 'const items = [{ title: "Fixing a word" }];\nconst unused = [{ title: "Never shown" }];\nexport default function P() {\n  return <ul>{items.map((i) => <h3>{i.title}</h3>)}</ul>;\n}\n';
+    const r = await tsx(source);
+    expect(r.data.map((f) => f.text)).toEqual(['Fixing a word']);
+    expect(source.slice((r.data[0] as { pos: number }).pos, (r.data[0] as { pos: number }).pos + 1)).toBe('"');
+  });
+});
+
+describe('scan gaps — fix round (D13)', () => {
+  const texts = (source: string): string[] => scanDialect('a.astro', source, 'astro').map((f) => f.text);
+  const dataOf = async (source: string): Promise<string[]> => (astroFindings(await loadTypescript(), 'a.astro', source).data ?? []).map((f) => f.text);
+  const tsx = (body: string): Promise<Awaited<ReturnType<typeof scanSource>>> => scan('app/page.tsx', body);
+
+  describe('wiring attributes do not make a const shown', () => {
+    it('Astro: a class map, a class:list array and a style object stay out', async () => {
+      const variants = '---\nconst variants = { primary: "bg-blue-600 text-white" };\n---\n';
+      expect(await dataOf(`${variants}<button class={variants[v]}>Go</button>`)).toEqual([]);
+      expect(await dataOf('---\nconst base = "rounded px-4 py-2";\n---\n<a class:list={[base]}>Go</a>')).toEqual([]);
+      expect(await dataOf('---\nconst look = { display: "flex items" };\n---\n<div style={look}>Go</div>')).toEqual([]);
+      expect(await dataOf('---\nconst hooks = { open: "do open now" };\n---\n<a data-x={hooks.open} id={hooks.open} href={hooks.open}>Go</a>')).toEqual([]);
+    });
+
+    it('Astro: copy attributes and component props still show a const', async () => {
+      expect(await dataOf('---\nconst labels = { logo: "Company logo" };\n---\n<img alt={labels.logo} />')).toEqual(['Company logo']);
+      expect(await dataOf('---\nconst copy = { cap: "Site capabilities" };\n---\n<SectionHead label={copy.cap} />')).toEqual(['Site capabilities']);
+    });
+
+    it('JSX: a className map stays out, a rendered child still shows', async () => {
+      expect((await tsx('const variants = { primary: "bg-blue-600 text-white" };\nexport default function P() {\n  return <button className={variants[v]}>Go</button>;\n}\n')).data).toEqual([]);
+      expect((await tsx('const items = [{ title: "Fixing a word" }];\nexport default function P() {\n  return <ul>{items.map((i) => <h3>{i.title}</h3>)}</ul>;\n}\n')).data.map((f) => f.text)).toEqual(['Fixing a word']);
+      expect((await tsx('const labels = { logo: "Company logo" };\nexport default function P() {\n  return <img alt={labels.logo} />;\n}\n')).data.map((f) => f.text)).toEqual(['Company logo']);
+    });
+  });
+
+  describe('the object walk', () => {
+    it('enters an object only under media, img, image or icon', async () => {
+      const source = '---\nconst uses = [{ style: { fontFamily: "Helvetica Neue", transition: "all 0.3s ease" }, media: { kind: "code", caption: "stet scan output" } }];\n---\n{uses.map((u) => <p>{u.media.caption}</p>)}';
+      expect(await dataOf(source)).toEqual(['stet scan output']);
+    });
+  });
+
+  describe('wiring props are no copy', () => {
+    const card = '<Card wrapperClass="flex items-center gap-2" gradient="from-blue-500 to-indigo-600" align="top left" mode="dark light" heroUrl="the home page" iconColor="deep sky blue" sub="One registry holds them all" />';
+
+    it('scanDialect skips the wiring props of a component and keeps the prose one', () => {
+      expect(texts(card)).toEqual(['One registry holds them all']);
+    });
+
+    it('scanSource reports the prose prop alone, so register never rewrites the rest', async () => {
+      const r = await tsx(`export default function P() {\n  return ${card};\n}\n`);
+      expect(r.literals.map((l) => [l.context, l.place?.attr, l.text])).toEqual([['jsx-attr', 'sub', 'One registry holds them all']]);
+    });
+
+    it('matches the suffixes whatever the case', () => {
+      expect(texts('<Card WrapperClass="flex items-center" cardStyle="a b" imgSrc="a b" filePath="a b" parentRef="a b" buttonVariant="a b" bgcolor="a b" />')).toEqual([]);
+    });
+
+    it('a position prop is copy where it reads as words, and a single token is not', async () => {
+      expect(texts('<Quote position="Staff engineer" /><Quote position="absolute" />')).toEqual(['Staff engineer']);
+      const r = await tsx('export default function P() {\n  return <Quote position="Staff engineer" />;\n}\n');
+      expect(r.literals.map((l) => [l.place?.attr, l.text])).toEqual([['position', 'Staff engineer']]);
+    });
+
+    it('a data field named for a position is still copy', async () => {
+      expect(await dataOf('---\nconst team = [{ position: "Staff engineer" }];\n---\n{team.map((t) => <p>{t.position}</p>)}')).toEqual(['Staff engineer']);
+    });
+  });
+
+  describe('event props', () => {
+    it('keeps only, once and online props as copy', () => {
+      expect(texts('<Badge only="Fast sync here" once="Just once more" online="Always on duty" />')).toEqual(['Fast sync here', 'Just once more', 'Always on duty']);
+    });
+
+    it('drops camelCase handlers and the lowercase DOM events', async () => {
+      expect(texts('<Button onClick="Do something here" onclick="Do other things" onMouseEnter="Hover over this" />')).toEqual([]);
+      const r = await tsx('export default function P() {\n  return <Button onClick="Do something here" only="Fast sync here" />;\n}\n');
+      expect(r.literals.map((l) => l.place?.attr)).toEqual(['only']);
+    });
+  });
+
+  describe('a component keeps its prose props under the cases a mutation could blur', () => {
+    it('className and srcSet are no prose, in any case (JSX)', async () => {
+      expect((await tsx('export default function P() {\n  return <Card className="a b" />;\n}\n')).literals).toEqual([]);
+      expect((await tsx('export default function P() {\n  return <Img srcSet="small one 1x, large one 2x" />;\n}\n')).literals).toEqual([]);
+    });
+
+    it('a path or URL in a component prop is no copy', () => {
+      expect(texts('<Foo hint="/docs/get started" /><Foo hint="https://x.io/a b" /><Foo hint="./a b" /><Foo hint="#top of page" />')).toEqual([]);
+    });
+  });
+
+  describe('data strings that are paths or file names', () => {
+    it('skips a file name, a path, a fragment and a URL', async () => {
+      const source = '---\nconst links = ["README.md", "intro.md", "/docs/get started", "./a b c", "#top of page", "https://x.io/a b", "A real label"];\n---\n{links}';
+      expect(await dataOf(source)).toEqual(['A real label']);
+    });
+  });
+
+  describe('a brace run that crosses a masked region', () => {
+    it('reports the tags\' own words and not the run around a comment', () => {
+      expect(texts('{flag && <b>one</b> some <!-- hidden --> text here <i>two</i>}')).toEqual(['one', 'two']);
+    });
+  });
+
+  describe('inline joins', () => {
+    it('a self-closing inline tag is not a join', () => {
+      expect(texts('<p>Hello <span/> world words</p>')).toEqual(['Hello', 'world words']);
+    });
+
+    it('does not join under a pre, line by line', () => {
+      expect(texts('<pre><code><span class="p">$</span> npx x init\n<span class="m">wrote a.json</span>\n<span class="m">wrote b.json</span></code></pre>')).toEqual(['npx x init', 'wrote a.json', 'wrote b.json']);
+      expect(texts('<p>Run <code>npx x init</code> and answer</p>')).toEqual(['Run npx x init and answer']);
+    });
+
+    describe('a number that decorates a line (PD1)', () => {
+      it('stays out of the sentence at either edge', () => {
+        expect(texts('<h2><span class="n">01</span>Scan your components</h2>')).toEqual(['Scan your components']);
+        expect(texts('<h2>Scan your components<span class="n">01</span></h2>')).toEqual(['Scan your components']);
+        expect(texts('<p>Claim made here<sup>1</sup></p>')).toEqual(['Claim made here']);
+        expect(texts('<li><span>2.</span> Run the scan</li>')).toEqual(['Run the scan']);
+        // An entity that decodes to no letter (`&nbsp;`) does not make the edge a word.
+        expect(texts('<h2>&nbsp;<span class="n">01</span>Scan your components</h2>').filter((t) => t.includes('Scan'))).toEqual(['Scan your components']);
+      });
+
+      it('joins a number in the middle, a symbol and a word', () => {
+        expect(texts('<p>Price: <b>$5</b> per month</p>')).toEqual(['Price: $5 per month']);
+        expect(texts('<p><b>Note:</b> read this</p>')).toEqual(['Note: read this']);
+        expect(texts('<span class="l"><span class="g">✓</span> wrote a.json</span>')).toEqual(['✓ wrote a.json']);
+        expect(texts('<a>stet<span>.</span></a>')).toEqual(['stet.']);
+        expect(texts('<p>Pay <b>5</b> dollars now</p>')).toEqual(['Pay 5 dollars now']);
+      });
+    });
+  });
 });

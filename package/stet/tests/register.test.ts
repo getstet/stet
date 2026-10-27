@@ -1128,6 +1128,85 @@ describe('runRegister — template-dialect files (F46)', () => {
   });
 });
 
+describe('runRegister — what scan now finds in props and data (D13)', () => {
+  it("rewrites a component's prose prop and leaves a structural one (T13.7)", async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<SectionHead sub="One registry holds them all" variant="primary" />'));
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const edited = read(dir, 'app/page.tsx');
+    expect(edited).toMatch(/sub=\{copy\('[a-z0-9_]+'\)\}/);
+    expect(edited).toContain('variant="primary"');
+  });
+
+  it('rewrites the prose prop alone and names the props it leaves (T13.12)', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<Field aria-describedby="hint error" testID="login button" event="Signup started" sub="One registry holds them all" />'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const edited = read(dir, 'app/page.tsx');
+    expect(edited).toMatch(/sub=\{copy\('[a-z0-9_]+'\)\}/);
+    for (const kept of ['aria-describedby="hint error"', 'testID="login button"', 'event="Signup started"']) expect(edited).toContain(kept);
+    const lines = [...cap.out, ...cap.err].filter((l) => l.includes('is a prop stet does not rewrite (aria-*, testid, event) — adopt by hand'));
+    expect(lines).toHaveLength(3);
+    for (const line of lines) expect(line).toMatch(/app\/page\.tsx: "[a-z0-9_]+" is a prop stet does not rewrite \(aria-\*, testid, event\) — adopt by hand$/);
+  });
+
+  it('rewrites aria-label, which is copy, and never a wiring prop', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', SERVER_PAGE('<Field aria-label="Close dialog here" wrapperClass="flex items-center gap-2" gradient="from-blue-500 to-indigo-600" only="Fast sync here" />'));
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    const edited = read(dir, 'app/page.tsx');
+    expect(edited).toMatch(/aria-label=\{copy\('[a-z0-9_]+'\)\}/);
+    expect(edited).toMatch(/only=\{copy\('[a-z0-9_]+'\)\}/);
+    for (const kept of ['wrapperClass="flex items-center gap-2"', 'gradient="from-blue-500 to-indigo-600"']) expect(edited).toContain(kept);
+    expect([...cap.out, ...cap.err].filter((l) => l.includes('is a prop stet does not rewrite'))).toEqual([]);
+  });
+
+  it('leaves module data byte-identical and lists it (T13.8)', async () => {
+    const dir = project();
+    const items = ['First data text', 'Second data text', 'Third data text', 'Fourth data text'];
+    const page = `const items = [${items.map((t) => `{ title: "${t}" }`).join(', ')}];\n${SERVER_PAGE('<ul>{items.map((i) => <h3>{i.title}</h3>)}</ul>')}`;
+    write(dir, 'app/page.tsx', page);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toBe(page);
+    expect(cap.out).toContain("4 strings in data (arrays and objects) are not rewritten — place copy('<key>') by hand; run with --verbose to list them");
+    const verbose = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], verbose)).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toBe(page);
+    expect(verbose.out).toContain("app/page.tsx:1: \"First data text\" sits in data — place copy('<key>') by hand");
+    expect(verbose.out.filter((l) => l.includes('sits in data'))).toHaveLength(4);
+  });
+
+  it('prints a single data string on its own line (T13.8)', async () => {
+    const dir = project();
+    write(dir, 'app/page.tsx', `const items = [{ title: "Fixing a word" }];\n${SERVER_PAGE('<ul>{items.map((i) => <h3>{i.title}</h3>)}</ul>')}`);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan'], cap)).toBe(0);
+    expect(cap.out).toContain("app/page.tsx:1: \"Fixing a word\" sits in data — place copy('<key>') by hand");
+  });
+
+  it('leaves .vue, .svelte and .mdx files byte-identical, and names each (T13.10)', async () => {
+    const dir = project({ managedSurfaces: ['src/**/*.vue', 'src/**/*.svelte', 'src/**/*.mdx'], copyModules: [] });
+    const shapes = [
+      '<SectionHead label="Capabilities" sub="One registry holds them all" variant="primary" />',
+      '<button title="Copy">Go</button>',
+      '<p>Install: run <b>npx x init</b> and answer.</p>',
+      '{flags.changelog && <a class="i" href="/changelog">Changelog</a>}',
+      '',
+    ].join('\n');
+    const files = ['src/a.vue', 'src/b.svelte', 'src/c.mdx'];
+    for (const file of files) write(dir, file, shapes);
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], cap)).toBe(0);
+    for (const file of files) {
+      expect(read(dir, file)).toBe(shapes);
+      expect(cap.out).toContain(`${file}: ${file.slice(file.lastIndexOf('.'))} is not rewritten — place copy('<key>') by hand`);
+    }
+  });
+});
+
 describe('runRegister — the static-HTML host', () => {
   const PAGE = readFileSync(
     fileURLToPath(new URL('./fixtures/html-host/index.html', import.meta.url)),

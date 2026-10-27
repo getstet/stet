@@ -254,6 +254,8 @@ scanning, adoption, key badges and the preview's page checks, so it works with w
 
 Upgrading from 0.8.0: a project that installed typescript only for stet can remove it.
 
+stet scan also reads attributes, component props, front matter and data, and reads a sentence split by inline tags as one, so a project with a scan baseline refreshes it with stet scan --baseline once it has adopted what it wants.
+
 Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
 selfsigned because the lockfile holds them. To drop them, delete their node_modules/ entries from package-lock.json
 and run npm i, or install production with npm ci --omit=dev --omit=peer.
