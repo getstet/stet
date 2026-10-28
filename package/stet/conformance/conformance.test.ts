@@ -7419,6 +7419,42 @@ describe('adoption', () => {
     expect(existing.stdout()).toContain('register: nothing to adopt');
   });
 
+  it('Requirement: scan reports copy literals as warnings, never failing by default — a JSX sentence is one finding', async () => {
+    const host = makeAdoptionHost({
+      page: 'export default function Page() {\n  return (\n    <main>\n      <p>Install: run{" "}\n  <b>npx x init</b>{" "}\n  and answer.</p>\n      <p>Read <Badge>new</Badge> docs</p>\n      <p>Hi <span dangerouslySetInnerHTML={h} /> there</p>\n    </main>\n  );\n}\n',
+    });
+    expect(await host.run('init', '--yes')).toBe(0);
+    expect(await host.run('scan')).toBe(0);
+    const warned = host.err.filter((l) => l.includes('unkeyed copy'));
+    expect(warned.filter((l) => l.includes('"Install: run npx x init and answer."'))).toHaveLength(1);
+    expect(warned.filter((l) => /"(Install: run|npx x init|and answer\.)"/.test(l))).toEqual([]);
+    // The paragraph holding a component keeps one finding per run.
+    for (const run of ['"Read"', '"new"', '"docs"']) expect(warned.filter((l) => l.includes(run))).toHaveLength(1);
+    // A sentence kept as written is still reported, with no key proposed.
+    expect(host.err.filter((l) => l.includes('possible copy "Hi there"'))).toHaveLength(1);
+  });
+
+  it('Requirement: register adds a key and rewrites the consuming leaf — a JSX sentence becomes one key on a server and a client component (journey A2)', async () => {
+    const host = makeAdoptionHost({ page: 'export default function Page() {\n  return <p>Run <b>npx x init</b> now.</p>;\n}\n' });
+    expect(await host.run('init', '--yes')).toBe(0);
+    host.write('app/widget.tsx', "'use client';\nimport Link from 'next/link';\nexport default function Widget() {\n  return <p>Read the <Link href=\"/docs\">docs</Link>.</p>;\n}\n");
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const page = host.file('app/page.tsx');
+    const widget = host.file('app/widget.tsx');
+    expect(page).toMatch(/<p>\{richParts\(copy\('\w+'\), \[\(c, k\) => <b key=\{k\}>\{c\}<\/b>\]\)\}<\/p>/);
+    expect(page).toContain("import { richParts } from '@getstet/stet/react/server';");
+    expect(widget).toMatch(/<p>\{richParts\(copy\('\w+'\), \[\(c, k\) => <Link key=\{k\} href="\/docs">\{c\}<\/Link>\]\)\}<\/p>/);
+    expect(widget).toContain('const copy = useCopy();');
+    expect(widget).toContain("import { richParts } from '@getstet/stet/react';");
+    const keys = JSON.parse(host.file('content/descriptor.json')).keys as Record<string, { tags?: number }>;
+    const values = JSON.parse(host.file('content/defaults.json')).default as Record<string, string>;
+    const sentences = Object.entries(values).filter(([, v]) => v === 'Run <1>npx x init</1> now.' || v === 'Read the <1>docs</1>.');
+    expect(sentences.map(([k]) => keys[k]?.tags)).toEqual([1, 1]);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.stdout()).toContain('register: nothing to adopt');
+  });
+
   it("Requirement: register adds a key and rewrites the consuming leaf — an Astro page's copy becomes key reads (journey A14)", async () => {
     const host = makeCliHost({
       config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },

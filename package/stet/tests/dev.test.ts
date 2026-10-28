@@ -14916,6 +14916,36 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     expect([tagged.renders.hero_headline, tagged.coincident]).toEqual([[[{ tag: 'p', classes: ['lede'] }, { tag: 'main', classes: null }]], ['hero_headline']]);
   });
 
+  it('T16.16: a JSX rich read is a render site, and site/split proposes a name from the element that holds it', async () => {
+    const host = nextSite();
+    write(host.cwd, 'package.json', JSON.stringify({ name: 'site', dependencies: { react: '^19', '@getstet/stet': '1' } }));
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      [
+        "import { copy } from '@/lib/content';",
+        "import { richParts } from '@getstet/stet/react/server';",
+        'export default function Page() {',
+        "  return <main><p className=\"lede\">{richParts(copy('hero_headline'), [(c, k) => <b key={k}>{c}</b>])}</p>",
+        "    <h2>{copy('hero_headline')}</h2></main>;",
+        '}',
+        '',
+      ].join('\n'),
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, body.renders.hero_headline]).toEqual([
+      true,
+      [
+        [{ tag: 'p', classes: ['lede'] }, { tag: 'main', classes: null }],
+        [{ tag: 'h2', classes: [] }, { tag: 'main', classes: null }],
+      ],
+    ]);
+    const asked = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_headline', at: 'app/page.tsx:4' });
+    expect([asked.status, asked.body]).toEqual([200, { proposed: 'home_page_paragraph' }]);
+  });
+
   it('T14.19: site/split proposes a name for an Astro place and, given it, moves that read alone', async () => {
     const host = rewritable(TERMINAL);
     expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);

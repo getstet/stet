@@ -368,6 +368,13 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
         );
         warned += 1;
       }
+      // A sentence kept as written, and a copy attribute on a sentence key's tag: copy register lists, proposed no key (D16).
+      for (const item of result.listed) {
+        if (baselined({ file, context: item.context, text: item.text })) continue;
+        const { line } = lineCol(source, item.pos);
+        report.warn('scan', `${file}:${line} possible copy ${JSON.stringify(clip(item.text, LITERAL_EXCERPT))}`, undefined, { at: { file, line } });
+        warned += 1;
+      }
     }
 
     // A file both lists match is parsed once and walked by both

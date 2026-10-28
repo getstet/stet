@@ -1164,3 +1164,40 @@ describe('scan gaps — fix round (D13)', () => {
     });
   });
 });
+
+describe('scanSource — a JSX sentence is one rich literal (D16)', () => {
+  const page = (body: string, head = ''): string => `${head}export default function Page() {\n  return ${body};\n}\n`;
+  const shape = (r: Awaited<ReturnType<typeof scanSource>>): Array<[string, string]> => r.literals.map((l) => [l.context, l.text]);
+
+  it('reads the sentence by JSX\'s text rule and claims its runs and its tags\' attributes (T16.10)', async () => {
+    const r = await scan('app/page.tsx', page('<p>Install: run{" "}\n  <b title="Bold">npx x init</b>{" "}\n  and answer.</p>'));
+    expect(shape(r)).toEqual([['jsx-rich', 'Install: run npx x init and answer.']]);
+    expect([r.literals[0]?.rich?.value, r.literals[0]?.rich?.tags]).toEqual(['Install: run <1>npx x init</1> and answer.', 1]);
+    expect(r.listed.map((x) => [x.text, x.reason])).toEqual([['Bold', 'on a tag inside a sentence key']]);
+    // A line break beside a tag is no space, as React renders it (J2); an entity is decoded.
+    expect((await scan('app/page.tsx', page('<p>run\n  <b>x</b>\n  and more</p>'))).literals[0]?.rich?.value).toBe('run<1>x</1>and more');
+    // (`A &amp; <em>B</em>`, the plan's own case, holds no two word characters in a row, so no copy gate passes it.)
+    expect((await scan('app/page.tsx', page('<p>Ask &amp; <em>Bring</em></p>'))).literals[0]?.rich?.value).toBe('Ask & <1>Bring</1>');
+  });
+
+  it('reads no sentence in a code block', async () => {
+    const r = await scan('app/page.tsx', page('<pre>Run <b>x</b> now</pre>'));
+    expect(r.literals.filter((l) => l.context === 'jsx-rich')).toEqual([]);
+  });
+
+  it("carries next/link's Link and the inline tags, and adopts the rest per piece (T16.11)", async () => {
+    const link = await scan('app/page.tsx', page('<p>Read the <Link href="/docs">docs</Link>.</p>', "import Link from 'next/link';\n"));
+    expect(shape(link)).toEqual([['jsx-rich', 'Read the docs.']]);
+    expect(link.literals[0]?.rich?.tags).toBe(1);
+    const legacy = await scan('app/page.tsx', page('<p>Read the <Link href="/x" legacyBehavior><a>docs</a></Link> now.</p>', "import Link from 'next/link';\n"));
+    expect(shape(legacy)).toEqual([['jsx-text', 'Read the'], ['jsx-text', 'docs'], ['jsx-text', 'now.']]);
+    expect(shape(await scan('app/page.tsx', page('<p>Read <Badge>new</Badge> docs</p>')))).toEqual([['jsx-text', 'Read'], ['jsx-text', 'new'], ['jsx-text', 'docs']]);
+    // A component parent would receive an array where it received its children (J5).
+    expect(shape(await scan('app/page.tsx', page('<Text>Run <b>x</b> now</Text>')))).toEqual([['jsx-text', 'Run'], ['jsx-text', 'x'], ['jsx-text', 'now']]);
+    const trans = await scan('app/page.tsx', page('<p>Run <Trans>x</Trans> now</p>'));
+    expect([trans.literals, trans.i18nSkips.map((s) => s.text)]).toEqual([[], ['Run', 'x', 'now']]);
+    const raw = await scan('app/page.tsx', page('<p>Hi <span dangerouslySetInnerHTML={h} /> there</p>'));
+    expect([raw.literals, raw.listed.map((x) => [x.text, x.reason])]).toEqual([[], [['Hi there', 'inside an element with dangerouslySetInnerHTML']]]);
+    expect(shape(await scan('app/page.tsx', page('<p>Hi {name} there <b>x</b></p>')))).toEqual([['jsx-text', 'Hi'], ['jsx-text', 'there'], ['jsx-text', 'x']]);
+  });
+});

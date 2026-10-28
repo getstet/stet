@@ -18,8 +18,9 @@ export type RichChildren<R> = string | R | Array<string | R>;
  * strings, which the host's framework escapes. A value the tag-tree reader
  * refuses renders as its plain text: a malformed value never shows a tag. A
  * value that is not a string renders nothing, as a plain read of a removed key does.
+ * `R` defaults to `any`, so a holder with no ReactNode context, such as a fragment, still typechecks.
  */
-export function richParts<R>(value: string, render: ReadonlyArray<(children: RichChildren<R>, key: number) => R>): Array<string | R> {
+export function richParts<R = any>(value: string, render: ReadonlyArray<(children: RichChildren<R>, key: number) => R>): Array<string | R> {
   if (typeof value !== 'string') return [];
   const tree = tagTree(value, render.length);
   if ('fault' in tree) return [plainOf(value)];

@@ -21,7 +21,7 @@ import { isHeadKind, numberNames } from './key-names.js';
 import { pageOfFile, routeOfFile } from './pages.js';
 import { planMount, type MountPlan } from './provider-mount.js';
 import { lineCol, type Report } from './report.js';
-import { applyFileEdits, planRewrite } from './rewrite.js';
+import { applyFileEdits, jsxReads, jsxRichClean, planRewrite } from './rewrite.js';
 import {
   componentName,
   dialectOf,
@@ -101,6 +101,11 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** The value a literal seeds its key with: a sentence key's tagged value, else its text (D16). */
+export function seedOf(literal: LocatedLiteral): string {
+  return literal.rich?.value ?? literal.text;
+}
+
 /**
  * The keys each text is held by, sorted by name: every web `text` key with a literal default-locale
  * value, no `tags`, no template slot, no `brand__` prefix, and no page SEO or JSON-LD reference —
@@ -142,8 +147,8 @@ export interface JsxRun {
   refusals: string[];
   /** Template-dialect files in the managed surfaces other than `.astro`: read by scan's dialect walk, never parsed or rewritten here. */
   dialectFiles: string[];
-  /** The `.astro` findings this pass does not rewrite, each with its reason, in run order. */
-  astroSkips: Array<{ file: string; line: number; text: string; reason: string }>;
+  /** The texts this pass does not rewrite (an `.astro` file's findings, a JSX sentence or a tag attribute inside one), each with its reason, in run order. */
+  skips: Array<{ file: string; line: number; text: string; reason: string }>;
   /** Each `application/ld+json` script of an `.astro` file: listed, never rewritten. */
   structured: Array<{ file: string; line: number }>;
   /** Display strings in the module-scope data of JSX files: reported, never rewritten. */
@@ -179,7 +184,7 @@ export async function planJsxRun(input: {
   const refusals: string[] = [];
   const dialectFiles: string[] = [];
   const dataFindings: JsxRun['dataFindings'] = [];
-  const astroSkips: JsxRun['astroSkips'] = [];
+  const skips: JsxRun['skips'] = [];
   const structured: JsxRun['structured'] = [];
   const components = componentCache();
   let ts: typeof import('typescript') | undefined;
@@ -212,7 +217,7 @@ export async function planJsxRun(input: {
       const page = pageOfFile(cwd, file, descriptor.pages);
       const { literals: found, plan } = planAstroFile({ ts, cwd, config, file, source, page, cache: components });
       const listed = (literal: { pos: number; text: string }, reason: string): void => {
-        astroSkips.push({ file, line: lineCol(source, literal.pos).line, text: literal.text, reason });
+        skips.push({ file, line: lineCol(source, literal.pos).line, text: literal.text, reason });
       };
       for (const skip of plan.skips) listed(skip, skip.reason);
       for (const pos of plan.structured) structured.push({ file, line: lineCol(source, pos).line });
@@ -280,6 +285,11 @@ export async function planJsxRun(input: {
     // JSX positions whether or not it went on to adopt any of them.
     parsed.set(file, result);
     for (const found of result.data) dataFindings.push({ file, line: lineCol(source, found.pos).line, text: found.text });
+    const listed = (literal: { pos: number; text: string }, reason: string): void => {
+      skips.push({ file, line: lineCol(source, literal.pos).line, text: literal.text, reason });
+    };
+    // A sentence kept as written, and a copy attribute on a tag a sentence key copies, are listed (D16).
+    for (const item of result.listed) listed(item, item.reason);
     // A component's prop that carries words no visitor reads (`aria-*`, a test id, an event name) is
     // reported and left, and it takes no part in the run: no name, no key to share.
     const candidates = result.literals.filter((literal) => {
@@ -319,9 +329,9 @@ export async function planJsxRun(input: {
           descriptor,
           snapshot,
           placeholder: '\u0001',
-          def: { shape: 'text', target },
-          stored: literal.text,
-          value: literal.text,
+          def: { shape: 'text', target, ...(literal.rich === undefined ? {} : { tags: literal.rich.tags }) },
+          stored: seedOf(literal),
+          value: seedOf(literal),
           report,
           name: literal.proposedKey,
           keep: false,
@@ -336,6 +346,25 @@ export async function planJsxRun(input: {
       report.warn('scan', `${file}: ${JSON.stringify(literal.proposedKey)} ${skipReason(planned.skipped)} — adopt by hand`);
       return false;
     });
+    // A file holding a sentence is read back with the names this pass gives; any doubt keeps every byte (D16).
+    if (literals.some((literal) => literal.context === 'jsx-rich')) {
+      const landed = literals.map((literal) => ({ literal, key: reuseFor(literal, target) ?? literal.proposedKey }));
+      const edits = landed.flatMap(({ literal, key }) => planRewrite(source, literal, key, kind, config.readPath.import).edits);
+      let clean: boolean;
+      try {
+        ts ??= await loadTypescript();
+        clean = await jsxRichClean(ts, file, source, applyFileEdits(source, edits), jsxReads(edits, landed));
+      } catch {
+        clean = false;
+      }
+      if (!clean) {
+        for (const literal of literals) {
+          reuseOf.delete(literal);
+          listed(literal, 'the rewrite did not read back cleanly');
+        }
+        continue;
+      }
+    }
     if (literals.length > 0) adoptable.push({ file, source, literals, target, kind });
   }
 
@@ -367,7 +396,7 @@ export async function planJsxRun(input: {
     if (reuseOf.has(literal) || reuseFor(literal, target) !== undefined) continue;
     const head = isHeadLiteral(literal);
     // A sentence key shares only with an identical sentence: its value's tags mean nothing to a plain text.
-    const slot = `${target}\u0000${head ? 'head' : 'body'}\u0000${literal.rich === undefined ? 'text' : 'rich'}\u0000${literal.text}`;
+    const slot = `${target}\u0000${head ? 'head' : 'body'}\u0000${literal.rich === undefined ? 'text' : 'rich'}\u0000${seedOf(literal)}`;
     const leader = first.get(slot);
     if (leader === undefined) first.set(slot, literal);
     else sharedWith.set(literal, leader);
@@ -395,7 +424,7 @@ export async function planJsxRun(input: {
     sharedWith,
     refusals,
     dialectFiles,
-    astroSkips,
+    skips,
     structured,
     dataFindings,
     modules,

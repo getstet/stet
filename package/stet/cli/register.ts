@@ -50,9 +50,9 @@ import {
 import { htmlPageOf } from './pages.js';
 import type { CliIo } from './main.js';
 import { clip, collapseLines, lineCol, plural, CliError, HostTextReport, Report, UsageError } from './report.js';
-import { applyFileEdits, formatDiff, planRewrite, type Edit } from './rewrite.js';
+import { applyFileEdits, formatDiff, jsxReads, jsxRichClean, planRewrite, type Edit } from './rewrite.js';
 import { printProviderSnippet } from './provider-mount.js';
-import { classifyAdoption, leadingOrder, planJsxRun, targetFor } from './register-run.js';
+import { classifyAdoption, leadingOrder, planJsxRun, seedOf, targetFor } from './register-run.js';
 import { loadTypescript, type LocatedLiteral } from './source-scan.js';
 import { validateValue } from './validate.js';
 
@@ -127,7 +127,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     report,
     ...(forcedKind === undefined ? {} : { forcedKind }),
   });
-  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, astroSkips, structured, dataFindings, modules, propertyNames, mount } = jsxRun;
+  const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, skips, structured, dataFindings, modules, propertyNames, mount } = jsxRun;
   // The fallback warns named the layout; the snippet names the edit, once.
   if (jsxRun.mountUnlocated && config.rootLayout !== undefined && config.router !== 'astro') {
     report.line(`${config.rootLayout}: could not locate the wrap point unambiguously — mount the CopyProvider by hand:`);
@@ -175,7 +175,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   const byLeading = leadingOrder(io.cwd);
   const met = adoptable.map((item, index) => ({ item, index })).sort((a, b) => byLeading(a.item.file, b.item.file) || a.index - b.index);
   // The texts pass two leaves as written, each with its reason, after pass one's.
-  const notRewritten = astroSkips.map((s) => notRewrittenLine(s.file, s.line, s.text, s.reason));
+  const notRewritten = skips.map((s) => notRewrittenLine(s.file, s.line, s.text, s.reason));
   let clientEdited = 0;
   let serverEdited = 0;
   for (const {
@@ -187,9 +187,15 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     const skipped: string[] = [];
     // An Astro file's literals land together: their edits and the read-back are the file's.
     const astroLanded: Array<{ literal: LocatedLiteral; key: string }> = [];
+    // A JSX file holding a sentence is read back with the keys it lands under (D16).
+    const jsxLanded: Array<{ literal: LocatedLiteral; key: string }> = [];
     const leaf = (literal: LocatedLiteral, key: string): void => {
-      if (astro === undefined) edits.push(...planRewrite(source, literal, key, kind, config.readPath.import).edits);
-      else astroLanded.push({ literal, key });
+      if (astro !== undefined) {
+        astroLanded.push({ literal, key });
+        return;
+      }
+      edits.push(...planRewrite(source, literal, key, kind, config.readPath.import).edits);
+      jsxLanded.push({ literal, key });
     };
     const unreadable = (literal: LocatedLiteral, key: string): boolean => {
       if (astro === undefined || readableAs(key, astro.form)) return false;
@@ -235,7 +241,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
         ...(choice?.label === undefined ? {} : { label: choice.label }),
         ...(choice?.help === undefined ? {} : { help: choice.help }),
       };
-      (snapshot['default'] ??= {})[key] = literal.text;
+      (snapshot['default'] ??= {})[key] = seedOf(literal);
       // Pass one gated the text and proved the rewrite; neither reads the name.
       leaf(literal, key);
       added += 1;
@@ -248,6 +254,9 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       if (planned.edits.length > 0 && !rereadsClean(await loadTypescript(), file, source, applyFileEdits(source, planned.edits), planned.reads, planned.moved)) {
         throw new CliError(`stet internal: ${file} did not read back cleanly after register planned it — nothing written`);
       }
+    }
+    if (jsxLanded.some(({ literal }) => literal.context === 'jsx-rich') && !(await jsxRichClean(await loadTypescript(), file, source, applyFileEdits(source, edits), jsxReads(edits, jsxLanded)))) {
+      throw new CliError(`stet internal: ${file} did not read back cleanly after register planned it — nothing written`);
     }
 
     if (edits.length > 0 && kind === 'client') clientEdited += 1;

@@ -59,19 +59,24 @@ import {
   type Span,
 } from './markup.js';
 import { CliError } from './report.js';
-import { applyFileEdits, dominantEol, type Edit } from './rewrite.js';
+import { applyFileEdits, dominantEol, freeParams, type Edit } from './rewrite.js';
 import {
   astroFindings,
+  bindingNames,
   collapseWhitespace,
   componentName,
   componentProse,
   COPY_ATTRS,
   decodeEntities,
   INLINE,
+  insideAttribute,
   isDecorativeCounter,
   nonCopyProp,
   parseDiagnosticsOf,
   qualifiesAsCopy,
+  richBindingOf,
+  SENTENCE_REASONS,
+  TAG_SHAPED,
   undecodedEntity,
   type DialectFinding,
   type LocatedLiteral,
@@ -136,11 +141,10 @@ const CANNOT_TELL = 'stet cannot tell how copy reads keys in this file';
 const PAGES_SCAN = 'SEO text — adopt it with stet pages scan';
 const EXPRESSION = 'written as an expression';
 const SHARES = 'a sentence that shares its element with other markup';
-const EMPTY = 'an empty element inside the sentence';
+const EMPTY = SENTENCE_REASONS.empty;
 const UNCOPYABLE = 'a tag stet cannot copy into a key read';
-const FOREIGN_RICH = 'a foreign richParts is bound in this file';
-const ON_TAG = 'on a tag inside a sentence key';
-const TAG_SHAPED = 'text that reads as a placeholder tag';
+const FOREIGN_RICH = SENTENCE_REASONS.foreignRich;
+const ON_TAG = SENTENCE_REASONS.onTag;
 
 /** The elements whose text is code, a field's value, a graphic or a slot's fallback, never copy stet rewrites. */
 const SKIP_TAGS = new Set(['code', 'kbd', 'samp', 'textarea', 'svg', 'math', 'slot']);
@@ -148,8 +152,6 @@ const SKIP_TAGS = new Set(['code', 'kbd', 'samp', 'textarea', 'svg', 'math', 'sl
 const RAW_ATTRS = ['is:raw', 'set:html', 'set:text'];
 /** The attributes an element inside a sentence may not carry: its content Astro's own, or sent to a slot (D16). */
 const SENTENCE_ATTRS = [...RAW_ATTRS, 'slot'];
-/** The modules a renderer import may name: every read entry ships `richParts`. */
-const RICH_MODULES = new Set(['@getstet/stet', '@getstet/stet/core', '@getstet/stet/react', '@getstet/stet/react/server']);
 /** A letter or a digit, once a text's entities are decoded. */
 const HAS_WORD = /[\p{L}\p{N}]/u;
 /** A rule that shows white space as written. */
@@ -237,7 +239,7 @@ function documentOf(file: string, page: string): Document | null {
 function boundNames(ts: typeof import('typescript'), tree: TS.Node): Set<string> {
   const names = new Set<string>();
   const visit = (node: TS.Node): void => {
-    if (ts.isParameter(node) || ts.isVariableDeclaration(node)) for (const name of patternNames(ts, node.name)) names.add(name);
+    if (ts.isParameter(node) || ts.isVariableDeclaration(node)) for (const name of bindingNames(ts, node.name)) names.add(name);
     else if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name !== undefined) {
       names.add(node.name.text);
     }
@@ -245,11 +247,6 @@ function boundNames(ts: typeof import('typescript'), tree: TS.Node): Set<string>
   };
   visit(tree);
   return names;
-}
-
-function patternNames(ts: typeof import('typescript'), name: TS.BindingName): string[] {
-  if (ts.isIdentifier(name)) return [name.text];
-  return name.elements.flatMap((el) => (ts.isOmittedExpression(el) ? [] : patternNames(ts, el.name)));
 }
 
 /** An element's tag as the source spells it: a component keeps its case. */
@@ -351,39 +348,6 @@ function importInsert(ts: typeof import('typescript'), r: Reading, source: strin
 }
 
 /**
- * What `richParts` names in the front matter: stet's renderer imported from a
- * read entry, nothing, or anything else (a renamed or default import, a
- * function or variable of the host's own).
- */
-function richBinding(ts: typeof import('typescript'), r: Reading): 'stet' | 'none' | 'foreign' {
-  if (r.front === null) return 'none';
-  let stet = false;
-  let foreign = false;
-  const visit = (node: TS.Node): void => {
-    if (ts.isImportDeclaration(node)) {
-      const clause = node.importClause;
-      const from = ts.isStringLiteral(node.moduleSpecifier) && RICH_MODULES.has(node.moduleSpecifier.text);
-      if (clause?.name?.text === 'richParts') foreign = true;
-      const named = clause?.namedBindings;
-      if (named !== undefined && ts.isNamespaceImport(named) && named.name.text === 'richParts') foreign = true;
-      if (named !== undefined && ts.isNamedImports(named)) {
-        for (const el of named.elements) {
-          if (el.name.text !== 'richParts') continue;
-          if (from && (el.propertyName?.text ?? 'richParts') === 'richParts') stet = true;
-          else foreign = true;
-        }
-      }
-      return;
-    }
-    if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && patternNames(ts, node.name).includes('richParts')) foreign = true;
-    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name?.text === 'richParts') foreign = true;
-    ts.forEachChild(node, visit);
-  };
-  visit(r.front.sf);
-  return foreign ? 'foreign' : stet ? 'stet' : 'none';
-}
-
-/**
  * The host's `compressHTML`, read from the text of its Astro config: absent, it
  * is `"jsx"`, Astro 7's default, under which a run of white space holding a line
  * break at a tag's edge renders nothing.
@@ -451,20 +415,20 @@ function isReference(ts: typeof import('typescript'), id: TS.Identifier): boolea
 /** Whether a scope node binds `name` itself, so a reference beneath it reads that binding and not the one traced. */
 function shadows(ts: typeof import('typescript'), node: TS.Node, name: string): boolean {
   if (ts.isFunctionLike(node)) {
-    if (node.parameters.some((p) => patternNames(ts, p.name).includes(name))) return true;
+    if (node.parameters.some((p) => bindingNames(ts, p.name).includes(name))) return true;
     if ((ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node)) && node.name?.text === name) return true;
   }
   if (ts.isClassExpression(node) && node.name?.text === name) return true;
-  if (ts.isCatchClause(node) && node.variableDeclaration !== undefined && patternNames(ts, node.variableDeclaration.name).includes(name)) return true;
+  if (ts.isCatchClause(node) && node.variableDeclaration !== undefined && bindingNames(ts, node.variableDeclaration.name).includes(name)) return true;
   const statements = ts.isBlock(node) || ts.isSourceFile(node) || ts.isModuleBlock(node) ? node.statements : ts.isCaseClause(node) || ts.isDefaultClause(node) ? node.statements : undefined;
   if (statements !== undefined) {
     for (const s of statements) {
-      if (ts.isVariableStatement(s) && s.declarationList.declarations.some((d) => patternNames(ts, d.name).includes(name))) return true;
+      if (ts.isVariableStatement(s) && s.declarationList.declarations.some((d) => bindingNames(ts, d.name).includes(name))) return true;
       if ((ts.isFunctionDeclaration(s) || ts.isClassDeclaration(s)) && s.name?.text === name) return true;
     }
   }
   if ((ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) && node.initializer !== undefined && ts.isVariableDeclarationList(node.initializer)) {
-    if (node.initializer.declarations.some((d) => patternNames(ts, d.name).includes(name))) return true;
+    if (node.initializer.declarations.some((d) => bindingNames(ts, d.name).includes(name))) return true;
   }
   return false;
 }
@@ -893,7 +857,7 @@ export function planAstroFile(input: {
       refusals.push({ start, end: Math.max(end, start + 1), reason });
     };
     const sentences: Array<{ start: number; end: number; reason: string }> = [];
-    const rich = richBinding(ts, r);
+    const rich = r.front === null ? 'none' : richBindingOf(ts, r.front.sf);
     const context: Context = {
       ts,
       cwd,
@@ -1296,10 +1260,10 @@ function sentenceRule(ctx: Context, path: Element[], sentence: Sentence): string
   }
   for (const d of sentence.descendants) {
     const attr = SENTENCE_ATTRS.find((a) => d.attrs.some((x) => x.name === a));
-    if (attr !== undefined) return `inside an element with ${attr}`;
+    if (attr !== undefined) return insideAttribute(attr);
   }
   // The value's tags are its only markup: words that read as one (`&lt;1&gt;`) would turn into a tag.
-  if (textsOf(sentence.range).some((t) => /<\/?\d+\/?>/.test(textOf(r.page.slice(t.start, t.end))))) return TAG_SHAPED;
+  if (textsOf(sentence.range).some((t) => TAG_SHAPED.test(textOf(r.page.slice(t.start, t.end))))) return SENTENCE_REASONS.tagShaped;
   const around = path.map((e) => ({ name: sourceTag(r, e), attrs: e.attrs }));
   for (const t of textsOf(sentence.range)) {
     const lead = (LEAD.exec(t.text)?.[0] ?? '').length;
@@ -1322,19 +1286,6 @@ function sentenceRule(ctx: Context, path: Element[], sentence: Sentence): string
 function rebased(rich: NonNullable<LocatedLiteral['rich']>, bom: number): NonNullable<LocatedLiteral['rich']> {
   const by = (span: { pos: number; end: number }): { pos: number; end: number } => ({ pos: span.pos + bom, end: span.end + bom });
   return { ...rich, renderers: rich.renderers.map((x) => ({ open: by(x.open), close: by(x.close), tag: x.tag })) };
-}
-
-/**
- * The parameter names a renderer takes: each wanted name, or the first of
- * `name_`, `name__`, … that no copied open tag mentions as a whole word, so a
- * renderer never shadows a name its tag reads.
- */
-export function freeParams(openTags: string[], wanted: string[]): string[] {
-  return wanted.map((name) => {
-    let free = name;
-    while (openTags.some((tag) => new RegExp(`(?<![\\w$])${free.replace(/\$/g, '\\$')}(?![\\w$])`).test(tag))) free += '_';
-    return free;
-  });
 }
 
 /** The first element of the document, depth-first, that `test` accepts. */

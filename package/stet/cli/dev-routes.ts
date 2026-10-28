@@ -69,7 +69,7 @@ import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { elementPath, markupBraces, maskExpressions, selfClosedRaw } from './markup.js';
-import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, packageNames, scriptKindFor } from './source-scan.js';
+import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, packageNames, richPartsBindingAt, scriptKindFor } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -2542,7 +2542,14 @@ function jsxPlacement(ts: typeof import('typescript'), file: string, source: str
       read = read.parent;
     }
     if (read === undefined) return 'open';
-    const holder = read.parent;
+    // A sentence key's read is the first argument of a stet-bound `richParts(<read>, …)` filling the container (D16, J9).
+    const rich =
+      ts.isCallExpression(read.parent) &&
+      read.parent.arguments[0] === read &&
+      ts.isIdentifier(read.parent.expression) &&
+      read.parent.expression.text === 'richParts' &&
+      richPartsBindingAt(ts, sf, read.parent) === 'stet';
+    const holder = rich ? read.parent.parent : read.parent;
     if (ts.isJsxExpression(holder) && holder.dotDotDotToken === undefined && ts.isJsxElement(holder.parent) && intrinsic(holder.parent.openingElement)) {
       const el = holder.parent;
       const tag = (el.openingElement.tagName as TS.Identifier).text.toLowerCase();

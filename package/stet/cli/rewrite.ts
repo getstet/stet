@@ -10,7 +10,7 @@
  * one parse per file stays in the scanner.
  */
 
-import type { LocatedAccessor, LocatedLiteral, Span } from './source-scan.js';
+import { parseDiagnosticsOf, scanSource, scriptKindFor, type LocatedAccessor, type LocatedLiteral, type Span } from './source-scan.js';
 import { CliError } from './report.js';
 
 /** A span replacement; an insertion has `pos === end`. */
@@ -71,8 +71,21 @@ export function planRewrite(
   // Never shadow the host's own `copy` (e.g. copy-to-clipboard) — skip and report.
   if (located.copyBinding === 'foreign') return { edits: [], skipped: 'copy-collision' };
 
-  const leafText = located.context === 'send-arg' ? `copy('${key}')` : `{copy('${key}')}`;
+  const leafText =
+    located.context === 'send-arg' ? `copy('${key}')` : located.context === 'jsx-rich' ? richLeaf(source, located, key) : `{copy('${key}')}`;
   const edits: Edit[] = [];
+  // Match the host file's newline (P3-13 — a `\n` inserted into a CRLF file is
+  // a mixed-ending line).
+  const nl = dominantEol(source);
+  // An import, unless the file already has it (a re-run must not duplicate it).
+  // Insert at the pre-computed offset — AFTER a `'use client'` directive and the
+  // last import — never at 0. At file start, insert AFTER a leading BOM so it
+  // never lands mid-file (P3-14).
+  const importEdit = (stmt: string): Edit => {
+    const bomAtStart = located.importInsertPos === 0 && source.charCodeAt(0) === 0xfeff;
+    const pos = bomAtStart ? 1 : located.importInsertPos;
+    return { pos, end: pos, text: pos === 0 || bomAtStart ? `${stmt}${nl}` : `${nl}${stmt}` };
+  };
 
   if (located.copyBinding === 'none') {
     // A client leaf needs `const copy = useCopy()` in a component body; with no
@@ -80,20 +93,8 @@ export function planRewrite(
     if (kind === 'client' && located.enclosingBodyPos === null) {
       return { edits: [], skipped: 'no-component-body' };
     }
-    // Match the host file's newline (P3-13 — a `\n` inserted into a CRLF file is
-    // a mixed-ending line).
-    const nl = dominantEol(source);
-    // The accessor import, unless the file already has it (a re-run must not
-    // duplicate it). Insert at the pre-computed offset — AFTER a `'use client'`
-    // directive and the last import — never at 0. At file start, insert AFTER a
-    // leading BOM so it never lands mid-file (P3-14).
     if (!located.accessorImported) {
-      const stmt =
-        kind === 'client' ? "import { useCopy } from '@getstet/stet/react';" : `import { copy } from '${readPathImport}';`;
-      const bomAtStart = located.importInsertPos === 0 && source.charCodeAt(0) === 0xfeff;
-      const pos = bomAtStart ? 1 : located.importInsertPos;
-      const text = pos === 0 || bomAtStart ? `${stmt}${nl}` : `${nl}${stmt}`;
-      edits.push({ pos, end: pos, text });
+      edits.push(importEdit(kind === 'client' ? "import { useCopy } from '@getstet/stet/react';" : `import { copy } from '${readPathImport}';`));
     }
     // The client hook binding, module-scoped `copy` needs none on the server.
     if (kind === 'client') {
@@ -101,10 +102,101 @@ export function planRewrite(
       edits.push({ pos: bodyPos, end: bodyPos, text: `const copy = useCopy();${nl}` });
     }
   }
+  // A sentence key's renderer, from the entry the file's kind reads: a server
+  // file's from `react/server`, which keeps the client provider out of its
+  // page's client chunk (D16, check 4 K4). Pushed after the accessor import, so
+  // every file lists the two in one order.
+  if (located.context === 'jsx-rich' && located.richImported !== true) {
+    edits.push(importEdit(`import { richParts } from '@getstet/stet/react${kind === 'client' ? '' : '/server'}';`));
+  }
 
   // `'stet'` falls through to the leaf edit alone — a `const copy`/import serves it.
   edits.push({ pos: located.pos, end: located.end, text: leafText });
   return { edits };
+}
+
+/**
+ * A sentence's children replaced with one `richParts` read (D16): renderer `n`
+ * is element `n`'s open tag, copied byte for byte with ` key={k}` after its tag
+ * name, then `{c}`, then its close tag. A tag that carries its own `key` keeps
+ * it and takes no second parameter, so none goes unused (check 4 K11).
+ */
+function richLeaf(source: string, located: LocatedLiteral, key: string): string {
+  const rich = located.rich;
+  if (rich === undefined) throw new Error(`stet internal: a sentence in ${located.file} reached the rewrite path without its renderers`);
+  const opens = rich.renderers.map((r) => source.slice(r.open.pos, r.open.end));
+  const [c, k] = freeParams(opens, ['c', 'k']);
+  const renderers = rich.renderers.map((r, i) => {
+    const open = opens[i] as string;
+    const close = source.slice(r.close.pos, r.close.end);
+    if (r.keyed === true) return `(${c}) => ${open}{${c}}${close}`;
+    const at = open.indexOf(r.tag, 1) + r.tag.length;
+    return `(${c}, ${k}) => ${open.slice(0, at)} key={${k}}${open.slice(at)}{${c}}${close}`;
+  });
+  return `{richParts(copy('${key}'), [${renderers.join(', ')}])}`;
+}
+
+/**
+ * The parameter names a renderer takes: each wanted name, or the first of
+ * `name_`, `name__`, … that no copied open tag mentions as a whole word, so a
+ * renderer never shadows a name its tag reads. The Astro and the JSX writer
+ * both call it (D16, check 4 K17).
+ */
+export function freeParams(openTags: string[], wanted: string[]): string[] {
+  return wanted.map((name) => {
+    let free = name;
+    while (openTags.some((tag) => new RegExp(`(?<![\\w$])${free.replace(/\$/g, '\\$')}(?![\\w$])`).test(tag))) free += '_';
+    return free;
+  });
+}
+
+/** A planned read of a JSX file for its read-back: the key, its offset in the edited text, its literal's in the original, and whether it is a sentence key's `richParts` read. */
+export interface JsxRead {
+  key: string;
+  at: number;
+  from: number;
+  rich: boolean;
+}
+
+/**
+ * Each landed literal's read in the text `applyFileEdits(source, edits)`
+ * gives: its leaf's offset moved by every other edit ending at or before it,
+ * the identical inserts counted once, as the batch applies them.
+ */
+export function jsxReads(edits: Edit[], landed: Array<{ literal: LocatedLiteral; key: string }>): JsxRead[] {
+  const unique = uniqueEdits(edits);
+  return landed.map(({ literal, key }) => {
+    const shift = unique
+      .filter((e) => e.end <= literal.pos && !(e.pos === literal.pos && e.end === literal.end))
+      .reduce((sum, e) => sum + e.text.length - (e.end - e.pos), 0);
+    return { key, at: literal.pos + shift, from: literal.pos, rich: literal.context === 'jsx-rich' };
+  });
+}
+
+/**
+ * Whether a JSX file rewritten with sentence keys reads back as planned (D16):
+ * it parses with no syntax error; its scan holds a `'jsx-rich'` read of each
+ * planned sentence key at its planned offset; and its literals, compared by
+ * text in order, are the original's without the ones replaced. The comparison
+ * reads texts, keys and offsets, which the read path's name does not change.
+ */
+export async function jsxRichClean(
+  ts: typeof import('typescript'),
+  file: string,
+  before: string,
+  after: string,
+  reads: JsxRead[],
+): Promise<boolean> {
+  if (parseDiagnosticsOf(ts.createSourceFile(file, after, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file))).length > 0) return false;
+  const prior = await scanSource(file, before, { readPathImport: '' });
+  const next = await scanSource(file, after, { readPathImport: '' });
+  for (const read of reads.filter((r) => r.rich)) {
+    if (!next.accessorCalls.some((call) => call.context === 'jsx-rich' && call.key === read.key && call.pos === read.at)) return false;
+  }
+  const replaced = new Set(reads.map((r) => r.from));
+  const kept = prior.literals.filter((l) => !replaced.has(l.pos)).map((l) => l.text);
+  const found = next.literals.map((l) => l.text);
+  return kept.length === found.length && kept.every((text, i) => text === found[i]);
 }
 
 /**
@@ -115,18 +207,7 @@ export function planRewrite(
  * by construction" true rather than hopeful.
  */
 export function applyFileEdits(source: string, edits: Edit[]): string {
-  // Dedupe identical inserts — two literals in one component both ask for the
-  // same `const copy`, two in one file both ask for the same import.
-  const seen = new Set<string>();
-  const unique: Edit[] = [];
-  for (const e of edits) {
-    if (e.pos === e.end) {
-      const dup = `${e.pos}\u0000${e.text}`;
-      if (seen.has(dup)) continue;
-      seen.add(dup);
-    }
-    unique.push(e);
-  }
+  const unique = uniqueEdits(edits);
 
   // Descending by pos, then by end: a zero-width insert at n orders AFTER a
   // replacement [n, …) so the insert's text survives, independent of input order.
@@ -146,6 +227,25 @@ export function applyFileEdits(source: string, edits: Edit[]): string {
   let out = source;
   for (const e of unique) out = out.slice(0, e.pos) + e.text + out.slice(e.end);
   return out;
+}
+
+/**
+ * A file's edits with identical inserts collapsed to the first — two literals
+ * in one component both ask for the same `const copy`, two in one file both
+ * ask for the same import.
+ */
+function uniqueEdits(edits: Edit[]): Edit[] {
+  const seen = new Set<string>();
+  const unique: Edit[] = [];
+  for (const e of edits) {
+    if (e.pos === e.end) {
+      const dup = `${e.pos}\u0000${e.text}`;
+      if (seen.has(dup)) continue;
+      seen.add(dup);
+    }
+    unique.push(e);
+  }
+  return unique;
 }
 
 /**
@@ -175,6 +275,9 @@ export function unRewriteFile(
       skipped.push(call);
       continue;
     }
+    // A sentence key's read goes back to markup by its renderers, which this
+    // inverse does not rebuild: a value in its place would show its tags.
+    if (call.context === 'jsx-rich') throw new CliError(`eject: ${call.file}: a richParts call stet cannot read back`);
     // Fail-safe: a stet key present in the source but ABSENT from the resolved
     // map (never published, no default — `resolveAll` omits undefined values)
     // must ABORT, never emit a silent `undefined` token into host source. eject

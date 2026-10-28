@@ -190,6 +190,18 @@ describe('stet split — a JavaScript host', () => {
     expect(files()).toEqual(before);
   });
 
+  it("names a sentence key's rich read by the element that holds it (T16.16)", async () => {
+    const host = next();
+    writeFileSync(
+      join(host.cwd, 'app/page.tsx'),
+      "import { copy } from '@/lib/content';\nimport { richParts } from '@getstet/stet/react/server';\nexport default function Page() {\n" +
+        "  return <main><p>{richParts(copy('home_hero_link_text'), [(c, k) => <b key={k}>{c}</b>])}</p></main>;\n}\n",
+    );
+    expect(await host.run('rename', '--propose', 'names.json')).toBe(0);
+    const plan = JSON.parse(host.file('names.json')) as { keys: Array<{ old: string; key: string; places: string[] }> };
+    expect(plan.keys.find((e) => e.old === 'home_hero_link_text')).toMatchObject({ key: 'home_page_paragraph', places: [expect.stringMatching(/^app\/page\.tsx:4 /)] });
+  });
+
   it('refuses a read at the line in a form stet cannot rewrite', async () => {
     const host = next(['export const which = "home_hero_link_text";']);
     const before = readFileSync(join(host.cwd, 'app/page.tsx'), 'utf8');

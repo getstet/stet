@@ -36,6 +36,16 @@ vi.mock('../cli/artifacts.js', async (importOriginal) => {
   };
 });
 
+/** A read-back made to fail on demand (T16.14): every other export is the real engine. */
+const planted = vi.hoisted(() => ({ jsxRichClean: false }));
+vi.mock('../cli/rewrite.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../cli/rewrite.js')>();
+  return {
+    ...real,
+    jsxRichClean: (...args: Parameters<typeof real.jsxRichClean>) => (planted.jsxRichClean ? Promise.resolve(false) : real.jsxRichClean(...args)),
+  };
+});
+
 import { astroReads } from '../cli/astro-rewrite.js';
 import { loadConfig } from '../cli/config.js';
 import { runRegister } from '../cli/register.js';
@@ -3229,6 +3239,22 @@ describe('register — the Astro rewriter (D14)', () => {
     expect(read(dir, 'src/pages/foreign.astro')).toBe(KEPT()['src/pages/foreign.astro']);
   });
 
+  it("renames a renderer's parameters where an open tag reads the name `c` (check 4 K17)", async () => {
+    const dir = astroSite({ 'src/pages/index.astro': BY_PROPERTY('<p>See <a href={c}>docs</a> now</p>\n', "const c = '/x';\n") }, { keys: { hero_sub: 'Sub words' } });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(read(dir, 'src/pages/index.astro')).toContain('<p>{richParts(copy.');
+    expect(read(dir, 'src/pages/index.astro')).toContain('[(c_) => <a href={c}>{c_}</a>])}</p>');
+  });
+
+  it('lists a sentence of a file that binds richParts as a variable, and keeps its bytes', async () => {
+    const page = BY_PROPERTY('<p>Mine run <b>npx z init</b> here.</p>\n', 'const richParts = (v: string) => v;\n');
+    const dir = astroSite({ 'src/pages/foreign.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    expect(read(dir, 'src/pages/foreign.astro')).toBe(page);
+    expect(notRewritten(cap)).toEqual(['src/pages/foreign.astro:6 "Mine run npx z init here." not rewritten (a foreign richParts is bound in this file) — adopt by hand']);
+  });
+
   it('adopts nothing the second time over its sentence keys, a titled link among them (T16.9, check 3 F16)', async () => {
     const files = KEPT();
     files['src/pages/rich.astro'] = BY_PROPERTY('<p>Install: run <b>npx x init</b> and answer.</p>\n<p>See <a class="i" href="/docs"><code>stet</code> docs</a> now</p>\n');
@@ -3696,5 +3722,161 @@ describe('register — the Astro rewriter (D14)', () => {
     const holding = Object.entries(defaults(dir).default).filter(([, v]) => v === 'stet changelog').map(([k]) => k);
     expect(holding).toHaveLength(2);
     expect(holding).toContain('nav_changelog');
+  });
+});
+
+describe('register — JSX sentence keys (D16)', () => {
+  /** A Next app-router host whose read path `@/lib/content` is a typed stub, with `files` beside it. */
+  const nextHost = (files: Record<string, string>, opts: SetupOpts = {}): string => {
+    const dir = project(opts);
+    write(dir, 'lib/content.ts', 'export const copy = (key: string): string => key;\n');
+    for (const [rel, text] of Object.entries(files)) write(dir, rel, text);
+    return dir;
+  };
+  /** `tsc --noEmit` over `include` with `@getstet/stet` resolved to the built package; the output, empty when clean. */
+  const tscHost = (dir: string, include: string[], options: Record<string, unknown>): string => {
+    if (!existsSync(join(packageRoot(), 'dist', 'react', 'server.js'))) execFileSync('npm', ['run', 'build'], { cwd: packageRoot(), stdio: 'pipe' });
+    if (!existsSync(join(dir, 'node_modules'))) symlinkSync(join(packageRoot(), '..', 'node_modules'), join(dir, 'node_modules'), 'dir');
+    write(
+      dir,
+      'tsconfig.json',
+      JSON.stringify({
+        compilerOptions: { target: 'ES2022', lib: ['ES2022', 'DOM'], module: 'ESNext', moduleResolution: 'bundler', jsx: 'react-jsx', skipLibCheck: true, noEmit: true, baseUrl: '.', paths: { '@/*': ['./*'] }, ...options },
+        include,
+      }),
+    );
+    try {
+      execFileSync(process.execPath, [createRequire(import.meta.url).resolve('typescript/bin/tsc'), '--noEmit', '-p', 'tsconfig.json'], { cwd: dir, encoding: 'utf8', stdio: 'pipe' });
+      return '';
+    } catch (error) {
+      return String((error as { stdout?: string }).stdout ?? error);
+    }
+  };
+  const SERVER_SENTENCES =
+    "const k = 'x';\nexport default function Page() {\n  return (\n    <main>\n      <p>Run <b>npx x init</b> now.</p>\n" +
+    '      <p>Keep <b key="x">this</b> key.</p>\n      <p>Mind <b data-k={k}>the</b> name.</p>\n    </main>\n  );\n}\n';
+
+  it("writes a server component's sentence through richParts from react/server, keyed renderers and all (T16.12)", async () => {
+    const dir = nextHost({ 'app/page.tsx': SERVER_SENTENCES });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const page = read(dir, 'app/page.tsx');
+    expect(page).toContain("import { copy } from '@/lib/content';");
+    expect(page).toContain("import { richParts } from '@getstet/stet/react/server';");
+    const key = /<p>\{richParts\(copy\('(\w+)'\), \[\(c, k\) => <b key=\{k\}>\{c\}<\/b>\]\)\}<\/p>/.exec(page)?.[1] as string;
+    expect([(descriptor(dir).keys[key] as KeyDef | undefined)?.tags, defaults(dir).default[key]]).toEqual([1, 'Run <1>npx x init</1> now.']);
+    // A tag that carries its own key keeps it and takes no second parameter; a tag that reads `k` moves the parameter aside (check 4 K11, K17).
+    expect(page).toMatch(/<p>\{richParts\(copy\('\w+'\), \[\(c\) => <b key="x">\{c\}<\/b>\]\)\}<\/p>/);
+    expect(page).toMatch(/<p>\{richParts\(copy\('\w+'\), \[\(c, k_\) => <b key=\{k_\} data-k=\{k\}>\{c\}<\/b>\]\)\}<\/p>/);
+    expect(tscHost(dir, ['app/page.tsx', 'lib/content.ts'], { strict: true, noUnusedParameters: true })).toBe('');
+  }, 60_000);
+
+  it("writes a client component's sentence through useCopy, importing richParts beside it (T16.13)", async () => {
+    const dir = nextHost({
+      'app/widget.tsx': "'use client';\nexport default function Widget() {\n  return <p>Read the <a href=\"/docs\">docs</a> first.</p>;\n}\n",
+      'app/page.tsx': "import { richParts } from '@getstet/stet';\nexport default function Page() {\n  return <p>Run <b>npx x init</b> now.</p>;\n}\n",
+    });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const widget = read(dir, 'app/widget.tsx');
+    expect(widget).toMatch(/^'use client';\nimport \{ richParts \} from '@getstet\/stet\/react';\nimport \{ useCopy \} from '@getstet\/stet\/react';\n/);
+    expect(widget).toContain('const copy = useCopy();');
+    expect(widget).toMatch(/<p>\{richParts\(copy\('\w+'\), \[\(c, k\) => <a key=\{k\} href="\/docs">\{c\}<\/a>\]\)\}<\/p>/);
+    // A server file that imports the renderer from the root entry already gains no second import.
+    const page = read(dir, 'app/page.tsx');
+    expect(page.match(/import \{ richParts \}/g)).toHaveLength(1);
+    expect(page).toContain("{richParts(copy('");
+    expect(tscHost(dir, ['app/widget.tsx', 'app/page.tsx', 'lib/content.ts'], { strict: true })).toBe('');
+  }, 60_000);
+
+  it('lists every literal of a file whose rewrite does not read back, and keeps its bytes (T16.14)', async () => {
+    const dir = nextHost({ 'app/page.tsx': SERVER_PAGE('<main><h1>Plain words here</h1><p>Run <b>npx x init</b> now.</p></main>') });
+    const before = read(dir, 'app/page.tsx');
+    const cap = io(dir);
+    planted.jsxRichClean = true;
+    try {
+      expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    } finally {
+      planted.jsxRichClean = false;
+    }
+    expect(read(dir, 'app/page.tsx')).toBe(before);
+    expect(notRewritten(cap)).toEqual([
+      'app/page.tsx:2 "Plain words here" not rewritten (the rewrite did not read back cleanly) — adopt by hand',
+      'app/page.tsx:2 "Run npx x init now." not rewritten (the rewrite did not read back cleanly) — adopt by hand',
+    ]);
+  });
+
+  it('lists every sentence of a file that binds its own richParts, and keeps its bytes (T16.15)', async () => {
+    const page = "import { richParts } from './mine';\nexport default function Page() {\n  return <main><p>Run <b>npx x init</b> now.</p><p>Read <i>this</i> first.</p></main>;\n}\n";
+    const dir = nextHost({ 'app/page.tsx': page });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toBe(page);
+    expect(notRewritten(cap)).toEqual([
+      'app/page.tsx:3 "Run npx x init now." not rewritten (a foreign richParts is bound in this file) — adopt by hand',
+      'app/page.tsx:3 "Read this first." not rewritten (a foreign richParts is bound in this file) — adopt by hand',
+    ]);
+  });
+
+  it('types a sentence whose holder is a fragment, with no ReactNode context to infer from', async () => {
+    const dir = nextHost({
+      'app/page.tsx':
+        "export default function Page() {\n  const on = true;\n  return <div>{on ? <>Run <b>npx x init</b> now.</> : null}<>Read <a href=\"/d\">docs</a> first.</></div>;\n}\n",
+    });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toContain('<>{richParts(');
+    expect(tscHost(dir, ['app/page.tsx', 'lib/content.ts'], { strict: true, noUnusedParameters: true })).toBe('');
+  }, 60_000);
+
+  it('never reads a declared plain key that holds the sentence\'s plain text', async () => {
+    const dir = nextHost(
+      { 'app/page.tsx': SERVER_PAGE('<p>Run <b>npx x init</b> now.</p>') },
+      { keys: { hero_install: { shape: 'text', target: 'web' } }, defaults: { hero_install: 'Run npx x init now.' } },
+    );
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const page = read(dir, 'app/page.tsx');
+    expect(page).not.toContain("copy('hero_install')");
+    const key = /richParts\(copy\('(\w+)'\)/.exec(page)?.[1] as string;
+    expect([(descriptor(dir).keys[key] as KeyDef | undefined)?.tags, defaults(dir).default[key], defaults(dir).default['hero_install']]).toEqual([1, 'Run <1>npx x init</1> now.', 'Run npx x init now.']);
+  });
+
+  it('gives two sentences with the same words and different markup two keys', async () => {
+    const dir = nextHost({ 'app/page.tsx': SERVER_PAGE('<div><p>Mix <b>one two</b> end</p><p>Mix <b>one</b> two end</p></div>') });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const keys = [...read(dir, 'app/page.tsx').matchAll(/richParts\(copy\('(\w+)'\)/g)].map((m) => m[1] as string);
+    expect(new Set(keys).size).toBe(2);
+    expect(keys.map((k) => defaults(dir).default[k])).toEqual(['Mix <1>one two</1> end', 'Mix <1>one</1> two end']);
+  });
+
+  it('keeps a sentence whose words read as placeholder tags as written, and lists it', async () => {
+    const page = SERVER_PAGE('<p>Orders over &lt;1&gt;30&lt;/1&gt; ship <b>free</b> now.</p>');
+    const dir = nextHost({ 'app/page.tsx': page });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toBe(page);
+    expect(notRewritten(cap)).toEqual(['app/page.tsx:2 "Orders over 30 ship free now." not rewritten (text that reads as a placeholder tag) — adopt by hand']);
+  });
+
+  it('keeps a decorative number at either edge of a sentence outside its key', async () => {
+    const dir = nextHost({ 'app/page.tsx': SERVER_PAGE('<main><h2><span className="n">01</span>Scan <code>x</code> now</h2><h3>Scan <code>y</code> later <span className="n">02</span></h3></main>') });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const page = read(dir, 'app/page.tsx');
+    expect(page).toMatch(/<h2><span className="n">\{copy\('\w+'\)\}<\/span>\{richParts\(copy\('\w+'\), \[\(c, k\) => <code key=\{k\}>\{c\}<\/code>\]\)\}<\/h2>/);
+    expect(page).toMatch(/<h3>\{richParts\(copy\('\w+'\), \[\(c, k\) => <code key=\{k\}>\{c\}<\/code>\]\)\}<span className="n">\{copy\('\w+'\)\}<\/span><\/h3>/);
+  });
+
+  it('adopts nothing the second time, and scan reports none of the sentences (T16.17)', async () => {
+    const dir = nextHost({
+      'app/page.tsx': SERVER_SENTENCES.replace('<p>Run <b>npx x init</b> now.</p>', '<p>Run{" "}\n        <b title="Bold words">npx x init</b>{" "}\n        now.</p>'),
+      'app/widget.tsx': "'use client';\nexport default function Widget() {\n  return <p>Read the <a href=\"/docs\">docs</a> first.</p>;\n}\n",
+    });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const after = ['app/page.tsx', 'app/widget.tsx'].map((rel) => read(dir, rel));
+    expect(after.join('\n')).not.toContain('npx x init');
+    const second = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], second)).toBe(0);
+    expect(second.out.at(-1)).toBe('register: nothing to adopt');
+    expect(['app/page.tsx', 'app/widget.tsx'].map((rel) => read(dir, rel))).toEqual(after);
+    const scanned = io(dir);
+    await runCli(['scan'], scanned);
+    expect([...scanned.out, ...scanned.err].join('\n')).not.toMatch(/unkeyed copy "(Run|Keep|Mind|Read)/);
   });
 });

@@ -27,6 +27,7 @@ import { dirname, join } from 'node:path';
 import type * as TS from 'typescript';
 
 import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
+import { plainOf } from '../src/placeholder.js';
 import { escapeRegExp } from '../src/seo.js';
 import type { Descriptor } from '../src/types.js';
 import {
@@ -191,7 +192,7 @@ export interface LocatedLiteral {
   raw: string;
   /** The unquoted, entity-decoded copy — seeds the default and derives the key. jsx-text is also whitespace-collapsed; jsx-attr keeps its significant whitespace; send-arg is a plain string literal (no entities). */
   text: string;
-  context: 'jsx-text' | 'jsx-attr' | 'send-arg' | 'module' | 'astro-text' | 'astro-attr' | 'astro-data' | 'astro-rich';
+  context: 'jsx-text' | 'jsx-attr' | 'send-arg' | 'module' | 'astro-text' | 'astro-attr' | 'astro-data' | 'astro-rich' | 'jsx-rich';
   shape: LiteralShape;
   /**
    * The name a new key would take before the run numbers it: a JSX literal's
@@ -214,8 +215,14 @@ export interface LocatedLiteral {
   importInsertPos: number;
   /** A head text the place alone does not name (an Astro feed link's `title`): it reuses no declared key and shares only with head texts. */
   inHead?: true;
-  /** A sentence key's value with its placeholder tags, their count, and each element's open and close tag in the source, in open-tag order (D16). */
-  rich?: { value: string; tags: number; renderers: Array<{ open: Span; close: Span; tag: string }> };
+  /**
+   * A sentence key's value with its placeholder tags, their count, and each
+   * element's open and close tag in the source, in open-tag order (D16). A JSX
+   * element whose open tag carries its own `key` is `keyed`.
+   */
+  rich?: { value: string; tags: number; renderers: Array<{ open: Span; close: Span; tag: string; keyed?: true }> };
+  /** A JSX sentence's file already imports stet's `richParts`, so its rewrite inserts no second import (D16). */
+  richImported?: true;
 }
 
 /** A copy string the scanner recognizes as i18n's — reported, never rewritten. */
@@ -239,7 +246,8 @@ export interface LocatedAccessor {
   end: number;
   /** The string-literal argument — the resolved value keys off it. */
   key: string;
-  context: 'jsx-text' | 'jsx-attr' | 'send-arg';
+  /** `'jsx-rich'` is a sentence key's whole `{richParts(copy('k'), [renderers])}` container (D16). */
+  context: 'jsx-text' | 'jsx-attr' | 'send-arg' | 'jsx-rich';
   /**
    * What `copy` binds to at the call — `'stet'` is the accessor (`useCopy()` or
    * a read-path `copy`) and eject un-rewrites it; `'foreign'`/`'none'` is some
@@ -256,6 +264,19 @@ export interface LocatedAccessor {
   section: string | null;
   item?: string;
   role: string;
+  /** A `'jsx-rich'` read's renderers: each one's open and close tag and its parameter names, in order. */
+  renderers?: Array<{ open: Span; close: Span; params: string[] }>;
+  /** A `'jsx-rich'` read whose renderers are not all `(c) => <x …>{c}</x>`: no rebuild reads it back. */
+  shape?: 'readable' | 'unreadable';
+}
+
+/** A JSX sentence or attribute the walk proves no rewrite for, with the reason register lists it under (D16). */
+export interface ListedText {
+  pos: number;
+  text: string;
+  /** A sentence, or a copy attribute on one of a sentence key's tags. */
+  context: 'jsx-rich' | 'jsx-attr';
+  reason: string;
 }
 
 /** One managed-surface file, walked once. */
@@ -271,6 +292,8 @@ export interface ScanResult {
   /** The `const … = resolveAll(…)` statement `init` added to the root layout — dropping it with the `stet` import avoids a dangling call. */
   resolvedMapDeclSpans: Span[];
   i18nSkips: I18nSkip[];
+  /** The sentences and the copy attributes on a sentence's tags that are listed rather than rewritten (D16). */
+  listed: ListedText[];
   parseErrors: boolean;
   /** Display strings in module-scope data (`dataLiterals`): reported, never rewritten. */
   data: DialectFinding[];
@@ -980,6 +1003,245 @@ function jsxTextIgnored(ts: typeof import('typescript'), sf: TS.SourceFile, text
   );
 }
 
+/** The modules a renderer import may name: every read entry ships `richParts` (D16). */
+export const RICH_MODULES = new Set(['@getstet/stet', '@getstet/stet/core', '@getstet/stet/react', '@getstet/stet/react/server']);
+
+/** Why a sentence stays as written, as the terminal prints it: the Astro and the JSX writer list a sentence alike (D16). */
+export const SENTENCE_REASONS = {
+  empty: 'an empty element inside the sentence',
+  foreignRich: 'a foreign richParts is bound in this file',
+  onTag: 'on a tag inside a sentence key',
+  tagShaped: 'text that reads as a placeholder tag',
+} as const;
+
+/** The reason for an element inside a sentence whose content an attribute owns. */
+export const insideAttribute = (name: string): string => `inside an element with ${name}`;
+
+/** Words that read as a placeholder tag (`<1>`, `</2>`, `<3/>`): in a sentence's value they would turn into one. */
+export const TAG_SHAPED = /<\/?\d+\/?>/;
+
+/** Every name a binding binds: an identifier, or each name a destructuring pattern holds. */
+export function bindingNames(ts: typeof import('typescript'), name: TS.BindingName): string[] {
+  if (ts.isIdentifier(name)) return [name.text];
+  return name.elements.flatMap((el) => (ts.isOmittedExpression(el) ? [] : bindingNames(ts, el.name)));
+}
+
+/** What a scope walk asks about one name: which of its bindings are stet's. */
+interface Binder {
+  name: string;
+  /** A `const`/`let`/`var` of the name, an identifier: stet's only where this accepts it. */
+  variable: (decl: TS.VariableDeclaration, isConst: boolean) => boolean;
+  /** A named import of the name from `spec`: stet's only where this accepts it. */
+  imported: (spec: string, el: TS.ImportSpecifier) => boolean;
+}
+
+/**
+ * What a name binds to AT a node — the nearest enclosing scope wins; no binding
+ * anywhere is `'none'`. `'stet'` only where the binder accepts the binding;
+ * any other binding of the name (a parameter, a destructured or default or
+ * namespace import, a `function`, or a block `const`/`let` declared after the
+ * node, in its TDZ) is `'foreign'`. Same-file only: a cross-module alias, a
+ * `var` hoisted from a sibling block and a shadowed initializer are the
+ * documented residuals (they need the type-checker — §2.3 known-limits); it
+ * resolves to the nearest LOCAL binding and never crashes.
+ */
+function bindingAt(ts: typeof import('typescript'), sf: TS.SourceFile, node: TS.Node, binder: Binder): 'stet' | 'foreign' | 'none' {
+  const binds = (name: TS.BindingName): boolean => bindingNames(ts, name).includes(binder.name);
+  // In a position-aware (block) scope, a `const`/`let` declared AFTER the node is
+  // in its TDZ → `'foreign'` (never `'stet'`, which would emit a use-before-declare;
+  // never `'none'`, since a second declaration would redeclare).
+  const classifyVarList = (list: TS.VariableDeclarationList, fromPos: number, positionAware: boolean): 'stet' | 'foreign' | null => {
+    for (const decl of list.declarations) {
+      if (ts.isIdentifier(decl.name)) {
+        if (decl.name.text !== binder.name) continue;
+        if (positionAware && decl.getStart(sf) > fromPos) return 'foreign';
+        return binder.variable(decl, (list.flags & ts.NodeFlags.Const) !== 0) ? 'stet' : 'foreign';
+      }
+      if (binds(decl.name)) return 'foreign';
+    }
+    return null;
+  };
+  // A default or namespace import of the name binds it to something else; a named one is the binder's to judge.
+  const classifyImport = (imp: TS.ImportDeclaration): 'stet' | 'foreign' | null => {
+    const spec = ts.isStringLiteral(imp.moduleSpecifier) ? imp.moduleSpecifier.text : '';
+    const clause = imp.importClause;
+    if (!clause) return null;
+    if (clause.name?.text === binder.name) return 'foreign';
+    const nb = clause.namedBindings;
+    if (nb && ts.isNamespaceImport(nb) && nb.name.text === binder.name) return 'foreign';
+    if (nb && ts.isNamedImports(nb)) {
+      for (const el of nb.elements) {
+        if (el.name.text !== binder.name) continue;
+        return binder.imported(spec, el) ? 'stet' : 'foreign';
+      }
+    }
+    return null;
+  };
+  // Whether ONE enclosing scope binds the name, and how — `null` if it does not.
+  // A Block is position-aware (TDZ); the SourceFile is NOT (a function body runs
+  // after module init, so a later top-level binding is still in scope at call).
+  const bindingInScope = (scope: TS.Node, fromPos: number): 'stet' | 'foreign' | null => {
+    if (ts.isBlock(scope) || ts.isModuleBlock(scope) || ts.isSourceFile(scope)) {
+      const positionAware = !ts.isSourceFile(scope);
+      for (const stmt of scope.statements) {
+        if (ts.isVariableStatement(stmt)) {
+          const k = classifyVarList(stmt.declarationList, fromPos, positionAware);
+          if (k) return k;
+        } else if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === binder.name) {
+          return 'foreign';
+        } else if (ts.isImportDeclaration(stmt)) {
+          const k = classifyImport(stmt);
+          if (k) return k;
+        }
+      }
+      return null;
+    }
+    if (ts.isFunctionDeclaration(scope) || ts.isFunctionExpression(scope) || ts.isArrowFunction(scope) || ts.isMethodDeclaration(scope)) {
+      return scope.parameters.some((p) => binds(p.name)) ? 'foreign' : null;
+    }
+    if (ts.isCatchClause(scope)) {
+      return scope.variableDeclaration && binds(scope.variableDeclaration.name) ? 'foreign' : null;
+    }
+    // A `for`/`for-in`/`for-of` header binding is always in scope for the body.
+    if (ts.isForStatement(scope) && scope.initializer && ts.isVariableDeclarationList(scope.initializer)) {
+      return classifyVarList(scope.initializer, fromPos, false);
+    }
+    if ((ts.isForInStatement(scope) || ts.isForOfStatement(scope)) && ts.isVariableDeclarationList(scope.initializer)) {
+      return classifyVarList(scope.initializer, fromPos, false);
+    }
+    return null;
+  };
+  const fromPos = node.getStart(sf);
+  for (let cur: TS.Node | undefined = node; cur; cur = cur.parent) {
+    const kind = bindingInScope(cur, fromPos);
+    if (kind) return kind;
+    if (ts.isSourceFile(cur)) break;
+  }
+  return 'none';
+}
+
+/** `richParts` is stet's renderer only as a named import from a read entry, under its own name. */
+const RICH_BINDER: Binder = {
+  name: 'richParts',
+  variable: () => false,
+  imported: (spec, el) => RICH_MODULES.has(spec) && (el.propertyName?.text ?? 'richParts') === 'richParts',
+};
+
+/** What `richParts` binds to at a node, by the scope walk the accessor's `copy` takes (D16). */
+export function richPartsBindingAt(ts: typeof import('typescript'), sf: TS.SourceFile, node: TS.Node): 'stet' | 'foreign' | 'none' {
+  return bindingAt(ts, sf, node, RICH_BINDER);
+}
+
+/**
+ * What `richParts` names anywhere under `root` (a file, a front matter):
+ * stet's renderer imported from a read entry, nothing, or anything else (a
+ * renamed or default import, a function or variable of the host's own). A
+ * writer reuses the first, inserts the import for the second, and lists every
+ * sentence for the third (D16).
+ */
+export function richBindingOf(ts: typeof import('typescript'), root: TS.Node): 'stet' | 'none' | 'foreign' {
+  let stet = false;
+  let foreign = false;
+  const visit = (node: TS.Node): void => {
+    if (ts.isImportDeclaration(node)) {
+      const clause = node.importClause;
+      const from = ts.isStringLiteral(node.moduleSpecifier) && RICH_MODULES.has(node.moduleSpecifier.text);
+      if (clause?.name?.text === 'richParts') foreign = true;
+      const named = clause?.namedBindings;
+      if (named !== undefined && ts.isNamespaceImport(named) && named.name.text === 'richParts') foreign = true;
+      if (named !== undefined && ts.isNamedImports(named)) {
+        for (const el of named.elements) {
+          if (el.name.text !== 'richParts') continue;
+          if (from && (el.propertyName?.text ?? 'richParts') === 'richParts') stet = true;
+          else foreign = true;
+        }
+      }
+      return;
+    }
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && bindingNames(ts, node.name).includes('richParts')) foreign = true;
+    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name?.text === 'richParts') foreign = true;
+    ts.forEachChild(node, visit);
+  };
+  visit(root);
+  return foreign ? 'foreign' : stet ? 'stet' : 'none';
+}
+
+/**
+ * The words one JSX text child renders, by JSX's own text rule (Babel's
+ * `cleanJSXElementLiteralChild`, which TypeScript's `react-jsx` transform
+ * applies too): split into lines; every line but the first loses its leading
+ * spaces and tabs, every line but the last its trailing ones; lines left empty
+ * are dropped and the rest joined with one space; entities decoded. So a line
+ * break beside a tag is no space, as React renders it (J2).
+ */
+export function jsxTextValue(raw: string): string {
+  const lines = raw.split(/\r\n|\n|\r/);
+  return lines
+    .map((line, i) => {
+      let kept = line;
+      if (i > 0) kept = kept.replace(/^[ \t]+/, '');
+      if (i < lines.length - 1) kept = kept.replace(/[ \t]+$/, '');
+      return kept;
+    })
+    .filter((line) => line !== '')
+    .map(decodeEntities)
+    .join(' ');
+}
+
+/**
+ * A JSX sentence's value and its text pieces, over `children`: each text by
+ * JSX's text rule, a string container as written, each element a numbered
+ * placeholder in open-tag order (`<n/>` where it renders nothing). Null where
+ * a child is anything else (an expression, a fragment), which no value holds.
+ */
+function sentenceParts(ts: typeof import('typescript'), sf: TS.SourceFile, children: readonly TS.JsxChild[]): { value: string; texts: string[] } | null {
+  let n = 0;
+  const texts: string[] = [];
+  const walk = (kids: readonly TS.JsxChild[]): string | null => {
+    let out = '';
+    for (const kid of kids) {
+      if (ts.isJsxText(kid)) {
+        const text = jsxTextValue(sf.text.slice(kid.pos, kid.end));
+        texts.push(text);
+        out += text;
+      } else if (ts.isJsxExpression(kid)) {
+        const e = kid.expression;
+        if (e === undefined || kid.dotDotDotToken !== undefined || !(ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e))) return null;
+        texts.push(e.text);
+        out += e.text;
+      } else if (ts.isJsxSelfClosingElement(kid)) {
+        n += 1;
+        out += `<${n}/>`;
+      } else if (ts.isJsxElement(kid)) {
+        n += 1;
+        const at = n;
+        const inner = walk(kid.children);
+        if (inner === null) return null;
+        out += inner === '' ? `<${at}/>` : `<${at}>${inner}</${at}>`;
+      } else {
+        return null;
+      }
+    }
+    return out;
+  };
+  const value = walk(children);
+  return value === null ? null : { value, texts };
+}
+
+/**
+ * A JSX sentence's value over an element's children (or a range of them): JSX's
+ * text rule and the open-tag numbering alone, with no copy or i18n gate, so the
+ * builder and eject's read-back judge one value (D15, D16).
+ */
+export function jsxSentenceValue(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+  element: TS.JsxElement | TS.JsxFragment,
+  children: readonly TS.JsxChild[] = element.children,
+): string | null {
+  return sentenceParts(ts, sf, children)?.value ?? null;
+}
+
 /**
  * The largest source file the scans read, in bytes. The compiler holds a
  * parse several hundred times a file's size, so a bundle or a vendored build
@@ -1057,6 +1319,7 @@ export async function scanSource(
     copyDeclSpans: [],
     resolvedMapDeclSpans: [],
     i18nSkips: [],
+    listed: [],
     parseErrors: false,
     data: [],
     sourceFile: sf,
@@ -1074,6 +1337,8 @@ export async function scanSource(
   let inPrologue = true;
   const stetImportSpans: Span[] = [];
   let accessorImported = false;
+  // The names a default import from `next/link` binds: a sentence carries that `Link` (D16).
+  const linkNames = new Set<string>();
 
   for (const stmt of sf.statements) {
     if (inPrologue && ts.isExpressionStatement(stmt) && ts.isStringLiteral(stmt.expression)) {
@@ -1092,6 +1357,7 @@ export async function scanSource(
 
     const clause = stmt.importClause;
     if (!clause) continue;
+    if (spec === 'next/link' && clause.name !== undefined) linkNames.add(clause.name.text);
     // `accessorImported` (file-level): the accessor import is ALREADY present, so
     // a re-run inserts no duplicate. The accessor is always a NAMED import —
     // `{ copy }` from the read-path, or `{ useCopy }` from @getstet/stet/react; a
@@ -1113,10 +1379,11 @@ export async function scanSource(
     end: number;
     raw: string;
     text: string;
-    context: 'jsx-text' | 'jsx-attr' | 'send-arg';
+    context: 'jsx-text' | 'jsx-attr' | 'send-arg' | 'jsx-rich';
     enclosingBodyPos: number | null;
     copyBinding: 'stet' | 'foreign' | 'none';
     place: Place;
+    rich?: NonNullable<LocatedLiteral['rich']>;
     /** The literal's node, and the JSX element it renders in, where it renders in one. */
     node: TS.Node;
     element?: TS.Node;
@@ -1184,114 +1451,20 @@ export async function scanSource(
   };
 
   // --- Per-literal lexical `copy` binding (operator 2026-08-24) ---
-  // Whether a binding name binds `copy` — an identifier, or a destructuring
-  // pattern (`{ copy }` / `[copy]` / `{ x: copy }`) whose LOCAL name is `copy`.
-  const bindingNameHasCopy = (name: TS.BindingName): boolean => {
-    if (ts.isIdentifier(name)) return name.text === 'copy';
-    for (const el of name.elements) {
-      if (ts.isBindingElement(el) && bindingNameHasCopy(el.name)) return true;
-    }
-    return false;
+  // `'stet'` ONLY for the exact `const copy = useCopy()`, or a named `{ copy }`
+  // (incl. `{ x as copy }`) from the read-path module; a `let`/`var copy` (even
+  // `= useCopy()`), any other initializer, a destructured `copy`, a default or
+  // namespace import (calling it leaf-only would hit a namespace/default at
+  // runtime) and a named `{ copy }` from any other module are `'foreign'`.
+  const copyBinder: Binder = {
+    name: 'copy',
+    variable: (decl, isConst) => {
+      const init = decl.initializer;
+      return isConst && !!init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === 'useCopy';
+    },
+    imported: (spec) => spec === opts.readPathImport,
   };
-  // A `copy` variable binding in one list. `'stet'` ONLY for the exact
-  // `const copy = useCopy()`; a `let`/`var copy` (even `= useCopy()`), any other
-  // initializer, or a destructured `copy` is `'foreign'`. In a position-aware
-  // (block) scope, a `const`/`let copy` declared AFTER the literal is in its TDZ
-  // → `'foreign'` (never `'stet'`, which would emit a use-before-declare; never
-  // `'none'`, since a second `const copy` would redeclare).
-  const classifyVarList = (
-    list: TS.VariableDeclarationList,
-    fromPos: number,
-    positionAware: boolean,
-  ): 'stet' | 'foreign' | null => {
-    for (const decl of list.declarations) {
-      if (ts.isIdentifier(decl.name)) {
-        if (decl.name.text !== 'copy') continue;
-        if (positionAware && decl.getStart(sf) > fromPos) return 'foreign';
-        const isConst = (list.flags & ts.NodeFlags.Const) !== 0;
-        const init = decl.initializer;
-        const isUseCopy =
-          !!init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === 'useCopy';
-        return isConst && isUseCopy ? 'stet' : 'foreign';
-      }
-      if (bindingNameHasCopy(decl.name)) return 'foreign';
-    }
-    return null;
-  };
-  // A `copy` import. The accessor is ONLY a named `{ copy }` (incl. `{ x as copy }`)
-  // from the read-path module → `'stet'`. A default `import copy from …` or a
-  // namespace `import * as copy from …` binds `copy` but calling it leaf-only
-  // would hit a namespace/default at runtime → `'foreign'`; a named `{ copy }`
-  // from any other module is `'foreign'` too.
-  const classifyImport = (imp: TS.ImportDeclaration): 'stet' | 'foreign' | null => {
-    const spec = ts.isStringLiteral(imp.moduleSpecifier) ? imp.moduleSpecifier.text : '';
-    const clause = imp.importClause;
-    if (!clause) return null;
-    if (clause.name?.text === 'copy') return 'foreign';
-    const nb = clause.namedBindings;
-    if (nb && ts.isNamespaceImport(nb) && nb.name.text === 'copy') return 'foreign';
-    if (nb && ts.isNamedImports(nb)) {
-      for (const el of nb.elements) {
-        if (el.name.text !== 'copy') continue;
-        return spec === opts.readPathImport ? 'stet' : 'foreign';
-      }
-    }
-    return null;
-  };
-  // Whether ONE enclosing scope binds `copy`, and how — `null` if it does not.
-  // A Block is position-aware (TDZ); the SourceFile is NOT (a function body runs
-  // after module init, so a later top-level binding is still in scope at call).
-  const bindingInScope = (node: TS.Node, fromPos: number): 'stet' | 'foreign' | null => {
-    if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isSourceFile(node)) {
-      const positionAware = !ts.isSourceFile(node);
-      for (const stmt of node.statements) {
-        if (ts.isVariableStatement(stmt)) {
-          const k = classifyVarList(stmt.declarationList, fromPos, positionAware);
-          if (k) return k;
-        } else if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === 'copy') {
-          return 'foreign';
-        } else if (ts.isImportDeclaration(stmt)) {
-          const k = classifyImport(stmt);
-          if (k) return k;
-        }
-      }
-      return null;
-    }
-    if (
-      ts.isFunctionDeclaration(node) ||
-      ts.isFunctionExpression(node) ||
-      ts.isArrowFunction(node) ||
-      ts.isMethodDeclaration(node)
-    ) {
-      return node.parameters.some((p) => bindingNameHasCopy(p.name)) ? 'foreign' : null;
-    }
-    if (ts.isCatchClause(node)) {
-      return node.variableDeclaration && bindingNameHasCopy(node.variableDeclaration.name) ? 'foreign' : null;
-    }
-    // A `for`/`for-in`/`for-of` header binding is always in scope for the body.
-    if (ts.isForStatement(node) && node.initializer && ts.isVariableDeclarationList(node.initializer)) {
-      return classifyVarList(node.initializer, fromPos, false);
-    }
-    if ((ts.isForInStatement(node) || ts.isForOfStatement(node)) && ts.isVariableDeclarationList(node.initializer)) {
-      return classifyVarList(node.initializer, fromPos, false);
-    }
-    return null;
-  };
-  // The `copy` binding visible AT a literal — nearest enclosing scope wins; no
-  // binding anywhere is `'none'`. Same-file only: a cross-module alias/re-export
-  // chain, a `var copy` hoisted from a sibling block, and a locally-shadowed
-  // `useCopy` identifier are the documented residuals (they need the
-  // type-checker — §2.3 known-limits); it resolves to the nearest LOCAL binding
-  // and never crashes.
-  const copyBindingAt = (node: TS.Node): 'stet' | 'foreign' | 'none' => {
-    const fromPos = node.getStart(sf);
-    for (let cur: TS.Node | undefined = node; cur; cur = cur.parent) {
-      const kind = bindingInScope(cur, fromPos);
-      if (kind) return kind;
-      if (ts.isSourceFile(cur)) break;
-    }
-    return 'none';
-  };
+  const copyBindingAt = (node: TS.Node): 'stet' | 'foreign' | 'none' => bindingAt(ts, sf, node, copyBinder);
 
   const elementOfAttr = (attr: TS.JsxAttribute): TS.Node | undefined => {
     const owner = attr.parent.parent; // JsxAttributes -> Jsx(Opening|SelfClosing)Element
@@ -1363,6 +1536,200 @@ export async function scanSource(
     partials.push({ pos, end: lit.end, raw: source.slice(pos, lit.end), text: lit.text, context: 'send-arg', enclosingBodyPos: enclosingComponentBodyPos(lit), copyBinding: copyBindingAt(lit), ...placeOf(lit, undefined) });
   };
 
+  // --- The JSX sentences (D16) ---
+  // Each element or fragment whose own words run through inline elements is read
+  // before its children: one sentence literal where every rule proves it, a
+  // listed sentence where one does not, and per piece where it is no sentence.
+  const richBinding = richBindingOf(ts, sf);
+  const listed: ListedText[] = [];
+  /** The runs a sentence holds: none is a literal of its own. */
+  const sentenceTexts = new Set<TS.Node>();
+  /** The runs of a sentence holding an i18n element or call: each is an i18n skip. */
+  const i18nTexts = new Set<TS.Node>();
+  /** The elements a sentence carries: none is a sentence of its own. */
+  const carriedEls = new Set<TS.Node>();
+  /** The tags a sentence key copies (a kept sentence's elements, a stet read's renderers): their copy attributes are listed. */
+  const sentenceTags = new Set<TS.Node>();
+  /** The accessor call inside a `'jsx-rich'` read, claimed by it. */
+  const richReads = new Set<TS.Node>();
+  const tagOf = (el: TS.JsxElement | TS.JsxSelfClosingElement): TS.JsxOpeningElement | TS.JsxSelfClosingElement =>
+    ts.isJsxElement(el) ? el.openingElement : el;
+  const hasAttr = (el: TS.JsxElement | TS.JsxSelfClosingElement, name: string): boolean =>
+    tagOf(el).attributes.properties.some((p) => ts.isJsxAttribute(p) && p.name.getText(sf) === name);
+  // A sentence carries the inline tags by their lowercase source name, and Next's `Link` where it holds no `legacyBehavior`.
+  const carries = (el: TS.JsxElement | TS.JsxSelfClosingElement): boolean => {
+    const tag = tagOf(el).tagName;
+    if (!ts.isIdentifier(tag)) return false;
+    return INLINE.has(tag.text) || (linkNames.has(tag.text) && !hasAttr(el, 'legacyBehavior'));
+  };
+  const stringChild = (kid: TS.JsxChild): kid is TS.JsxExpression & { expression: TS.StringLiteral | TS.NoSubstitutionTemplateLiteral } =>
+    ts.isJsxExpression(kid) && kid.dotDotDotToken === undefined && kid.expression !== undefined && (ts.isStringLiteral(kid.expression) || ts.isNoSubstitutionTemplateLiteral(kid.expression));
+  const insidePre = (node: TS.Node): boolean => {
+    for (let at: TS.Node | undefined = node; at; at = at.parent) if (jsxTagName(ts, sf, at) === 'pre') return true;
+    return false;
+  };
+  // The first rule that keeps a sentence as written: an element whose content an
+  // attribute owns, an empty element, words that read as a placeholder tag, or a
+  // `richParts` of the host's own.
+  const sentenceReason = (els: Array<TS.JsxElement | TS.JsxSelfClosingElement>, texts: string[]): string | null => {
+    for (const el of els) {
+      const attr = ['dangerouslySetInnerHTML', 'children'].find((name) => hasAttr(el, name));
+      if (attr !== undefined) return insideAttribute(attr);
+    }
+    for (const el of els) {
+      if (ts.isJsxSelfClosingElement(el)) return SENTENCE_REASONS.empty;
+      if (el.children.length > 0 && el.children.every((k) => ts.isJsxText(k) && /^[ \t\n\r\f]*$/.test(k.text))) return SENTENCE_REASONS.empty;
+    }
+    if (texts.some((t) => TAG_SHAPED.test(t))) return SENTENCE_REASONS.tagShaped;
+    return richBinding === 'foreign' ? SENTENCE_REASONS.foreignRich : null;
+  };
+  const sentenceAt = (holder: TS.JsxElement | TS.JsxFragment): void => {
+    // A component parent would receive an array where it received its children (J5).
+    if (ts.isJsxElement(holder) && !(ts.isIdentifier(holder.openingElement.tagName) && /^[a-z]/.test(holder.openingElement.tagName.text))) return;
+    // A code block's lines stay apart (PD3); text in an i18n element or under the ignore marker keeps its own rules.
+    if (insidePre(holder) || insideI18nElement(ts, sf, holder) || hasJsxIgnoreBefore(ts, sf, holder)) return;
+    const kids = holder.children;
+    const words = kids.some((k) => (ts.isJsxText(k) && HAS_WORD.test(decodeEntities(k.text))) || (stringChild(k) && HAS_WORD.test(k.expression.text)));
+    if (!words) return;
+    const contentStart = ts.isJsxElement(holder) ? holder.openingElement.end : holder.openingFragment.end;
+    const contentEnd = ts.isJsxElement(holder) ? holder.closingElement.getStart(sf) : holder.closingFragment.getStart(sf);
+    // A number that decorates the line's edge stays outside the sentence (PD1).
+    const blank = (k: TS.JsxChild | undefined): boolean => k !== undefined && ts.isJsxText(k) && k.containsOnlyTriviaWhiteSpaces;
+    const counter = (k: TS.JsxChild | undefined): k is TS.JsxElement =>
+      k !== undefined &&
+      ts.isJsxElement(k) &&
+      carries(k) &&
+      isDecorativeCounter(source.slice(k.openingElement.end, k.closingElement.getStart(sf)), source.slice(contentStart, k.getStart(sf)), source.slice(k.end, contentEnd));
+    let i = 0;
+    let j = kids.length - 1;
+    while (i <= j && blank(kids[i])) i++;
+    while (j >= i && blank(kids[j])) j--;
+    let from = 0;
+    let to = kids.length;
+    let pos = contentStart;
+    let end = contentEnd;
+    const first = kids[i];
+    if (i < j && counter(first)) {
+      from = i + 1;
+      pos = first.end;
+      i += 1;
+    }
+    const last = kids[j];
+    if (j > i && counter(last)) {
+      to = j;
+      end = last.getStart(sf);
+    }
+    const range = kids.slice(from, to);
+    // The sentence is the range's whole content: text, string containers and carried elements, at any depth.
+    const carried: Array<TS.JsxElement | TS.JsxSelfClosingElement> = [];
+    const texts: TS.JsxText[] = [];
+    let i18n = false;
+    const read = (nodes: readonly TS.JsxChild[]): boolean => {
+      for (const kid of nodes) {
+        if (ts.isJsxText(kid)) texts.push(kid);
+        else if (stringChild(kid)) continue;
+        else if (ts.isJsxExpression(kid) && kid.expression !== undefined && isI18nCall(ts, kid.expression)) i18n = true;
+        else if ((ts.isJsxElement(kid) || ts.isJsxSelfClosingElement(kid)) && I18N_ELEMENTS.has(jsxTagName(ts, sf, kid) ?? '')) i18n = true;
+        else if ((ts.isJsxElement(kid) || ts.isJsxSelfClosingElement(kid)) && carries(kid)) {
+          carried.push(kid);
+          if (ts.isJsxElement(kid) && !read(kid.children)) return false;
+        } else return false;
+      }
+      return true;
+    };
+    if (!read(range)) return;
+    if (i18n) {
+      // An i18n element or call inside refuses the sentence whole: each of its runs is i18n's.
+      for (const t of texts) i18nTexts.add(t);
+      for (const el of carried) carriedEls.add(el);
+      claimed.push({ pos, end });
+      return;
+    }
+    if (carried.length === 0) return;
+    const parts = sentenceParts(ts, sf, range);
+    if (parts === null) return;
+    const text = collapseWhitespace(plainOf(parts.value));
+    if (!qualifiesAsCopy(text)) return;
+    for (const t of texts) sentenceTexts.add(t);
+    for (const el of carried) carriedEls.add(el);
+    claimed.push({ pos, end });
+    const why = sentenceReason(carried, parts.texts);
+    if (why !== null) {
+      const raw = source.slice(pos, end);
+      listed.push({ pos: pos + raw.length - raw.trimStart().length, text, context: 'jsx-rich', reason: why });
+      return;
+    }
+    for (const el of carried) sentenceTags.add(el);
+    const at = placeOf(holder, holder);
+    at.place.line = sf.getLineAndCharacterOfPosition(pos).line + 1;
+    const renderers = carried.map((el) => {
+      const open = tagOf(el);
+      return {
+        open: { pos: open.getStart(sf), end: open.end },
+        // A self-closing element is listed above, so its close is never copied.
+        close: ts.isJsxElement(el) ? { pos: el.closingElement.getStart(sf), end: el.closingElement.end } : { pos: el.end, end: el.end },
+        tag: open.tagName.getText(sf),
+        ...(hasAttr(el, 'key') ? { keyed: true as const } : {}),
+      };
+    });
+    partials.push({
+      pos,
+      end,
+      raw: source.slice(pos, end),
+      text,
+      context: 'jsx-rich',
+      enclosingBodyPos: enclosingComponentBodyPos(holder),
+      copyBinding: copyBindingAt(holder),
+      ...at,
+      rich: { value: parts.value, tags: carried.length, renderers },
+    });
+  };
+  // A sentence key's read, `{richParts(copy('k'), [renderers])}`: one accessor, its renderers read from the tree (D15).
+  const richReadAt = (container: TS.JsxExpression): void => {
+    const call = container.expression;
+    if (call === undefined || !ts.isCallExpression(call) || !ts.isIdentifier(call.expression) || call.expression.text !== 'richParts') return;
+    const [read, list] = call.arguments;
+    const keyArg = read !== undefined && ts.isCallExpression(read) ? accessorKeyArg(read) : undefined;
+    if (keyArg === undefined || list === undefined || call.arguments.length !== 2 || !ts.isArrayLiteralExpression(list)) return;
+    if (richPartsBindingAt(ts, sf, call) !== 'stet') return;
+    const inner = read as TS.CallExpression;
+    // `(c, k) => <x …>{c}</x>`, parenthesized or not, with nothing beside `{c}` but a line break JSX drops.
+    const renderers = list.elements.map((el) => {
+      if (!ts.isArrowFunction(el)) return null;
+      let body: TS.Node = el.body;
+      while (ts.isParenthesizedExpression(body)) body = body.expression;
+      if (ts.isJsxElement(body) || ts.isJsxSelfClosingElement(body)) sentenceTags.add(body);
+      const params = el.parameters;
+      if (params.length < 1 || params.length > 2 || params.some((p) => !ts.isIdentifier(p.name) || p.dotDotDotToken !== undefined || p.initializer !== undefined)) return null;
+      if (!ts.isJsxElement(body)) return null;
+      const kids = body.children.filter((k) => !(ts.isJsxText(k) && k.containsOnlyTriviaWhiteSpaces && /[\r\n]/.test(k.text)));
+      const only = kids[0];
+      const c = (params[0] as TS.ParameterDeclaration).name as TS.Identifier;
+      if (kids.length !== 1 || only === undefined || !ts.isJsxExpression(only) || only.expression === undefined || !ts.isIdentifier(only.expression) || only.expression.text !== c.text) return null;
+      return {
+        open: { pos: body.openingElement.getStart(sf), end: body.openingElement.end },
+        close: { pos: body.closingElement.getStart(sf), end: body.closingElement.end },
+        params: params.map((p) => (p.name as TS.Identifier).text),
+      };
+    });
+    const readable = renderers.every((r) => r !== null);
+    richReads.add(inner);
+    claimArguments(inner);
+    const at = placeOf(call, container.parent);
+    accessorCalls.push({
+      file,
+      pos: container.getStart(sf),
+      end: container.end,
+      key: keyArg.text,
+      context: 'jsx-rich',
+      copyBinding: ts.isIdentifier(inner.expression) ? copyBindingAt(inner) : 'stet',
+      ...at,
+      role: roleOf(at.place),
+      renderers: readable ? (renderers as NonNullable<(typeof renderers)[number]>[]) : [],
+      shape: readable ? 'readable' : 'unreadable',
+    });
+  };
+
   const jsxNames = new Set<string>();
   const collectNames = (node: TS.Node): void => {
     if (ts.isIdentifier(node)) jsxNames.add(node.text);
@@ -1370,6 +1737,9 @@ export async function scanSource(
   };
 
   const visit = (node: TS.Node): void => {
+    if ((ts.isJsxElement(node) || ts.isJsxFragment(node)) && !carriedEls.has(node)) sentenceAt(node);
+    if (ts.isJsxExpression(node) && !ts.isJsxAttribute(node.parent)) richReadAt(node);
+
     if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
         const init = decl.initializer;
@@ -1388,7 +1758,7 @@ export async function scanSource(
       }
     }
 
-    if (ts.isCallExpression(node)) {
+    if (ts.isCallExpression(node) && !richReads.has(node)) {
       const keyArg = accessorKeyArg(node);
       if (keyArg) {
         const { context, pos, end } = accessorContext(node);
@@ -1441,7 +1811,7 @@ export async function scanSource(
       claimed.push({ pos: node.getStart(sf), end: node.end });
     }
 
-    if (ts.isJsxText(node) && !node.containsOnlyTriviaWhiteSpaces) {
+    if (ts.isJsxText(node) && !node.containsOnlyTriviaWhiteSpaces && !sentenceTexts.has(node)) {
       const raw = source.slice(node.pos, node.end);
       const leading = raw.length - raw.trimStart().length;
       const trailing = raw.length - raw.trimEnd().length;
@@ -1450,7 +1820,7 @@ export async function scanSource(
       const trimmed = source.slice(pos, end);
       const text = collapseWhitespace(decodeEntities(trimmed));
       if (text !== '') {
-        const suppression = jsxTextSuppression(ts, sf, node);
+        const suppression = i18nTexts.has(node) ? 'i18n' : jsxTextSuppression(ts, sf, node);
         if (suppression === 'i18n') i18nSkips.push({ file, pos, text });
         else if (suppression === null) partials.push({ pos, end, raw: trimmed, text, context: 'jsx-text', enclosingBodyPos: enclosingComponentBodyPos(node), copyBinding: copyBindingAt(node), ...placeOf(node, node.parent) });
       }
@@ -1475,7 +1845,9 @@ export async function scanSource(
           // significant, so it is NOT collapsed (unlike jsx-text). `raw` stays
           // the quoted source slice, so the §2.4 re-confirm guard is untouched.
           const pos = init.getStart(sf);
-          partials.push({ pos, end: init.end, raw: source.slice(pos, init.end), text: decodeEntities(init.text), context: 'jsx-attr', enclosingBodyPos: enclosingComponentBodyPos(node), copyBinding: copyBindingAt(node), ...placeOf(node, element, name) });
+          // A tag a sentence key copies takes its attributes whole: an edit inside it would overlap the sentence's (D16).
+          if (element !== undefined && sentenceTags.has(element)) listed.push({ pos, text: decodeEntities(init.text), context: 'jsx-attr', reason: SENTENCE_REASONS.onTag });
+          else partials.push({ pos, end: init.end, raw: source.slice(pos, init.end), text: decodeEntities(init.text), context: 'jsx-attr', enclosingBodyPos: enclosingComponentBodyPos(node), copyBinding: copyBindingAt(node), ...placeOf(node, element, name) });
         }
       }
     }
@@ -1540,11 +1912,12 @@ export async function scanSource(
     copyBinding: p.copyBinding,
     accessorImported,
     importInsertPos,
+    ...(p.rich === undefined ? {} : { rich: p.rich, ...(richBinding === 'stet' ? { richImported: true as const } : {}) }),
   }));
 
   const data = dataLiterals(ts, sf, 0, (name) => jsxNames.has(name));
 
-  return { file, hasUseClient, literals, accessorCalls, stetImportSpans, copyDeclSpans, resolvedMapDeclSpans, i18nSkips, parseErrors: false, data, sourceFile: sf, claimed };
+  return { file, hasUseClient, literals, accessorCalls, stetImportSpans, copyDeclSpans, resolvedMapDeclSpans, i18nSkips, listed, parseErrors: false, data, sourceFile: sf, claimed };
 }
 
 /**
