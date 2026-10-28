@@ -229,6 +229,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       descriptor.keys[key] = {
         shape: 'text',
         target,
+        ...(literal.rich === undefined ? {} : { tags: literal.rich.tags }),
         ...(section === undefined ? {} : { section }),
         ...(limits === undefined ? {} : { limits }),
         ...(choice?.label === undefined ? {} : { label: choice.label }),
@@ -244,7 +245,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       const planned = astroEdits(source, astro, astroLanded);
       edits.push(...planned.edits);
       // Pass one read the file back with its own names; a failure with the final ones is stet's.
-      if (planned.edits.length > 0 && !rereadsClean(await loadTypescript(), file, source, applyFileEdits(source, planned.edits), planned.reads, 0)) {
+      if (planned.edits.length > 0 && !rereadsClean(await loadTypescript(), file, source, applyFileEdits(source, planned.edits), planned.reads, planned.moved)) {
         throw new CliError(`stet internal: ${file} did not read back cleanly after register planned it — nothing written`);
       }
     }

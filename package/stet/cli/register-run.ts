@@ -192,9 +192,10 @@ export async function planJsxRun(input: {
   const index = sharedTextIndex(descriptor, snapshot);
   const reuseOf = new Map<LocatedLiteral, string>();
   // The declared key a literal reads in place of a new one: web text only, and
-  // never for a head text, which a visible key's edit must not retitle (R32).
+  // never for a head text, which a visible key's edit must not retitle (R32),
+  // or for a sentence key, whose tags no declared key carries (D16).
   const reuseFor = (literal: LocatedLiteral, target: Target): string | undefined =>
-    target === DEFAULT_TARGET && !isHeadLiteral(literal) ? index.get(literal.text)?.[0] : undefined;
+    target === DEFAULT_TARGET && !isHeadLiteral(literal) && literal.rich === undefined ? index.get(literal.text)?.[0] : undefined;
 
   // Pass one: every surface parsed and classified before any literal is named,
   // so a role that repeats across the run is numbered across it. Every literal
@@ -230,7 +231,7 @@ export async function planJsxRun(input: {
           descriptor,
           snapshot,
           placeholder: '\u0001',
-          def: { shape: 'text', target },
+          def: { shape: 'text', target, ...(literal.rich === undefined ? {} : { tags: literal.rich.tags }) },
           stored: literal.text,
           value: literal.text,
           report,
@@ -240,10 +241,10 @@ export async function planJsxRun(input: {
       });
       if (literals.length === 0) continue;
       // The whole file read back with the names this pass gives; any doubt keeps every byte.
-      const { edits, reads } = astroEdits(source, plan, literals.map((literal) => ({ literal, key: reuseFor(literal, target) ?? literal.proposedKey })));
+      const { edits, reads, moved } = astroEdits(source, plan, literals.map((literal) => ({ literal, key: reuseFor(literal, target) ?? literal.proposedKey })));
       let clean: boolean;
       try {
-        clean = rereadsClean(ts, file, source, applyFileEdits(source, edits), reads, 0);
+        clean = rereadsClean(ts, file, source, applyFileEdits(source, edits), reads, moved);
       } catch {
         clean = false;
       }
@@ -365,7 +366,8 @@ export async function planJsxRun(input: {
   for (const { literal, target } of leading) {
     if (reuseOf.has(literal) || reuseFor(literal, target) !== undefined) continue;
     const head = isHeadLiteral(literal);
-    const slot = `${target}\u0000${head ? 'head' : 'body'}\u0000${literal.text}`;
+    // A sentence key shares only with an identical sentence: its value's tags mean nothing to a plain text.
+    const slot = `${target}\u0000${head ? 'head' : 'body'}\u0000${literal.rich === undefined ? 'text' : 'rich'}\u0000${literal.text}`;
     const leader = first.get(slot);
     if (leader === undefined) first.set(slot, literal);
     else sharedWith.set(literal, leader);

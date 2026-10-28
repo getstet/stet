@@ -106,6 +106,17 @@ describe('the Astro rewriter (D14)', () => {
     expect(read(body('')).literals.map((l) => l.text)).toEqual(['Ninth words here']);
   });
 
+  it('T16.5: the read-back counts the elements a sentence key moves into its renderers', () => {
+    for (const [sentence, moved] of [['<p>Install: run <b>npx x init</b> and answer.</p>', 1], ['<p>See <a class="i" href="/docs"><code>stet</code> docs</a> now</p>', 2]] as const) {
+      const source = `---\nimport { copy } from "../copy";\n---\n<p>{copy.a}</p>\n${sentence}\n`;
+      const dir = host({ 'src/pages/index.astro': source });
+      const { after, reads } = rewrite(dir, 'src/pages/index.astro', source);
+      expect(after).toContain('{richParts(copy.');
+      expect(rereadsClean(ts, 'src/pages/index.astro', source, after, reads, moved)).toBe(true);
+      expect(rereadsClean(ts, 'src/pages/index.astro', source, after, reads, 0)).toBe(false);
+    }
+  });
+
   it("a leaf re-confirms the literal's span, and the JSX engine refuses an Astro literal by its shape (additions)", () => {
     const dir = host({ 'src/pages/index.astro': PAGE });
     const { literals, plan } = planAstroFile({ ts, cwd: dir, config: loadConfig(dir), file: 'src/pages/index.astro', source: PAGE, page: 'home' });

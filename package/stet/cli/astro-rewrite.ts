@@ -32,8 +32,10 @@ import {
   placeOf,
   readDocument,
   textOf,
+  valueOf,
   type Document,
   type Element,
+  type TextSegment,
 } from './html-host.js';
 import { baseName, isHeadKind, metaCopyNameOf, roleOf, type Place } from './key-names.js';
 import { bindingsOf, braceRoot, braceTree, codeOf, KEY_READ, parsesAsExpression, stetModuleTest, type FileCode } from './key-reads.js';
@@ -66,6 +68,7 @@ import {
   COPY_ATTRS,
   decodeEntities,
   INLINE,
+  isDecorativeCounter,
   nonCopyProp,
   parseDiagnosticsOf,
   qualifiesAsCopy,
@@ -79,7 +82,11 @@ export interface AstroPlan {
   form: 'call' | 'property';
   /** The accessor import (with the fence where the file has no front matter), or null where `copy` is already stet's. */
   insert: Edit | null;
-  /** The renderer import a rich literal needs (D16), or null. */
+  /**
+   * The renderer import a rich literal needs (D16), or null where the file
+   * already imports it. Where `insert` is planned too, it carries both
+   * statements at that one insertion point and takes its place.
+   */
   richInsert: Edit | null;
   skips: Array<{ pos: number; text: string; reason: string }>;
   /** Each `application/ld+json` script, by its open tag's offset: listed apart from the findings, never rewritten. */
@@ -128,11 +135,23 @@ const REBOUND = 'copy is rebound here';
 const CANNOT_TELL = 'stet cannot tell how copy reads keys in this file';
 const PAGES_SCAN = 'SEO text — adopt it with stet pages scan';
 const EXPRESSION = 'written as an expression';
+const SHARES = 'a sentence that shares its element with other markup';
+const EMPTY = 'an empty element inside the sentence';
+const UNCOPYABLE = 'a tag stet cannot copy into a key read';
+const FOREIGN_RICH = 'a foreign richParts is bound in this file';
+const ON_TAG = 'on a tag inside a sentence key';
+const TAG_SHAPED = 'text that reads as a placeholder tag';
 
 /** The elements whose text is code, a field's value, a graphic or a slot's fallback, never copy stet rewrites. */
 const SKIP_TAGS = new Set(['code', 'kbd', 'samp', 'textarea', 'svg', 'math', 'slot']);
 /** The attributes that make an element's content Astro's own: printed raw, or replaced. */
 const RAW_ATTRS = ['is:raw', 'set:html', 'set:text'];
+/** The attributes an element inside a sentence may not carry: its content Astro's own, or sent to a slot (D16). */
+const SENTENCE_ATTRS = [...RAW_ATTRS, 'slot'];
+/** The modules a renderer import may name: every read entry ships `richParts`. */
+const RICH_MODULES = new Set(['@getstet/stet', '@getstet/stet/core', '@getstet/stet/react', '@getstet/stet/react/server']);
+/** A letter or a digit, once a text's entities are decoded. */
+const HAS_WORD = /[\p{L}\p{N}]/u;
 /** A rule that shows white space as written. */
 const PRESERVED = /white-space\s*:\s*(?:pre|pre-wrap|pre-line|break-spaces)\b|whiteSpace\s*:\s*["'`](?:pre|pre-wrap|pre-line|break-spaces)\b/i;
 /** A name the property form can read as `copy.<name>`. */
@@ -297,21 +316,90 @@ function bindingOf(ts: typeof import('typescript'), cwd: string, config: StetCon
   const global = (text: string): boolean => /(?<![\w$])copy(?![\w$])/.test(text);
   if (r.braces.some((b) => global(r.page.slice(b.start, b.end)))) return { fault: CANNOT_TELL };
   if (r.front !== null && refsTo(ts, r.front.sf, 'copy').length > 0) return { fault: CANNOT_TELL };
+  return { binding: 'none', form: 'call', insert: importInsert(ts, r, source, [copyImport(config)]) };
+}
+
+/** The renderer's import, as register inserts it (D16). */
+const RICH_IMPORT = "import { richParts } from '@getstet/stet';";
+
+/** The read path's accessor import, as register inserts it. */
+function copyImport(config: StetConfig): string {
+  return `import { copy } from '${config.readPath.import}';`;
+}
+
+/**
+ * The one edit that adds import statements to a file, in its own line endings:
+ * at the end of its front matter's last import (past a comment trailing it on
+ * that line, which stays with its import), first in a front matter with none,
+ * or in a fence of its own where the file has no front matter.
+ */
+function importInsert(ts: typeof import('typescript'), r: Reading, source: string, statements: string[]): Edit {
   const eol = dominantEol(source);
-  const statement = `import { copy } from '${config.readPath.import}';`;
+  const lines = statements.join(eol);
   let insert: Edit;
   if (r.front === null) {
-    insert = { pos: 0, end: 0, text: `---${eol}${statement}${eol}---${eol}` };
+    insert = { pos: 0, end: 0, text: `---${eol}${lines}${eol}---${eol}` };
   } else {
     const last = r.front.sf.statements.filter((s) => ts.isImportDeclaration(s)).at(-1);
-    // After the comment that trails the last import, which stays on its own import.
     const after = last === undefined ? 0 : (ts.getTrailingCommentRanges(r.front.sf.text, last.end)?.at(-1)?.end ?? last.end);
     insert =
       last === undefined
-        ? { pos: r.front.open, end: r.front.open, text: `${statement}${eol}` }
-        : { pos: r.front.open + after, end: r.front.open + after, text: `${eol}${statement}` };
+        ? { pos: r.front.open, end: r.front.open, text: `${lines}${eol}` }
+        : { pos: r.front.open + after, end: r.front.open + after, text: `${eol}${lines}` };
   }
-  return { binding: 'none', form: 'call', insert: { ...insert, pos: insert.pos + r.bom, end: insert.end + r.bom } };
+  return { ...insert, pos: insert.pos + r.bom, end: insert.end + r.bom };
+}
+
+/**
+ * What `richParts` names in the front matter: stet's renderer imported from a
+ * read entry, nothing, or anything else (a renamed or default import, a
+ * function or variable of the host's own).
+ */
+function richBinding(ts: typeof import('typescript'), r: Reading): 'stet' | 'none' | 'foreign' {
+  if (r.front === null) return 'none';
+  let stet = false;
+  let foreign = false;
+  const visit = (node: TS.Node): void => {
+    if (ts.isImportDeclaration(node)) {
+      const clause = node.importClause;
+      const from = ts.isStringLiteral(node.moduleSpecifier) && RICH_MODULES.has(node.moduleSpecifier.text);
+      if (clause?.name?.text === 'richParts') foreign = true;
+      const named = clause?.namedBindings;
+      if (named !== undefined && ts.isNamespaceImport(named) && named.name.text === 'richParts') foreign = true;
+      if (named !== undefined && ts.isNamedImports(named)) {
+        for (const el of named.elements) {
+          if (el.name.text !== 'richParts') continue;
+          if (from && (el.propertyName?.text ?? 'richParts') === 'richParts') stet = true;
+          else foreign = true;
+        }
+      }
+      return;
+    }
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && patternNames(ts, node.name).includes('richParts')) foreign = true;
+    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name?.text === 'richParts') foreign = true;
+    ts.forEachChild(node, visit);
+  };
+  visit(r.front.sf);
+  return foreign ? 'foreign' : stet ? 'stet' : 'none';
+}
+
+/**
+ * The host's `compressHTML`, read from the text of its Astro config: absent, it
+ * is `"jsx"`, Astro 7's default, under which a run of white space holding a line
+ * break at a tag's edge renders nothing.
+ */
+function compressionOf(cwd: string): 'jsx' | 'true' | 'false' {
+  for (const ext of ['mjs', 'ts', 'js', 'cjs', 'mts']) {
+    let text: string;
+    try {
+      text = readFileSync(join(cwd, `astro.config.${ext}`), 'utf8');
+    } catch {
+      continue;
+    }
+    const set = /compressHTML\s*:\s*(true|false|["']jsx["'])/.exec(text)?.[1];
+    return set === 'true' || set === 'false' ? set : 'jsx';
+  }
+  return 'jsx';
 }
 
 // --- Names and their references --------------------------------------------
@@ -756,11 +844,13 @@ interface Candidate {
   pos: number;
   end: number;
   seed: string;
-  context: 'astro-text' | 'astro-attr' | 'astro-data';
+  context: 'astro-text' | 'astro-attr' | 'astro-data' | 'astro-rich';
   at: { kind: 'element' | 'attribute'; tag: string; attr?: string; metaName?: string; inSvg?: true };
   /** The document element its name is read from. */
   el: Element | undefined;
   inHead?: true;
+  /** A sentence's tag count and its elements' tags, offsets based in `page` (D16). */
+  rich?: NonNullable<LocatedLiteral['rich']>;
 }
 
 /**
@@ -802,28 +892,61 @@ export function planAstroFile(input: {
     const refuse = (start: number, end: number, reason: string): void => {
       refusals.push({ start, end: Math.max(end, start + 1), reason });
     };
-    const context: Context = { ts, cwd, r, page, cache, preserved: preservesWhiteSpace(cwd, r), candidates, refuse };
+    const sentences: Array<{ start: number; end: number; reason: string }> = [];
+    const rich = richBinding(ts, r);
+    const context: Context = {
+      ts,
+      cwd,
+      r,
+      page,
+      cache,
+      preserved: preservesWhiteSpace(cwd, r),
+      boundary: compressionOf(cwd) === 'jsx' ? 'collapse-newline' : 'space',
+      foreignRich: rich === 'foreign',
+      candidates,
+      refuse,
+      refuseSentence: (start, end, reason) => sentences.push({ start, end, reason }),
+    };
     textCandidates(context);
+    richCandidates(context);
     attributeCandidates(context);
     braceTextCandidates(context);
     dataCandidates(context, found.data ?? []);
 
     // The cross-check: a candidate counts only where scan reported it.
-    const byPos = new Map(candidates.map((c) => [c.scanPos, c]));
+    const byPos = new Map<number, Candidate[]>();
+    for (const c of candidates) byPos.set(c.scanPos, [...(byPos.get(c.scanPos) ?? []), c]);
     const kept: Candidate[] = [];
+    const listed = (finding: DialectFinding, reason: string): void => {
+      plan.skips.push({ pos: finding.pos, text: finding.text, reason });
+    };
     for (const finding of findings) {
       const at = finding.pos - r.bom;
-      const candidate = byPos.get(at);
-      if (candidate !== undefined && candidate.scanTexts.includes(finding.text)) {
+      const candidate = byPos.get(at)?.find((c) => c.scanTexts.includes(finding.text));
+      // A piece of a sentence a rule keeps whole is listed with that rule, never adopted alone.
+      const sentence = candidate?.context === 'astro-text' ? sentences.find((x) => x.start <= at && at < x.end) : undefined;
+      if (sentence !== undefined) {
+        listed(finding, sentence.reason);
+        continue;
+      }
+      if (candidate !== undefined) {
         if (!kept.includes(candidate)) kept.push(candidate);
         continue;
       }
       const refusal = refusals.filter((x) => x.start <= at && at < x.end).sort((a, b) => a.end - a.start - (b.end - b.start))[0];
       const opaque = r.document.opaque.find((o) => o.start <= at && at < o.end);
       const raw = within(r.raw, at);
-      const reason = refusal?.reason ?? (opaque !== undefined ? `inside <${opaque.tag}>` : raw ? 'inside an element with is:raw' : UNPLACED);
-      plan.skips.push({ pos: finding.pos, text: finding.text, reason });
+      listed(finding, refusal?.reason ?? (opaque !== undefined ? `inside <${opaque.tag}>` : raw ? 'inside an element with is:raw' : UNPLACED));
     }
+    // A sentence key takes its elements' tags whole: a copy attribute on one is listed, and no other edit lands inside it.
+    for (const sentence of kept.filter((c) => c.rich !== undefined)) {
+      for (const other of kept.filter((c) => c !== sentence && c.pos < sentence.end && sentence.pos < c.end)) {
+        kept.splice(kept.indexOf(other), 1);
+        const finding = findings.find((f) => f.pos - r.bom === other.scanPos) as DialectFinding;
+        listed(finding, other.context === 'astro-attr' ? ON_TAG : UNPLACED);
+      }
+    }
+    if (kept.some((c) => c.rich !== undefined) && rich === 'none') plan.richInsert = importInsert(ts, r, source, [...(bound.insert === null ? [] : [copyImport(config)]), RICH_IMPORT]);
 
     // The names: html-host's section word and item over the element enclosing each literal, the role from its place.
     const lineAt = lineIndex(source);
@@ -856,6 +979,7 @@ export function planAstroFile(input: {
         accessorImported: bound.binding === 'stet',
         importInsertPos: bound.insert?.pos ?? 0,
         ...(c.inHead === true ? { inHead: true as const } : {}),
+        ...(c.rich === undefined ? {} : { rich: rebased(c.rich, r.bom) }),
       };
     });
     plan.skips.sort((a, b) => a.pos - b.pos);
@@ -877,8 +1001,14 @@ interface Context {
   cache: ComponentCache;
   /** Whether the file shows white space as written somewhere. */
   preserved: boolean;
+  /** How a run of white space at a tag's edge renders, by the host's `compressHTML`. */
+  boundary: 'space' | 'collapse-newline';
+  /** Whether the front matter binds `richParts` to anything but stet's renderer. */
+  foreignRich: boolean;
   candidates: Candidate[];
   refuse: (start: number, end: number, reason: string) => void;
+  /** A sentence a rule keeps whole: each piece of it scan reports alone is listed with the rule. */
+  refuseSentence: (start: number, end: number, reason: string) => void;
 }
 
 /**
@@ -1017,7 +1147,7 @@ function textCandidates(ctx: Context): void {
         ctx.refuse(start, end, UNPLACED);
         continue;
       }
-      const bordering = segment.text.slice(0, lead) + segment.text.slice(segment.text.length - trail);
+      const bordering = [segment.text.slice(0, lead), segment.text.slice(segment.text.length - trail)].find((e) => SHOWN_SPACE.test(e)) ?? '';
       const tag = sourceTag(r, nearest);
       const why = runRules(ctx, path.map((e) => ({ name: sourceTag(r, e), attrs: e.attrs })), raw, bordering);
       if (why !== null) {
@@ -1038,6 +1168,173 @@ function textCandidates(ctx: Context): void {
     }
   };
   for (const root of r.document.roots) visit(root, [root]);
+}
+
+/**
+ * Each sentence: an element whose own words run through inline elements,
+ * rewritten whole into one rich key (D16) where every rule proves it renders
+ * as it did. The outermost element holding words of its own is the sentence;
+ * one holding an element no sentence carries is refused and its children read
+ * on, each piece of it left to the text rule.
+ */
+function richCandidates(ctx: Context): void {
+  const { r } = ctx;
+  const visit = (el: Element, path: Element[]): void => {
+    if (el.opaque) return;
+    const sentence = sentenceOf(r, el);
+    if (sentence === null) {
+      for (const child of el.children) visit(child, [...path, child]);
+      return;
+    }
+    const { range, descendants } = sentence;
+    const texts = textsOf(range);
+    const start = sentenceStart(range);
+    const end = sentenceEnd(range);
+    // Where scan reports the sentence: its first character that is no white space and no tag.
+    const scanPos = texts.map((t) => t.start + (t.text.length - t.text.trimStart().length)).find((at, i) => at < (texts[i] as TextSegment).end) ?? start;
+    const scanText = collapseWhitespace(decodeEntities(texts.map((t) => r.page.slice(t.start, t.end)).join('')));
+    // Its element holds markup no sentence carries, a brace or a comment: scan breaks the run there.
+    const whole = texts.every((t) => !/[{\0]/.test(t.text)) && descendants.every((d) => INLINE.has(sourceTag(r, d)));
+    if (!whole) {
+      ctx.refuse(scanPos, scanPos + 1, SHARES);
+      for (const child of el.children) visit(child, [...path, child]);
+      return;
+    }
+    if (!qualifiesAsCopy(scanText)) return;
+    const refused = (reason: string): void => {
+      ctx.refuse(scanPos, scanPos + 1, reason);
+      ctx.refuseSentence(start, end, reason);
+    };
+    const why = sentenceRule(ctx, path, sentence);
+    if (why !== null) return refused(why);
+    if (ctx.foreignRich) return refused(FOREIGN_RICH);
+    const synthetic: Element = { ...el, segments: range, children: range.filter((s): s is Element => 'tag' in s), descendants };
+    ctx.candidates.push({
+      scanPos,
+      scanTexts: [scanText],
+      pos: start,
+      end,
+      seed: valueOf(synthetic, { boundary: ctx.boundary }).value,
+      context: 'astro-rich',
+      at: { kind: 'element', tag: placeTag(sourceTag(r, el)) },
+      el,
+      ...(pathHead(path).head ? { inHead: true as const } : {}),
+      rich: {
+        value: valueOf(synthetic, { boundary: ctx.boundary }).value,
+        tags: descendants.length,
+        renderers: descendants.map((d) => ({ open: { pos: d.openStart, end: d.openEnd }, close: { pos: d.closeStart, end: d.closeEnd }, tag: sourceTag(r, d) })),
+      },
+    });
+  };
+  for (const root of r.document.roots) visit(root, [root]);
+}
+
+/** A sentence's segments, past the white space at its edges and a number that decorates its line (PD1), and every element inside them. */
+interface Sentence {
+  range: Array<TextSegment | Element>;
+  descendants: Element[];
+}
+
+/**
+ * The sentence an element holds, or null: words of its own (a letter or digit
+ * in its direct text) and at least one element among them. A leading or
+ * trailing inline element that holds only a number stays outside it, as scan
+ * leaves it outside the sentence it reports.
+ */
+function sentenceOf(r: Reading, el: Element): Sentence | null {
+  const blank = (s: TextSegment | Element): boolean => !('tag' in s) && /^[ \t\n\r\f]*$/.test(s.text);
+  const words = el.segments.some((s) => !('tag' in s) && HAS_WORD.test(decodeEntities(s.text)));
+  if (!words) return null;
+  let i = 0;
+  let j = el.segments.length - 1;
+  while (i <= j && blank(el.segments[i] as TextSegment | Element)) i++;
+  while (j >= i && blank(el.segments[j] as TextSegment | Element)) j--;
+  const counter = (k: number): boolean => {
+    const s = el.segments[k];
+    if (s === undefined || !('tag' in s) || !INLINE.has(sourceTag(r, s))) return false;
+    return isDecorativeCounter(r.page.slice(s.contentStart, s.contentEnd), r.page.slice(el.contentStart, s.openStart), r.page.slice(s.closeEnd, el.contentEnd));
+  };
+  if (i < j && counter(i)) i++;
+  if (j > i && counter(j)) j--;
+  const range = el.segments.slice(i, j + 1);
+  const children = range.filter((s): s is Element => 'tag' in s);
+  if (children.length === 0) return null;
+  return { range, descendants: children.flatMap((c) => [c, ...c.descendants]) };
+}
+
+/** Every text segment of a sentence's range, at any depth, in document order. */
+function textsOf(range: ReadonlyArray<TextSegment | Element>): TextSegment[] {
+  return range.flatMap((s) => ('tag' in s ? textsOf(s.segments) : [s]));
+}
+
+/** A sentence's first character that is no ASCII white space: a text's, or an element's open tag. */
+function sentenceStart(range: ReadonlyArray<TextSegment | Element>): number {
+  const first = range[0] as TextSegment | Element;
+  return 'tag' in first ? first.openStart : first.start + (LEAD.exec(first.text)?.[0] ?? '').length;
+}
+
+/** Just past a sentence's last character that is no ASCII white space. */
+function sentenceEnd(range: ReadonlyArray<TextSegment | Element>): number {
+  const last = range[range.length - 1] as TextSegment | Element;
+  return 'tag' in last ? last.closeEnd : last.end - (TRAIL.exec(last.text)?.[0] ?? '').length;
+}
+
+/**
+ * The first rule that keeps a sentence as written, or null: an element inside
+ * it that is empty (self-closing, void, or white space alone), one whose
+ * content is Astro's own or sent to a slot, words that read as a placeholder
+ * tag, a run that fails D14's text rules
+ * (the element around it, a component's slot read as a string, an entity,
+ * spacing the page may show), or a tag whose copy would not parse in a brace.
+ */
+function sentenceRule(ctx: Context, path: Element[], sentence: Sentence): string | null {
+  const { ts, r } = ctx;
+  for (const d of sentence.descendants) {
+    const open = r.page.slice(d.openStart, d.openEnd);
+    if (VOID_ELEMENTS.has(d.tag) || /\/\s*>$/.test(open)) return EMPTY;
+    if (d.contentEnd > d.contentStart && d.segments.every((s) => !('tag' in s) && /^[ \t\n\r\f]*$/.test(s.text))) return EMPTY;
+  }
+  for (const d of sentence.descendants) {
+    const attr = SENTENCE_ATTRS.find((a) => d.attrs.some((x) => x.name === a));
+    if (attr !== undefined) return `inside an element with ${attr}`;
+  }
+  // The value's tags are its only markup: words that read as one (`&lt;1&gt;`) would turn into a tag.
+  if (textsOf(sentence.range).some((t) => /<\/?\d+\/?>/.test(textOf(r.page.slice(t.start, t.end))))) return TAG_SHAPED;
+  const around = path.map((e) => ({ name: sourceTag(r, e), attrs: e.attrs }));
+  for (const t of textsOf(sentence.range)) {
+    const lead = (LEAD.exec(t.text)?.[0] ?? '').length;
+    const trail = lead === t.text.length ? 0 : (TRAIL.exec(t.text)?.[0] ?? '').length;
+    // Each edge is judged alone: a space on either side of a word is not two in a row.
+    const edge = [t.text.slice(0, lead), t.text.slice(t.text.length - trail)].find((e) => SHOWN_SPACE.test(e)) ?? '';
+    const why = runRules(ctx, around, r.page.slice(t.start + lead, t.end - trail), edge);
+    if (why !== null) return why;
+  }
+  const opens = sentence.descendants.map((d) => r.page.slice(d.openStart, d.openEnd));
+  const [c] = freeParams(opens, ['c']);
+  for (const [i, d] of sentence.descendants.entries()) {
+    const close = r.page.slice(d.closeStart, d.closeEnd);
+    if (!close.startsWith('</') || !parsesAsExpression(ts, 'astro', `{(${c}) => ${opens[i]}{${c}}${close}}`)) return UNCOPYABLE;
+  }
+  return null;
+}
+
+/** A sentence's tag offsets moved past a byte-order mark. */
+function rebased(rich: NonNullable<LocatedLiteral['rich']>, bom: number): NonNullable<LocatedLiteral['rich']> {
+  const by = (span: { pos: number; end: number }): { pos: number; end: number } => ({ pos: span.pos + bom, end: span.end + bom });
+  return { ...rich, renderers: rich.renderers.map((x) => ({ open: by(x.open), close: by(x.close), tag: x.tag })) };
+}
+
+/**
+ * The parameter names a renderer takes: each wanted name, or the first of
+ * `name_`, `name__`, … that no copied open tag mentions as a whole word, so a
+ * renderer never shadows a name its tag reads.
+ */
+export function freeParams(openTags: string[], wanted: string[]): string[] {
+  return wanted.map((name) => {
+    let free = name;
+    while (openTags.some((tag) => new RegExp(`(?<![\\w$])${free.replace(/\$/g, '\\$')}(?![\\w$])`).test(tag))) free += '_';
+    return free;
+  });
 }
 
 /** The first element of the document, depth-first, that `test` accepts. */
@@ -1135,6 +1432,8 @@ function braceTextCandidates(ctx: Context): void {
     if (!/<[A-Za-z]/.test(inside)) continue;
     const tags = markupTags(inside);
     const path = elementPath(r.document.roots, brace.start);
+    // A sentence key's renderers: each tag is copied whole from the source, never rewritten (check 3 F16).
+    const renderers = /^\{\s*richParts\s*\(/.test(r.page.slice(brace.start, brace.end));
     for (const open of tags) {
       if (open.close || componentName(open.name)) continue;
       for (const attr of openTagAttrs(inside, open, base)) {
@@ -1142,7 +1441,7 @@ function braceTextCandidates(ctx: Context): void {
         const value = r.page.slice(attr.valueStart, attr.valueEnd);
         const scanText = collapseWhitespace(decodeEntities(value));
         if (scanText === '') continue;
-        const entity = bindsCopy(r, brace) ? REBOUND : entityReason(value);
+        const entity = renderers ? ON_TAG : bindsCopy(r, brace) ? REBOUND : entityReason(value);
         if (entity !== undefined) {
           ctx.refuse(attr.valueStart, attr.valueEnd, entity);
           continue;
@@ -1161,6 +1460,7 @@ function braceTextCandidates(ctx: Context): void {
         });
       }
     }
+    if (renderers) continue;
     for (let k = 0; k + 1 < tags.length; k++) {
       const open = tags[k] as MarkupTag;
       const close = tags[k + 1] as MarkupTag;
@@ -1552,7 +1852,7 @@ export function astroHeadEdits(
   bound: Array<{ field: SeoField; key: string }>,
 ): ReturnType<typeof astroEdits> {
   const plan = head.plan;
-  if (plan === undefined) return { edits: [], reads: [] };
+  if (plan === undefined) return { edits: [], reads: [], moved: 0 };
   const landed = bound.flatMap(({ field, key }) => {
     const read = head[field];
     if (read === undefined || !('site' in read)) return [];
@@ -1583,8 +1883,18 @@ export function astroLeaf(source: string, literal: LocatedLiteral, key: string, 
   if (literal.shape !== 'astro') throw new Error(`stet internal: a ${literal.shape}-shaped finding in ${literal.file} reached the Astro leaf`);
   if (source.slice(literal.pos, literal.end) !== literal.raw) throw new CliError('source changed since scan; re-run stet scan');
   const read = readOf(key, form);
+  if (literal.rich !== undefined) {
+    // Each element of the sentence becomes a renderer: its open tag and close tag copied from the source, byte for byte.
+    const opens = literal.rich.renderers.map((x) => source.slice(x.open.pos, x.open.end));
+    const [c] = freeParams(opens, ['c']);
+    const renderers = literal.rich.renderers.map((x, i) => `(${c}) => ${opens[i]}{${c}}${source.slice(x.close.pos, x.close.end)}`);
+    return { pos: literal.pos, end: literal.end, text: `{${RICH_CALL}${read}, [${renderers.join(', ')}])}` };
+  }
   return { pos: literal.pos, end: literal.end, text: literal.context === 'astro-data' ? read : `{${read}}` };
 }
+
+/** What a sentence key's brace opens with, before its read. */
+const RICH_CALL = 'richParts(';
 
 function readOf(key: string, form: 'call' | 'property'): string {
   return form === 'property' ? `copy.${key}` : `copy('${key}')`;
@@ -1595,9 +1905,18 @@ export function readableAs(key: string, form: 'call' | 'property'): boolean {
   return form === 'call' || IDENTIFIER.test(key);
 }
 
-/** Where scan reports a literal: an attribute's value starts after its quote. */
+/** Where scan reports a literal: an attribute's value starts after its quote, a sentence at its first character past its tags. */
 function scanPosOf(literal: LocatedLiteral): number {
-  return literal.context === 'astro-attr' ? literal.pos + 1 : literal.pos;
+  if (literal.context === 'astro-attr') return literal.pos + 1;
+  const rich = literal.rich;
+  if (rich === undefined) return literal.pos;
+  let at = literal.pos;
+  for (;;) {
+    const open = rich.renderers.find((x) => x.open.pos === at);
+    if (open !== undefined) at = open.open.end;
+    else if (/\s/.test(literal.raw.charAt(at - literal.pos))) at += 1;
+    else return at;
+  }
 }
 
 /**
@@ -1609,15 +1928,19 @@ export function astroEdits(
   source: string,
   plan: AstroPlan,
   landed: Array<{ literal: LocatedLiteral; key: string }>,
-): { edits: Edit[]; reads: Array<{ at: number; text: string; key: string; from: number }> } {
-  if (landed.length === 0) return { edits: [], reads: [] };
+): { edits: Edit[]; reads: Array<{ at: number; text: string; key: string; from: number }>; moved: number } {
+  if (landed.length === 0) return { edits: [], reads: [], moved: 0 };
   const leaves = landed.map(({ literal, key }) => astroLeaf(source, literal, key, plan.form));
-  const edits = [...leaves, ...(plan.insert === null ? [] : [plan.insert])];
+  // A landed sentence key needs the renderer's import, which carries the accessor's too where both are inserted.
+  const rich = landed.some(({ literal }) => literal.rich !== undefined);
+  const insert = rich && plan.richInsert !== null ? plan.richInsert : plan.insert;
+  const edits = [...leaves, ...(insert === null ? [] : [insert])];
   const reads = landed.map(({ literal, key }, i) => {
     const shift = edits.filter((e) => e.end <= literal.pos && e !== leaves[i]).reduce((sum, e) => sum + e.text.length - (e.end - e.pos), 0);
-    return { at: literal.pos + shift + (literal.context === 'astro-data' ? 0 : 1), text: readOf(key, plan.form), key, from: scanPosOf(literal) };
+    const inside = literal.context === 'astro-data' ? 0 : literal.rich === undefined ? 1 : 1 + RICH_CALL.length;
+    return { at: literal.pos + shift + inside, text: readOf(key, plan.form), key, from: scanPosOf(literal) };
   });
-  return { edits, reads };
+  return { edits, reads, moved: landed.reduce((sum, { literal }) => sum + (literal.rich?.tags ?? 0), 0) };
 }
 
 /**
@@ -1728,7 +2051,19 @@ export function astroReads(
   const r = read;
   const stetModule = stetModuleTest(cwd, [config.readPath.file, ...filesForGlobs(cwd, config.copyModules)])(file);
   const bindings = bindingsOf(ts, `${file}.ts`, r.front === null ? [] : [r.front.sf.text], stetModule);
-  const ctx: Context = { ts, cwd, r, page, cache: componentCache(), preserved: false, candidates: [], refuse: () => undefined };
+  const ctx: Context = {
+    ts,
+    cwd,
+    r,
+    page,
+    cache: componentCache(),
+    preserved: false,
+    boundary: 'space',
+    foreignRich: false,
+    candidates: [],
+    refuse: () => undefined,
+    refuseSentence: () => undefined,
+  };
   const lineAt = lineIndex(source);
   const found: Array<{ key: string; at: number; where: Candidate['at']; el: Element | undefined; head: boolean }> = [];
   const spans: Array<Span & { brace?: Brace }> = [

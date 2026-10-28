@@ -3144,13 +3144,137 @@ describe('register — the Astro rewriter (D14)', () => {
     expect(proposed.map((x) => x.base).sort()).toEqual(keys.map(([k]) => k).sort());
   });
 
-  it('leaves a sentence with inline markup as written until its key lands (T14.5)', async () => {
-    const page = BY_PROPERTY('<p>Install: run <b>npx x init</b> and answer.</p>\n');
-    const dir = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+  /** The key a rewritten read names on the page, with its declaration and value. */
+  const richKey = (dir: string, out: string, at: RegExp): { key: string; def: Record<string, unknown>; value: unknown } => {
+    const key = (at.exec(out) as RegExpExecArray)[1] as string;
+    return { key, def: descriptor(dir).keys[key] as Record<string, unknown>, value: defaults(dir).default[key] };
+  };
+
+  it('rewrites a sentence with inline markup into one rich key (T16.3)', async () => {
+    const dir = astroSite(
+      {
+        'src/pages/index.astro': BY_PROPERTY(
+          ['<p>Install: run <b>npx x init</b> and answer.</p>', "<p>See <a class='i'  href=\"/docs\"><code>stet</code> docs</a> now</p>", '<p>Was <del>old</del> <span class="w">new</span></p>', ''].join('\n'),
+        ),
+        'src/pages/again.astro': BY_PROPERTY('<p>Again run <b>npx y init</b> to start.</p>\n', 'import { richParts } from "@getstet/stet";\n'),
+      },
+      { keys: { hero_sub: 'Sub words' } },
+    );
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out.slice(0, out.indexOf('<p>'))).toBe("---\nimport { copy } from \"../copy\";\nimport { richParts } from '@getstet/stet';\n---\n");
+    const install = richKey(dir, out, /<p>\{richParts\(copy\.(\w+), \[\(c\) => <b>\{c\}<\/b>\]\)\}<\/p>\n<p>\{richParts/);
+    expect([install.def['tags'], install.value]).toEqual([1, 'Install: run <1>npx x init</1> and answer.']);
+    // The link's open tag is copied byte for byte, renderers numbered in open-tag order.
+    const docs = richKey(dir, out, /<p>\{richParts\(copy\.(\w+), \[\(c\) => <a class='i'  href="\/docs">\{c\}<\/a>, \(c\) => <code>\{c\}<\/code>\]\)\}<\/p>/);
+    expect([docs.def['tags'], docs.value]).toEqual([2, 'See <1><2>stet</2> docs</1> now']);
+    const was = richKey(dir, out, /<p>\{richParts\(copy\.(\w+), \[\(c\) => <del>\{c\}<\/del>, \(c\) => <span class="w">\{c\}<\/span>\]\)\}<\/p>/);
+    expect([was.def['tags'], was.value]).toEqual([2, 'Was <1>old</1> <2>new</2>']);
+    // A file that already imports the renderer gains no second import.
+    const again = read(dir, 'src/pages/again.astro');
+    expect(again.match(/richParts \}/g)).toHaveLength(1);
+    expect(again).toMatch(/^---\nimport \{ copy \} from "\.\.\/copy";\nimport \{ richParts \} from "@getstet\/stet";\n---\n<p>\{copy\.hero_sub\}<\/p>\n<p>\{richParts\(copy\.\w+, \[\(c\) => <b>\{c\}<\/b>\]\)\}<\/p>\n$/);
+  });
+
+  it('seeds a sentence written over several lines as Astro renders it, under each compressHTML mode (T16.3, check 3 F1)', async () => {
+    const page = BY_PROPERTY('<p>Install: run\n  <b>npx x init</b>\n  and answer.</p>\n');
+    const jsx = astroSite({ 'src/pages/index.astro': page }, { keys: { hero_sub: 'Sub words' } });
+    expect(await runRegister(['--from', 'scan', '--write'], io(jsx))).toBe(0);
+    expect(richKey(jsx, read(jsx, 'src/pages/index.astro'), /richParts\(copy\.(\w+),/).value).toBe('Install: run<1>npx x init</1>and answer.');
+    const spaced = astroSite({ 'src/pages/index.astro': page, 'astro.config.mjs': 'export default { compressHTML: true };\n' }, { keys: { hero_sub: 'Sub words' } });
+    expect(await runRegister(['--from', 'scan', '--write'], io(spaced))).toBe(0);
+    expect(richKey(spaced, read(spaced, 'src/pages/index.astro'), /richParts\(copy\.(\w+),/).value).toBe('Install: run <1>npx x init</1> and answer.');
+  });
+
+  /** T16.4's pages: each sentence a rule keeps as written, and one whose link's title is listed. */
+  const KEPT = (): Record<string, string> => ({
+    'src/components/Card.astro': '---\nconst html = await Astro.slots.render("default");\n---\n<div set:html={html} />\n',
+    'src/pages/index.astro': BY_PROPERTY(
+      [
+        '<div>Text <b>bold</b> here<ul><li>One list item</li></ul></div>',
+        '<p>Hi <b set:html={x}>raw</b> there</p>',
+        '<p>Hi <span slot="meta">slotted</span> there</p>',
+        '<p>Go <a href="/x" @click="go">here</a> now</p>',
+        '<p>Hi <i class="dot"/> there</p>',
+        "<Card>Don't run <b>this</b> twice</Card>",
+        '<p>Read <a href="/docs" title="Open docs">the docs</a> first.</p>',
+        '',
+      ].join('\n'),
+      'import Card from "../components/Card.astro";\nconst x = "<b>y</b>";\n',
+    ),
+    'src/pages/foreign.astro': BY_PROPERTY('<p>Mine run <b>npx z init</b> here.</p>\n', 'function richParts(v: string) { return v; }\n'),
+  });
+
+  it('lists each sentence a rule keeps as written, and the copy attribute of a tag inside a sentence key (T16.4)', async () => {
+    const dir = astroSite(KEPT(), { keys: { hero_sub: 'Sub words' } });
     const cap = io(dir);
     expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
-    expect(read(dir, 'src/pages/index.astro')).toBe(page);
-    expect(notRewritten(cap)).toEqual(['src/pages/index.astro:5 "Install: run npx x init and answer." not rewritten (stet cannot place this text) — adopt by hand']);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(notRewritten(cap)).toEqual([
+      'src/pages/foreign.astro:6 "Mine run npx z init here." not rewritten (a foreign richParts is bound in this file) — adopt by hand',
+      'src/pages/index.astro:7 "Text bold here" not rewritten (a sentence that shares its element with other markup) — adopt by hand',
+      'src/pages/index.astro:8 "Hi raw there" not rewritten (inside an element with set:html) — adopt by hand',
+      'src/pages/index.astro:9 "Hi slotted there" not rewritten (inside an element with slot) — adopt by hand',
+      'src/pages/index.astro:10 "Go here now" not rewritten (a tag stet cannot copy into a key read) — adopt by hand',
+      'src/pages/index.astro:11 "Hi" not rewritten (an empty element inside the sentence) — adopt by hand',
+      'src/pages/index.astro:11 "there" not rewritten (an empty element inside the sentence) — adopt by hand',
+      'src/pages/index.astro:12 "Don\'t run this twice" not rewritten (shown where stet cannot follow) — adopt by hand',
+      'src/pages/index.astro:13 "Open docs" not rewritten (on a tag inside a sentence key) — adopt by hand',
+    ]);
+    expect(out).toMatch(/<li>\{copy\.\w+\}<\/li>/);
+    expect(out).toMatch(/<p>\{richParts\(copy\.\w+, \[\(c\) => <a href="\/docs" title="Open docs">\{c\}<\/a>\]\)\}<\/p>/);
+    for (const kept of ['<p>Hi <b set:html={x}>raw</b> there</p>', '<p>Go <a href="/x" @click="go">here</a> now</p>', '<p>Hi <i class="dot"/> there</p>', "<Card>Don't run <b>this</b> twice</Card>"]) {
+      expect(out).toContain(kept);
+    }
+    expect(read(dir, 'src/pages/foreign.astro')).toBe(KEPT()['src/pages/foreign.astro']);
+  });
+
+  it('adopts nothing the second time over its sentence keys, a titled link among them (T16.9, check 3 F16)', async () => {
+    const files = KEPT();
+    files['src/pages/rich.astro'] = BY_PROPERTY('<p>Install: run <b>npx x init</b> and answer.</p>\n<p>See <a class="i" href="/docs"><code>stet</code> docs</a> now</p>\n');
+    // A file read by call, after a raw sample whose braces are text: its rich read's brace holds a quote, which scan must not read as text.
+    files['src/pages/called.astro'] = '<pre is:raw><code>{copy(\'x\')} {</code></pre>\n<p>Called run <b>npx x init</b> and <a href="/d" title="Open it">go</a>.</p>\n';
+    const dir = astroSite(files, { keys: { hero_sub: 'Sub words' } });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(read(dir, 'src/pages/called.astro')).toContain("{richParts(copy('");
+    const pages = ['src/pages/index.astro', 'src/pages/rich.astro', 'src/pages/foreign.astro', 'src/pages/called.astro'];
+    const after = pages.map((p) => read(dir, p));
+    const second = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], second)).toBe(0);
+    expect(second.out.at(-1)).toBe('register: nothing to adopt');
+    expect(pages.map((p) => read(dir, p))).toEqual(after);
+  });
+
+  it('keeps the white space at a sentence\'s edges where it was written', async () => {
+    const dir = astroSite({ 'src/pages/index.astro': BY_PROPERTY('<p>\n  Install: run <b>npx x init</b> and answer.\n</p>\n<p>  Pad <b>x</b> end  </p>\n') }, { keys: { hero_sub: 'Sub words' } });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toMatch(/<p>\n  \{richParts\(copy\.\w+, \[\(c\) => <b>\{c\}<\/b>\]\)\}\n<\/p>\n<p>  \{richParts\(copy\.\w+, \[\(c\) => <b>\{c\}<\/b>\]\)\}  <\/p>/);
+  });
+
+  it('leaves a decorative counter outside a sentence key', async () => {
+    const dir = astroSite({ 'src/pages/index.astro': BY_PROPERTY('<h2><span class="n">01</span>Scan <code>x</code> now</h2>\n') }, { keys: { hero_sub: 'Sub words' } });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toMatch(/<h2><span class="n">01<\/span>\{richParts\(copy\.\w+, \[\(c\) => <code>\{c\}<\/code>\]\)\}<\/h2>/);
+  });
+
+  it('keeps a sentence whose words read as a placeholder tag, and lists it', async () => {
+    const dir = astroSite({ 'src/pages/index.astro': BY_PROPERTY('<p>Orders over &lt;1&gt;30&lt;/1&gt; ship <b>free</b> now.</p>\n') }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    expect(read(dir, 'src/pages/index.astro')).not.toContain('richParts(');
+    expect(notRewritten(cap).join('\n')).toContain('text that reads as a placeholder tag');
+  });
+
+  it('reads one space at each end of a pre-wrap text as an edge, and two spaces inside as spacing the page may show', async () => {
+    const dir = astroSite({ 'src/pages/index.astro': BY_PROPERTY('<p class="t"> Hello there </p>\n<p class="t">Hello  there</p>\n<style>.t { white-space: pre-wrap; }</style>\n') }, { keys: { hero_sub: 'Sub words' } });
+    const cap = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write', '--verbose'], cap)).toBe(0);
+    const out = read(dir, 'src/pages/index.astro');
+    expect(out).toMatch(/<p class="t"> \{copy\.\w+\} <\/p>/);
+    expect(out).toContain('<p class="t">Hello  there</p>');
+    expect(notRewritten(cap).join('\n')).toContain('spacing the page may show');
   });
 
   it('rewrites front-matter data only where every use is traced to a display (T14.6)', async () => {

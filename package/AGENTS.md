@@ -35,6 +35,8 @@ Nothing else lists what the package exports.
 | `src/bundle.ts` | the read bundle's format and its read semantics (both forms), and `resolveAll` — every declared key resolved once into the map an accessor takes |
 | `src/access.ts` | the framework-free ambient-access contract |
 | `src/validate.ts` | save-time checks: shapes, limits, variables, required variables (`checkRequires`), class rules, fit budgets |
+| `src/placeholder.ts` | the numbered placeholder tags a tagged value carries: their pattern, a value's plain text, and `tagTree`, the one reader of its tags, which the save gate and the renderer share; it imports nothing |
+| `src/rich.ts` | `richParts`, the renderer a sentence key is read through: each placeholder element handed to a renderer copied from the host's markup, the words between as strings, a value the tag reader refuses rendered as its plain text; it imports only `src/placeholder.ts`, and every read entry ships it |
 | `src/value-check.ts` | one value against its key's rules as findings: the shape check, then the save checks with the template's slots in scope — the gate the CLI, the dashboard and the mounted API's draft and publish routes share, with the store keys a check reads and the rows as they stand once a set of drafts ships |
 | `src/seo.ts` | the offline SEO audit: the fourteen rules, the one severity table, the two word lists |
 | `src/targets/adapter.ts` | the target seam: the adapter contract, and the one registry a consumer looks up by a key's declared target |
@@ -144,7 +146,7 @@ bin; `src/` stays zero-I/O and its purity roster lists `src/` alone.
 | `cli/import-closure.ts` | the depth-bounded import and re-export closure of files, and whether the walk stopped at an import it does not follow; the wrapper chain and the route reads share it |
 | `cli/key-names.ts` | the element vocabulary and the naming rule, a runtime leaf |
 | `cli/key-plan.ts` | the naming plan for register and rename |
-| `cli/astro-rewrite.ts` | what an `.astro` file yields for register: the literals it can rewrite safely, the findings it cannot with their reasons, the binding and form, the read-back, a page's title and description with the edit that binds each (`readAstroHead`, which `pages scan` seeds and binds from), and the name of a read already there |
+| `cli/astro-rewrite.ts` | what an `.astro` file yields for register: the literals it can rewrite safely (a sentence with inline markup as one rich key read through `richParts`), the findings it cannot with their reasons, the binding and form, the read-back, a page's title and description with the edit that binds each (`readAstroHead`, which `pages scan` seeds and binds from), and the name of a read already there |
 | `cli/markup.ts` | the markup readers every dialect reader shares — the blanking, the brace and tag matchers, a tag's attributes, and the `is:raw` spans (`rawSpans`, `unraw`) the scan, the rewriter and the code spans read alike — importing nothing from `cli/` |
 | `cli/key-reads.ts` | the read forms, a dialect's code spans (`codeOf`, the code and non-code regions of a file), the one brace matcher, the rename's three classes, the test of a module specifier against stet's own modules (`stetModuleTest`) and the parse check over its braces |
 | `cli/email-render.ts` | the render seam — one host template executed per child process, the failure taxonomy the exit table maps to, and the ceilings (output size, wall clock); the pointer's request (`pointerRequest`, `templateProps`), its containment inside the project (`containedPointer`) and the optional frame, fill and send the runner applies |
@@ -164,8 +166,8 @@ both are thin over
 | File | Holds |
 |---|---|
 | `react/provider.tsx` | `CopyProvider` (holds the resolved map + descriptor) and `useCopy()` — the client accessor from context, memoized, with a clear error outside a provider |
-| `react/server.ts` | `createServerCopy` — the server-component accessor, a thin wrapper over `createAccessor`, importing no `react` |
-| `react/index.ts` | the `@getstet/stet/react` surface: `CopyProvider`, `useCopy`, `createServerCopy` |
+| `react/server.ts` | `createServerCopy` — the server-component accessor, a thin wrapper over `createAccessor` — and `richParts` re-exported, importing no `react` |
+| `react/index.ts` | the `@getstet/stet/react` surface: `CopyProvider`, `useCopy`, `createServerCopy`, `richParts` |
 | `server/mount.ts` | `createStetHandler` — the Bearer-authenticated catch-all `{ GET, POST }`: constant-time auth through `bearerMatches`, the RPC-delegating POST routes (`revert` checks the body's key against the version before the write), the content gate on draft and publish (a 422 with the validator's messages, before anything is written), the render proxy and Bearer reads (`changes?id` answers one change with its members), and the fire-and-forget publish hooks |
 | `server/forms.ts` | `createStetFormsHandler` — the public join and unsubscribe routes, separate from the Bearer mount |
 | `server/unsubscribe-token.ts` | the unsubscribe token and `unsubscribeUrl`, signed by the forms secret alone |

@@ -57,6 +57,7 @@ import {
   rawSpans,
   readAttrs,
   selfClosedRaw,
+  unraw,
   VOID_ELEMENTS,
   type Dialect,
   type MarkupTag,
@@ -213,8 +214,8 @@ export interface LocatedLiteral {
   importInsertPos: number;
   /** A head text the place alone does not name (an Astro feed link's `title`): it reuses no declared key and shares only with head texts. */
   inHead?: true;
-  /** The placeholder tags a sentence key declares. */
-  tags?: number;
+  /** A sentence key's value with its placeholder tags, their count, and each element's open and close tag in the source, in open-tag order (D16). */
+  rich?: { value: string; tags: number; renderers: Array<{ open: Span; close: Span; tag: string }> };
 }
 
 /** A copy string the scanner recognizes as i18n's — reported, never rewritten. */
@@ -2143,7 +2144,8 @@ function attributeFindings(file: string, source: string, markup: string, tags: M
 function braceFindings(file: string, source: string, work: string): DialectFinding[] {
   const found: DialectFinding[] = [];
   const code = dialectCode(source, 'astro').braces;
-  for (const brace of markupBraces(selfClosedRaw(source), 'astro')) {
+  // An `is:raw` element's text is blank to the brace walk: an unclosed `{` in a sample opens nothing.
+  for (const brace of markupBraces(selfClosedRaw(unraw(source)), 'astro')) {
     if (brace.inTag || !code.some((c) => c.start === brace.start)) continue;
     const base = brace.start + 1;
     const inside = work.slice(base, brace.end - 1);
@@ -2198,6 +2200,16 @@ export function scanDialect(file: string, source: string, dialect: Dialect): Dia
   if (dialect === 'astro') found.push(...braceFindings(file, source, work));
   const joined = inlineSpans(markup, tags);
   work = blankSpans(work, joined);
+  // A sentence key's read (`{richParts(copy('k'), [(c) => <b>{c}</b>])}`) is register's own code, its
+  // braces nested past what `BRACED` balances: blanked whole, so no half of it reads as text (D16).
+  if (dialect === 'astro') {
+    // An `is:raw` element's text is blank to the brace walk, as the rewriter reads it: its braces open nothing.
+    for (const brace of markupBraces(selfClosedRaw(unraw(source)), 'astro')) {
+      if (!brace.inTag && /^\{\s*richParts\s*\(/.test(source.slice(brace.start, brace.end))) {
+        work = work.slice(0, brace.start) + work.slice(brace.start, brace.end).replace(/[^\n]/g, '\0') + work.slice(brace.end);
+      }
+    }
+  }
   const strip = (pattern: RegExp): void => {
     work = work.replace(pattern, (match) => match.replace(/[^\n]/g, '\0'));
   };

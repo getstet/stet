@@ -27,6 +27,7 @@ import { bearerMatches, createStetHandler } from '../server/mount.js';
 import { route as normalizeRoute } from '../src/seo.js';
 import { DescriptorError, keyDefOf, loadDescriptor, loadDescriptorWithWarnings } from '../src/descriptor.js';
 import { canonicalize } from '../src/codegen.js';
+import { plainOf } from '../src/placeholder.js';
 import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
@@ -68,7 +69,7 @@ import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { elementPath, markupBraces, maskExpressions, selfClosedRaw } from './markup.js';
-import { collapseWhitespace, decodeEntities, dialectOf, loadTypescript, matchGlob, packageNames, scriptKindFor } from './source-scan.js';
+import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, packageNames, scriptKindFor } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -2160,11 +2161,18 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
   const renders = complete ? Object.fromEntries([...sites].filter(([key]) => !open.has(key) && keys.has(key))) : {};
   // A placed key whose words a file of the route writes as text: one of its matches may be that text (R21).
   const copyModule = (rel: string): boolean => ready.config.copyModules.some((glob) => matchGlob(glob, rel));
-  const texts = chain.files.filter((file) => !own.has(file.rel) && !isGenerated(file.text) && !copyModule(file.rel)).map((file) => flatText(file.text));
+  const shown = chain.files.filter((file) => !own.has(file.rel) && !isGenerated(file.text) && !copyModule(file.rel));
+  const texts = shown.map((file) => flatText(file.text));
+  // A sentence key's words, its tags dropped, against each file's text with its inline tags dropped (check 3 F20).
+  let sentences: string[] | undefined;
   const coincident = Object.keys(renders)
     .filter((key) => {
       const value = heldTextOf(ready.descriptor, ready.snapshot, key);
-      return value !== null && flatText(value) !== '' && texts.some((text) => wordBoundedIndex(text, flatText(value), JOINS_WORD) !== -1);
+      if (value === null) return false;
+      const tagged = keyDefOf(ready.descriptor, key)?.tags !== undefined;
+      const words = flatText(tagged ? plainOf(value) : value);
+      const pool = tagged ? (sentences ??= shown.map((file) => flatText(file.text.replace(INLINE_TAG, '')))) : texts;
+      return words !== '' && pool.some((text) => wordBoundedIndex(text, words, JOINS_WORD) !== -1);
     })
     .sort();
   return json({ route, files, keys: [...keys].sort(), complete, renders, coincident });
@@ -2479,11 +2487,14 @@ function astroPlacement(file: string, source: string): (found: RegExpExecArray) 
       return htmlElement(source, el) && !printed ? 'inert' : 'open';
     }
     if (el.opaque || brace.start < el.openEnd || brace.end > el.contentEnd || !htmlElement(source, el)) return 'open';
-    // The brace's inside is the read alone: `{copy.k}`, `{ copy('k') }`.
+    // The brace's inside is the read alone: `{copy.k}`, `{ copy('k') }`, or a sentence key's
+    // `{richParts(copy.k, …)}`, the rest of which is its renderers (D16).
     const inner = source.slice(brace.start + 1, brace.end - 1);
     const at = m - brace.start - 1;
-    const rest = found[5] !== undefined ? /^\s*$/ : /^\s*\)\s*$/;
-    if (!/^\s*$/.test(inner.slice(0, at)) || !rest.test(inner.slice(at + found[0].length))) return 'open';
+    const close = found[5] !== undefined ? '' : '\\)\\s*';
+    const rich = /^\s*richParts\(\s*$/.test(inner.slice(0, at));
+    const rest = new RegExp(rich ? `^\\s*${close},` : `^\\s*${close}$`);
+    if ((!rich && !/^\s*$/.test(inner.slice(0, at))) || !rest.test(inner.slice(at + found[0].length))) return 'open';
     if (misnested(path.map((up) => (htmlElement(source, up) ? up.tag : null)))) return 'open';
     const chain: SiteLevel[] = [{ tag: el.tag, classes: astroClasses(el) }];
     const parent = path[path.length - 2];
@@ -2560,6 +2571,8 @@ function jsxPlacement(ts: typeof import('typescript'), file: string, source: str
   };
 }
 
+/** An open or close tag of one of the inline elements a sentence joins (`INLINE`), as scan drops them from a sentence's text. */
+const INLINE_TAG = new RegExp(`</?(?:${[...INLINE].join('|')})(?=[\\s/>])[^>]*>`, 'g');
 /** Text as a page shows it, for the coincidence test: entities decoded, whitespace collapsed. */
 const flatText = (text: string): string => collapseWhitespace(decodeEntities(text));
 /** What continues a word for the coincidence test: a letter or digit, or a character that joins a name, path or package (`@getstet/stet`). */

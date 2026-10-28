@@ -12,6 +12,10 @@
 import { createAccessor, type Accessor, type AccessorOptions } from '../src/access.js';
 import type { ContentKey, Descriptor } from '../src/types.js';
 
+// A server component renders a sentence key through the same renderer, with no provider and no `react`.
+export { richParts } from '../src/rich.js';
+export type { RichChildren } from '../src/rich.js';
+
 /** The accessor for a server component — callable for text keys, `.get()` for other shapes. */
 export function createServerCopy<K extends string = ContentKey>(
   descriptor: Descriptor,

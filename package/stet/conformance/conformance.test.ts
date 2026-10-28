@@ -60,7 +60,7 @@ import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { GATE_LINE, HOOK_BEFORE_0_3_1, SHARED_GATE_LINE, runHookInstall } from '../cli/hook.js';
 import { refuseDanglingReferences } from '../cli/remove.js';
-import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
+import { isNodeBuiltin, runtimeImportClosure, runtimeImports, sourceFiles } from '../tests/helpers/source-roster.js';
 import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
 import { TS_BROKEN } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
@@ -998,6 +998,14 @@ describe('content-read', () => {
     const server = runtimeImportClosure(new URL('../react/server.ts', import.meta.url));
     expect(server.modules.filter((m) => /(^|\/)react\/provider\.tsx$/.test(m))).toEqual([]);
     expect(server.bare.filter((spec) => spec === 'react' || spec.startsWith('react/') || spec.startsWith('react-dom'))).toEqual([]);
+
+    // The renderer a sentence key is read through ships on every read entry, and
+    // carries only the one tag reader: no `zod`, no target (D16).
+    for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts']) {
+      expect({ entry, rich: runtimeImportClosure(new URL(entry, import.meta.url)).modules.includes('src/rich.ts') }).toEqual({ entry, rich: true });
+    }
+    expect(runtimeImports(new URL('../src/rich.ts', import.meta.url))).toEqual(['./placeholder.js']);
+    expect(runtimeImports(new URL('../src/placeholder.ts', import.meta.url))).toEqual([]);
 
     // The walker is proven to SEE a builtin before it vouches for none: the two
     // modules that carry the crypto import are outside both closures above, and

@@ -14894,6 +14894,28 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     ]);
   });
 
+  it('T16.8: a rich read is a render site, and a hard-coded twin of its words makes its key coincident (check 3 F20)', async () => {
+    const host = placedSite(
+      '---\nimport { copy } from "../../lib/content";\nimport { richParts } from "@getstet/stet";\nimport Promo from "../components/Promo.astro";\n---\n' +
+        '<main><p class="lede">{richParts(copy.hero_headline, [(c) => <b>{c}</b>])}</p><Promo /></main>\n',
+      {
+        'package.json': JSON.stringify({ name: 'site', dependencies: { '@getstet/stet': '1' } }),
+        'src/components/Promo.astro': '<aside><span>Run <b>npx</b> now</span></aside>\n',
+      },
+      { hero_headline: 'Run <1>npx</1> now' },
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const plain = await routeRendersOf(handler, host);
+    expect([plain.complete, plain.renders.hero_headline, plain.coincident]).toEqual([true, [[{ tag: 'p', classes: ['lede'] }, { tag: 'main', classes: null }]], []]);
+    // Declared as a sentence key, its words are read without their tags: the twin is coincident.
+    const at = join(host.cwd, 'content/descriptor.json');
+    const descriptor = loadDescriptor(JSON.parse(readFileSync(at, 'utf8')));
+    (descriptor.keys['hero_headline'] as { tags?: number }).tags = 1;
+    writeJsonDeterministic(at, descriptor);
+    const tagged = await routeRendersOf(handler, host);
+    expect([tagged.renders.hero_headline, tagged.coincident]).toEqual([[[{ tag: 'p', classes: ['lede'] }, { tag: 'main', classes: null }]], ['hero_headline']]);
+  });
+
   it('T14.19: site/split proposes a name for an Astro place and, given it, moves that read alone', async () => {
     const host = rewritable(TERMINAL);
     expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);

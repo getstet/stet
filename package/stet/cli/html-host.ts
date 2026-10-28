@@ -628,10 +628,15 @@ function tokensOf(el: Element): Token[] {
  * descendants. A whitespace run at a tag boundary keeps ONE space, so a
  * sentence broken across lines reads as a sentence; whitespace at the very
  * start or end of the content contributes nothing, so the indentation the
- * document keeps is never part of the value.
+ * document keeps is never part of the value. Under `boundary: 'collapse-newline'`
+ * (Astro's default `compressHTML`) a run at a tag boundary that holds a line
+ * break contributes nothing, as Astro renders it.
  */
-export function valueOf(el: Element): { value: string; plain: string; tags: number } {
+export function valueOf(el: Element, options: { boundary?: 'space' | 'collapse-newline' } = {}): { value: string; plain: string; tags: number } {
   const tokens = tokensOf(el);
+  const collapse = options.boundary === 'collapse-newline';
+  // The space a boundary run keeps: none where the run breaks the line and the mode drops such a run.
+  const kept = (run: string): boolean => run !== '' && !(collapse && /[\r\n]/.test(run));
   const parts: string[] = [];
   tokens.forEach((token, i) => {
     if (token.kind !== 'text') {
@@ -643,11 +648,11 @@ export function valueOf(el: Element): { value: string; plain: string; tags: numb
     const before = i > 0;
     const after = i < tokens.length - 1;
     if (core === '') {
-      if (before && after && /[ \t\r\n\f]/.test(stripped)) parts.push(' ');
+      if (before && after && kept(/[ \t\r\n\f]*/.exec(stripped)?.[0] ?? '')) parts.push(' ');
       return;
     }
-    const lead = before && /^[ \t\r\n\f]/.test(stripped) ? ' ' : '';
-    const trail = after && /[ \t\r\n\f]$/.test(stripped) ? ' ' : '';
+    const lead = before && kept(/^[ \t\r\n\f]*/.exec(stripped)?.[0] ?? '') ? ' ' : '';
+    const trail = after && kept(/[ \t\r\n\f]*$/.exec(stripped)?.[0] ?? '') ? ' ' : '';
     parts.push(`${lead}${core}${trail}`);
   });
   const value = parts.join('');
