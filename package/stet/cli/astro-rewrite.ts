@@ -2307,7 +2307,8 @@ export function planAstroUnrewrite(input: {
     } else if (use?.kind === 'attr' && typeof value === 'string' && !componentName(use.tag) && COPY_ATTRS.has(use.name.toLowerCase()) && !value.includes('{')) {
       edits.push({ pos: use.start, end: use.end, text: `"${astroEscape(value, ATTR_SET)}"` });
     } else {
-      edits.push({ pos: x.at, end: x.end, text: JSON.stringify(value) });
+      // A `<` in a restored string would end a client script at a `</script`, so it goes as the escape that evaluates to the same string.
+      edits.push({ pos: x.at, end: x.end, text: JSON.stringify(value).replace(/</g, '\\u003c') });
     }
   }
   edits.push(...glued.values());
@@ -2678,8 +2679,9 @@ export function unrewrittenClean(
   const elementsBefore = count(b);
   const elementsAfter = count(a);
   if (elementsBefore === null || elementsAfter !== elementsBefore + expected.elements) return false;
-  // 3. Every brace parses as one expression.
+  // 3. Every brace parses as one expression, and no restored value split a script or style element.
   const code = dialectCode(a, 'astro');
+  if (code.raws !== dialectCode(b, 'astro').raws) return false;
   if (!code.braces.every((brace) => parsesAsExpression(ts, 'astro', a.slice(brace.start, brace.end)))) return false;
   // 4. No read through stet's names, no renderer call and no stet import remains outside the client scripts.
   const nonCode = (codeOf(ts, file, a, 'astro') as FileCode).nonCode;

@@ -140,14 +140,15 @@ export function gitFiles(cwd: string, args: string[], env: NodeJS.ProcessEnv = c
  * Porcelain paths are relative to the repository's top whatever the working
  * directory, so the checkout's own prefix (`site/` where the checkout is a
  * folder of its repository) is stripped; the pathspecs themselves are read
- * relative to `cwd`. A directory that is not a repository answers nothing.
+ * relative to `cwd`. A directory that is not a repository answers nothing; a
+ * status git fails to answer is `null`, which no caller may read as "clean".
  */
-export function uncommittedPaths(cwd: string, pathspecs: string[]): string[] {
+export function uncommittedPaths(cwd: string, pathspecs: string[]): string[] | null {
   const prefix = gitData(cwd, ['rev-parse', '--show-prefix']);
   if (prefix.code !== 0) return [];
   const base = prefix.stdout.trim();
   const status = gitData(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...pathspecs]);
-  if (status.code !== 0) return [];
+  if (status.code !== 0) return null;
   const paths = new Set<string>();
   for (const { x, y, path } of porcelainRecords(status.stdout)) {
     // A deletion is the terminal's to commit, and an unmerged path is a merge's.

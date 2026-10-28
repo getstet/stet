@@ -1064,6 +1064,8 @@ function pendingForms(site: Ready): string[] {
   // the documents.
   const roots = [...new Set(globs.map(staticPrefix))].map((root) => (root === '' ? '.' : `:(literal)${root}`));
   const asked = uncommittedPaths(site.path, [...files, ...roots, ...[...recorded.keys()].map((file) => `:(literal)${file}`)]);
+  // Git that cannot answer offers nothing, and the records wait for an answer that can.
+  if (asked === null) return [];
   forgetHostWrites(site, asked);
   const changed = asked.filter((file) => files.includes(file) || globs.some((glob) => matchGlob(glob, file)) || recorded.has(file));
   // A document that cannot be read is left out, so one unreadable file never
@@ -1089,11 +1091,15 @@ function hostWritten(site: Ready): Map<string, string> {
   return hostWrites.get(site.path) ?? new Map();
 }
 
-/** Records the files a route of this server just wrote, each with the bytes now on disk; a file that already differed from HEAD before the write carries edits that are not stet's and is left out. */
-function recordHostWrites(site: Ready, labels: string[], dirtyBefore: string[]): void {
+/**
+ * Records the files a route of this server just wrote, each with the bytes now on disk; a file that already differed from HEAD before the write carries edits that are not stet's and is left out.
+ * A file dirty before only because stet's own earlier write left it so (its bytes before this write are the recorded ones) is still stet's. Nothing is recorded where git could not say what was dirty.
+ */
+function recordHostWrites(site: Ready, labels: string[], dirtyBefore: string[] | null, hashesBefore: Map<string, string | null>): void {
+  if (dirtyBefore === null) return;
   const held = hostWrites.get(site.path) ?? new Map<string, string>();
   for (const file of labels) {
-    if (dirtyBefore.includes(file)) continue;
+    if (dirtyBefore.includes(file) && !(held.has(file) && held.get(file) === hashesBefore.get(file))) continue;
     const hash = hashOf(site, file);
     if (hash !== null) held.set(file, hash);
   }
@@ -1332,12 +1338,13 @@ function applyKeyMove(
 ): { written: string[]; touched: string | null; at: GitState; pending: string[] } {
   const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, new Report()).filter((p) => p.status !== 'unchanged');
   const dirtyBefore = uncommittedPaths(ready.path, changed.map((p) => `:(literal)${p.label}`));
+  const hashesBefore = new Map(changed.map((p) => [p.label, hashOf(ready, p.label)]));
   try {
     writePlanned(changed);
   } catch (error) {
     rethrowBatchFailure(label, error);
   }
-  recordHostWrites(ready, changed.map((p) => p.label), dirtyBefore);
+  recordHostWrites(ready, changed.map((p) => p.label), dirtyBefore, hashesBefore);
   return { written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) };
 }
 
@@ -2994,8 +3001,9 @@ async function declarePages(req: Request, site: SiteState): Promise<Response> {
   }
   const report = new Report();
   const dirtyBefore = uncommittedPaths(ready.path, ['.']);
+  const hashesBefore = new Map([...hostWritten(ready).keys()].map((file) => [file, hashOf(ready, file)]));
   const written = applyPages(ready.path, ready.config, ready.descriptor, ready.snapshot, set, names, report);
-  recordHostWrites(ready, written, dirtyBefore);
+  recordHostWrites(ready, written, dirtyBefore, hashesBefore);
   const touched = touchReadPath(ready);
   return json({ lines: linesOf(report), findings: report.findings, written, touched, at: gitState(ready.path) });
 }

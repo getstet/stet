@@ -2680,6 +2680,8 @@ function previewLoaded() {
   S.census = null;
   S.hover = null;
   S.edit = null;
+  S.choose = null;
+  paintPanePick();
   closePopover();
   paintPopover();
   paintHover();
@@ -3096,9 +3098,11 @@ function choosePick(hit, again, rect, sel) {
   // At phone width, and on a touch screen at any width, the second tap focuses the field, which only then scrolls into view.
   if (narrow() || touchScreen()) { focusField(key, hit.entry); return; }
   if (!entryHeld(key, hit.entry)) return;
-  if (hit.attr === null && hit.inplace) {
+  // The page numbers a sentence's elements in the order they show, so a value that orders its tags otherwise is typed in its field.
+  const sentence = hit.by !== 'mark' && (keyDef(key) || {}).tags !== undefined;
+  if (hit.attr === null && hit.inplace && (!sentence || tagsInOrder(entryText(key, S.locale, hit.entry)))) {
     // A sentence key (one declaring tags) is typed in its element without moving a page node (D18).
-    const form = hit.by === 'mark' ? 'runs' : (keyDef(key) || {}).tags !== undefined ? 'sentence' : 'inplace';
+    const form = hit.by === 'mark' ? 'runs' : sentence ? 'sentence' : 'inplace';
     postToPreview(Object.assign({ stet: 'edit', key: key, locale: S.locale }, hit.entry === undefined ? {} : { entry: hit.entry },
       { form: form, oneLine: entryText(key, S.locale, hit.entry).indexOf('\n') === -1 }));
     S.edit = { key: key, locale: S.locale, entry: hit.entry, form: form, before: S.draft[S.locale + ' ' + key], rect: rect };
@@ -3106,6 +3110,16 @@ function choosePick(hit, again, rect, sel) {
   } else {
     openPopover(key, S.locale, hit.entry, rect, hit.attr === null ? sel : undefined);
   }
+}
+/** Whether a value's placeholder elements open in the order of their numbers, `<1>` first: the order the page shows them in. */
+function tagsInOrder(value) {
+  let next = 1;
+  for (const m of String(value).matchAll(/<(\/?)(\d+)(\/?)>/g)) {
+    if (m[1] === '/') continue;
+    if (Number(m[2]) !== next) return false;
+    next += 1;
+  }
+  return true;
 }
 /** The key a frame click named, selected as a pick from the list is, its field scrolled into view; the pane stays where it is. */
 function selectFromFrame(id, entry) {
@@ -3323,6 +3337,8 @@ function onMoved(data) {
   if (typeof data.route !== 'string') return;
   S.moved = shownRoute(data.route);
   S.frameRoute = data.route.replace(/[?#].*$/, ''); // the agent compares `location.pathname`
+  S.choose = null;
+  paintPanePick();
   if (ready() && S.tab === 'Content') paintPaneHead();
   void guard(loadRouteReads(routePath(S.moved)));
 }

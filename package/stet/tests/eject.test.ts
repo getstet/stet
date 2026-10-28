@@ -8,10 +8,11 @@
  * over it is clean (it still builds).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { runInNewContext } from 'node:vm';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
@@ -33,6 +34,7 @@ vi.mock('../cli/source-scan.js', async (importOriginal) => {
 
 import { createMemoryStore } from '../adapters/store-memory.js';
 import { cleanupCliHosts, htmlFixture, makeHtmlHost } from '../conformance/cli-host.js';
+import { unrewrittenClean } from '../cli/astro-rewrite.js';
 import { runEject } from '../cli/eject.js';
 import { HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
 import { packageRoot } from '../cli/installed.js';
@@ -350,6 +352,20 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     const dir = host();
     await runEject(['--write'], io(dir));
     expect(existsSync(join(dir, 'stet-history.json'))).toBe(false);
+  });
+
+  it('REVIEW-N1: a write that fails on a later file puts every earlier file back and exits nonzero', async () => {
+    const dir = host();
+    // The snapshot and the layout are written before the page the run cannot write.
+    chmodSync(join(dir, 'app/page.tsx'), 0o444);
+    const before = hostBytes(dir);
+    const cap = io(dir);
+    try {
+      expect(await runCli(['eject', '--write'], cap), cap.out.join('\n')).toBe(1);
+    } finally {
+      chmodSync(join(dir, 'app/page.tsx'), 0o644);
+    }
+    expectUnchanged(dir, before);
   });
 });
 
@@ -1641,6 +1657,32 @@ describe('eject — an Astro host\'s reads go back as text (D15)', () => {
     expect(await runEject(['--write'], io(dir))).toBe(0);
     expect(read(dir, PAGE)).toBe('<h1>Hello world</h1>\n<pre is:raw><code>import { copy } from "@/lib/content";</code></pre>\n');
     expect(existsSync(join(dir, 'src/lib/content.ts'))).toBe(false);
+  });
+
+  it('REVIEW-S1: a value closing a script is written into a client script with its "<" escaped, and the script count stays', async () => {
+    const value = '</script><script>alert(1)</script><script>';
+    const page = "<h1>x</h1>\n<script>\nimport { copy } from '@/lib/content';\nconsole.log(copy('hero'));\n</script>\n";
+    const dir = astroHost({ [PAGE]: page }, { hero: value });
+    const cap = io(dir);
+    expect(await runEject(['--write'], cap), cap.out.join('\n')).toBe(0);
+    const after = read(dir, PAGE);
+    expect(after.match(/<script/gi)).toHaveLength(1);
+    expect(after.match(/<\/script/gi)).toHaveLength(1);
+    // The restored literal still evaluates to the editor's value.
+    const logged: unknown[] = [];
+    const body = /<script>\n([\s\S]*?)\n<\/script>/.exec(after)?.[1] ?? '';
+    runInNewContext(body.replace(/^import .*\n/, ''), { console: { log: (v: unknown) => logged.push(v) } });
+    expect(logged).toEqual([value]);
+  });
+
+  it('REVIEW-S1: the read-back refuses a rewrite that split a client script into balanced pairs', async () => {
+    const ts = await loadTypescript();
+    const before = "<h1>x</h1>\n<script>\nconsole.log(copy('hero'));\n</script>\n";
+    const split = '<h1>x</h1>\n<script>\nconsole.log("</script><script>alert(1)</script><script>");\n</script>\n';
+    const intact = '<h1>x</h1>\n<script>\nconsole.log("\\u003c/script>");\n</script>\n';
+    const expected = { elements: 0, names: new Set(['copy']) };
+    expect(unrewrittenClean(ts, PAGE, before, split, [], expected)).toBe(false);
+    expect(unrewrittenClean(ts, PAGE, before, intact, [], expected)).toBe(true);
   });
 });
 

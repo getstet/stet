@@ -328,9 +328,11 @@ export function unraw(page: string): string {
  * `<script>` runs in the browser, so it is its own scope; a Vue or Svelte
  * `<script>` is the component's, which its template reads. `braces` lists every
  * brace expression the walk read, in the markup and in its tags, for the
- * rename's parse check.
+ * rename's parse check, and `raws` counts the `<script>` and `<style>` elements
+ * with a body, so a rewrite that splits one can be told by its count.
  */
-export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]; expressions: Span[]; braces: Span[] } {
+export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]; expressions: Span[]; braces: Span[]; raws: number } {
+  let raws = 0;
   const scripts: Span[] = [];
   const expressions: Span[] = [];
   const braces: Span[] = [];
@@ -390,6 +392,7 @@ export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]
           i = end;
           continue;
         }
+        raws += 1;
         const close = lower.indexOf(`</${name}`, end);
         const bodyEnd = close === -1 ? n : close;
         if (name === 'script' && !JS_SCRIPT_TYPE.test(tag)) {
@@ -435,7 +438,7 @@ export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]
     }
     i += 1;
   }
-  return { scripts, expressions, braces };
+  return { scripts, expressions, braces, raws };
 }
 
 /** A Vue directive: its quoted value is an expression. */

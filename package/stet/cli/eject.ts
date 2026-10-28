@@ -41,7 +41,7 @@ import {
   planGuidanceRemoval,
 } from './agents.js';
 import { flag, ENV_OPTION, noPositionals, parse, text as argText } from './args.js';
-import { writeJsonDeterministic, writeText } from './artifacts.js';
+import { asUpdate, planJson, planWrite, rethrowBatchFailure, writeJsonDeterministic, writePlanned, writeText } from './artifacts.js';
 import {
   CONFIG_FILE,
   HOST_MIGRATIONS,
@@ -356,10 +356,18 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
     // (1) The snapshot + regenerated defaults and resolved modules.
     report.line(`snapshot: ${Object.keys(merged[config.locales.default] ?? {}).length} default key(s) → ${config.snapshotPath}, + ${config.codegen.defaults}`);
     if (write) {
-      writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
-      writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged));
-      writeText(join(io.cwd, config.codegen.resolved), generateResolvedModule(descriptor, merged));
-      for (const [file, out] of edited) writeText(join(io.cwd, file), out);
+      // ONE batch, with rollback: the snapshot, the regenerated modules and every
+      // un-rewritten host file land together or not at all. The deletions follow it.
+      try {
+        writePlanned([
+          asUpdate(planJson(join(io.cwd, config.snapshotPath), merged, config.snapshotPath)),
+          asUpdate(planWrite(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged), config.codegen.defaults)),
+          asUpdate(planWrite(join(io.cwd, config.codegen.resolved), generateResolvedModule(descriptor, merged), config.codegen.resolved)),
+          ...[...edited].map(([file, out]) => asUpdate(planWrite(join(io.cwd, file), out, file))),
+        ]);
+      } catch (error) {
+        rethrowBatchFailure('stet eject', error);
+      }
       // `force` because a file already gone is a completed deletion: a racing
       // remove must not throw here, after the snapshot has been written.
       for (const rel of removable) rmSync(join(io.cwd, rel), { force: true });
@@ -703,8 +711,14 @@ function ejectHtml(d: {
   const keys = Object.keys(merged[config.locales.default] ?? {}).length;
   report.line(`snapshot: ${keys} default key(s) → ${config.snapshotPath}`);
   if (write && refusal === null) {
-    writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
-    for (const [file, text] of stripped) writeText(join(io.cwd, file), text);
+    try {
+      writePlanned([
+        asUpdate(planJson(join(io.cwd, config.snapshotPath), merged, config.snapshotPath)),
+        ...[...stripped].map(([file, text]) => asUpdate(planWrite(join(io.cwd, file), text, file))),
+      ]);
+    } catch (error) {
+      rethrowBatchFailure('stet eject', error);
+    }
   }
 
   // What stays: the config, the descriptor and the snapshot. No registry on

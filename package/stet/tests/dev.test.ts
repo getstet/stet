@@ -4650,6 +4650,31 @@ describe('POST /api/site/pages/declare', () => {
       expect(made.status).toBe(200);
       expect(status(host).trim()).toBe('M src/pages/about.astro');
     });
+
+    it('REVIEW-S2: records nothing when the git status taken before the write fails', async () => {
+      const host = seoHost();
+      appendFileSync(join(host.cwd, 'src/pages/about.astro'), '<!-- by hand -->\n');
+      // A git whose first `status` listing fails and whose every later call is the real one.
+      const bin = tempDir('stet-gitfail-');
+      const flag = join(bin, 'fail-once');
+      writeFileSync(flag, '');
+      const real = execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim();
+      writeFileSync(join(bin, 'git'), `#!/bin/sh\ncase " $* " in *" --untracked-files=all "*) if [ -e '${flag}' ]; then rm -f '${flag}'; exit 1; fi;; esac\nexec '${real}' "$@"\n`, { mode: 0o755 });
+      const { handler } = handlerOver([host.cwd]);
+      const pathBefore = process.env['PATH'];
+      process.env['PATH'] = `${bin}:${pathBefore}`;
+      try {
+        const declared = await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+        expect(declared.status).toBe(200);
+        expect(declared.body['written']).toContain('src/pages/about.astro');
+      } finally {
+        process.env['PATH'] = pathBefore;
+      }
+      expect(existsSync(flag)).toBe(false);
+      const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+      expect(pending).not.toContain('src/pages/about.astro');
+      expect(pending).toContain('content/descriptor.json');
+    });
   });
 
   it('declares every proposal where no names are given', async () => {
@@ -11329,6 +11354,18 @@ describe('the page', () => {
           page.dom.window.close();
         });
 
+        it('REVIEW-H2: a sentence key whose value orders its tags otherwise opens its field, never the sentence form', async () => {
+          const site = siteBody({
+            descriptor: { ...descriptor, keys: { ...descriptor.keys, lab_sentence: { shape: 'text', target: 'web', tags: 2 } } },
+            snapshot: { ...snapshot, default: { ...snapshot.default, lab_sentence: 'Read the <2>docs</2> then run <1>npx x init</1>.' } },
+          });
+          const { page, agent } = await bridged({ site });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { tag: 'p' });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          expect(agent.sent('edit').filter((m) => m['form'] === 'sentence')).toEqual([]);
+          page.dom.window.close();
+        });
+
         // C9 — typing a sentence key in the page (D16, D18)
         const SENTENCE_VALUE = 'Install: run <1>npx x init</1> and answer.';
         const SENTENCE_PLAIN = 'Install: run npx x init and answer.';
@@ -11424,6 +11461,19 @@ describe('the page', () => {
           const rule = /\.shell\.picked #sidetoggle\{([^}]*)\}/.exec(css);
           const props = (rule?.[1] ?? '').split(';');
           expect(props).toEqual(expect.arrayContaining(['min-height:36px', 'white-space:nowrap', 'overflow:hidden', 'text-overflow:ellipsis']));
+          page.dom.window.close();
+        });
+
+        it('REVIEW-L1: the two-key chooser goes with the page it was opened on', async () => {
+          const { page, agent } = await bridged();
+          await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }]);
+          const box = byId(page, 'panepick');
+          expect(box.hidden).toBe(false);
+          await agent.moved('/pricing');
+          const afterMove = box.hidden;
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          expect([afterMove, box.hidden]).toEqual([true, true]);
           page.dom.window.close();
         });
 
@@ -15024,5 +15074,35 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     const split = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_install', at: 'src/pages/index.astro:5', name: 'home_page_span' });
     expect([split.status, split.body['key']]).toEqual([200, 'home_page_span']);
     expect(host.file('src/pages/index.astro')).toContain('<span class="w">{copy.home_page_span}</span></div>\n<div class="box"><span class="install">{copy.hero_install}</span>');
+  });
+});
+
+describe('REVIEW probe: a second stet write to one page file (PD14)', () => {
+  it('REVIEW-H1: commits the page after Declare pages and then Split both wrote it', async () => {
+    const host = astroHost(['about.astro']);
+    writeFileSync(
+      join(host.cwd, 'stet.config.json'),
+      JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } }, null, 2),
+    );
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }));
+    write(host.cwd, 'src/lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(
+      host.cwd,
+      'src/pages/about.astro',
+      "---\nimport { copy } from '@/lib/content';\n---\n<html><head><title>About us</title><meta name=\"description\" content=\"Who we are.\" /></head><body>\n<h1>{copy('hero_headline')}</h1>\n<p>{copy('hero_headline')}</p>\n</body></html>\n",
+    );
+    git(host.cwd, ['add', '-A']);
+    git(host.cwd, ['commit', '-qm', 'pages']);
+    const { handler } = handlerOver([host.cwd]);
+    const declared = await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+    expect(declared.status).toBe(200);
+    expect(declared.body['written']).toContain('src/pages/about.astro');
+    const first = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+    expect(first).toContain('src/pages/about.astro');
+    const split = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_headline', at: 'src/pages/about.astro:6', name: 'about_para' });
+    expect(split.status).toBe(200);
+    expect(split.body['written']).toContain('src/pages/about.astro');
+    const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+    expect(pending).toContain('src/pages/about.astro');
   });
 });
