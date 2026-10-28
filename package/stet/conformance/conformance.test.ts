@@ -7902,7 +7902,8 @@ describe('adoption', () => {
     expect(readFileSync(join(odd.cwd, 'CLAUDE.md')).equals(latin1)).toBe(true);
 
     // A dialect host's parse refusals collapse to one count line rather than
-    // burying the plan they print beside, and `--verbose` restores the list.
+    // burying the plan they print beside, and `--verbose` restores the list
+    // (a `.vue` wall: an `.astro` file goes to the Astro un-rewrite, D15).
     // The host keeps a stet-importing surface on purpose: with no importer the
     // compiler-less probe skips the un-rewrite loop whole and no refusal would
     // print at all.
@@ -7911,12 +7912,12 @@ describe('adoption', () => {
     expect(await wall.run('register', '--from', 'scan', '--write')).toBe(0);
     const wallConfig = JSON.parse(wall.file('stet.config.json'));
     for (let i = 0; i < 5; i++) {
-      wall.write(`src/pages/p${i}.astro`, '---\nconst t = 1;\n---\n<h1>Chapter</h1>\n');
+      wall.write(`src/pages/p${i}.vue`, '<template>\n  <h1>Chapter</h1>\n</template>\n');
     }
     wall.write(
       'stet.config.json',
       JSON.stringify(
-        { ...wallConfig, managedSurfaces: [...wallConfig.managedSurfaces, 'src/pages/**/*.astro'] },
+        { ...wallConfig, managedSurfaces: [...wallConfig.managedSurfaces, 'src/pages/**/*.vue'] },
         null,
         2,
       ),
@@ -7928,7 +7929,7 @@ describe('adoption', () => {
       '5 file(s) could not be parsed cleanly — not un-rewritten ' +
         '(the backstop refuses the dep drop if they still import stet); run with --verbose to list them',
     );
-    expect(walled.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toEqual([]);
+    expect(walled.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l))).toEqual([]);
     // The rest of the plan is untouched — the collapse replaces the wall, not
     // the manifest around it.
     expect(walled.join('\n')).toContain('stays (no stet imports):');
@@ -7937,7 +7938,7 @@ describe('adoption', () => {
     const beforeWallVerbose = wall.out.length;
     expect(await wall.run('eject', '--verbose')).toBe(0);
     const wallListed = wall.out.slice(beforeWallVerbose);
-    expect(wallListed.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toHaveLength(5);
+    expect(wallListed.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l))).toHaveLength(5);
     expect(wallListed.join('\n')).not.toContain('run with --verbose to list them');
 
     // On the static-HTML host there is nothing to un-rewrite, unwrap or delete:
@@ -7964,6 +7965,40 @@ describe('adoption', () => {
     expect(html.stdout()).toContain(
       'stays (no stet imports): stet.config.json, content/descriptor.json, content/defaults.json',
     );
+
+    // A JSX sentence key goes back to the markup register replaced: the
+    // renderers' own tags, the inserted key gone, the renderer's import with
+    // the accessor's (D15, R31).
+    const sentence = 'export default function Page() {\n  return <p>Run <b className="cmd">npx x init</b> now.</p>;\n}\n';
+    const jsx = makeAdoptionHost({ page: sentence });
+    expect(await jsx.run('init', '--yes')).toBe(0);
+    expect(await jsx.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(jsx.file('app/page.tsx')).toContain('{richParts(copy(');
+    expect(await jsx.run('eject', '--write')).toBe(0);
+    expect(jsx.file('app/page.tsx')).toBe(sentence);
+    expect(jsx.allText()).not.toMatch(/@getstet\/stet/);
+
+    // An Astro page's reads go back as text: register's rewrite and the import
+    // and fence it inserted reversed byte for byte (D15, R23).
+    const astro = makeCliHost({
+      config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: [], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },
+    });
+    const astroPage = '<h3>Fixing a word</h3>\n<button title="Copy the command">x</button>\n<p>Install: run <b>npx x init</b> and answer.</p>\n';
+    for (const [rel, text] of Object.entries({
+      'package.json': JSON.stringify({ name: 'host', dependencies: { '@getstet/stet': '^1.0.0' } }),
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }),
+      'src/lib/content.ts': 'export const copy = (key: string): string => key;\n',
+      'src/pages/index.astro': astroPage,
+    })) {
+      mkdirSync(dirname(join(astro.cwd, rel)), { recursive: true });
+      writeFileSync(join(astro.cwd, rel), text);
+    }
+    expect(await astro.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(astro.file('src/pages/index.astro')).toContain("import { richParts } from '@getstet/stet';");
+    expect(await astro.run('eject', '--write')).toBe(0);
+    expect(astro.file('src/pages/index.astro')).toBe(astroPage);
+    expect(astro.exists('src/lib/content.ts')).toBe(false);
+    expect(JSON.parse(astro.file('package.json')).dependencies['@getstet/stet']).toBeUndefined();
   });
 
   it('Requirement: hook install adds the pre-commit gate, opt-in and executable', async () => {

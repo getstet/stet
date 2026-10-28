@@ -240,7 +240,9 @@ person, and imports an existing list. Recipes and the SQL reference:
 Next.js (both routers), React and Astro are first-class for scanning and
 adoption. On an Astro site, stet register rewrites text, copy attributes,
 component props and the front-matter data a page shows into key reads and
-lists what it cannot rewrite safely for adoption by hand. A plain HTML site
+lists what it cannot rewrite safely for adoption by hand; stet pages scan --apply
+binds each page's title and description to its SEO keys; stet eject puts them
+back as text. A plain HTML site
 with no build is a host too: stet marks the
 elements it manages and regenerates them from the committed snapshot. A head
 text that repeats a key the page shows — the share description that is the

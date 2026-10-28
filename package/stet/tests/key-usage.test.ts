@@ -662,6 +662,25 @@ describe('the @getstet/stet exemption covers reads of the generated data alone (
   });
 });
 
+describe('the generated data handed to a stet element as a prop is no unreadable read (route-reads)', () => {
+  const layout = (mount: string): string =>
+    `import { CopyProvider } from '@getstet/stet/react';\nimport descriptorJson from '../content/descriptor.json';\nimport { RESOLVED } from '../content/resolved';\nexport default function Root({ children }: { children: React.ReactNode }) {\n  return <html><body>${mount}</body></html>;\n}\n`;
+  const withLayout = (mount: string): Record<string, string> => ({
+    'content/resolved.ts': "export const RESOLVED = { hero_title: 'a' } as const;\n",
+    'app/layout.tsx': layout(mount),
+  });
+
+  it('resolved on the provider register mounts', async () => {
+    const usage = await usageOf(host(withLayout('<CopyProvider descriptor={descriptorJson as never} resolved={RESOLVED}>{children}</CopyProvider>')));
+    expect(usage.causes).toEqual([]);
+  });
+
+  it('the same data handed to an element that is not stet\'s stays a cause', async () => {
+    const usage = await usageOf(host(withLayout('<Mine resolved={RESOLVED}>{children}</Mine>')));
+    expect(usage.causes).toHaveLength(1);
+  });
+});
+
 describe('require and import() declare bindings like an import (R-require, F11)', () => {
   const dynamic = (rel: string, text: string): Record<string, string> => ({ [rel]: text });
 

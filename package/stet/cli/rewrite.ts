@@ -10,7 +10,8 @@
  * one parse per file stays in the scanner.
  */
 
-import { parseDiagnosticsOf, scanSource, scriptKindFor, type LocatedAccessor, type LocatedLiteral, type Span } from './source-scan.js';
+import { PLACEHOLDER, tagTree, type TagNode } from '../src/placeholder.js';
+import { jsxSentenceValue, parseDiagnosticsOf, scanSource, scriptKindFor, type LocatedAccessor, type LocatedLiteral, type Span } from './source-scan.js';
 import { CliError } from './report.js';
 
 /** A span replacement; an insertion has `pos === end`. */
@@ -164,13 +165,22 @@ export interface JsxRead {
  * the identical inserts counted once, as the batch applies them.
  */
 export function jsxReads(edits: Edit[], landed: Array<{ literal: LocatedLiteral; key: string }>): JsxRead[] {
-  const unique = uniqueEdits(edits);
   return landed.map(({ literal, key }) => {
-    const shift = unique
-      .filter((e) => e.end <= literal.pos && !(e.pos === literal.pos && e.end === literal.end))
-      .reduce((sum, e) => sum + e.text.length - (e.end - e.pos), 0);
+    const shift = shiftAt(edits, literal.pos, (e) => e.pos === literal.pos && e.end === literal.end);
     return { key, at: literal.pos + shift, from: literal.pos, rich: literal.context === 'jsx-rich' };
   });
+}
+
+/** How far the text at `pos` moves once `edits` apply: by every edit ending at or before it but `self`, identical inserts counted once. */
+function shiftAt(edits: Edit[], pos: number, self: (e: Edit) => boolean): number {
+  return uniqueEdits(edits)
+    .filter((e) => e.end <= pos && !self(e))
+    .reduce((sum, e) => sum + e.text.length - (e.end - e.pos), 0);
+}
+
+/** Where `edit`'s text starts in the text `applyFileEdits(source, edits)` gives. */
+export function landedAt(edits: Edit[], edit: Edit): number {
+  return edit.pos + shiftAt(edits, edit.pos, (e) => e === edit);
 }
 
 /**
@@ -248,21 +258,34 @@ function uniqueEdits(edits: Edit[]): Edit[] {
   return unique;
 }
 
+/** Why eject cannot put a file's reads back, as the terminal prints it, on both hosts (D15). */
+export const RICH_UNREADABLE = 'a richParts call stet cannot read back';
+export const UNREWRITE_UNCLEAN = 'the un-rewrite did not read back cleanly';
+
+/** A sentence key eject put back: its edit, and the value its markup must read back as. */
+export interface RestoredSentence {
+  edit: Edit;
+  value: string;
+}
+
 /**
  * Eject's inverse — every register-produced accessor call back to a plain
  * literal, plus the now-orphaned imports and `const copy` lines dropped in the
  * SAME descending batch. It takes the re-scan's `accessorCalls` (an adopted
  * file's `literals` are empty), and the value is serialized for its exact
- * context so a quote, `<`, `>`, `{` or newline never becomes a syntax error.
+ * context so a quote, `<`, `>`, `{` or newline never becomes a syntax error. A
+ * sentence key's read is rebuilt into the markup it replaced (D15); one it
+ * cannot rebuild refuses the file with the reason, and nothing of it is edited.
  */
 export function unRewriteFile(
   source: string,
   calls: LocatedAccessor[],
   values: Record<string, unknown>,
   dropSpans: Span[],
-): { edited: string; edits: Edit[]; skipped: LocatedAccessor[] } {
+): { edited: string; edits: Edit[]; skipped: LocatedAccessor[]; sentences: RestoredSentence[]; refused?: string } {
   const edits: Edit[] = [];
   const skipped: LocatedAccessor[] = [];
+  const sentences: RestoredSentence[] = [];
   for (const call of calls) {
     // A FOREIGN `copy` (a copy-to-clipboard binding in scope) is not ours to
     // touch: replacing it with a value makes a dead button, and its argument may
@@ -272,12 +295,11 @@ export function unRewriteFile(
     // still un-rewrites — the value simply replaces the call, and a missing
     // value still aborts below.
     if (call.copyBinding === 'foreign') {
+      // A sentence key's renderer around a foreign read cannot be put back by its value.
+      if (call.context === 'jsx-rich') return { edited: source, edits: [], skipped, sentences: [], refused: RICH_UNREADABLE };
       skipped.push(call);
       continue;
     }
-    // A sentence key's read goes back to markup by its renderers, which this
-    // inverse does not rebuild: a value in its place would show its tags.
-    if (call.context === 'jsx-rich') throw new CliError(`eject: ${call.file}: a richParts call stet cannot read back`);
     // Fail-safe: a stet key present in the source but ABSENT from the resolved
     // map (never published, no default — `resolveAll` omits undefined values)
     // must ABORT, never emit a silent `undefined` token into host source. eject
@@ -285,12 +307,104 @@ export function unRewriteFile(
     if (!(call.key in values) || values[call.key] === undefined) {
       throw new CliError(`eject: no resolved value for key ${call.key}`);
     }
-    edits.push({ pos: call.pos, end: call.end, text: serializeValue(values[call.key], call.context) });
+    const value = values[call.key];
+    if (call.context === 'jsx-rich') {
+      const text = call.shape === 'readable' && typeof value === 'string' ? sentenceMarkup(source, call, value) : null;
+      if (text === null) return { edited: source, edits: [], skipped, sentences: [], refused: RICH_UNREADABLE };
+      const edit = { pos: call.pos, end: call.end, text };
+      edits.push(edit);
+      sentences.push({ edit, value: value as string });
+      continue;
+    }
+    edits.push({ pos: call.pos, end: call.end, text: serializeValue(value, call.context) });
   }
   for (const span of dropSpans) {
     edits.push({ pos: span.pos, end: span.end, text: '' });
   }
-  return { edited: applyFileEdits(source, edits), edits, skipped };
+  return { edited: applyFileEdits(source, edits), edits, skipped, sentences };
+}
+
+/**
+ * A sentence key's markup from its value's placeholder tree (D15): each text
+ * part by the JSX text rule, widened so a part that is white space alone or
+ * holds a line break rides a container; each element its renderer's open tag
+ * with the ` key={k}` register inserted after the tag name removed, its
+ * children and its close tag. Null where the tag reader refuses the value, or
+ * a copied tag still names a renderer's parameter.
+ */
+function sentenceMarkup(source: string, call: LocatedAccessor, value: string): string | null {
+  const renderers = call.renderers ?? [];
+  const tree = tagTree(value, renderers.length);
+  if ('fault' in tree) return null;
+  const opens: string[] = [];
+  for (const renderer of renderers) {
+    let open = source.slice(renderer.open.pos, renderer.open.end);
+    const tag = /^<[A-Za-z][\w:.-]*/.exec(open)?.[0] ?? '';
+    const k = renderer.params[1];
+    const keyed = k === undefined ? null : new RegExp(`^\\s+key=\\{${k.replace(/\$/g, '\\$')}\\}`).exec(open.slice(tag.length));
+    if (keyed !== null) open = tag + open.slice(tag.length + keyed[0].length);
+    if (renderer.params.some((p) => new RegExp(`(?<![\\w$])${p.replace(/\$/g, '\\$')}(?![\\w$])`).test(open))) return null;
+    opens.push(open);
+  }
+  let out = '';
+  const walk = (nodes: TagNode[]): void => {
+    for (const node of nodes) {
+      if (typeof node === 'string') {
+        out += /[<>{}&\r\n]/.test(node) || node.trim() === '' ? `{${JSON.stringify(node)}}` : node;
+        continue;
+      }
+      const renderer = renderers[node.n - 1] as NonNullable<LocatedAccessor['renderers']>[number];
+      out += opens[node.n - 1] as string;
+      walk(node.children);
+      out += source.slice(renderer.close.pos, renderer.close.end);
+    }
+  };
+  walk(tree);
+  return out;
+}
+
+/** A value with its placeholder numbers renamed in order of first opening: the markup reads its elements in that order whichever order the value wrote them. */
+function byAppearance(value: string): string {
+  const order = new Map<string, number>();
+  return value.replace(PLACEHOLDER, (_match, closing: string, n: string, selfClosing: string) => {
+    if (closing === '' && !order.has(n)) order.set(n, order.size + 1);
+    return `<${closing}${order.get(n) ?? n}${selfClosing}>`;
+  });
+}
+
+/**
+ * Whether a JSX file with its sentence keys put back reads back (D15): it
+ * parses with no syntax error; its scan holds no `'jsx-rich'` read; and each
+ * restored sentence's children (the span `at`–`end` of `after`) read, by JSX's
+ * text rule and the open-tag numbering alone, as the key's value — no copy or
+ * i18n gate, so a value in any script reads back (check 4 K12).
+ */
+export async function jsxUnrewrittenClean(
+  ts: typeof import('typescript'),
+  file: string,
+  after: string,
+  restored: Array<{ at: number; end: number; value: string }>,
+): Promise<boolean> {
+  const sf = ts.createSourceFile(file, after, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
+  if (parseDiagnosticsOf(sf).length > 0) return false;
+  if ((await scanSource(file, after, { readPathImport: '' })).accessorCalls.some((call) => call.context === 'jsx-rich')) return false;
+  return restored.every(({ at, end, value }) => {
+    // The innermost element or fragment whose children hold the span.
+    let holder: import('typescript').JsxElement | import('typescript').JsxFragment | undefined;
+    const visit = (node: import('typescript').Node): void => {
+      if (ts.isJsxElement(node) || ts.isJsxFragment(node)) {
+        const open = ts.isJsxElement(node) ? node.openingElement : node.openingFragment;
+        const close = ts.isJsxElement(node) ? node.closingElement : node.closingFragment;
+        if (open.end <= at && end <= close.getStart(sf)) holder = node;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    if (holder === undefined) return false;
+    const kids = holder.children.filter((kid) => kid.end > at && kid.getStart(sf) < end);
+    const read = jsxSentenceValue(ts, sf, holder, kids);
+    return read !== null && byAppearance(read) === byAppearance(value);
+  });
 }
 
 /**

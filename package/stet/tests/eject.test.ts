@@ -13,7 +13,23 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
+
+/** Read-backs made to fail on demand (T15.4, T15.9): every other export is the real one. */
+const planted = vi.hoisted(() => ({ jsxUnrewrittenClean: false, decode: false }));
+vi.mock('../cli/rewrite.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../cli/rewrite.js')>();
+  return {
+    ...real,
+    jsxUnrewrittenClean: (...args: Parameters<typeof real.jsxUnrewrittenClean>) =>
+      planted.jsxUnrewrittenClean ? Promise.resolve(false) : real.jsxUnrewrittenClean(...args),
+  };
+});
+// The Astro read-back's check 5 decodes each restored text; a planted decode makes it fail.
+vi.mock('../cli/source-scan.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../cli/source-scan.js')>();
+  return { ...real, decodeEntities: (text: string) => (planted.decode ? `${real.decodeEntities(text)}\u0000` : real.decodeEntities(text)) };
+});
 
 import { createMemoryStore } from '../adapters/store-memory.js';
 import { cleanupCliHosts, htmlFixture, makeHtmlHost } from '../conformance/cli-host.js';
@@ -22,7 +38,8 @@ import { HOOK_BEFORE_0_3_1 } from '../cli/hook.js';
 import { packageRoot } from '../cli/installed.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { locateWrapTarget, providerEdits } from '../cli/provider-mount.js';
-import { applyFileEdits } from '../cli/rewrite.js';
+import { runRegister } from '../cli/register.js';
+import { applyFileEdits, jsxUnrewrittenClean } from '../cli/rewrite.js';
 import { loadTypescript } from '../cli/source-scan.js';
 
 const tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc');
@@ -1172,13 +1189,13 @@ describe('runEject --write — value serialization', () => {
  * that passes while proving nothing.
  */
 describe('runEject — the parse-refusal wall', () => {
-  /** A dialect file the TypeScript parser refuses — the shape that built the wall. */
-  const REFUSED = '---\nconst t = 1;\n---\n<h1>Chapter</h1>\n';
+  /** A dialect file the TypeScript parser refuses — the shape that built the wall. An `.astro` file goes to the Astro un-rewrite instead (D15). */
+  const REFUSED = '<template>\n  <h1>Chapter</h1>\n</template>\n';
   const IMPORTER = "import { copy } from '@/lib/content';\nexport const title = copy('hero');\n";
 
   const REFUSAL_CONFIG = {
     ...BASE_CONFIG,
-    managedSurfaces: ['src/**/*.astro', 'src/**/*.ts'],
+    managedSurfaces: ['src/**/*.vue', 'src/**/*.ts'],
     rootLayout: 'app/layout.tsx',
   };
 
@@ -1189,7 +1206,7 @@ describe('runEject — the parse-refusal wall', () => {
       // The importer, without which the whole loop is unreachable.
       'src/page.ts': IMPORTER,
     };
-    for (let i = 0; i < count; i++) files[`src/pages/p${i}.astro`] = REFUSED;
+    for (let i = 0; i < count; i++) files[`src/pages/p${i}.vue`] = REFUSED;
     return scaffold({ config: REFUSAL_CONFIG, files });
   }
 
@@ -1204,7 +1221,7 @@ describe('runEject — the parse-refusal wall', () => {
         '(the backstop refuses the dep drop if they still import stet); run with --verbose to list them',
     );
     // Not one per-file line survives.
-    expect(cap.out.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toEqual([]);
+    expect(cap.out.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l))).toEqual([]);
 
     // The plan's other sections are all still there — asserted by what they say,
     // never by counting lines, so the case does not break on an unrelated line.
@@ -1219,7 +1236,7 @@ describe('runEject — the parse-refusal wall', () => {
     const dir = refusingHost(5);
     const cap = io(dir);
     expect(await runEject(['--verbose'], cap)).toBe(0);
-    const perFile = cap.out.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l));
+    const perFile = cap.out.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l));
     expect(perFile).toHaveLength(5);
     expect(cap.out.join('\n')).not.toContain('run with --verbose to list them');
   });
@@ -1228,7 +1245,7 @@ describe('runEject — the parse-refusal wall', () => {
     const dir = refusingHost(2);
     const cap = io(dir);
     expect(await runEject([], cap)).toBe(0);
-    const perFile = cap.out.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l));
+    const perFile = cap.out.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l));
     expect(perFile).toHaveLength(2);
     expect(cap.out.join('\n')).not.toContain('run with --verbose to list them');
   });
@@ -1238,12 +1255,12 @@ describe('runEject — the parse-refusal wall', () => {
     // well clear of it and would pass under an off-by-one.
     const three = io(refusingHost(3));
     expect(await runEject([], three)).toBe(0);
-    expect(three.out.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toHaveLength(3);
+    expect(three.out.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l))).toHaveLength(3);
     expect(three.out.join('\n')).not.toContain('run with --verbose to list them');
 
     const four = io(refusingHost(4));
     expect(await runEject([], four)).toBe(0);
-    expect(four.out.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toEqual([]);
+    expect(four.out.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l))).toEqual([]);
     expect(four.out.join('\n')).toContain('4 file(s) could not be parsed cleanly');
   });
 
@@ -1257,11 +1274,11 @@ describe('runEject — the parse-refusal wall', () => {
       files: {
         'app/layout.tsx': PLAIN_LAYOUT,
         'lib/content.ts': READ_PATH,
-        'src/pages/p0.astro': REFUSED,
-        'src/pages/p1.astro': REFUSED,
-        'src/pages/p2.astro': REFUSED,
-        'src/pages/p3.astro': REFUSED,
-        'src/pages/p4.astro': REFUSED,
+        'src/pages/p0.vue': REFUSED,
+        'src/pages/p1.vue': REFUSED,
+        'src/pages/p2.vue': REFUSED,
+        'src/pages/p3.vue': REFUSED,
+        'src/pages/p4.vue': REFUSED,
       },
     });
     const cap = io(dir);
@@ -1432,3 +1449,333 @@ describe('eject — the contacts tables stay in the database', () => {
   });
 });
 
+
+/** Every host file's bytes, for "nothing was written". */
+function hostBytes(dir: string): Map<string, Buffer> {
+  const files = new Map<string, Buffer>();
+  const walk = (sub: string): void => {
+    for (const entry of readdirSync(join(dir, sub), { withFileTypes: true })) {
+      const rel = sub === '' ? entry.name : `${sub}/${entry.name}`;
+      if (entry.isDirectory()) walk(rel);
+      else files.set(rel, readFileSync(join(dir, rel)));
+    }
+  };
+  walk('');
+  return files;
+}
+
+function expectUnchanged(dir: string, before: Map<string, Buffer>): void {
+  const after = hostBytes(dir);
+  expect([...after.keys()].sort()).toEqual([...before.keys()].sort());
+  for (const [rel, buf] of after) expect(buf.equals(before.get(rel) as Buffer), rel).toBe(true);
+}
+
+/** The line a file eject cannot prove refuses the run with (D15). */
+const refusedLine = (file: string, reason: string): string => `${file}: ${reason} — restore its reads by hand, then re-run eject`;
+
+describe('eject — an Astro host\'s reads go back as text (D15)', () => {
+  const ASTRO_CONFIG = {
+    project: 't',
+    managedSurfaces: ['src/**/*.astro'],
+    emailSurfaces: [],
+    copyModules: [],
+    readPath: { file: 'src/lib/content.ts', import: '@/lib/content' },
+    router: 'astro',
+    descriptorPath: 'content/descriptor.json',
+    snapshotPath: 'content/defaults.json',
+    codegen: { registry: 'content/keys.ts', defaults: 'content/defaults.ts', dts: 'content/stet-env.d.ts' },
+  };
+  /** An Astro host whose read path no host module imports, with `keys` declared and seeded. */
+  const astroHost = (files: Record<string, string>, keys: Record<string, string> = { hero: 'Hello world' }, opts: { tagged?: boolean; readPath?: string } = {}): string =>
+    scaffold({
+      config: ASTRO_CONFIG,
+      tsconfig: { compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } },
+      descriptor: { version: 1, keys: Object.fromEntries(Object.keys(keys).map((k) => [k, opts.tagged === true ? { shape: 'text', target: 'web', tags: 1 } : { shape: 'text', target: 'web' }])) },
+      defaults: { default: keys },
+      files: { 'src/lib/content.ts': opts.readPath ?? 'export const copy = (key: string): string => key;\n', ...files },
+    });
+  const PAGE = 'src/pages/index.astro';
+  const CALLED = (body: string, front = ''): string => `---\nimport { copy } from '@/lib/content';\n${front}---\n${body}`;
+
+  it('T15.4: refuses a file whose reads it cannot prove, naming it, and writes nothing', async () => {
+    const cases: Array<[string, string]> = [
+      [CALLED("<h1>{copy('hero')}</h1>\n{items.map((copy) => <p>{copy.t}</p>)}\n", "const items = [{ t: 'x' }];\n"), 'copy is rebound in a brace'],
+      [CALLED('<h1>{copy.get(name)}</h1>\n', "const name = 'hero';\n"), 'copy.get(name) is no declared key stet can restore'],
+      [
+        CALLED("<p>{richParts(copy('hero'), [(c) => <b>{c.toUpperCase()}</b>])}</p>\n", "import { richParts } from '@getstet/stet';\n"),
+        'a richParts call stet cannot read back',
+      ],
+    ];
+    for (const [page, reason] of cases) {
+      const dir = astroHost({ [PAGE]: page });
+      const before = hostBytes(dir);
+      const cap = io(dir);
+      await expect(runEject([], cap)).rejects.toThrow(/still importing stet/);
+      expect(cap.out).toContain(refusedLine(PAGE, reason));
+      // The whole plan printed before the refusal.
+      expect(cap.out.join('\n')).toContain('drop the stet dependency from package.json');
+      await expect(runEject(['--write'], io(dir))).rejects.toThrow(/still importing stet/);
+      expectUnchanged(dir, before);
+    }
+    // A read-back that fails (planted) refuses the same way.
+    const dir = astroHost({ [PAGE]: CALLED("<h1>{copy('hero')}</h1>\n") });
+    const cap = io(dir);
+    planted.decode = true;
+    try {
+      await expect(runEject([], cap)).rejects.toThrow(/still importing stet/);
+    } finally {
+      planted.decode = false;
+    }
+    expect(cap.out).toContain(refusedLine(PAGE, 'the un-rewrite did not read back cleanly'));
+    // A key with no value aborts, as for a JSX leaf.
+    const ghost = astroHost({ [PAGE]: CALLED("<h1>{copy('ghost')}</h1>\n") });
+    await expect(runEject(['--write'], io(ghost))).rejects.toThrow('eject: no resolved value for key ghost');
+  });
+
+  it('un-rewrites a file whose only reads go through a declared copy module that imports no stet (addition: the import probe)', async () => {
+    const page = '---\nimport { copy } from "../copy";\n---\n<h1>{copy.hero}</h1>\n';
+    const dir = scaffold({
+      config: { ...ASTRO_CONFIG, copyModules: ['src/copy.ts'] },
+      tsconfig: { compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } },
+      descriptor: { version: 1, keys: { hero: { shape: 'text', target: 'web' } } },
+      defaults: { default: { hero: 'Hello world' } },
+      files: { 'src/copy.ts': 'export const copy: Record<string, string> = { hero: "Hello world" };\n', [PAGE]: page },
+    });
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, PAGE)).toBe('<h1>Hello world</h1>\n');
+  });
+
+  it('T15.5: register then eject gives every .astro file back as it was, and leaves no stet anywhere', async () => {
+    const original: Record<string, string> = {
+      'src/components/Head.astro': '---\ninterface Props { label: string; sub?: string }\nconst { label, sub } = Astro.props;\n---\n<div><span>{label}</span>{sub && <p>{sub}</p>}</div>\n',
+      [PAGE]: [
+        '---',
+        'import Head from "../components/Head.astro";',
+        'const surfaces = [',
+        '  { id: "a", label: "Site copy", note: "Every page holds words" },',
+        '  { id: "b", label: "Email slots", note: "Every email holds words" },',
+        '];',
+        'const flags = { changelog: true };',
+        'const flag = true;',
+        '---',
+        '<h3>Fixing a word</h3>',
+        '<button title="Copy the command" class="b">x</button>',
+        '<img alt="A team at work" src="/t.png">',
+        '<a href="/docs" title="Tom &amp; Jerry">z</a>',
+        '<Head label="Capabilities" sub="One registry holds them all" />',
+        '<Head label="Tom &amp; Jerry" />',
+        '{flags.changelog && <a class="i" href="/changelog">Changelog</a>}',
+        '{flag && <img alt="Brace alt words" src="/x.png">}',
+        '{[1, 2].map((i) => <a href="/x" title="Brace title words">{i}</a>)}',
+        '{surfaces.map((s) => (<a id={"x-" + s.id}><h3>{s.label}</h3><p>{s.note}</p></a>))}',
+        '<p>Install: run <b>npx x init</b> and answer.</p>',
+        "<p>See <a class='i'  href=\"/docs\"><code>stet</code> docs</a> now</p>",
+        '<p>Was <del>old</del> <span class="w">new</span></p>',
+        '',
+      ].join('\n'),
+      'src/pages/bare.astro': '<h3>Fenceless word here</h3>\n',
+      'src/pages/noted.astro': "---\nimport x from './x'; // note\n---\n<h3>Noted word here</h3>\n",
+      'src/pages/plain.astro': '---\nconst n = 1;\n---\n<h3>Plain front word</h3>\n',
+      'src/pages/marked.astro': '﻿<html>\r\n<body>\r\n<h3>Fixing a word</h3>\r\n</body>\r\n</html>\r\n',
+    };
+    const dir = astroHost(original, {});
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const registered = Object.keys(original).map((rel) => read(dir, rel));
+    expect(registered.filter((text, i) => text !== Object.values(original)[i])).toHaveLength(Object.keys(original).length - 1);
+    expect(read(dir, PAGE)).toContain('{richParts(copy(');
+    const cap = io(dir);
+    expect(await runEject(['--write'], cap)).toBe(0);
+    for (const [rel, text] of Object.entries(original)) expect(read(dir, rel), rel).toBe(text);
+    expect(JSON.parse(read(dir, 'package.json')).dependencies['@getstet/stet']).toBeUndefined();
+    expect(allText(dir)).not.toMatch(/@getstet\/stet|from ['"]@\/lib\/content/);
+    expect(existsSync(join(dir, 'src/lib/content.ts'))).toBe(false);
+  }, 60_000);
+
+  const RICH = "import { richParts } from '@getstet/stet';\n";
+
+  it('refuses an Astro renderer whose open tag names its own parameter', async () => {
+    const dir = astroHost({ [PAGE]: `---\nimport { copy } from '@/lib/content';\n${RICH}---\n<p>{richParts(copy('hero'), [(c) => <a href={c}>{c}</a>])}</p>\n` }, { hero: 'Run <1>x</1> now' }, { tagged: true });
+    const cap = io(dir);
+    await expect(runEject([], cap)).rejects.toThrow(/still importing stet/);
+    expect(cap.out).toContain(refusedLine(PAGE, 'a richParts call stet cannot read back'));
+  });
+
+  it('refuses a sentence read through a copy that is not stet\'s', async () => {
+    const dir = astroHost(
+      {
+        [PAGE]: `---\nimport { copy } from './mine';\n${RICH}---\n<p>{richParts(copy('hero'), [(c) => <b>{c}</b>])}</p>\n`,
+        'src/pages/mine.ts': 'export const copy = (k: string) => "Other <1>x</1>";\n',
+      },
+      { hero: 'Run <1>x</1> now' },
+      { tagged: true },
+    );
+    const cap = io(dir);
+    await expect(runEject([], cap)).rejects.toThrow(/still importing stet/);
+    expect(cap.out).toContain(refusedLine(PAGE, 'a richParts call stet cannot read back'));
+  });
+
+  it('keeps the line break between two restored braces in a pre', async () => {
+    const dir = astroHost({ [PAGE]: CALLED("<pre>\n{copy('hero')}\n{copy('hero')}\n</pre>\n") });
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, PAGE)).toBe('<pre>\nHello world\nHello world\n</pre>\n');
+  });
+
+  it('writes an attribute value holding an unmatched brace as an expression', async () => {
+    const dir = astroHost({ [PAGE]: CALLED("<button title={copy('hero')}>x</button>\n") }, { hero: 'Use { name here' });
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, PAGE)).toBe('<button title={"Use { name here"}>x</button>\n');
+  });
+
+  it('writes a component prop value holding an unmatched brace as an expression', async () => {
+    const dir = astroHost({ [PAGE]: CALLED("<Card label={copy('hero')} />\n") }, { hero: 'Use { name here' });
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, PAGE)).toBe('<Card label={"Use { name here"} />\n');
+  });
+
+  it('an is:raw code sample naming the read path is no consumer of it', async () => {
+    const dir = astroHost(
+      { [PAGE]: CALLED("<h1>{copy('hero')}</h1>\n<pre is:raw><code>import { copy } from \"@/lib/content\";</code></pre>\n") },
+      { hero: 'Hello world' },
+      { readPath: "import { readBundle } from '@getstet/stet';\nexport const copy = (key: string): string => String(readBundle) + key;\n" },
+    );
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, PAGE)).toBe('<h1>Hello world</h1>\n<pre is:raw><code>import { copy } from "@/lib/content";</code></pre>\n');
+    expect(existsSync(join(dir, 'src/lib/content.ts'))).toBe(false);
+  });
+});
+
+describe('eject — a JSX sentence key goes back to markup (D15)', () => {
+  /** A Next app-router host with a typed read path and no keys yet. */
+  const nextHost = (files: Record<string, string>, opts: { keys?: Record<string, unknown>; defaults?: Record<string, unknown> } = {}): string =>
+    scaffold({
+      config: BASE_CONFIG,
+      descriptor: { version: 1, keys: opts.keys ?? {} },
+      defaults: { default: opts.defaults ?? {} },
+      files: { 'app/layout.tsx': PLAIN_LAYOUT, 'lib/content.ts': 'export const copy = (key: string): string => key;\n', ...files },
+    });
+  const SERVER_SENTENCES =
+    "const k = 'x';\nexport default function Page() {\n  return (\n    <main>\n      <p>Run <b>npx x init</b> now.</p>\n" +
+    '      <p>Keep <b key="x">this</b> key.</p>\n      <p>Mind <b data-k={k}>the</b> name.</p>\n    </main>\n  );\n}\n';
+  const WIDGET = "'use client';\nexport default function Widget() {\n  return <p>Read the <a href=\"/docs\">docs</a> first.</p>;\n}\n";
+  const IMPORTING = "import { richParts } from '@getstet/stet';\nexport default function Page() {\n  return <p>Run <b>npx x init</b> now.</p>;\n}\n";
+  const SPACED = 'export default function Page() {\n  return <p><b>x</b> <i>y</i> words</p>;\n}\n';
+
+  it('T15.8: each sentence comes back as the markup register replaced, and the host typechecks', async () => {
+    const dir = nextHost({ 'app/page.tsx': SERVER_SENTENCES, 'app/widget.tsx': WIDGET, 'app/other/page.tsx': IMPORTING, 'app/spaced/page.tsx': SPACED });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toContain('[(c, k) => <b key={k}>{c}</b>]');
+    expect(read(dir, 'app/widget.tsx')).toContain("import { richParts } from '@getstet/stet/react';");
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toBe(SERVER_SENTENCES);
+    expect(read(dir, 'app/widget.tsx')).toBe(WIDGET);
+    expect(read(dir, 'app/layout.tsx')).toBe(PLAIN_LAYOUT);
+    // The host's own renderer import goes with stet's.
+    expect(read(dir, 'app/other/page.tsx')).toBe(IMPORTING.slice(IMPORTING.indexOf('\n') + 1));
+    // A part that is white space alone rides a container, which JSX would otherwise drop.
+    expect(read(dir, 'app/spaced/page.tsx')).toBe('export default function Page() {\n  return <p><b>x</b>{" "}<i>y</i> words</p>;\n}\n');
+    expect(allText(dir)).not.toMatch(/@getstet\/stet|from ['"]@\/lib\/content/);
+    const typed = tscClean(dir);
+    expect(typed.output).toBe('');
+
+    // Prettier 3's output over a registered sentence, byte for byte (check 4 K5): the
+    // restored file, formatted again, is the original byte for byte (checked with
+    // Prettier 3.9.10 over this exact text, check 4 K6).
+    const formatted =
+      'import { richParts } from "@getstet/stet/react/server";\nimport { copy } from "@/lib/content";\nexport default function Page() {\n  return (\n    <main>\n' +
+      '      <p className="lede">\n        {richParts(copy("home_page_paragraph"), [\n          (c, k) => (\n            <b key={k} className="cmd">\n              {c}\n' +
+      '            </b>\n          ),\n        ])}\n      </p>\n    </main>\n  );\n}\n';
+    const pretty = nextHost(
+      { 'app/page.tsx': formatted },
+      {
+        keys: { home_page_paragraph: { shape: 'text', target: 'web', tags: 1 } },
+        defaults: { home_page_paragraph: 'Install: run <1>npx @getstet/stet@latest init --yes</1> and answer its questions.' },
+      },
+    );
+    expect(await runEject(['--write'], io(pretty))).toBe(0);
+    expect(read(pretty, 'app/page.tsx')).toBe(
+      'export default function Page() {\n  return (\n    <main>\n      <p className="lede">\n' +
+        '        Install: run <b className="cmd">npx @getstet/stet@latest init --yes</b> and answer its questions.\n      </p>\n    </main>\n  );\n}\n',
+    );
+  }, 60_000);
+
+  it('T15.10: a value in any script reads back (check 4 K12)', async () => {
+    const page = 'export default function Page() {\n  return (\n    <main>\n      <p>Run now <b>npx x init</b> please</p>\n      <p>Then read <b>the docs</b> first</p>\n    </main>\n  );\n}\n';
+    const dir = nextHost({ 'app/page.tsx': page });
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    const defaults = JSON.parse(read(dir, 'content/defaults.json')) as { default: Record<string, string> };
+    const keyOf = (start: string): string => Object.keys(defaults.default).find((k) => defaults.default[k]?.startsWith(start)) as string;
+    // The plan's value, and one with no Latin word anywhere, which scan's copy gate would refuse.
+    const values = { [keyOf('Run now')]: '今すぐ <1>npx x init</1> を実行', [keyOf('Then read')]: '次に <1>説明書</1> を読む' };
+    Object.assign(defaults.default, values);
+    write(dir, 'content/defaults.json', JSON.stringify(defaults));
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    const after = read(dir, 'app/page.tsx');
+    expect(after).toBe('export default function Page() {\n  return (\n    <main>\n      <p>今すぐ <b>npx x init</b> を実行</p>\n      <p>次に <b>説明書</b> を読む</p>\n    </main>\n  );\n}\n');
+    const at = after.indexOf('今');
+    const end = after.indexOf('</p>');
+    expect(await jsxUnrewrittenClean(await loadTypescript(), 'app/page.tsx', after, [{ at, end, value: '今すぐ <1>npx x init</1> を実行' }])).toBe(true);
+  }, 60_000);
+
+  it('T15.9: refuses a sentence it cannot rebuild or read back, naming the file, and writes nothing', async () => {
+    const imports = "import { copy } from '@/lib/content';\nimport { richParts } from '@getstet/stet/react/server';\n";
+    const upper = nextHost(
+      { 'app/page.tsx': `${imports}export default function Page() {\n  return <p>{richParts(copy('hero'), [(c, k) => <b key={k}>{c.toUpperCase()}</b>])}</p>;\n}\n` },
+      { keys: { hero: { shape: 'text', target: 'web', tags: 1 } }, defaults: { hero: 'Run <1>x</1> now' } },
+    );
+    const before = hostBytes(upper);
+    const cap = io(upper);
+    await expect(runEject([], cap)).rejects.toThrow(/still importing stet/);
+    expect(cap.out).toContain(refusedLine('app/page.tsx', 'a richParts call stet cannot read back'));
+    await expect(runEject(['--write'], io(upper))).rejects.toThrow(/still importing stet/);
+    expectUnchanged(upper, before);
+
+    const readable = nextHost(
+      { 'app/page.tsx': `${imports}export default function Page() {\n  return <p>{richParts(copy('hero'), [(c, k) => <b key={k}>{c}</b>])}</p>;\n}\n` },
+      { keys: { hero: { shape: 'text', target: 'web', tags: 1 } }, defaults: { hero: 'Run <1>x</1> now' } },
+    );
+    const kept = hostBytes(readable);
+    const planned = io(readable);
+    planted.jsxUnrewrittenClean = true;
+    try {
+      await expect(runEject([], planned)).rejects.toThrow(/still importing stet/);
+      expect(planned.out).toContain(refusedLine('app/page.tsx', 'the un-rewrite did not read back cleanly'));
+      await expect(runEject(['--write'], io(readable))).rejects.toThrow(/still importing stet/);
+    } finally {
+      planted.jsxUnrewrittenClean = false;
+    }
+    expectUnchanged(readable, kept);
+  }, 60_000);
+
+  const IMPORTS = "import { copy } from '@/lib/content';\nimport { richParts } from '@getstet/stet/react/server';\n";
+  const tagged = (defaults: Record<string, string>): { keys: Record<string, unknown>; defaults: Record<string, string> } => ({
+    keys: Object.fromEntries(Object.keys(defaults).map((k) => [k, { shape: 'text', target: 'web', tags: 1 }])),
+    defaults,
+  });
+
+  it('refuses a renderer whose open tag still names k after the key attribute goes', async () => {
+    const dir = nextHost({ 'app/page.tsx': `${IMPORTS}export default function P() {\n  return <p>{richParts(copy('hero'), [(c, k) => <b key={k} title={k}>{c}</b>])}</p>;\n}\n` }, tagged({ hero: 'Run <1>x</1> now' }));
+    const cap = io(dir);
+    await expect(runEject([], cap)).rejects.toThrow(/still importing stet/);
+    expect(cap.out).toContain(refusedLine('app/page.tsx', 'a richParts call stet cannot read back'));
+  });
+
+  it('writes a value holding an entity-looking & into a container', async () => {
+    const dir = nextHost({ 'app/page.tsx': `${IMPORTS}export default function P() {\n  return <p>{richParts(copy('hero'), [(c, k) => <b key={k}>{c}</b>])}</p>;\n}\n` }, tagged({ hero: 'A &amp; B <1>&lt;x</1> now' }));
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toBe('export default function P() {\n  return <p>{"A &amp; B "}<b>{"&lt;x"}</b> now</p>;\n}\n');
+  });
+
+  it('restores a renderer whose open tag a formatter broke over lines', async () => {
+    const page = `${IMPORTS}export default function P() {\n  return (\n    <p>\n      {richParts(copy('hero'), [\n        (c, k) => (\n          <b\n            key={k}\n            className="cmd"\n          >\n            {c}\n          </b>\n        ),\n      ])}\n    </p>\n  );\n}\n`;
+    const dir = nextHost({ 'app/page.tsx': page }, tagged({ hero: 'Run <1>x</1> now' }));
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toBe('export default function P() {\n  return (\n    <p>\n      Run <b\n            className="cmd"\n          >x</b> now\n    </p>\n  );\n}\n');
+  });
+
+  it('restores a value whose tags were reordered to the markup of each number', async () => {
+    const page = `${IMPORTS}export default function P() {\n  return <p>{richParts(copy('hero'), [(c, k) => <b key={k}>{c}</b>, (c, k) => <a key={k} href="/d">{c}</a>])}</p>;\n}\n`;
+    const dir = nextHost({ 'app/page.tsx': page }, tagged({ hero: 'Read <2>docs</2> then run <1>x</1>.' }));
+    expect(await runEject(['--write'], io(dir))).toBe(0);
+    expect(read(dir, 'app/page.tsx')).toBe('export default function P() {\n  return <p>Read <a href="/d">docs</a> then run <b>x</b>.</p>;\n}\n');
+  });
+});

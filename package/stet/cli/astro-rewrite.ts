@@ -21,6 +21,8 @@ import { dirname, join, relative, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
+import { tagTree, type TagNode } from '../src/placeholder.js';
+import { escapeRegExp } from '../src/seo.js';
 import { loadConfig, pathAliasMappings, resolveSpecifier, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import {
@@ -41,6 +43,7 @@ import { baseName, isHeadKind, metaCopyNameOf, roleOf, type Place } from './key-
 import { bindingsOf, braceRoot, braceTree, codeOf, KEY_READ, parsesAsExpression, stetModuleTest, type FileCode } from './key-reads.js';
 import {
   blankNonMarkup,
+  closing,
   dialectCode,
   elementPath,
   FRONTMATTER,
@@ -59,7 +62,7 @@ import {
   type Span,
 } from './markup.js';
 import { CliError } from './report.js';
-import { applyFileEdits, dominantEol, freeParams, type Edit } from './rewrite.js';
+import { applyFileEdits, dominantEol, freeParams, RICH_UNREADABLE, UNREWRITE_UNCLEAN, type Edit } from './rewrite.js';
 import {
   astroFindings,
   bindingNames,
@@ -2122,4 +2125,573 @@ function frontRead(ctx: Context, at: number): { where: Candidate['at']; el: Elem
   const first = uses.uses.find((u) => (u.kind === 'display' || u.kind === 'head') && wholeMatch(u.pattern, path) && u.at !== undefined);
   if (first?.at === undefined) return null;
   return { where: first.at, el: first.brace === undefined ? undefined : elementPath(r.document.roots, first.brace.start).at(-1), head: first.kind === 'head' };
+}
+
+// --- The un-rewrite (D15) ---------------------------------------------------
+
+/** The sets eject restores a value with: Astro text, and an HTML attribute's quoted value (D15, check 3 F23). */
+const TEXT_SET = '&<>{}';
+const ATTR_SET = '&"';
+
+/** Why eject refuses an Astro file, beside the reasons both hosts share. */
+const UN_REBOUND = 'copy is rebound in a brace';
+const undeclared = (read: string): string => `${read} is no declared key stet can restore`;
+
+/** The names a key is read through, and with the renderer every name register's imports bind. */
+const READ_NAMES = new Set(['copy', 'copyMap', 'get']);
+const STET_NAMES = new Set([...READ_NAMES, 'richParts']);
+
+/** A code region of the file and the bindings its reads go through: the front matter's, a markup brace's, or a client script's own. */
+interface UnScope {
+  span: Span;
+  bindings: Map<string, 'stet' | 'foreign' | 'none'>;
+  brace?: Brace;
+  script?: true;
+}
+
+/** A read of a key through stet's binding: the expression's span (a call's closing parenthesis included). */
+interface UnRead {
+  at: number;
+  end: number;
+  key: string;
+  scope: UnScope;
+}
+
+/** One renderer of a sentence key's read: its open and close tag in the source. */
+interface RichRenderer {
+  open: Span;
+  close: Span;
+}
+
+/** Each text eject writes into markup, by its offset in the replacement text: what check 5 reads back. */
+type RestoredPart = { offset: number; text: string; value: string };
+
+/**
+ * An `.astro` file with every read of a declared key through stet's binding
+ * replaced by the key's value, serialized for its position, the imports and
+ * the fence register inserted removed where nothing reads them any longer, and
+ * the result read back. A file it cannot prove is refused whole with the
+ * reason; a key with no value aborts eject, as a JSX leaf's does (D15).
+ */
+export function planAstroUnrewrite(input: {
+  ts: typeof import('typescript');
+  cwd: string;
+  config: StetConfig;
+  file: string;
+  source: string;
+  values: Record<string, unknown>;
+}): { edited: string; edits: Edit[]; reads: number } | { refused: string } {
+  const { ts, cwd, config, file, source, values } = input;
+  const stetModule = stetModuleTest(cwd, [config.readPath.file, ...filesForGlobs(cwd, config.copyModules)])(file);
+  const isStet = (spec: string): boolean => spec === '@getstet/stet' || spec.startsWith('@getstet/stet/') || stetModule(spec);
+  const unchanged = { edited: source, edits: [], reads: 0 };
+  let read: Reading | { fault: string };
+  try {
+    read = readAstro(ts, file, source);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    read = { fault: 'markup stet cannot pair' };
+  }
+  // A file stet cannot read is refused only where it imports stet's reads.
+  if ('fault' in read) return [...source.matchAll(/\bfrom\s*['"]([^'"]+)['"]/g)].some((m) => isStet(m[1] as string)) ? { refused: UNREWRITE_UNCLEAN } : unchanged;
+  const r = read;
+  const { page, front } = r;
+  const frontBindings = bindingsOf(ts, `${file}.ts`, front === null ? [] : [front.sf.text], isStet);
+  const rich = front === null ? 'none' : richBindingOf(ts, front.sf);
+  const scopes: UnScope[] = [
+    ...(front === null ? [] : [{ span: { start: front.open, end: front.close }, bindings: frontBindings }]),
+    ...r.braces.map((brace) => ({ span: { start: brace.start, end: brace.end }, bindings: frontBindings, brace })),
+    // A client script is its own scope: its reads go through its own bindings (check 3 F21).
+    ...r.code.regions
+      .filter((region) => region.own === true)
+      .map((region) => ({ span: { start: region.start, end: region.end }, bindings: bindingsOf(ts, `${file}.ts`, [region.text], isStet), script: true as const })),
+  ];
+  if (rich !== 'stet' && !scopes.some((s) => [...READ_NAMES].some((name) => s.bindings.get(name) === 'stet'))) return unchanged;
+  const imports: Span[] =
+    front === null ? [] : front.sf.statements.filter((s) => ts.isImportDeclaration(s)).map((s) => ({ start: front.open + s.getStart(front.sf), end: front.open + s.end }));
+  const inCode = (at: number): boolean => !within(r.code.nonCode, at) && !within(imports, at);
+  const mode = compressionOf(cwd);
+
+  // The sentence keys: each `richParts` call fills a content brace in the shape D16 writes.
+  const sentences: Array<Span & { read: UnRead; renderers: RichRenderer[] }> = [];
+  if (rich === 'stet') {
+    for (const scope of scopes.filter((s) => s.script !== true)) {
+      for (const m of page.slice(scope.span.start, scope.span.end).matchAll(/(?<![\w$.])richParts(?![\w$])/g)) {
+        const at = scope.span.start + m.index;
+        if (!inCode(at)) continue;
+        let start = at;
+        while (start > scope.span.start && /\s/.test(page.charAt(start - 1))) start -= 1;
+        start -= 1;
+        const end = page.charAt(start) === '{' ? closing(page, start, '}') : -1;
+        const use = scope.brace === undefined || end < 0 ? null : bracePlace(r, scope.brace, { start, end });
+        const parsed = use?.kind === 'content' ? richReadOf(page, start, end, mode) : null;
+        if (parsed === null || frontBindings.get(parsed.read.name) !== 'stet') return { refused: RICH_UNREADABLE };
+        sentences.push({ start, end, read: { ...parsed.read, scope }, renderers: parsed.renderers });
+      }
+    }
+  }
+
+  // The plain reads, each through its scope's binding.
+  const reads: UnRead[] = [];
+  for (const scope of scopes) {
+    for (const m of page.slice(scope.span.start, scope.span.end).matchAll(KEY_READ)) {
+      const at = scope.span.start + m.index;
+      if (!inCode(at) || /[\w$.]/.test(page.charAt(at - 1))) continue;
+      const name = /^(copyMap|copy|get)/.exec(m[0])?.[1] as string;
+      if (scope.bindings.get(name) !== 'stet') continue;
+      if (scope.brace !== undefined && rebinds(page, scope.brace, name)) {
+        // Another name rebound is left to the read-back, which finds its read still there.
+        if (name === 'copy') return { refused: UN_REBOUND };
+        continue;
+      }
+      const sentence = sentences.find((s) => s.start <= at && at < s.end);
+      if (sentence !== undefined) {
+        if (sentence.read.at !== at) return { refused: RICH_UNREADABLE };
+        continue;
+      }
+      if (m[5] === 'get') return { refused: undeclared(readText(page, at)) };
+      let end = at + m[0].length;
+      if (m[2] !== undefined || m[4] !== undefined) {
+        const shut = /^\s*\)/.exec(page.slice(end));
+        if (shut === null) return { refused: undeclared(readText(page, at)) };
+        end += shut[0].length;
+      }
+      reads.push({ at, end, key: (m[2] ?? m[4] ?? m[5]) as string, scope });
+    }
+  }
+  // A read that names its key dynamically, or a key no read form names, is refused before the read-back (check 3 F22).
+  for (const scope of scopes) {
+    for (const m of page.slice(scope.span.start, scope.span.end).matchAll(/(?<![\w$.])(copyMap|copy|get)(?![\w$])/g)) {
+      const at = scope.span.start + m.index;
+      const name = m[1] as string;
+      if (!inCode(at) || scope.bindings.get(name) !== 'stet' || (scope.brace !== undefined && rebinds(page, scope.brace, name))) continue;
+      if (reads.some((x) => x.at === at) || sentences.some((s) => s.start <= at && at < s.end)) continue;
+      const rest = page.slice(at + name.length);
+      if (/^\s*(?:\?\.\s*)?[[(]/.test(rest) || /^\s*\??\.\s*get\s*\(/.test(rest)) return { refused: undeclared(readText(page, at)) };
+    }
+  }
+
+  // Each read's replacement, serialized for its position.
+  const valueOf = (key: string): unknown => {
+    if (!Object.hasOwn(values, key) || values[key] === undefined) throw new CliError(`eject: no resolved value for key ${key}`);
+    return values[key];
+  };
+  const markupStart = front === null ? 0 : (FRONTMATTER.exec(page) as RegExpExecArray)[0].length;
+  const edits: Edit[] = [];
+  const texts: Array<{ edit: Edit; parts: RestoredPart[] }> = [];
+  const glued = new Map<number, Edit>();
+  let elements = 0;
+  const restoreText = (start: number, end: number, text: string, parts: RestoredPart[]): void => {
+    const edit = { pos: start, end, text };
+    edits.push(edit);
+    texts.push({ edit, parts });
+    // Astro rendered a brace glued to the text or brace beside it across a line break; the text it becomes is glued too (check 3 F9).
+    if (mode === 'jsx' && !inPre(page, start)) for (const run of gluedRuns(page, start, end, markupStart)) glued.set(run.pos, run);
+  };
+  for (const sentence of sentences) {
+    const value = valueOf(sentence.read.key);
+    const built = typeof value === 'string' ? rebuild(page, sentence.renderers, value) : null;
+    if (built === null) return { refused: RICH_UNREADABLE };
+    elements += built.elements;
+    restoreText(sentence.start, sentence.end, built.text, built.parts);
+  }
+  for (const x of reads) {
+    const value = valueOf(x.key);
+    const use = x.scope.brace === undefined ? null : braceUse(r, x.scope.brace, x.at, x.end);
+    if (use?.kind === 'content' && typeof value === 'string') {
+      const text = astroEscape(value, TEXT_SET);
+      restoreText(use.start, use.end, text, [{ offset: 0, text, value }]);
+    } else if (use?.kind === 'attr' && typeof value === 'string' && !use.name.includes(':') && componentName(use.tag) && !value.includes('"') && !value.includes('{')) {
+      // Astro hands a quoted prop to the component as written (check 3 F14).
+      edits.push({ pos: use.start, end: use.end, text: `"${value}"` });
+    } else if (use?.kind === 'attr' && typeof value === 'string' && !componentName(use.tag) && COPY_ATTRS.has(use.name.toLowerCase()) && !value.includes('{')) {
+      edits.push({ pos: use.start, end: use.end, text: `"${astroEscape(value, ATTR_SET)}"` });
+    } else {
+      edits.push({ pos: x.at, end: x.end, text: JSON.stringify(value) });
+    }
+  }
+  edits.push(...glued.values());
+  let mid: string;
+  try {
+    mid = applyFileEdits(page, edits);
+  } catch (error) {
+    if (error instanceof CliError) return { refused: UNREWRITE_UNCLEAN };
+    throw error;
+  }
+  const all = [...edits, ...importRemovals(ts, r, mid, isStet)];
+  // A front matter left holding nothing goes with its fence, as register's own fence came in.
+  if (front !== null) {
+    const fence = markupStart;
+    const inFence = all.filter((e) => e.end <= fence);
+    const body = applyFileEdits(page.slice(0, fence), inFence).replace(/^---[ \t]*/, '').replace(/---[ \t]*$/, '');
+    if (inFence.length > 0 && body.trim() === '') {
+      const eol = /^\r?\n/.exec(page.slice(fence))?.[0] ?? '';
+      all.splice(0, all.length, ...all.filter((e) => e.end > fence), { pos: 0, end: fence + eol.length, text: '' });
+    }
+  }
+  const finalEdits = all.map((e) => ({ ...e, pos: e.pos + r.bom, end: e.end + r.bom }));
+  const after = applyFileEdits(source, finalEdits);
+  // Each restored text's offset in the edited file: its edit moved by every edit before it.
+  const restored = texts.flatMap(({ edit, parts }) => {
+    const shift = all.filter((e) => e !== edit && e.end <= edit.pos).reduce((sum, e) => sum + e.text.length - (e.end - e.pos), 0);
+    return parts.map((p) => ({ at: r.bom + edit.pos + shift + p.offset, text: p.text, value: p.value }));
+  });
+  const names = new Set([...READ_NAMES].filter((name) => frontBindings.get(name) === 'stet'));
+  if (rich === 'stet') names.add('richParts');
+  if (!unrewrittenClean(ts, file, source, after, restored, { elements, names })) return { refused: UNREWRITE_UNCLEAN };
+  return { edited: after, edits: finalEdits, reads: reads.length + sentences.length };
+}
+
+/** Whether a brace binds `name` itself: by its tree, or by the word where it does not parse. */
+function rebinds(page: string, brace: Brace, name: string): boolean {
+  return brace.binds === null ? new RegExp(`(?<![\\w$])${name}(?![\\w$])`).test(page.slice(brace.start, brace.end)) : brace.binds.has(name);
+}
+
+/** A read's source text, for the refusal: its name, any `.get`, and the bracketed part that follows. */
+function readText(page: string, at: number): string {
+  const head = /^(?:copyMap|copy|get)(?:\s*\??\.\s*get)?\s*(?:\?\.\s*)?/.exec(page.slice(at))?.[0] ?? '';
+  let i = at + head.length;
+  if (page.charAt(i) !== '(' && page.charAt(i) !== '[') return page.slice(at, at + head.trimEnd().length);
+  let depth = 0;
+  let quote: string | null = null;
+  for (; i < page.length; i++) {
+    const ch = page.charAt(i);
+    if (quote !== null) {
+      if (ch === '\\') i += 1;
+      else if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'" || ch === '`') quote = ch;
+    else if ('([{'.includes(ch)) depth += 1;
+    else if (')]}'.includes(ch) && --depth === 0) return page.slice(at, i + 1);
+  }
+  return page.slice(at);
+}
+
+/**
+ * Where the brace around a read sits, where the read is its whole content:
+ * element content, or an attribute's value (its name and the tag's source
+ * name). A brace nested inside another brace's markup is placed by that
+ * markup's own tags. Null where the read is not a brace's whole content, or
+ * the brace is code.
+ */
+type BracePlace = ({ kind: 'content' } | { kind: 'attr'; name: string; tag: string }) & Span;
+
+function braceUse(r: Reading, top: Brace, at: number, end: number): BracePlace | null {
+  const { page } = r;
+  let lb = at;
+  while (lb > top.start && /\s/.test(page.charAt(lb - 1))) lb -= 1;
+  lb -= 1;
+  let rb = end;
+  while (rb < top.end && /\s/.test(page.charAt(rb))) rb += 1;
+  if (page.charAt(lb) !== '{' || page.charAt(rb) !== '}' || closing(page, lb, '}') !== rb + 1) return null;
+  return bracePlace(r, top, { start: lb, end: rb + 1 });
+}
+
+/** Where a brace sits: `top` itself or a brace inside its markup, as element content or an attribute's value; null where it is code. */
+function bracePlace(r: Reading, top: Brace, span: Span): BracePlace | null {
+  const { page } = r;
+  const lb = span.start;
+  if (lb === top.start) {
+    if (!top.inTag) return { kind: 'content', ...span };
+    const attr = braceContext(r, top).attr;
+    return attr === undefined ? null : { kind: 'attr', name: attr.name, tag: attr.tag, ...span };
+  }
+  if (page.charAt(lb - 1) === '$') return null;
+  const inner = top.start + 1;
+  const tags = markupTags(r.blanked.slice(inner, top.end - 1));
+  const holder = tags.find((t) => !t.close && inner + t.start < lb && lb < inner + t.end);
+  if (holder !== undefined) {
+    const spelled = /([^\s"'=<>/{}]+)\s*=\s*$/.exec(page.slice(inner + holder.start, lb))?.[1];
+    return spelled === undefined ? null : { kind: 'attr', name: spelled, tag: holder.name, ...span };
+  }
+  const open: string[] = [];
+  for (const tag of tags.filter((t) => inner + t.end <= lb)) {
+    if (tag.close) {
+      const i = open.lastIndexOf(tag.name);
+      if (i >= 0) open.length = i;
+    } else if (!tag.selfClosing && !VOID_ELEMENTS.has(tag.name.toLowerCase())) {
+      open.push(tag.name);
+    }
+  }
+  return open.length > 0 ? { kind: 'content', ...span } : null;
+}
+
+/** Whether `at` sits inside a `<pre>`, whose white space Astro keeps in every mode. */
+function inPre(page: string, at: number): boolean {
+  const before = page.slice(0, at);
+  return (before.match(/<pre\b[^>]*>/gi)?.length ?? 0) > (before.match(/<\/pre\s*>/gi)?.length ?? 0);
+}
+
+/** The white space holding a line break between a restored brace and the text or brace beside it, which Astro's `"jsx"` mode rendered as nothing. */
+function gluedRuns(page: string, start: number, end: number, markupStart: number): Edit[] {
+  const out: Edit[] = [];
+  let before = start;
+  while (before > markupStart && /\s/.test(page.charAt(before - 1))) before -= 1;
+  if (before > markupStart && /[\r\n]/.test(page.slice(before, start)) && page.charAt(before - 1) !== '>') out.push({ pos: before, end: start, text: '' });
+  let after = end;
+  while (after < page.length && /\s/.test(page.charAt(after))) after += 1;
+  if (after < page.length && /[\r\n]/.test(page.slice(end, after)) && page.charAt(after) !== '<') out.push({ pos: end, end: after, text: '' });
+  return out;
+}
+
+/**
+ * A content brace holding `richParts(READ, [renderers])` in the shape D16
+ * writes, read textually: white space (line breaks included) between any two
+ * tokens and one trailing comma before `]` or `)`, so a call a formatter or a
+ * person wrapped reads back (check 3 F8). Each renderer is strict: `(c) => `,
+ * an optional parenthesis, an open tag that does not name `c`, exactly `{c}`
+ * with nothing beside it but white space holding a line break under the
+ * `"jsx"` mode (check 4 K5), and the close tag of the same name. Null where any
+ * token is out of shape.
+ */
+function richReadOf(page: string, start: number, end: number, mode: 'jsx' | 'true' | 'false'): { read: Omit<UnRead, 'scope'> & { name: string }; renderers: RichRenderer[] } | null {
+  let i = start + 1;
+  const ws = (): string => {
+    const from = i;
+    while (i < end && /\s/.test(page.charAt(i))) i += 1;
+    return page.slice(from, i);
+  };
+  const take = (token: string): boolean => {
+    if (!page.startsWith(token, i)) return false;
+    i += token.length;
+    return true;
+  };
+  const ident = (): string | null => {
+    const m = /^[A-Za-z_$][\w$]*/.exec(page.slice(i, end));
+    if (m === null) return null;
+    i += m[0].length;
+    return m[0];
+  };
+  const gap = (): boolean => {
+    const run = ws();
+    return run === '' || (mode === 'jsx' && /[\r\n]/.test(run));
+  };
+  ws();
+  if (!take('richParts')) return null;
+  ws();
+  if (!take('(')) return null;
+  ws();
+  const sticky = new RegExp(KEY_READ.source, 'y');
+  sticky.lastIndex = i;
+  const m = sticky.exec(page);
+  if (m === null || m[5] === 'get') return null;
+  const at = i;
+  i += m[0].length;
+  if (m[2] !== undefined || m[4] !== undefined) {
+    ws();
+    if (!take(')')) return null;
+  }
+  const read = { at, end: i, key: (m[2] ?? m[4] ?? m[5]) as string, name: /^(copyMap|copy|get)/.exec(m[0])?.[1] as string };
+  ws();
+  if (!take(',')) return null;
+  ws();
+  if (!take('[')) return null;
+  const renderers: RichRenderer[] = [];
+  for (;;) {
+    ws();
+    if (take(']')) break;
+    let param: string | null;
+    if (take('(')) {
+      ws();
+      param = ident();
+      ws();
+      if (!take(')')) return null;
+    } else {
+      param = ident();
+    }
+    if (param === null) return null;
+    ws();
+    if (!take('=>')) return null;
+    ws();
+    const wrapped = take('(');
+    if (wrapped) ws();
+    if (page.charAt(i) !== '<' || !/[A-Za-z]/.test(page.charAt(i + 1))) return null;
+    const tag = openTag(page, i);
+    const opened = page.slice(i, tag.end);
+    const spelled = /^<([A-Za-z][\w:.-]*)/.exec(opened)?.[1] as string;
+    if (tag.selfClosing || tag.end > end || !opened.endsWith('>') || new RegExp(`(?<![\\w$])${param.replace(/\$/g, '\\$')}(?![\\w$])`).test(opened)) return null;
+    const open = { start: i, end: tag.end };
+    i = tag.end;
+    if (!gap() || !take(`{${param}}`) || !gap()) return null;
+    const shut = new RegExp(`^</${escapeRegExp(spelled)}\\s*>`).exec(page.slice(i, end));
+    if (shut === null) return null;
+    renderers.push({ open, close: { start: i, end: i + shut[0].length } });
+    i += shut[0].length;
+    if (wrapped) {
+      ws();
+      if (!take(')')) return null;
+    }
+    ws();
+    if (take(',')) continue;
+    if (take(']')) break;
+    return null;
+  }
+  ws();
+  take(',');
+  ws();
+  if (!take(')')) return null;
+  ws();
+  return i === end - 1 && page.charAt(i) === '}' ? { read, renderers } : null;
+}
+
+/** A sentence key's markup from its value's placeholder tree: each text Astro text, each element its renderer's tags around its children. Null where the tag reader refuses the value. */
+function rebuild(page: string, renderers: RichRenderer[], value: string): { text: string; parts: RestoredPart[]; elements: number } | null {
+  const tree = tagTree(value, renderers.length);
+  if ('fault' in tree) return null;
+  let text = '';
+  const parts: RestoredPart[] = [];
+  let elements = 0;
+  const walk = (nodes: TagNode[]): void => {
+    for (const node of nodes) {
+      if (typeof node === 'string') {
+        const escaped = astroEscape(node, TEXT_SET);
+        parts.push({ offset: text.length, text: escaped, value: node });
+        text += escaped;
+        continue;
+      }
+      const renderer = renderers[node.n - 1] as RichRenderer;
+      text += page.slice(renderer.open.start, renderer.open.end);
+      elements += 1;
+      walk(node.children);
+      text += page.slice(renderer.close.start, renderer.close.end);
+    }
+  };
+  walk(tree);
+  return { text, parts, elements };
+}
+
+/**
+ * The removals of the front matter's stet imports nothing in `mid` (the file
+ * with its reads restored) mentions any longer: a declaration whose named
+ * bindings are only stet's names goes whole, the exact inverse of register's
+ * insertion (check 3 F23); one that also binds other names loses only the
+ * unused ones. Offsets are the original's, outside every read's edit.
+ */
+function importRemovals(ts: typeof import('typescript'), r: Reading, mid: string, isStet: (spec: string) => boolean): Edit[] {
+  const { page, front } = r;
+  if (front === null) return [];
+  const used = mentioned(ts, r.file, mid);
+  const out: Edit[] = [];
+  const whole: Span[] = [];
+  for (const s of front.sf.statements) {
+    if (!ts.isImportDeclaration(s) || !ts.isStringLiteral(s.moduleSpecifier) || !isStet(s.moduleSpecifier.text)) continue;
+    const clause = s.importClause;
+    const named = clause?.namedBindings;
+    if (clause === undefined || clause.isTypeOnly || named === undefined || !ts.isNamedImports(named)) continue;
+    const gone = named.elements.filter((el) => STET_NAMES.has(el.name.text) && !used.has(el.name.text));
+    if (gone.length === 0) continue;
+    if (gone.length === named.elements.length) {
+      if (clause.name === undefined) whole.push({ start: front.open + s.getStart(front.sf), end: front.open + s.end });
+      else out.push({ pos: front.open + clause.name.end, end: front.open + named.end, text: '' });
+      continue;
+    }
+    // Each run of unused names goes with the comma before the next kept one, or after the last kept one.
+    const els = named.elements;
+    for (let i = 0; i < els.length; i++) {
+      if (!gone.includes(els[i] as TS.ImportSpecifier)) continue;
+      let j = i;
+      while (j + 1 < els.length && gone.includes(els[j + 1] as TS.ImportSpecifier)) j += 1;
+      const next = els[j + 1];
+      const prev = els[i - 1];
+      out.push(
+        next !== undefined
+          ? { pos: front.open + (els[i] as TS.ImportSpecifier).getStart(front.sf), end: front.open + next.getStart(front.sf), text: '' }
+          : { pos: front.open + (prev as TS.ImportSpecifier).end, end: front.open + (els[j] as TS.ImportSpecifier).end, text: '' },
+      );
+      i = j;
+    }
+  }
+  // Declarations with only white space between them go as one run, as register inserts its two together.
+  const runs: Span[] = [];
+  for (const span of whole) {
+    const last = runs.at(-1);
+    if (last !== undefined && page.slice(last.end, span.start).trim() === '') last.end = span.end;
+    else runs.push({ ...span });
+  }
+  for (const { start, end } of runs) {
+    const lineStart = page.lastIndexOf('\n', start - 1) + 1;
+    const startsLine = /^[ \t]*$/.test(page.slice(lineStart, start));
+    const eol = /^[ \t]*(?:\r?\n|$)/.exec(page.slice(end))?.[0];
+    if (startsLine && eol !== undefined) {
+      out.push({ pos: lineStart, end: end + eol.length, text: '' });
+      continue;
+    }
+    // Something shares its line: the line break before it goes with it, which register's insertion added, unless the line above ends in a comment.
+    const lineBreak = page.charAt(lineStart - 2) === '\r' ? 2 : 1;
+    if (startsLine && lineStart - lineBreak > front.open && !within(r.code.nonCode, lineStart - lineBreak - 1)) {
+      out.push({ pos: lineStart - lineBreak, end, text: '' });
+    } else {
+      let from = start;
+      while (from > lineStart && /[ \t]/.test(page.charAt(from - 1))) from -= 1;
+      out.push({ pos: from, end, text: '' });
+    }
+  }
+  return out;
+}
+
+/** Which of stet's names `text`'s front matter (outside its imports) and markup braces still mention. */
+function mentioned(ts: typeof import('typescript'), file: string, text: string): Set<string> {
+  const found = new Set<string>();
+  const fm = FRONTMATTER.exec(text);
+  const sf = fm === null ? null : ts.createSourceFile(`${file}.ts`, text.slice(fm[0].indexOf('\n') + 1, fm[0].lastIndexOf('\n')), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const braces = dialectCode(text, 'astro').braces.map((b) => text.slice(b.start, b.end).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, ''));
+  for (const name of STET_NAMES) {
+    const word = new RegExp(`(?<![\\w$])${name}(?![\\w$])`);
+    if ((sf !== null && refsTo(ts, sf, name).length > 0) || braces.some((b) => word.test(b))) found.add(name);
+  }
+  return found;
+}
+
+/**
+ * Whether an un-rewritten Astro file reads back: its front matter parses, its
+ * markup pairs with the elements the rich rebuilds restore added, every brace
+ * parses as one expression, no read through a name stet's binding gave the
+ * original (and no `richParts` call, and no import of stet) remains in its code,
+ * and each restored text decodes to its value on its own span (D15 check 5,
+ * check 3 F2). `restored` offsets are into `after`.
+ */
+export function unrewrittenClean(
+  ts: typeof import('typescript'),
+  file: string,
+  before: string,
+  after: string,
+  restored: Array<{ at: number; text: string; value: string }>,
+  expected: { elements: number; names: ReadonlySet<string> },
+): boolean {
+  const ab = after.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const b = before.slice(before.charCodeAt(0) === 0xfeff ? 1 : 0);
+  const a = after.slice(ab);
+  // 1. The front matter parses.
+  const fm = FRONTMATTER.exec(a);
+  const front = fm === null ? null : ts.createSourceFile(`${file}.ts`, a.slice(fm[0].indexOf('\n') + 1, fm[0].lastIndexOf('\n')), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  if (front !== null && parseDiagnosticsOf(front).length > 0) return false;
+  // 2. The markup pairs, with the elements the rebuilds restored added.
+  const count = (text: string): number | null => {
+    try {
+      const document = documentOf(file, text);
+      const all = (els: readonly Element[]): number => els.reduce((n, el) => n + 1 + all(el.children), 0);
+      return document === null ? null : all(document.roots);
+    } catch (error) {
+      if (error instanceof RangeError) return null;
+      throw error;
+    }
+  };
+  const elementsBefore = count(b);
+  const elementsAfter = count(a);
+  if (elementsBefore === null || elementsAfter !== elementsBefore + expected.elements) return false;
+  // 3. Every brace parses as one expression.
+  const code = dialectCode(a, 'astro');
+  if (!code.braces.every((brace) => parsesAsExpression(ts, 'astro', a.slice(brace.start, brace.end)))) return false;
+  // 4. No read through stet's names, no renderer call and no stet import remains outside the client scripts.
+  const nonCode = (codeOf(ts, file, a, 'astro') as FileCode).nonCode;
+  const spans = [...code.scripts.filter((s) => s.own !== true), ...code.expressions];
+  for (const span of spans) {
+    for (const m of a.slice(span.start, span.end).matchAll(KEY_READ)) {
+      const at = span.start + m.index;
+      if (!within(nonCode, at) && !/[\w$.]/.test(a.charAt(at - 1)) && expected.names.has(/^(copyMap|copy|get)/.exec(m[0])?.[1] as string)) return false;
+    }
+    if (expected.names.has('richParts') && [...a.slice(span.start, span.end).matchAll(/(?<![\w$.])richParts\s*\(/g)].some((m) => !within(nonCode, span.start + m.index))) return false;
+  }
+  if (front?.statements.some((s) => ts.isImportDeclaration(s) && ts.isStringLiteral(s.moduleSpecifier) && /^@getstet\/stet(?:\/|$)/.test(s.moduleSpecifier.text))) return false;
+  // 5. Each restored text reads back as its value, on its own span.
+  return restored.every((x) => decodeEntities(after.slice(x.at, x.at + x.text.length)) === x.value);
 }

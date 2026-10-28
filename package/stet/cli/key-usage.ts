@@ -1419,7 +1419,13 @@ function classifyUse(ctx: WalkContext, scope: Scope, tree: Tree, use: TS.Express
       return [asValue(out)];
     }
   }
-  if (ts.isJsxExpression(p) && ts.isJsxAttribute(p.parent)) return [asValue(read(p.parent, []))];
+  if (ts.isJsxExpression(p) && ts.isJsxAttribute(p.parent)) {
+    const out = asValue(read(p.parent, []));
+    // The JSX twin of exemptCallee: a prop handed to an element bound to a stet import (the provider's `resolved`).
+    const tag = p.parent.parent.parent.tagName;
+    if (ts.isIdentifier(tag) && scope.imports.some((i) => i.local === tag.text && isStetPackage(i.spec))) out.exemptArg = true;
+    return [out];
+  }
   return [asValue(read(p, []))];
 }
 
