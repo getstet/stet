@@ -51,13 +51,13 @@
     window.parent.postMessage(message, parentOrigin);
   };
 
-  /** A node's text as typed: its text nodes in order, each `<br>` a newline. */
-  function textWithBreaks(node) {
+  /** A node's text as typed: its text nodes in order, each read by `read` where given, and each `<br>` a newline. */
+  function textWithBreaks(node, read) {
     var out = '';
     for (var c = node.firstChild; c; c = c.nextSibling) {
-      if (c.nodeType === 3) out += c.data;
+      if (c.nodeType === 3) out += read ? read(c) : c.data;
       else if (c.nodeType === 1 && c.tagName === 'BR') out += '\n';
-      else if (c.nodeType === 1) out += textWithBreaks(c);
+      else if (c.nodeType === 1) out += textWithBreaks(c, read);
     }
     return out;
   }
@@ -520,7 +520,7 @@
     var by = found.by;
     // A draft mapped piece by piece: one line per hit, else the whole draft.
     var pieces = found.pieces;
-    // A key that declares numbered placeholder tags maps its draft onto the marked element's structure.
+    // A key that declares numbered placeholder tags maps its draft onto the structure of the element it fills.
     var tagged = typeof request.tags === 'number';
     var mapped = draft !== null && !found.unmapped;
     // Text found inside more text is always a guess; a whole-text match is one until a save confirms it;
@@ -535,11 +535,12 @@
       }
       var piece = pieces !== null ? pieces[hit.index] : draft;
       if (!mapped || touchesEdit(hit.el) || painted.indexOf(hit) === -1) return;
-      // A tagged draft maps only onto the element its key is marked on; text found inside more text waits for Save.
+      // A tagged draft maps only onto a whole element, the one its key is marked on or a sentence key fills (D16);
+      // text found inside more text waits for Save.
       var done = hit.pattern
         ? !tagged && draftContained(hit, piece, swapped)
         : tagged
-          ? by === 'mark' && hit.attr === null && draftTagged(hit.el, piece, swapped)
+          ? wholeElement(hit) && draftTagged(hit.el, piece, swapped)
           : draftInto(hit, piece, swapped);
       if (!done) mapped = false;
     });
@@ -587,6 +588,11 @@
     });
   }
 
+  /** Whether a hit of `find`'s is an element's whole text: a mark on its text, or an element whose whole text matched. */
+  function wholeElement(hit) {
+    return hit.attr === null && !hit.node;
+  }
+
   /** Whether a swap in `list` stands on the hit's node or attribute. */
   function held(hit, list) {
     return list.some(function (s) { return hit.node ? s.node === hit.node : !s.node && s.el === hit.el && s.attr === hit.attr; });
@@ -612,7 +618,7 @@
         if (touchesEdit(hit.el) || held(hit, swapped)) return;
         var piece = found.pieces !== null ? found.pieces[hit.index] : d.draft;
         if (hit.pattern) { if (!tagged) draftContained(hit, piece, layered); }
-        else if (tagged) { if (found.by === 'mark' && hit.attr === null) draftTagged(hit.el, piece, layered); }
+        else if (tagged) { if (wholeElement(hit)) draftTagged(hit.el, piece, layered); }
         else draftInto(hit, piece, layered);
       });
     });
@@ -635,6 +641,7 @@
     ['twitter:description', 'meta[name="twitter:description"],meta[property="twitter:description"]'],
   ];
   var payload = null; // the last census payload's keys (`censusKeys`)
+  var taggedKeys = new Set(); // the payload's keys that declare numbered placeholder tags: sentence keys, typed by their element
   var reads = null;   // the open route's reads from the dashboard: { route, keys: Set, renders: Map or null, coincident: Set }, or null where it cannot tell
   var index = null;   // the matchers over `payload`, rebuilt when the payload or the reads that apply change (`buildIndex`)
   var hits = new Map(); // element → [{ key, attr, by, node?, entry?, weak? }], what hover and click read
@@ -924,11 +931,16 @@
       body.querySelectorAll('br').forEach(function (br) {
         for (var up = br.parentElement; up && !withBreaks.has(up); up = up.parentElement) withBreaks.add(up);
       });
+      // An element holding a node this script swapped is read as the page holds it, so a sentence key showing its draft is still found there.
+      var holdsSwap = new Set();
+      swapped.concat(layered).forEach(function (s) {
+        for (var up = s.node ? s.node.parentElement : null; up && !holdsSwap.has(up); up = up.parentElement) holdsSwap.add(up);
+      });
       var all = body.querySelectorAll('*');
       for (var i = all.length - 1; i >= 0; i -= 1) {
         var el = all[i];
         if (SKIP[el.tagName] || el.firstElementChild === null) continue;
-        var text = norm(withBreaks.has(el) ? textWithBreaks(el) : el.textContent);
+        var text = norm(withBreaks.has(el) || holdsSwap.has(el) ? textWithBreaks(el, page.text) : el.textContent);
         noteLine(text, el);
         var list = whole.get(text);
         if (list === undefined) continue;
@@ -1042,11 +1054,21 @@
     return null;
   }
 
-  /** Whether a hit can be typed in place: the text of a visible HTML element whose only words are the key's, or a marked element. */
+  /**
+   * Whether a hit can be typed in place: the text of a visible HTML element
+   * whose only words are the key's, a marked element, or the element a
+   * sentence key's words fill (a key the census marked tagged, D16).
+   */
   function inplaceHit(el, hit) {
     if (hit.attr !== null || !(el instanceof HTMLElement) || el.closest('svg') || !document.body.contains(el)) return false;
     if (hit.by === 'mark') return true;
+    if (hit.by === 'element') return taggedKeys.has(hit.key);
     return hit.by === 'whole' && inplaceable(el, hit.node);
+  }
+
+  /** The form a hit is typed in: the runs form on a mark, the sentence form on a sentence key's element, else the in-place form. */
+  function formOf(hit) {
+    return hit.by === 'mark' ? 'runs' : hit.by === 'element' ? 'sentence' : 'inplace';
   }
 
   /** The hits on an element as a message lists them, one per key, attribute and entry. */
@@ -1334,8 +1356,8 @@
     return out.replace(ASCII_SPACE, ' ').trim();
   }
 
-  function editListeners(el, method) {
-    el[method]('beforeinput', onBeforeInput);
+  function editListeners(el, method, form) {
+    el[method]('beforeinput', form === 'sentence' ? onSentenceBeforeInput : onBeforeInput);
     el[method]('input', onInput);
     el[method]('compositionstart', onCompositionStart);
     el[method]('compositionend', onCompositionEnd);
@@ -1414,9 +1436,7 @@
    */
   function startRuns(el, key, locale, entry, oneLine) {
     var word = wordIn(el);
-    var nodes = [];
-    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-    for (var node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node);
+    var nodes = textNodesOf(el);
     var islands = nodes.map(function (n) {
       var island = document.createElement('span');
       island.setAttribute('contenteditable', 'plaintext-only');
@@ -1453,6 +1473,14 @@
     getSelection().addRange(range);
   }
 
+  /** Every text node under `el`, in document order. */
+  function textNodesOf(el) {
+    var nodes = [];
+    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (var node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node);
+    return nodes;
+  }
+
   /** The page's non-collapsed selection when it lies inside one text node of `el`: that node and the offsets. Null otherwise. */
   function wordIn(el) {
     var selection = getSelection();
@@ -1461,6 +1489,271 @@
     var node = range.startContainer;
     if (node !== range.endContainer || node.nodeType !== 3 || !el.contains(node)) return null;
     return { node: node, start: range.startOffset, end: range.endOffset };
+  }
+
+  // ---- The sentence form (D18): a sentence key typed with no page node moved ----
+
+  // The kinds an input method fires while it composes (WebKit commits through the last two): the browser applies them.
+  var COMPOSING = ['insertCompositionText', 'deleteCompositionText', 'insertFromComposition', 'deleteByComposition'];
+  var INSERTS = ['insertText', 'insertReplacementText', 'insertFromPaste', 'insertFromDrop', 'insertFromYank'];
+  // Each delete kind and what it removes from a collapsed caret; the empty ones remove only a selection.
+  var DELETES = {
+    deleteContentBackward: 'grapheme-', deleteContentForward: 'grapheme+',
+    deleteWordBackward: 'word-', deleteWordForward: 'word+',
+    deleteSoftLineBackward: 'line-', deleteSoftLineForward: 'line+',
+    deleteByCut: '', deleteContent: '',
+  };
+  var LINE_BREAKS = /(?:\r\n|\n|\r)+/g;
+  // src/placeholder.ts PLACEHOLDER: `<1>`, `</1>` and `<1/>` are the only tags a value carries.
+  var PLACEHOLDER = /<(\/?)(\d+)(\/?)>/g;
+  function placeholders(text) { return (text.match(PLACEHOLDER) || []).length; }
+  var segmenter = function (granularity) {
+    return typeof Intl === 'object' && typeof Intl.Segmenter === 'function' ? new Intl.Segmenter(undefined, { granularity: granularity }) : null;
+  };
+  var GRAPHEMES = segmenter('grapheme');
+  var WORDS = segmenter('word');
+
+  /**
+   * The sentence form (D16's sentence keys on a JavaScript host): the element
+   * itself is editable, the browser performs no edit, and every edit the editor
+   * makes is cancelled at `beforeinput` and applied by the agent to one held
+   * text node's data. No node is created, moved or removed, so a framework's
+   * later commit finds every node where it left it. A mutation the agent did
+   * not make means the framework re-rendered: the edit ends `interrupted`,
+   * and the typed value stays as an unsaved draft.
+   */
+  function startSentence(el, key, locale, entry) {
+    var held = textNodesOf(el);
+    var wrote = new Map();
+    held.forEach(function (node) { wrote.set(node, node.data); });
+    edit = {
+      form: 'sentence', key: key, locale: locale, entry: entry, el: el,
+      held: held,
+      parents: held.map(function (node) { return node.parentNode; }),
+      wrote: wrote, original: new Map(wrote),
+      value: taggedValue(el), proposed: false, composing: false, composedInto: null,
+      observer: new MutationObserver(onSentenceMutation),
+    };
+    edit.observer.observe(el, { childList: true, characterData: true, subtree: true, characterDataOldValue: false });
+    el.setAttribute('contenteditable', 'plaintext-only');
+    el.setAttribute('spellcheck', 'false');
+    editListeners(el, 'addEventListener', 'sentence');
+    document.addEventListener('selectionchange', normalizeCaret);
+    // A double click's word stays selected: no node moved, so the page's range still stands.
+    var word = selectedIn(el) === null ? null : getSelection().getRangeAt(0).cloneRange();
+    window.focus();
+    el.focus();
+    if (word === null) caretAt(el);
+    else {
+      getSelection().removeAllRanges();
+      getSelection().addRange(word);
+    }
+    normalizeCaret();
+  }
+
+  /**
+   * The selection kept inside one run while a sentence is typed, on every
+   * `selectionchange` and after every edit: one whose anchor and focus are not
+   * in the same held node collapses to its focus, and a caret in no held node
+   * moves into the last held node that ends at or before it, at its end, else
+   * into the first, at its start. So no edit can cross an element boundary. A
+   * selection reaching outside the element is left alone (focus leaving ends the edit).
+   */
+  function normalizeCaret() {
+    if (edit === null || edit.form !== 'sentence') return;
+    var selection = getSelection();
+    var el = edit.el;
+    if (selection === null || selection.rangeCount === 0 || !el.contains(selection.anchorNode) || !el.contains(selection.focusNode)) return;
+    var node = selection.focusNode;
+    var offset = selection.focusOffset;
+    var inside = edit.held.filter(function (n) { return el.contains(n); });
+    if (inside.indexOf(node) !== -1) {
+      if (selection.anchorNode !== node) selection.collapse(node, offset);
+      return;
+    }
+    if (inside.length === 0) return;
+    var point = document.createRange();
+    point.setStart(node, offset);
+    var before = inside.filter(function (n) { return point.comparePoint(n, n.length) <= 0; });
+    if (before.length > 0) selection.collapse(before[before.length - 1], before[before.length - 1].length);
+    else selection.collapse(inside[0], 0);
+  }
+
+  /**
+   * Whether `records` hold a change the agent did not make. Its own is a
+   * `characterData` record on a held node that still holds what it wrote;
+   * while an input method composes, one on a held node is the method's, and
+   * the node composed into is noted (`false` once a second node is). Anything
+   * else is foreign: a node added or removed anywhere under the element, a text
+   * that is not held, a held text neither written nor composed.
+   */
+  function foreign(e, records) {
+    for (var i = 0; i < records.length; i += 1) {
+      var record = records[i];
+      if (record.type === 'characterData' && e.wrote.has(record.target)) {
+        if (record.target.data === e.wrote.get(record.target)) continue;
+        if (e.composing) {
+          e.composedInto = e.composedInto === null || e.composedInto === record.target ? record.target : false;
+          continue;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+  function onSentenceMutation(records) {
+    if (edit !== null && edit.form === 'sentence' && foreign(edit, records)) end('interrupted');
+  }
+  /** The records the sentence's observer holds, judged now, so a page write is seen before the agent writes over it (K13); whether the edit is still open. */
+  function judged() {
+    var open = edit;
+    onSentenceMutation(open.observer.takeRecords());
+    return edit === open;
+  }
+
+  /** The held run the selection's focus stands in, or null. */
+  function focusRun() {
+    var selection = getSelection();
+    var node = selection !== null && selection.rangeCount > 0 ? selection.focusNode : null;
+    return edit.held.indexOf(node) === -1 ? null : node;
+  }
+  /** The selection's offsets in `node` where the selection lies wholly in it, collapsed or not; null where it reaches another node. */
+  function selectionIn(node) {
+    var selection = getSelection();
+    if (selection.anchorNode !== node || selection.focusNode !== node) return null;
+    return [Math.min(selection.anchorOffset, selection.focusOffset), Math.max(selection.anchorOffset, selection.focusOffset)];
+  }
+  /**
+   * The event's first target range where it starts and ends in `node`, so iOS
+   * autocorrect's word replacement lands; null otherwise. Chrome gives none
+   * under `plaintext-only`, and Firefox and Safari give Backspace at a run's
+   * start a range in the run before, which is never applied (K1).
+   */
+  function targetIn(event, node) {
+    var ranges = typeof event.getTargetRanges === 'function' ? event.getTargetRanges() : [];
+    var range = ranges.length > 0 ? ranges[0] : null;
+    return range !== null && range.startContainer === node && range.endContainer === node ? [range.startOffset, range.endOffset] : null;
+  }
+
+  /**
+   * Every edit in the sentence form: an input method's composition is the
+   * browser's to apply and is judged at `compositionend`; every other kind is
+   * cancelled and applied by the agent inside the focus node alone, through
+   * the target range where it lies in that node, else the selection. A line
+   * break, a paragraph, undo, redo and every format kind do nothing (Enter
+   * ends the edit, Escape cancels it).
+   */
+  function onSentenceBeforeInput(event) {
+    if (edit === null) return;
+    if (!judged()) { event.preventDefault(); return; }
+    var type = event.inputType;
+    if (COMPOSING.indexOf(type) !== -1) {
+      // Safari may deliver `insertFromComposition` after `compositionend`: the method's write is then judged
+      // in a task of its own, once the browser has made it.
+      var late = !edit.composing;
+      edit.composing = true;
+      if (late) {
+        var open = edit;
+        setTimeout(function () { if (edit === open) sentenceComposed(); }, 0);
+      }
+      return;
+    }
+    event.preventDefault();
+    if (INSERTS.indexOf(type) !== -1) {
+      var text = typeof event.data === 'string' ? event.data : event.dataTransfer ? event.dataTransfer.getData('text/plain') : '';
+      sentenceInsert(event, text, type === 'insertReplacementText');
+    } else if (Object.prototype.hasOwnProperty.call(DELETES, type)) {
+      var node = focusRun();
+      var span = node === null ? null : targetIn(event, node) || selectionIn(node);
+      if (span !== null && span[0] === span[1]) span = collapsedDelete(node.data, span[0], DELETES[type]);
+      if (span !== null) writeRun(node, span[0], span[1], '');
+    }
+  }
+
+  /**
+   * `text` typed in the focus node, every run of line breaks one space: over
+   * the event's target range where it lies in that node, else over the
+   * selection; with `rangeOnly` (`insertReplacementText`), over a target range alone.
+   */
+  function sentenceInsert(event, text, rangeOnly) {
+    var node = focusRun();
+    if (node === null) return;
+    var target = event === null ? null : targetIn(event, node);
+    var span = target !== null ? target : rangeOnly ? null : selectionIn(node);
+    if (span !== null) writeRun(node, span[0], span[1], String(text).replace(LINE_BREAKS, ' '));
+  }
+
+  /**
+   * What a delete removes from a collapsed caret at `at` in a run's `data`:
+   * one grapheme (an emoji or a combining mark goes whole), back or on to the
+   * next word with the spaces before it, or to the run's edge; null for nothing.
+   */
+  function collapsedDelete(data, at, how) {
+    if (how === 'line-') return at > 0 ? [0, at] : null;
+    if (how === 'line+') return at < data.length ? [at, data.length] : null;
+    if (how === 'grapheme-' || how === 'grapheme+') {
+      var back = how === 'grapheme-';
+      if (back ? at === 0 : at === data.length) return null;
+      if (GRAPHEMES === null) {
+        var pair = back ? /[\uDC00-\uDFFF]/.test(data[at - 1]) && at > 1 : /[\uD800-\uDBFF]/.test(data[at]) && at < data.length - 1;
+        return back ? [at - (pair ? 2 : 1), at] : [at, at + (pair ? 2 : 1)];
+      }
+      var segment = GRAPHEMES.segment(data).containing(back ? at - 1 : at);
+      return back ? [segment.index, at] : [at, segment.index + segment.segment.length];
+    }
+    if (how !== 'word-' && how !== 'word+') return null;
+    var pieces = WORDS === null
+      ? (data.match(/[\p{L}\p{N}]+|[^\p{L}\p{N}]+/gu) || []).reduce(function (out, piece) {
+        var from = out.length > 0 ? out[out.length - 1].to : 0;
+        return out.concat([{ from: from, to: from + piece.length, word: /[\p{L}\p{N}]/u.test(piece) }]);
+      }, [])
+      : Array.from(WORDS.segment(data)).map(function (s) { return { from: s.index, to: s.index + s.segment.length, word: s.isWordLike === true }; });
+    if (how === 'word-') {
+      var i = pieces.length - 1;
+      while (i >= 0 && pieces[i].from >= at) i -= 1;
+      while (i > 0 && !pieces[i].word) i -= 1;
+      return i >= 0 ? [pieces[i].from, at] : null;
+    }
+    var j = 0;
+    while (j < pieces.length && pieces[j].to <= at) j += 1;
+    while (j < pieces.length - 1 && !pieces[j].word) j += 1;
+    return j < pieces.length ? [at, pieces[j].to] : null;
+  }
+
+  /**
+   * One edit applied to one held run: its text from `start` to `end` becomes
+   * `text`, unless that would leave the run empty (the field can empty it; in
+   * the page a run keeps a character, so the browser never drops its node). The
+   * caret lands after the text, and the new value is proposed.
+   */
+  function writeRun(node, start, end, text) {
+    var data = node.data.slice(0, start) + text + node.data.slice(end);
+    if (data === '' || data === node.data) return;
+    // The sentence form never lets a placeholder tag be typed; any other `<` is prose.
+    if (placeholders(data) > placeholders(node.data)) return;
+    node.data = data;
+    edit.wrote.set(node, node.data);
+    getSelection().collapse(node, start + text.length);
+    normalizeCaret();
+    propose();
+  }
+
+  /**
+   * An input method's composition ending: where every held node still has its
+   * parent and the caret stands in the run composed into, that run's text is
+   * the agent's own from now on and the value is proposed; otherwise the edit
+   * ends `interrupted`. A composition that wrote nothing changes nothing.
+   */
+  function sentenceComposed() {
+    if (!judged()) return;
+    var into = edit.composedInto;
+    edit.composing = false;
+    edit.composedInto = null;
+    if (into === null) return;
+    var intact = edit.held.every(function (node, i) { return node.parentNode === edit.parents[i]; });
+    if (!intact || into === false || focusRun() !== into) { end('interrupted'); return; }
+    edit.wrote.set(into, into.data);
+    propose();
   }
 
   // Condition 3. The browser edits the DOM, runs the microtask checkpoint (the
@@ -1481,7 +1774,8 @@
     }, 0);
   }
   function onInput() {
-    if (edit === null) return;
+    // The sentence form's browser edits are an input method's alone, judged at `compositionend`.
+    if (edit === null || edit.form === 'sentence') return;
     clearTimeout(edit.pendingTimer);
     edit.pending = false;
     edit.ownText = edit.el.textContent;
@@ -1490,10 +1784,16 @@
     if (!edit.composing) propose();
   }
   function onCompositionStart() { if (edit !== null) edit.composing = true; }
-  function onCompositionEnd() { if (edit === null) return; edit.composing = false; propose(); }
+  function onCompositionEnd() {
+    if (edit === null) return;
+    if (edit.form === 'sentence') { sentenceComposed(); return; }
+    edit.composing = false;
+    propose();
+  }
   function propose() {
     edit.proposed = true;
-    var value = edit.islands ? taggedValue(edit.el) : typedValue(edit.el, edit.oneLine);
+    var value = edit.form === 'sentence' || edit.islands ? taggedValue(edit.el) : typedValue(edit.el, edit.oneLine);
+    if (edit.form === 'sentence') edit.value = value;
     tell({ stet: 'typed', key: edit.key, locale: edit.locale, entry: edit.entry, value: value });
   }
   function onEditMutation() {
@@ -1501,7 +1801,11 @@
     if (edit.el.textContent !== edit.ownText) end('lost');
   }
   function watchConnected() {
-    if (edit !== null && !edit.el.isConnected) end('lost');
+    if (edit !== null && !edit.el.isConnected) end(goneHow(edit));
+  }
+  /** How an edit whose element left the document ends: a sentence `interrupted`, so the dashboard says the page redrew it (K14); any other `lost`. */
+  function goneHow(e) {
+    return e.form === 'sentence' ? 'interrupted' : 'lost';
   }
 
   // Focus leaving the element ends the edit, kept: a click on other copy, on the
@@ -1512,7 +1816,7 @@
     if (event.relatedTarget instanceof Node && edit.el.contains(event.relatedTarget)) return;
     // A removal fires focusout while the element is still in the document: look again once the page's own code is done.
     var open = edit;
-    Promise.resolve().then(function () { if (edit === open) end(open.el.isConnected ? 'keep' : 'lost'); });
+    Promise.resolve().then(function () { if (edit === open) end(open.el.isConnected ? 'keep' : goneHow(open)); });
   }
 
   function onEditKey(event) {
@@ -1522,7 +1826,12 @@
     if (event.key === 'Enter' && event.shiftKey && edit.oneLine) { event.preventDefault(); return; }
     if (event.key === 'Escape') { event.preventDefault(); end('cancel'); return; }
     // A space on a button or a summary is its activation: the agent types it, so the element never sees it.
-    if (event.key === ' ' && !event.metaKey && !event.ctrlKey && !event.altKey) { event.preventDefault(); document.execCommand('insertText', false, ' '); return; }
+    if (event.key === ' ' && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      if (edit.form !== 'sentence') document.execCommand('insertText', false, ' ');
+      else if (judged()) sentenceInsert(null, ' ');
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && /^[biu]$/i.test(event.key)) event.preventDefault();
     // An island never merges into the page's markup beside it.
     if (edit.islands && (event.key === 'Backspace' || event.key === 'Delete') && atIslandEdge(event.key === 'Backspace')) event.preventDefault();
@@ -1552,17 +1861,27 @@
   // edit left at the last `input`. A held node that was a child at the last
   // `input` and is not now was moved by React: nothing is put back. The runs
   // form unwraps each island to its held text node with its original text.
+  //
+  // The sentence form puts back only its own writes, keep, cancel or
+  // interrupted alike: a node the page rewrote holds the page's text and is
+  // left, so the page's DOM is the framework's own view of it. A page write its
+  // observer has not delivered yet is judged first, and ends the edit
+  // `interrupted`, which the dashboard hears as `lost` with `interrupted` set.
   function end(how) {
     if (edit === null) return;
     var e = edit;
+    if (e.form === 'sentence' && how !== 'interrupted' && foreign(e, e.observer.takeRecords())) how = 'interrupted';
     edit = null;
     clearTimeout(e.pendingTimer);
     e.observer.disconnect();
     var el = e.el;
     el.removeAttribute('contenteditable');
     el.removeAttribute('spellcheck');
-    editListeners(el, 'removeEventListener');
-    if (e.islands) {
+    editListeners(el, 'removeEventListener', e.form);
+    if (e.form === 'sentence') {
+      document.removeEventListener('selectionchange', normalizeCaret);
+      restoreOwnWrites(e.held, e.wrote, e.original, e.parents);
+    } else if (e.islands) {
       e.islands.forEach(function (island, i) {
         e.nodes[i].data = e.data[i];
         if (island.parentNode !== null) island.parentNode.replaceChild(e.nodes[i], island);
@@ -1571,19 +1890,36 @@
       var moved = e.nodes.some(function (n, i) { return e.attached[i] && n.parentNode !== el; });
       if (el.isConnected && !moved) {
         while (el.firstChild) el.removeChild(el.firstChild);
-        e.nodes.forEach(function (n, i) {
-          if (n.nodeType === 3 && n.data === e.last[i]) n.data = e.data[i];
-          el.appendChild(n);
-        });
+        e.nodes.forEach(function (n) { el.appendChild(n); });
+        var texts = e.nodes.filter(function (n) { return n.nodeType === 3; });
+        var byNode = function (values) { return new Map(e.nodes.map(function (n, i) { return [n, values[i]]; })); };
+        restoreOwnWrites(texts, byNode(e.last), byNode(e.data), texts.map(function () { return el; }));
       }
     }
     giveBack(e.lent);
     settle();
-    tell({ stet: 'edited', key: e.key, locale: e.locale, entry: e.entry, how: how, proposed: e.proposed });
+    var message = { stet: 'edited', key: e.key, locale: e.locale, entry: e.entry, how: how === 'interrupted' ? 'lost' : how, proposed: e.proposed };
+    if (how === 'interrupted') message.interrupted = true;
+    tell(message);
     // The drafts show by the ordinary swap again, without an answer of their own, and the census reads the page as it stands.
+    // A sentence the page redrew is left as the page drew it: only the census runs.
+    if (how === 'interrupted') { runCensus(); return; }
     if (last !== null) locate(last, false, undefined, true);
     else if (lastLayer !== null) layer(lastLayer);
     runCensus();
+  }
+
+  /**
+   * Give each of `nodes` its `original` text back where it is still in the
+   * document, still under its parent from `parents` and still holds `wrote`:
+   * only this script's own write is undone, never a text the page wrote since.
+   */
+  function restoreOwnWrites(nodes, wrote, original, parents) {
+    nodes.forEach(function (node, i) {
+      if (node.isConnected && node.parentNode === parents[i] && node.data === wrote.get(node) && node.data !== original.get(node)) {
+        node.data = original.get(node);
+      }
+    });
   }
 
   /**
@@ -1612,8 +1948,9 @@
 
   /**
    * The page's `edit`: the selected element's hit for the key starts the
-   * in-place form (`whole`) or the runs form (a mark). Where no such hit stands
-   * the edit is answered `lost` at once, which moves it to the dashboard's field.
+   * in-place form (`whole`), the runs form (a mark) or the sentence form (a
+   * sentence key's element). Where no such hit stands the edit is answered
+   * `lost` at once, which moves it to the dashboard's field.
    */
   function beginEdit(data) {
     if (edit !== null && edit.key === data.key && edit.locale === data.locale && edit.entry === data.entry) return;
@@ -1621,7 +1958,7 @@
     var hit;
     if (mode === 'edit' && selEl !== null && selEl.isConnected) {
       hit = (hits.get(selEl) || []).filter(function (h) {
-        return h.key === data.key && h.entry === data.entry && (h.by === 'mark') === (data.form === 'runs') && inplaceHit(selEl, h);
+        return h.key === data.key && h.entry === data.entry && formOf(h) === data.form && inplaceHit(selEl, h);
       })[0];
     }
     if (hit === undefined) {
@@ -1630,6 +1967,7 @@
     }
     var lent = lend(selEl);
     if (data.form === 'runs') startRuns(selEl, data.key, data.locale, data.entry, data.oneLine);
+    else if (data.form === 'sentence') startSentence(selEl, data.key, data.locale, data.entry);
     else startInplace(selEl, hit.node, data.key, data.locale, data.entry, data.oneLine);
     edit.lent = lent;
   }
@@ -1672,7 +2010,9 @@
         ? k.parts.filter(function (p) { return p && typeof p === 'object' && isEntry(p.entry) && isTexts(p.texts); })
           .map(function (p) { return { entry: p.entry, texts: p.texts.slice() }; })
         : [];
-      out.push({ key: k.key, texts: k.texts.slice(), parts: parts });
+      var record = { key: k.key, texts: k.texts.slice(), parts: parts };
+      if (typeof k.tags === 'number') record.tags = k.tags;
+      out.push(record);
     });
     return out;
   }
@@ -1691,7 +2031,7 @@
 
   function editRequest(data) {
     return typeof data.key === 'string' && typeof data.locale === 'string' && (data.entry === undefined || isEntry(data.entry))
-      && (data.form === 'inplace' || data.form === 'runs') && typeof data.oneLine === 'boolean';
+      && (data.form === 'inplace' || data.form === 'runs' || data.form === 'sentence') && typeof data.oneLine === 'boolean';
   }
 
   // ---- Hydration, the observer, and the page's own navigation ----
@@ -1723,7 +2063,12 @@
     if (!hydrated) return;
     if (data.stet === 'locate' && typeof data.key === 'string' && Array.isArray(data.texts)) locate(data, data.scroll === true);
     else if (data.stet === 'clear') { last = null; end('keep'); clear(); clearLayer(); select(null); declined = []; }
-    else if (data.stet === 'census' && Array.isArray(data.keys)) { payload = censusKeys(data.keys); buildIndex(); runCensus(); }
+    else if (data.stet === 'census' && Array.isArray(data.keys)) {
+      payload = censusKeys(data.keys);
+      taggedKeys = new Set(payload.filter(function (k) { return k.tags !== undefined; }).map(function (k) { return k.key; }));
+      buildIndex();
+      runCensus();
+    }
     else if (data.stet === 'reads' && typeof data.route === 'string' && (data.keys === null || isTexts(data.keys))) {
       // Sites or coincident keys of the wrong shape cost the placing, never the narrowing.
       var placing = isRenders(data.renders) && isTexts(data.coincident);

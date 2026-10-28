@@ -139,11 +139,11 @@ describe('the preview agent', () => {
     expect(reply).toMatchObject({ found: 1, draft: 'shown' });
   });
 
-  it('waits for Save with a tagged draft for a key found by its text', async () => {
+  it('shows a tagged draft in the page’s own styling on the element whose whole text the key fills (D16)', async () => {
     const framed = await frame(PAGE);
     const reply = await framed.locate({ key: 'k_hello', texts: ['Hello big world'], tags: 1, draft: 'Hi <1>large</1> world' });
-    expect(reply).toMatchObject({ found: 1, by: 'text', draft: 'after-save' });
-    expect((framed.doc.getElementById('hello') as HTMLElement).innerHTML).toBe('Hello <b>big</b> world');
+    expect(reply).toMatchObject({ found: 1, by: 'text', draft: 'shown' });
+    expect((framed.doc.getElementById('hello') as HTMLElement).innerHTML).toBe('Hi <b>large</b> world');
   });
 
   it('waits for Save with a tagged draft found inside a longer paragraph', async () => {
@@ -693,6 +693,7 @@ interface CensusKey {
   key: string;
   texts: string[];
   parts?: Array<{ entry: number | string; texts: string[] }>;
+  tags?: number;
 }
 
 const sentOf = (framed: Framed, stet: string): Message[] => framed.sent.filter((m) => m['stet'] === stet);
@@ -2609,5 +2610,384 @@ describe('fix-preview-editing (8o)', () => {
       const reply = await placed(framed, [{ key: 'k', texts: ['Hello'] }], { renders: { k: [site(['em', null])] }, coincident: ['k'] });
       expect([reply?.['found'], reply?.['head']]).toEqual([{ k: 2 }, [{ key: 'k', where: 'title' }]]);
     });
+  });
+});
+
+describe('typing a sentence key in the page (C9, D18)', () => {
+  const SENTENCE = '<p id="s">Install: run <b>npx x init</b> and answer.</p><p id="away" tabindex="-1">Away</p>';
+  const INSTALL: CensusKey[] = [{ key: 'install', texts: ['Install: run npx x init and answer.'], tags: 1 }];
+  const DRAFT = { key: 'install', texts: ['Install: run npx x init and answer.'], tags: 1 };
+
+  interface Sentence {
+    framed: Framed;
+    p: HTMLElement;
+    first: Text;
+    bold: Text;
+    last: Text;
+  }
+  /** The text nodes under `el`, in document order. */
+  const textsOf = (el: Element): Text[] => {
+    const walker = el.ownerDocument.createTreeWalker(el, 4);
+    const out: Text[] = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) out.push(node as Text);
+    return out;
+  };
+  /** The sentence page, its census, Edit, a click on the `p` and the page's `edit` in the sentence form; `before` runs ahead of the census. */
+  async function sentenceEdit(body = SENTENCE, keys = INSTALL, before?: (s: Sentence) => void | Promise<void>): Promise<Sentence> {
+    const framed = await frame(body);
+    const p = framed.doc.getElementById('s') as HTMLElement;
+    const [first, bold, last] = textsOf(p) as [Text, Text, Text];
+    const s = { framed, p, first, bold, last };
+    await before?.(s);
+    await editOn(framed, p, keys, (keys[0] as CensusKey).key, { form: 'sentence' });
+    return s;
+  }
+  type Span = [Node, number, Node, number];
+  /** A cancellable `beforeinput` at the sentence: `getTargetRanges` answers `ranges` as StaticRanges, and `paste` is its dataTransfer's text. */
+  function input(framed: Framed, host: Element, inputType: string, opts: { data?: string; ranges?: Span[]; paste?: string } = {}): InputEvent {
+    const event = new framed.win.InputEvent('beforeinput', { inputType, data: opts.data ?? null, bubbles: true, cancelable: true });
+    const ranges = (opts.ranges ?? []).map(
+      ([startContainer, startOffset, endContainer, endOffset]) => new framed.win.StaticRange({ startContainer, startOffset, endContainer, endOffset }),
+    );
+    Object.defineProperty(event, 'getTargetRanges', { value: () => ranges });
+    if (opts.paste !== undefined) Object.defineProperty(event, 'dataTransfer', { value: { getData: (type: string) => (type === 'text/plain' ? opts.paste : '') } });
+    host.dispatchEvent(event);
+    return event;
+  }
+  const select = (framed: Framed, anchor: Node, anchorOffset: number, focus: Node, focusOffset: number): void => {
+    (framed.win.getSelection() as Selection).setBaseAndExtent(anchor, anchorOffset, focus, focusOffset);
+  };
+  const selectionChanged = (framed: Framed): void => {
+    framed.doc.dispatchEvent(new framed.win.Event('selectionchange'));
+  };
+  /** The selection as collapsed or not, the text of its focus node (each run's differs) and its offset. */
+  const caretOf = (framed: Framed): [boolean, string | null, number] => {
+    const selection = framed.win.getSelection() as Selection;
+    return [selection.isCollapsed, selection.focusNode?.textContent ?? null, selection.focusOffset];
+  };
+  const datas = (s: Sentence): string[] => [s.first.data, s.bold.data, s.last.data];
+  const typedValues = (framed: Framed): unknown[] => sentOf(framed, 'typed').map((m) => m['value']);
+  const boldValue = (bold: string): string => 'Install: run <1>' + bold + '</1> and answer.';
+
+  it('T18.1: the census finds the sentence by its element, and the pick offers typing in place (check 3 F4)', async () => {
+    const framed = await frame(SENTENCE);
+    expect((await censusOf(framed, INSTALL))?.['found']).toEqual({ install: 1 });
+    await setMode(framed, 'edit');
+    press(framed, framed.doc.getElementById('s') as Element, 'click');
+    await tick();
+    expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'install', attr: null, by: 'element', inplace: true }]);
+  });
+
+  it('T18.2: starting moves no node', async () => {
+    let held: Array<[Node, Node | null]> = [];
+    const s = await sentenceEdit(SENTENCE, INSTALL, ({ framed, p, bold }) => {
+      held = [...p.querySelectorAll('*'), ...textsOf(p)].map((n): [Node, Node | null] => [n, n.parentNode]);
+      select(framed, bold, 0, bold, 3);
+    });
+    const now = [...s.p.querySelectorAll('*'), ...textsOf(s.p)];
+    expect(now.length).toBe(held.length);
+    now.forEach((n, i) => {
+      expect(n).toBe((held[i] as [Node, Node | null])[0]);
+      expect(n.parentNode).toBe((held[i] as [Node, Node | null])[1]);
+    });
+    expect(s.p.querySelector('[data-stet-island]')).toBeNull();
+    expect(s.p.getAttribute('contenteditable')).toBe('plaintext-only');
+    const selection = s.framed.win.getSelection() as Selection;
+    expect([selection.toString(), selection.anchorNode === s.bold]).toEqual(['npx', true]);
+  });
+
+  it('T18.3: an insert lands in its node', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, 4);
+    const event = input(s.framed, s.p, 'insertText', { data: 'y' });
+    await tick();
+    expect(event.defaultPrevented).toBe(true);
+    expect(s.bold.data).toBe('npx yx init');
+    expect(caretOf(s.framed)).toEqual([true, 'npx yx init', 5]);
+    expect(typedValues(s.framed)).toEqual(['Install: run <1>npx yx init</1> and answer.']);
+    expect([sentOf(s.framed, 'edited'), s.p.getAttribute('contenteditable')]).toEqual([[], 'plaintext-only']);
+  });
+
+  it('T18.4: edits that would cross or empty a run do nothing (check 4 K1)', async () => {
+    const s = await sentenceEdit();
+    const { framed, p, first, bold, last } = s;
+    const start = datas(s);
+    const nothing = (event: InputEvent): void => {
+      expect([event.inputType, event.defaultPrevented, datas(s)]).toEqual([event.inputType, true, start]);
+    };
+    // A range from the first run into the bold one.
+    select(framed, first, 5, bold, 2);
+    nothing(input(framed, p, 'deleteContentBackward', { ranges: [[first, 5, bold, 2]] }));
+    nothing(input(framed, p, 'insertText', { data: 'q', ranges: [[first, 5, bold, 2]] }));
+    // Backspace at the bold run's start: Firefox's and Safari's range in the run before, then Chrome's none.
+    caret(framed, bold, 0);
+    nothing(input(framed, p, 'deleteContentBackward', { ranges: [[first, first.length - 1, first, first.length]] }));
+    nothing(input(framed, p, 'deleteContentBackward'));
+    // A delete that would empty the bold run.
+    select(framed, bold, 0, bold, bold.length);
+    nothing(input(framed, p, 'deleteContentBackward'));
+    nothing(input(framed, p, 'deleteByCut', { ranges: [[bold, 0, bold, bold.length]] }));
+    caret(framed, bold, 2);
+    for (const kind of ['insertParagraph', 'historyUndo', 'formatBold']) nothing(input(framed, p, kind));
+    await tick();
+    expect(typedValues(framed)).toEqual([]);
+    caret(framed, first, first.length);
+    expect(input(framed, p, 'insertFromPaste', { paste: 'a\nb' }).defaultPrevented).toBe(true);
+    expect(first.data).toBe('Install: run a b');
+    // A placeholder tag is never typed: `<2` is prose, and the `>` that would close it does nothing.
+    caret(framed, bold, bold.length);
+    input(framed, p, 'insertText', { data: '<2' });
+    expect(bold.data).toBe('npx x init<2');
+    const typedBefore = typedValues(framed).length;
+    expect(input(framed, p, 'insertText', { data: '>' }).defaultPrevented).toBe(true);
+    expect([bold.data, typedValues(framed).length]).toEqual(['npx x init<2', typedBefore]);
+    // A plain `<b>` is prose and goes in.
+    caret(framed, last, 0);
+    input(framed, p, 'insertFromPaste', { paste: 'a <b> b' });
+    expect(last.data).toBe('a <b> b and answer.');
+  });
+
+  it('T18.4b: edits that follow the selection (check 4 K1)', async () => {
+    const body = '<p id="s">run more words <b>npx</b> ok 👍🏽</p>';
+    const s = await sentenceEdit(body, [{ key: 'words', texts: ['run more words npx ok 👍🏽'], tags: 1 }]);
+    const { framed, p, first, bold, last } = s;
+    caret(framed, first, 8);
+    input(framed, p, 'deleteWordBackward');
+    expect(datas(s)).toEqual(['run  words ', 'npx', ' ok 👍🏽']);
+    caret(framed, last, last.length);
+    input(framed, p, 'deleteContentBackward');
+    expect(last.data).toBe(' ok ');
+    select(framed, first, 0, first, 3);
+    input(framed, p, 'insertText', { data: 'go' });
+    expect(first.data).toBe('go  words ');
+    caret(framed, first, 2);
+    input(framed, p, 'insertReplacementText', { data: 'GO' });
+    expect(first.data).toBe('go  words ');
+    // iOS autocorrect's word replacement: a range inside the focus node.
+    input(framed, p, 'insertReplacementText', { data: 'GO', ranges: [[first, 0, first, 2]] });
+    expect([first.data, bold.data]).toEqual(['GO  words ', 'npx']);
+  });
+
+  it('T18.5: the selection stays inside one run', async () => {
+    const { framed, p, first, bold } = await sentenceEdit();
+    select(framed, first, 2, bold, 1);
+    selectionChanged(framed);
+    expect(caretOf(framed)).toEqual([true, bold.data, 1]);
+    caret(framed, p, 1);
+    selectionChanged(framed);
+    expect(caretOf(framed)).toEqual([true, first.data, first.length]);
+  });
+
+  it('T18.6: a change the agent did not make ends the edit, and only the agent’s own writes go back (check 4 K2, K14)', async () => {
+    const typeInto = (s: Sentence): void => {
+      caret(s.framed, s.first, 0);
+      input(s.framed, s.p, 'insertText', { data: 'A' });
+      caret(s.framed, s.bold, 0);
+      input(s.framed, s.p, 'insertText', { data: 'B' });
+    };
+    const s = await sentenceEdit();
+    typeInto(s);
+    await tick();
+    s.bold.data = 'X';
+    await tick();
+    expect(lastOf(s.framed, 'edited')).toEqual({
+      stet: 'edited',
+      key: 'install',
+      locale: 'default',
+      entry: undefined,
+      how: 'lost',
+      interrupted: true,
+      proposed: true,
+      channel: 'c1',
+    });
+    expect([s.first.data, s.bold.data, s.p.hasAttribute('contenteditable')]).toEqual(['Install: run ', 'X', false]);
+
+    // An edit started over a shown draft: its swaps are lent, and the one whose node holds the agent's text again is returned.
+    const lent = await sentenceEdit(SENTENCE, INSTALL, async ({ framed }) => {
+      await framed.locate({ ...DRAFT, draft: 'Install: go <1>npx x init</1> and answer.' });
+    });
+    expect(lent.first.data).toBe('Install: go ');
+    typeInto(lent);
+    await tick();
+    lent.bold.data = 'X';
+    await tick();
+    expect(lastOf(lent.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true, proposed: true });
+    expect([lent.first.data, lent.bold.data]).toEqual(['Install: go ', 'X']);
+    // The returned swap puts the page's words back on clear; the node the page rewrote is no longer the agent's.
+    lent.framed.send({ stet: 'clear' });
+    await tick();
+    expect([lent.first.data, lent.bold.data]).toEqual(['Install: run ', 'X']);
+
+    const appended = await sentenceEdit();
+    appended.p.appendChild(appended.framed.doc.createElement('span'));
+    await tick();
+    expect(lastOf(appended.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true, proposed: false });
+
+    const removed = await sentenceEdit();
+    removed.p.remove();
+    await tick();
+    expect(lastOf(removed.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+
+    const blurred = await sentenceEdit();
+    blurred.p.dispatchEvent(new blurred.framed.win.FocusEvent('focusout', { bubbles: true, relatedTarget: null }));
+    blurred.p.remove();
+    await tick();
+    expect(sentOf(blurred.framed, 'edited')).toHaveLength(1);
+    expect(lastOf(blurred.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+  });
+
+  it('T18.12: a framework write just before a keystroke ends the edit before the agent writes (check 4 K13)', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, 1);
+    s.bold.data = 'X';
+    input(s.framed, s.p, 'insertText', { data: 'y' });
+    await tick();
+    expect([s.bold.data, typedValues(s.framed)]).toEqual(['X', []]);
+    expect(lastOf(s.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true, proposed: false });
+  });
+
+  it('T18.7: the agent’s own writes never end it', async () => {
+    const s = await sentenceEdit();
+    const expected: string[] = [];
+    caret(s.framed, s.bold, s.bold.length);
+    for (const ch of 'abcde') {
+      input(s.framed, s.p, 'insertText', { data: ch });
+      expected.push(boldValue(s.bold.data));
+      if (ch === 'c') await tick();
+    }
+    for (let i = 0; i < 5; i += 1) {
+      input(s.framed, s.p, 'deleteContentBackward');
+      expected.push(boldValue(s.bold.data));
+      await tick(1);
+    }
+    await tick();
+    expect(s.bold.data).toBe('npx x init');
+    expect(typedValues(s.framed)).toEqual(expected);
+    expect(expected[4]).toBe(boldValue('npx x initabcde'));
+    expect([sentOf(s.framed, 'edited'), s.p.getAttribute('contenteditable')]).toEqual([[], 'plaintext-only']);
+  });
+
+  it('T18.8: a composition is the input method’s, judged when it ends (check 4 K8)', async () => {
+    const compose = (s: Sentence): void => {
+      caret(s.framed, s.bold, s.bold.length);
+      s.p.dispatchEvent(new s.framed.win.CompositionEvent('compositionstart', { bubbles: true }));
+    };
+    const end = (s: Sentence): void => {
+      s.p.dispatchEvent(new s.framed.win.CompositionEvent('compositionend', { bubbles: true }));
+    };
+    const s = await sentenceEdit();
+    compose(s);
+    expect(input(s.framed, s.p, 'insertCompositionText', { data: 'とう' }).defaultPrevented).toBe(false);
+    s.bold.data += 'とう';
+    await tick();
+    expect(input(s.framed, s.p, 'insertFromComposition', { data: '東京' }).defaultPrevented).toBe(false);
+    s.bold.data = 'npx x init東京';
+    caret(s.framed, s.bold, s.bold.length);
+    end(s);
+    await tick();
+    expect(typedValues(s.framed)).toEqual([boldValue('npx x init東京')]);
+    expect(sentOf(s.framed, 'edited')).toEqual([]);
+
+    // The caret ends in another run than the one composed into.
+    const away = await sentenceEdit();
+    compose(away);
+    away.bold.data += 'と';
+    caret(away.framed, away.first, 2);
+    end(away);
+    await tick();
+    expect(lastOf(away.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+
+    // A held node loses its parent while the method composes.
+    const moved = await sentenceEdit();
+    compose(moved);
+    moved.bold.data += 'と';
+    moved.first.remove();
+    end(moved);
+    await tick();
+    expect(lastOf(moved.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+
+    // Safari's order: `compositionend` first, then the `insertFromComposition` beforeinput and the browser's write.
+    const late = await sentenceEdit();
+    compose(late);
+    end(late);
+    expect(input(late.framed, late.p, 'insertFromComposition', { data: '東京' }).defaultPrevented).toBe(false);
+    late.bold.data = 'npx x init東京';
+    caret(late.framed, late.bold, late.bold.length);
+    await tick();
+    await tick();
+    expect(typedValues(late.framed)).toEqual([boldValue('npx x init東京')]);
+    expect(sentOf(late.framed, 'edited')).toEqual([]);
+    // The method is done: a page write to the node now ends the edit.
+    late.bold.data = 'zzz';
+    await tick();
+    expect(lastOf(late.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+  });
+
+  it('T18.9: keep and cancel put the agent’s writes back', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, 4);
+    input(s.framed, s.p, 'insertText', { data: 'y' });
+    // The dashboard's locate for the new draft: nothing is painted into the sentence under edit.
+    await s.framed.locate({ ...DRAFT, draft: boldValue('npx yx init') });
+    key(s.framed, s.p, { key: 'Enter' });
+    await tick();
+    expect(lastOf(s.framed, 'edited')).toMatchObject({ how: 'keep', proposed: true });
+    // The draft shows through its swap, which holds the page's own words underneath.
+    expect([s.bold.data, s.p.hasAttribute('contenteditable')]).toEqual(['npx yx init', false]);
+    s.framed.send({ stet: 'clear' });
+    await tick();
+    expect(s.bold.data).toBe('npx x init');
+
+    const cancelled = await sentenceEdit();
+    caret(cancelled.framed, cancelled.bold, 4);
+    input(cancelled.framed, cancelled.p, 'insertText', { data: 'y' });
+    key(cancelled.framed, cancelled.p, { key: 'Escape' });
+    await tick();
+    expect(lastOf(cancelled.framed, 'edited')).toMatchObject({ how: 'cancel', proposed: true });
+    expect(cancelled.bold.data).toBe('npx x init');
+
+    // A node the page changed in the meantime: the edit ends interrupted and the node is never written.
+    const rewritten = await sentenceEdit();
+    caret(rewritten.framed, rewritten.first, 0);
+    input(rewritten.framed, rewritten.p, 'insertText', { data: 'A' });
+    rewritten.bold.data = 'X';
+    key(rewritten.framed, rewritten.p, { key: 'Enter' });
+    await tick();
+    expect(lastOf(rewritten.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true, proposed: true });
+    expect([rewritten.first.data, rewritten.bold.data]).toEqual(['Install: run ', 'X']);
+  });
+
+  it('a framework write just before the space key ends the edit before the agent writes (check 4 K13)', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, 1);
+    s.bold.data = 'X';
+    key(s.framed, s.p, { key: ' ' });
+    await tick();
+    expect([s.bold.data, typedValues(s.framed)]).toEqual(['X', []]);
+    expect(lastOf(s.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+  });
+
+  it('a composition that wrote two held nodes ends interrupted, not proposed (check 4 K8)', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, s.bold.length);
+    s.p.dispatchEvent(new s.framed.win.CompositionEvent('compositionstart', { bubbles: true }));
+    s.first.data += 'と';
+    s.bold.data += 'う';
+    caret(s.framed, s.bold, s.bold.length);
+    s.p.dispatchEvent(new s.framed.win.CompositionEvent('compositionend', { bubbles: true }));
+    await tick();
+    expect(typedValues(s.framed)).toEqual([]);
+    expect(lastOf(s.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+  });
+
+  it('a sentence whose draft the layer paints stays in the census, so it can be picked again (small call 3)', async () => {
+    const body = '<p id="s">Install: run <b>npx x init</b> and answer.</p><p id="o">Other words here today.</p>';
+    const framed = await frame(body);
+    const keys: CensusKey[] = [...INSTALL, { key: 'other', texts: ['Other words here today.'] }];
+    await censusOf(framed, keys);
+    framed.send({ stet: 'layer', drafts: [{ ...DRAFT, draft: 'Install: go <1>npx x init</1> and answer.' }] });
+    await tick(300);
+    expect((framed.doc.getElementById('s') as HTMLElement).textContent).toBe('Install: go npx x init and answer.');
+    expect((await censusOf(framed, keys))?.['found']).toEqual({ other: 1, install: 1 });
   });
 });

@@ -11329,6 +11329,75 @@ describe('the page', () => {
           page.dom.window.close();
         });
 
+        // C9 — typing a sentence key in the page (D16, D18)
+        const SENTENCE_VALUE = 'Install: run <1>npx x init</1> and answer.';
+        const SENTENCE_PLAIN = 'Install: run npx x init and answer.';
+        const SENTENCE_SITE = siteBody({
+          descriptor: { ...descriptor, keys: { ...descriptor.keys, lab_sentence: { shape: 'text', target: 'web', tags: 1 }, lab_marked: { shape: 'text', target: 'web', tags: 1 } } },
+          snapshot: { ...snapshot, default: { ...snapshot.default, lab_sentence: SENTENCE_VALUE, lab_marked: 'Ship <1>it</1> now' } },
+        });
+
+        it('sends a sentence key’s plain text and tags, and types its element hit in the sentence form (T18.1)', async () => {
+          const { page, agent } = await bridged({ site: SENTENCE_SITE });
+          const entry = (agent.sent('census').at(-1)?.['keys'] as Array<Record<string, unknown>>).find((k) => k['key'] === 'lab_sentence');
+          expect(entry).toEqual({ key: 'lab_sentence', texts: [SENTENCE_PLAIN], tags: 1 });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { tag: 'p' });
+          expect(agent.locates().at(-1)).toMatchObject({ key: 'lab_sentence', texts: [SENTENCE_PLAIN], tags: 1 });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          expect(agent.sent('edit').at(-1)).toEqual({ stet: 'edit', key: 'lab_sentence', locale: 'default', form: 'sentence', oneLine: true });
+          await agent.typed('lab_sentence', 'Install: go <1>npx x init</1> and answer.');
+          // The locate sent while the words were typed matches nothing on the page; its answer is held back while typing.
+          agent.say(LOCATED({ key: 'lab_sentence', found: 0, seq: agent.locates().at(-1)?.['seq'] }));
+          const asked = agent.locates().length;
+          await agent.edited('lab_sentence', 'keep');
+          // A kept edit asks again, and the page's answer replaces the stale not-found line.
+          expect(agent.locates().length).toBe(asked + 1);
+          agent.say(LOCATED({ key: 'lab_sentence', found: 1, seq: agent.locates().at(-1)?.['seq'] }));
+          await page.settle();
+          expect(lines(page).filter((l) => /was not found/.test(l))).toEqual([]);
+          // Another key selected: the sentence's draft rides the layer, matched by its plain text.
+          await agent.pick([{ key: 'lab_marked', by: 'mark' }], { again: true, tag: 'h1' });
+          expect(agent.sent('edit').at(-1)).toMatchObject({ key: 'lab_marked', form: 'runs' });
+          const layered = (agent.sent('layer').at(-1)?.['drafts'] as Array<Record<string, unknown>>).find((d) => d['key'] === 'lab_sentence');
+          expect(layered).toMatchObject({ texts: [SENTENCE_PLAIN], tags: 1, draft: 'Install: go <1>npx x init</1> and answer.' });
+          page.dom.window.close();
+        });
+
+        it('keeps the words typed into a sentence the page redrew, and says so until the next selection (T18.10)', async () => {
+          const INTERRUPTED = 'The page redrew this text while you typed. Your words are kept as an unsaved edit in the field.';
+          const { page, agent } = await bridged({ site: SENTENCE_SITE });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          await agent.typed('lab_sentence', 'Install: run <1>npx xx init</1> and answer.');
+          await agent.edited('lab_sentence', 'lost', { interrupted: true });
+          expect(stateOf(page).draft).toEqual({ 'default lab_sentence': 'Install: run <1>npx xx init</1> and answer.' });
+          expect(stateOf(page).edit).toBeNull();
+          expect([popover(page).hidden, poptext(page).value]).toEqual([false, 'Install: run <1>npx xx init</1> and answer.']);
+          expect(lines(page)).toContain(INTERRUPTED);
+          await page.act('key:lab_sentence');
+          expect(lines(page)).not.toContain(INTERRUPTED);
+          // Picking the key again in the page ends the line too (choosePick, not the sidebar).
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          await agent.edited('lab_sentence', 'lost', { interrupted: true });
+          expect(lines(page)).toContain(INTERRUPTED);
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { tag: 'p' });
+          expect(lines(page)).not.toContain(INTERRUPTED);
+          page.dom.window.close();
+        });
+
+        it('G4: picking an interrupted sentence again shows its kept draft before the edit starts (C9 validation)', async () => {
+          const { page, agent } = await bridged({ site: SENTENCE_SITE });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          await agent.typed('lab_sentence', 'Install: run <1>npx xx init</1> and answer.');
+          await agent.edited('lab_sentence', 'lost', { interrupted: true });
+          await wait(400); await page.settle();
+          const locates = agent.locates().length;
+          const edits = agent.sent('edit').length;
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          expect(agent.sent('edit').length).toBe(edits + 1);
+          expect(agent.locates().slice(locates).at(-1)).toMatchObject({ key: 'lab_sentence', draft: 'Install: run <1>npx xx init</1> and answer.' });
+          page.dom.window.close();
+        });
+
         // The validation round: the reads race, the phone row, the chooser, and the guards no case reached
         const held = (page: Painted): unknown[] => [evalIn(page, 'frameHold !== null'), byId(page, 'panetop').style.height];
 

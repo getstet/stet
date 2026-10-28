@@ -458,6 +458,7 @@ const S = {
   unmanaged: null,
   warn: null,
   unsure: null,
+  interrupted: null,
   moved: null,
   pageInfo: false,
   // The Templates tab: the slot being edited, the frame's width preset, and each template's last render
@@ -667,7 +668,7 @@ async function loadSite(path) {
   S.confirmed = new Set();
   S.census = null; S.hover = null; S.choose = null; S.usage = null; S.routeReads = null; routeReadsFor = null;
   S.frameRoute = null; readsPending = false; releaseFrame(false);
-  S.unmanaged = null; S.warn = null; S.unsure = null; S.moved = null; S.pageInfo = false;
+  S.unmanaged = null; S.warn = null; S.unsure = null; S.interrupted = null; S.moved = null; S.pageInfo = false;
   S.unsavedOpen = false; S.leaveAsk = null; S.renaming = null;
   S.tplKey = null; S.tpl = { ctx: '', byName: {} };
   // A new checkout is a new route field and a new frame, and ends any start
@@ -2534,6 +2535,11 @@ function renderedValues(id) {
 }
 /** The distinct strings of a list of texts, in order. */
 const distinct = (texts) => texts.filter((t, i) => typeof t === 'string' && texts.indexOf(t) === i);
+/** A key's texts as the page shows them, for the agent: a key declaring tags (a sentence key) sends its plain text, the tags taken out (D16). */
+function pageTexts(id, texts) {
+  const def = keyDef(id);
+  return def && def.tags !== undefined ? texts.map((text) => deriveText('{v}', text, true)) : texts;
+}
 /** Every string a key renders as saved: a text value, each list entry, each string field. */
 function renderedTexts(id) {
   const texts = [];
@@ -2586,7 +2592,7 @@ function layerItems(id, value, from) {
   const candidates = from || renderedValues(id);
   if (typeof value === 'string') {
     const texts = distinct(candidates);
-    return texts.length === 0 ? [] : [Object.assign({ key: id, texts: texts, draft: value }, def.tags === undefined ? {} : { tags: def.tags })];
+    return texts.length === 0 ? [] : [Object.assign({ key: id, texts: pageTexts(id, texts), draft: value }, def.tags === undefined ? {} : { tags: def.tags })];
   }
   if (!value || typeof value !== 'object') return [];
   const out = [];
@@ -2638,7 +2644,7 @@ function locateKey(scroll) {
   const def = keyDef(S.sel) || {};
   if (def.derivesFrom !== undefined) {
     // A derived key is shown where its source renders, outlined dashed; the whole message names the key picked.
-    postLocate({ key: S.sel, mark: def.derivesFrom, texts: renderedTexts(def.derivesFrom), draft: null, scroll: scroll, guess: true, dashed: true });
+    postLocate({ key: S.sel, mark: def.derivesFrom, texts: pageTexts(def.derivesFrom, renderedTexts(def.derivesFrom)), draft: null, scroll: scroll, guess: true, dashed: true });
     postLayer();
     return;
   }
@@ -2652,7 +2658,7 @@ function locateKey(scroll) {
   }
   postLocate({
     key: S.sel,
-    texts: renderedTexts(S.sel),
+    texts: pageTexts(S.sel, renderedTexts(S.sel)),
     draft: typeof held === 'string' ? held : null,
     scroll: scroll,
     // Dashed where a match is a guess, and where no file of the route reads the key.
@@ -2703,7 +2709,7 @@ function verifyNow() {
   if (!check || check.key !== S.sel) { S.saveCheck = null; locateKey(scrollNext); return; }
   postLocate({
     key: check.key,
-    texts: check.phase === 'after' ? renderedTexts(check.key) : check.before,
+    texts: pageTexts(check.key, check.phase === 'after' ? renderedTexts(check.key) : check.before),
     draft: null,
     scroll: false,
     guess: true,
@@ -2770,9 +2776,14 @@ window.addEventListener('message', (event) => {
       if (e.before === undefined) { delete S.draft[e.locale + ' ' + e.key]; delete S.base[e.locale + ' ' + e.key]; }
       else S.draft[e.locale + ' ' + e.key] = e.before;
       draftChanged();
+    } else if (data.how === 'keep') {
+      // The locate sent while the words were typed matched nothing; ask again so its answer does not stand.
+      locateKey(false);
     } else if (data.how === 'lost') {
       if (data.proposed !== true && e.before === undefined) { delete S.draft[e.locale + ' ' + e.key]; delete S.base[e.locale + ' ' + e.key]; }
       S.located = Object.assign({}, S.located, { key: e.key, redrawn: true });
+      // The page re-rendered a sentence while it was typed in: the words stay in the field, unsaved.
+      S.interrupted = data.interrupted === true ? e.key : null;
       openPopover(e.key, e.locale, e.entry, e.rect);
       if (S.popover !== null) S.popover.redrawn = true;
     }
@@ -2832,7 +2843,8 @@ function paintPaneNote() {
     const unfound = unfoundKeys();
     if (unfound.length > 0) lines.push('Keys this page reads that were not found: ' + unfound.join(', ') + '.');
   } else if (S.sel !== null) {
-    if ((at && at.key === S.sel && at.redrawn) || (S.popover !== null && S.popover.key === S.sel && S.popover.redrawn)) {
+    if (S.interrupted === S.sel) lines.push('The page redrew this text while you typed. Your words are kept as an unsaved edit in the field.');
+    else if ((at && at.key === S.sel && at.redrawn) || (S.popover !== null && S.popover.key === S.sel && S.popover.redrawn)) {
       lines.push('The page redrew this text, so the edit moved to a field.');
     }
     let line = '';
@@ -3075,13 +3087,18 @@ function choosePick(hit, again, rect, sel) {
   // A text match on a page whose reads are complete, of a key stet could not place, shown in more than one place.
   S.unsure = hit.attr === null && hit.by !== 'mark' && hit.sure !== true && S.warn === null && reads !== null && reads.complete &&
     reads.route === framePath() && S.census !== null && own(S.census.found, key) && S.census.found[key] > 1 ? { key: key, n: S.census.found[key] } : null;
+  // The agent paints nothing at an interrupted end, so the sentence still shows the page's words: send the kept draft again.
+  const redraw = S.interrupted === key;
+  S.interrupted = null;
   selectFromFrame(key, hit.entry);
+  if (redraw) locateKey(false);
   if (!again) return;
   // At phone width, and on a touch screen at any width, the second tap focuses the field, which only then scrolls into view.
   if (narrow() || touchScreen()) { focusField(key, hit.entry); return; }
   if (!entryHeld(key, hit.entry)) return;
   if (hit.attr === null && hit.inplace) {
-    const form = hit.by === 'mark' ? 'runs' : 'inplace';
+    // A sentence key (one declaring tags) is typed in its element without moving a page node (D18).
+    const form = hit.by === 'mark' ? 'runs' : (keyDef(key) || {}).tags !== undefined ? 'sentence' : 'inplace';
     postToPreview(Object.assign({ stet: 'edit', key: key, locale: S.locale }, hit.entry === undefined ? {} : { entry: hit.entry },
       { form: form, oneLine: entryText(key, S.locale, hit.entry).indexOf('\n') === -1 }));
     S.edit = { key: key, locale: S.locale, entry: hit.entry, form: form, before: S.draft[S.locale + ' ' + key], rect: rect };
@@ -3174,6 +3191,7 @@ function endSelection() {
   S.unmanaged = null;
   S.warn = null;
   S.unsure = null;
+  S.interrupted = null;
   closePopover();
   render();
   locateKey(false);
@@ -3204,7 +3222,7 @@ function postCensus() {
       }
     }
     if (parts.length > 0 || values.some((v) => v && typeof v === 'object')) keys.push({ key: id, texts: texts, parts: parts });
-    else if (texts.length > 0) keys.push({ key: id, texts: texts });
+    else if (texts.length > 0) keys.push(Object.assign({ key: id, texts: pageTexts(id, texts) }, def.tags === undefined ? {} : { tags: def.tags }));
   }
   postToPreview({ stet: 'census', keys: keys });
 }
@@ -4264,6 +4282,7 @@ const ACTIONS = {
     S.located = null;
     S.warn = null;
     S.unsure = null;
+    S.interrupted = null;
     S.unmanaged = null;
     S.choose = null;
     closePopover();

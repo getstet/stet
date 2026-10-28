@@ -152,7 +152,7 @@ switches between the two when focus is in no field. Words count as a key only wh
 
 A second click, a double click or Enter on selected copy edits the text where
 it stands, with the caret where you clicked. Typing in the page shows a count only near the key's limit. Enter keeps the
-edit and Esc puts the text back. Copy that shares its element with other text,
+edit and Esc puts the text back. A sentence with inline markup (bold, links, code, a highlighted word) is one key on React, Next and Astro sites: typing in the page changes its words and keeps its markup. Copy that shares its element with other text,
 a value carrying `{{name}}`, an attribute such as alt text, and every tap at a
 viewport 760 px wide or narrower open the dashboard's field instead, with the
 key's counter beside it. What is typed is an unsaved edit until Save; the page shows
