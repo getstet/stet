@@ -149,8 +149,8 @@ const UNCOPYABLE = 'a tag stet cannot copy into a key read';
 const FOREIGN_RICH = SENTENCE_REASONS.foreignRich;
 const ON_TAG = SENTENCE_REASONS.onTag;
 
-/** The elements whose text is code, a field's value, a graphic or a slot's fallback, never copy stet rewrites. */
-const SKIP_TAGS = new Set(['code', 'kbd', 'samp', 'textarea', 'svg', 'math', 'slot']);
+/** The elements whose text is a field's value, a graphic or a slot's fallback, never copy stet rewrites; a `<code>`, `<kbd>` or `<samp>` outside a `<pre>` holds copy like any element. */
+const SKIP_TAGS = new Set(['textarea', 'svg', 'math', 'slot']);
 /** The attributes that make an element's content Astro's own: printed raw, or replaced. */
 const RAW_ATTRS = ['is:raw', 'set:html', 'set:text'];
 /** The attributes an element inside a sentence may not carry: its content Astro's own, or sent to a slot (D16). */

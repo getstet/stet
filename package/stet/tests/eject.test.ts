@@ -1587,6 +1587,7 @@ describe('eject — an Astro host\'s reads go back as text (D15)', () => {
         '<p>Install: run <b>npx x init</b> and answer.</p>',
         "<p>See <a class='i'  href=\"/docs\"><code>stet</code> docs</a> now</p>",
         '<p>Was <del>old</del> <span class="w">new</span></p>',
+        '<div class="cell"><h3>Capture</h3><code>t("hero_headline")</code></div>',
         '',
       ].join('\n'),
       'src/pages/bare.astro': '<h3>Fenceless word here</h3>\n',
@@ -1599,6 +1600,7 @@ describe('eject — an Astro host\'s reads go back as text (D15)', () => {
     const registered = Object.keys(original).map((rel) => read(dir, rel));
     expect(registered.filter((text, i) => text !== Object.values(original)[i])).toHaveLength(Object.keys(original).length - 1);
     expect(read(dir, PAGE)).toContain('{richParts(copy(');
+    expect(read(dir, PAGE)).toMatch(/<code>\{copy\('\w+'\)\}<\/code><\/div>/);
     const cap = io(dir);
     expect(await runEject(['--write'], cap)).toBe(0);
     for (const [rel, text] of Object.entries(original)) expect(read(dir, rel), rel).toBe(text);

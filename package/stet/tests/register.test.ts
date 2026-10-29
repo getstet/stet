@@ -3382,6 +3382,7 @@ describe('register — the Astro rewriter (D14)', () => {
             '<p>a&nbsp;b</p>',
             '<Card>Plain words</Card>',
             "<Slug>Don't panic</Slug>",
+            '<pre><code>npx x init</code></pre>',
             '',
           ].join('\n'),
           'import Card from "../components/Card.astro";\nimport Slug from "../components/Slug.astro";\nconst html = "";\nconst name = "x";\n',
@@ -3398,8 +3399,6 @@ describe('register — the Astro rewriter (D14)', () => {
     expect(notRewritten(cap)).toEqual([
       'src/pages/css.astro:6 "two spaces" not rewritten (spacing the page may show) — adopt by hand',
       'src/pages/index.astro:9 "Preformatted words here" not rewritten (inside <pre>) — adopt by hand',
-      'src/pages/index.astro:10 "Code words here" not rewritten (inside <code>) — adopt by hand',
-      'src/pages/index.astro:11 "Keyboard words here" not rewritten (inside <kbd>) — adopt by hand',
       'src/pages/index.astro:12 "Area words here" not rewritten (inside <textarea>) — adopt by hand',
       'src/pages/index.astro:13 "Graphic words here" not rewritten (inside <svg>) — adopt by hand',
       'src/pages/index.astro:14 "fallback words" not rewritten (inside <slot>) — adopt by hand',
@@ -3408,13 +3407,21 @@ describe('register — the Astro rewriter (D14)', () => {
       'src/pages/index.astro:17 "Hello" not rewritten (beside an expression) — adopt by hand',
       'src/pages/index.astro:17 ", welcome" not rewritten (beside an expression) — adopt by hand',
       'src/pages/index.astro:21 "Don\'t panic" not rewritten (shown where stet cannot follow) — adopt by hand',
+      'src/pages/index.astro:22 "npx x init" not rewritten (inside <pre>) — adopt by hand',
       'src/pages/wrap.astro:5 "two spaces" not rewritten (spacing the page may show) — adopt by hand',
       'src/pages/wrap.astro:6 "one x" not rewritten (spacing the page may show) — adopt by hand',
     ]);
     const lines = (text: string): string[] => text.split('\n');
     const changed = lines(out).filter((line, i) => line !== lines(before)[i]);
-    expect(changed).toEqual([expect.stringMatching(/^<p>\{copy\.\w+\}<\/p>$/), expect.stringMatching(/^<p>\{copy\.\w+\}<\/p>$/), expect.stringMatching(/^<Card>\{copy\.\w+\}<\/Card>$/)]);
-    expect(Object.values(defaults(dir).default)).toEqual(expect.arrayContaining(['two spaces', 'a\u00a0b', 'Plain words']));
+    expect(changed).toEqual([
+      expect.stringMatching(/^<code>\{copy\.\w+\}<\/code>$/),
+      expect.stringMatching(/^<kbd>\{copy\.\w+\}<\/kbd>$/),
+      expect.stringMatching(/^<p>\{copy\.\w+\}<\/p>$/),
+      expect.stringMatching(/^<p>\{copy\.\w+\}<\/p>$/),
+      expect.stringMatching(/^<Card>\{copy\.\w+\}<\/Card>$/),
+    ]);
+    expect(lines(out)).toContain('<pre><code>npx x init</code></pre>');
+    expect(Object.values(defaults(dir).default)).toEqual(expect.arrayContaining(['Code words here', 'Keyboard words here', 'two spaces', 'a\u00a0b', 'Plain words']));
   });
 
   it('reads the copy binding and the form from the front matter and the markup braces alone (T14.8)', async () => {

@@ -7491,9 +7491,10 @@ describe('adoption', () => {
     expect(page).toMatch(/<button title=\{copy\.\w+\}>x<\/button>/);
     expect(page).toMatch(/<SectionHead label=\{copy\.\w+\} \/>/);
     expect(page).toMatch(/const surfaces = \[\{ label: copy\.\w+ \}\];/);
-    expect(page).toContain('<code>t("hero_headline")</code>');
+    expect(page).toMatch(/<code>\{copy\.\w+\}<\/code>/);
+    expect(page).not.toContain('<code>t("hero_headline")</code>');
     expect(page).toContain('<title>Pricing</title>');
-    expect(host.out).toContain('src/pages/index.astro:12 "t(\\"hero_headline\\")" not rewritten (inside <code>) — adopt by hand');
+    expect(host.stdout()).not.toContain('inside <code>');
     expect(host.out).toContain('src/pages/index.astro:6 "Pricing" not rewritten (SEO text — adopt it with stet pages scan) — adopt by hand');
     host.out.length = 0;
     expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
