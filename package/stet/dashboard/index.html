@@ -1300,7 +1300,7 @@ function gitBar() {
     ? '<span class="muted" style="font-size:11px;white-space:nowrap" title="' + esc(S.pending.join('\n')) + '">' +
       plural(S.pending.length, 'stet file') + ' not yet committed</span>' +
       '<button class="btn sm pri" data-act="commit">Commit</button>'
-    : '<button class="btn sm" data-act="commit" disabled>Commit</button>';
+    : '<button class="btn sm" data-act="commit"' + (S.untracked.length > 0 ? '' : ' disabled') + '>Commit</button>';
   const grey = (label, title) => '<button class="btn sm" data-act="push" disabled' +
     (title ? ' title="' + esc(title) + '"' : '') + '>' + esc(label) + '</button>';
   const blue = (label) => '<button class="btn sm pri" data-act="push">' + esc(label) + '</button>';
