@@ -27,7 +27,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
@@ -60,9 +60,9 @@ import { mintPreviewToken, verifyPreviewToken } from '../server/index.js';
 import { runCli, type CliIo } from '../cli/main.js';
 import { GATE_LINE, HOOK_BEFORE_0_3_1, SHARED_GATE_LINE, runHookInstall } from '../cli/hook.js';
 import { refuseDanglingReferences } from '../cli/remove.js';
-import { isNodeBuiltin, runtimeImportClosure, sourceFiles } from '../tests/helpers/source-roster.js';
+import { isNodeBuiltin, runtimeImportClosure, runtimeImports, sourceFiles } from '../tests/helpers/source-roster.js';
 import { BUILT_BIN, builtBinExists, installStetShim } from '../tests/helpers/stet-shim.js';
-import { TS7_REFUSAL } from '../cli/source-scan.js';
+import { TS_BROKEN } from '../cli/source-scan.js';
 import { cleanupEmailHosts, makeEmailHost } from '../tests/helpers/email-host.js';
 import { MARKETING, chainProject, doctor as doctorOf, write as writeChain } from '../tests/helpers/chain-project.js';
 import { cleanupOutsideFiles, outsideFile, previewHost } from '../tests/helpers/email-preview-host.js';
@@ -977,18 +977,35 @@ describe('content-read', () => {
     // loaded only under `stet audit lighthouse`: no entry a host runs reaches
     // them, the read entries, the mount and the four store adapters among them.
     const auditOnly = ['lighthouse', 'chrome-launcher', 'selfsigned', 'puppeteer-core'];
+    // `typescript` is stet's own dependency, loaded only by the source tools:
+    // the same eight entries stay free of it, so no host bundle carries the compiler.
+    const toolOnly = ['typescript'];
     for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts', '../server/index.ts', '../adapters/store-memory.ts', '../adapters/store-snapshot.ts', '../adapters/store-pg.ts', '../adapters/store-postgrest.ts']) {
       const closure = runtimeImportClosure(new URL(entry, import.meta.url));
       expect({ entry, audit: closure.bare.filter((spec) => auditOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
         entry,
         audit: [],
       });
+      expect({ entry, tool: closure.bare.filter((spec) => toolOnly.some((name) => spec === name || spec.startsWith(`${name}/`))) }).toEqual({
+        entry,
+        tool: [],
+      });
+      // The dev tools stay on their side: render sites live in `cli/`, the matching in the preview agent (D12).
+      expect({ entry, dev: closure.modules.filter((m) => m.startsWith('cli/') || m.startsWith('templates/')) }).toEqual({ entry, dev: [] });
     }
 
     // The server accessor's subpath carries no client code: no provider module, no `react` at all.
     const server = runtimeImportClosure(new URL('../react/server.ts', import.meta.url));
     expect(server.modules.filter((m) => /(^|\/)react\/provider\.tsx$/.test(m))).toEqual([]);
     expect(server.bare.filter((spec) => spec === 'react' || spec.startsWith('react/') || spec.startsWith('react-dom'))).toEqual([]);
+
+    // The renderer a sentence key is read through ships on every read entry, and
+    // carries only the one tag reader: no `zod`, no target (D16).
+    for (const entry of ['../src/index.ts', '../react/index.ts', '../react/server.ts']) {
+      expect({ entry, rich: runtimeImportClosure(new URL(entry, import.meta.url)).modules.includes('src/rich.ts') }).toEqual({ entry, rich: true });
+    }
+    expect(runtimeImports(new URL('../src/rich.ts', import.meta.url))).toEqual(['./placeholder.js']);
+    expect(runtimeImports(new URL('../src/placeholder.ts', import.meta.url))).toEqual([]);
 
     // The walker is proven to SEE a builtin before it vouches for none: the two
     // modules that carry the crypto import are outside both closures above, and
@@ -5527,7 +5544,7 @@ describe('cli', () => {
   });
 
   it.skipIf(!builtBinExists())('Requirement: doctor names the compiler scan and register need', async () => {
-    const NOT_INSTALLED = 'typescript: not installed — stet scan and stet register read src/copy.ts with it; npm i -D typescript';
+    const NOT_LOADED = 'stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet. stet scan and stet register read src/copy.ts with it';
     /** An Astro host whose `.astro` surfaces are dialect files and whose copy modules only the compiler reads. */
     const astro = (copyModules: string[]): CliHost => {
       const host = makeCliHost({
@@ -5547,19 +5564,19 @@ describe('cli', () => {
 
     const installed = astro(['src/copy.ts']);
     expect(await installed.run('doctor')).toBe(0);
-    expect(`${installed.stdout()}\n${installed.stderr()}`).not.toContain('typescript:');
+    expect(`${installed.stdout()}\n${installed.stderr()}`).not.toContain(TS_BROKEN);
 
     const missing = doctor(astro(['src/copy.ts']), { hideTypescript: true });
     expect(missing.code).toBe(0);
-    expect(missing.text).toContain(NOT_INSTALLED);
+    expect(missing.text).toContain(NOT_LOADED);
 
     const dialectOnly = doctor(astro([]), { hideTypescript: true });
     expect(dialectOnly.code).toBe(0);
-    expect(dialectOnly.text).not.toContain('typescript:');
+    expect(dialectOnly.text).not.toContain(TS_BROKEN);
 
     const broken = doctor(astro(['src/copy.ts']), { breakTypescript: true });
     expect(broken.code).toBe(0);
-    expect(broken.text).toContain(NOT_INSTALLED);
+    expect(broken.text).toContain(NOT_LOADED);
   });
 
   /** A host with one declared, pointered template `welcome`, a recording send function and the given store. */
@@ -6577,9 +6594,8 @@ describe('adoption', () => {
     expect(spilled).not.toContain('next ?');
     // The quoted brace-opener survives, and it is real page-title copy.
     expect(spilled).toContain('possible copy "{`stet changelog — $"');
-    // The inline-tag split, both halves, stated rather than silently repaired.
-    expect(spilled).toContain('possible copy "Managed"');
-    expect(spilled).toContain('possible copy "sending"');
+    // A sentence split by an inline tag is one finding.
+    expect(spilled).toContain('possible copy "Managed sending"');
 
     // ONE ignore comment silencing a WHOLE copy module is named — file, comment
     // line and count — on the LINE channel, with the exit unmoved even under a
@@ -6619,16 +6635,16 @@ describe('adoption', () => {
     expect(await bare.run('scan')).toBe(0);
     expect(bare.stderr()).toBe('');
 
-    // The scanner is the TypeScript 5 compiler API, and it says so. TS7's npm
-    // package exposes version constants at its root and no compiler at all, so
-    // a 7.x resolution is refused by name rather than crashing somewhere
-    // further in — and the peer range (`>=5 <7`) states the same fact.
-    expect(TS7_REFUSAL).toContain('typescript 7 is not yet supported');
-    expect(TS7_REFUSAL).toContain('install typescript@5');
-    const peers = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    // The scanner is the TypeScript 5 compiler API, and stet ships its own
+    // copy: a dependency at a 5.x range, no peer. A copy that does not load is
+    // a broken install, and the one line says to reinstall stet.
+    expect(TS_BROKEN).toContain('reinstall stet: npm i @getstet/stet');
+    const shipped = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+      dependencies: Record<string, string>;
       peerDependencies: Record<string, string>;
     };
-    expect(peers.peerDependencies['typescript']).toBe('>=5 <7');
+    expect(shipped.dependencies['typescript']).toBe('^5.6.0');
+    expect(shipped.peerDependencies['typescript']).toBeUndefined();
 
     // The declared-slot check rides the same walk. A slot whose flattened key
     // has left the file that renders it is copy the dashboard still offers an
@@ -6945,22 +6961,22 @@ describe('adoption', () => {
     expect(listed.filter((l) => /^src\/pages\/p\d\.tsx: could not be parsed/.test(l))).toHaveLength(4);
     expect(listed.join('\n')).not.toContain('run with --verbose to list them');
 
-    // A template-dialect file is named, never parsed and never counted among the refusals.
-    const astro = makeAdoptionHost();
-    expect(await astro.run('init', '--yes')).toBe(0);
-    const astroConfig = JSON.parse(astro.file('stet.config.json'));
-    astro.write('stet.config.json', JSON.stringify({ ...astroConfig, managedSurfaces: ['src/pages/**/*.astro'] }, null, 2));
-    astro.write('src/pages/index.astro', '---\nconst t = 1;\n---\n<h1>Chapter one</h1>\n');
-    const beforeDialect = astro.out.length;
-    expect(await astro.run('register', '--from', 'scan')).toBe(0);
-    const one = astro.out.slice(beforeDialect);
-    expect(one).toContain("src/pages/index.astro: .astro is not rewritten — place copy('<key>') by hand");
+    // A `.vue`, `.svelte` or `.mdx` file is named, never parsed and never counted among the refusals.
+    const dialect = makeAdoptionHost();
+    expect(await dialect.run('init', '--yes')).toBe(0);
+    const dialectConfig = JSON.parse(dialect.file('stet.config.json'));
+    dialect.write('stet.config.json', JSON.stringify({ ...dialectConfig, managedSurfaces: ['src/pages/**/*.vue'] }, null, 2));
+    dialect.write('src/pages/index.vue', '<template>\n  <h1>Chapter one</h1>\n</template>\n');
+    const beforeDialect = dialect.out.length;
+    expect(await dialect.run('register', '--from', 'scan')).toBe(0);
+    const one = dialect.out.slice(beforeDialect);
+    expect(one).toContain("src/pages/index.vue: .vue is not rewritten — place copy('<key>') by hand");
     expect(one.join('\n')).not.toContain('could not be parsed');
-    for (let i = 1; i < 5; i++) astro.write(`src/pages/p${i}.astro`, '<h1>Another chapter</h1>\n');
-    const beforeFive = astro.out.length;
-    expect(await astro.run('register', '--from', 'scan')).toBe(0);
-    expect(astro.out.slice(beforeFive)).toContain(
-      "5 files are not rewritten (.astro) — place copy('<key>') by hand; run with --verbose to list them",
+    for (let i = 1; i < 5; i++) dialect.write(`src/pages/p${i}.vue`, '<template><h1>Another chapter</h1></template>\n');
+    const beforeFive = dialect.out.length;
+    expect(await dialect.run('register', '--from', 'scan')).toBe(0);
+    expect(dialect.out.slice(beforeFive)).toContain(
+      "5 files are not rewritten (.vue) — place copy('<key>') by hand; run with --verbose to list them",
     );
 
     // On the static-HTML host the ONE edit is the mark, and the plain run writes
@@ -7403,6 +7419,136 @@ describe('adoption', () => {
     expect(existing.stdout()).toContain('register: nothing to adopt');
   });
 
+  it('Requirement: scan reports copy literals as warnings, never failing by default — a JSX sentence is one finding', async () => {
+    const host = makeAdoptionHost({
+      page: 'export default function Page() {\n  return (\n    <main>\n      <p>Install: run{" "}\n  <b>npx x init</b>{" "}\n  and answer.</p>\n      <p>Read <Badge>new</Badge> docs</p>\n      <p>Hi <span dangerouslySetInnerHTML={h} /> there</p>\n    </main>\n  );\n}\n',
+    });
+    expect(await host.run('init', '--yes')).toBe(0);
+    expect(await host.run('scan')).toBe(0);
+    const warned = host.err.filter((l) => l.includes('unkeyed copy'));
+    expect(warned.filter((l) => l.includes('"Install: run npx x init and answer."'))).toHaveLength(1);
+    expect(warned.filter((l) => /"(Install: run|npx x init|and answer\.)"/.test(l))).toEqual([]);
+    // The paragraph holding a component keeps one finding per run.
+    for (const run of ['"Read"', '"new"', '"docs"']) expect(warned.filter((l) => l.includes(run))).toHaveLength(1);
+    // A sentence kept as written is still reported, with no key proposed.
+    expect(host.err.filter((l) => l.includes('possible copy "Hi there"'))).toHaveLength(1);
+  });
+
+  it('Requirement: register adds a key and rewrites the consuming leaf — a JSX sentence becomes one key on a server and a client component (journey A2)', async () => {
+    const host = makeAdoptionHost({ page: 'export default function Page() {\n  return <p>Run <b>npx x init</b> now.</p>;\n}\n' });
+    expect(await host.run('init', '--yes')).toBe(0);
+    host.write('app/widget.tsx', "'use client';\nimport Link from 'next/link';\nexport default function Widget() {\n  return <p>Read the <Link href=\"/docs\">docs</Link>.</p>;\n}\n");
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const page = host.file('app/page.tsx');
+    const widget = host.file('app/widget.tsx');
+    expect(page).toMatch(/<p>\{richParts\(copy\('\w+'\), \[\(c, k\) => <b key=\{k\}>\{c\}<\/b>\]\)\}<\/p>/);
+    expect(page).toContain("import { richParts } from '@getstet/stet/react/server';");
+    expect(widget).toMatch(/<p>\{richParts\(copy\('\w+'\), \[\(c, k\) => <Link key=\{k\} href="\/docs">\{c\}<\/Link>\]\)\}<\/p>/);
+    expect(widget).toContain('const copy = useCopy();');
+    expect(widget).toContain("import { richParts } from '@getstet/stet/react';");
+    const keys = JSON.parse(host.file('content/descriptor.json')).keys as Record<string, { tags?: number }>;
+    const values = JSON.parse(host.file('content/defaults.json')).default as Record<string, string>;
+    const sentences = Object.entries(values).filter(([, v]) => v === 'Run <1>npx x init</1> now.' || v === 'Read the <1>docs</1>.');
+    expect(sentences.map(([k]) => keys[k]?.tags)).toEqual([1, 1]);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.stdout()).toContain('register: nothing to adopt');
+  });
+
+  it("Requirement: register adds a key and rewrites the consuming leaf — an Astro page's copy becomes key reads (journey A14)", async () => {
+    const host = makeCliHost({
+      config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },
+    });
+    const files: Record<string, string> = {
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }),
+      'src/lib/content.ts': 'export const copyMap: Record<string, string> = {};\n',
+      'src/copy.ts': "import { copyMap } from '@/lib/content';\nexport const copy = copyMap;\n",
+      'src/components/SectionHead.astro': '---\nconst { label } = Astro.props;\n---\n<span>{label}</span>\n',
+      'src/pages/index.astro': [
+        '---',
+        'import { copy } from "../copy";',
+        'import SectionHead from "../components/SectionHead.astro";',
+        'const surfaces = [{ label: "Site copy" }];',
+        '---',
+        '<html><head><title>Pricing</title></head><body>',
+        '<p>{copy.hero_headline}</p>',
+        '<h3>Fixing a word</h3>',
+        '<button title="Copy">x</button>',
+        '<SectionHead label="Capabilities" />',
+        '{surfaces.map((s) => <h3>{s.label}</h3>)}',
+        '<code>t("hero_headline")</code>',
+        '</body></html>',
+        '',
+      ].join('\n'),
+    };
+    for (const [rel, text] of Object.entries(files)) {
+      mkdirSync(dirname(join(host.cwd, rel)), { recursive: true });
+      writeFileSync(join(host.cwd, rel), text);
+    }
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const page = host.file('src/pages/index.astro');
+    expect(page).toMatch(/<h3>\{copy\.\w+\}<\/h3>/);
+    expect(page).toMatch(/<button title=\{copy\.\w+\}>x<\/button>/);
+    expect(page).toMatch(/<SectionHead label=\{copy\.\w+\} \/>/);
+    expect(page).toMatch(/const surfaces = \[\{ label: copy\.\w+ \}\];/);
+    expect(page).toMatch(/<code>\{copy\.\w+\}<\/code>/);
+    expect(page).not.toContain('<code>t("hero_headline")</code>');
+    expect(page).toContain('<title>Pricing</title>');
+    expect(host.stdout()).not.toContain('inside <code>');
+    expect(host.out).toContain('src/pages/index.astro:6 "Pricing" not rewritten (SEO text — adopt it with stet pages scan) — adopt by hand');
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.stdout()).toContain('register: nothing to adopt');
+  });
+
+  it("Requirement: pages scan declares routes by confirmation, never inference — an Astro page's title and description are seeded and bound (journey A14)", async () => {
+    const host = makeCliHost({
+      config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },
+    });
+    const pricing =
+      '<html><head><title>stet — pricing</title><meta name="description" content="Pay for the projects you run." /></head><body><h1>Plans</h1></body></html>\n';
+    const files: Record<string, string> = {
+      'content/descriptor.json': JSON.stringify({ version: 1, keys: {} }),
+      'content/defaults.json': JSON.stringify({ default: {} }),
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }),
+      'src/lib/content.ts': 'export const copyMap: Record<string, string> = {};\n',
+      'src/copy.ts': "import { copyMap } from '@/lib/content';\nexport const copy = copyMap;\n",
+      'src/layouts/Base.astro':
+        '---\nconst { title } = Astro.props;\n---\n<html><head><title>{title}</title><meta name="description" content="Shared words for every page" /></head><body><slot /></body></html>\n',
+      'src/pages/pricing.astro': pricing,
+      'src/pages/identities/index.astro':
+        '---\nimport { copy } from "../../copy";\nimport Base from "../../layouts/Base.astro";\n---\n<Base title="Brand options"><h1>{copy.eyebrow}</h1></Base>\n',
+    };
+    for (const [rel, text] of Object.entries(files)) {
+      mkdirSync(dirname(join(host.cwd, rel)), { recursive: true });
+      writeFileSync(join(host.cwd, rel), text);
+    }
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('  seo: seo_pricing_title, seo_pricing_desc — seeded from the page');
+    expect(host.file('src/pages/pricing.astro')).toBe(pricing);
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain(
+      '  description: src/pages/identities/index.astro writes it where stet cannot bind it (shown where stet cannot follow) — bind seo_identities_desc by hand',
+    );
+    const values = loadSnapshot(JSON.parse(host.file('content/defaults.json')))['default'] ?? {};
+    expect(values['seo_pricing_title']).toBe('stet — pricing');
+    expect(values['seo_pricing_desc']).toBe('Pay for the projects you run.');
+    expect(values['seo_identities_title']).toBe('Brand options');
+    expect(values['seo_identities_desc']).toBe('');
+    // A page that bound no `copy` gets the read path's import; one reading through a copy module adds none.
+    expect(host.file('src/pages/pricing.astro')).toBe(
+      "---\nimport { copy } from '@/lib/content';\n---\n" +
+        '<html><head><title>{copy(\'seo_pricing_title\')}</title><meta name="description" content={copy(\'seo_pricing_desc\')} /></head><body><h1>Plans</h1></body></html>\n',
+    );
+    expect(host.file('src/pages/identities/index.astro')).toContain('<Base title={copy.seo_identities_title}>');
+    // A second run proposes nothing and moves no page.
+    const pages = ['src/pages/pricing.astro', 'src/pages/identities/index.astro'].map((rel) => host.file(rel));
+    host.out.length = 0;
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain('pages scan: nothing to propose');
+    expect(['src/pages/pricing.astro', 'src/pages/identities/index.astro'].map((rel) => host.file(rel))).toEqual(pages);
+  });
+
   it('Requirement: register applies an edited naming plan', async () => {
     type Plan = { made: Record<string, string>; keys: Array<Record<string, unknown> & { proposed: string }> };
     const planOf = (host: { file(rel: string): string }): Plan => JSON.parse(host.file('naming.json')) as Plan;
@@ -7757,7 +7903,8 @@ describe('adoption', () => {
     expect(readFileSync(join(odd.cwd, 'CLAUDE.md')).equals(latin1)).toBe(true);
 
     // A dialect host's parse refusals collapse to one count line rather than
-    // burying the plan they print beside, and `--verbose` restores the list.
+    // burying the plan they print beside, and `--verbose` restores the list
+    // (a `.vue` wall: an `.astro` file goes to the Astro un-rewrite, D15).
     // The host keeps a stet-importing surface on purpose: with no importer the
     // compiler-less probe skips the un-rewrite loop whole and no refusal would
     // print at all.
@@ -7766,12 +7913,12 @@ describe('adoption', () => {
     expect(await wall.run('register', '--from', 'scan', '--write')).toBe(0);
     const wallConfig = JSON.parse(wall.file('stet.config.json'));
     for (let i = 0; i < 5; i++) {
-      wall.write(`src/pages/p${i}.astro`, '---\nconst t = 1;\n---\n<h1>Chapter</h1>\n');
+      wall.write(`src/pages/p${i}.vue`, '<template>\n  <h1>Chapter</h1>\n</template>\n');
     }
     wall.write(
       'stet.config.json',
       JSON.stringify(
-        { ...wallConfig, managedSurfaces: [...wallConfig.managedSurfaces, 'src/pages/**/*.astro'] },
+        { ...wallConfig, managedSurfaces: [...wallConfig.managedSurfaces, 'src/pages/**/*.vue'] },
         null,
         2,
       ),
@@ -7783,7 +7930,7 @@ describe('adoption', () => {
       '5 file(s) could not be parsed cleanly — not un-rewritten ' +
         '(the backstop refuses the dep drop if they still import stet); run with --verbose to list them',
     );
-    expect(walled.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toEqual([]);
+    expect(walled.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l))).toEqual([]);
     // The rest of the plan is untouched — the collapse replaces the wall, not
     // the manifest around it.
     expect(walled.join('\n')).toContain('stays (no stet imports):');
@@ -7792,7 +7939,7 @@ describe('adoption', () => {
     const beforeWallVerbose = wall.out.length;
     expect(await wall.run('eject', '--verbose')).toBe(0);
     const wallListed = wall.out.slice(beforeWallVerbose);
-    expect(wallListed.filter((l) => /^src\/pages\/p\d\.astro: could not be parsed/.test(l))).toHaveLength(5);
+    expect(wallListed.filter((l) => /^src\/pages\/p\d\.vue: could not be parsed/.test(l))).toHaveLength(5);
     expect(wallListed.join('\n')).not.toContain('run with --verbose to list them');
 
     // On the static-HTML host there is nothing to un-rewrite, unwrap or delete:
@@ -7819,6 +7966,40 @@ describe('adoption', () => {
     expect(html.stdout()).toContain(
       'stays (no stet imports): stet.config.json, content/descriptor.json, content/defaults.json',
     );
+
+    // A JSX sentence key goes back to the markup register replaced: the
+    // renderers' own tags, the inserted key gone, the renderer's import with
+    // the accessor's (D15, R31).
+    const sentence = 'export default function Page() {\n  return <p>Run <b className="cmd">npx x init</b> now.</p>;\n}\n';
+    const jsx = makeAdoptionHost({ page: sentence });
+    expect(await jsx.run('init', '--yes')).toBe(0);
+    expect(await jsx.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(jsx.file('app/page.tsx')).toContain('{richParts(copy(');
+    expect(await jsx.run('eject', '--write')).toBe(0);
+    expect(jsx.file('app/page.tsx')).toBe(sentence);
+    expect(jsx.allText()).not.toMatch(/@getstet\/stet/);
+
+    // An Astro page's reads go back as text: register's rewrite and the import
+    // and fence it inserted reversed byte for byte (D15, R23).
+    const astro = makeCliHost({
+      config: { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: [], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },
+    });
+    const astroPage = '<h3>Fixing a word</h3>\n<button title="Copy the command">x</button>\n<p>Install: run <b>npx x init</b> and answer.</p>\n';
+    for (const [rel, text] of Object.entries({
+      'package.json': JSON.stringify({ name: 'host', dependencies: { '@getstet/stet': '^1.0.0' } }),
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }),
+      'src/lib/content.ts': 'export const copy = (key: string): string => key;\n',
+      'src/pages/index.astro': astroPage,
+    })) {
+      mkdirSync(dirname(join(astro.cwd, rel)), { recursive: true });
+      writeFileSync(join(astro.cwd, rel), text);
+    }
+    expect(await astro.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(astro.file('src/pages/index.astro')).toContain("import { richParts } from '@getstet/stet';");
+    expect(await astro.run('eject', '--write')).toBe(0);
+    expect(astro.file('src/pages/index.astro')).toBe(astroPage);
+    expect(astro.exists('src/lib/content.ts')).toBe(false);
+    expect(JSON.parse(astro.file('package.json')).dependencies['@getstet/stet']).toBeUndefined();
   });
 
   it('Requirement: hook install adds the pre-commit gate, opt-in and executable', async () => {
@@ -8961,8 +9142,8 @@ describe('dashboard', () => {
     expect(await host.run('pages', 'scan', '--apply')).toBe(0);
     const page = await served(host.cwd);
     const doc = page.dom.window.document;
-    expect([...doc.querySelectorAll('#gsel option')].map((option) => option.textContent)).toEqual(['home — page', 'SEO']);
-    expect((doc.getElementById('gsel') as HTMLSelectElement).value).toBe('page:home');
+    expect([...doc.querySelectorAll('#gsel option')].map((option) => option.textContent)).toEqual(['All keys', 'This page', 'home — page', 'SEO']);
+    expect((doc.getElementById('gsel') as HTMLSelectElement).value).toBe('all');
     // The SEO group holds exactly the keys every mark of which is a head text.
     const marks = (await call(handlerOver([host.cwd]).handler, `/api/site/marks${siteOf(host.cwd)}`)).body;
     const head = Object.keys(marks.places as Record<string, Array<{ head?: true }>>)
@@ -9302,9 +9483,10 @@ describe('dashboard', () => {
       page.dom.window.close();
       return at;
     };
-    expect(await opens('/about.html?x=1')).toEqual({ group: 'page:about', route: '/about.html?x=1', loads: 1 });
-    expect(await opens('/')).toEqual({ group: 'page:home', route: '/', loads: 1 });
-    expect(await opens('/retired.html')).toEqual({ group: 'page:about', route: '/about.html', loads: 1 });
+    // The route is chosen through the groups; the list opens on every key.
+    expect(await opens('/about.html?x=1')).toEqual({ group: 'all', route: '/about.html?x=1', loads: 1 });
+    expect(await opens('/')).toEqual({ group: 'all', route: '/', loads: 1 });
+    expect(await opens('/retired.html')).toEqual({ group: 'all', route: '/about.html', loads: 1 });
   });
 
   it('Requirement: The header shows the branch, the preview link and Publish to live', async () => {
@@ -10224,11 +10406,13 @@ describe('dashboard', () => {
       },
     });
     await agent.pick([{ key: 'lab_button' }]);
-    // The tap selects, scrolls the field into view with the tapped element kept on screen, and opens no popover.
-    expect(scrolled).toContain('text:lab_button {"block":"nearest"}');
+    // The tap selects and opens no popover; the field is not scrolled to, so the frame under the finger stays put.
+    expect(scrolled).toEqual([]);
     expect(evalIn(page, 'S.popover')).toBeNull();
-    // A second tap on the selected key opens the column's field, not the popover.
+    // A second tap on the selected key focuses the column's field and scrolls it into view, the tapped element kept on screen.
     await agent.pick([{ key: 'lab_button' }], { again: true });
+    expect(scrolled).toEqual(['text:lab_button {"block":"nearest"}']);
+    expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_button');
     expect(evalIn(page, 'S.popover')).toBeNull();
     expect(evalIn(page, 'S.edit')).toBeNull();
     // The editor sits directly under the preview, the key list after it, every card of the column one column wide.
@@ -11214,7 +11398,7 @@ describe('key-usage', () => {
       ].join('\n'),
     );
 
-    // Without `typescript` the rows carry no badge, `usage` is null and the install line is among the findings.
+    // Without stet's own `typescript` the rows carry no badge, `usage` is null and the reinstall line is among the findings.
     const noCompiler = hostOver();
     vi.resetModules();
     vi.doMock('typescript', () =>
@@ -11233,7 +11417,7 @@ describe('key-usage', () => {
       expect(bareAnswer.rows.every((r) => !('badge' in r))).toBe(true);
       expect(bareAnswer.usage).toBeNull();
       expect(bareAnswer.findings).toEqual([
-        expect.objectContaining({ level: 'warn', message: "stet needs 'typescript' to read your source — install it as a dev dependency: npm i -D typescript" }),
+        expect.objectContaining({ level: 'warn', message: 'stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet' }),
       ]);
     } finally {
       vi.doUnmock('typescript');
@@ -11481,10 +11665,10 @@ describe('preview-editing', () => {
       return { framed, btn, node };
     };
 
-    // Typing in place on a React page: the whole text selected, typing replaces it, Enter keeps it, React's nodes come back.
+    // Typing in place on a React page: a collapsed caret, nothing selected, typing inserts, Enter keeps it, React's nodes come back.
     const typing = await buttonEdit();
-    const range = (typing.framed.win.getSelection() as Selection).getRangeAt(0);
-    expect([range.startContainer, range.startOffset, range.endContainer, range.endOffset]).toEqual([typing.btn, 0, typing.btn, typing.btn.childNodes.length]);
+    const selection = typing.framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.anchorNode, selection.anchorOffset]).toEqual([true, typing.btn, typing.btn.childNodes.length]);
     expect(typing.btn.getAttribute('contenteditable')).toBe('plaintext-only');
     typing.btn.textContent = 'Try it free';
     typing.btn.dispatchEvent(new typing.framed.win.InputEvent('input', { inputType: 'insertText', bubbles: true }));
@@ -11693,7 +11877,7 @@ describe('preview-editing', () => {
     expect(idOf(framed, 'close').getAttribute('aria-label')).toBe('Begin');
     bridge.page.dom.window.close();
 
-    // A tap at phone width: no popover, the key is selected, the column's field scrolled into view and typed in.
+    // A tap at phone width: no popover, the key is selected; a second tap scrolls the column's field into view, focused, and it is typed in.
     const scrolled: string[] = [];
     const phone = await bridged({
       site: labSite(),
@@ -11706,8 +11890,10 @@ describe('preview-editing', () => {
     });
     await phone.agent.pick([{ key: 'lab_button' }]);
     expect(selected(phone.page)).toBe('lab_button');
-    expect(scrolled).toContain('text:lab_button');
+    // The first tap scrolls nothing; the second focuses the field and scrolls it into view.
+    expect(scrolled).toEqual([]);
     await phone.agent.pick([{ key: 'lab_button' }], { again: true });
+    expect(scrolled).toEqual(['text:lab_button']);
     expect(phone.agent.sent('edit')).toEqual([]);
     expect(popover(phone.page).hidden).toBe(true);
     expect(docOf(phone.page).activeElement?.getAttribute('data-act-input')).toBe('text:lab_button');

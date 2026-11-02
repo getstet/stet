@@ -46,7 +46,7 @@ import { applyPages, auditablePages, pageOfFile, proposeForHost, servedRoute, ty
 import { unmountEdits } from './provider-mount.js';
 import { plural, Report, UsageError } from './report.js';
 import { applyFileEdits } from './rewrite.js';
-import { loadTypescript } from './source-scan.js';
+import { TS_BROKEN, loadTypescript } from './source-scan.js';
 import { childEnv, devDefaults, foregroundEnv, readWorkspace, routerPreviewCommand, workspacePath, type WorkspaceEntry } from './workspace.js';
 
 const AUDIT_PACKAGE_MISSING = 'stet audit lighthouse needs Lighthouse — run npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5';
@@ -390,12 +390,12 @@ async function footprintOf(cwd: string, config: StetConfig): Promise<{ lines: st
   const layout = config.rootLayout === undefined ? undefined : join(cwd, config.rootLayout);
   const source = layout !== undefined && existsSync(layout) ? readFileSync(layout, 'utf8') : '';
   if (layout !== undefined && source.includes('<CopyProvider') && clientReadFiles(cwd, config).length === 0) {
-    // The line promises what upgrade does: it names the unmount only where `unmountEdits` takes the mount out, and says to install typescript where it does not load (upgrade leaves the mount then).
+    // The line promises what upgrade does: it names the unmount only where `unmountEdits` takes the mount out, and gives the broken-install line where stet's own typescript does not load (upgrade leaves the mount then).
     const ts = await loadTypescript().catch(() => null);
     const unmount = ts === null ? null : unmountEdits(ts, layout, source, cwd, config);
     lines.push(
       ts === null
-        ? `stet  ${config.rootLayout as string} mounts CopyProvider and no client reads — install typescript, then stet upgrade can unmount it`
+        ? `stet  ${config.rootLayout as string} mounts CopyProvider and no client reads — ${TS_BROKEN}`
         : unmount === null
           ? `stet  ${config.rootLayout as string}: CopyProvider is mounted and no client component reads copy — unmount it by hand; the mount is not the one stet init wrote`
           : `stet  ${config.rootLayout as string} mounts CopyProvider and no client component reads copy — stet upgrade unmounts it`,

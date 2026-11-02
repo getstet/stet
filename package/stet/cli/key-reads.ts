@@ -33,16 +33,8 @@ import type * as TS from 'typescript';
 
 import { normalizeNoExt, pathAliasMappings, resolveSpecifier } from './config.js';
 import { lineIndex } from './html-host.js';
-import {
-  BOGUS_COMMENT,
-  CDATA_SECTION,
-  CODE_FENCE,
-  ESM_LINE,
-  FRONTMATTER,
-  HTML_COMMENT,
-  scriptKindFor,
-  type Dialect,
-} from './source-scan.js';
+import { dialectCode, openTag, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
+import { parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 
 /**
  * A read of a key: `copy.get('<key>')`, `copy('<key>')` or `get('<key>')`, and
@@ -54,258 +46,7 @@ import {
 export const KEY_READ =
   /\bcopy(?:Map)?\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1|\b(?:copy|get)\s*\(\s*(['"`])([^'"`\n]+)\3|\bcopy(?:Map)?\s*\??\.\s*([A-Za-z_$][\w$]*)/g;
 
-/** A half-open span of source offsets. */
-export interface Span {
-  start: number;
-  end: number;
-  /** A script that is its own scope: a client `<script>` in Astro or HTML, which the front matter's imports never reach. */
-  own?: true;
-}
-
-/** A script whose `type` names no JavaScript is data: JSON-LD, a template. */
-const JS_SCRIPT_TYPE = /\btype\s*=\s*["']?(?!module\b|text\/javascript\b|application\/javascript\b)[^"'\s>]+/i;
-
-/** The dialects whose `<script>` elements are client scripts, each its own scope. */
-const OWN_SCOPE: ReadonlySet<Dialect> = new Set(['astro', 'html', 'mdx']);
-
-/** The attribute that makes an element's content text, per dialect. */
-const RAW_ATTR: Partial<Record<Dialect, RegExp>> = {
-  astro: /\sis:raw(?=[\s/>=])/,
-  vue: /\sv-pre(?=[\s/>=])/,
-};
-
-/**
- * The open tag at `i` (its `<`): where it ends, as `closing` reads it, its name
- * lowercased, and whether it closes itself (`<script … />`), in which case a
- * template dialect gives its element no body. The one reading of an open tag
- * `dialectCode` and the dashboard's marks route share.
- */
-export function openTag(source: string, i: number): { end: number; name: string; selfClosing: boolean } {
-  const end = closing(source, i, '>');
-  const tag = source.slice(i, end);
-  return { end, name: (/^<([A-Za-z][\w:.-]*)/.exec(tag)?.[1] ?? '').toLowerCase(), selfClosing: /\/\s*>$/.test(tag) };
-}
-
-/**
- * The code spans of a template dialect's source, at the markup level. Front
- * matter, script bodies and MDX's ESM lines are TypeScript regions, returned
- * apart so the caller can take their comments out with the compiler; tag
- * interiors outside their quoted values, and braces, are expressions. A
- * `.html` file on a JavaScript host evaluates only its scripts.
- *
- * One walk over the markup, so a `<script>` inside a raw element is raw too.
- * An open tag closes where `closing` says, quotes and braces respected, so
- * `set:html={a > b}` and `define:vars={{ … }}` stay inside it and count as
- * expressions; a self-closing `<script … />` has no body. An Astro or HTML
- * `<script>` runs in the browser, so it is its own scope; a Vue or Svelte
- * `<script>` is the component's, which its template reads. `braces` lists every
- * brace expression the walk read, in the markup and in its tags, for the
- * rename's parse check.
- */
-export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]; expressions: Span[]; braces: Span[] } {
-  const scripts: Span[] = [];
-  const expressions: Span[] = [];
-  const braces: Span[] = [];
-  const blank: Span[] = [];
-  const pass = (pattern: RegExp): void => {
-    for (const m of source.matchAll(pattern)) blank.push({ start: m.index, end: m.index + m[0].length });
-  };
-  if (dialect === 'astro' || dialect === 'mdx') {
-    const fm = FRONTMATTER.exec(source);
-    if (fm !== null && fm.index === 0) {
-      const open = fm[0].indexOf('\n') + 1;
-      scripts.push({ start: open, end: fm[0].lastIndexOf('\n') });
-      blank.push({ start: 0, end: fm[0].length });
-    }
-  }
-  pass(HTML_COMMENT);
-  pass(CDATA_SECTION);
-  if (dialect === 'mdx') {
-    pass(CODE_FENCE);
-    // A fence with no close runs to the end of the document, as CommonMark reads it.
-    for (const m of source.matchAll(/^[ \t]*(?:`{3,}|~{3,})/gm)) {
-      if (!within(blank, m.index)) blank.push({ start: m.index, end: source.length });
-    }
-    for (const m of source.matchAll(ESM_LINE)) {
-      if (within(blank, m.index)) continue;
-      scripts.push({ start: m.index, end: m.index + m[0].length });
-      blank.push({ start: m.index, end: m.index + m[0].length });
-    }
-  }
-  pass(BOGUS_COMMENT);
-
-  const raw = RAW_ATTR[dialect];
-  const lower = source.toLowerCase();
-  const n = source.length;
-  let i = 0;
-  while (i < n) {
-    const skip = blank.find((b) => b.start <= i && i < b.end);
-    if (skip !== undefined) {
-      i = skip.end;
-      continue;
-    }
-    const ch = source[i];
-    if (ch === '`' && dialect === 'mdx') {
-      // Inline code in MDX prose is text: `{copy.k}` there prints as written.
-      const run = /^`+/.exec(source.slice(i))?.[0] ?? '`';
-      const shut = new RegExp(`(?<!\`)${run}(?!\`)`, 'g');
-      shut.lastIndex = i + run.length;
-      const found = shut.exec(source);
-      i = found === null ? i + run.length : found.index + run.length;
-      continue;
-    }
-    if (ch === '<' && /[A-Za-z]/.test(source[i + 1] ?? '')) {
-      const { end, name, selfClosing } = openTag(source, i);
-      const tag = source.slice(i, end);
-      if (dialect !== 'html') expressions.push(...tagCode(source, i, end, dialect, braces));
-      if (name === 'script' || name === 'style') {
-        if (selfClosing) {
-          i = end;
-          continue;
-        }
-        const close = lower.indexOf(`</${name}`, end);
-        const bodyEnd = close === -1 ? n : close;
-        if (name === 'script' && !JS_SCRIPT_TYPE.test(tag)) {
-          scripts.push({ start: end, end: bodyEnd, ...(OWN_SCOPE.has(dialect) ? { own: true as const } : {}) });
-        }
-        i = close === -1 ? n : closing(source, close, '>');
-        continue;
-      }
-      // The attribute itself, never the words of a quoted value (`title="… is:raw …"`).
-      if (raw !== undefined && raw.test(tag.replace(/(=\s*)(["'])[\s\S]*?\2/g, '$1""')) && !selfClosing) {
-        // Astro ends a raw element at the first close tag of its name, a nested
-        // one included (checked with astro build); Vue's parser nests, so
-        // `v-pre` ends at the close tag that balances it.
-        let close = lower.indexOf(`</${name}`, end);
-        if (dialect === 'vue') {
-          const opener = new RegExp(`<${name}(?=[\\s/>])`, 'g');
-          for (let open = end; close !== -1; ) {
-            opener.lastIndex = open;
-            const inner = opener.exec(lower);
-            if (inner === null || inner.index > close) break;
-            const nested = openTag(source, inner.index);
-            open = nested.end;
-            if (!nested.selfClosing) close = lower.indexOf(`</${name}`, close + 2);
-          }
-        }
-        i = close === -1 ? n : closing(source, close, '>');
-        continue;
-      }
-      i = end;
-      continue;
-    }
-    // Vue interpolates only a double brace: `{see below}` in its text prints.
-    if (ch === '{' && dialect !== 'html' && (dialect !== 'vue' || source[i + 1] === '{')) {
-      const end = closing(source, i, '}');
-      // `{/* a note */}` is a comment in every brace dialect; a brace holding
-      // code beside its comments is code, the comments passed over later.
-      const inner = source.slice(i + 1, end - 1).replace(/\/\*[\s\S]*?\*\//g, '').trim();
-      if (inner !== '') {
-        expressions.push({ start: i, end });
-        braces.push({ start: i, end });
-      }
-      i = end;
-      continue;
-    }
-    i += 1;
-  }
-  return { scripts, expressions, braces };
-}
-
-/** A Vue directive: its quoted value is an expression. */
-const VUE_DIRECTIVE = /^(?::|@|#|v-)/;
-
-/**
- * An open tag's code: its interior with every quoted attribute value taken
- * out, so `class="nav_docs"` and `href="#nav_docs"` are text, and a braced
- * value is code. Two dialects read inside the quotes: a Vue directive's value
- * (`:title="copy.k"`, `@click`, `v-if`) is an expression, and a Svelte value's
- * braces (`title="{copy.k}"`) are code.
- */
-function tagCode(source: string, start: number, end: number, dialect: Dialect, braces: Span[]): Span[] {
-  const out: Span[] = [];
-  let from = start;
-  let i = start;
-  while (i < end) {
-    const ch = source[i] as string;
-    if ((ch === '"' || ch === "'") && /=\s*$/.test(source.slice(Math.max(start, i - 8), i))) {
-      const close = source.indexOf(ch, i + 1);
-      const stop = close === -1 || close >= end ? end : close + 1;
-      const attr = /([^\s=<]+)\s*=\s*$/.exec(source.slice(start, i))?.[1] ?? '';
-      if (dialect === 'vue' && VUE_DIRECTIVE.test(attr)) {
-        i = stop;
-        continue;
-      }
-      if (i > from) out.push({ start: from, end: i });
-      if (dialect === 'svelte') {
-        for (let j = i + 1; j < stop - 1; j++) {
-          if (source[j] !== '{') continue;
-          const braceEnd = closing(source, j, '}');
-          out.push({ start: j, end: braceEnd });
-          braces.push({ start: j, end: braceEnd });
-          j = braceEnd - 1;
-        }
-      }
-      from = stop;
-      i = stop;
-      continue;
-    }
-    if (ch === '{') {
-      const braceEnd = closing(source, i, '}');
-      braces.push({ start: i, end: braceEnd });
-      i = braceEnd;
-      continue;
-    }
-    i += 1;
-  }
-  if (end > from) out.push({ start: from, end });
-  return out;
-}
-
-/**
- * The offset just past the `>` or `}` that closes the construct opening at
- * `from` — quote-aware, comment-aware inside a brace, and counting nested
- * braces, so `alt={`a > b`}` and `{ {a: 1} }` close where they do and a `}` in a
- * brace's comment closes nothing. The one brace matcher: the rename's walk and
- * the dashboard's marks route both end a brace here.
- */
-export function closing(source: string, from: number, close: '>' | '}'): number {
-  let depth = 0;
-  let quote: string | null = null;
-  for (let i = from; i < source.length; i++) {
-    const ch = source[i] as string;
-    if (quote !== null) {
-      if (ch === '\\') i += 1;
-      else if (ch === quote) quote = null;
-      continue;
-    }
-    if (depth > 0 && ch === '/' && (source[i + 1] === '*' || (source[i + 1] === '/' && source[i - 1] !== ':'))) {
-      // A comment inside an expression: a brace or quote in it closes nothing.
-      const end = source[i + 1] === '*' ? source.indexOf('*/', i + 2) : source.indexOf('\n', i + 2);
-      i = end === -1 ? source.length : source[i + 1] === '*' ? end + 1 : end - 1;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === '`') {
-      // In a tag, a quote opens only an attribute value; in a brace, any string
-      // — but a quote right after a letter is JSX text's apostrophe (`We're`),
-      // which JavaScript never writes. A backtick there is a tagged template
-      // (`t\`Hi\``), a string like any other.
-      if (depth > 0 && ch !== '`' && /[A-Za-z0-9]/.test(source[i - 1] ?? '')) continue;
-      if (close === '}' || depth > 0 || /=\s*$/.test(source.slice(Math.max(from, i - 8), i))) quote = ch;
-      continue;
-    }
-    if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (close === '}' && depth === 0) return i + 1;
-    } else if (ch === '>' && close === '>' && depth === 0) return i + 1;
-  }
-  return source.length;
-}
-
-export function within(spans: Span[], at: number): boolean {
-  return spans.some((s) => s.start <= at && at < s.end);
-}
+export { dialectCode, within, type Span } from './markup.js';
 
 /**
  * The comments and JSX text of a TypeScript region — the parts of it that are
@@ -668,23 +409,41 @@ export function parsesAsExpression(ts: typeof import('typescript'), dialect: Dia
   return parsesAsOne(ts, inner) || (dialect === 'astro' && parsesAsOne(ts, asJsx(inner)));
 }
 
+/**
+ * An Astro brace's inside as one TSX expression — as written, or as JSX spells
+ * it — or null where neither parses as one. The root expression is
+ * `braceRoot`'s. `asJsx` changes lengths, so the tree is read for its shape and
+ * its names: no offset in it is a source offset, and no edit is placed from it.
+ */
+export function braceTree(ts: typeof import('typescript'), brace: string): TS.SourceFile | null {
+  const inner = brace.slice(1, -1).replace(/^\s*\.\.\./, '');
+  return parseOne(ts, inner, true) ?? parseOne(ts, asJsx(inner), true);
+}
+
+/** The expression a `braceTree` holds. */
+export function braceRoot(ts: typeof import('typescript'), tree: TS.SourceFile): TS.Expression {
+  const only = tree.statements[0] as TS.ExpressionStatement;
+  return (only.expression as TS.ParenthesizedExpression).expression;
+}
+
 /** Whether `inner` parses as one TypeScript expression; a lone comment counts, closed. */
 function parsesAsOne(ts: typeof import('typescript'), inner: string): boolean {
   if (inner.replace(/\/\*[\s\S]*?\*\//g, '').trim() === '') return !/\/\*(?![\s\S]*\*\/)/.test(inner);
-  const sf = ts.createSourceFile('brace.tsx', `(${inner}\n)`, ts.ScriptTarget.Latest, false, ts.ScriptKind.TSX);
-  const diagnostics = (sf as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics ?? [];
+  return parseOne(ts, inner, false) !== null;
+}
+
+/** `inner` parsed as one parenthesized TSX expression, or null where it is not one. */
+function parseOne(ts: typeof import('typescript'), inner: string, parents: boolean): TS.SourceFile | null {
+  const sf = ts.createSourceFile('brace.tsx', `(${inner}\n)`, ts.ScriptTarget.Latest, parents, ts.ScriptKind.TSX);
   const only = sf.statements[0];
-  return (
-    diagnostics.length === 0 &&
+  const one =
+    parseDiagnosticsOf(sf).length === 0 &&
     sf.statements.length === 1 &&
     only !== undefined &&
     ts.isExpressionStatement(only) &&
-    ts.isParenthesizedExpression(only.expression)
-  );
+    ts.isParenthesizedExpression(only.expression);
+  return one ? sf : null;
 }
-
-/** The HTML elements that take no close tag: Astro reads `<br>` as JSX reads `<br />`. */
-const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
 
 /**
  * An attribute's value: quoted or braced as JSX writes it, or unquoted as HTML

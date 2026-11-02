@@ -1,5 +1,5 @@
 /**
- * `stet init` on a host with the optional `typescript` peer absent (P3-12).
+ * `stet init` where stet's own `typescript` does not load (P3-12).
  * `init` mounts no provider, so nothing in it needs the compiler: the scaffold
  * is written whole and the not-mounted line printed. This file mocks
  * `typescript` so the dynamic import rejects — kept separate so the mock never

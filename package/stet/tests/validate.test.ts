@@ -276,6 +276,17 @@ describe('checkTags', () => {
     );
   });
 
+  it('measures a sentence key over its words and refuses a tag the renderer would not read (T16.6)', () => {
+    const d = tagged(1);
+    d.keys['hero_headline']!.limits = { max: 40, severity: 'hard' };
+    const value = 'Run <1>npx x init</1> now';
+    expect(checkLimits(d, 'hero_headline', value).findings).toEqual([]);
+    expect(validateSave(d, { key: 'hero_headline', value }).ok).toBe(true);
+    for (const bad of ['Run <1>npx</1> <1>x</1>', 'Run npx', 'Run <01>npx</1>', 'Run </1/>npx']) {
+      expect({ bad, rules: checkTags(d, 'hero_headline', bad).findings.map((f) => f.rule) }).toEqual({ bad, rules: ['tags'] });
+    }
+  });
+
   it('leaves a key without tags unchecked — a <1> in prose is prose', () => {
     const verdict = checkTags(descriptor, 'hero_headline', 'the <1> shape');
     expect(verdict.ok).toBe(true);

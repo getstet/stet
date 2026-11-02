@@ -1,5 +1,5 @@
 /**
- * `stet eject` where the optional `typescript` peer is not there.
+ * `stet eject` where stet's own `typescript` is not there (a deleted install).
  *
  * Its own file because `vi.mock` is file-scoped and shadows ANY real
  * resolution — an ambient `node_modules/typescript` in an ancestor directory
@@ -120,7 +120,7 @@ describe('runEject — typescript absent', () => {
     await expect(runEject(['--write'], io(dir))).rejects.toThrow(
       /cannot reverse the accessor calls without typescript: 1 file\(s\)/,
     );
-    await expect(runEject(['--write'], io(dir))).rejects.toThrow(/npm i -D typescript/);
+    await expect(runEject(['--write'], io(dir))).rejects.toThrow(/npm i @getstet\/stet/);
     // Nothing was written: the guidance, the hook and the dependency all stand.
     expect(read(dir, 'package.json')).toBe(pkgBefore);
     expect(existsSync(join(dir, 'AGENTS.md'))).toBe(true);
@@ -141,7 +141,7 @@ describe('runEject — typescript absent', () => {
     // fires. That is the honest exit — the plan could not be verified.
     await expect(runEject([], cap)).rejects.toThrow(/still importing stet/);
     const out = cap.out.join('\n');
-    expect(out).toContain('un-rewrite: unverifiable — typescript is not installed (1 file(s) import the accessor)');
+    expect(out).toContain("un-rewrite: unverifiable — stet's TypeScript compiler did not load (1 file(s) import the accessor)");
     expect(out).toContain('still imports stet: app/page.tsx');
     // The unverifiable line prints ABOVE the survivors lines.
     expect(cap.out.findIndex((l) => l.startsWith('un-rewrite: unverifiable'))).toBeLessThan(

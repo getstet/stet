@@ -15,7 +15,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { generateDefaultsModule, generateRegistry } from '../src/codegen.js';
 import { loadDescriptor } from '../src/descriptor.js';
@@ -23,7 +23,14 @@ import { loadSnapshot } from '../src/snapshot.js';
 import { makeHtmlHost } from '../conformance/cli-host.js';
 import { loadConfig } from '../cli/config.js';
 import { runCli, type CliIo } from '../cli/main.js';
+import { rereadsClean } from '../cli/astro-rewrite.js';
 import { normalize, pageOfFile, proposeForHost, proposePages } from '../cli/pages.js';
+
+// Passes through unless a case sets it: T17.4 makes the read-back refuse one page.
+vi.mock('../cli/astro-rewrite.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../cli/astro-rewrite.js')>();
+  return { ...actual, rereadsClean: vi.fn(actual.rereadsClean) };
+});
 
 interface Host extends CliIo {
   cwd: string;
@@ -1209,5 +1216,271 @@ describe('pageOfFile', () => {
 
   it('normalizes a name through the one spelling of descriptor words', () => {
     expect(normalize('Pricing Page')).toBe('pricing_page');
+  });
+});
+
+/**
+ * An Astro page's title and description (D17, C7b): `pages scan` seeds the two
+ * SEO keys from the page and binds the page to them through register's Astro
+ * leaf, insertion and read-back.
+ */
+describe('pages scan — an Astro page seeds its title and description and binds them', () => {
+  /** An Astro host: the read path imported as `@/lib/content` (mapped unless `alias` is false) and `src/copy.ts` a declared copy module. */
+  function astroProject(
+    files: Record<string, string>,
+    options: { alias?: boolean; keys?: Record<string, unknown>; defaults?: Record<string, string>; pages?: Record<string, unknown> } = {},
+  ): Host {
+    const host = project(options.keys, options.defaults, options.pages);
+    host.put(
+      'stet.config.json',
+      JSON.stringify({
+        project: 't',
+        router: 'astro',
+        managedSurfaces: ['src/**/*.astro'],
+        copyModules: ['src/copy.ts'],
+        readPath: { file: 'src/lib/content.ts', import: '@/lib/content' },
+      }),
+    );
+    if (options.alias !== false) {
+      host.put('tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }));
+    }
+    host.put('src/lib/content.ts', 'export const copyMap: Record<string, string> = {};\n');
+    host.put('src/copy.ts', "import { copyMap } from '@/lib/content';\nexport const copy = copyMap;\n");
+    for (const [rel, text] of Object.entries(files)) host.put(rel, text);
+    return host;
+  }
+
+  const head = (title: string, description: string): string =>
+    `<html>\n<head>\n<svg><title>Close</title></svg>\n${title}\n${description}\n</head>\n<body><h1>Words</h1></body>\n</html>\n`;
+  const PRICING = head('<title>stet — pricing</title>', '<meta name="description" content="Pay for the projects you run." />');
+  const ABOUT =
+    "---\nimport { copy } from '../copy';\n---\n<html><head><title>About stet</title><meta name=\"description\" content=\"Who we are and why.\" /></head><body><h1>{copy.hero}</h1></body></html>\n";
+  const BASE = (rest = ''): string =>
+    `---\nconst { title } = Astro.props;\n---\n<html><head><title>{title}</title>${rest}</head><body><slot /></body></html>\n`;
+  const snapshotOf = (host: Host): Record<string, unknown> => loadSnapshot(JSON.parse(host.file('content/defaults.json')))['default'] ?? {};
+
+  it('T17.1: seeds both values from the page and binds it, past an svg title, by the file\'s own form', async () => {
+    const host = astroProject({ 'src/pages/pricing.astro': PRICING, 'src/pages/about.astro': ABOUT });
+    const before = { pricing: host.file('src/pages/pricing.astro'), about: host.file('src/pages/about.astro') };
+
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('  seo: seo_pricing_title, seo_pricing_desc — seeded from the page');
+    expect(host.stdout()).toContain('  title: "stet — pricing"');
+    expect(host.stdout()).toContain('  description: "Pay for the projects you run."');
+    // The plan writes nothing.
+    expect(host.file('src/pages/pricing.astro')).toBe(before.pricing);
+    expect(host.file('src/pages/about.astro')).toBe(before.about);
+
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).not.toContain('seo check will report nothing new');
+    expect(snapshotOf(host)['seo_pricing_title']).toBe('stet — pricing');
+    expect(snapshotOf(host)['seo_pricing_desc']).toBe('Pay for the projects you run.');
+    // No binding before: the call form, the fence and the import inserted.
+    expect(host.file('src/pages/pricing.astro')).toBe(
+      `---\nimport { copy } from '@/lib/content';\n---\n` +
+        head("<title>{copy('seo_pricing_title')}</title>", '<meta name="description" content={copy(\'seo_pricing_desc\')} />'),
+    );
+    // A page reading `copy.hero` through a copy module reads by property and adds no import.
+    expect(host.file('src/pages/about.astro')).toBe(
+      "---\nimport { copy } from '../copy';\n---\n<html><head><title>{copy.seo_about_title}</title><meta name=\"description\" content={copy.seo_about_desc} /></head><body><h1>{copy.hero}</h1></body></html>\n",
+    );
+    expect(snapshotOf(host)['seo_about_title']).toBe('About stet');
+  });
+
+  it('T17.2: follows a layout prop to the title and names the description it cannot bind', async () => {
+    const host = astroProject({
+      'src/layouts/Base.astro': BASE('<meta name="description" content="Shared words for every page" />'),
+      'src/pages/identities/index.astro':
+        "---\nimport Base from '../../layouts/Base.astro';\n---\n<Base title=\"Brand options\"><h1>Words</h1></Base>\n",
+    });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain(
+      '  description: src/pages/identities/index.astro writes it where stet cannot bind it (shown where stet cannot follow) — bind seo_identities_desc by hand',
+    );
+    expect(snapshotOf(host)['seo_identities_title']).toBe('Brand options');
+    expect(snapshotOf(host)['seo_identities_desc']).toBe('');
+    expect(host.file('src/pages/identities/index.astro')).toBe(
+      "---\nimport Base from '../../layouts/Base.astro';\nimport { copy } from '@/lib/content';\n---\n<Base title={copy('seo_identities_title')}><h1>Words</h1></Base>\n",
+    );
+  });
+
+  it('T17.3: a field written where stet cannot bind it scaffolds empty with the reason, the page byte-identical', async () => {
+    const pages: Record<string, string> = {
+      'src/pages/expr.astro': '---\nconst y = 1;\n---\n<html><head><title>{`x ${y}`}</title></head><body><h1>Words</h1></body></html>\n',
+      'src/pages/none.astro': '<html><head></head><body><h1>Words</h1></body></html>\n',
+      'src/pages/slot.astro':
+        "---\nimport Base from '../layouts/Base.astro';\n---\n<Base><Fragment slot=\"title\">Pricing words</Fragment></Base>\n",
+      'src/pages/entity.astro': '<html><head><title>A &copy 2026</title></head><body><h1>Words</h1></body></html>\n',
+    };
+    const host = astroProject({ ...pages, 'src/layouts/Base.astro': '---\n---\n<html><head><title><slot name="title" /></title></head><body><slot /></body></html>\n' });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    const out = host.stdout();
+    const line = (page: string, field: string, reason: string, key: string): string =>
+      `  ${field}: src/pages/${page}.astro writes it where stet cannot bind it (${reason}) — bind ${key} by hand`;
+    expect(out).toContain(line('expr', 'title', 'written as an expression', 'seo_expr_title'));
+    expect(out).toContain(line('none', 'title', 'the page sets no title', 'seo_none_title'));
+    expect(out).toContain(line('slot', 'title', 'shown where stet cannot follow', 'seo_slot_title'));
+    expect(out).toContain(line('entity', 'title', 'an entity stet cannot read: &copy 20', 'seo_entity_title'));
+    for (const page of ['expr', 'none', 'slot', 'entity']) {
+      expect(host.file(`src/pages/${page}.astro`)).toBe(pages[`src/pages/${page}.astro`]);
+      expect(snapshotOf(host)[`seo_${page}_title`]).toBe('');
+      expect(snapshotOf(host)[`seo_${page}_desc`]).toBe('');
+    }
+  });
+
+  it('T17.8: an import that resolves nowhere writes nothing, and a prop used in code is left', async () => {
+    const host = astroProject({ 'src/pages/pricing.astro': PRICING }, { alias: false });
+    const descriptor = host.file('content/descriptor.json');
+    const snapshot = host.file('content/defaults.json');
+    expect(await host.run('pages', 'scan', '--apply')).toBe(1);
+    expect(host.stderr()).toContain("readPath.import is '@/lib/content', but no tsconfig/jsconfig path mapping");
+    expect(host.file('content/descriptor.json')).toBe(descriptor);
+    expect(host.file('content/defaults.json')).toBe(snapshot);
+    expect(host.file('src/pages/pricing.astro')).toBe(PRICING);
+
+    const coded = '---\nconst { title } = Astro.props;\n---\n<html><head><title>{title}</title></head><body><h1 id={title}>Words</h1><slot /></body></html>\n';
+    const page = "---\nimport Base from '../layouts/Base.astro';\n---\n<Base title=\"Brand options\"><h1>Words</h1></Base>\n";
+    const used = astroProject({ 'src/layouts/Base.astro': coded, 'src/pages/brand.astro': page });
+    expect(await used.run('pages', 'scan', '--apply')).toBe(0);
+    expect(used.stdout()).toContain(
+      '  title: src/pages/brand.astro writes it where stet cannot bind it (used in code) — bind seo_brand_title by hand',
+    );
+    expect(used.file('src/pages/brand.astro')).toBe(page);
+    expect(snapshotOf(used)['seo_brand_title']).toBe('');
+  });
+
+  it('T17.4: a page that does not read back keeps its bytes and its seeds, and the others bind', async () => {
+    const host = astroProject({ 'src/pages/pricing.astro': PRICING, 'src/pages/about.astro': ABOUT });
+    const actual = (await vi.importActual<typeof import('../cli/astro-rewrite.js')>('../cli/astro-rewrite.js')).rereadsClean;
+    vi.mocked(rereadsClean).mockImplementation((ts, file, ...rest) => (file === 'src/pages/pricing.astro' ? false : actual(ts, file, ...rest)));
+    try {
+      expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    } finally {
+      vi.mocked(rereadsClean).mockImplementation(actual);
+    }
+    expect(host.stdout()).toContain(
+      "src/pages/pricing.astro: the page's title and description were seeded but not bound (the rewrite did not read back cleanly) — bind them by hand",
+    );
+    expect(host.file('src/pages/pricing.astro')).toBe(PRICING);
+    expect(snapshotOf(host)['seo_pricing_title']).toBe('stet — pricing');
+    expect(snapshotOf(host)['seo_pricing_desc']).toBe('Pay for the projects you run.');
+    expect(host.file('src/pages/about.astro')).toContain('<title>{copy.seo_about_title}</title>');
+    expect(host.stdout()).not.toContain('src/pages/pricing.astro: fills');
+
+    // A declared page with empty slots: its fill line is absent when its read-back fails, the seeds stay.
+    const declared = astroProject(
+      { 'src/pages/pricing.astro': PRICING },
+      {
+        keys: {
+          seo_pricing_title: { shape: 'text', target: 'web', pages: ['pricing'] },
+          seo_pricing_desc: { shape: 'text', target: 'web', pages: ['pricing'] },
+        },
+        defaults: { seo_pricing_title: '', seo_pricing_desc: '' },
+        pages: { pricing: { route: '/pricing', seo: { title: 'seo_pricing_title', description: 'seo_pricing_desc' } } },
+      },
+    );
+    vi.mocked(rereadsClean).mockImplementation(() => false);
+    try {
+      expect(await declared.run('pages', 'scan', '--apply')).toBe(0);
+    } finally {
+      vi.mocked(rereadsClean).mockImplementation(actual);
+    }
+    expect(declared.stdout()).toContain("the page's title and description were seeded but not bound");
+    expect(declared.stdout()).not.toContain('fills the title from the page and binds it');
+    expect(declared.stdout()).not.toContain('fills the description from the page and binds it');
+    expect(declared.file('src/pages/pricing.astro')).toBe(PRICING);
+    expect(snapshotOf(declared)['seo_pricing_title']).toBe('stet — pricing');
+  });
+
+  it('T17.5: a declared page with an empty slot takes the seed and the binding, and a filled slot is left', async () => {
+    const keys = {
+      seo_pricing_title: { shape: 'text', target: 'web', pages: ['pricing'] },
+      seo_pricing_desc: { shape: 'text', target: 'web', pages: ['pricing'] },
+      seo_about_title: { shape: 'text', target: 'web', pages: ['about'] },
+      seo_about_desc: { shape: 'text', target: 'web', pages: ['about'] },
+    };
+    const host = astroProject(
+      { 'src/pages/pricing.astro': PRICING, 'src/pages/about.astro': ABOUT },
+      {
+        keys,
+        defaults: { seo_pricing_title: '', seo_pricing_desc: 'Already written', seo_about_title: 'Kept title', seo_about_desc: 'Kept words' },
+        pages: {
+          pricing: { route: '/pricing', seo: { title: 'seo_pricing_title', description: 'seo_pricing_desc' } },
+          about: { route: '/about', seo: { title: 'seo_about_title', description: 'seo_about_desc' } },
+        },
+      },
+    );
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain('src/pages/pricing.astro: fills the title from the page and binds it to seo_pricing_title');
+    expect(snapshotOf(host)['seo_pricing_title']).toBe('stet — pricing');
+    expect(snapshotOf(host)['seo_pricing_desc']).toBe('Already written');
+    expect(host.file('src/pages/pricing.astro')).toBe(
+      `---\nimport { copy } from '@/lib/content';\n---\n` +
+        head("<title>{copy('seo_pricing_title')}</title>", '<meta name="description" content="Pay for the projects you run." />'),
+    );
+    expect(host.file('src/pages/about.astro')).toBe(ABOUT);
+    expect(snapshotOf(host)['seo_about_title']).toBe('Kept title');
+  });
+
+  it('T17.6 (guard): a plain run writes nothing', async () => {
+    const host = astroProject({ 'src/pages/pricing.astro': PRICING });
+    const forms = ['content/descriptor.json', 'content/defaults.json', 'src/pages/pricing.astro'].map((rel) => host.file(rel));
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(['content/descriptor.json', 'content/defaults.json', 'src/pages/pricing.astro'].map((rel) => host.file(rel))).toEqual(forms);
+  });
+
+  it('T17.7 (guard): a second run proposes nothing and every page file is byte-identical', async () => {
+    const host = astroProject({ 'src/pages/pricing.astro': PRICING, 'src/pages/about.astro': ABOUT });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    const pages = ['src/pages/pricing.astro', 'src/pages/about.astro'].map((rel) => host.file(rel));
+    host.out.length = 0;
+    expect(await host.run('pages', 'scan')).toBe(0);
+    expect(host.stdout()).toContain('pages scan: nothing to propose');
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(['src/pages/pricing.astro', 'src/pages/about.astro'].map((rel) => host.file(rel))).toEqual(pages);
+  });
+
+  it('T17.9: a description with braces is seeded and bound as the page spells it', async () => {
+    const words = 'Keep {x} and ${y} and {braces}';
+    const host = astroProject({ 'src/pages/pricing.astro': head('<title>T</title>', `<meta name="description" content="${words}" />`) });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(snapshotOf(host)['seo_pricing_desc']).toBe(words);
+    expect(host.file('src/pages/pricing.astro')).toContain(`<meta name="description" content={copy('seo_pricing_desc')} />`);
+  });
+
+  it('T17.10: a short title is a title: <title>404</title> is seeded and bound', async () => {
+    const host = astroProject({ 'src/pages/404.astro': head('<title>404</title>', '<meta name="description" content="Nothing lives at this address." />') });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(snapshotOf(host)['seo_404_title']).toBe('404');
+    expect(host.file('src/pages/404.astro')).toContain("<title>{copy('seo_404_title')}</title>");
+  });
+
+  it('T17.11: the description is the meta named description, in any case, not og:description', async () => {
+    const host = astroProject({
+      'src/pages/pricing.astro': head('<title>Pricing</title>', '<meta property="og:description" content="og one" />\n<meta name="Description" content="real one" />'),
+    });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(snapshotOf(host)['seo_pricing_desc']).toBe('real one');
+    const page = host.file('src/pages/pricing.astro');
+    expect(page).toContain('<meta property="og:description" content="og one" />');
+    expect(page).toContain(`<meta name="Description" content={copy('seo_pricing_desc')} />`);
+  });
+
+  it('T17.12: a page with its own <title> that also passes a title to its layout binds neither title', async () => {
+    const layout =
+      '---\nconst { title, description } = Astro.props;\n---\n<html><head><title>{title}</title><meta name="description" content={description} /></head><body><slot /></body></html>\n';
+    const page =
+      "---\nimport L from '../layouts/L.astro';\n---\n<L title=\"Layout T\" description=\"Layout D\"><title>Own T</title><h1>Words</h1></L>\n";
+    const host = astroProject({ 'src/layouts/L.astro': layout, 'src/pages/both.astro': page });
+    expect(await host.run('pages', 'scan', '--apply')).toBe(0);
+    expect(host.stdout()).toContain(
+      '  title: src/pages/both.astro writes it where stet cannot bind it (shown where stet cannot follow) — bind seo_both_title by hand',
+    );
+    expect(snapshotOf(host)['seo_both_title']).toBe('');
+    expect(snapshotOf(host)['seo_both_desc']).toBe('Layout D');
+    const after = host.file('src/pages/both.astro');
+    expect(after).toContain('title="Layout T"');
+    expect(after).toContain('<title>Own T</title>');
+    expect(after).toContain("description={copy('seo_both_desc')}");
   });
 });

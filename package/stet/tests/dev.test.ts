@@ -10,6 +10,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import {
+  appendFileSync,
   chmodSync,
   cpSync,
   existsSync,
@@ -3313,7 +3314,7 @@ describe('the committable files', () => {
         await save(handler, t);
         const refused = await post(handler, `/api/site/commit${at(t)}`, { files: [] });
         expect(refused.status).toBe(400);
-        expect(refused.body).toEqual({ error: 'files is required', pending: t.written });
+        expect(refused.body).toEqual({ error: 'files is required', pending: t.written, untracked: [] });
       });
 
       for (const folder of [undefined, 'site'] as const) {
@@ -3419,6 +3420,37 @@ describe('the committable files', () => {
     }
   });
 
+  describe('on the static-HTML host, an untracked marked document', () => {
+    /** A twin whose snapshot is untracked too, and a page copied from the marked index, never added to git. */
+    const drafted = async (): Promise<Twin> => {
+      const t = await twin('html', { untracked: true });
+      write(t.cwd, 'draft.html', readFileSync(join(t.cwd, 'index.html'), 'utf8'));
+      expect(porcelain(t.cwd)).toContain('?? draft.html');
+      return t;
+    };
+
+    it('is listed apart from the pending forms, the untracked snapshot staying pending', async () => {
+      const t = await drafted();
+      const { handler } = handlerOver([t.cwd]);
+      const site = await get(handler, `/api/site${at(t)}`);
+      expect(site.pending).toEqual(['content/defaults.json']);
+      expect(site.untracked).toEqual(['draft.html']);
+    });
+
+    it('is committed only where the commit names it', async () => {
+      const t = await drafted();
+      const { handler } = handlerOver([t.cwd]);
+      const bare = await post(handler, `/api/site/commit${at(t)}`, { files: ['content/defaults.json'] });
+      expect(bare.status).toBe(200);
+      expect(bare.body['untracked']).toEqual(['draft.html']);
+      expect(porcelain(t.cwd)).toContain('?? draft.html');
+      const named = await post(handler, `/api/site/commit${at(t)}`, { files: ['draft.html'] });
+      expect(named.status).toBe(200);
+      expect(named.body['untracked']).toEqual([]);
+      expect(git(t.cwd, ['show', '--name-only', '--format=', 'HEAD']).out.trim()).toBe('draft.html');
+    });
+  });
+
   for (const kind of ['js', 'html'] as const) {
     // The shipped gate runs the stet installed in the checkout — here the built
     // bin, behind a resolve hook that hides `typescript`.
@@ -3437,7 +3469,7 @@ describe('the committable files', () => {
         const before = head(t.cwd);
         const refused = await post(handler, `/api/site/commit${at(t)}`, { files: saved.body['pending'] });
         expect(refused.status).toBe(409);
-        expect(String(refused.body['output'])).toContain("stet needs 'typescript' to read your source");
+        expect(String(refused.body['output'])).toContain('stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet');
         expect(refused.body['pending']).toEqual(t.written);
         expect(head(t.cwd)).toBe(before);
       },
@@ -4585,6 +4617,95 @@ describe('POST /api/site/pages/declare', () => {
     expect(saved.status).toBe(200);
     const cleared = await get(handler, `/api/site/seo${site(host)}`);
     expect((cleared.seo.seo as Array<any>).some((f) => f.rule === 'missing-title' && f.page === 'about')).toBe(false);
+  });
+
+  describe('the page files its own write changed (PD14)', () => {
+    /** An Astro host whose about page writes its own title and description, committed. */
+    function seoHost(): CliHost {
+      const host = astroHost(['about.astro']);
+      writeFileSync(
+        join(host.cwd, 'stet.config.json'),
+        JSON.stringify(
+          { project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } },
+          null,
+          2,
+        ),
+      );
+      write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }));
+      write(host.cwd, 'src/lib/content.ts', 'export const copyMap: Record<string, string> = {};\n');
+      write(
+        host.cwd,
+        'src/pages/about.astro',
+        '<html><head><title>About us</title><meta name="description" content="Who we are." /></head><body><h1>x</h1></body></html>\n',
+      );
+      git(host.cwd, ['add', '-A']);
+      git(host.cwd, ['commit', '-qm', 'pages']);
+      return host;
+    }
+    const status = (host: CliHost): string => git(host.cwd, ['status', '--porcelain']).out;
+
+    it('commits the page file Declare pages rewrote, with the keys', async () => {
+      const host = seoHost();
+      const { handler } = handlerOver([host.cwd]);
+      const declared = await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+      expect(declared.status).toBe(200);
+      expect(declared.body['written']).toContain('src/pages/about.astro');
+      const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+      expect(pending).toContain('src/pages/about.astro');
+      const made = await post(handler, `/api/site/commit${site(host)}`, { files: pending });
+      expect(made.status).toBe(200);
+      expect(status(host)).toBe('');
+    });
+
+    it('leaves out a page file that had uncommitted edits before Declare pages wrote to it', async () => {
+      const host = seoHost();
+      appendFileSync(join(host.cwd, 'src/pages/about.astro'), '<!-- by hand -->\n');
+      const { handler } = handlerOver([host.cwd]);
+      await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+      const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+      expect(pending).not.toContain('src/pages/about.astro');
+      const made = await post(handler, `/api/site/commit${site(host)}`, { files: pending });
+      expect(made.status).toBe(200);
+      expect(status(host).trim()).toBe('M src/pages/about.astro');
+    });
+
+    it('leaves out a page file edited by hand after Declare pages', async () => {
+      const host = seoHost();
+      const { handler } = handlerOver([host.cwd]);
+      await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+      appendFileSync(join(host.cwd, 'src/pages/about.astro'), '<!-- by hand -->\n');
+      const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+      expect(pending).not.toContain('src/pages/about.astro');
+      expect(pending).toContain('content/descriptor.json');
+      const made = await post(handler, `/api/site/commit${site(host)}`, { files: pending });
+      expect(made.status).toBe(200);
+      expect(status(host).trim()).toBe('M src/pages/about.astro');
+    });
+
+    it('REVIEW-S2: records nothing when the git status taken before the write fails', async () => {
+      const host = seoHost();
+      appendFileSync(join(host.cwd, 'src/pages/about.astro'), '<!-- by hand -->\n');
+      // A git whose first `status` listing fails and whose every later call is the real one.
+      const bin = tempDir('stet-gitfail-');
+      const flag = join(bin, 'fail-once');
+      writeFileSync(flag, '');
+      const real = execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim();
+      writeFileSync(join(bin, 'git'), `#!/bin/sh\ncase " $* " in *" --untracked-files=all "*) if [ -e '${flag}' ]; then rm -f '${flag}'; exit 1; fi;; esac\nexec '${real}' "$@"\n`, { mode: 0o755 });
+      const { handler } = handlerOver([host.cwd]);
+      const pathBefore = process.env['PATH'];
+      process.env['PATH'] = `${bin}:${pathBefore}`;
+      try {
+        const declared = await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+        expect(declared.status).toBe(200);
+        expect(declared.body['written']).toContain('src/pages/about.astro');
+      } finally {
+        process.env['PATH'] = pathBefore;
+      }
+      expect(existsSync(flag)).toBe(false);
+      const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+      expect(pending).not.toContain('src/pages/about.astro');
+      expect(pending).toContain('content/descriptor.json');
+    });
   });
 
   it('declares every proposal where no names are given', async () => {
@@ -5996,7 +6117,7 @@ describe('GET /api/site/marks', () => {
       expect(took).toBeLessThan(200);
     });
 
-    it('answers a read inside markup too deep for the walk with its file and line', async () => {
+    it('answers a read inside markup nested deeper than a recursive walk reaches with its file, line and element', async () => {
       const host = readsHost({
         'src/deep.astro': '<div>'.repeat(5000) + "{copy.get('hero_headline')}" + '</div>'.repeat(5000) + '\n',
       });
@@ -6004,7 +6125,7 @@ describe('GET /api/site/marks', () => {
       const res = await handler(req(`/api/site/marks?site=${encodeURIComponent(realpathSync(host.cwd))}`));
       expect(res.status).toBe(200);
       expect(((await res.json()) as { places: Record<string, unknown[]> }).places['hero_headline']).toEqual([
-        { file: 'src/deep.astro', line: 1, kind: 'text in src/deep.astro' },
+        { file: 'src/deep.astro', line: 1, tag: 'div', kind: 'text in <div>' },
       ]);
     });
 
@@ -6909,8 +7030,9 @@ describe('the page', () => {
     const groupIds = [...page.dom.window.document.querySelectorAll('#gsel option')].map(
       (option) => (option as HTMLOptionElement).value,
     );
-    expect(groupIds).toEqual(['page:home', 'seo', 'prefix:brand', 'prefix:loose', 'prefix:unseeded', 'prefix:welcome']);
-    for (const group of groupIds) {
+    expect(groupIds).toEqual(['all', 'page', 'page:home', 'seo', 'prefix:brand', 'prefix:loose', 'prefix:unseeded', 'prefix:welcome']);
+    // Every key and the open page's keys come first; the groups after them hold each key once.
+    for (const group of groupIds.slice(2)) {
       await page.change('group', group);
       for (const key of page.keys()) {
         await page.act(`key:${key}`);
@@ -7717,6 +7839,52 @@ describe('the page', () => {
       page.dom.window.close();
     });
 
+    // D19 — the project's name in Setup (T19.1, T19.3)
+    describe('Setup names the project (D19)', () => {
+      const setupHeading = (page: Painted): string =>
+        [...docOf(page).querySelectorAll('.card .ch h3')].map((h) => h.textContent ?? '').find((t) => t !== 'Attribution' && !t.startsWith('Pending')) ?? '';
+      const projname = (page: Painted): HTMLInputElement => docOf(page).getElementById('projname') as HTMLInputElement;
+
+      it('shows the field first with the folder as its placeholder, and renames through workspace/update', async () => {
+        const page = await paint();
+        await page.act('tab:Setup');
+        expect(projname(page).value).toBe('');
+        expect(projname(page).placeholder).toBe('mini');
+        expect(painted(page)).toContain('Shown in this dashboard only; the folder keeps its name. Leave it empty to show the folder\'s name.');
+        expect((projname(page).closest('.cb') as HTMLElement).querySelector('input')?.id).toBe('projname');
+
+        page.answer('/api/workspace/update', 200, { sites: [miniRow({ name: 'Marketing site', folder: 'mini' })] });
+        await page.change('entryName', 'Marketing site');
+        expect(updates(page)).toEqual([{ path: '/checkouts/mini', name: 'Marketing site' }]);
+        expect(labels(page)[0]).toEqual(['Marketing site', 'mini', 'snapshot-only · 11 keys', 'js host · astro']);
+        expect(setupHeading(page)).toBe('Marketing site');
+        expect(docOf(page).getElementById('sidetoggle')?.textContent).toContain('Marketing site');
+        expect(projname(page).value).toBe('Marketing site');
+        expect(projname(page).placeholder).toBe('mini');
+
+        page.answer('/api/workspace/update', 200, { sites: [miniRow()] });
+        await page.change('entryName', '');
+        expect(updates(page).at(-1)).toEqual({ path: '/checkouts/mini', name: '' });
+        expect(labels(page)[0]?.[0]).toBe('mini');
+        expect(setupHeading(page)).toBe('mini');
+        expect(docOf(page).getElementById('sidetoggle')?.textContent).toContain('mini');
+        expect(projname(page).value).toBe('');
+        expect(page.errors).toEqual([]);
+        page.dom.window.close();
+      });
+
+      it('shows a refused name and leaves every label as it was', async () => {
+        const page = await paint();
+        await page.act('tab:Setup');
+        page.answer('/api/workspace/update', 400, { error: 'the name was refused' });
+        await page.change('entryName', 'Marketing site');
+        expect(page.toast()).toBe('the name was refused');
+        expect(labels(page)[0]?.[0]).toBe('mini');
+        expect(setupHeading(page)).toBe('mini');
+        page.dom.window.close();
+      });
+    });
+
     it('tells two unnamed twins apart by folder, and never extends a name', async () => {
       const page = await paint({
         sites: [
@@ -7969,6 +8137,44 @@ describe('the page', () => {
       await page.settle();
       expect(doc.querySelector('[data-tpl-field="welcome"]')?.textContent).toContain('requires: name');
       expect((doc.querySelector('[data-tpl-field="welcome"] textarea') as HTMLTextAreaElement).value).toBe('Hi {{name}}');
+      page.dom.window.close();
+    });
+
+    it('a mouse click on a slot scrolls its field into view once the pointer leaves the email; a tap scrolls at once (8o T1.8)', async () => {
+      const page = await open();
+      const scrolled: string[] = [];
+      (page.dom.window.HTMLElement.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = function (this: HTMLElement) {
+        scrolled.push(this.getAttribute('data-act-input') ?? '');
+      };
+      const doc = (frameOf(page) as HTMLIFrameElement).contentDocument as Document;
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe(`text:${HEADLINE}`);
+      expect(scrolled).toEqual([]);
+      (doc.querySelector(`[data-stet="${HEADLINE}"]`) as HTMLElement).dispatchEvent(new page.dom.window.MouseEvent('pointerout', { bubbles: true, relatedTarget: null }));
+      expect(scrolled).toEqual([`text:${HEADLINE}`]);
+      const tap = new page.dom.window.MouseEvent('click', { bubbles: true, cancelable: true });
+      Object.defineProperty(tap, 'pointerType', { value: 'touch' });
+      (doc.querySelector('[data-stet="welcome__greeting"]') as HTMLElement).dispatchEvent(tap);
+      await page.settle();
+      expect(scrolled).toEqual([`text:${HEADLINE}`, 'text:welcome__greeting']);
+      page.dom.window.close();
+    });
+
+    it('a mouse click on a slot keeps its field where it is while the pointer moves between elements of the email (8o F4g)', async () => {
+      const page = await open();
+      const scrolled: string[] = [];
+      (page.dom.window.HTMLElement.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = function (this: HTMLElement) {
+        scrolled.push(this.getAttribute('data-act-input') ?? '');
+      };
+      const doc = (frameOf(page) as HTMLIFrameElement).contentDocument as Document;
+      clickIn(page, `[data-stet="${HEADLINE}"]`);
+      await page.settle();
+      const slot = doc.querySelector(`[data-stet="${HEADLINE}"]`) as HTMLElement;
+      slot.dispatchEvent(new page.dom.window.MouseEvent('pointerout', { bubbles: true, relatedTarget: doc.body }));
+      expect(scrolled).toEqual([]);
+      slot.dispatchEvent(new page.dom.window.MouseEvent('pointerout', { bubbles: true, relatedTarget: null }));
+      expect(scrolled).toEqual([`text:${HEADLINE}`]);
       page.dom.window.close();
     });
 
@@ -8353,18 +8559,30 @@ describe('the page', () => {
       page.dom.window.close();
     });
 
-    it('shows an edited key: selects it, on its group, in its locale', async () => {
+    it('shows an edited key: selects it, lists it among all keys, in its locale', async () => {
       const page = await three();
       run(page, 'setDraftIn("de", "hero_headline", "Geaendert"); render();');
       await page.settle();
       await page.act('unsaved');
       await page.act('showEdit:default loose_key');
       expect(run(page, 'S.sel')).toBe('loose_key');
-      expect(run(page, 'S.group')).toBe('prefix:loose');
+      // The list shows every key, so the edited one is listed where it stands.
+      expect(run(page, 'S.group')).toBe('all');
       expect(docOf(page).querySelector('.row.on')?.getAttribute('data-act')).toBe('key:loose_key');
       await page.act('showEdit:de hero_headline');
       expect(run(page, 'S.locale')).toBe('de');
       expect(run(page, 'S.sel')).toBe('hero_headline');
+      page.dom.window.close();
+    });
+
+    it('shows an edited key: moves the list to the key’s group when the open group does not hold it (F4k)', async () => {
+      const page = await three();
+      await page.change('group', 'seo');
+      await page.act('unsaved');
+      await page.act('showEdit:default loose_key');
+      expect(run(page, 'S.sel')).toBe('loose_key');
+      expect(run(page, 'S.group')).toBe('prefix:loose');
+      expect(docOf(page).querySelector('.row.on')?.getAttribute('data-act')).toBe('key:loose_key');
       page.dom.window.close();
     });
 
@@ -9127,8 +9345,9 @@ describe('the page', () => {
       it('puts the head keys in the SEO group (journeys B17, C1)', async () => {
         const page = await kcPage();
         const labels = [...docOf(page).querySelectorAll('#gsel option')].map((option) => option.textContent);
-        expect(labels).toEqual(['home — page', 'SEO']);
-        expect((docOf(page).getElementById('gsel') as HTMLSelectElement).value).toBe('page:home');
+        expect(labels).toEqual(['All keys', 'This page', 'home — page', 'SEO']);
+        expect((docOf(page).getElementById('gsel') as HTMLSelectElement).value).toBe('all');
+        await page.change('group', 'page:home');
         expect(page.keys()).toEqual(['foot', 'hero']);
         await page.change('group', 'seo');
         expect(page.keys()).toEqual(['desc', 'share', 'title']);
@@ -9639,7 +9858,8 @@ describe('the page', () => {
       const looks = agent.locates();
       expect(looks.some((m) => JSON.stringify(m['texts']) === JSON.stringify(['Saved words']))).toBe(true);
       expect(looks.at(-1)).toMatchObject({ key: 'hero_headline', guess: false });
-      expect(note(page).hidden).toBe(true);
+      // Above the frame the note keeps its line, empty.
+      expect([note(page).hidden, note(page).textContent]).toEqual([false, '']);
       page.dom.window.close();
     });
 
@@ -9822,6 +10042,8 @@ describe('the page', () => {
       const popover = (page: Painted): HTMLElement => byId(page, 'popover');
       const poptext = (page: Painted): HTMLTextAreaElement => byId(page, 'poptext') as HTMLTextAreaElement;
       const lines = (page: Painted): string[] => [...note(page).children].map((line) => line.textContent ?? '');
+      /** The note's last line where the open page's reads are incomplete or failed (8o D2). */
+      const UNKNOWN = 'stet could not work out which keys this page reads, so any text that matches a key can be picked.';
       const selected = (page: Painted): string => docOf(page).querySelector('#main .ch h3 .mono')?.textContent ?? '';
       const typeInto = async (page: Painted, field: HTMLTextAreaElement, value: string): Promise<void> => {
         field.value = value;
@@ -9936,6 +10158,100 @@ describe('the page', () => {
         expect(popover(page).hidden).toBe(false);
         expect(poptext(page).value).toBe('loose');
         expect(lines(page)).toContain('The page redrew this text, so the edit moved to a field.');
+        page.dom.window.close();
+      });
+
+      it('R15: a double click’s selected word is selected in the field over the frame, so typing replaces it', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const greeting = { key: 'lab_greeting', by: 'pattern', inplace: false };
+        const range = (): [number, number] => [poptext(page).selectionStart, poptext(page).selectionEnd];
+        // 'Welcome back, {{name}}.': the word occurs once.
+        await agent.pick([greeting], { again: true, sel: { text: 'back', offset: 8 } });
+        expect(range()).toEqual([8, 12]);
+        await typeInto(page, poptext(page), 'to be or not to be');
+        await press(page, poptext(page), 'Enter');
+        // Several occurrences: the one nearest where the word sat in the element.
+        await agent.pick([greeting], { again: true, sel: { text: 'be', offset: 14 } });
+        expect(range()).toEqual([16, 18]);
+        await press(page, poptext(page), 'Enter');
+        await agent.pick([greeting], { again: true, sel: { text: 'be', offset: 2 } });
+        expect(range()).toEqual([3, 5]);
+        await press(page, poptext(page), 'Enter');
+        // A trailing space the browser selected with the word is not part of it.
+        await agent.pick([greeting], { again: true, sel: { text: 'be\n', offset: 14 } });
+        expect(range()).toEqual([16, 18]);
+        await press(page, poptext(page), 'Enter');
+        // Not in the value, or no selection: the caret at the end.
+        await agent.pick([greeting], { again: true, sel: { text: 'missing', offset: 0 } });
+        expect(range()).toEqual([18, 18]);
+        await press(page, poptext(page), 'Enter');
+        await agent.pick([greeting], { again: true });
+        expect(range()).toEqual([18, 18]);
+        page.dom.window.close();
+      });
+
+      it('R15: a word the value holds twice is selected at the ordinal it had in the element, tokens in the value or not', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const greeting = { key: 'lab_greeting', by: 'pattern', inplace: false };
+        const range = (): [number, number] => [poptext(page).selectionStart, poptext(page).selectionEnd];
+        await agent.pick([greeting], { again: true });
+        await typeInto(page, poptext(page), '{{count}} items and {{count}} items');
+        await press(page, poptext(page), 'Enter');
+        // The element shows '12 items and 12 items': its offsets drift from the value's.
+        await agent.pick([greeting], { again: true, sel: { text: 'items', offset: 16, nth: 1 } });
+        expect(range()).toEqual([30, 35]);
+        await press(page, poptext(page), 'Enter');
+        await agent.pick([greeting], { again: true, sel: { text: 'items', offset: 3, nth: 0 } });
+        expect(range()).toEqual([10, 15]);
+        await press(page, poptext(page), 'Enter');
+        // An ordinal the value does not reach falls back to the nearest occurrence.
+        await agent.pick([greeting], { again: true, sel: { text: 'items', offset: 28, nth: 5 } });
+        expect(range()).toEqual([30, 35]);
+        page.dom.window.close();
+      });
+
+      it('R15: a word selected in the element’s text is not looked for in an attribute’s value; the caret goes to the end', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        const attr = { key: 'lab_greeting', by: 'attr', inplace: false, attr: 'alt' };
+        await agent.pick([attr], { again: true, sel: { text: 'back', offset: 8, nth: 0 } });
+        const value = poptext(page).value;
+        expect(value).toContain('back');
+        expect([poptext(page).selectionStart, poptext(page).selectionEnd]).toEqual([value.length, value.length]);
+        page.dom.window.close();
+      });
+
+      it('R15: the word selected by a double click survives the chooser of two keys', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }], { again: true, sel: { text: 'oo', offset: 1 } });
+        await page.act('choose:loose_key');
+        expect([poptext(page).selectionStart, poptext(page).selectionEnd]).toEqual([1, 3]);
+        page.dom.window.close();
+      });
+
+      it('R14: a click in the frame on no key’s copy ends the selection as Escape does: the edit box closes, unsaved edits stay, the ring goes', async () => {
+        const { page, agent } = await bridged({ site: GREETING });
+        await agent.pick([{ key: 'lab_greeting', by: 'pattern', inplace: false }], { again: true });
+        await typeInto(page, poptext(page), 'Welcome, {{name}}.');
+        expect(popover(page).hidden).toBe(false);
+        const clears = agent.sent('clear').length;
+        await agent.tell({ stet: 'deselect' });
+        expect(popover(page).hidden).toBe(true);
+        expect(selected(page)).toBe('');
+        expect(stateOf(page).draft).toEqual({ 'default lab_greeting': 'Welcome, {{name}}.' });
+        expect(agent.sent('clear').length).toBeGreaterThan(clears);
+        page.dom.window.close();
+      });
+
+      it('R14: deselect, then unmanaged, keeps the note for text no key matches; deselect alone takes an earlier note away', async () => {
+        const { page, agent } = await bridged();
+        await agent.pick([{ key: 'hero_headline' }]);
+        expect(selected(page)).toBe('hero_headline');
+        await agent.tell({ stet: 'deselect' });
+        await agent.tell({ stet: 'unmanaged', text: 'Docs', tag: 'a' });
+        expect(selected(page)).toBe('');
+        expect(lines(page)[0]).toBe('No key matches this text.');
+        await agent.tell({ stet: 'deselect' });
+        expect(lines(page)).not.toContain('No key matches this text.');
         page.dom.window.close();
       });
 
@@ -10075,7 +10391,7 @@ describe('the page', () => {
         page.dom.window.close();
       });
 
-      it('opens no popover under 760 px: a pick selects and scrolls the field into view, and a second pick focuses it (7.5)', async () => {
+      it('opens no popover under 760 px: a pick selects, and a second pick focuses the field and scrolls it into view (7.5)', async () => {
         const scrolled: string[] = [];
         const { page, agent } = await bridged({
           site: GREETING,
@@ -10088,8 +10404,9 @@ describe('the page', () => {
         });
         await agent.pick([{ key: 'hero_headline' }]);
         expect(selected(page)).toBe('hero_headline');
-        expect(scrolled).toContain('text:hero_headline');
+        expect(scrolled).toEqual([]);
         await agent.pick([{ key: 'hero_headline' }], { again: true });
+        expect(scrolled).toEqual(['text:hero_headline']);
         expect(agent.sent('edit')).toEqual([]);
         expect(popover(page).hidden).toBe(true);
         expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:hero_headline');
@@ -10256,11 +10573,12 @@ describe('the page', () => {
       });
 
       it('says where a key the census found only in the head sits (the C5 flag, an addition)', async () => {
-        const { page, agent } = await bridged();
+        // The route's reads answer complete, so no line that stet cannot tell follows the head line.
+        const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['loose_key'], complete: true }]] });
         await agent.census({ found: { loose_key: 1 }, head: [{ key: 'loose_key', where: 'description' }] });
         await page.change('group', 'prefix:loose');
         await page.act('key:loose_key');
-        expect(note(page).textContent).toBe('loose_key appears as the meta description, under the title in search results. It is not part of the page’s visible text.');
+        expect(lines(page)).toEqual(['loose_key appears as the meta description, under the title in search results. It is not part of the page’s visible text.']);
         page.dom.window.close();
       });
 
@@ -10352,7 +10670,7 @@ describe('the page', () => {
         it('counts a page whose route reads are incomplete as not yet checked', async () => {
           const { page, agent } = await badged(usageOf(), BADGED, [['/api/site/route-reads', 200, { route: '/a', files: [], keys: [], complete: false }]]);
           await visit(agent, ['/', '/a', '/b/', '/c', '/d']);
-          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '5 of 5 pages not yet checked']);
+          expect(await noteOf(page, 'lone_key')).toEqual([SCOPE, '5 of 5 pages not yet checked', UNKNOWN]);
           page.dom.window.close();
         });
 
@@ -10377,8 +10695,8 @@ describe('the page', () => {
             'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)',
           ]);
           expect(await noteOf(page, 'blind_key')).toEqual([LINE, 'Key prefixes read without naming each key: tier_ (src/pricing.ts:4)']);
-          expect(page.html()).not.toContain('can’t tell');
-          expect(page.html()).not.toContain("can't tell");
+          expect(docOf(page).getElementById('shell')?.textContent).not.toContain('can’t tell');
+          expect(docOf(page).getElementById('shell')?.textContent).not.toContain("can't tell");
           page.dom.window.close();
         });
 
@@ -10431,7 +10749,7 @@ describe('the page', () => {
           const { page, agent } = await badged(usageOf());
           for (const route of ['/', '/a', '/b/', '/c']) await visitWith(page, agent, route);
           await visitWith(page, agent, '/d', { status: 500 });
-          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          expect(await noteOf(page, 'lone_key')).toEqual([...AMONG_FIVE, UNKNOWN]);
           expect(await badges(page, 'lone_key')).not.toContain('may be a leftover');
           page.dom.window.close();
         });
@@ -10445,7 +10763,7 @@ describe('the page', () => {
           expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
           await wait(500);
           await page.settle();
-          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          expect(await noteOf(page, 'lone_key')).toEqual([...AMONG_FIVE, UNKNOWN]);
 
           // The same page, its reads slow but complete: unchecked until they answer, then the upgrade.
           const second = await badged(usageOf());
@@ -10465,7 +10783,7 @@ describe('the page', () => {
           for (const route of ['/', '/a', '/b/', '/c', '/d']) await visitWith(page, agent, route);
           expect(await noteOf(page, 'lone_key')).toEqual(['may be a leftover']);
           await visitWith(page, agent, '/c', { complete: false });
-          expect(await noteOf(page, 'lone_key')).toEqual(AMONG_FIVE);
+          expect(await noteOf(page, 'lone_key')).toEqual([...AMONG_FIVE, UNKNOWN]);
           page.dom.window.close();
         });
 
@@ -10687,6 +11005,665 @@ describe('the page', () => {
           await wait(500);
           await page.settle();
           expect(lines(page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: seo_home_title.']);
+          page.dom.window.close();
+        });
+      });
+
+      // --- fix-preview-editing (8o): the frame holds still, the reads reach the agent, phone width, the keys list, the near-limit count ---
+      describe('fix-preview-editing (8o)', () => {
+        const evalIn = (page: Painted, code: string): unknown => (page.dom.window as unknown as { eval: (c: string) => unknown }).eval(code);
+        const widthOf = (px: number) => (window: Painted['dom']['window']): void => {
+          Object.defineProperty(window, 'innerWidth', { configurable: true, get: () => px });
+        };
+        /** Records every field scroll as `<field> <arg>`; `held` is read from the page at the call. */
+        const spyScroll = (window: Painted['dom']['window'], out: string[]): void => {
+          (window.HTMLElement.prototype as unknown as { scrollIntoView: (arg: unknown) => void }).scrollIntoView = function (this: HTMLElement, arg: unknown) {
+            out.push((this.getAttribute('data-act-input') ?? '') + ' ' + JSON.stringify(arg));
+          };
+        };
+        /** jsdom lays out nothing: the preview box is given a phone pane's width so `fitFrame` runs. */
+        const paneWidth = (window: Painted['dom']['window']): void => {
+          Object.defineProperty(window.HTMLElement.prototype, 'clientWidth', { configurable: true, get(this: HTMLElement) { return this.id === 'devwrap' ? 326 : 0; } });
+        };
+        /** A touch screen: the primary pointer is coarse. */
+        const coarse = (window: Painted['dom']['window']): void => {
+          (window as unknown as { matchMedia: (q: string) => { matches: boolean } }).matchMedia = (q: string) => ({ matches: q === '(pointer: coarse)' });
+        };
+        const hover = (agent: ReturnType<typeof agentOf>): Promise<void> =>
+          agent.tell({ stet: 'hover', keys: [{ key: 'hero_headline', attr: null, by: 'whole' }], tag: 'h1', rect: RECT, inplace: true });
+
+        // D1 — the hold
+        it('holds the field scroll a pick asks for until the pointer leaves the frame (T1.1)', async () => {
+          const scrolled: string[] = [];
+          const { page, agent } = await bridged({ prepare: (w) => { widthOf(1280)(w); spyScroll(w, scrolled); } });
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect(selected(page)).toBe('hero_headline');
+          expect(scrolled).toEqual([]);
+          await agent.tell({ stet: 'out' });
+          expect(scrolled).toEqual(['text:hero_headline {"block":"nearest"}']);
+          page.dom.window.close();
+        });
+
+        it('opens a hidden key column only once the pointer leaves the frame (T1.2)', async () => {
+          const { page, agent } = await bridged({ prepare: widthOf(1280) });
+          await page.act('keys');
+          expect(byId(page, 'work').className).toBe('wrap content wide');
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect(byId(page, 'work').className).toBe('wrap content wide');
+          await agent.tell({ stet: 'out' });
+          expect(byId(page, 'work').className).toBe('wrap content');
+          page.dom.window.close();
+        });
+
+        it('drops the field scroll when the dashboard is pressed during the hold (T1.3)', async () => {
+          const scrolled: string[] = [];
+          const { page, agent } = await bridged({ prepare: (w) => { widthOf(1280)(w); spyScroll(w, scrolled); } });
+          await agent.pick([{ key: 'hero_headline' }]);
+          const save = docOf(page).querySelector('#main [data-act="save"]') as HTMLElement;
+          save.dispatchEvent(new page.dom.window.MouseEvent('pointerdown', { bubbles: true }));
+          await agent.tell({ stet: 'out' });
+          expect(scrolled).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('holds the block above the frame at its height while the pointer is in the frame, wider than 760 px (T1.4)', async () => {
+          const { page, agent } = await bridged({ prepare: widthOf(1280) });
+          const top = byId(page, 'panetop');
+          await hover(agent);
+          expect([top.style.height, top.style.overflow]).toEqual(['0px', 'hidden']);
+          await agent.tell({ stet: 'out' });
+          expect([top.style.height, top.style.overflow]).toEqual(['', '']);
+          page.dom.window.close();
+          const phone = await bridged({ prepare: widthOf(390) });
+          await hover(phone.agent);
+          expect([byId(phone.page, 'panetop').style.height, byId(phone.page, 'panetop').style.overflow]).toEqual(['', '']);
+          phone.page.dom.window.close();
+        });
+
+        it('keeps the note’s line above a frame, empty or not, and hides an empty note at phone width (T1.5)', async () => {
+          const { page } = await bridged({ prepare: widthOf(1280) });
+          expect([note(page).hidden, note(page).textContent]).toEqual([false, '']);
+          page.dom.window.close();
+          const phone = await bridged({ prepare: widthOf(390) });
+          expect(note(phone.page).hidden).toBe(true);
+          phone.page.dom.window.close();
+        });
+
+        it('hides the hover label when the pointer leaves the frame (T1.6)', async () => {
+          const { page, agent } = await bridged();
+          await hover(agent);
+          expect(byId(page, 'hoverlabel').hidden).toBe(false);
+          await agent.tell({ stet: 'out' });
+          expect(byId(page, 'hoverlabel').hidden).toBe(true);
+          page.dom.window.close();
+        });
+
+        it('scrolls to no field when the pointer leaves with an edit open (T1.7)', async () => {
+          const scrolled: string[] = [];
+          const { page, agent } = await bridged({ prepare: (w) => { widthOf(1280)(w); spyScroll(w, scrolled); } });
+          await agent.pick([{ key: 'hero_headline' }], { again: true });
+          expect(stateOf(page).edit).toMatchObject({ key: 'hero_headline', form: 'inplace' });
+          await agent.tell({ stet: 'out' });
+          expect(scrolled).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('floats the chooser over the frame, outside the block above it (T1.9)', async () => {
+          const { page, agent } = await bridged();
+          await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }]);
+          const box = byId(page, 'panepick');
+          expect({ hidden: box.hidden, inTop: byId(page, 'panetop').contains(box), buttons: [...box.querySelectorAll('button')].map((b) => b.textContent), top: box.style.top })
+            .toEqual({ hidden: false, inTop: false, buttons: ['hero_headline', 'loose_key'], top: '76px' });
+          page.dom.window.close();
+        });
+
+        it('holds nothing for a pick made by Enter, and holds for a click (T1.10)', async () => {
+          const { page, agent } = await bridged();
+          await agent.pick([{ key: 'hero_headline' }], { key: true });
+          const byEnter = evalIn(page, 'frameHold === null');
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect({ byEnter, byClick: evalIn(page, 'frameHold === null') }).toEqual({ byEnter: true, byClick: false });
+          page.dom.window.close();
+        });
+
+        it('follows the phone rule on a touch screen wider than a phone: the second tap releases the hold and focuses the field (T1.12, R12)', async () => {
+          const scrolled: string[] = [];
+          const { page, agent } = await bridged({
+            prepare: (w) => {
+              widthOf(1024)(w);
+              coarse(w);
+              (w.HTMLElement.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = function (this: HTMLElement) {
+                scrolled.push((this.getAttribute('data-act-input') ?? '') + ' held:' + String((w as unknown as { eval: (c: string) => unknown }).eval('frameHold !== null')));
+              };
+            },
+          });
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect({ held: evalIn(page, 'frameHold !== null'), scrolled }).toEqual({ held: true, scrolled: [] });
+          await agent.pick([{ key: 'hero_headline' }], { again: true });
+          expect({ held: evalIn(page, 'frameHold !== null'), scrolled, edits: agent.sent('edit'), popover: popover(page).hidden })
+            .toEqual({ held: false, scrolled: ['text:hero_headline held:false'], edits: [], popover: true });
+          expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:hero_headline');
+          page.dom.window.close();
+        });
+
+        // D2 — the reads reach the agent
+        it('sends the held reads before the census on ready, or none where they are incomplete (T2.5)', async () => {
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }]] });
+          await agent.census({ found: {} });
+          await wait(20); await page.settle();
+          const order = (from: number): unknown[] =>
+            agent.posts.slice(from).map((p) => p.message).filter((m) => ['mode', 'reads', 'census'].includes(m['stet'] as string))
+              .map((m) => (m['stet'] === 'reads' ? { stet: 'reads', route: m['route'], keys: m['keys'] } : m['stet']));
+          let at = agent.posts.length;
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/');
+          expect(order(at).slice(0, 3)).toEqual(['mode', { stet: 'reads', route: '/', keys: ['hero_headline'] }, 'census']);
+          page.answer('/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: false });
+          await agent.census({ found: {} });
+          await wait(20); await page.settle();
+          at = agent.posts.length;
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/');
+          expect(order(at).slice(0, 3)).toEqual(['mode', { stet: 'reads', route: '/', keys: null }, 'census']);
+          page.dom.window.close();
+        });
+
+        it('posts the reads once the route’s reads answer (T2.6)', async () => {
+          // The pane's own request is still out when the agent announces itself and its census lands.
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }, 400]] });
+          await agent.census({ found: {} });
+          expect(agent.sent('reads')).toEqual([{ stet: 'reads', route: '/', keys: null, renders: null, coincident: null }]);
+          await wait(500); await page.settle();
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: ['hero_headline'], renders: {}, coincident: [] });
+          page.dom.window.close();
+        });
+
+        it('says last in the note that stet cannot tell which keys the page reads, once the reads answer incomplete, in Edit (T2.7)', async () => {
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: false }, 400]] });
+          await agent.census({ found: {} });
+          expect(lines(page)).not.toContain(UNKNOWN);
+          await wait(500); await page.settle();
+          expect(lines(page).at(-1)).toBe(UNKNOWN);
+          await agent.tell({ stet: 'unmanaged', text: 'x', tag: 'p' });
+          expect(lines(page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: hero_headline.', UNKNOWN]);
+          await page.act('mode:use');
+          expect(lines(page)).not.toContain(UNKNOWN);
+          page.dom.window.close();
+        });
+
+        it('asks the route’s reads again on a frame reload and posts the new answer (T2.8, R11)', async () => {
+          let asked = 0;
+          const { page, agent } = await bridged({
+            routes: [['/api/site/route-reads', 200, () => { asked += 1; return { route: '/', files: ['app/page.tsx'], keys: asked === 1 ? ['hero_headline'] : ['hero_headline', 'loose_key'], complete: true }; }]],
+          });
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/');
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          expect({ asked, last: agent.sent('reads').at(-1) }).toEqual({ asked: 2, last: { stet: 'reads', route: '/', keys: ['hero_headline', 'loose_key'], renders: {}, coincident: [] } });
+          page.dom.window.close();
+        });
+
+        it('asks the reads again when the descriptor’s keys change (T2.9)', async () => {
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }]] });
+          await agent.census({ found: {} });
+          await wait(20); await page.settle();
+          const before = page.requested('/api/site/route-reads').length;
+          page.answer('/api/site', 200, siteBody({ descriptor: { ...descriptor, keys: { ...descriptor.keys, added_key: { shape: 'text', target: 'web' } } } }));
+          evalIn(page, 'void refreshSite()');
+          await wait(20); await page.settle();
+          expect(page.requested('/api/site/route-reads').length).toBe(before + 1);
+          page.dom.window.close();
+        });
+
+        it('follows a full page load: the pane and the page keys take the route the frame shows (T2.10)', async () => {
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }]] });
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          page.answer('/api/site/route-reads', 200, { route: '/pricing', files: ['app/pricing/page.tsx'], keys: ['loose_key'], complete: true });
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/pricing');
+          await agent.census({ found: {}, route: '/pricing' });
+          await wait(50); await page.settle();
+          const state = JSON.parse(evalIn(page, 'JSON.stringify({ unknown: readsUnknown(), page: pageKeys() })') as string);
+          expect({ state, sent: agent.sent('reads').at(-1) }).toEqual({ state: { unknown: false, page: ['loose_key'] }, sent: { stet: 'reads', route: '/pricing', keys: ['loose_key'], renders: {}, coincident: [] } });
+          page.dom.window.close();
+        });
+
+        it('follows the app’s own navigation: the reads it asks for go to the agent under the new path, before its census (T2.10, an addition for M2.7)', async () => {
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }]] });
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          page.answer('/api/site/route-reads', 200, { route: '/pricing', files: ['app/pricing/page.tsx'], keys: ['loose_key'], complete: true });
+          await agent.moved('/pricing?tier=pro');
+          await wait(50); await page.settle();
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/pricing', keys: ['loose_key'], renders: {}, coincident: [] });
+          page.dom.window.close();
+        });
+
+        // D12 — the sites reach the agent, and a pick stet cannot place says so
+        it('sends the route’s render sites and coincident keys with its reads, or none where the reads are incomplete (T12.16)', async () => {
+          const renders = { hero_headline: [[{ tag: 'h1', classes: [] }]] };
+          const { page, agent } = await bridged({
+            routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['hero_headline'], complete: true, renders, coincident: ['hero_headline'] }]],
+          });
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: ['hero_headline'], renders, coincident: ['hero_headline'] });
+          page.answer('/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['hero_headline'], complete: false, renders, coincident: ['hero_headline'] });
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/');
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: null, renders: null, coincident: null });
+          page.dom.window.close();
+        });
+
+        it('says a text shown in several places may not all come from the key, only for a pick stet could not place (T12.17)', async () => {
+          const UNSURE = "This text shows in 3 places. stet can't tell which of them come from loose_key; saving changes only those.";
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: true }]] });
+          await agent.census({ found: { loose_key: 3 } });
+          await wait(50); await page.settle();
+          await agent.pick([{ key: 'loose_key' }]);
+          expect(lines(page)).toContain(UNSURE);
+          await agent.pick([{ key: 'loose_key', sure: true }]);
+          expect(lines(page).join(' ')).not.toContain('places. stet');
+          await agent.census({ found: { loose_key: 1 } });
+          await agent.pick([{ key: 'loose_key' }]);
+          expect(lines(page).join(' ')).not.toContain('places. stet');
+          await agent.census({ found: { loose_key: 3 } });
+          page.answer('/api/site/route-reads', 200, { route: '/', files: ['src/pages/index.astro'], keys: ['loose_key'], complete: false });
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/');
+          await agent.census({ found: { loose_key: 3 } });
+          await wait(50); await page.settle();
+          await agent.pick([{ key: 'loose_key' }]);
+          expect(lines(page).join(' ')).not.toContain('places. stet');
+          expect(lines(page).at(-1)).toBe(UNKNOWN);
+          page.dom.window.close();
+        });
+
+        // D8 — phone width
+        it('draws the frame at Mobile at phone width, whatever wider width is stored (T8.1)', async () => {
+          const { page } = await bridged({ storage: { 'stet.preview.width': 'desktop' }, prepare: (w) => { widthOf(390)(w); paneWidth(w); } });
+          evalIn(page, 'fitFrame()');
+          const frame = docOf(page).querySelector('#devwrap iframe') as HTMLIFrameElement;
+          expect(frame.style.width).toBe('390px');
+          expect(byId(page, 'panehead').querySelector('[data-act="width:mobile"]')?.className).toBe('on');
+          page.dom.window.close();
+        });
+
+        it('keeps a width picked at phone width for the tab only (T8.2)', async () => {
+          const { page } = await bridged({ prepare: (w) => { widthOf(390)(w); paneWidth(w); } });
+          await page.act('width:desktop');
+          evalIn(page, 'fitFrame()');
+          expect((docOf(page).querySelector('#devwrap iframe') as HTMLIFrameElement).style.width).toBe('1280px');
+          expect(page.storage()['stet.preview.width']).toBeUndefined();
+          page.dom.window.close();
+        });
+
+        it('scrolls nothing on a first tap at phone width; the second focuses and scrolls the field (T8.3)', async () => {
+          const scrolled: string[] = [];
+          const { page, agent } = await bridged({ prepare: (w) => { widthOf(390)(w); spyScroll(w, scrolled); } });
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect(scrolled).toEqual([]);
+          await agent.pick([{ key: 'hero_headline' }], { again: true });
+          expect(scrolled).toEqual(['text:hero_headline {"block":"nearest"}']);
+          expect(docOf(page).activeElement?.getAttribute('data-act-input')).toBe('text:hero_headline');
+          page.dom.window.close();
+        });
+
+        it('folds the sidebar to one row at phone width with a project open (T8.4, R7)', async () => {
+          const page = await paint({ prepare: widthOf(390) });
+          const shell = byId(page, 'shell');
+          const row = byId(page, 'sidetoggle');
+          expect({ picked: shell.classList.contains('picked'), open: shell.classList.contains('sideopen'), text: row.textContent, expanded: row.getAttribute('aria-expanded') })
+            .toEqual({ picked: true, open: false, text: 'Project: mini ▾', expanded: 'false' });
+          await page.act('sideToggle');
+          expect([shell.classList.contains('sideopen'), row.getAttribute('aria-expanded')]).toEqual([true, 'true']);
+          await page.act('site:/checkouts/other');
+          expect([shell.classList.contains('sideopen'), row.getAttribute('aria-expanded'), row.textContent]).toEqual([false, 'false', 'Project: other ▾']);
+          page.dom.window.close();
+        });
+
+        it('shows no row with no project open (T8.5)', async () => {
+          const page = await paint({ sites: [], prepare: widthOf(390) });
+          expect([byId(page, 'shell').classList.contains('picked'), byId(page, 'sidetoggle').textContent]).toEqual([false, '']);
+          page.dom.window.close();
+        });
+
+        // D9 — the keys list
+        it('lists All keys and This page first, opens on All keys, and counts every key (T9.1)', async () => {
+          const { page } = await bridged();
+          const options = [...docOf(page).querySelectorAll('#gsel option')].map((o) => o.textContent);
+          expect(options.slice(0, 2)).toEqual(['All keys', 'This page']);
+          expect(evalIn(page, 'S.group')).toBe('all');
+          expect(byId(page, 'keycount').textContent).toBe(String(Object.keys(descriptor.keys).length));
+          page.dom.window.close();
+        });
+
+        it('fills This page from the census, its count with it (T9.2)', async () => {
+          const { page, agent } = await bridged();
+          await page.change('group', 'page');
+          await agent.census({ found: { hero_headline: 1, loose_key: 2 } });
+          expect(page.keys()).toEqual(['hero_headline', 'loose_key']);
+          expect(byId(page, 'keycount').textContent).toBe('2');
+          page.dom.window.close();
+        });
+
+        // D10 — the near-limit count
+        it('shows the count by text typed in place only near the key’s limit (T10.1)', async () => {
+          const { page, agent } = await bridged({ site: GREETING });
+          await agent.pick([{ key: 'lab_greeting' }], { again: true });
+          expect(stateOf(page).edit).toMatchObject({ key: 'lab_greeting', form: 'inplace' });
+          const counter = byId(page, 'counter');
+          await agent.typed('lab_greeting', 'x'.repeat(35));
+          expect(counter.hidden).toBe(true);
+          await agent.typed('lab_greeting', 'x'.repeat(36));
+          expect([counter.hidden, counter.textContent, counter.className]).toEqual([false, '36 / 40', 'cnt amb']);
+          await agent.typed('lab_greeting', 'x'.repeat(41));
+          expect([counter.hidden, counter.textContent, counter.className]).toEqual([false, '41 / 40 · Save asks first', 'cnt bad']);
+          page.dom.window.close();
+        });
+
+        it('shows no count by text typed in place for a key with no limit (T10.2)', async () => {
+          const { page, agent } = await bridged();
+          await agent.pick([{ key: 'loose_key' }], { again: true, tag: 'p' });
+          expect(stateOf(page).edit).toMatchObject({ key: 'loose_key' });
+          for (const n of [1, 200]) {
+            await agent.typed('loose_key', 'x'.repeat(n));
+            expect(byId(page, 'counter').hidden).toBe(true);
+          }
+          page.dom.window.close();
+        });
+
+        it('REVIEW-H2: a sentence key whose value orders its tags otherwise opens its field, never the sentence form', async () => {
+          const site = siteBody({
+            descriptor: { ...descriptor, keys: { ...descriptor.keys, lab_sentence: { shape: 'text', target: 'web', tags: 2 } } },
+            snapshot: { ...snapshot, default: { ...snapshot.default, lab_sentence: 'Read the <2>docs</2> then run <1>npx x init</1>.' } },
+          });
+          const { page, agent } = await bridged({ site });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { tag: 'p' });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          expect(agent.sent('edit').filter((m) => m['form'] === 'sentence')).toEqual([]);
+          page.dom.window.close();
+        });
+
+        // C9 — typing a sentence key in the page (D16, D18)
+        const SENTENCE_VALUE = 'Install: run <1>npx x init</1> and answer.';
+        const SENTENCE_PLAIN = 'Install: run npx x init and answer.';
+        const SENTENCE_SITE = siteBody({
+          descriptor: { ...descriptor, keys: { ...descriptor.keys, lab_sentence: { shape: 'text', target: 'web', tags: 1 }, lab_marked: { shape: 'text', target: 'web', tags: 1 } } },
+          snapshot: { ...snapshot, default: { ...snapshot.default, lab_sentence: SENTENCE_VALUE, lab_marked: 'Ship <1>it</1> now' } },
+        });
+
+        it('sends a sentence key’s plain text and tags, and types its element hit in the sentence form (T18.1)', async () => {
+          const { page, agent } = await bridged({ site: SENTENCE_SITE });
+          const entry = (agent.sent('census').at(-1)?.['keys'] as Array<Record<string, unknown>>).find((k) => k['key'] === 'lab_sentence');
+          expect(entry).toEqual({ key: 'lab_sentence', texts: [SENTENCE_PLAIN], tags: 1 });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { tag: 'p' });
+          expect(agent.locates().at(-1)).toMatchObject({ key: 'lab_sentence', texts: [SENTENCE_PLAIN], tags: 1 });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          expect(agent.sent('edit').at(-1)).toEqual({ stet: 'edit', key: 'lab_sentence', locale: 'default', form: 'sentence', oneLine: true });
+          await agent.typed('lab_sentence', 'Install: go <1>npx x init</1> and answer.');
+          // The locate sent while the words were typed matches nothing on the page; its answer is held back while typing.
+          agent.say(LOCATED({ key: 'lab_sentence', found: 0, seq: agent.locates().at(-1)?.['seq'] }));
+          const asked = agent.locates().length;
+          await agent.edited('lab_sentence', 'keep');
+          // A kept edit asks again, and the page's answer replaces the stale not-found line.
+          expect(agent.locates().length).toBe(asked + 1);
+          agent.say(LOCATED({ key: 'lab_sentence', found: 1, seq: agent.locates().at(-1)?.['seq'] }));
+          await page.settle();
+          expect(lines(page).filter((l) => /was not found/.test(l))).toEqual([]);
+          // Another key selected: the sentence's draft rides the layer, matched by its plain text.
+          await agent.pick([{ key: 'lab_marked', by: 'mark' }], { again: true, tag: 'h1' });
+          expect(agent.sent('edit').at(-1)).toMatchObject({ key: 'lab_marked', form: 'runs' });
+          const layered = (agent.sent('layer').at(-1)?.['drafts'] as Array<Record<string, unknown>>).find((d) => d['key'] === 'lab_sentence');
+          expect(layered).toMatchObject({ texts: [SENTENCE_PLAIN], tags: 1, draft: 'Install: go <1>npx x init</1> and answer.' });
+          page.dom.window.close();
+        });
+
+        it('keeps the words typed into a sentence the page redrew, and says so until the next selection (T18.10)', async () => {
+          const INTERRUPTED = 'The page redrew this text while you typed. Your words are kept as an unsaved edit in the field.';
+          const { page, agent } = await bridged({ site: SENTENCE_SITE });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          await agent.typed('lab_sentence', 'Install: run <1>npx xx init</1> and answer.');
+          await agent.edited('lab_sentence', 'lost', { interrupted: true });
+          expect(stateOf(page).draft).toEqual({ 'default lab_sentence': 'Install: run <1>npx xx init</1> and answer.' });
+          expect(stateOf(page).edit).toBeNull();
+          expect([popover(page).hidden, poptext(page).value]).toEqual([false, 'Install: run <1>npx xx init</1> and answer.']);
+          expect(lines(page)).toContain(INTERRUPTED);
+          await page.act('key:lab_sentence');
+          expect(lines(page)).not.toContain(INTERRUPTED);
+          // Picking the key again in the page ends the line too (choosePick, not the sidebar).
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          await agent.edited('lab_sentence', 'lost', { interrupted: true });
+          expect(lines(page)).toContain(INTERRUPTED);
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { tag: 'p' });
+          expect(lines(page)).not.toContain(INTERRUPTED);
+          page.dom.window.close();
+        });
+
+        it('G4: picking an interrupted sentence again shows its kept draft before the edit starts (C9 validation)', async () => {
+          const { page, agent } = await bridged({ site: SENTENCE_SITE });
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          await agent.typed('lab_sentence', 'Install: run <1>npx xx init</1> and answer.');
+          await agent.edited('lab_sentence', 'lost', { interrupted: true });
+          await wait(400); await page.settle();
+          const locates = agent.locates().length;
+          const edits = agent.sent('edit').length;
+          await agent.pick([{ key: 'lab_sentence', by: 'element' }], { again: true, tag: 'p' });
+          expect(agent.sent('edit').length).toBe(edits + 1);
+          expect(agent.locates().slice(locates).at(-1)).toMatchObject({ key: 'lab_sentence', draft: 'Install: run <1>npx xx init</1> and answer.' });
+          page.dom.window.close();
+        });
+
+        // The validation round: the reads race, the phone row, the chooser, and the guards no case reached
+        const held = (page: Painted): unknown[] => [evalIn(page, 'frameHold !== null'), byId(page, 'panetop').style.height];
+
+        it('drops a route-reads answer that arrives for a route the frame has left (F1)', async () => {
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/a', files: [], keys: ['hero_headline'], complete: true }, 400]] });
+          await agent.census({ found: {}, route: '/a' });
+          page.answer('/api/site/route-reads', 200, { route: '/b', files: [], keys: ['loose_key'], complete: true });
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/b');
+          await agent.census({ found: {}, route: '/b' });
+          await wait(60); await page.settle();
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/b', keys: ['loose_key'], renders: {}, coincident: [] });
+          await wait(500); await page.settle();
+          expect(evalIn(page, 'S.routeReads.route')).toBe('/b');
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/b', keys: ['loose_key'], renders: {}, coincident: [] });
+          expect(lines(page)).not.toContain(UNKNOWN);
+          page.dom.window.close();
+        });
+
+        it('cuts a long project name in the phone sidebar row to one line (F2)', async () => {
+          const page = await paint({ prepare: widthOf(360) });
+          const css = [...docOf(page).querySelectorAll('style')].map((el) => el.textContent ?? '').join('\n');
+          const rule = /\.shell\.picked #sidetoggle\{([^}]*)\}/.exec(css);
+          const props = (rule?.[1] ?? '').split(';');
+          expect(props).toEqual(expect.arrayContaining(['min-height:36px', 'white-space:nowrap', 'overflow:hidden', 'text-overflow:ellipsis']));
+          page.dom.window.close();
+        });
+
+        it('REVIEW-L1: the two-key chooser goes with the page it was opened on', async () => {
+          const { page, agent } = await bridged();
+          await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }]);
+          const box = byId(page, 'panepick');
+          expect(box.hidden).toBe(false);
+          await agent.moved('/pricing');
+          const afterMove = box.hidden;
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          expect([afterMove, box.hidden]).toEqual([true, true]);
+          page.dom.window.close();
+        });
+
+        it('moves the chooser with the picked element when the frame scrolls (F3)', async () => {
+          const { page, agent } = await bridged();
+          await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }]);
+          const box = byId(page, 'panepick');
+          const before = box.style.top;
+          await agent.tell({ stet: 'rect', rect: { left: 100, top: 300, width: 200, height: 20 } });
+          expect(before).toBe('76px');
+          expect(box.style.top).toBe('326px');
+          page.dom.window.close();
+        });
+
+        it('puts the chooser where its element is once the hold ends and the frame has moved (F4l)', async () => {
+          let frameTop = 0;
+          const { page, agent } = await bridged({
+            prepare: (w) => {
+              widthOf(1280)(w);
+              (w.HTMLElement.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect = function (this: HTMLElement) {
+                return { left: 0, top: this.tagName === 'IFRAME' ? frameTop : 0, width: 0, height: 0, right: 0, bottom: 0 };
+              };
+            },
+          });
+          await agent.pick([{ key: 'hero_headline' }, { key: 'loose_key' }]);
+          const box = byId(page, 'panepick');
+          expect(box.style.top).toBe('76px');
+          frameTop = 40;
+          await agent.tell({ stet: 'out' });
+          expect(box.style.top).toBe('116px');
+          page.dom.window.close();
+        });
+
+        it('releases the hold when the page goes away (F4a)', async () => {
+          const { page, agent } = await bridged({ prepare: widthOf(1280) });
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect(held(page)).toEqual([true, '0px']);
+          await agent.tell({ stet: 'bye' });
+          expect(held(page)).toEqual([false, '']);
+          page.dom.window.close();
+        });
+
+        it('releases the hold on switching to Use (F4b)', async () => {
+          const { page, agent } = await bridged({ prepare: widthOf(1280) });
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect(held(page)).toEqual([true, '0px']);
+          await page.act('mode:use');
+          expect(held(page)).toEqual([false, '']);
+          page.dom.window.close();
+        });
+
+        it('releases the hold on opening a project (F4b)', async () => {
+          const { page, agent } = await bridged({ prepare: widthOf(1280) });
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect(held(page)).toEqual([true, '0px']);
+          evalIn(page, 'void loadSite(S.path)');
+          await wait(30); await page.settle();
+          expect(held(page)).toEqual([false, '']);
+          page.dom.window.close();
+        });
+
+        it('scrolls to no field when the pointer leaves with the popover open (F4c)', async () => {
+          const scrolled: string[] = [];
+          const { page, agent } = await bridged({ prepare: (w) => { widthOf(1280)(w); spyScroll(w, scrolled); } });
+          await agent.pick([{ key: 'hero_headline', inplace: false }], { again: true });
+          expect(popover(page).hidden).toBe(false);
+          await agent.tell({ stet: 'out' });
+          expect(scrolled).toEqual([]);
+          page.dom.window.close();
+        });
+
+        it('holds the frame for text no key matches until the pointer leaves (F4d)', async () => {
+          const { page, agent } = await bridged({ prepare: widthOf(1280) });
+          await agent.tell({ stet: 'unmanaged', text: 'x', tag: 'p' });
+          expect(held(page)).toEqual([true, '0px']);
+          await agent.tell({ stet: 'out' });
+          expect(held(page)).toEqual([false, '']);
+          page.dom.window.close();
+        });
+
+        it('sends no keys for a page whose reads are another route’s (F4e)', async () => {
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }]] });
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/', keys: ['hero_headline'], renders: {}, coincident: [] });
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/pricing');
+          expect(agent.sent('reads').at(-1)).toEqual({ stet: 'reads', route: '/pricing', keys: null, renders: null, coincident: null });
+          page.dom.window.close();
+        });
+
+        it('judges a pick and the not-found keys by the route the frame shows, not the one the pane asked for (F4f)', async () => {
+          const { page, agent } = await bridged({ routes: [['/api/site/route-reads', 200, { route: '/', files: ['app/page.tsx'], keys: ['hero_headline'], complete: true }]] });
+          await agent.census({ found: {} });
+          await wait(50); await page.settle();
+          page.answer('/api/site/route-reads', 200, { route: '/pricing', files: ['app/pricing/page.tsx'], keys: ['loose_key'], complete: true });
+          await agent.tell({ stet: 'bye' });
+          await agent.load();
+          await agent.ready('/pricing');
+          await agent.census({ found: {}, route: '/pricing' });
+          await wait(50); await page.settle();
+          await agent.pick([{ key: 'hero_headline' }]);
+          expect(lines(page)).toContain('This text matches hero_headline, but no file on this page reads that key — saving may not change it.');
+          await agent.tell({ stet: 'unmanaged', text: 'x', tag: 'p' });
+          expect(lines(page)).toEqual(['No key matches this text.', 'Keys this page reads that were not found: loose_key.']);
+          page.dom.window.close();
+        });
+
+        it('lights Mobile and draws the frame at it when the window narrows past 760 px (F4h)', async () => {
+          const { page } = await bridged({ prepare: (w) => { widthOf(1280)(w); paneWidth(w); } });
+          evalIn(page, 'fitFrame()');
+          const lit = (): string | undefined => byId(page, 'panehead').querySelector('button.on[data-act^="width:"]')?.getAttribute('data-act') ?? undefined;
+          expect(lit()).toBe('width:desktop');
+          widthOf(390)(page.dom.window);
+          page.dom.window.dispatchEvent(new page.dom.window.Event('resize'));
+          await page.settle();
+          expect(lit()).toBe('width:mobile');
+          expect((docOf(page).querySelector('#devwrap iframe') as HTMLIFrameElement).style.width).toBe('390px');
+          page.dom.window.close();
+        });
+
+        it('keeps the group picked through a refresh while the list still offers it, and falls back to All keys when it does not (F4i)', async () => {
+          const { page } = await bridged();
+          await page.change('group', 'page');
+          evalIn(page, 'void refreshSite()');
+          await wait(30); await page.settle();
+          expect(evalIn(page, 'S.group')).toBe('page');
+          await page.change('group', 'prefix:loose');
+          const { loose_key: _gone, ...keys } = descriptor.keys;
+          page.answer('/api/site', 200, siteBody({ descriptor: { ...descriptor, keys } }));
+          evalIn(page, 'void refreshSite()');
+          await wait(30); await page.settle();
+          expect(evalIn(page, 'S.group')).toBe('all');
+          page.dom.window.close();
+        });
+
+        it('shows the count from 90 % of the limit, rounded up (F4j)', async () => {
+          const site = siteBody({
+            descriptor: {
+              ...descriptor,
+              keys: {
+                ...descriptor.keys,
+                lab_hundred: { shape: 'text', target: 'web', limits: { max: 100, severity: 'advisory' } },
+                lab_odd: { shape: 'text', target: 'web', limits: { max: 45, severity: 'advisory' } },
+              },
+            },
+            snapshot: { ...snapshot, default: { ...snapshot.default, lab_hundred: 'x', lab_odd: 'x' } },
+          });
+          const { page, agent } = await bridged({ site });
+          const counter = byId(page, 'counter');
+          const shownAt = async (key: string, n: number): Promise<boolean> => {
+            await agent.typed(key, 'x'.repeat(n));
+            return !counter.hidden;
+          };
+          await agent.pick([{ key: 'lab_hundred' }], { again: true });
+          expect([await shownAt('lab_hundred', 89), await shownAt('lab_hundred', 90)]).toEqual([false, true]);
+          await agent.pick([{ key: 'lab_odd' }], { again: true });
+          expect([await shownAt('lab_odd', 40), await shownAt('lab_odd', 41)]).toEqual([false, true]);
           page.dom.window.close();
         });
       });
@@ -11762,8 +12739,12 @@ describe('the page', () => {
       routes: [['/api/site/marks', 200, allMarkedIn('index.html', null), 50]],
     });
     expect(await until(() => late.keys().length > 0 || painted(late).includes('No keys.'))).toBe(true);
-    expect((docOf(late).getElementById('gsel') as HTMLSelectElement).value).toBe('doc:index.html');
+    // The route is the first group's, the document's; the list shows every key.
+    expect((docOf(late).getElementById('gsel') as HTMLSelectElement).value).toBe('all');
+    expect(late.dom.window.eval('JSON.stringify([firstGroup(), S.route === groupRoute(firstGroup())])')).toBe('["doc:index.html",true]');
+    expect(late.keys()).toEqual(Object.keys(descriptor.keys).sort());
     // The page record names `seo_home_title`, so the SEO group holds it and the document the rest.
+    await late.change('group', 'doc:index.html');
     expect(late.keys()).toEqual(Object.keys(descriptor.keys).filter((id) => id !== 'seo_home_title').sort());
     late.dom.window.close();
 
@@ -11772,7 +12753,8 @@ describe('the page', () => {
       routes: [['/api/site/marks', 409, { error: 'index.html could not be read' }]],
     });
     // With no marks there is no document group; the site still opens on its visible text, not on SEO.
-    expect((docOf(refused).getElementById('gsel') as HTMLSelectElement).value).toBe('prefix:brand');
+    expect((docOf(refused).getElementById('gsel') as HTMLSelectElement).value).toBe('all');
+    expect(refused.dom.window.eval('firstGroup()')).toBe('prefix:brand');
     refused.dom.window.close();
   });
 
@@ -11883,7 +12865,7 @@ describe('the page', () => {
   it('groups keys by page, then by prefix, with no Other (journey A19)', async () => {
     const page = await paint();
     const labels = [...docOf(page).querySelectorAll('#gsel option')].map((option) => option.textContent);
-    expect(labels).toEqual(['home — page', 'SEO', 'brand', 'loose', 'unseeded', 'welcome']);
+    expect(labels).toEqual(['All keys', 'This page', 'home — page', 'SEO', 'brand', 'loose', 'unseeded', 'welcome']);
     await page.change('group', 'seo');
     expect(page.keys()).toEqual(['seo_home_title']);
     expect(painted(page)).not.toContain('>Other<');
@@ -11909,7 +12891,8 @@ describe('the page', () => {
       site: siteBody({ host: 'html', descriptor: unpaged }),
       routes: [['/api/site/marks', 200, allMarkedIn('index.html', null)]],
     });
-    expect((docOf(byDocument).getElementById('gsel') as HTMLSelectElement).value).toBe('doc:index.html');
+    // The list opens on every key; the groups are as before.
+    expect((docOf(byDocument).getElementById('gsel') as HTMLSelectElement).value).toBe('all');
     expect(await groupOfEveryRow(byDocument)).toEqual(expected('index.html'));
     byDocument.dom.window.close();
 
@@ -11917,7 +12900,7 @@ describe('the page', () => {
       site: siteBody({ host: 'html', descriptor: unpaged }),
       routes: [['/api/site/marks', 200, allMarkedIn('index.html', 'home')]],
     });
-    expect((docOf(byPage).getElementById('gsel') as HTMLSelectElement).value).toBe('page:home');
+    expect((docOf(byPage).getElementById('gsel') as HTMLSelectElement).value).toBe('all');
     expect(await groupOfEveryRow(byPage)).toEqual(expected('home — page'));
     byPage.dom.window.close();
   });
@@ -12217,14 +13200,15 @@ describe('the page', () => {
 
     it('opens on the page the preview shows (journey B18, B19)', async () => {
       const about = await twoPages('/about.html?x=1');
-      expect(opened(about)).toEqual({ group: 'page:about', route: '/about.html?x=1', loads: [`/api/site/preview?site=%2Fcheckouts%2Fmini&route=${encodeURIComponent('/about.html?x=1')}`] });
+      // The route is chosen through the groups as before; the list opens on every key.
+      expect(opened(about)).toEqual({ group: 'all', route: '/about.html?x=1', loads: [`/api/site/preview?site=%2Fcheckouts%2Fmini&route=${encodeURIComponent('/about.html?x=1')}`] });
       about.dom.window.close();
       const home = await twoPages('/');
-      expect(opened(home)).toMatchObject({ group: 'page:home', route: '/' });
+      expect(opened(home)).toMatchObject({ group: 'all', route: '/' });
       expect(home.requested('/api/site/preview?')).toHaveLength(1);
       home.dom.window.close();
       const gone = await twoPages('/retired.html');
-      expect(opened(gone)).toMatchObject({ group: 'page:about', route: '/about.html' });
+      expect(opened(gone)).toMatchObject({ group: 'all', route: '/about.html' });
       expect(gone.requested('/api/site/preview?')).toHaveLength(1);
       gone.dom.window.close();
     });
@@ -13254,6 +14238,17 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     return host;
   }
 
+  /** The route's reads without D12's render sites, which `routeRendersOf` answers alone. */
+  const routeReadsOf = async (handler: (r: Request) => Promise<Response>, host: CliHost, route = '/'): Promise<any> => {
+    const { renders: _renders, coincident: _coincident, ...body } = await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent(route)}`);
+    return body;
+  };
+  /** The route's render sites and coincident keys (D12). */
+  const routeRendersOf = async (handler: (r: Request) => Promise<Response>, host: CliHost, route = '/'): Promise<any> => {
+    const body = await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent(route)}`);
+    return { complete: body.complete, renders: body.renders, coincident: body.coincident };
+  };
+
   it('answers each judged key with its state, the file count and the root', async () => {
     const host = nextSite();
     const { handler } = handlerOver([host.cwd]);
@@ -13360,7 +14355,7 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
   it('lists a Next route’s page, its layout and what they import through the alias, complete', async () => {
     const host = nextSite();
     const { handler } = handlerOver([host.cwd]);
-    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+    expect(await routeReadsOf(handler, host)).toEqual({
       route: '/',
       files: ['app/layout.tsx', 'app/page.tsx'],
       keys: ['footer_links', 'hero_headline'],
@@ -13368,19 +14363,38 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     });
   });
 
+  it('an html page whose declared keys are all marked answers its marks, complete', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.complete).toBe(true);
+    expect(body.keys).toEqual(expect.arrayContaining(marksIn(host.cwd, 'index.html')));
+  });
+
+  it('an html page answers incomplete, its marked keys still listed, where a declared web text key is marked in no document', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const descriptor = JSON.parse(readFileSync(join(host.cwd, 'content/descriptor.json'), 'utf8')) as { keys: Record<string, unknown> };
+    const snapshot = JSON.parse(readFileSync(join(host.cwd, 'content/defaults.json'), 'utf8')) as { default: Record<string, unknown> };
+    descriptor.keys['script_rendered_line'] = { shape: 'text', target: 'web' };
+    snapshot.default['script_rendered_line'] = 'Rendered by the page script';
+    write(host.cwd, 'content/descriptor.json', `${JSON.stringify(descriptor, null, 2)}\n`);
+    write(host.cwd, 'content/defaults.json', `${JSON.stringify(snapshot, null, 2)}\n`);
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.complete).toBe(false);
+    expect(body.keys).toEqual(expect.arrayContaining(marksIn(host.cwd, 'index.html')));
+  });
+
   it('an alias that resolves nowhere makes the route incomplete', async () => {
     const host = nextSite();
     const { handler } = handlerOver([host.cwd]);
-    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/pricing')}`)).toEqual({
+    expect(await routeReadsOf(handler, host, '/pricing')).toEqual({
       route: '/pricing',
       files: ['app/layout.tsx', 'app/pricing/page.tsx'],
       keys: ['footer_links', 'pricing_price'],
       complete: false,
     });
   });
-
-  const routeReadsOf = (handler: (r: Request) => Promise<Response>, host: CliHost, route = '/'): Promise<any> =>
-    get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent(route)}`);
 
   it('F3a: a specifier resolved through baseUrl alone is followed', async () => {
     const host = nextSite();
@@ -13494,7 +14508,7 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     );
     const { handler } = handlerOver([host.cwd]);
     const body = await routeReadsOf(handler, host);
-    expect(body.keys).toEqual(['footer_links', 'hero_headline']);
+    expect(body.keys).toEqual(['footer_links', 'hero_body', 'hero_headline']);
     expect(body.complete).toBe(false);
   });
 
@@ -13608,12 +14622,172 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     const host = snapshotHost();
     write(host.cwd, 'src/main.tsx', "import { copy } from '../lib/content';\ndocument.title = copy('hero_headline');\n");
     const { handler } = handlerOver([host.cwd]);
-    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+    expect(await routeReadsOf(handler, host)).toEqual({
       route: '/',
       files: [],
       keys: [],
       complete: false,
     });
+  });
+
+  // 8o D2b: the route reads resolve TypeScript's spellings and skip framework modules.
+  const astroPage = (host: CliHost, page: string, files: Record<string, string> = {}): void => {
+    for (const [rel, text] of Object.entries(files)) write(host.cwd, rel, text);
+    write(host.cwd, 'src/pages/custody.astro', page);
+  };
+
+  it('T2b.3 an Astro route answers complete: a .js specifier reaches the generated module’s source, astro:assets is not host source', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport Fonts from '../components/Fonts.astro';\nimport { title } from '../copy';\n---\n<Fonts /><h1>{title}</h1>\n", {
+      'src/copy.ts': "import type { Key } from '../content/keys.js';\nexport const copy = (k: Key | string): string => String(k);\nexport const title = copy('hero_headline');\n",
+      'src/components/Fonts.astro': "---\nimport { Font } from 'astro:assets';\n---\n<Font />\n",
+    });
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host, '/custody');
+    expect([body.complete, body.keys]).toEqual([true, ['hero_headline']]);
+  });
+
+  it('T2b.4 guard: an unknown bare alias still ends the walk', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport X from 'missing-alias/x';\n---\n<h1>x</h1>\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  it('T2b.5 guard: a path alias spelled with a colon resolves through the mapping first', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport { title } from 'app:copy';\n---\n<h1>{title}</h1>\n", {
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { 'app:*': ['src/*'] } } }),
+      'src/copy.ts': "export const copy = (k: string): string => k;\nexport const title = copy('hero_headline');\n",
+    });
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host, '/custody');
+    expect([body.complete, body.keys]).toEqual([true, ['hero_headline']]);
+  });
+
+  // 8o D2c (R9): the route reads take each file's reads from key-usage's walk.
+  const plainLayout = 'export default function Layout({ children }: { children: unknown }) { return <html><body>{children as any}</body></html>; }\n';
+
+  it('T2c.1 a prefix read counts every key under it, and the route stays complete', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      "import { copy } from '../lib/content';\nconst tiers = ['tier_name', 'price'];\nexport default function Page() { return <ul>{tiers.map((t) => <li key={t}>{copy(`pricing_${t}`)}</li>)}</ul>; }\n",
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([true, ['pricing_price', 'pricing_tier_name']]);
+  });
+
+  it('T2c.2 a read key-usage cannot settle (a cause) answers incomplete', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'components/T.tsx', "import { copy } from '../lib/content';\nexport const T = ({ k }: { k: string }) => <b>{copy(k)}</b>;\n");
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      "import { T } from '../components/T';\nconst pick = (n: number) => ['hero', 'body'][n];\nexport default function Page() { return <T k={`${pick(0)}_headline`} />; }\n",
+    );
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host)).complete).toBe(false);
+  });
+
+  it('T2c.3 a page that loads modules through import.meta.glob answers incomplete', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nconst mods = import.meta.glob('../data/*.ts', { eager: true });\n---\n<h1>{Object.keys(mods).length}</h1>\n", {
+      'src/data/a.ts': "export const t = 'hero_headline';\n",
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  it('T2c.4 guard: Astro.glob answers incomplete too', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nconst posts = await Astro.glob('../posts/*.md');\n---\n<h1>{posts.length}</h1>\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  it('a prefix read adds only the keys under its own prefix', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, 'components/Other.tsx', "import { copy } from '../lib/content';\nexport const O = ({ t }: { t: string }) => <i>{copy(`hero_${t}`)}</i>;\n");
+    write(host.cwd, 'app/page.tsx', "import { copy } from '../lib/content';\nimport { O } from '../components/Other';\nexport default function Page({ t }: { t: string }) { return <i>{copy(`pricing_${t}`)}{O}</i>; }\n");
+    write(host.cwd, 'other/Elsewhere.tsx', "import { copy } from '../lib/content';\nexport const E = ({ t }: { t: string }) => <i>{copy(`blog_${t}`)}</i>;\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([true, ['hero_body', 'hero_headline', 'pricing_price', 'pricing_tier_name']]);
+  });
+
+  it('a read key-usage cannot settle in a file outside the closure leaves the route complete', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, 'app/page.tsx', "import { copy } from '../lib/content';\nexport default function Page() { return <i>{copy('hero_body')}</i>; }\n");
+    write(host.cwd, 'components/Other.tsx', "import { copy } from '../lib/content';\nexport const O = ({ k }: { k: string }) => <i>{copy(k)}</i>;\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([true, ['hero_body']]);
+  });
+
+  it('a typed import.meta.glob answers incomplete', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nconst m = import.meta.glob<Record<string, unknown>>('../data/*.ts');\n---\n<h1>x</h1>\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  it('a closure source file git ignores answers incomplete, its names kept', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, '.gitignore', 'components/Ignored.tsx\n');
+    write(host.cwd, 'components/Ignored.tsx', "export const I = 'hero_body';\n");
+    write(host.cwd, 'app/page.tsx', "import { I } from '../components/Ignored';\nexport default function Page() { return <i>{I}</i>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([false, ['hero_body']]);
+  });
+
+  it('a module another scheme names (virtual:) is not host source', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport 'virtual:uno.css';\n---\n<h1>x</h1>\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(true);
+  });
+
+  it('an alias the host declares that maps to no file ends the walk', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nimport X from 'app:Missing';\n---\n<h1>x</h1>\n", {
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { 'app:*': ['src/*'] } } }),
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host, '/custody')).complete).toBe(false);
+  });
+
+  // 8o L5: a ternary of key names reads both.
+  it('a copy() whose argument picks between two key names answers complete with both keys', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, 'app/page.tsx', "import { copy } from '../lib/content';\nexport default function Page({ a }: { a: boolean }) { return <i>{copy(a ? 'blog_intro' : 'hero_body')}</i>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect([body.complete, body.keys]).toEqual([true, ['blog_intro', 'hero_body']]);
+  });
+
+  it('a copy() whose argument picks between a key name and a variable answers incomplete', async () => {
+    const host = nextSite();
+    write(host.cwd, 'lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(host.cwd, 'app/page.tsx', "import { copy } from '../lib/content';\nexport default function Page({ a, k }: { a: boolean; k: string }) { return <i>{copy(a ? 'hero_body' : k)}</i>; }\n");
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeReadsOf(handler, host)).complete).toBe(false);
   });
 
   it('the html host answers the document’s marks', async () => {
@@ -13625,11 +14799,363 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
       .map(([key]) => key)
       .sort();
     expect(expected.length).toBeGreaterThan(0);
-    expect(await get(handler, `/api/site/route-reads${site(host)}&route=${encodeURIComponent('/')}`)).toEqual({
+    expect(await routeReadsOf(handler, host)).toEqual({
       route: '/',
       files: ['index.html'],
       keys: expected,
       complete: true,
     });
+  });
+
+  // 8o D12: the route reads say where each key renders.
+  /** An Astro host whose `/` is `page`, with `files` beside it and the snapshot's `values` over the fixture's. */
+  function placedSite(page: string, files: Record<string, string> = {}, values: Record<string, string> = {}): CliHost {
+    const host = astroHost(['index.astro']);
+    for (const [rel, text] of Object.entries(files)) write(host.cwd, rel, text);
+    write(host.cwd, 'src/pages/index.astro', page);
+    if (Object.keys(values).length > 0) {
+      const at = join(host.cwd, 'content/defaults.json');
+      const snapshot = loadSnapshot(JSON.parse(readFileSync(at, 'utf8')));
+      Object.assign(snapshot['default'] as Record<string, unknown>, values);
+      writeJsonDeterministic(at, snapshot);
+      writeFileSync(join(host.cwd, 'content/defaults.ts'), generateDefaultsModule(snapshot));
+    }
+    return host;
+  }
+  const FRONT = '---\nimport { copy } from "../../lib/content";\n---\n';
+
+  it('T12.1 Astro direct reads are sites; an attribute read is inert', async () => {
+    const host = placedSite(
+      FRONT + '<main><div class="acts"><span class="install">{copy.hero_headline}<button onclick={`x(${copy.hero_headline})`}>c</button></span></div></main>\n',
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, body.renders.hero_headline]).toEqual([true, [[{ tag: 'span', classes: ['install'] }, { tag: 'div', classes: null }]]]);
+  });
+
+  it.each([
+    ['a front-matter read', '---\nimport { copy } from "../../lib/content";\nconst t = copy.hero_headline;\n---\n<main><h1>{copy.hero_headline}</h1><p>{t}</p></main>\n'],
+    ['a read in a nested brace', FRONT + '<main><h1>{copy.hero_headline}</h1>{Math.random() > 1 && <a>{copy.hero_headline}</a>}</main>\n'],
+    ['a brace holding more than the read', FRONT + '<main><h1>{copy.hero_headline}</h1><p>{copy.hero_headline.toUpperCase()}</p></main>\n'],
+    ['a component attribute', FRONT + '<main><h1>{copy.hero_headline}</h1><Head label={copy.hero_headline} /></main>\n'],
+    ['a component’s content', FRONT + '<main><h1>{copy.hero_headline}</h1><Card>{copy.hero_headline}</Card></main>\n'],
+    ['set:html', FRONT + '<main><h1>{copy.hero_headline}</h1><div set:html={copy.hero_headline} /></main>\n'],
+    ['a prefix read', '---\nimport { copy } from "../../lib/content";\nconst part = "headline";\n---\n<main><h1>{copy.hero_headline}</h1><p>{copy(`hero_${part}`)}</p></main>\n'],
+  ])('T12.2 %s opens the key', async (_name, page) => {
+    // A direct read of another key on the page is placed: the file was read.
+    const host = placedSite(page.replace('</main>', '<b>{copy.pricing_price}</b></main>'));
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, Object.keys(body.renders)]).toEqual([true, ['pricing_price']]);
+  });
+
+  it('T12.3 one open read opens the key across files', async () => {
+    const host = placedSite(
+      '---\nimport { copy } from "../../lib/content";\nimport Accent from "../components/Accent.astro";\n---\n<main><h1>{copy.hero_headline}</h1><b>{copy.pricing_price}</b><Accent /></main>\n',
+      { 'src/components/Accent.astro': '---\nimport { copy } from "../../lib/content";\nconst accent = (s: string) => s;\n---\n<em>{accent(copy.hero_headline)}</em>\n' },
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, Object.keys(body.renders)]).toEqual([true, ['pricing_price']]);
+  });
+
+  it('T12.4 the chain’s classes: level 0 static or computed, the climb stops at a component', async () => {
+    const host = nextSite();
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      [
+        "import { copy } from '@/lib/content';",
+        "const s = { x: 'y' };",
+        'const Card = ({ children }: { children: unknown }) => <div>{children as any}</div>;',
+        'export default function Page() {',
+        "  return <main><section><p className=\"lede\">{copy('hero_headline')}</p></section><i className={s.x}>{copy('pricing_price')}</i><Card><b>{copy('pricing_tier_name')}</b></Card></main>;",
+        '}',
+        '',
+      ].join('\n'),
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, body.renders]).toEqual([
+      true,
+      {
+        hero_headline: [[{ tag: 'p', classes: ['lede'] }, { tag: 'section', classes: null }]],
+        pricing_price: [[{ tag: 'i', classes: null }, { tag: 'main', classes: null }]],
+        pricing_tier_name: [[{ tag: 'b', classes: [] }]],
+      },
+    ]);
+    const astro = placedSite(FRONT + '<main><p class:list={["a", Math.random()]}>{copy.hero_headline}</p></main>\n');
+    const other = handlerOver([astro.cwd]).handler;
+    expect((await routeRendersOf(other, astro)).renders.hero_headline).toEqual([[{ tag: 'p', classes: null }, { tag: 'main', classes: null }]]);
+  });
+
+  it('T12.5 guard: incomplete reads carry no sites', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, "---\nconst mods = import.meta.glob('../data/*.ts', { eager: true });\n---\n<h1>{Object.keys(mods).length}</h1>\n", {
+      'src/data/a.ts': "export const t = 'hero_headline';\n",
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeRendersOf(handler, host, '/custody')).toEqual({ complete: false, renders: {}, coincident: [] });
+  });
+
+  it('T12.5: a complete route carries the sites the same page would (the M12.10 control)', async () => {
+    const host = astroHost(['custody.astro']);
+    astroPage(host, FRONT + '<main><h1>{copy.hero_headline}</h1></main>\n');
+    const { handler } = handlerOver([host.cwd]);
+    expect((await routeRendersOf(handler, host, '/custody')).renders).toHaveProperty('hero_headline');
+    astroPage(host, '---\nimport { copy } from "../../lib/content";\nconst mods = import.meta.glob("../data/*.ts");\n---\n<main><h1>{copy.hero_headline}</h1></main>\n');
+    expect(await routeRendersOf(handler, host, '/custody')).toEqual({ complete: false, renders: {}, coincident: [] });
+  });
+
+  it('T12.6 a faulted document opens its reads', async () => {
+    const host = placedSite(FRONT + '<main><div><p>{copy.hero_headline}</p></main>\n');
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect(body.complete).toBe(true);
+    expect(body.renders).not.toHaveProperty('hero_headline');
+  });
+
+  it('T12.7 guard: the html host carries no sites', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeRendersOf(handler, host)).toEqual({ complete: true, renders: {}, coincident: [] });
+  });
+
+  it('T12.19 a read KEY_READ does not see opens the key (F1)', async () => {
+    const host = placedSite(
+      [
+        '---',
+        'import { copy } from "../../lib/content";',
+        'const t = copy;',
+        '---',
+        '<html><body><main>',
+        '<div class="cell"><h3>{copy.hero_headline}</h3></div>',
+        '<ul><li>{copy["hero_headline"]}</li></ul>',
+        '<p class="lede">{t.pricing_tier_name}</p><h3>{copy.pricing_tier_name}</h3>',
+        '<b>{copy.pricing_price}</b>',
+        '</main></body></html>',
+        '',
+      ].join('\n'),
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect(body.complete).toBe(true);
+    expect(Object.keys(body.renders)).toEqual(['pricing_price']);
+
+    const next = nextSite();
+    write(next.cwd, 'app/layout.tsx', plainLayout);
+    write(next.cwd, 'package.json', JSON.stringify({ name: 'site', dependencies: { react: '^19', '@getstet/stet': '1' } }));
+    write(
+      next.cwd,
+      'app/page.tsx',
+      "import { copy } from '@/lib/content';\nimport { useCopy } from '@getstet/stet/react';\nexport default function Page() { const t = useCopy(); return <main><p>{t('hero_headline')}</p><h3>{copy('hero_headline')}</h3><b>{copy('pricing_price')}</b></main>; }\n",
+    );
+    const other = handlerOver([next.cwd]).handler;
+    const tsx = await routeRendersOf(other, next);
+    expect([tsx.complete, Object.keys(tsx.renders)]).toEqual([true, ['pricing_price']]);
+  });
+
+  it('T12.20 only a key whose words a route file writes as text is coincident (R21, N17)', async () => {
+    const host = placedSite(
+      [
+        '---',
+        'import { copy } from "../../lib/content";',
+        'import { pkg } from "@getstet/stet";',
+        'import Promo from "../components/Promo.astro";',
+        'import "../copy";',
+        '---',
+        '<main><h1>{copy.hero_headline}</h1><b>{copy.pricing_tier_name}</b><i>{copy.pricing_price}</i><em>{copy.brand__name}</em><Promo /><s>{pkg}</s></main>',
+        '',
+      ].join('\n'),
+      {
+        'package.json': JSON.stringify({ name: 'site', dependencies: { '@getstet/stet': '1' } }),
+        'stet.config.json': JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'] }, null, 2),
+        'src/components/Promo.astro': '<aside><p>Never miss a post again.</p></aside>\n',
+        'src/copy.ts': 'export const labels = { price: "$16" };\n',
+      },
+      { brand__name: 'stet' },
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect(body.complete).toBe(true);
+    expect(Object.keys(body.renders).sort()).toEqual(['brand__name', 'hero_headline', 'pricing_price', 'pricing_tier_name']);
+    expect(body.coincident).toEqual(['hero_headline']);
+  });
+
+  it('T12.21 the tree builder’s re-parenting ends the chain (F3)', async () => {
+    const host = placedSite(FRONT + '<main><p><div><span>{copy.hero_headline}</span></div></p><p><div>{copy.pricing_price}</div></p></main>\n');
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.renders.hero_headline, body.renders.pricing_price]).toEqual([
+      [[{ tag: 'span', classes: [] }, { tag: 'div', classes: null }]],
+      [[{ tag: 'div', classes: [] }]],
+    ]);
+  });
+
+  it('T12.21 (F1, an addition): markup the tree builder repairs past the parent opens the key', async () => {
+    const host = placedSite(
+      FRONT +
+        '<main><p><span><div>{copy.hero_headline}</div></span></p><ul><li><li>{copy.pricing_price}</li></li></ul><section><b>{copy.pricing_tier_name}</b></section></main>\n',
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, Object.keys(body.renders)]).toEqual([true, ['pricing_tier_name']]);
+
+    const next = nextSite();
+    write(next.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      next.cwd,
+      'app/page.tsx',
+      "import { copy } from '@/lib/content';\nexport default function Page() { return <main><p><span><div>{copy('hero_headline')}</div></span></p><ul><li><li>{copy('pricing_price')}</li></li></ul><section><b>{copy('pricing_tier_name')}</b></section></main>; }\n",
+    );
+    const other = handlerOver([next.cwd]).handler;
+    const tsx = await routeRendersOf(other, next);
+    expect([tsx.complete, Object.keys(tsx.renders)]).toEqual([true, ['pricing_tier_name']]);
+  });
+
+  it('T12.26 (F3, an addition): a code sample in an is:raw block is no read and no render site', async () => {
+    // The shape of the reference host's docs/adopt.astro: a diff sample quoting copy('…') in a raw <pre>.
+    const host = placedSite(
+      FRONT +
+        '<main><h3>{copy.pricing_price}</h3>\n<pre is:raw><code><span class="add">+      &lt;h1&gt;{copy(\'pricing_price\')}&lt;/h1&gt;</span>\n<span class="add">+      &lt;p&gt;{copy(\'hero_headline\')}&lt;/p&gt;</span></code></pre></main>\n',
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, body.renders]).toEqual([true, { pricing_price: [[{ tag: 'h3', classes: [] }, { tag: 'main', classes: null }]] }]);
+  });
+  /**
+   * The Astro host register rewrites (D14): pages read keys by property through
+   * the declared copy module `src/copy.ts`, and `hero_install` holds the
+   * terminal's words.
+   */
+  function rewritable(page: string): CliHost {
+    const host = astroHost(['index.astro']);
+    write(
+      host.cwd,
+      'stet.config.json',
+      JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], copyModules: ['src/copy.ts'], readPath: { file: 'lib/content.ts', import: '@/lib/content' } }, null, 2),
+    );
+    write(host.cwd, 'src/copy.ts', 'export const copy: Record<string, string> = {};\n');
+    write(host.cwd, 'src/pages/index.astro', page);
+    const descriptor = loadDescriptor(JSON.parse(readFileSync(join(host.cwd, 'content/descriptor.json'), 'utf8')));
+    descriptor.keys['hero_install'] = { shape: 'text', target: 'web' };
+    writeJsonDeterministic(join(host.cwd, 'content/descriptor.json'), descriptor);
+    const snapshot = loadSnapshot(JSON.parse(readFileSync(join(host.cwd, 'content/defaults.json'), 'utf8')));
+    (snapshot['default'] as Record<string, unknown>)['hero_install'] = 'npx x init';
+    writeJsonDeterministic(join(host.cwd, 'content/defaults.json'), snapshot);
+    return host;
+  }
+  const TERMINAL =
+    '---\nimport { copy } from "../copy";\n---\n<main>\n<div class="term"><span class="w">npx x init</span></div>\n<div class="box"><span class="install">{copy.hero_install}</span></div>\n</main>\n';
+
+  it('T14.16: the route reads place a text register rewrote: both its sites render the key, and nothing is coincident', async () => {
+    const host = rewritable(TERMINAL);
+    const { handler } = handlerOver([host.cwd]);
+    const before = await routeRendersOf(handler, host);
+    expect([before.coincident, before.renders.hero_install]).toEqual([['hero_install'], [[{ tag: 'span', classes: ['install'] }, { tag: 'div', classes: null }]]]);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.file('src/pages/index.astro')).toContain('<span class="w">{copy.hero_install}</span>');
+    const after = await routeRendersOf(handler, host);
+    expect([after.coincident, after.renders.hero_install]).toEqual([
+      [],
+      [
+        [{ tag: 'span', classes: ['w'] }, { tag: 'div', classes: null }],
+        [{ tag: 'span', classes: ['install'] }, { tag: 'div', classes: null }],
+      ],
+    ]);
+  });
+
+  it('T16.8: a rich read is a render site, and a hard-coded twin of its words makes its key coincident (check 3 F20)', async () => {
+    const host = placedSite(
+      '---\nimport { copy } from "../../lib/content";\nimport { richParts } from "@getstet/stet";\nimport Promo from "../components/Promo.astro";\n---\n' +
+        '<main><p class="lede">{richParts(copy.hero_headline, [(c) => <b>{c}</b>])}</p><Promo /></main>\n',
+      {
+        'package.json': JSON.stringify({ name: 'site', dependencies: { '@getstet/stet': '1' } }),
+        'src/components/Promo.astro': '<aside><span>Run <b>npx</b> now</span></aside>\n',
+      },
+      { hero_headline: 'Run <1>npx</1> now' },
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const plain = await routeRendersOf(handler, host);
+    expect([plain.complete, plain.renders.hero_headline, plain.coincident]).toEqual([true, [[{ tag: 'p', classes: ['lede'] }, { tag: 'main', classes: null }]], []]);
+    // Declared as a sentence key, its words are read without their tags: the twin is coincident.
+    const at = join(host.cwd, 'content/descriptor.json');
+    const descriptor = loadDescriptor(JSON.parse(readFileSync(at, 'utf8')));
+    (descriptor.keys['hero_headline'] as { tags?: number }).tags = 1;
+    writeJsonDeterministic(at, descriptor);
+    const tagged = await routeRendersOf(handler, host);
+    expect([tagged.renders.hero_headline, tagged.coincident]).toEqual([[[{ tag: 'p', classes: ['lede'] }, { tag: 'main', classes: null }]], ['hero_headline']]);
+  });
+
+  it('T16.16: a JSX rich read is a render site, and site/split proposes a name from the element that holds it', async () => {
+    const host = nextSite();
+    write(host.cwd, 'package.json', JSON.stringify({ name: 'site', dependencies: { react: '^19', '@getstet/stet': '1' } }));
+    write(host.cwd, 'app/layout.tsx', plainLayout);
+    write(
+      host.cwd,
+      'app/page.tsx',
+      [
+        "import { copy } from '@/lib/content';",
+        "import { richParts } from '@getstet/stet/react/server';",
+        'export default function Page() {',
+        "  return <main><p className=\"lede\">{richParts(copy('hero_headline'), [(c, k) => <b key={k}>{c}</b>])}</p>",
+        "    <h2>{copy('hero_headline')}</h2></main>;",
+        '}',
+        '',
+      ].join('\n'),
+    );
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeRendersOf(handler, host);
+    expect([body.complete, body.renders.hero_headline]).toEqual([
+      true,
+      [
+        [{ tag: 'p', classes: ['lede'] }, { tag: 'main', classes: null }],
+        [{ tag: 'h2', classes: [] }, { tag: 'main', classes: null }],
+      ],
+    ]);
+    const asked = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_headline', at: 'app/page.tsx:4' });
+    expect([asked.status, asked.body]).toEqual([200, { proposed: 'home_page_paragraph' }]);
+  });
+
+  it('T14.19: site/split proposes a name for an Astro place and, given it, moves that read alone', async () => {
+    const host = rewritable(TERMINAL);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const { handler } = handlerOver([host.cwd]);
+    const asked = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_install', at: 'src/pages/index.astro:5' });
+    expect([asked.status, asked.body]).toEqual([200, { proposed: 'home_page_span' }]);
+    const split = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_install', at: 'src/pages/index.astro:5', name: 'home_page_span' });
+    expect([split.status, split.body['key']]).toEqual([200, 'home_page_span']);
+    expect(host.file('src/pages/index.astro')).toContain('<span class="w">{copy.home_page_span}</span></div>\n<div class="box"><span class="install">{copy.hero_install}</span>');
+  });
+});
+
+describe('REVIEW probe: a second stet write to one page file (PD14)', () => {
+  it('REVIEW-H1: commits the page after Declare pages and then Split both wrote it', async () => {
+    const host = astroHost(['about.astro']);
+    writeFileSync(
+      join(host.cwd, 'stet.config.json'),
+      JSON.stringify({ project: 't', router: 'astro', managedSurfaces: ['src/**/*.astro'], readPath: { file: 'src/lib/content.ts', import: '@/lib/content' } }, null, 2),
+    );
+    write(host.cwd, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['./src/*'] } } }));
+    write(host.cwd, 'src/lib/content.ts', 'export const copy = (k: string): string => k;\n');
+    write(
+      host.cwd,
+      'src/pages/about.astro',
+      "---\nimport { copy } from '@/lib/content';\n---\n<html><head><title>About us</title><meta name=\"description\" content=\"Who we are.\" /></head><body>\n<h1>{copy('hero_headline')}</h1>\n<p>{copy('hero_headline')}</p>\n</body></html>\n",
+    );
+    git(host.cwd, ['add', '-A']);
+    git(host.cwd, ['commit', '-qm', 'pages']);
+    const { handler } = handlerOver([host.cwd]);
+    const declared = await post(handler, `/api/site/pages/declare${site(host)}`, { names: ['about'] });
+    expect(declared.status).toBe(200);
+    expect(declared.body['written']).toContain('src/pages/about.astro');
+    const first = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+    expect(first).toContain('src/pages/about.astro');
+    const split = await post(handler, `/api/site/split${site(host)}`, { key: 'hero_headline', at: 'src/pages/about.astro:6', name: 'about_para' });
+    expect(split.status).toBe(200);
+    expect(split.body['written']).toContain('src/pages/about.astro');
+    const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
+    expect(pending).toContain('src/pages/about.astro');
   });
 });

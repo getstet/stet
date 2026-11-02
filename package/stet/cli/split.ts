@@ -18,6 +18,7 @@ import { resolve } from '../src/resolve.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
 import { flag, parse, text as argText } from './args.js';
+import { astroPlaceName } from './astro-rewrite.js';
 import { rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
@@ -29,7 +30,7 @@ import type { CliIo } from './main.js';
 import { htmlPageOf, pageOfFile } from './pages.js';
 import { accessorBaseName, hostRefusals, keyMoveWrites, markRenames, readRenames, slotOrBrand, type HostRenames, type OnlyAt } from './rename.js';
 import { HostTextReport, UsageError } from './report.js';
-import { scanSource } from './source-scan.js';
+import { dialectOf, loadTypescript, scanSource } from './source-scan.js';
 
 const USAGE = 'stet split <key> <new> --at <file>:<line> [--write]';
 
@@ -157,9 +158,14 @@ export async function proposedSplitName(
       return null;
     }
     const page = pageOfFile(cwd, at.file, descriptor.pages);
-    const result = await scanSource(at.file, source, { readPathImport: config.readPath.import, ...(page === undefined ? {} : { page }) });
-    const call = result.accessorCalls.find((c) => c.key === key && c.copyBinding === 'stet' && c.place.line === at.line);
-    if (call !== undefined) base = accessorBaseName(page, call);
+    if (dialectOf(at.file) === 'astro') {
+      // An Astro file's reads are named by the rewriter that wrote them.
+      base = astroPlaceName(await loadTypescript(), cwd, at.file, source, key, at.line, page);
+    } else {
+      const result = await scanSource(at.file, source, { readPathImport: config.readPath.import, ...(page === undefined ? {} : { page }) });
+      const call = result.accessorCalls.find((c) => c.key === key && c.copyBinding === 'stet' && c.place.line === at.line);
+      if (call !== undefined) base = accessorBaseName(page, call);
+    }
   }
   if (base === null) return null;
   return numberNames([base], (name) => Object.hasOwn(descriptor.keys, name))[0] as string;

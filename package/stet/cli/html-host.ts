@@ -33,6 +33,7 @@ import { targetAdapter } from '../src/targets/adapter.js';
 import { DEFAULT_TARGET, type Descriptor, type KeyDef } from '../src/types.js';
 import { headLimitsFor } from '../src/seo.js';
 import { plainOf } from '../src/validate.js';
+import { readAttrs, type HtmlAttr } from './markup.js';
 import { CliError, Report } from './report.js';
 import {
   baseName,
@@ -62,6 +63,7 @@ import {
   qualifiesAsCopy,
   undecodedEntity,
 } from './source-scan.js';
+export type { HtmlAttr } from './markup.js';
 
 // --- The grammar ------------------------------------------------------------
 
@@ -77,9 +79,6 @@ import {
  */
 const TAG_TOKEN =
   /<(\/?)([A-Za-z][A-Za-z0-9:-]*)((?:\s+[^\s"'=<>/]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*(\/?)>/g;
-
-/** One attribute inside a tag's attribute run. Match indices give the value's own offsets. */
-const ATTR = /([^\s"'=<>/]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?/gd;
 
 /** Elements that never have content, so they close themselves. */
 const VOID = new Set([
@@ -153,20 +152,6 @@ const MARK_IN_SOURCE = /\bdata-stet(-[a-z-]+)?\s*=/g;
 const MARK_WITH_VALUE = /\s*data-stet(?:-[a-z-]+)?="[^"]*"/g;
 
 // --- What the reader yields -------------------------------------------------
-
-export interface HtmlAttr {
-  /** Lower-cased. */
-  name: string;
-  /** The raw slice between the quotes, or the bare run of an unquoted value. */
-  value: string;
-  quoted: boolean;
-  /** Absolute offsets INSIDE the quotes, so a replacement never touches them. */
-  valueStart: number;
-  valueEnd: number;
-  /** The attribute's whole span, its name included. */
-  start: number;
-  end: number;
-}
 
 export interface TextSegment {
   text: string;
@@ -549,45 +534,6 @@ function fillDescendants(root: Element): void {
   }
 }
 
-/** One tag's attributes, with absolute offsets for the value inside its quotes. */
-function readAttrs(source: string, base: number, run: string): HtmlAttr[] {
-  const attrs: HtmlAttr[] = [];
-  ATTR.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = ATTR.exec(run)) !== null) {
-    const name = (match[1] as string).toLowerCase();
-    const raw = match[2];
-    const start = base + match.index;
-    if (raw === undefined) {
-      attrs.push({
-        name,
-        value: '',
-        quoted: false,
-        valueStart: start + (match[1] as string).length,
-        valueEnd: start + (match[1] as string).length,
-        start,
-        end: start + match[0].length,
-      });
-      continue;
-    }
-    const span = match.indices?.[2];
-    const rawStart = span === undefined ? start + match[0].indexOf(raw) : base + span[0];
-    const rawEnd = span === undefined ? rawStart + raw.length : base + span[1];
-    const quote = raw.charAt(0);
-    const quoted = quote === '"' || quote === "'";
-    attrs.push({
-      name,
-      value: quoted ? raw.slice(1, -1) : raw,
-      quoted,
-      valueStart: quoted ? rawStart + 1 : rawStart,
-      valueEnd: quoted ? rawEnd - 1 : rawEnd,
-      start,
-      end: start + match[0].length,
-    });
-  }
-  return attrs;
-}
-
 // --- The value --------------------------------------------------------------
 
 /** A flattened key element: text runs and the open/close/self tokens of its descendants. */
@@ -634,7 +580,7 @@ function readBack(value: string): string {
 }
 
 /** A raw slice as text: blanked spans removed, runs collapsed, entities decoded. */
-function textOf(raw: string): string {
+export function textOf(raw: string): string {
   return decodeEntities(collapseAscii(raw.replace(/\0/g, '')));
 }
 
@@ -682,10 +628,15 @@ function tokensOf(el: Element): Token[] {
  * descendants. A whitespace run at a tag boundary keeps ONE space, so a
  * sentence broken across lines reads as a sentence; whitespace at the very
  * start or end of the content contributes nothing, so the indentation the
- * document keeps is never part of the value.
+ * document keeps is never part of the value. Under `boundary: 'collapse-newline'`
+ * (Astro's default `compressHTML`) a run at a tag boundary that holds a line
+ * break contributes nothing, as Astro renders it.
  */
-export function valueOf(el: Element): { value: string; plain: string; tags: number } {
+export function valueOf(el: Element, options: { boundary?: 'space' | 'collapse-newline' } = {}): { value: string; plain: string; tags: number } {
   const tokens = tokensOf(el);
+  const collapse = options.boundary === 'collapse-newline';
+  // The space a boundary run keeps: none where the run breaks the line and the mode drops such a run.
+  const kept = (run: string): boolean => run !== '' && !(collapse && /[\r\n]/.test(run));
   const parts: string[] = [];
   tokens.forEach((token, i) => {
     if (token.kind !== 'text') {
@@ -697,11 +648,11 @@ export function valueOf(el: Element): { value: string; plain: string; tags: numb
     const before = i > 0;
     const after = i < tokens.length - 1;
     if (core === '') {
-      if (before && after && /[ \t\r\n\f]/.test(stripped)) parts.push(' ');
+      if (before && after && kept(/[ \t\r\n\f]*/.exec(stripped)?.[0] ?? '')) parts.push(' ');
       return;
     }
-    const lead = before && /^[ \t\r\n\f]/.test(stripped) ? ' ' : '';
-    const trail = after && /[ \t\r\n\f]$/.test(stripped) ? ' ' : '';
+    const lead = before && kept(/^[ \t\r\n\f]*/.exec(stripped)?.[0] ?? '') ? ' ' : '';
+    const trail = after && kept(/[ \t\r\n\f]*$/.exec(stripped)?.[0] ?? '') ? ' ' : '';
     parts.push(`${lead}${core}${trail}`);
   });
   const value = parts.join('');
@@ -1063,7 +1014,7 @@ function* sectionChain(el: Element | undefined, parents: Map<Element, Element>):
 }
 
 /** What the naming rule gives an element: its section word, the repeated item it sits in, its role and the section's element. */
-interface Naming {
+export interface Naming {
   sectionWord: string | null;
   item?: string;
   role: string;
@@ -1075,7 +1026,7 @@ interface Naming {
  * mark's for `rename --propose`. Inside a repeated item the section is the one
  * above the outermost item; outside one, a heading takes P4's role.
  */
-function namingOf(el: Element, parents: Map<Element, Element>, items: (at: Element) => ItemNode, place: Place): Naming {
+export function namingOf(el: Element, parents: Map<Element, Element>, items: (at: Element) => ItemNode, place: Place): Naming {
   const up: Element[] = [];
   for (let at: Element | undefined = el; at !== undefined; at = parents.get(at)) up.push(at);
   const role = roleOf(place);
@@ -1092,7 +1043,7 @@ function namingOf(el: Element, parents: Map<Element, Element>, items: (at: Eleme
 }
 
 /** The item rule's reads over one document, over key-names' `itemReader`: a text is a key element or a copy attribute. */
-function htmlItems(parents: Map<Element, Element>, texts: ReadonlySet<Element>): (at: Element) => ItemNode {
+export function htmlItems(parents: Map<Element, Element>, texts: ReadonlySet<Element>): (at: Element) => ItemNode {
   return itemReader<Element>({
     parentOf: (n) => parents.get(n),
     childrenOf: (n) => n.children,
@@ -1861,12 +1812,16 @@ const DERIVE_MIN = 12;
 /** A letter or a digit: what a word boundary may not cut through. */
 const WORD_CHAR = /[\p{L}\p{N}]/u;
 
-/** The first occurrence of `part` in `text` with no letter or digit against either end, or -1. */
-function wordBoundedIndex(text: string, part: string): number {
+/**
+ * The first occurrence of `part` in `text` with no letter or digit against either
+ * end, or -1; `joins` names the characters that continue a word where a caller
+ * reads more than letters and digits as one.
+ */
+export function wordBoundedIndex(text: string, part: string, joins: RegExp = WORD_CHAR): number {
   for (let at = text.indexOf(part); at !== -1; at = text.indexOf(part, at + 1)) {
     const before = at === 0 ? '' : text.charAt(at - 1);
     const after = text.charAt(at + part.length);
-    if (!WORD_CHAR.test(before) && !WORD_CHAR.test(after)) return at;
+    if (!joins.test(before) && !joins.test(after)) return at;
   }
   return -1;
 }

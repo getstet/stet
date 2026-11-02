@@ -76,6 +76,17 @@ describe('runtimeImportClosure — the load forms a bundler follows', () => {
     expect(() => closureOf('e-require-computed.ts')).toThrowError(/unanalyzable require/);
   });
 
+  it('follows a bare name passed to a call result, as createRequire(...)(\'x\') loads it', () => {
+    // The loader is a call's result, not an identifier named `require`, so the
+    // `require` rule alone never sees it. The same name through the same
+    // loader is the same load.
+    expect(closureOf('e-create-require.ts').bare).toEqual(['marker-leaf', 'node:module']);
+  });
+
+  it('takes from a curried call only a lone bare string, and never a relative one', () => {
+    expect(closureOf('e-curried-decoy.ts').bare).toEqual(['second']);
+  });
+
   it('follows import x = require() and erases the type-only form', () => {
     expect(closureOf('f-import-equals.ts').bare).toEqual(['marker-leaf']);
 

@@ -114,10 +114,24 @@ export function moduleSpecifier(ts: typeof import('typescript'), stmt: TS.Statem
   return undefined;
 }
 
+/**
+ * The TypeScript sources a compiled-extension specifier names: TypeScript's own
+ * ESM rule, so `./keys.js` reaches `keys.ts` (or `keys.tsx`), `.mjs` `.mts` and
+ * `.cjs` `.cts`, and, as Vite resolves it, `.jsx` `.tsx`.
+ */
+export function sourceSpellings(base: string): string[] {
+  if (base.endsWith('.js')) return [`${base.slice(0, -3)}.ts`, `${base.slice(0, -3)}.tsx`];
+  if (base.endsWith('.mjs')) return [`${base.slice(0, -4)}.mts`];
+  if (base.endsWith('.cjs')) return [`${base.slice(0, -4)}.cts`];
+  if (base.endsWith('.jsx')) return [`${base.slice(0, -4)}.tsx`];
+  return [];
+}
+
 /** An absolute path, extension probed, as a repo-relative file; null where nothing is there. */
 export function probeFile(cwd: string, base: string): string | null {
   const candidates = [
     base,
+    ...sourceSpellings(base),
     ...CHAIN_EXTENSIONS.map((ext) => `${base}${ext}`),
     ...CHAIN_EXTENSIONS.map((ext) => join(base, `index${ext}`)),
   ];

@@ -3770,7 +3770,7 @@ describe('list --json: the unread-key badge (D6, 5.6)', () => {
     );
   });
 
-  it('without typescript: no badge, usage null, the install line among the findings', async () => {
+  it('without stet’s typescript: no badge, usage null, the reinstall line among the findings', async () => {
     const host = templateLiteralHost();
     vi.resetModules();
     vi.doMock('typescript', () =>
@@ -3788,7 +3788,7 @@ describe('list --json: the unread-key badge (D6, 5.6)', () => {
       expect(answer.rows.every((r) => !('badge' in r))).toBe(true);
       expect(answer.usage).toBeNull();
       expect(answer.findings).toEqual([
-        expect.objectContaining({ level: 'warn', message: "stet needs 'typescript' to read your source — install it as a dev dependency: npm i -D typescript" }),
+        expect.objectContaining({ level: 'warn', message: 'stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet' }),
       ]);
     } finally {
       vi.doUnmock('typescript');

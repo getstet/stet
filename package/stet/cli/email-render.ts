@@ -28,7 +28,7 @@ const STRAY_EXCERPT = 200;
 /** Why a render did not produce bytes. One per non-zero exit the runner names. */
 export type RenderFailure =
   | 'export-not-function'
-  | 'ts7-unsupported'
+  | 'compiler-missing'
   | 'missing-dependency'
   | 'render-threw'
   | 'not-renderable'
@@ -77,7 +77,7 @@ const NOTE_PREFIX = 'stet-note: ';
  */
 const REASONS: Record<number, RenderFailure> = {
   2: 'export-not-function',
-  3: 'ts7-unsupported',
+  3: 'compiler-missing',
   4: 'missing-dependency',
   5: 'render-threw',
   6: 'not-renderable',

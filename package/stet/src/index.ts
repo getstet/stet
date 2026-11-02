@@ -94,6 +94,10 @@ export type {
   Verdict,
 } from './validate.js';
 
+// The renderer a sentence key is read through: each placeholder element in the host's own markup.
+export { richParts } from './rich.js';
+export type { RichChildren } from './rich.js';
+
 // The SEO check: nine rules over the descriptor and the committed snapshot.
 export { SEO_SEVERITY, seoCheck } from './seo.js';
 export type { SeoFinding, SeoRule } from './seo.js';
