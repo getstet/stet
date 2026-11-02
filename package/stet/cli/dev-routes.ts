@@ -31,14 +31,14 @@ import { plainOf } from '../src/placeholder.js';
 import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
-import type { Descriptor } from '../src/types.js';
+import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
 import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
 import { pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
 import { isBarePackage } from './email-extract.js';
 import { filesForGlobs, staticPrefix } from './files.js';
-import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, type GitState } from './git.js';
+import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, uncommittedStatus, type GitState } from './git.js';
 import {
   heldTextOf,
   isHeadText,
@@ -568,7 +568,7 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
     dev: devDefaults(config, entry),
     previewDefault: routerPreviewCommand(config),
     entry,
-    pending: pendingForms(site),
+    ...pendingSplit(site),
     git: { ...site.git, live: liveOf(site.path, site.git.branch) },
   });
 }
@@ -772,7 +772,7 @@ async function save(ctx: DevContext, req: Request, site: SiteState, listed: Work
     same,
     findings: [...gate.findings, ...report.findings],
     at: gitState(ready.path),
-    pending: pendingForms(ready),
+    ...pendingSplit(ready),
   });
 }
 
@@ -849,7 +849,7 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
   // Every refusal carries the list as git reads it now, so the page never
   // keeps offering a Commit the server just refused.
   const refuse = (error: string, status: number, output?: string): Response =>
-    json({ error, ...(output === undefined ? {} : { output }), pending: pendingForms(ready) }, status);
+    json({ error, ...(output === undefined ? {} : { output }), ...pendingSplit(ready) }, status);
   if (!Array.isArray(files) || files.length === 0) return refuse('files is required', 400);
   // `git add` would stage the forms into the operation's own index — a merge
   // commit would then carry the stet edit — and mid-rebase the commit would
@@ -860,9 +860,10 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
 
   // Read from git now, not from the page's last reply: a list gone stale since
   // would otherwise commit a deletion or a file already committed elsewhere.
-  const pending = pendingForms(ready);
+  // An untracked host document is committed only where the caller names it.
+  const { pending, untracked } = pendingSplit(ready);
   for (const file of files) {
-    if (typeof file === 'string' && pending.includes(file)) continue;
+    if (typeof file === 'string' && (pending.includes(file) || untracked.includes(file))) continue;
     const form = typeof file === 'string' && stetWrittenForms(ready, [file]).has(file);
     return refuse(form ? `${String(file)} has nothing to commit` : `${String(file)} is not a stet-written form of this site`, 400);
   }
@@ -912,7 +913,7 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
     short: git(ready.path, ['rev-parse', '--short', 'HEAD']).out.trim(),
     subject: git(ready.path, ['log', '-1', '--format=%s']).out.trim(),
     at: gitState(ready.path),
-    pending: pendingForms(ready),
+    ...pendingSplit(ready),
   });
 }
 
@@ -1049,13 +1050,17 @@ function gitSpelling(path: string): string {
 }
 
 /**
- * The committable files: the stet-written forms git reports as differing from
- * HEAD — staged, unstaged or untracked — deletions and unmerged paths left out,
- * a document counting only where it carries a mark. Read from the checkout
- * every time, so a reload, a restart or a save made in the terminal all give
- * the same answer.
+ * The committable files, split in two. `pending` holds the stet-written forms
+ * git reports as differing from HEAD — staged, unstaged or untracked —
+ * deletions and unmerged paths left out, a document counting only where it
+ * carries a mark. `untracked` holds the host documents and host files among
+ * them that git has never held: a page still being drafted is not committed
+ * unless its caller names it. stet's own forms (the descriptor, the snapshot,
+ * the codegen files) stay in `pending` even when untracked, so a first commit
+ * after `init` carries them. Read from the checkout every time, so a reload, a
+ * restart or a save made in the terminal all give the same answer.
  */
-function pendingForms(site: Ready): string[] {
+function pendingSplit(site: Ready): { pending: string[]; untracked: string[] } {
   const { files, globs } = stetFormPaths(site);
   const recorded = hostWritten(site);
   // Git reads a glob its own way (`[` is a class to git and a character to
@@ -1063,17 +1068,20 @@ function pendingForms(site: Ready): string[] {
   // the folders the globs walk, as literal paths, and stet's own matcher picks
   // the documents.
   const roots = [...new Set(globs.map(staticPrefix))].map((root) => (root === '' ? '.' : `:(literal)${root}`));
-  const asked = uncommittedPaths(site.path, [...files, ...roots, ...[...recorded.keys()].map((file) => `:(literal)${file}`)]);
+  const asked = uncommittedStatus(site.path, [...files, ...roots, ...[...recorded.keys()].map((file) => `:(literal)${file}`)]);
   // Git that cannot answer offers nothing, and the records wait for an answer that can.
-  if (asked === null) return [];
-  forgetHostWrites(site, asked);
-  const changed = asked.filter((file) => files.includes(file) || globs.some((glob) => matchGlob(glob, file)) || recorded.has(file));
+  if (asked === null) return { pending: [], untracked: [] };
+  forgetHostWrites(site, asked.map((entry) => entry.path));
+  const neverHeld = new Set(asked.filter((entry) => entry.untracked).map((entry) => entry.path));
+  const changed = asked.map((entry) => entry.path).filter((file) => files.includes(file) || globs.some((glob) => matchGlob(glob, file)) || recorded.has(file));
   // A document that cannot be read is left out, so one unreadable file never
   // stops the site opening.
   const readable = changed.filter((file) => files.includes(file) || canRead(join(site.path, file)));
   const accepted = stetWrittenForms(site, readable);
   // A host file stet's own route wrote is committable while its bytes are still the ones stet wrote.
-  return readable.filter((file) => accepted.has(file) || (recorded.has(file) && hashOf(site, file) === recorded.get(file)));
+  const committable = readable.filter((file) => accepted.has(file) || (recorded.has(file) && hashOf(site, file) === recorded.get(file)));
+  const held = (file: string): boolean => neverHeld.has(file) && !files.includes(file);
+  return { pending: committable.filter((file) => !held(file)), untracked: committable.filter(held) };
 }
 
 /** The host source files stet's own routes wrote this run, by site path: each file and the sha256 of the bytes written. Lost when `stet dev` restarts. */
@@ -1335,7 +1343,7 @@ function applyKeyMove(
   ready: Ready,
   plan: { descriptor: Descriptor; snapshot: Snapshot; host: HostRenames },
   label: string,
-): { written: string[]; touched: string | null; at: GitState; pending: string[] } {
+): { written: string[]; touched: string | null; at: GitState; pending: string[]; untracked: string[] } {
   const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, new Report()).filter((p) => p.status !== 'unchanged');
   const dirtyBefore = uncommittedPaths(ready.path, changed.map((p) => `:(literal)${p.label}`));
   const hashesBefore = new Map(changed.map((p) => [p.label, hashOf(ready, p.label)]));
@@ -1345,7 +1353,7 @@ function applyKeyMove(
     rethrowBatchFailure(label, error);
   }
   recordHostWrites(ready, changed.map((p) => p.label), dirtyBefore, hashesBefore);
-  return { written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) };
+  return { written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), ...pendingSplit(ready) };
 }
 
 /**
@@ -1422,7 +1430,8 @@ function carries(site: SiteState): Response {
     }
   }
   keys.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.locale < b.locale ? -1 : a.locale > b.locale ? 1 : 0));
-  return json({ keys, files: pendingForms(ready) });
+  const { pending, untracked } = pendingSplit(ready);
+  return json({ keys, files: pending, untracked });
 }
 
 /**
@@ -1670,11 +1679,11 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
   const body = await readJson(req);
   const sha = commitOf(ready, reqStr(body, 'sha'));
   const refuse = (error: string, output?: string): Response =>
-    json({ error, ...(output === undefined ? {} : { output }), at: gitState(ready.path), pending: pendingForms(ready) }, 409);
+    json({ error, ...(output === undefined ? {} : { output }), at: gitState(ready.path), ...pendingSplit(ready) }, 409);
   const { keys, before } = removedKeysOf(ready, sha);
   if (before === null || keys.length === 0) throw new UsageError(`${sha.slice(0, 7)} removed no key`);
   if (operationInProgress(ready.path)) return refuse('a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal');
-  if (pendingForms(ready).length > 0) return refuse('Restore waits for the uncommitted stet files — commit them first');
+  if (pendingSplit(ready).pending.length > 0) return refuse('Restore waits for the uncommitted stet files — commit them first');
   // The revert's commit takes the whole index, so a staged change would ride along.
   if (gitData(ready.path, ['diff', '--cached', '--quiet']).code !== 0) return refuse('Restore waits for the staged changes — commit or unstage them first');
   const touched = gitData(ready.path, ['diff', '--name-only', `${sha}^`, sha]).stdout.split('\n').filter((f) => f !== '');
@@ -1692,7 +1701,7 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
       short: git(ready.path, ['rev-parse', '--short', 'HEAD']).out.trim(),
       subject: git(ready.path, ['log', '-1', '--format=%s']).out.trim(),
       at: gitState(ready.path),
-      pending: pendingForms(ready),
+      ...pendingSplit(ready),
     });
   const report = new Report();
 
@@ -1751,7 +1760,7 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
   const intent = await siteGitRun(ctx, ready, ['add', '-N', '--', ...literal]);
   if (intent.code !== 0) return refuse('git commit failed', intent.out);
   const made = await siteGitRun(ctx, ready, ['commit', '-m', message, '--', ...literal]);
-  if (made.code !== 0) return json({ error: 'git commit failed', output: made.out, markup, at: gitState(ready.path), pending: pendingForms(ready) }, 409);
+  if (made.code !== 0) return json({ error: 'git commit failed', output: made.out, markup, at: gitState(ready.path), ...pendingSplit(ready) }, 409);
   return done({ skipped: next.skipped, markup });
 }
 
@@ -2073,7 +2082,8 @@ function usageCacheOf(ctx: DevContext, path: string): UsageCache {
 
 /**
  * The keys one route's files read: on the static-HTML host the marks of the
- * document served at the route; on a JavaScript host the reads `siteReads`
+ * document served at the route, complete where every web text key the
+ * descriptor declares is marked in some document; on a JavaScript host the reads `siteReads`
  * settles for the route's page files (`routeFiles`) and everything they import,
  * through the host's path aliases: the keys each file names, and every declared
  * key under a prefix it reads. `complete` is false where the walk met a file it
@@ -2090,7 +2100,12 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
     const document = set.documents.find((d) => normalizeRoute(servedRoute(d.file)) === normalizeRoute(route));
     if (document === undefined) return json(unmapped);
     const keys = [...new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key))].sort();
-    return json({ route, files: [document.file], keys, complete: true, renders: {}, coincident: [] });
+    // A declared key no document marks is rendered by something other than the HTML (the page's own script), so the marks are not the page's whole reads.
+    const marked = new Set(set.claimed.map((mark) => mark.key));
+    const markedEverywhere = Object.entries(ready.descriptor.keys).every(
+      ([key, def]) => def.shape !== 'text' || def.target !== DEFAULT_TARGET || def.derivesFrom !== undefined || marked.has(key),
+    );
+    return json({ route, files: [document.file], keys, complete: markedEverywhere, renders: {}, coincident: [] });
   }
   const files = routeFiles(ready.path, route, ready.config);
   if (files === null) return json(unmapped);

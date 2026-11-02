@@ -144,18 +144,28 @@ export function gitFiles(cwd: string, args: string[], env: NodeJS.ProcessEnv = c
  * status git fails to answer is `null`, which no caller may read as "clean".
  */
 export function uncommittedPaths(cwd: string, pathspecs: string[]): string[] | null {
+  const found = uncommittedStatus(cwd, pathspecs);
+  return found === null ? null : found.map((entry) => entry.path);
+}
+
+/**
+ * `uncommittedPaths`, each path with whether git has never held it: untracked,
+ * or only recorded as an intent to add (`add -N`, which a refused commit leaves
+ * behind).
+ */
+export function uncommittedStatus(cwd: string, pathspecs: string[]): Array<{ path: string; untracked: boolean }> | null {
   const prefix = gitData(cwd, ['rev-parse', '--show-prefix']);
   if (prefix.code !== 0) return [];
   const base = prefix.stdout.trim();
   const status = gitData(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...pathspecs]);
   if (status.code !== 0) return null;
-  const paths = new Set<string>();
+  const paths = new Map<string, boolean>();
   for (const { x, y, path } of porcelainRecords(status.stdout)) {
     // A deletion is the terminal's to commit, and an unmerged path is a merge's.
     if (x === 'D' || y === 'D' || x === 'U' || y === 'U' || (x === 'A' && y === 'A')) continue;
-    if (path.startsWith(base)) paths.add(path.slice(base.length));
+    if (path.startsWith(base)) paths.set(path.slice(base.length), x === '?' || (x === ' ' && y === 'A'));
   }
-  return [...paths].sort();
+  return [...paths].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([path, untracked]) => ({ path, untracked }));
 }
 
 /**

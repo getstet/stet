@@ -3314,7 +3314,7 @@ describe('the committable files', () => {
         await save(handler, t);
         const refused = await post(handler, `/api/site/commit${at(t)}`, { files: [] });
         expect(refused.status).toBe(400);
-        expect(refused.body).toEqual({ error: 'files is required', pending: t.written });
+        expect(refused.body).toEqual({ error: 'files is required', pending: t.written, untracked: [] });
       });
 
       for (const folder of [undefined, 'site'] as const) {
@@ -3418,6 +3418,37 @@ describe('the committable files', () => {
       expect(made.status, glob).toBe(200);
       expect(git(cwd, ['status', '--porcelain']).out, glob).toBe('');
     }
+  });
+
+  describe('on the static-HTML host, an untracked marked document', () => {
+    /** A twin whose snapshot is untracked too, and a page copied from the marked index, never added to git. */
+    const drafted = async (): Promise<Twin> => {
+      const t = await twin('html', { untracked: true });
+      write(t.cwd, 'draft.html', readFileSync(join(t.cwd, 'index.html'), 'utf8'));
+      expect(porcelain(t.cwd)).toContain('?? draft.html');
+      return t;
+    };
+
+    it('is listed apart from the pending forms, the untracked snapshot staying pending', async () => {
+      const t = await drafted();
+      const { handler } = handlerOver([t.cwd]);
+      const site = await get(handler, `/api/site${at(t)}`);
+      expect(site.pending).toEqual(['content/defaults.json']);
+      expect(site.untracked).toEqual(['draft.html']);
+    });
+
+    it('is committed only where the commit names it', async () => {
+      const t = await drafted();
+      const { handler } = handlerOver([t.cwd]);
+      const bare = await post(handler, `/api/site/commit${at(t)}`, { files: ['content/defaults.json'] });
+      expect(bare.status).toBe(200);
+      expect(bare.body['untracked']).toEqual(['draft.html']);
+      expect(porcelain(t.cwd)).toContain('?? draft.html');
+      const named = await post(handler, `/api/site/commit${at(t)}`, { files: ['draft.html'] });
+      expect(named.status).toBe(200);
+      expect(named.body['untracked']).toEqual([]);
+      expect(git(t.cwd, ['show', '--name-only', '--format=', 'HEAD']).out.trim()).toBe('draft.html');
+    });
   });
 
   for (const kind of ['js', 'html'] as const) {
@@ -14330,6 +14361,28 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
       keys: ['footer_links', 'hero_headline'],
       complete: true,
     });
+  });
+
+  it('an html page whose declared keys are all marked answers its marks, complete', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.complete).toBe(true);
+    expect(body.keys).toEqual(expect.arrayContaining(marksIn(host.cwd, 'index.html')));
+  });
+
+  it('an html page answers incomplete, its marked keys still listed, where a declared web text key is marked in no document', async () => {
+    const host = await makeHtmlHost({ register: true });
+    const descriptor = JSON.parse(readFileSync(join(host.cwd, 'content/descriptor.json'), 'utf8')) as { keys: Record<string, unknown> };
+    const snapshot = JSON.parse(readFileSync(join(host.cwd, 'content/defaults.json'), 'utf8')) as { default: Record<string, unknown> };
+    descriptor.keys['script_rendered_line'] = { shape: 'text', target: 'web' };
+    snapshot.default['script_rendered_line'] = 'Rendered by the page script';
+    write(host.cwd, 'content/descriptor.json', `${JSON.stringify(descriptor, null, 2)}\n`);
+    write(host.cwd, 'content/defaults.json', `${JSON.stringify(snapshot, null, 2)}\n`);
+    const { handler } = handlerOver([host.cwd]);
+    const body = await routeReadsOf(handler, host);
+    expect(body.complete).toBe(false);
+    expect(body.keys).toEqual(expect.arrayContaining(marksIn(host.cwd, 'index.html')));
   });
 
   it('an alias that resolves nowhere makes the route incomplete', async () => {

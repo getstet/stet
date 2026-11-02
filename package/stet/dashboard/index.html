@@ -363,6 +363,8 @@ const S = {
   note: '',
   findings: [],
   pending: [],
+  // Host documents the last reply named that git has never held: listed in the Commit panel, never committed unless ticked there.
+  untracked: [],
   health: null,
   seo: null,
   audit: null,
@@ -401,7 +403,7 @@ const S = {
   // 'locale key' drafts Save mine over it resends without their base.
   staleKeys: [],
   mine: [],
-  // The header's Commit opened: what the commit carries ({ keys, files }) and a refused Put back's line.
+  // The header's Commit opened: what the commit carries ({ keys, files, untracked }), the untracked files ticked in it, and a refused Put back's line.
   commitPanel: null,
   publishAsk: false,
   previewLink: null,
@@ -648,6 +650,7 @@ async function loadSite(path) {
   dropDrafts();
   S.findings = [];
   S.pending = [];
+  S.untracked = [];
   S.message = '';
   S.removal = null;
   S.same = null; S.overLimit = null; S.staleKeys = []; S.mine = []; S.commitPanel = null; S.publishAsk = false; S.previewLink = null;
@@ -680,6 +683,7 @@ async function loadSite(path) {
   S.site = res.body;
   S.env = 'default';
   S.pending = Array.isArray(S.site.pending) ? S.site.pending : [];
+  S.untracked = Array.isArray(S.site.untracked) ? S.site.untracked : [];
   S.seen = seenOf(S.site.id);
   if (ready()) {
     // Awaited before the first group is chosen: the marks decide the groups,
@@ -1027,6 +1031,7 @@ async function refreshSite() {
   const keysBefore = ready() ? Object.keys(S.site.descriptor.keys).join('\n') : null;
   S.site = res.body;
   S.pending = Array.isArray(S.site.pending) ? S.site.pending : [];
+  S.untracked = Array.isArray(S.site.untracked) ? S.site.untracked : [];
   S.health = null; S.seo = null;
   if (ready()) {
     await loadMarks();
@@ -1446,6 +1451,8 @@ function commitPanel() {
   const p = S.commitPanel;
   const keys = Array.isArray(p.keys) ? p.keys : [];
   const files = Array.isArray(p.files) ? p.files : [];
+  const untracked = Array.isArray(p.untracked) ? p.untracked : [];
+  const ticked = Array.isArray(p.ticked) ? p.ticked : [];
   const named = new Set(keys.map((k) => k.key));
   const rows = keys.map((k, i) => {
     const was = own(k, 'head') ? shown(k.head) : '';
@@ -1456,11 +1463,15 @@ function commitPanel() {
       (own(k, 'head') ? '<button class="btn sm" data-act="putBack:' + i + '">Put back</button>' : '') + '</div>';
   }).join('');
   return '<div class="card"><div class="ch"><h3 style="font-size:12.5px">' +
-    esc('What this commit carries · ' + plural(named.size, 'key') + ' · ' + plural(files.length, 'file')) + '</h3></div>' +
+    esc('What this commit carries · ' + plural(named.size, 'key') + ' · ' + plural(files.length + ticked.length, 'file')) + '</h3></div>' +
     '<div class="cb">' + rows +
     files.map((f) => '<div class="muted mono" style="font-size:11px">' + esc(f) + '</div>').join('') +
+    (untracked.length === 0 ? '' :
+      '<div style="margin-top:8px;font-size:11.5px">' + esc('New files — tick to include') + '</div>' +
+      untracked.map((f, i) => '<label class="muted mono" style="font-size:11px;display:flex;gap:6px;align-items:center;min-height:28px">' +
+        '<input type="checkbox"' + (ticked.includes(f) ? ' checked' : '') + ' data-act-change="commitTick:' + i + '">' + esc(f) + '</label>').join('')) +
     (p.error ? '<div class="err">' + esc(p.error) + '</div>' : '') +
-    '<div style="margin-top:8px"><button class="btn pri sm" data-act="commitApply"' + (files.length === 0 ? ' disabled' : '') + '>Commit</button>' +
+    '<div style="margin-top:8px"><button class="btn pri sm" data-act="commitApply"' + (files.length + ticked.length === 0 ? ' disabled' : '') + '>Commit</button>' +
     '<button class="btn sm" data-act="commitCancel">Cancel</button></div></div></div>';
 }
 /** Two values word by word, an LCS over whitespace-split words: removed runs `[-…-]`, added runs `[+…+]`. */
@@ -4427,7 +4438,11 @@ const ACTIONS = {
   publish: () => { void guard(mountWrite('publish')); },
   discard: () => { void guard(mountWrite('discard')); },
   commit: () => { void guard(openCommitPanel()); },
-  commitApply: () => { S.commitPanel = null; void guard(commit()); },
+  commitApply: () => {
+    const ticked = S.commitPanel && Array.isArray(S.commitPanel.ticked) ? S.commitPanel.ticked : [];
+    S.commitPanel = null;
+    void guard(commit(ticked));
+  },
   commitCancel: () => { S.commitPanel = null; render(); },
   putBack: (el, i) => { void guard(putBack(Number(i))); },
   push: () => { void guard(push()); },
@@ -4575,6 +4590,13 @@ const ACTIONS_CHANGE = {
   entryCommand: (el) => { void guard(updateEntry({ devCommand: el.value })); },
   entryPreview: (el) => { void guard(updateEntry({ previewCommand: el.value })); },
   entryPush: (el) => { void guard(updateEntry({ pushAfterCommit: el.checked })); },
+  commitTick: (el, i) => {
+    const p = S.commitPanel;
+    const file = p && Array.isArray(p.untracked) ? p.untracked[Number(i)] : undefined;
+    if (file === undefined) return;
+    p.ticked = el.checked ? p.ticked.concat(file) : p.ticked.filter((f) => f !== file);
+    render();
+  },
 };
 
 const ACTIONS_INPUT = {
@@ -4759,7 +4781,7 @@ async function save(anyway) {
   // The server reads the committable files from the checkout, so a save that
   // wrote nothing still answers the ones an earlier save left uncommitted.
   const wrote = res.body.written || [];
-  if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
+  takePending(res.body);
   takeGit(res.body.at);
   S.site.snapshot = mergedSnapshot(values);
   postCensus();
@@ -4794,11 +4816,17 @@ async function useTheirs(i) {
   await refreshSite();
 }
 
+/** The commit lists a reply carried, kept where it names them. */
+function takePending(body) {
+  if (Array.isArray(body.pending)) S.pending = body.pending;
+  if (Array.isArray(body.untracked)) S.untracked = body.untracked;
+}
+
 /** Commit pressed: what the commit carries, read from the checkout; `error` is the line a refused Put back leaves over the read again. */
 async function openCommitPanel(error = '') {
   clearGitError();
   const res = await api('/api/site/carries' + query());
-  S.commitPanel = res.ok ? { keys: res.body.keys, files: res.body.files, error: error } : { keys: [], files: S.pending, error: res.body.error || 'the change list could not be read' };
+  S.commitPanel = res.ok ? { keys: res.body.keys, files: res.body.files, untracked: res.body.untracked, ticked: [], error: error } : { keys: [], files: S.pending, untracked: [], ticked: [], error: res.body.error || 'the change list could not be read' };
   render();
 }
 /**
@@ -4821,26 +4849,28 @@ async function putBack(i) {
     render();
     return;
   }
-  if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
+  takePending(res.body);
   takeGit(res.body.at);
   S.site.snapshot = mergedSnapshot([{ key: k.key, locale: k.locale, value: k.head }]);
   await openCommitPanel();
   await loadPreview(htmlHost() ? { reload: true } : undefined);
 }
 
-/** The committable files the last reply named, committed; the server titles the commit from the snapshot. */
-async function commit() {
+/** The committable files the last reply named, with the untracked ones ticked in the panel, committed; the server titles the commit from the snapshot. */
+async function commit(ticked = []) {
   clearGitError();
-  if (S.pending.length === 0) { tst('Nothing to commit.'); return; }
-  const res = await post('/api/site/commit' + query(), { files: S.pending });
+  const files = S.pending.concat(ticked.filter((f) => S.untracked.includes(f)));
+  if (files.length === 0) { tst('Nothing to commit.'); return; }
+  const res = await post('/api/site/commit' + query(), { files: files });
   if (!res.ok) {
     S.gitError = gitFailure('The commit was refused. Git\'s output is below.', res.body);
-    if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
+    takePending(res.body);
     render();
     return;
   }
   tst('Committed ' + res.body.short + ' — ' + res.body.subject);
   S.pending = Array.isArray(res.body.pending) ? res.body.pending : [];
+  S.untracked = Array.isArray(res.body.untracked) ? res.body.untracked : [];
   takeGit(res.body.at);
   // The commit is the key's newest past value.
   void guard(loadKeyHistory());
@@ -4965,7 +4995,7 @@ async function restore() {
   const res = await post('/api/site/restore' + query(), { sha: sha });
   if (!res.ok) {
     S.opened.error = [res.body.error, res.body.output].filter(Boolean).join('\n');
-    if (Array.isArray(res.body.pending)) S.pending = res.body.pending;
+    takePending(res.body);
     render();
     return;
   }
