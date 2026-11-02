@@ -2676,7 +2676,7 @@ describe('environments', () => {
 
 /**
  * `constructor` is the ONE prototype name the descriptor's key grammar admits
- * (`^[a-z0-9]+(?:_{1,2}[a-z0-9]+)*$`), so every membership test over a
+ * (`^[a-z0-9]+(?:(?:\.|_{1,2})[a-z0-9]+)*$`), so every membership test over a
  * JSON-parsed key map has to be an own-property test. A bare `in` or a bare
  * index answers it from `Object.prototype`, and each of these four commands
  * then behaved as though an undeclared key were declared — differently, and

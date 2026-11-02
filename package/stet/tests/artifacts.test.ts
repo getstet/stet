@@ -247,6 +247,7 @@ describe('planRepoForms — which forms a host has', () => {
       defaultConfig(),
       { version: 1, keys: { a: { shape: 'text', target: 'web' } } },
       { default: { a: 'A' } },
+      null,
       new Report(),
     );
     expect(plans.map((p) => p.label)).toEqual([
@@ -269,6 +270,7 @@ describe('planRepoForms — which forms a host has', () => {
       config,
       { version: 1, keys: { heading: { shape: 'text', target: 'web' } } },
       { default: { heading: 'A different heading' } },
+      null,
       new Report(),
     );
     expect(plans.map((p) => p.label)).toEqual([
@@ -291,6 +293,7 @@ describe('planRepoForms — which forms a host has', () => {
         config,
         { version: 1, keys: { hero: { shape: 'text', target: 'web', tags: 1 } } },
         { default: { hero: 'A heading with no placeholder at all.' } },
+        null,
         new Report(),
       ),
     ).toThrow(/1 document\(s\) could not be regenerated — index\.html:25 tag-count-mismatch; nothing was written/);

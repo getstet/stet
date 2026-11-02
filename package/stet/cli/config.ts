@@ -11,11 +11,11 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve as resolvePath } from 'node:path';
+import { dirname, isAbsolute, join, posix, resolve as resolvePath } from 'node:path';
 
 import { SEO_SEVERITY } from '../src/seo.js';
 import type { SeoRule } from '../src/seo.js';
-import { writeJsonDeterministic } from './artifacts.js';
+import { asUpdate, planJson, writeJsonDeterministic, type WritePlan } from './artifacts.js';
 import { CliError, UsageError } from './report.js';
 
 export const CONFIG_FILE = 'stet.config.json';
@@ -24,6 +24,29 @@ export const CONFIG_FILE = 'stet.config.json';
 export const HOST_MIGRATIONS = join('stet', 'migrations');
 
 export type StoreAdapterName = 'pg' | 'postgrest' | 'memory' | 'snapshot';
+
+/** A function the project reads copy through: its written name (`TS.t`, `t`) and the argument that carries the key. */
+export interface ReadFunction {
+  name: string;
+  key: number;
+}
+
+/** The placeholder grammar a host reads: stet stores `{{name}}`; a `{name}` host converts at import and generation. */
+export type Placeholders = '{{name}}' | '{name}';
+
+/** The joiner the naming rule puts between a name's parts. */
+export type KeyStyle = 'underscore' | 'dotted';
+
+/** One file generated from the snapshot for the host to read: a classic script, an ES module or bare JSON. */
+export interface GeneratedOutput {
+  file: string;
+  format: 'script' | 'esm' | 'json';
+  /** The global or export the table is bound to; required for `script` and `esm`. */
+  name?: string;
+  values: 'value' | 'value-status';
+  /** Key prefixes and exact names kept; absent keeps every key. */
+  only?: string[];
+}
 
 /** One store connection: an adapter and the variables holding its credential. */
 export interface StoreBlock {
@@ -76,7 +99,19 @@ export interface StetConfig {
    * `baseline` names the accepted-literals file that makes an existing repo
    * start at zero.
    */
-  scan: { severity: 'warn' | 'fail'; baseline: string };
+  scan: { severity: 'warn' | 'fail'; baseline: string; /** Hyperscript builders whose first argument is not a tag (`h(Card, …)`); absent is none. */ builders?: string[] };
+  /** The functions the project reads copy through, and the attribute its elements carry a key in; absent, only stet's own accessors read. */
+  reads?: { functions: ReadFunction[]; attribute?: string };
+  /** The placeholder grammar the host's table is written in. */
+  placeholders: Placeholders;
+  /** The joiner the naming rule puts between a name's parts. */
+  keyStyle: KeyStyle;
+  /** Files generated from the snapshot for the host to read. */
+  generated: GeneratedOutput[];
+  /** A folder (relative to this config's) whose config and copy this checkout reads instead of its own. */
+  copyFrom?: string;
+  /** Where the approval status file lives. */
+  statusPath: string;
   /**
    * The detected router. `register` reads it to choose the accessor: `pages`
    * and `vite` force the client form, a Pages-Router file and a Vite SPA's
@@ -280,6 +315,30 @@ function parseEnvironments(environments: Record<string, unknown>, path: string):
   return map;
 }
 
+/** A read function's written name: identifiers joined by dots (`t`, `TS.t`, `i18n.copy.t`). */
+const READ_NAME = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
+
+/** The joiner the naming rule puts between a name's parts under the config's `keyStyle`. */
+export function keyJoiner(config: Pick<StetConfig, 'keyStyle'>): '_' | '.' {
+  return config.keyStyle === 'dotted' ? '.' : '_';
+}
+
+/**
+ * The config file edited as RAW JSON, so no default and no unknown field is
+ * rewritten: `loadConfig` fills in every default and ignores the fields later
+ * changes own, and writing its result back would rewrite settings the caller
+ * never read. A project with no config file gets one, defaults included.
+ * `edit` changes the object in place.
+ */
+export function rawConfigPlan(cwd: string, edit: (raw: Record<string, unknown>) => void): WritePlan {
+  const path = join(cwd, CONFIG_FILE);
+  const raw: Record<string, unknown> = existsSync(path)
+    ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>)
+    : { ...defaultConfig() };
+  edit(raw);
+  return asUpdate(planJson(path, raw, CONFIG_FILE));
+}
+
 /** Where a Next host's `CopyProvider` mount lives, absent a host saying otherwise. */
 export const DEFAULT_ROOT_LAYOUT = 'app/layout.tsx';
 
@@ -295,6 +354,10 @@ export function defaultConfig(): StetConfig {
     emailSurfaces: [],
     copyModules: [],
     scan: { severity: 'warn', baseline: '.stet/scan-baseline.json' },
+    placeholders: '{{name}}',
+    keyStyle: 'underscore',
+    generated: [],
+    statusPath: 'content/status.json',
     router: 'app',
     readPath: { file: 'lib/content.ts', import: '@/lib/content' },
     rootLayout: DEFAULT_ROOT_LAYOUT,
@@ -421,8 +484,86 @@ export function loadConfig(cwd: string): StetConfig {
         `${CONFIG_FILE}: scan.severity must be "warn" or "fail" — got ${JSON.stringify(scan['severity'] ?? null)}`,
       );
     }
-    config.scan = { severity, baseline: str(scan, 'baseline', config.scan.baseline, 'scan.') };
+    const builders = scan['builders'] === undefined ? undefined : stringArray(scan, 'builders', [], 'scan.');
+    config.scan = {
+      severity,
+      baseline: str(scan, 'baseline', config.scan.baseline, 'scan.'),
+      ...(builders === undefined ? {} : { builders }),
+    };
   }
+
+  const reads = obj(source, 'reads');
+  if (reads) {
+    const functions = reads['functions'];
+    if (!Array.isArray(functions) || functions.length === 0) {
+      throw new CliError(`${CONFIG_FILE}: reads.functions must be a list of function names, such as "t" or "TS.t"`);
+    }
+    const parsed: ReadFunction[] = functions.map((entry) => {
+      if (typeof entry === 'string' && READ_NAME.test(entry)) return { name: entry, key: 0 };
+      if (entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
+        const { name, key } = entry as Record<string, unknown>;
+        if (typeof name === 'string' && READ_NAME.test(name) && (key === undefined || (Number.isInteger(key) && (key as number) >= 0))) {
+          return { name, key: key === undefined ? 0 : (key as number) };
+        }
+      }
+      throw new CliError(`${CONFIG_FILE}: reads.functions must be a list of function names, such as "t" or "TS.t"`);
+    });
+    const attribute = optionalStr(reads, 'attribute');
+    if (attribute !== undefined && !/^data-[a-z][a-z0-9-]*$/.test(attribute)) {
+      throw new CliError(`${CONFIG_FILE}: reads.attribute must be a data-* attribute name`);
+    }
+    config.reads = attribute === undefined ? { functions: parsed } : { functions: parsed, attribute };
+  }
+  const placeholders = optionalStr(source, 'placeholders');
+  if (placeholders !== undefined) {
+    if (placeholders !== '{{name}}' && placeholders !== '{name}') {
+      throw new CliError(`${CONFIG_FILE}: placeholders must be "{{name}}" or "{name}"`);
+    }
+    config.placeholders = placeholders;
+  }
+  const keyStyle = optionalStr(source, 'keyStyle');
+  if (keyStyle !== undefined) {
+    if (keyStyle !== 'underscore' && keyStyle !== 'dotted') {
+      throw new CliError(`${CONFIG_FILE}: keyStyle must be "underscore" or "dotted"`);
+    }
+    config.keyStyle = keyStyle;
+  }
+  const generated = source['generated'];
+  if (generated !== undefined) {
+    if (!Array.isArray(generated)) throw new CliError(`${CONFIG_FILE}: generated must be a list`);
+    config.generated = generated.map((entry, i) => {
+      const fail = (): never => {
+        throw new CliError(`${CONFIG_FILE}: generated[${i}] needs a file, a format (script, esm or json) and, for script and esm, a name`);
+      };
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return fail();
+      const { file, format, name, values, only } = entry as Record<string, unknown>;
+      if (typeof file !== 'string' || file === '') return fail();
+      if (format !== 'script' && format !== 'esm' && format !== 'json') return fail();
+      if (format !== 'json' && (typeof name !== 'string' || name === '')) return fail();
+      if (values !== undefined && values !== 'value' && values !== 'value-status') return fail();
+      if (only !== undefined && (!Array.isArray(only) || only.some((p) => typeof p !== 'string'))) return fail();
+      // A config that writes outside its repo is the one way stet would write host source it does not own.
+      const at = posix.normalize(file.replace(/\\/g, '/'));
+      if (isAbsolute(file) || at === '..' || at.startsWith('../')) {
+        throw new CliError(
+          `${CONFIG_FILE}: generated[${i}].file must be inside this checkout — a second checkout generates its own file through copyFrom`,
+        );
+      }
+      return {
+        file,
+        format,
+        ...(typeof name === 'string' ? { name } : {}),
+        values: values === undefined ? 'value' : values,
+        ...(only === undefined ? {} : { only: only as string[] }),
+      };
+    });
+  }
+  const copyFrom = optionalStr(source, 'copyFrom');
+  if (copyFrom !== undefined) {
+    if (copyFrom.trim() === '') throw new CliError(`${CONFIG_FILE}: copyFrom must name a folder holding stet.config.json`);
+    config.copyFrom = copyFrom;
+  }
+  config.statusPath = str(source, 'statusPath', config.statusPath);
 
   const readPath = obj(source, 'readPath');
   if (readPath) {
@@ -769,11 +910,11 @@ function obj(source: Record<string, unknown>, field: string): Record<string, unk
 }
 
 /** An array-of-strings field — `managedSurfaces`, `emailSurfaces` and `copyModules`. */
-function stringArray(source: Record<string, unknown>, field: string, fallback: string[]): string[] {
+function stringArray(source: Record<string, unknown>, field: string, fallback: string[], prefix = ''): string[] {
   const value = source[field];
   if (value === undefined) return fallback;
   if (!Array.isArray(value) || value.some((g) => typeof g !== 'string')) {
-    throw new CliError(`${CONFIG_FILE}: ${field} must be an array of strings`);
+    throw new CliError(`${CONFIG_FILE}: ${prefix}${field} must be an array of strings`);
   }
   return value as string[];
 }

@@ -50,6 +50,7 @@ import {
 import { htmlPageOf } from './pages.js';
 import type { CliIo } from './main.js';
 import { clip, collapseLines, lineCol, plural, CliError, HostTextReport, Report, UsageError } from './report.js';
+import { loadStatus } from './status.js';
 import { applyFileEdits, formatDiff, jsxReads, jsxRichClean, planRewrite, type Edit } from './rewrite.js';
 import { printProviderSnippet } from './provider-mount.js';
 import { classifyAdoption, leadingOrder, planJsxRun, seedOf, targetFor } from './register-run.js';
@@ -402,7 +403,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   // would red the host tsc until a separate `stet upgrade`.
   try {
     writePlanned([
-      ...planRepoForms(io.cwd, config, descriptor, snapshot, report),
+      ...planRepoForms(io.cwd, config, descriptor, snapshot, loadStatus(io.cwd, config), report),
       ...edited.map((e) => asUpdate(planWrite(e.abs, e.text, e.rel))),
     ]);
   } catch (error) {

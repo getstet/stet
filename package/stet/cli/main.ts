@@ -15,6 +15,7 @@ import { pathToFileURL } from 'node:url';
 
 import type { StoreAdapter } from '../src/store.js';
 import { runAgentsInstall } from './agents.js';
+import { runApprove } from './approve.js';
 import { runAudit } from './audit.js';
 import { runAuditLighthouse } from './lighthouse.js';
 import type { LighthouseRunner } from './lighthouse-run.js';
@@ -27,6 +28,7 @@ import { runEmailExtract } from './email-extract.js';
 import { runEmailRender, runEmailTest } from './email-send.js';
 import { runEmailVerify } from './email-verify.js';
 import { runHookInstall, runHookRemove } from './hook.js';
+import { runImport } from './import.js';
 import { runInit } from './init.js';
 import { packageVersion } from './installed.js';
 import { runPagesScan } from './pages.js';
@@ -162,12 +164,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         );
       }
       case 'import':
-        // Named, not "unknown command": the fast-follow is real, so the error
-        // teaches what is coming rather than implying a typo.
-        throw new UsageError(
-          'stet import is a named fast-follow, not yet available in this release — ' +
-            'adopt existing copy with stet scan + stet register for now',
-        );
+        return await runImport(rest, io);
+      case 'approve':
+        return await runApprove(rest, io);
       case 'check':
         return await runCheck(rest, io);
       case 'seo': {
@@ -275,6 +274,8 @@ export function usage(): string {
     '  init [--app DIR] [--host html] [--yes]   scaffold a project; the shown edit writes the agent guidance',
     '  scan                       report unkeyed copy in the managed surfaces — warn by default',
     '  register --from scan [--plan FILE | --plan-out FILE] [--write] [--verbose]   add keys named by role and rewrite the consuming leaf; --plan-out writes the names to edit, --plan applies them; --verbose lists every parse refusal',
+    '  import <file> [--export NAME] [--only PREFIX…] [--section WORD] [--replace] [--by NAME] [--write]   bring in the keys of a copy table the project already keeps; plan first, --write applies',
+    '  approve <key>… [--by NAME]   mark keys approved on a snapshot-only project, in the status file',
     '  remove <key> [<key>...] [--write]   delete keys from descriptor + snapshot; plan first, --write applies',
     '  rename <old> <new> | --plan FILE [--write] [--env NAME] | --propose FILE   move keys to new names in the descriptor, snapshot, host reads and every store; --propose writes a plan naming each key as register would today',
     '  merge <key> --into <other> [--write]   make a key read another that carries the same words; its marks and reads move, and it goes',

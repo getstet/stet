@@ -41,15 +41,16 @@ import {
 } from '../src/types.js';
 import { validateSave, VARIABLE } from '../src/validate.js';
 import { flag, parse, positionalsAround, refuseEnv, text } from './args.js';
-import { asUpdate, planJson, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
+import { asUpdate, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { CONFIG_FILE, defaultConfig, loadConfig, type StetConfig } from './config.js';
+import { loadConfig, rawConfigPlan, type StetConfig } from './config.js';
 import { containedPointer, outsideLine } from './email-render.js';
 import { filesForGlobs } from './files.js';
 import { gitFiles } from './git.js';
 import type { CliIo } from './main.js';
 import { normalize } from './pages.js';
 import { clip, plural, CliError, Report, UsageError } from './report.js';
+import { loadStatus } from './status.js';
 import { applyFileEdits, dominantEol, formatDiff, type Edit } from './rewrite.js';
 import {
   decodeEntities,
@@ -316,7 +317,7 @@ function applyProposals(
       // The repo forms, and the codegen files among them ride the key add
       // exactly as `register` regenerates it: the slot keys this run wrote must
       // typecheck in the host's editor without an intervening `stet upgrade`.
-      plans.push(...planRepoForms(io.cwd, config, descriptor, snapshot, report));
+      plans.push(...planRepoForms(io.cwd, config, descriptor, snapshot, loadStatus(io.cwd, config), report));
       for (const proposal of landed) {
         plans.push(asUpdate(planWrite(at(proposal.file), proposal.edited, proposal.file)));
       }
@@ -438,22 +439,18 @@ function selectProposals(set: ProposalSet, names: string[]): TemplateProposal[] 
  */
 function surfacePlan(cwd: string, globs: string[]): WritePlan | null {
   if (globs.length === 0) return null;
-  const path = join(cwd, CONFIG_FILE);
-  const raw: Record<string, unknown> = existsSync(path)
-    ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>)
-    : { ...defaultConfig() };
-
-  // `Object.hasOwn`, not a bare index: the config is JSON-parsed, so a
-  // `"__proto__"` member is an own property and every other name would answer
-  // from the prototype as if it had been declared.
-  const declared = (field: string): string[] => {
-    const value = Object.hasOwn(raw, field) ? raw[field] : undefined;
-    return Array.isArray(value) ? value.filter((g): g is string => typeof g === 'string') : [];
-  };
-  // A Set keeps first-seen order, so a re-run of the same globs is a no-op.
-  raw['managedSurfaces'] = [...new Set([...declared('managedSurfaces'), ...globs])];
-  raw['emailSurfaces'] = [...new Set([...declared('emailSurfaces'), ...globs])];
-  return asUpdate(planJson(path, raw, CONFIG_FILE));
+  return rawConfigPlan(cwd, (raw) => {
+    // `Object.hasOwn`, not a bare index: the config is JSON-parsed, so a
+    // `"__proto__"` member is an own property and every other name would answer
+    // from the prototype as if it had been declared.
+    const declared = (field: string): string[] => {
+      const value = Object.hasOwn(raw, field) ? raw[field] : undefined;
+      return Array.isArray(value) ? value.filter((g): g is string => typeof g === 'string') : [];
+    };
+    // A Set keeps first-seen order, so a re-run of the same globs is a no-op.
+    raw['managedSurfaces'] = [...new Set([...declared('managedSurfaces'), ...globs])];
+    raw['emailSurfaces'] = [...new Set([...declared('emailSurfaces'), ...globs])];
+  });
 }
 
 /**

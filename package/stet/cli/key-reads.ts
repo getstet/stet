@@ -41,10 +41,25 @@ import { parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
  * `copy.<key>`, `copy?.<key>` or `copyMap.<key>` — the accessor `register`
  * writes, the map the scaffolded read path exports, and the forms a host
  * re-exports them under. The call alternative comes before the property
- * alternative, so `copy.get('x')` reads `x`, not `get`.
+ * alternative, so `copy.get('x')` reads `x`, not `get`. The element form
+ * `copy['x']` is the LAST alternative (groups 6 and 7), so groups 1 to 5 mean
+ * what they always meant to every consumer: a dotted key has no property form,
+ * and this is the read it takes on a host that spells its map's keys out.
  */
 export const KEY_READ =
-  /\bcopy(?:Map)?\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1|\b(?:copy|get)\s*\(\s*(['"`])([^'"`\n]+)\3|\bcopy(?:Map)?\s*\??\.\s*([A-Za-z_$][\w$]*)/g;
+  /\bcopy(?:Map)?\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1|\b(?:copy|get)\s*\(\s*(['"`])([^'"`\n]+)\3|\bcopy(?:Map)?\s*\??\.\s*([A-Za-z_$][\w$]*)|\bcopy(?:Map)?\s*\[\s*(['"`])([^'"`\n]+)\6\s*\]/g;
+
+/** A key as a whole-word regex, its dots literal: `home.title` never matches `home_title`; a dotted key inside a longer declared one is `longerKeyAt`'s to skip. */
+export function keyPattern(key: string, flags = ''): RegExp {
+  return new RegExp(`(?<![\\w$])${key.replace(/[.$]/g, '\\$&')}(?![\\w$])`, flags);
+}
+
+/** Where a dotted run longer than `key` starts at `at` and is itself a declared key — `waitlist.title` inside `waitlist.title.more` — that key; else null. */
+export function longerKeyAt(source: string, at: number, key: string, declared: ReadonlySet<string> | undefined): string | null {
+  if (declared === undefined) return null;
+  const run = /^[\w$]+(?:\.[\w$]+)*/.exec(source.slice(at))?.[0];
+  return run !== undefined && run !== key && declared.has(run) ? run : null;
+}
 
 export { dialectCode, within, type Span } from './markup.js';
 
@@ -281,8 +296,10 @@ export function planReadRenames(input: {
   renames: ReadonlyMap<string, string>;
   isStetModule: (spec: string) => boolean;
   copyModule: boolean;
+  /** Every declared key, so an occurrence that is the head of a longer dotted key is that key's, not this one's. */
+  declared?: ReadonlySet<string>;
 }): ReadRenames {
-  const { ts, file, source, dialect, renames, isStetModule, copyModule } = input;
+  const { ts, file, source, dialect, renames, isStetModule, copyModule, declared } = input;
   const out: ReadRenames = { edits: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
   if (renames.size === 0) return out;
 
@@ -327,7 +344,7 @@ export function planReadRenames(input: {
 
   // The parse check: every brace expression the walk read in a file holding a
   // leaving key parses as one expression, or the file's sorting is refused.
-  const held = [...renames.keys()].find((key) => new RegExp(`(?<![\\w$])${key}(?![\\w$])`).test(source));
+  const held = [...renames.keys()].find((key) => keyPattern(key).test(source));
   if (held !== undefined && dialect !== null) {
     for (const brace of braces) {
       if (parsesAsExpression(ts, dialect, source.slice(brace.start, brace.end))) continue;
@@ -337,9 +354,10 @@ export function planReadRenames(input: {
   }
 
   for (const [key, next] of renames) {
-    const pattern = new RegExp(`(?<![\\w$])${key}(?![\\w$])`, 'g');
+    const pattern = keyPattern(key, 'g');
     for (const m of source.matchAll(pattern)) {
       const at = m.index;
+      if (longerKeyAt(source, at, key, declared) !== null) continue;
       const line = lineOf(at);
       const occ: Occurrence = { file, line, at, key, text: lineText(at).trim() };
       if (!within(code, at) || within(nonCode, at)) {

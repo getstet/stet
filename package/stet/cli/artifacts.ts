@@ -19,6 +19,8 @@ import { isHtmlHost, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { planDocuments } from './html-host.js';
 import { CliError, UsageError, type Report } from './report.js';
+import { completeStatus, statusPlan, type StatusFile } from './status.js';
+import { isStoreBacked } from './store.js';
 
 /** JSON, keys sorted at every depth, two-space indent, one trailing newline. */
 export function writeJsonDeterministic(path: string, value: unknown): void {
@@ -154,8 +156,25 @@ export function writePlanned(
 }
 
 /**
- * The six repo forms as one update batch — the descriptor, the snapshot and
- * the regenerated codegen files.
+ * The forms that ride beside the descriptor and the snapshot: the approval
+ * status file, planned over `completeStatus` so it holds every declared key —
+ * null while the file does not exist and nothing is approved, and always null
+ * on a store-backed project, where publishing is the approval.
+ */
+export function planSideForms(
+  cwd: string,
+  config: Pick<StetConfig, 'statusPath' | 'store'>,
+  descriptor: Descriptor,
+  _snapshot: Snapshot,
+  status: StatusFile | null,
+): { status: WritePlan | null; generated: WritePlan[] } {
+  const held = status === null || isStoreBacked(config.store) ? null : status;
+  return { status: held === null ? null : statusPlan(cwd, config, completeStatus(held, descriptor)), generated: [] };
+}
+
+/**
+ * The repo forms as one update batch — the descriptor, the snapshot, the
+ * regenerated codegen files and, once one exists, the status file.
  *
  * The three commands that write keys write exactly these six, and a batch that
  * missed one would leave a permanent finding: `generateRegistry` stamps the
@@ -170,18 +189,22 @@ export function writePlanned(
  * leaves behind.
  *
  * `config.ts`'s runtime import of this module is one runtime edge between the
- * two; `isHtmlHost` is the other, and it runs the other way. This module also
- * reaches `html-host.ts` and `files.ts` at runtime — one way, since neither of
- * those imports anything from here.
+ * two; `isHtmlHost` is the other, and it runs the other way, and `status.ts`
+ * and `store.ts` each run back the same way (a function called, never a value
+ * read at load). This module also reaches `html-host.ts` and `files.ts` at
+ * runtime — one way, since neither of those imports anything from here.
  */
 export function planRepoForms(
   cwd: string,
-  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces'>,
+  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces' | 'statusPath' | 'store'>,
   descriptor: Descriptor,
   snapshot: Snapshot,
+  status: StatusFile | null,
   report: Report,
 ): WritePlan[] {
   const at = (rel: string): string => join(cwd, rel);
+  const side = planSideForms(cwd, config, descriptor, snapshot, status);
+  const sideWrites = [...(side.status === null ? [] : [side.status]), ...side.generated];
   // On the static-HTML host the repo forms are the descriptor, the snapshot and
   // the MARKED DOCUMENTS: there are no codegen files, and each document is
   // regenerated from the snapshot rather than written from a generator.
@@ -206,6 +229,7 @@ export function planRepoForms(
       asUpdate(planJson(at(config.descriptorPath), descriptor, config.descriptorPath)),
       asUpdate(planJson(at(config.snapshotPath), snapshot, config.snapshotPath)),
       ...writes.map((w) => asUpdate(planWrite(w.abs, w.text, w.rel))),
+      ...sideWrites,
     ];
   }
   const { keysTs, dts } = generateRegistry(descriptor);
@@ -216,6 +240,7 @@ export function planRepoForms(
     asUpdate(planWrite(at(config.codegen.dts), dts, config.codegen.dts)),
     asUpdate(planWrite(at(config.codegen.defaults), generateDefaultsModule(snapshot), config.codegen.defaults)),
     asUpdate(planWrite(at(config.codegen.resolved), generateResolvedModule(descriptor, snapshot), config.codegen.resolved)),
+    ...sideWrites,
   ];
 }
 

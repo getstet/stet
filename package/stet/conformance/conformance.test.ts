@@ -519,7 +519,7 @@ describe('descriptor', () => {
     // — the fixture declares all eight — and the emission is as sorted and as
     // reproducible as `KEYS`.
     const stringUnion = /^export const STRING_KEYS = \[\n([\s\S]*?)^\] as const;$/m.exec(keysTs);
-    const stringKeys = [...(stringUnion?.[1] ?? '').matchAll(/^ {2}'([a-z0-9_]+)',$/gm)].map((m) => m[1] as string);
+    const stringKeys = [...(stringUnion?.[1] ?? '').matchAll(/^ {2}'([a-z0-9_.]+)',$/gm)].map((m) => m[1] as string);
     const ofShape = (...shapes: string[]): string[] =>
       Object.entries(descriptor.keys)
         .filter(([, def]) => shapes.includes(def.shape))

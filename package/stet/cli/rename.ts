@@ -34,6 +34,7 @@ import { dirname, join, resolve as resolvePath } from 'node:path';
 import { isNotSupported, isStoreError } from '../adapters/store-shared.js';
 import { DescriptorError, loadDescriptorWithWarnings, pageKeyReferences } from '../src/descriptor.js';
 import { resolve } from '../src/resolve.js';
+import { escapeRegExp } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
@@ -43,6 +44,7 @@ import {
   asUpdate,
   planJson,
   planRepoForms,
+  planSideForms,
   planWrite,
   rethrowBatchFailure,
   writePlanned,
@@ -52,6 +54,7 @@ import {
 import { descriptorOf, snapshotOf } from './check.js';
 import {
   isHtmlHost,
+  keyJoiner,
   loadConfig,
   selectStoreBlock,
   type StetConfig,
@@ -80,6 +83,7 @@ import { injectedFor } from './project.js';
 import { CliError, HostTextReport, plural, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff } from './rewrite.js';
 import { dialectOf, loadTypescript, matchGlob, scanSource, type LocatedAccessor } from './source-scan.js';
+import { loadStatus, renameStatus } from './status.js';
 import { isStoreBacked, resolveStore } from './store.js';
 import { resolveEditor } from './write.js';
 
@@ -214,8 +218,8 @@ export async function runRename(args: string[], io: CliIo): Promise<number> {
       return report.emit(io);
     }
   }
-  const host = storeOnly ? null : isHtmlHost(config) ? markRenames(io.cwd, config, renames) : await readRenames(io.cwd, config, renames);
-  const plans: WritePlan[] = forms === null || host === null ? [] : keyMoveWrites(io.cwd, config, forms, host, report);
+  const host = storeOnly ? null : isHtmlHost(config) ? markRenames(io.cwd, config, renames) : await readRenames(io.cwd, config, renames, new Set(Object.keys(descriptor.keys)));
+  const plans: WritePlan[] = forms === null || host === null ? [] : keyMoveWrites(io.cwd, config, forms, host, renames, report);
   // Only the forms whose bytes change are written, and named.
   const changed = plans.filter((p) => p.status !== 'unchanged');
   const files = changed.map((p) => p.label);
@@ -330,7 +334,7 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
         continue;
       }
       const page = (docsOf.get(mark.key)?.size ?? 0) > 1 ? SITE_PAGE : htmlPageOf(io.cwd, mark.file, descriptor.pages);
-      placed.set(mark.key, { base: htmlBaseName(page, mark), section: mark.sectionWord, places: [place] });
+      placed.set(mark.key, { base: htmlBaseName(page, mark, keyJoiner(config)), section: mark.sectionWord, places: [place] });
     }
   } else {
     for (const rel of filesForGlobs(io.cwd, config.managedSurfaces)) {
@@ -349,6 +353,7 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
       if (dialectOf(rel) !== null) continue;
       const result = await scanSource(rel, readFileSync(join(io.cwd, rel), 'utf8'), {
         readPathImport: config.readPath.import,
+        joiner: keyJoiner(config),
         ...(page === undefined ? {} : { page }),
       });
       if (result.parseErrors) continue;
@@ -359,7 +364,7 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
           had.places.push(call.place);
           continue;
         }
-        placed.set(call.key, { base: accessorBaseName(page, call), section: isHeadKind(call.place) ? null : call.section, places: [call.place] });
+        placed.set(call.key, { base: accessorBaseName(page, call, keyJoiner(config)), section: isHeadKind(call.place) ? null : call.section, places: [call.place] });
       }
     }
   }
@@ -410,13 +415,16 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
 }
 
 /** An accessor call's role name before its number: register's naming of the element the call renders in. */
-export function accessorBaseName(page: string | undefined, call: LocatedAccessor): string {
-  return baseName({
-    ...(page === undefined ? {} : { page }),
-    ...(isHeadKind(call.place) ? {} : { section: call.section }),
-    ...(call.item === undefined ? {} : { item: call.item }),
-    role: call.role,
-  });
+export function accessorBaseName(page: string | undefined, call: LocatedAccessor, joiner: '_' | '.' = '_'): string {
+  return baseName(
+    {
+      ...(page === undefined ? {} : { page }),
+      ...(isHeadKind(call.place) ? {} : { section: call.section }),
+      ...(call.item === undefined ? {} : { item: call.item }),
+      role: call.role,
+    },
+    joiner,
+  );
 }
 
 /** A mark as the place a plan lists. */
@@ -768,25 +776,31 @@ export function renamedForms(
 
 /**
  * The one batch a key move writes — rename's, merge's and split's: the
- * descriptor and the snapshot, with the codegen files on a JavaScript host, and
- * every host file whose marks or reads change. On the static-HTML host the
- * documents change only where a mark is renamed: a moved key's text is the one
- * it had, so nothing is regenerated.
+ * descriptor and the snapshot, with the codegen files on a JavaScript host, the
+ * status file once the project has one (its entries moved with the keys in
+ * `moved`, old name → new), and every host file whose marks or reads change.
+ * On the static-HTML host the documents change only where a mark is renamed: a
+ * moved key's text is the one it had, so nothing is regenerated.
  */
 export function keyMoveWrites(
   cwd: string,
   config: StetConfig,
   forms: { descriptor: Descriptor; snapshot: Snapshot },
   host: HostRenames,
+  moved: ReadonlyMap<string, string>,
   report: Report,
 ): WritePlan[] {
+  const status = renameStatus(loadStatus(cwd, config), moved);
+  const side = planSideForms(cwd, config, forms.descriptor, forms.snapshot, status);
   return [
     ...(isHtmlHost(config)
       ? [
           asUpdate(planJson(join(cwd, config.descriptorPath), forms.descriptor, config.descriptorPath)),
           asUpdate(planJson(join(cwd, config.snapshotPath), forms.snapshot, config.snapshotPath)),
+          ...(side.status === null ? [] : [side.status]),
+          ...side.generated,
         ]
-      : planRepoForms(cwd, config, forms.descriptor, forms.snapshot, report)),
+      : planRepoForms(cwd, config, forms.descriptor, forms.snapshot, status, report)),
     ...host.edited.map((e) => asUpdate(planWrite(join(cwd, e.rel), e.text, e.rel))),
   ];
 }
@@ -848,7 +862,7 @@ export function markRenames(
     // A split moves one place and leaves the key's others, so it sweeps nothing.
     const lineAt = lineIndex(document.source);
     for (const [old] of only === undefined ? renames : []) {
-      const mark = new RegExp(`\\sdata-stet(?:-[a-z][a-z0-9-]*)?\\s*=\\s*(["']?)${old}\\1(?![\\w-])`, 'g');
+      const mark = new RegExp(`\\sdata-stet(?:-[a-z][a-z0-9-]*)?\\s*=\\s*(["']?)${escapeRegExp(old)}\\1(?![\\w-])`, 'g');
       for (const m of document.source.matchAll(mark)) {
         const at = m.index + m[0].length - old.length - (m[1] as string).length;
         if (edits.some((e) => e.pos === at)) continue;
@@ -874,6 +888,7 @@ export async function readRenames(
   cwd: string,
   config: StetConfig,
   renames: ReadonlyMap<string, string>,
+  declared: ReadonlySet<string>,
   only?: OnlyAt,
 ): Promise<HostRenames> {
   const ts = await loadTypescript();
@@ -898,6 +913,7 @@ export async function readRenames(
       renames,
       isStetModule: isStetModule(rel),
       copyModule: config.copyModules.some((glob) => matchGlob(glob, rel)),
+      declared,
     });
     const here = (o: Occurrence): boolean => only === undefined || (o.file === only.file && o.line === only.line);
     const rewritten = found.rewritten.filter(here);

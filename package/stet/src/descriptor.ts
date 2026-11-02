@@ -163,7 +163,9 @@ export function checkDescriptorStructure(d: Descriptor): DescriptorWarning[] {
  */
 export function deriveLabel(key: string): string {
   const separator = key.lastIndexOf('__');
-  const leaf = separator === -1 ? key : key.slice(separator + 2);
+  const slot = separator === -1 ? key : key.slice(separator + 2);
+  // A dotted key's label is its last segment: `waitlist.use.music_videos` → "Music videos".
+  const leaf = slot.slice(slot.lastIndexOf('.') + 1);
   const words = leaf.split('_').filter((w) => w.length > 0);
   const first = words[0];
   if (first === undefined) return key;

@@ -62,7 +62,7 @@ export async function runMerge(args: string[], io: CliIo): Promise<number> {
     report.line('merge: run with --write to apply');
     return report.emit(io);
   }
-  const changed = keyMoveWrites(io.cwd, config, plan, plan.host, report).filter((p) => p.status !== 'unchanged');
+  const changed = keyMoveWrites(io.cwd, config, plan, plan.host, new Map([[leaving, into]]), report).filter((p) => p.status !== 'unchanged');
   try {
     writePlanned(changed);
   } catch (error) {
@@ -122,7 +122,7 @@ export async function planMerge(
   }
 
   const renames = new Map([[leaving, into]]);
-  const host = isHtmlHost(config) ? markRenames(cwd, config, renames) : await readRenames(cwd, config, renames);
+  const host = isHtmlHost(config) ? markRenames(cwd, config, renames) : await readRenames(cwd, config, renames, new Set(Object.keys(descriptor.keys)));
   refused.push(...hostRefusals(host, leaving));
   if (refused.length > 0) return { refused };
 

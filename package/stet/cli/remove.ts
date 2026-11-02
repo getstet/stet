@@ -40,6 +40,7 @@ import type { CliIo } from './main.js';
 import { clip, CliError, Report, UsageError } from './report.js';
 import { filesForGlobs } from './files.js';
 import { mentionsToken } from './source-scan.js';
+import { loadStatus } from './status.js';
 import { isStoreBacked } from './store.js';
 
 /** How much of a leaving value the plan quotes — the `scan`/`register` excerpt width. */
@@ -170,7 +171,7 @@ export function planRemoval(
       );
     }
     for (const { file, source } of surfaces) {
-      if (!mentionsToken(source, key)) continue;
+      if (!mentionsToken(source, key, new Set(Object.keys(descriptor.keys)))) continue;
       report.line(
         `  ${file} mentions "${key}" — un-wire the read first, or the regenerated types surface it ` +
           `at the host's typecheck`,
@@ -263,7 +264,7 @@ function apply(
   report: Report,
 ): void {
   try {
-    writePlanned(planRepoForms(io.cwd, config, cleaned, snapshot, report));
+    writePlanned(planRepoForms(io.cwd, config, cleaned, snapshot, loadStatus(io.cwd, config), report));
   } catch (error) {
     rethrowBatchFailure('stet remove --write', error);
   }

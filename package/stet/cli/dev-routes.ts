@@ -58,7 +58,7 @@ import {
 } from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
-import { codeOf, dialectCode, KEY_READ, nonCodeOf, within, type Span } from './key-reads.js';
+import { codeOf, dialectCode, KEY_READ, keyPattern, longerKeyAt, nonCodeOf, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
 import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
@@ -66,6 +66,7 @@ import { applyPages, auditablePages, fileRoute, pagesCompiler, proposeForHost, r
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
+import { loadStatus, type StatusFile } from './status.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { elementPath, markupBraces, maskExpressions, selfClosedRaw } from './markup.js';
@@ -790,9 +791,10 @@ function applyForms(
   snapshot: Snapshot,
   report: Report,
   label: string,
+  status: StatusFile = loadStatus(path, config),
 ): { written: string[]; unchanged: string[] } {
   try {
-    return writePlanned(planRepoForms(path, config, descriptor, snapshot, report));
+    return writePlanned(planRepoForms(path, config, descriptor, snapshot, status, report));
   } catch (error) {
     rethrowBatchFailure(label, error);
     // `rethrowBatchFailure` always throws; TypeScript cannot see it.
@@ -1335,16 +1337,17 @@ async function mergeKeys(req: Request, site: SiteState): Promise<Response> {
   const body = await readJson(req);
   const plan = await planMerge(ready.path, ready.config, ready.descriptor, ready.snapshot, reqStr(body, 'key'), reqStr(body, 'into'));
   if ('refused' in plan) return json({ error: plan.refused.join('\n'), lines: plan.refused }, 409);
-  return json(applyKeyMove(ready, plan, 'dashboard merge'));
+  return json(applyKeyMove(ready, plan, new Map([[reqStr(body, 'key'), reqStr(body, 'into')]]), 'dashboard merge'));
 }
 
 /** A merge or split plan written as its command's one batch, answered with what changed and the checkout's state. */
 function applyKeyMove(
   ready: Ready,
   plan: { descriptor: Descriptor; snapshot: Snapshot; host: HostRenames },
+  moved: ReadonlyMap<string, string>,
   label: string,
 ): { written: string[]; touched: string | null; at: GitState; pending: string[]; untracked: string[] } {
-  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, new Report()).filter((p) => p.status !== 'unchanged');
+  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, moved, new Report()).filter((p) => p.status !== 'unchanged');
   const dirtyBefore = uncommittedPaths(ready.path, changed.map((p) => `:(literal)${p.label}`));
   const hashesBefore = new Map(changed.map((p) => [p.label, hashOf(ready, p.label)]));
   try {
@@ -1372,7 +1375,7 @@ async function splitPlace(req: Request, site: SiteState): Promise<Response> {
   if (typeof name !== 'string' || name === '') throw new UsageError('name is required');
   const plan = await planSplit(ready.path, ready.config, ready.descriptor, ready.snapshot, key, name, at);
   if ('refused' in plan) return json({ error: plan.refused.join('\n'), lines: plan.refused }, 409);
-  return json({ ...applyKeyMove(ready, plan, 'dashboard split'), key: name });
+  return json({ ...applyKeyMove(ready, plan, new Map(), 'dashboard split'), key: name });
 }
 
 /**
@@ -2470,7 +2473,7 @@ export function renderSites(ts: typeof import('typescript'), file: string, sourc
   for (const [key, entry] of out) {
     if (entry.open) continue;
     let named = 0;
-    for (const m of source.matchAll(new RegExp(`(?<![\\w$])${key}(?![\\w$])`, 'g'))) if (inCode(m.index)) named += 1;
+    for (const m of source.matchAll(keyPattern(key, 'g'))) if (longerKeyAt(source, m.index, key, declared) === null && inCode(m.index)) named += 1;
     if (named > (classified.get(key) ?? 0)) entry.open = true;
   }
   return out;

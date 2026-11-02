@@ -1113,7 +1113,7 @@ function named(id) {
 // whichever page names it; the rest group by the key's first underscore
 // segment, unmerged — `principle` and `principles` are two groups. A group is
 // `{ id, label, keys }`, and `S.group` holds an id.
-const prefixOf = (id) => (id.indexOf('_') === -1 ? id : id.slice(0, id.indexOf('_')));
+const prefixOf = (id) => { const sep = id.indexOf('.') === -1 ? '_' : '.'; return id.indexOf(sep) === -1 ? id : id.slice(0, id.indexOf(sep)); };
 function groups() {
   if (!ready()) return [];
   const descriptor = S.site.descriptor;

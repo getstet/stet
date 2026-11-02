@@ -36,6 +36,7 @@ import { isHtmlHost } from './config.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence } from './project.js';
 import { Report } from './report.js';
+import { loadStatus } from './status.js';
 import { isStoreBacked } from './store.js';
 
 export async function runPull(args: string[], io: CliIo): Promise<number> {
@@ -124,7 +125,7 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
       let written: string[];
       try {
         ({ written } = writePlanned(
-          planRepoForms(io.cwd, config, project.descriptor, merged, report),
+          planRepoForms(io.cwd, config, project.descriptor, merged, loadStatus(io.cwd, config), report),
         ));
       } catch (error) {
         rethrowBatchFailure('stet pull', error);

@@ -57,6 +57,7 @@ import type { CliIo } from './main.js';
 import { clip, plural, posixRelative, CliError, Report, UsageError } from './report.js';
 import { applyFileEdits } from './rewrite.js';
 import { loadTypescript } from './source-scan.js';
+import { loadStatus } from './status.js';
 import { servableFile } from './static-files.js';
 
 // --- The dirent walk --------------------------------------------------------
@@ -1270,7 +1271,7 @@ export function applyPages(
   let written: string[] = [];
   let unchanged: string[] = [];
   try {
-    ({ written, unchanged } = writePlanned([...planRepoForms(cwd, config, descriptor, snapshot, report), ...pageWrites]));
+    ({ written, unchanged } = writePlanned([...planRepoForms(cwd, config, descriptor, snapshot, loadStatus(cwd, config), report), ...pageWrites]));
   } catch (error) {
     rethrowBatchFailure('pages scan --apply', error);
   }

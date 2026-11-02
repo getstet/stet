@@ -1305,6 +1305,8 @@ export async function scanSource(
     readPathImport: string;
     /** The file's page word, where it serves a page; a component file has none. */
     page?: string;
+    /** The joiner the naming rule puts between a name's parts (`keyJoiner`); `_` where absent. */
+    joiner?: '_' | '.';
   },
 ): Promise<ScanResult> {
   const ts = await loadTypescript();
@@ -1899,12 +1901,15 @@ export async function scanSource(
     proposedKey:
       p.context === 'send-arg'
         ? proposeKey(p.text)
-        : baseName({
-            ...(opts.page === undefined ? {} : { page: opts.page }),
-            ...(isHeadKind(p.place) ? {} : { section: p.section }),
-            ...(p.item === undefined ? {} : { item: p.item }),
-            role: p.role ?? roleOf(p.place),
-          }),
+        : baseName(
+            {
+              ...(opts.page === undefined ? {} : { page: opts.page }),
+              ...(isHeadKind(p.place) ? {} : { section: p.section }),
+              ...(p.item === undefined ? {} : { item: p.item }),
+              role: p.role ?? roleOf(p.place),
+            },
+            opts.joiner,
+          ),
     place: p.place,
     sectionWord: p.section,
     ...(p.item === undefined ? {} : { item: p.item }),
@@ -2739,14 +2744,19 @@ function blankLineFrom(text: string, i: number): boolean {
  * warn that rides the pre-commit hook: a crash there fails somebody's commit
  * over a typo in their descriptor.
  */
-export function mentionsToken(source: string, token: string): boolean {
+export function mentionsToken(source: string, token: string, declared?: ReadonlySet<string>): boolean {
   const escaped = escapeRegExp(token);
   // `\b` asserts a boundary only beside a word character, so a token that
   // begins or ends with punctuation takes a bare match on that side rather
   // than one that can never hold.
   const left = /^\w/.test(token) ? '\\b' : '';
   const right = /\w$/.test(token) ? '\\b' : '';
-  return new RegExp(`${left}${escaped}${right}`).test(source);
+  // A dotted token that is the head of a longer declared key (`waitlist.foot` in `waitlist.foot.more`) is that key's mention.
+  for (const m of source.matchAll(new RegExp(`${left}${escaped}${right}`, 'g'))) {
+    const run = declared === undefined ? undefined : /^[\w$]+(?:\.[\w$]+)*/.exec(source.slice(m.index))?.[0];
+    if (run === undefined || run === token || !declared?.has(run)) return true;
+  }
+  return false;
 }
 
 /**

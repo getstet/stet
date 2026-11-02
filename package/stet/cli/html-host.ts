@@ -1071,13 +1071,16 @@ export function markOrder(
 }
 
 /** A proposal's or a mark's role name before its number: the page, the section (none for a head text), the item and the role. */
-export function htmlBaseName(page: string, at: { sectionWord: string | null; item?: string; role: string } & HeadTest): string {
-  return baseName({
-    page,
-    ...(isHeadText(at) ? {} : { section: at.sectionWord }),
-    ...(at.item === undefined ? {} : { item: at.item }),
-    role: at.role,
-  });
+export function htmlBaseName(page: string, at: { sectionWord: string | null; item?: string; role: string } & HeadTest, joiner: '_' | '.' = '_'): string {
+  return baseName(
+    {
+      page,
+      ...(isHeadText(at) ? {} : { section: at.sectionWord }),
+      ...(at.item === undefined ? {} : { item: at.item }),
+      role: at.role,
+    },
+    joiner,
+  );
 }
 
 function readOne(
@@ -1970,8 +1973,10 @@ export function planHtmlRegister(input: {
   chosen?: (proposed: string) => ChosenName | undefined;
   /** The proposals, where the caller has already located them (`scan`). */
   set?: HtmlProposalSet;
+  /** The joiner the naming rule puts between a name's parts (`keyJoiner`); `_` where absent. */
+  joiner?: '_' | '.';
 }): HtmlRegisterPlan {
-  const { cwd, files, descriptor, snapshot, report, pageOf, chosen } = input;
+  const { cwd, files, descriptor, snapshot, report, pageOf, chosen, joiner } = input;
   const set = input.set ?? proposeHtml(cwd, files);
   // The names the descriptor held before the run: a role name never lands on one.
   const before = new Set(Object.keys(descriptor.keys));
@@ -2179,7 +2184,7 @@ export function planHtmlRegister(input: {
   // head text — and the run's names are numbered together.
   const bases = minting.map(({ tmp, proposal }) => {
     const docs = docsOf.get(tmp) ?? new Set<string>();
-    return htmlBaseName(docs.size > 1 ? SITE_PAGE : pageOf(proposal.file), proposal);
+    return htmlBaseName(docs.size > 1 ? SITE_PAGE : pageOf(proposal.file), proposal, joiner);
   });
   const proposedNames = numberNames(bases, (name) => before.has(name));
   const finalOf = new Map<string, string>();

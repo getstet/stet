@@ -12,7 +12,7 @@ const descriptor = miniDescriptor();
 /** The entries of one emitted `export const <name> = [ … ] as const;` block. */
 function entriesOf(keysTs: string, name: string): string[] {
   const block = new RegExp(`^export const ${name} = \\[\\n([\\s\\S]*?)^\\] as const;$`, 'm').exec(keysTs);
-  return [...(block?.[1] ?? '').matchAll(/^ {2}'([a-z0-9_]+)',$/gm)].map((m) => m[1] as string);
+  return [...(block?.[1] ?? '').matchAll(/^ {2}'([a-z0-9_.]+)',$/gm)].map((m) => m[1] as string);
 }
 
 describe('generateRegistry', () => {
