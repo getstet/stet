@@ -2018,10 +2018,10 @@ describe('dispatch', () => {
     expect(host.stderr()).toContain('stet hook has two subcommands, install and remove — got "uninstall"');
   });
 
-  it('import is a named, declined fast-follow — not "unknown command"', async () => {
+  it('import is a command — a bare `stet import` asks for its file, never "unknown command"', async () => {
     const host = makeHost();
     expect(await host.run('import')).toBe(2);
-    expect(host.stderr()).toContain('fast-follow');
+    expect(host.stderr()).toContain('usage: stet import <file>');
     expect(host.stderr()).not.toContain('unknown command');
   });
 
@@ -3335,7 +3335,7 @@ describe('per-command help', () => {
 
   it('reads every command word out of the usage', () => {
     expect(commands).toEqual([
-      'init', 'scan', 'register', 'remove', 'rename', 'merge', 'split', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
+      'init', 'scan', 'register', 'import', 'approve', 'remove', 'rename', 'merge', 'split', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
       'email extract', 'email verify', 'email render', 'email test', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
       'seed', 'pull', 'audit', 'audit lighthouse', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
       'contacts export', 'contacts erase', 'contacts suppress', 'contacts import', 'contacts group add',

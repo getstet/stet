@@ -17,12 +17,13 @@ import { join, posix } from 'node:path';
 import type * as TS from 'typescript';
 
 import { loadDescriptor } from '../src/descriptor.js';
+import { toStet } from '../src/placeholders.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { Descriptor, PageDef } from '../src/types.js';
 
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { writeJsonDeterministic } from './artifacts.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, keyJoiner, loadConfig, type StetConfig } from './config.js';
 import { isRegistryFile, proposeTemplates, templateExports, type ExtractSkip } from './email-extract.js';
 import { filesForGlobs } from './files.js';
 import { htmlBaseName, planHtmlRegister, proposeHtml } from './html-host.js';
@@ -233,6 +234,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
           report: new Report(),
           pageOf: (file) => htmlPageOf(io.cwd, file, forms.descriptor.pages),
           set: html,
+          joiner: keyJoiner(config),
         }).keyAt
       : null;
   const run =
@@ -263,7 +265,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
               ? ` (${proposal.attr})`
               : ` (meta ${proposal.metaName})`;
         // The role name before its number, where the naming pass gave none.
-        const base = htmlBaseName(htmlPageOf(io.cwd, file, rawPages(descriptorOnce())), proposal);
+        const base = htmlBaseName(htmlPageOf(io.cwd, file, rawPages(descriptorOnce())), proposal, keyJoiner(config));
         report.warn(
           'scan',
           `${file}:${proposal.line} possible copy ${JSON.stringify(clip(proposal.value, LITERAL_EXCERPT))}${suffix} — ` +
@@ -337,6 +339,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
         held === undefined
           ? await scanSource(file, source, {
               readPathImport: config.readPath.import,
+              joiner: keyJoiner(config),
               ...(page === undefined ? {} : { page }),
             })
           : held;
@@ -409,7 +412,10 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
           warned += 1;
           continue;
         }
-        const verdict = classifyAdoption(descriptor, snapshot, literal.proposedKey, literal.text);
+        // The table's own form, named on the line: ` (pair)`, ` (object)`, nothing for a bare string.
+        const form = literal.form === undefined ? '' : ` (${literal.form})`;
+        // A `{name}` host's table reads in its own spelling; the snapshot holds the stored `{{name}}`.
+        const verdict = classifyAdoption(descriptor, snapshot, literal.proposedKey, toStet(literal.text, config.placeholders));
         // Adopted is SILENT — the module's literal IS the snapshot default.
         if (verdict === 'adopted') continue;
         if (verdict === 'diverged') {
@@ -427,7 +433,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
           report.warn(
             'scan',
             `${at} ${literal.proposedKey} diverged from the snapshot default — ` +
-              `module ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))}, ` +
+              `module ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))}${form}, ` +
               (stored === undefined
                 ? 'snapshot has no default'
                 : `snapshot ${JSON.stringify(clip(stored, LITERAL_EXCERPT))}`),
@@ -441,7 +447,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
         report.warn(
           'scan',
           note === undefined
-            ? `${at} unkeyed copy ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))} — propose key ${literal.proposedKey}`
+            ? `${at} unkeyed copy ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))}${form} — propose key ${literal.proposedKey}`
             : `${at} ${note}`,
           literal.proposedKey,
         );

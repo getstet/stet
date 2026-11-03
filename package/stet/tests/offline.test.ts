@@ -57,6 +57,7 @@ describe('the core is pure by construction', () => {
       'descriptor.ts',
       'index.ts',
       'placeholder.ts',
+      'placeholders.ts',
       'preview-token.ts',
       'preview.ts',
       'resolve.ts',

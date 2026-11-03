@@ -223,6 +223,8 @@ export interface LocatedLiteral {
   rich?: { value: string; tags: number; renderers: Array<{ open: Span; close: Span; tag: string; keyed?: true }> };
   /** A JSX sentence's file already imports stet's `richParts`, so its rewrite inserts no second import (D16). */
   richImported?: true;
+  /** A copy module's property value read out of a `[value, meta]` pair or a `{ value, … }` object; absent for a bare string. */
+  form?: 'pair' | 'object';
 }
 
 /** A copy string the scanner recognizes as i18n's — reported, never rewritten. */
@@ -2118,7 +2120,11 @@ export async function scanModule(
   };
 
   /**
-   * The name of the object-literal property this literal is the value of.
+   * The name of the object-literal property this literal is the value of, and
+   * the form it sits in: the property's own string, element 0 of its
+   * `[value, meta]` pair, or the `value` member of its `{ value, … }` object.
+   * Null for a pair's later element or a sibling of `value` — a status word or a
+   * note, never copy — and undefined where the literal is no property's value.
    *
    * A per-value cast or parenthesis wraps the literal without changing what the
    * property is — `{ hero: 'Hero copy' as const }` names its key just as plainly
@@ -2127,20 +2133,49 @@ export async function scanModule(
    * dropped those to derived keys, forking the registry from the module through
    * a side door.
    */
-  const valueOfProperty = (lit: TS.Node): string | undefined => {
-    let node: TS.Node = lit;
-    for (
-      let up: TS.Node | undefined = node.parent;
-      up !== undefined &&
-      (ts.isAsExpression(up) || ts.isSatisfiesExpression(up) || ts.isParenthesizedExpression(up));
-      up = node.parent
-    ) {
-      node = up;
-    }
+  const valueOfProperty = (lit: TS.Node): { name: string | undefined; form?: 'pair' | 'object' } | null | undefined => {
+    const climb = (from: TS.Node): TS.Node => {
+      let node = from;
+      for (
+        let up: TS.Node | undefined = node.parent;
+        up !== undefined &&
+        (ts.isAsExpression(up) || ts.isSatisfiesExpression(up) || ts.isParenthesizedExpression(up));
+        up = node.parent
+      ) {
+        node = up;
+      }
+      return node;
+    };
+    /** The property `node` is the initializer of, inside an object literal. */
+    const propertyOf = (node: TS.Node): TS.PropertyAssignment | undefined => {
+      const parent: TS.Node | undefined = node.parent;
+      if (parent === undefined || !ts.isPropertyAssignment(parent) || parent.initializer !== node) return undefined;
+      return ts.isObjectLiteralExpression(parent.parent) ? parent : undefined;
+    };
+    const node = climb(lit);
     const parent: TS.Node | undefined = node.parent;
-    if (parent === undefined || !ts.isPropertyAssignment(parent) || parent.initializer !== node) return undefined;
-    if (!ts.isObjectLiteralExpression(parent.parent)) return undefined;
-    return propName(ts, parent.name);
+    // `"home.title": ["Make your whole ad campaign.", "approved"]`: element 0 is the value. Only the
+    // two-string pair reads so: a one-element list (`classes: ['x']`) or a longer one stays the
+    // literals it always was.
+    if (parent !== undefined && ts.isArrayLiteralExpression(parent)) {
+      const pair = propertyOf(climb(parent));
+      if (pair === undefined || parent.elements.length !== 2 || !parent.elements.every((e) => ts.isStringLiteralLike(e))) return undefined;
+      return parent.elements[0] === node ? { name: propName(ts, pair.name), form: 'pair' } : null;
+    }
+    const own = propertyOf(node);
+    if (own === undefined) return undefined;
+    // `"home.lead": { value: "Every variant, one run.", note: "…" }`: the `value` member is the value.
+    const holder = own.parent as TS.ObjectLiteralExpression;
+    const outer = propertyOf(climb(holder));
+    const bare = (e: TS.Expression): TS.Expression =>
+      ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e) ? bare(e.expression) : e;
+    const valued = holder.properties.find(
+      (p): p is TS.PropertyAssignment => ts.isPropertyAssignment(p) && propName(ts, p.name) === 'value' && ts.isStringLiteralLike(bare(p.initializer)),
+    );
+    if (outer !== undefined && valued !== undefined) {
+      return valued === own ? { name: propName(ts, outer.name), form: 'object' } : null;
+    }
+    return { name: propName(ts, own.name) };
   };
 
   const record = (node: TS.Node, literalText: string, isTemplate: boolean): void => {
@@ -2154,9 +2189,13 @@ export async function scanModule(
     // host named under a grammar-valid unclaimed name is a finding by
     // declaration, anything else takes the bar — so the count is
     // would-have-been findings and never suppressed junk.
+    // A pair's status word and a sibling of `value` are the table's own data, never copy.
+    const at = valueOfProperty(node);
+    if (at === null) return;
+
     const ignoredAt = ignoreAbove(node);
     if (ignoredAt !== undefined) {
-      const ignoredName = isTemplate ? undefined : valueOfProperty(node);
+      const ignoredName = isTemplate ? undefined : at?.name;
       let declared = false;
       if (ignoredName !== undefined && KEY_NAME.test(ignoredName) && !wouldClaim.has(ignoredName)) {
         wouldClaim.add(ignoredName);
@@ -2171,7 +2210,7 @@ export async function scanModule(
     let note: string | undefined;
     // A template with substitutions is never a property proposal — a default has
     // to be a literal value, and the slotted-template shape is extract's.
-    const name = isTemplate ? undefined : valueOfProperty(node);
+    const name = isTemplate ? undefined : at?.name;
     if (name !== undefined) {
       if (!KEY_NAME.test(name)) {
         note = `property name ${name} fails the key grammar — propose key ${key}`;
@@ -2184,6 +2223,7 @@ export async function scanModule(
         key = name;
       }
     }
+    const form = shape === 'property' ? at?.form : undefined;
     if (shape !== 'property' && !qualifiesAsCopy(literalText)) return;
     if (note !== undefined) notes.set(pos, note);
     literals.push({
@@ -2199,6 +2239,7 @@ export async function scanModule(
       copyBinding: 'none',
       accessorImported: false,
       importInsertPos: 0,
+      ...(form === undefined ? {} : { form }),
     });
   };
 
