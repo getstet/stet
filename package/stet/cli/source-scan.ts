@@ -22,7 +22,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { builtinModules } from 'node:module';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import type * as TS from 'typescript';
 
@@ -45,12 +45,14 @@ import {
   type ItemNode,
   type Place,
   type SectionNode,
+  wordsOf,
 } from './key-names.js';
 import {
   blankNonMarkup,
   closing,
   dialectCode,
   FRONTMATTER,
+  HTML_TAGS,
   markupBraces,
   maskExpressions,
   markupTags,
@@ -1939,6 +1941,213 @@ function lineSpan(source: string, pos: number, nodeEnd: number): Span {
   if (source.charAt(end) === '\r') end += 1;
   if (source.charAt(end) === '\n') end += 1;
   return { pos: start, end };
+}
+
+/** What the screen pass reads from the config (D15). */
+export interface ScreenOptions {
+  /** The configured read functions' written names (`TS.t`): a call of one is a read, never an element. */
+  reads: readonly string[];
+  /** The mark attributes (`markAttributes`): a prop of one names the key its element reads. */
+  attributes: readonly string[];
+  /** `scan.builders`: callees read as an element whatever their first argument (`h(Card, …)`). */
+  builders: readonly string[];
+  /** The file's page word, where it serves a page; else the file's own name gives one. */
+  page?: string;
+  joiner?: '_' | '.';
+}
+
+/**
+ * A JavaScript screen's copy (D15): a hyperscript element's string child or
+ * copy prop, or a string a DOM property or `setAttribute` takes. It is listed
+ * for adoption by hand and never rewritten, so it is its own type: it carries
+ * none of a `LocatedLiteral`'s rewrite fields and cannot reach `planRewrite`.
+ */
+export interface ScreenLiteral {
+  file: string;
+  pos: number;
+  text: string;
+  place: Place;
+  sectionWord: string | null;
+  /** The role name before its number. */
+  proposedKey: string;
+}
+
+/** One screen's copy, and the text it holds as possible copy with no key: an HTML fragment's, or a string child of a call no element encloses. */
+export interface ScreenScan {
+  literals: ScreenLiteral[];
+  possible: DialectFinding[];
+}
+
+/** A hyperscript call read as an element: its tag, its props where the second argument is an object literal, and its children. */
+export interface HyperscriptElement {
+  tag: string;
+  props?: TS.ObjectLiteralExpression;
+  children: readonly TS.Expression[];
+  /** Named in `scan.builders`, or given props: an element beyond doubt, which `log("div", "x")` is not. */
+  sure: boolean;
+}
+
+/** The copy props a hyperscript element carries: the JSX walk's copy attributes a visitor reads. */
+const SCREEN_PROPS: ReadonlySet<string> = new Set([...COPY_ATTRS].filter((name) => ['placeholder', 'title', 'alt', 'aria-label'].includes(name)));
+
+/** The DOM properties whose string is copy, each with the attribute it is; `textContent` and `innerText` are the element's text. */
+const DOM_COPY: Record<string, string | undefined> = { textContent: undefined, innerText: undefined, title: 'title', placeholder: 'placeholder', alt: 'alt', ariaLabel: 'aria-label' };
+
+/** A custom element's name: lowercase, with a hyphen, and no attribute's (`aria-label` is `setAttribute`'s first argument). */
+const CUSTOM_ELEMENT = /^(?!aria-|data-)[a-z][a-z0-9]*-[a-z0-9-]*$/;
+
+/**
+ * A call read as a hyperscript element (D15): a first argument naming an HTML
+ * element (`HTML_TAGS`) or a custom one, then an optional object literal of
+ * props (or `null`) and the children; or any call of a name in
+ * `scan.builders`, whose first argument may be a component (`h(Card, …)`). A
+ * call of a configured read function is a read and never an element. Null for
+ * any other call.
+ */
+export function hyperscriptElement(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+  call: TS.CallExpression,
+  opts: Pick<ScreenOptions, 'reads' | 'builders'>,
+): HyperscriptElement | null {
+  const callee = call.expression.getText(sf).replace(/\s+/g, '');
+  const [first, second] = call.arguments;
+  if (first === undefined || opts.reads.includes(callee)) return null;
+  const built = opts.builders.includes(callee);
+  const named = ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first) ? first.text : undefined;
+  if (!built && (named === undefined || !(HTML_TAGS.has(named) || CUSTOM_ELEMENT.test(named)))) return null;
+  const props = second !== undefined && (ts.isObjectLiteralExpression(second) || second.kind === ts.SyntaxKind.NullKeyword);
+  return {
+    tag: named ?? first.getText(sf),
+    ...(second !== undefined && ts.isObjectLiteralExpression(second) ? { props: second } : {}),
+    children: call.arguments.slice(props ? 2 : 1),
+    sure: built || props,
+  };
+}
+
+/**
+ * A JavaScript screen's copy (D15), over a file `scanSource` parsed. Inside a
+ * hyperscript element a string child is copy, and so is a string `placeholder`,
+ * `title`, `alt` or `aria-label` prop; a prop named by a mark attribute names
+ * the key the element reads, so its children are not copy (and `<mark>-<prop>`
+ * keys that prop); a read call, like every other expression, is code. The
+ * enclosing elements are the chain `sectionWord` reads. A string assigned to a
+ * DOM copy property, or `setAttribute`'s value for a copy attribute, is copy
+ * with the role from the property. An `innerHTML` or `insertAdjacentHTML`
+ * fragment is read by the dialect detector as possible copy, and so is the
+ * string child of a call that is an element only by its shape and sits in no
+ * element (`log("div", "x")`).
+ */
+export function scanScreen(ts: typeof import('typescript'), sf: TS.SourceFile, opts: ScreenOptions): ScreenScan {
+  const file = sf.fileName;
+  const page = opts.page ?? (wordsOf(basename(file).replace(/\.[^.]*$/, '')) || undefined);
+  const literals: ScreenLiteral[] = [];
+  const possible: DialectFinding[] = [];
+  const isString = (n: TS.Node): n is TS.StringLiteral | TS.NoSubstitutionTemplateLiteral => ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n);
+  const elements = new Map<TS.CallExpression, HyperscriptElement | null>();
+  const elementOf = (call: TS.CallExpression): HyperscriptElement | null => {
+    if (!elements.has(call)) elements.set(call, hyperscriptElement(ts, sf, call, opts));
+    return elements.get(call) ?? null;
+  };
+  // The elements a node sits inside as a child, nearest first.
+  const enclosing = (node: TS.Node): HyperscriptElement[] => {
+    const out: HyperscriptElement[] = [];
+    for (let at = node; at.parent !== undefined; at = at.parent) {
+      const el = ts.isCallExpression(at.parent) ? elementOf(at.parent) : null;
+      if (el !== null && el.children.includes(at as TS.Expression)) out.push(el);
+    }
+    return out;
+  };
+  const propOf = (el: HyperscriptElement, name: string): TS.PropertyAssignment | undefined =>
+    el.props?.properties.find((p): p is TS.PropertyAssignment => ts.isPropertyAssignment(p) && propName(ts, p.name) === name);
+  const textOf = (el: HyperscriptElement): string =>
+    el.children.map((c) => (isString(c) ? c.text : ts.isCallExpression(c) && elementOf(c) !== null ? textOf(elementOf(c) as HyperscriptElement) : '')).join('');
+  const firstHeading = (el: HyperscriptElement): HyperscriptElement | undefined => {
+    let found: HyperscriptElement | undefined;
+    const look = (n: TS.Node): void => {
+      if (found !== undefined) return;
+      const inner = ts.isCallExpression(n) ? elementOf(n) : null;
+      if (inner !== null && /^h[1-6]$/.test(inner.tag)) found = inner;
+      else ts.forEachChild(n, look);
+    };
+    el.children.forEach(look);
+    return found;
+  };
+  const sectionNode = (el: HyperscriptElement): SectionNode => ({
+    tag: el.tag,
+    id: () => {
+      const init = propOf(el, 'id')?.initializer;
+      return init !== undefined && isString(init) ? init.text : undefined;
+    },
+    heading: () => {
+      const heading = firstHeading(el);
+      return heading === undefined ? undefined : textOf(heading);
+    },
+    headingTag: () => firstHeading(el)?.tag,
+  });
+  const push = (node: TS.StringLiteral | TS.NoSubstitutionTemplateLiteral, chain: HyperscriptElement[], attr?: string, tag = chain[0]?.tag): void => {
+    if (!qualifiesAsCopy(node.text)) return;
+    const pos = node.getStart(sf);
+    const place: Place = { file, line: sf.getLineAndCharacterOfPosition(pos).line + 1, ...(tag === undefined ? {} : { tag }), ...(attr === undefined ? {} : { attr }) };
+    const section = sectionWord(chain.map(sectionNode));
+    const proposedKey = baseName({ ...(page === undefined ? {} : { page }), ...(isHeadKind(place) ? {} : { section }), role: roleOf(place) }, opts.joiner);
+    literals.push({ file, pos, text: node.text, place, sectionWord: section, proposedKey });
+  };
+  // An HTML fragment's text runs, each at its place in the file; a template's substitutions are blanked.
+  const fragment = (expr: TS.Expression): void => {
+    if (!isString(expr) && !ts.isTemplateExpression(expr)) return;
+    const base = expr.getStart(sf) + 1;
+    let text = isString(expr) ? expr.text : sf.text.slice(base, expr.end - 1);
+    if (ts.isTemplateExpression(expr)) {
+      for (const span of expr.templateSpans) {
+        const from = span.expression.getFullStart() - 2 - base;
+        const to = span.literal.getStart(sf) + 1 - base;
+        text = text.slice(0, from) + text.slice(from, to).replace(/[^\n]/g, ' ') + text.slice(to);
+      }
+    }
+    for (const found of scanDialect(file, text, 'html')) possible.push({ file, pos: base + found.pos, text: collapseWhitespace(found.text) });
+  };
+
+  const visit = (node: TS.Node): void => {
+    const el = ts.isCallExpression(node) ? elementOf(node) : null;
+    if (el !== null) {
+      const chain = [el, ...enclosing(node)];
+      const sure = chain.some((e) => e.sure);
+      if (sure) {
+        for (const prop of el.props?.properties ?? []) {
+          const name = ts.isPropertyAssignment(prop) ? propName(ts, prop.name) : undefined;
+          if (name === undefined || !SCREEN_PROPS.has(name) || !isString((prop as TS.PropertyAssignment).initializer)) continue;
+          if (opts.attributes.some((a) => propOf(el, `${a}-${name}`) !== undefined)) continue;
+          push((prop as TS.PropertyAssignment).initializer as TS.StringLiteral, chain, name);
+        }
+      }
+      if (!opts.attributes.some((a) => propOf(el, a) !== undefined)) {
+        for (const child of el.children) {
+          if (!isString(child)) continue;
+          if (sure) push(child, chain);
+          else if (qualifiesAsCopy(child.text)) possible.push({ file, pos: child.getStart(sf), text: child.text });
+        }
+      }
+    }
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const [name, value] = node.arguments;
+      const method = node.expression.name.text;
+      if (method === 'setAttribute' && name !== undefined && value !== undefined && isString(name) && SCREEN_PROPS.has(name.text) && isString(value)) push(value, [], name.text);
+      if (method === 'insertAdjacentHTML' && value !== undefined) fragment(value);
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isPropertyAccessExpression(node.left)) {
+      const property = node.left.name.text;
+      if (property === 'innerHTML') fragment(node.right);
+      else if (Object.hasOwn(DOM_COPY, property) && isString(node.right)) {
+        // `document.title` is the page's title, every other `title` an element's tooltip.
+        const pageTitle = property === 'title' && node.left.expression.getText(sf) === 'document';
+        push(node.right, [], pageTitle ? undefined : DOM_COPY[property], pageTitle ? 'title' : undefined);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sf, visit);
+  return { literals, possible };
 }
 
 /**

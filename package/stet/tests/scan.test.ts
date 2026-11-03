@@ -2053,3 +2053,74 @@ describe('runScan — display strings in module data (D13)', () => {
     expect(entries).toEqual([expect.objectContaining({ context: 'data', text: 'Pick a key' })]);
   });
 });
+
+describe('runScan — hyperscript and plain-JS screens (D15)', () => {
+  /** Topshine's shape: a static-HTML host whose screens render through `h`, keys dotted, read through `TS.t` and marked with `data-copy`. */
+  const screenHost = (screen: string, config: Record<string, unknown> = {}) =>
+    makeHtmlHost({
+      files: { 'index.html': '<!doctype html>\n<html><head></head><body><script src="screens/waitlist.js"></script></body></html>\n', 'screens/waitlist.js': screen },
+      config: { managedSurfaces: ['screens/*.js'], keyStyle: 'dotted', reads: { functions: ['TS.t', 'TS.tx'], attribute: 'data-copy' }, ...config },
+    });
+  const unkeyed = (lines: string[]): string[] => lines.filter((l) => l.includes('unkeyed copy'));
+  const possible = (lines: string[]): string[] => lines.filter((l) => l.includes('possible copy'));
+
+  it('P6.1 proposes a hyperscript pill under its section, named by the one rule', async () => {
+    const host = await screenHost(
+      'var h = TS.h;\nTS.screen(function () {\n  return h("main", { class: "page" },\n    h("section", { id: "hero" },\n      h("span", { class: "badge outline wl-pill" }, "For ads, music videos and films")));\n});\n',
+    );
+    expect(await host.run('scan')).toBe(0);
+    expect(unkeyed(host.err)).toEqual(['warn: screens/waitlist.js:5:53 unkeyed copy "For ads, music videos and films" — propose key waitlist.hero.span']);
+  });
+
+  it('P6.1 reads, keyed elements and code are not copy; textContent is copy and innerHTML possible copy', async () => {
+    const host = await screenHost(
+      [
+        'var h = TS.h;',
+        'function form(k) {',
+        '  return h("form", { class: "card" },',
+        '    h("button", { key: "join", class: "btn accent", type: "submit", "data-copy": "waitlist.join" }, TS.tx("waitlist.join"), TS.icon("arrow")),',
+        '    h("label", { key: k[0] }, h("input", { type: "checkbox" }), TS.tx("waitlist.use." + k[0])));',
+        '}',
+        'function done(el, box) {',
+        '  el.textContent = "Copied";',
+        '  box.innerHTML = "<b>Done</b> now";',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    expect(await host.run('scan')).toBe(0);
+    expect(unkeyed(host.err)).toEqual(['warn: screens/waitlist.js:8:20 unkeyed copy "Copied" — propose key waitlist.page.text']);
+    expect(possible(host.err)).toEqual([expect.stringMatching(/^warn: screens\/waitlist\.js:9 possible copy ".*Done.*"$/)]);
+  });
+
+  it('P6.1 reads a component builder named in scan.builders, and leaves the call code without it', async () => {
+    const screen = 'var h = TS.h;\nexport var plans = h(Card, { title: "Plans" }, "Pick one");\n';
+    const listed = await screenHost(screen, { scan: { severity: 'warn', baseline: '.stet/scan-baseline.json', builders: ['h'] } });
+    expect(await listed.run('scan')).toBe(0);
+    expect(unkeyed(listed.err)).toEqual([
+      'warn: screens/waitlist.js:2:37 unkeyed copy "Plans" — propose key waitlist.page.card_title',
+      'warn: screens/waitlist.js:2:48 unkeyed copy "Pick one" — propose key waitlist.page.card',
+    ]);
+    const bare = await screenHost(screen);
+    expect(await bare.run('scan')).toBe(0);
+    expect(unkeyed(bare.err)).toEqual([]);
+  });
+
+  it('P6.3 a log("div", "x")-shaped call in no element proposes at most one possible copy line and never a key', async () => {
+    const host = await screenHost('log("div", "x");\nlog("div", "the draft was saved");\n');
+    expect(await host.run('scan')).toBe(0);
+    expect(unkeyed(host.err)).toEqual([]);
+    expect(possible(host.err).length).toBeLessThanOrEqual(1);
+  });
+
+  it('proposes no key for an element already marked with the configured attribute (C3 validation V15)', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<!doctype html>\n<html lang="en"><head></head><body>\n<p data-copy="home.lead">A paragraph of copy here.</p>\n</body></html>\n' },
+      config: { reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+      keys: { 'home.lead': { shape: 'text', target: 'web' } },
+      defaults: { 'home.lead': 'A paragraph of copy here.' },
+    });
+    expect(await host.run('scan')).toBe(0);
+    expect(host.stderr()).not.toContain('A paragraph of copy here.');
+  });
+});
