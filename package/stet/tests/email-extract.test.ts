@@ -893,7 +893,7 @@ describe('extract --apply — the batch', () => {
     await run(host, [...WALK, '--apply']);
 
     const report = new Report();
-    check(loadConfig(host.dir), host.dir, report);
+    await check(loadConfig(host.dir), host.dir, report);
     // The seeded `{{name}}` is declared in its key's `vars`, so the variable
     // whitelist passes it; currency and the generated files agree too.
     expect(report.findings.filter((f) => f.level === 'error')).toEqual([]);

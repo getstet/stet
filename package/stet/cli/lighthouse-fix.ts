@@ -47,7 +47,7 @@ function leadingIndent(source: string, offset: number): string | null {
 /** The head edits one html document needs, or the reason it takes none. */
 export function planDocumentFix(
   document: Document,
-  context: { language?: string; page: string | null; keys: ReadonlySet<string> },
+  context: { language?: string; page: string | null; keys: ReadonlySet<string>; joiner?: '_' | '.' },
 ): DocumentFix | { skip: string } {
   const { file, source } = document;
   const htmls = document.roots.filter((el) => el.tag === 'html');
@@ -87,12 +87,12 @@ export function planDocumentFix(
   }
   const tags: string[] = [];
   if (context.page !== null && !head.children.some((el) => el.tag === 'title')) {
-    const key = numberNames([`${context.page}_page_title`], (n) => context.keys.has(n))[0] as string;
+    const key = numberNames([`${context.page}${context.joiner ?? '_'}page_title`], (n) => context.keys.has(n))[0] as string;
     tags.push(`<title data-stet="${key}"></title>`);
     mints.push({ key, role: 'page_title' });
   }
   if (context.page !== null && !head.children.some((el) => metaNamed(el, 'description'))) {
-    const key = numberNames([`${context.page}_meta_description`], (n) => context.keys.has(n))[0] as string;
+    const key = numberNames([`${context.page}${context.joiner ?? '_'}meta_description`], (n) => context.keys.has(n))[0] as string;
     tags.push(`<meta name="description" content="" data-stet-content="${key}">`);
     mints.push({ key, role: 'meta_description' });
   }

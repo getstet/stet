@@ -1735,7 +1735,7 @@ describe('POST /api/site/save', () => {
     expect(again.body['written']).toEqual([]);
 
     const report = new Report();
-    check(loadConfig(host.cwd), host.cwd, report);
+    await check(loadConfig(host.cwd), host.cwd, report);
     expect(report.findings.filter((f) => f.level === 'error')).toEqual([]);
   });
 
@@ -4477,7 +4477,7 @@ describe('one site’s requests never interleave', () => {
     expect(JSON.parse(host.file('content/defaults.json')).default.hero_headline).toBe('Second');
 
     const report = new Report();
-    check(loadConfig(host.cwd), host.cwd, report);
+    await check(loadConfig(host.cwd), host.cwd, report);
     expect(report.findings.filter((f) => f.level === 'error')).toEqual([]);
   });
 });
@@ -14436,6 +14436,61 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     const body = await routeReadsOf(handlerOver([host.cwd]).handler, host);
     expect(body.keys).toEqual(PLAIN_KEYS.slice().sort());
     expect(body.complete).toBe(false);
+  });
+
+  it('V5 an inline script is read beside the marks, and one that loads scripts leaves the route incomplete', async () => {
+    const inline = await plainHost({
+      'index.html': plainPage('  <h1 data-stet="home.title">Text of home.title</h1>\n  <script>TS.t("waitlist.title");</script>'),
+    });
+    const read = await routeReadsOf(handlerOver([inline.cwd]).handler, inline);
+    expect(read.keys).toEqual(['home.title', 'waitlist.title']);
+
+    const marked = PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n');
+    const loader = await plainHost({
+      'index.html': plainPage(`${marked}\n  <script>var s = document.createElement("script"); s.src = "x.js"; document.head.appendChild(s);</script>`),
+    });
+    expect((await routeReadsOf(handlerOver([loader.cwd]).handler, loader)).complete).toBe(false);
+    const quiet = await plainHost({ 'index.html': plainPage(`${marked}\n  <script>console.log("hi");</script>`) });
+    expect((await routeReadsOf(handlerOver([quiet.cwd]).handler, quiet)).complete).toBe(true);
+  });
+
+  it('V6 a followed script that imports lazily leaves the route incomplete', async () => {
+    const marked = PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n');
+    for (const lazy of ['import("./x.js");', 'require("./x.js");']) {
+      const host = await plainHost({ 'index.html': plainPage(`${marked}\n  <script src="s.js"></script>`), 's.js': `${lazy}\n`, 'x.js': 'TS.t("waitlist.title");\n' });
+      expect((await routeReadsOf(handlerOver([host.cwd]).handler, host)).complete, lazy).toBe(false);
+    }
+  });
+
+  it('V7 a script written as a string, or an element or attribute created by a computed name, leaves the route incomplete', async () => {
+    const marked = PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n');
+    const loaders = [
+      'document.write("<script src=a.js></script>");',
+      'document.body.innerHTML += "<SCRIPT src=a.js></SCRIPT>";',
+      'var el = document.createElement(tag);',
+      'el.setAttribute(attr, value);',
+      'fetch(u).then(eval);',
+      'var f = new Function("return 1");',
+    ];
+    for (const loader of loaders) {
+      const host = await plainHost({ 'index.html': plainPage(`${marked}\n  <script src="s.js"></script>`), 's.js': `${loader}\n` });
+      expect((await routeReadsOf(handlerOver([host.cwd]).handler, host)).complete, loader).toBe(false);
+    }
+    const plain = await plainHost({ 'index.html': plainPage(`${marked}\n  <script src="s.js"></script>`), 's.js': 'var el = document.createElement("div"); el.setAttribute("class", "x");\n' });
+    expect((await routeReadsOf(handlerOver([plain.cwd]).handler, plain)).complete).toBe(true);
+  });
+
+  it('V13 a copy table and a generated file loaded by <script src> do not make a fully marked page incomplete', async () => {
+    const marked = PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n');
+    const host = await plainHost(
+      {
+        'index.html': plainPage(`${marked}\n  <script src="data/copy.js"></script>\n  <script src="gen/strings.js"></script>`),
+        'data/copy.js': 'window.TS = window.TS || {};\nTS.copyTable = { "home.title": ["Make it", "approved"] };\n',
+        'gen/strings.js': 'window.TS_STRINGS = {};\n',
+      },
+      { reads: { functions: ['TS.t'] }, copyModules: ['data/copy.js'], generated: [{ file: 'gen/strings.js', format: 'script', name: 'TS_STRINGS', values: 'value' }] },
+    );
+    expect((await routeReadsOf(handlerOver([host.cwd]).handler, host)).complete).toBe(true);
   });
 
   it('an alias that resolves nowhere makes the route incomplete', async () => {

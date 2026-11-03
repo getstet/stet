@@ -1354,7 +1354,7 @@ describe('eject — the static-HTML host', () => {
     const host = await adopted();
     const before = Buffer.from(host.file('index.html'), 'utf8');
     expect(await host.run('eject')).toBe(0);
-    expect(host.stdout()).toContain('document: index.html — every mark removed, the text stays');
+    expect(host.stdout()).toContain('document: index.html — every data-stet mark removed, the text stays');
     expect(host.stdout()).toContain(
       'stays (no stet imports): stet.config.json, content/descriptor.json, content/defaults.json',
     );

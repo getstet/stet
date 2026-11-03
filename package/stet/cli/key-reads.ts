@@ -35,7 +35,7 @@ import { escapeRegExp } from '../src/seo.js';
 import { normalizeNoExt, pathAliasMappings, resolveSpecifier, type ReadFunction } from './config.js';
 import { lineIndex } from './html-host.js';
 import { dialectCode, openTag, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
-import { parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
+import { occurrenceIsKey, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 
 /**
  * A read of a key: `copy.get('<key>')`, `copy('<key>')` or `get('<key>')`, and
@@ -50,16 +50,9 @@ import { parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 export const KEY_READ =
   /\bcopy(?:Map)?\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1|\b(?:copy|get)\s*\(\s*(['"`])([^'"`\n]+)\3|\bcopy(?:Map)?\s*\??\.\s*([A-Za-z_$][\w$]*)|\bcopy(?:Map)?\s*\[\s*(['"`])([^'"`\n]+)\6\s*\]/g;
 
-/** A key as a whole-word regex, its dots literal: `home.title` never matches `home_title`; a dotted key inside a longer declared one is `longerKeyAt`'s to skip. */
+/** A key as a whole-word regex, its dots literal: `home.title` never matches `home_title`; a key that is the tail or head of a longer declared one is `occurrenceIsKey`'s to skip. */
 export function keyPattern(key: string, flags = ''): RegExp {
   return new RegExp(`(?<![\\w$])${key.replace(/[.$]/g, '\\$&')}(?![\\w$])`, flags);
-}
-
-/** Where a dotted run longer than `key` starts at `at` and is itself a declared key — `waitlist.title` inside `waitlist.title.more` — that key; else null. */
-export function longerKeyAt(source: string, at: number, key: string, declared: ReadonlySet<string> | undefined): string | null {
-  if (declared === undefined) return null;
-  const run = /^[\w$]+(?:\.[\w$]+)*/.exec(source.slice(at))?.[0];
-  return run !== undefined && run !== key && declared.has(run) ? run : null;
 }
 
 export { dialectCode, within, type Span } from './markup.js';
@@ -417,7 +410,8 @@ export function planReadRenames(input: {
 
   // The parse check: every brace expression the walk read in a file holding a
   // leaving key parses as one expression, or the file's sorting is refused.
-  const held = [...renames.keys()].find((key) => keyPattern(key).test(source));
+  const holds = (key: string): boolean => [...source.matchAll(keyPattern(key, 'g'))].some((m) => occurrenceIsKey(source, m.index, key, declared));
+  const held = dialect === null ? undefined : [...renames.keys()].find(holds);
   if (held !== undefined && dialect !== null) {
     for (const brace of braces) {
       if (parsesAsExpression(ts, dialect, source.slice(brace.start, brace.end))) continue;
@@ -430,7 +424,7 @@ export function planReadRenames(input: {
     const pattern = keyPattern(key, 'g');
     for (const m of source.matchAll(pattern)) {
       const at = m.index;
-      if (longerKeyAt(source, at, key, declared) !== null) continue;
+      if (!occurrenceIsKey(source, at, key, declared)) continue;
       const line = lineOf(at);
       const occ: Occurrence = { file, line, at, key, text: lineText(at).trim() };
       if (!within(code, at) || within(nonCode, at)) {

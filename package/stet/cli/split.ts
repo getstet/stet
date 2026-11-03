@@ -63,7 +63,8 @@ export async function runSplit(args: string[], io: CliIo): Promise<number> {
     return report.emit(io);
   }
   const where = `${at.file}:${at.line}`;
-  const what = isHtmlHost(config) ? 'mark' : 'read';
+  // A mark is the one place with no line of source text; a configured read in a script is a read.
+  const what = plan.host.rewritten.some((occ) => occ.text === '') ? 'mark' : 'read';
   report.line(`${where} the ${what} is renamed; the value ${JSON.stringify(plan.text)} is copied`);
   for (const place of plan.keeps) report.line(`${place.file}:${place.line} keeps ${key}`);
   if (!flag(values, 'write')) {

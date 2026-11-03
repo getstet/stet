@@ -39,6 +39,7 @@ import { proposeHtml, stripMarks } from './html-host.js';
 import type { CliIo } from './main.js';
 import { clip, CliError, Report, UsageError } from './report.js';
 import { filesForGlobs } from './files.js';
+import { usageFiles } from './key-usage.js';
 import { mentionsToken } from './source-scan.js';
 import { loadStatus } from './status.js';
 import { isStoreBacked } from './store.js';
@@ -401,7 +402,10 @@ function surfaceSources(cwd: string, config: StetConfig): { file: string; source
   const globs = [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules];
   const found: { file: string; source: string }[] = [];
   const html = isHtmlHost(config);
-  for (const file of filesForGlobs(cwd, globs)) {
+  // On an html host that names its read functions, the scripts it reads copy in are surfaces too.
+  const files = new Set(filesForGlobs(cwd, globs));
+  if (html && config.reads !== undefined) for (const file of usageFiles(cwd, config)) files.add(file);
+  for (const file of files) {
     try {
       const text = readFileSync(join(cwd, file), 'utf8');
       // On this host a document's marks are the very thing the batch strips, so

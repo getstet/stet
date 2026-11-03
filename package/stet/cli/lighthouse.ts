@@ -763,7 +763,7 @@ async function planFixes(
       if (target.file === undefined || plans.some((plan) => 'file' in plan && plan.file === target.file)) continue;
       const document = readDocument(target.file, readFileSync(join(cwd, target.file), 'utf8'));
       const page = pageOfFile(cwd, target.file, descriptor.pages, { html: true }) ?? null;
-      const plan = planDocumentFix(document, { ...(config.language === undefined ? {} : { language: config.language }), page, keys });
+      const plan = planDocumentFix(document, { ...(config.language === undefined ? {} : { language: config.language }), page, keys, joiner: keyJoiner(config) });
       // A key minted for one document is taken for the next.
       if (!('skip' in plan)) for (const mint of plan.mints) keys.add(mint.key);
       plans.push(plan);

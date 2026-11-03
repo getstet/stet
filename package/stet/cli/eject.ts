@@ -46,6 +46,7 @@ import {
   CONFIG_FILE,
   HOST_MIGRATIONS,
   isHtmlHost,
+  markAttributes,
   normalizeNoExt,
   pathAliasMappings,
   resolveSpecifier,
@@ -668,7 +669,9 @@ function importSpecifiers(text: string): string[] {
  * There is nothing to un-rewrite, unwrap or delete: the marks ARE the whole
  * install. So each document is regenerated from the resolved snapshot — so the
  * text left behind is the committed truth rather than whatever the page last
- * held — and then every mark is stripped with its text kept. The guidance, hook
+ * held — baking every mark the project reads, a `reads.attribute` mark included —
+ * and then every `data-stet` mark is stripped with its text kept; the project's
+ * own attribute is the site's runtime and stays. The guidance, hook
  * and dependency stages run exactly as on every host.
  *
  * A document it cannot regenerate refuses the run WHOLE: under `--write` before
@@ -689,7 +692,7 @@ function ejectHtml(d: {
 }): number {
   const { io, config, descriptor, merged, write, report } = d;
   const files = filesForGlobs(io.cwd, config.managedSurfaces).filter((f) => f.endsWith('.html'));
-  const { writes, skips } = planDocuments(io.cwd, files, descriptor, merged, report);
+  const { writes, skips } = planDocuments(io.cwd, files, descriptor, merged, report, markAttributes(config));
   const first = skips[0];
   const refusal =
     first === undefined
@@ -705,7 +708,7 @@ function ejectHtml(d: {
   for (const file of files) {
     const current = readFileSync(join(io.cwd, file), 'utf8');
     stripped.set(file, stripMarks(rebuilt.get(file) ?? current));
-    report.line(`document: ${file} — every mark removed, the text stays`);
+    report.line(`document: ${file} — every data-stet mark removed, the text stays`);
   }
 
   const keys = Object.keys(merged[config.locales.default] ?? {}).length;

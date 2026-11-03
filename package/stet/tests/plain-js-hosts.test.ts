@@ -12,9 +12,11 @@ import { check } from '../cli/check.js';
 import { keyUsage, namedKeys, usageCache } from '../cli/key-usage.js';
 import { planProblems } from '../cli/key-plan.js';
 import { baseName } from '../cli/key-names.js';
-import { keyPattern, longerKeyAt } from '../cli/key-reads.js';
+import { keyPattern } from '../cli/key-reads.js';
 import { Report } from '../cli/report.js';
-import { loadTypescript, mentionsToken } from '../cli/source-scan.js';
+import { planDocumentFix } from '../cli/lighthouse-fix.js';
+import { readDocument } from '../cli/html-host.js';
+import { loadTypescript, mentionsToken, occurrenceIsKey } from '../cli/source-scan.js';
 import { approveKeys, completeStatus, loadStatus, renameStatus, resetChanged, statusPlan, type StatusFile } from '../cli/status.js';
 import { generateRegistry } from '../src/codegen.js';
 import { deriveLabel, loadDescriptor } from '../src/descriptor.js';
@@ -97,8 +99,8 @@ describe('add-plain-js-hosts (0.9.0) C1', () => {
     const declared = new Set(['waitlist.title', 'waitlist.title.more']);
     const hits = [...src.matchAll(keyPattern('waitlist.title', 'g'))].map((m) => m.index);
     expect(hits).toHaveLength(2);
-    expect(longerKeyAt(src, hits[0] as number, 'waitlist.title', declared)).toBe('waitlist.title.more');
-    expect(longerKeyAt(src, hits[1] as number, 'waitlist.title', declared)).toBeNull();
+    expect(occurrenceIsKey(src, hits[0] as number, 'waitlist.title', declared)).toBe(false);
+    expect(occurrenceIsKey(src, hits[1] as number, 'waitlist.title', declared)).toBe(true);
     expect(mentionsToken('TS.t("waitlist.foot.more")', 'waitlist.foot', new Set(['waitlist.foot', 'waitlist.foot.more']))).toBe(false);
     expect(mentionsToken('TS.t("waitlist.foot")', 'waitlist.foot', new Set(['waitlist.foot', 'waitlist.foot.more']))).toBe(true);
   });
@@ -470,5 +472,161 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
     expect(after).toMatch(/<p data-stet="[a-z0-9_.]+">A new paragraph the register run adopts\.<\/p>/);
     expect(after).not.toMatch(/data-copy="(?!a\.b")/);
     expect(await html.run('check')).toBe(0);
+  });
+
+  // fix round B: the spellings of a read, handlers as code, globals, the commands that move keys.
+  const PAGE = (inner: string): string => `<!DOCTYPE html>\n<html lang="en">\n<head><title>Join</title></head>\n<body>\n${inner}\n</body>\n</html>\n`;
+
+  it('V1 a configured read is seen however it is spelled; any other reference to the function is a cause', async () => {
+    // A spelling of the call is followed to its prefix; a reference that is not a call is a cause, which opens every unnamed key.
+    const forms: Record<string, { cause: boolean; form: (arg: string) => string }> = {
+      window_prefixed: { cause: false, form: (a) => `window.TS.tx(${a});` },
+      optional_chain: { cause: false, form: (a) => `TS?.tx(${a});` },
+      element_access: { cause: false, form: (a) => `TS["tx"](${a});` },
+      paren_callee: { cause: false, form: (a) => `(TS.tx)(${a});` },
+      alias_var: { cause: true, form: (a) => `var t = TS.tx; t(${a});` },
+      alias_destructure: { cause: true, form: (a) => `var { tx } = TS; tx(${a});` },
+      call_method: { cause: true, form: (a) => `TS.tx.call(TS, ${a});` },
+      bind_method: { cause: true, form: (a) => `TS.tx.bind(TS)(${a});` },
+      as_value_map: { cause: true, form: (a) => `items.map(TS.tx); void ${a};` },
+      alias_head: { cause: true, form: (a) => `var T = TS; T.tx(${a});` },
+    };
+    for (const [name, { cause, form }] of Object.entries(forms)) {
+      const dir = host({ 'screen.js': `var TS = window.TS;\nvar k = pick();\n${form('"waitlist.use." + k')}\n${form('"home.title"')}\n` }, { reads: { functions: ['TS.t', 'TS.tx'] } });
+      const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+      expect(usage.keys['waitlist.use.ads']?.state, `${name} waitlist.use.ads`).toBe('unknown');
+      expect(usage.keys['privacy.body']?.state, `${name} privacy.body`).toBe(cause ? 'unknown' : 'not_found');
+      expect(usage.keys['home.title']?.state, `${name} literal`).toBe('read');
+    }
+    // The line that binds the name to the head object is no alias of it.
+    const plain = host({ 'screen.js': 'var TS = window.TS;\nTS.tx("home.title");\n' }, { reads: { functions: ['TS.tx'] } });
+    expect((await keyUsage(plain, loadConfig(plain), descriptorOf())).keys['privacy.body']?.state).toBe('not_found');
+  });
+
+  it('V2 an inline handler and a javascript: URL are code: read by the scan, rewritten by rename', async () => {
+    const reads = { functions: ['TS.tx'] };
+    const handler = host({ 'index.html': PAGE('  <button onclick="TS.tx(\'home.title\')">Go</button>') }, { reads });
+    expect((await keyUsage(handler, loadConfig(handler), descriptorOf())).keys['home.title']?.state).toBe('read');
+    const href = host({ 'index.html': PAGE('  <a href="javascript:TS.tx(\'waitlist.title\')">Go</a>') }, { reads });
+    expect((await keyUsage(href, loadConfig(href), descriptorOf())).keys['waitlist.title']?.state).toBe('read');
+    const computed = host({ 'index.html': PAGE('  <button onclick="TS.tx(pick())">Go</button>') }, { reads });
+    const usage = await keyUsage(computed, loadConfig(computed), descriptorOf());
+    expect(usage.causes.map((c) => c.file)).toEqual(['index.html']);
+    expect(usage.keys['privacy.body']?.state).toBe('unknown');
+    const prose = host({ 'index.html': PAGE('  <p title="TS.tx(\'home.title\')" class="onclick">Go</p>') }, { reads });
+    expect((await keyUsage(prose, loadConfig(prose), descriptorOf())).keys['home.title']?.state).toBe('not_found');
+
+    const page = PAGE('  <p data-stet="c.d">Text of c.d</p>\n  <button onclick="TS.tx(\'a.b\')">Go</button>\n  <a href="javascript:TS.tx(\'a.b\')">Link</a>');
+    const html = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: { 'a.b': { shape: 'text', target: 'web' }, 'c.d': { shape: 'text', target: 'web' } },
+      defaults: { 'a.b': 'Text of a.b', 'c.d': 'Text of c.d' },
+      config: { reads },
+    });
+    expect(await html.run('rename', 'a.b', 'a.z', '--write')).toBe(0);
+    expect(html.file('index.html')).toContain('<button onclick="TS.tx(\'a.z\')">Go</button>');
+    expect(html.file('index.html')).toContain('<a href="javascript:TS.tx(\'a.z\')">Link</a>');
+    expect(html.stdout()).not.toContain('left as it is');
+  });
+
+  it('V3 a var that is declared twice, assigned by a pattern, or assigned from another script is not once-assigned', async () => {
+    const reads = { functions: ['TS.tx'] };
+    const dead = async (files: Record<string, string>): Promise<string | undefined> => {
+      const dir = host(files, { reads });
+      return (await keyUsage(dir, loadConfig(dir), descriptorOf())).keys['privacy.body']?.state;
+    };
+    // The control: once assigned, the key is placed and nothing stands.
+    expect(await dead({ 's.js': 'var KEY = "waitlist.title";\nTS.tx(KEY);\n' })).toBe('not_found');
+    expect(await dead({ 's.js': 'var KEY = "waitlist.title";\nvar KEY = pick();\nTS.tx(KEY);\n' })).toBe('unknown');
+    expect(await dead({ 's.js': 'var KEY = "waitlist.title";\n({ KEY } = o);\nTS.tx(KEY);\n' })).toBe('unknown');
+    expect(await dead({ 's.js': 'var KEY = "waitlist.title";\n[KEY] = a;\nTS.tx(KEY);\n' })).toBe('unknown');
+    expect(await dead({ 's.js': 'var KEY = "waitlist.title";\nTS.tx(KEY);\n', 'other.js': 'KEY = pick();\n' })).toBe('unknown');
+    expect(await dead({ 's.js': 'var KEY = "waitlist.title";\nTS.tx(KEY);\n', 'other.js': 'var KEY = pick();\n' })).toBe('unknown');
+  });
+
+  it('V4 remove on an html host with reads names a screen that still reads the key', async () => {
+    const html = await makeHtmlHost({
+      files: { 'screen.js': 'var TS = window.TS;\nTS.tx("a.x");\n' },
+      keys: { 'a.x': { shape: 'text', target: 'web' }, 'c.d': { shape: 'text', target: 'web' } },
+      defaults: { 'a.x': 'Text of a.x', 'c.d': 'Text of c.d' },
+      config: { reads: { functions: ['TS.tx'] } },
+    });
+    expect(await html.run('remove', 'a.x')).toBe(0);
+    expect(html.stdout()).toContain('screen.js mentions "a.x"');
+  });
+
+  it('V8 eject on a project with reads.attribute bakes the snapshot into data-copy elements and strips data-stet only', async () => {
+    const page = PAGE('  <b data-copy="a.b">Old words</b>\n  <i data-stet="c.d">Old c</i>');
+    const html = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: { 'a.b': { shape: 'text', target: 'web' }, 'c.d': { shape: 'text', target: 'web' } },
+      defaults: { 'a.b': 'New words', 'c.d': 'New c' },
+      config: { reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+    });
+    expect(await html.run('eject', '--write')).toBe(0);
+    expect(html.file('index.html')).toContain('<b data-copy="a.b">New words</b>');
+    expect(html.file('index.html')).toContain('<i>New c</i>');
+    expect(html.stdout()).toContain('document: index.html — every data-stet mark removed, the text stays');
+  });
+
+  it('V10 a copy module stays in the usage file list on a project that sets neither reads nor generated', async () => {
+    const table = 'window.TS = window.TS || {};\nTS.copyTable = {\n  "waitlist.title": ["Join", "new"]\n};\n';
+    const dir = host({ 'data/copy.js': table }, { copyModules: ['data/copy.js'] });
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    expect(usage.keys['waitlist.title']?.state).toBe('read');
+    expect(usage.files).toBe(1);
+  });
+
+  it('V11 a var that a function assigns later is a cause, not a placed key', async () => {
+    const dir = host({ 's.js': 'var k = "waitlist.title";\nfunction set() { k = pick(); }\nTS.tx(k);\n' }, { reads: { functions: ['TS.tx'] } });
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    expect(usage.causes.map((c) => c.text)).toEqual(['TS.tx(k)']);
+    expect(usage.keys['privacy.body']?.state).toBe('unknown');
+  });
+
+  it('V14 split names a read, not a mark, where the place is a configured read in a script', async () => {
+    const html = await makeHtmlHost({
+      files: { 'index.html': PAGE('  <p data-stet="a.b">Text of a.b</p>'), 'screen.js': 'var TS = window.TS;\nvar x = 1;\nTS.tx("a.b");\n' },
+      keys: { 'a.b': { shape: 'text', target: 'web' } },
+      defaults: { 'a.b': 'Text of a.b' },
+      config: { reads: { functions: ['TS.tx'] } },
+    });
+    expect(await html.run('split', 'a.b', 'a.c', '--at', 'screen.js:3')).toBe(0);
+    expect(html.stdout()).toContain('screen.js:3 the read is renamed;');
+    html.out.length = 0;
+    expect(await html.run('split', 'a.b', 'a.c', '--at', 'index.html:5')).toBe(0);
+    expect(html.stdout()).toContain('index.html:5 the mark is renamed;');
+  });
+
+  it('C1-2 a dotted key\'s tail is not the flat key it ends in: rename and remove leave the dotted read alone', async () => {
+    const keys = ['title', 'home.title'];
+    const make = (files: Record<string, string>) =>
+      makeHtmlHost({
+        files,
+        keys: Object.fromEntries(keys.map((k) => [k, { shape: 'text', target: 'web' }])),
+        defaults: Object.fromEntries(keys.map((k) => [k, `Text of ${k}`])),
+        config: { reads: { functions: ['TS.tx'] } },
+      });
+    const src = 'var TS = window.TS;\nTS.tx("title");\nTS.tx("home.title");\n';
+    const both = await make({ 'screen.js': src });
+    expect(await both.run('rename', 'title', 'heading', '--write')).toBe(0);
+    expect(both.file('screen.js')).toBe('var TS = window.TS;\nTS.tx("heading");\nTS.tx("home.title");\n');
+
+    const only = await make({ 'index.html': '<!DOCTYPE html>\n<html lang="en">\n<body>\n  <script>TS.tx("home.title");</script>\n</body>\n</html>\n' });
+    expect(await only.run('remove', 'title')).toBe(0);
+    expect(only.stdout()).not.toContain('mentions "title"');
+
+    const declared = new Set(keys);
+    expect(occurrenceIsKey(src, src.indexOf('home.title') + 5, 'title', declared)).toBe(false);
+    expect(occurrenceIsKey(src, src.indexOf('"title"') + 1, 'title', declared)).toBe(true);
+    expect(mentionsToken('TS.tx("home.title")', 'title', declared)).toBe(false);
+  });
+
+  it('Q44 the head edits mint the page keys under the project\'s joiner', () => {
+    const doc = readDocument('index.html', '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n</head>\n<body></body>\n</html>\n');
+    const fix = planDocumentFix(doc, { page: 'home', keys: new Set(), joiner: '.' });
+    expect('skip' in fix ? [] : fix.mints.map((m) => m.key)).toEqual(['home.page_title', 'home.meta_description']);
+    const plain = planDocumentFix(doc, { page: 'home', keys: new Set() });
+    expect('skip' in plain ? [] : plain.mints.map((m) => m.key)).toEqual(['home_page_title', 'home_meta_description']);
   });
 });
