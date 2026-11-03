@@ -251,11 +251,25 @@ headline reaches the share card. Any JavaScript host reads through
 `@getstet/stet/core`. Non-JS services read the committed bundle directly — a
 stdlib-only Python helper ships in the package.
 
+A plain JavaScript site with its own copy table is a host too: name the functions it reads copy through and the attribute its elements carry a key in, import the table, and stet generates the table back from the committed snapshot, placeholders in the site's own spelling.
+[docs/plain-js-sites.md](https://github.com/getstet/stet/blob/main/package/docs/plain-js-sites.md)
+covers the config, the import, the generated outputs and the second checkout.
+
+## Keys and approval
+
+A key name is lowercase letters and digits in parts joined by a dot or an underscore: home.title, waitlist.use.music_videos, hero_headline.
+
+A key is proposed until someone approves it, in the dashboard or with stet approve; a changed value is proposed again.
+
+A second checkout that only reads the copy keeps a four-line stet.config.json with copyFrom, and stet check there says when its generated strings file is behind.
+
 ## Requirements
 
 Node.js 22 or later; `stet audit lighthouse` needs 22.19 or later, Google Chrome, and three dev dependencies a plain install leaves out:
 `npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. stet installs its own copy of TypeScript 5 (about 24 MB) for
 scanning, adoption, key badges and the preview's page checks, so it works with whatever TypeScript the project has, or none.
+
+Upgrading from 0.8.1: key names may carry dots; nothing changes for a project without them.
 
 Upgrading from 0.8.0: a project that installed typescript only for stet can remove it.
 
