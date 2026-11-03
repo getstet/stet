@@ -11,8 +11,9 @@
 //
 // Messages from the dashboard: hello, locate, clear, census, reads (the keys a
 // file of the open page reads, so the census matches only those, with
-// `renders`, where the source writes each key into an element's text, and
-// `coincident`, the keys whose words a file of the page also writes as text),
+// `renders`, where the source writes each key into an element's text,
+// `coincident`, the keys whose words a file of the page also writes as text,
+// and `attributes`, the attributes a mark is read on),
 // layer, mode, edit, end. Messages to it: ready, located, census, hover, pick,
 // unmanaged, deselect (a click on no key's copy), out (the pointer left the
 // frame), rect, typed, edited, key, moved, bye.
@@ -58,6 +59,20 @@
       if (c.nodeType === 3) out += read ? read(c) : c.data;
       else if (c.nodeType === 1 && c.tagName === 'BR') out += '\n';
       else if (c.nodeType === 1) out += textWithBreaks(c, read);
+    }
+    return out;
+  }
+
+  /**
+   * A node's text with one space on each side of every element child's text, each
+   * text node read by `read` where given, so a value the page splits across sibling
+   * elements and trims reads whole: `<span>One.</span><span>Two.</span>` → `One. Two.` (D16.2).
+   */
+  function spaced(node, read) {
+    var out = '';
+    for (var c = node.firstChild; c; c = c.nextSibling) {
+      if (c.nodeType === 3) out += read ? read(c) : c.data;
+      else if (c.nodeType === 1 && !SKIP[c.tagName]) out += ' ' + spaced(c, read) + ' ';
     }
     return out;
   }
@@ -276,10 +291,15 @@
     var all = document.querySelectorAll('*');
     for (var i = 0; i < all.length; i += 1) {
       var el = all[i];
-      if (el.getAttribute('data-stet') === key) found.push({ el: el, attr: null });
+      if (markAttrs.some(function (name) { return el.getAttribute(name) === key; })) found.push({ el: el, attr: null });
+      var named = [];
       for (var j = 0; j < el.attributes.length; j += 1) {
         var a = el.attributes[j];
-        if (a.name.indexOf('data-stet-') === 0 && a.value === key) found.push({ el: el, attr: a.name.slice('data-stet-'.length) });
+        var on = a.value === key ? markOf(a.name) : undefined;
+        if (typeof on === 'string' && named.indexOf(on) === -1) {
+          named.push(on);
+          found.push({ el: el, attr: on });
+        }
       }
     }
     return found;
@@ -321,6 +341,7 @@
       var el = all[i];
       if (SKIP[el.tagName]) continue;
       var index = which(el.textContent);
+      if (index === -1 && el.firstElementChild !== null) index = which(spaced(el));
       if (index === -1 || found.some(function (f) { return el.contains(f.el); })) continue;
       found.push({ el: el, attr: null, index: index });
     }
@@ -631,8 +652,26 @@
   function isLN(ch) { return ch !== undefined && /[\p{L}\p{N}]/u.test(ch); }
   // A text this short, or with no letter or digit, claims any lone `·` or `.` the page writes.
   function weakText(text) { return text.length < 3 || !/[\p{L}\p{N}]/u.test(text); }
-  // The elements a static-HTML host's marks sit on: the text mark and each attribute a mark may name.
-  var MARKED = '[data-stet],[data-stet-alt],[data-stet-aria-label],[data-stet-title],[data-stet-placeholder],[data-stet-content]';
+  // The attributes a mark is read on: the config's own key attribute beside `data-stet` (Q21), as the
+  // dashboard's reads message names them, and the attributes a mark may name with a suffix.
+  var markAttrs = ['data-stet'];
+  var MARK_SUFFIXES = ['alt', 'aria-label', 'title', 'placeholder', 'content'];
+  /** The elements marks sit on, as a selector: each mark attribute on the text, and with each suffix. */
+  function markedSelector(attrs) {
+    return attrs.map(function (name) {
+      return ['[' + name + ']'].concat(MARK_SUFFIXES.map(function (suffix) { return '[' + name + '-' + suffix + ']'; })).join(',');
+    }).join(',');
+  }
+  var MARKED = markedSelector(markAttrs);
+  /** What an attribute named `name` marks: null for the element's text, the attribute a suffix names, or undefined where it is no mark. */
+  function markOf(name) {
+    for (var i = 0; i < markAttrs.length; i += 1) {
+      var a = markAttrs[i];
+      if (name === a) return null;
+      if (name.indexOf(a + '-') === 0 && MARK_SUFFIXES.indexOf(name.slice(a.length + 1)) !== -1) return name.slice(a.length + 1);
+    }
+    return undefined;
+  }
   var HEAD_METAS = [
     ['description', 'meta[name="description"]'],
     ['og:title', 'meta[property="og:title"],meta[name="og:title"]'],
@@ -666,6 +705,7 @@
     var loose = [];
     var declared = new Set();
     var lines = new Map(); // a line of a value written over several lines → true, so the walk notes where it stands
+    var squeezed = new Set(); // each one-line whole text with its spaces taken out: an element whose runs read so is read again spaced (D16.2)
     var multi = [];        // [{ key, entry, lines }]: each such value, its non-empty lines normalized
     keys.forEach(function (k) {
       // Every key stays declared, so a mark always names it; only the keys the page reads are matched by text.
@@ -694,6 +734,8 @@
             }
             return;
           }
+          // A value written over several lines is matched line by line, never across an element's runs.
+          if (split.length <= 1) squeezed.add(plain.replace(/ /g, ''));
           var list = whole.get(plain);
           if (list === undefined) whole.set(plain, (list = []));
           if (!list.some(function (h) { return h.key === k.key && h.entry === entry; })) list.push({ key: k.key, entry: entry });
@@ -744,7 +786,7 @@
       return bucket === undefined ? loose : loose.concat(bucket);
     }
 
-    return { whole: whole, patternsFor: patternsFor, containedIn: containedIn, declared: declared, lines: lines, multi: multi };
+    return { whole: whole, patternsFor: patternsFor, containedIn: containedIn, declared: declared, lines: lines, multi: multi, squeezed: squeezed };
   }
 
   /** The reads that apply to the page the frame shows: the dashboard's, for this path; else none. */
@@ -890,10 +932,9 @@
       for (var m = 0; m < marks.length; m += 1) {
         var attributes = marks[m].attributes;
         for (var a = 0; a < attributes.length; a += 1) {
-          var name = attributes[a].name;
-          if (name.indexOf('data-stet') !== 0 || !index.declared.has(attributes[a].value)) continue;
-          if (name === 'data-stet') record(marks[m], { key: attributes[a].value, attr: null, by: 'mark' });
-          else if (name.indexOf('data-stet-') === 0) record(marks[m], { key: attributes[a].value, attr: name.slice('data-stet-'.length), by: 'mark' });
+          var on = markOf(attributes[a].name);
+          if (on === undefined || !index.declared.has(attributes[a].value)) continue;
+          record(marks[m], { key: attributes[a].value, attr: on, by: 'mark' });
         }
       }
     } else if (body) {
@@ -943,6 +984,9 @@
         var text = norm(withBreaks.has(el) || holdsSwap.has(el) ? textWithBreaks(el, page.text) : el.textContent);
         noteLine(text, el);
         var list = whole.get(text);
+        // A value the page split across sibling elements and trimmed (D16.2): read again with a space
+        // between the children's texts, where the text with every space taken out is one a key holds.
+        if (list === undefined && index.squeezed.has(text.replace(/ /g, ''))) list = whole.get((text = norm(spaced(el, page.text))));
         if (list === undefined) continue;
         list.forEach(function (h) {
           var at = places[h.key];
@@ -984,7 +1028,7 @@
       for (var w = 0; w < withAttrs.length; w += 1) {
         for (var n = 0; n < ATTRS.length; n += 1) {
           var value = page.attr(withAttrs[w], ATTRS[n]);
-          if (value === null || (marks.length > 0 && withAttrs[w].hasAttribute('data-stet-' + ATTRS[n]))) continue;
+          if (value === null || (marks.length > 0 && markedOn(withAttrs[w], ATTRS[n]))) continue;
           wholeHits(withAttrs[w], norm(value), { attr: ATTRS[n], by: 'attr' });
         }
       }
@@ -1026,6 +1070,11 @@
     return { stet: 'census', found: found, entries: entries, ambiguous: ambiguous, weak: weak, head: head, route: location.pathname };
   }
 
+  /** Whether a mark names the attribute `attr` of `el`. */
+  function markedOn(el, attr) {
+    return markAttrs.some(function (name) { return el.hasAttribute(name + '-' + attr); });
+  }
+
   /** The census, answered, unless no payload has come or an edit is open (the edit's own keystrokes change the text). */
   function runCensus() {
     if (index !== null && edit === null) tell(census());
@@ -1056,25 +1105,42 @@
 
   /**
    * Whether a hit can be typed in place: the text of a visible HTML element
-   * whose only words are the key's, a marked element, or the element a
-   * sentence key's words fill (a key the census marked tagged, D16).
+   * whose only words are the key's, a marked element, the element a sentence
+   * key's words fill (a key the census marked tagged, D16), or, on a page no
+   * framework draws (one the agent was added to without a hold), the element
+   * whose whole text a plain key's words fill across its runs (D16.3). A
+   * framework's page keeps such an element to the field, since the runs form
+   * moves the page's text nodes into islands.
    */
   function inplaceHit(el, hit) {
     if (hit.attr !== null || !(el instanceof HTMLElement) || el.closest('svg') || !document.body.contains(el)) return false;
     if (hit.by === 'mark') return true;
-    if (hit.by === 'element') return taggedKeys.has(hit.key);
+    if (hit.by === 'element') return taggedKeys.has(hit.key) || !hold;
     return hit.by === 'whole' && inplaceable(el, hit.node);
   }
 
-  /** The form a hit is typed in: the runs form on a mark, the sentence form on a sentence key's element, else the in-place form. */
+  /** The form a hit is typed in: the runs form on a mark or a plain key's element, the sentence form on a sentence key's element, else the in-place form. */
   function formOf(hit) {
-    return hit.by === 'mark' ? 'runs' : hit.by === 'element' ? 'sentence' : 'inplace';
+    return hit.by === 'mark' ? 'runs' : hit.by === 'element' ? (taggedKeys.has(hit.key) ? 'sentence' : 'runs') : 'inplace';
   }
 
-  /** The hits on an element as a message lists them, one per key, attribute and entry. */
+  /** How many text runs `el` holds: its text nodes with a letter, digit or mark of their own, whitespace between elements aside. */
+  function runsIn(el) {
+    var n = 0;
+    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (var node = walker.nextNode(); node; node = walker.nextNode()) if (norm(node.data) !== '' && !SKIP[node.parentElement.tagName]) n += 1;
+    return n;
+  }
+
+  /**
+   * The hits on an element as a message lists them, one per key, attribute and
+   * entry; on a hover a mark or element hit on an element of several text runs
+   * carries `runs`, their count, for the label (D16.3).
+   */
   function keysOf(at, full) {
     var seen = [];
     var keys = [];
+    var runs = null;
     at.hits.forEach(function (hit) {
       var id = hit.key + ' ' + hit.attr + ' ' + hit.entry;
       var had = seen.indexOf(id);
@@ -1082,6 +1148,10 @@
       if (had !== -1) { if (full && hit.sure === true) keys[had].sure = true; return; }
       seen.push(id);
       var key = { key: hit.key, attr: hit.attr, by: hit.by };
+      if (!full && hit.attr === null && (hit.by === 'mark' || hit.by === 'element')) {
+        if (runs === null) runs = runsIn(at.el);
+        if (runs > 1) key.runs = runs;
+      }
       if (full) {
         if (hit.entry !== undefined) key.entry = hit.entry;
         key.inplace = inplaceHit(at.el, hit);
@@ -1331,8 +1401,10 @@
    * boundaries. The first run's leading and the last run's trailing whitespace
    * are the element's, not the value's, and a run of whitespace is one space,
    * as HTML renders it, so the page source's line wrapping never reaches the value.
+   * An element in `filled` (the sentence form's elements that held text when the
+   * edit began) is written `<n></n>` though a select-all emptied it (D16.5).
    */
-  function taggedValue(el) {
+  function taggedValue(el, filled) {
     var number = new Map();
     var all = el.querySelectorAll('*');
     for (var i = 0, n = 0; i < all.length; i += 1) {
@@ -1344,7 +1416,7 @@
         if (c.nodeType === 3) out += c.data;
         else if (c.nodeType !== 1) continue;
         else if (c.hasAttribute('data-stet-island')) out += textWithBreaks(c);
-        else if (c.firstElementChild === null && norm(c.textContent) === '') out += '<' + number.get(c) + '/>';
+        else if (c.firstElementChild === null && norm(c.textContent) === '' && !(filled && filled.has(c))) out += '<' + number.get(c) + '/>';
         else {
           out += '<' + number.get(c) + '>';
           walk(c);
@@ -1354,6 +1426,33 @@
     };
     walk(el);
     return out.replace(ASCII_SPACE, ' ').trim();
+  }
+
+  /**
+   * A runs edit's value for a key that declares no tags (D16.3): the islands'
+   * texts as the page spaces them where that reading is the key's saved value
+   * (a word the page splits across elements, a variable in its own element),
+   * else each island's text joined with one space, as a sentence the page split
+   * into elements and trimmed reads. Whitespace collapses as HTML renders it,
+   * so a no-break space stays.
+   */
+  function runsValue(e) {
+    var texts = e.islands.map(function (island) { return textWithBreaks(island).replace(ASCII_SPACE, ' '); });
+    if (e.ownSpacing) return texts.join('').replace(ASCII_SPACE, ' ').trim();
+    return texts.map(function (text) { return text.trim(); }).filter(function (text) { return text !== ''; }).join(' ');
+  }
+
+  /** The census payload's texts for a key, or for one entry of it. */
+  function censusTexts(key, entry) {
+    var k = payload === null ? undefined : payload.filter(function (p) { return p.key === key; })[0];
+    var part = k === undefined || entry === undefined ? undefined : k.parts.filter(function (p) { return p.entry === entry; })[0];
+    return k === undefined ? [] : entry === undefined ? k.texts : part === undefined ? [] : part.texts;
+  }
+
+  /** Whether `el`'s text as the page spaces it, each text node read by `read`, is one of the census's texts for the key or entry. */
+  function ownSpacing(el, key, entry, read) {
+    var reading = norm(textWithBreaks(el, read));
+    return censusTexts(key, entry).some(function (text) { var p = pattern(text); return p !== null && p.test(reading); });
   }
 
   function editListeners(el, method, form) {
@@ -1390,13 +1489,14 @@
     selection.addRange(range);
   }
 
-  function startInplace(el, node, key, locale, entry, oneLine) {
+  function startInplace(el, node, key, locale, entry, oneLine, savedOf) {
     var nodes = Array.prototype.slice.call(el.childNodes);
     edit = {
       key: key, locale: locale, entry: entry, oneLine: oneLine, el: el,
       nodes: nodes,
       data: nodes.map(function (n) { return n.nodeType === 3 ? n.data : null; }),
-      last: null, attached: null,
+      saved: nodes.map(function (n) { return n.nodeType === 3 ? savedOf(n) : null; }),
+      last: null, attached: null, caret: null,
       ownText: el.textContent, pending: false, pendingTimer: null, composing: false, proposed: false,
       observer: new MutationObserver(onEditMutation),
     };
@@ -1406,13 +1506,17 @@
     el.setAttribute('contenteditable', 'plaintext-only');
     el.setAttribute('spellcheck', 'false');
     editListeners(el, 'addEventListener');
+    document.addEventListener('selectionchange', noteCaret);
     // A double click's word stays selected, so typing replaces it; any other start puts a caret where the click landed.
     var word = selectedIn(el) === null ? null : getSelection().getRangeAt(0).cloneRange();
     window.focus();
     el.focus();
-    if (word === null) { caretAt(el); return; }
-    getSelection().removeAllRanges();
-    getSelection().addRange(word);
+    if (word === null) caretAt(el);
+    else {
+      getSelection().removeAllRanges();
+      getSelection().addRange(word);
+    }
+    noteCaret();
   }
 
   /** The island the last click landed on, where the browser can say where text sits; undefined for a key press or a click on no run. */
@@ -1434,9 +1538,11 @@
    * runs stays the page's. The island under the click starts selected, else the
    * first island with text.
    */
-  function startRuns(el, key, locale, entry, oneLine) {
+  function startRuns(el, key, locale, entry, oneLine, savedOf) {
     var word = wordIn(el);
     var nodes = textNodesOf(el);
+    var tagged = taggedKeys.has(key) || censusTexts(key, entry).some(function (text) { return placeholders(text) > 0; });
+    var spacing = !tagged && ownSpacing(el, key, entry, savedOf);
     var islands = nodes.map(function (n) {
       var island = document.createElement('span');
       island.setAttribute('contenteditable', 'plaintext-only');
@@ -1449,9 +1555,10 @@
     settle();
     edit = {
       key: key, locale: locale, entry: entry, oneLine: oneLine, el: el,
-      nodes: nodes, islands: islands,
+      nodes: nodes, islands: islands, tagged: tagged, ownSpacing: spacing,
       data: nodes.map(function (n) { return n.data; }),
-      last: null, attached: null,
+      saved: nodes.map(savedOf),
+      last: null, attached: null, caret: null,
       ownText: el.textContent, pending: false, pendingTimer: null, composing: false, proposed: false,
       observer: new MutationObserver(onEditMutation),
     };
@@ -1459,18 +1566,22 @@
     edit.attached = nodes.map(function () { return false; });
     edit.observer.observe(el, { childList: true, characterData: true, subtree: true });
     editListeners(el, 'addEventListener');
+    document.addEventListener('selectionchange', noteCaret);
     window.focus();
     // A double click's word stays selected in its island, so typing replaces it; the wrapping moved its text node, so the range is made again.
     var first = (word !== null && islands[nodes.indexOf(word.node)]) || islandAtClick(islands) ||
       islands.filter(function (island) { return norm(island.textContent) !== ''; })[0] || islands[0];
     if (first === undefined) return;
     first.focus();
-    if (word === null || nodes.indexOf(word.node) === -1) { caretAt(first); return; }
-    var range = document.createRange();
-    range.setStart(word.node, word.start);
-    range.setEnd(word.node, word.end);
-    getSelection().removeAllRanges();
-    getSelection().addRange(range);
+    if (word === null || nodes.indexOf(word.node) === -1) caretAt(first);
+    else {
+      var range = document.createRange();
+      range.setStart(word.node, word.start);
+      range.setEnd(word.node, word.end);
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+    }
+    noteCaret();
   }
 
   /** Every text node under `el`, in document order. */
@@ -1526,12 +1637,13 @@
     var held = textNodesOf(el);
     var wrote = new Map();
     held.forEach(function (node) { wrote.set(node, node.data); });
+    var filled = new Set(Array.prototype.filter.call(el.querySelectorAll('*'), function (e) { return norm(e.textContent) !== ''; }));
     edit = {
       form: 'sentence', key: key, locale: locale, entry: entry, el: el,
-      held: held,
+      held: held, filled: filled, whole: false,
       parents: held.map(function (node) { return node.parentNode; }),
       wrote: wrote, original: new Map(wrote),
-      value: taggedValue(el), proposed: false, composing: false, composedInto: null,
+      value: taggedValue(el, filled), proposed: false, composing: false, composedInto: null,
       observer: new MutationObserver(onSentenceMutation),
     };
     edit.observer.observe(el, { childList: true, characterData: true, subtree: true, characterDataOldValue: false });
@@ -1557,16 +1669,26 @@
    * in the same held node collapses to its focus, and a caret in no held node
    * moves into the last held node that ends at or before it, at its end, else
    * into the first, at its start. So no edit can cross an element boundary. A
-   * selection reaching outside the element is left alone (focus leaving ends the edit).
+   * selection reaching outside the element is left alone (focus leaving ends the
+   * edit). A selection covering the whole held text, from the start of the first
+   * held node with text to the end of the last, is kept and marked `whole`, so
+   * typing replaces the sentence's words (D16.5).
    */
   function normalizeCaret() {
     if (edit === null || edit.form !== 'sentence') return;
+    edit.whole = false;
     var selection = getSelection();
     var el = edit.el;
     if (selection === null || selection.rangeCount === 0 || !el.contains(selection.anchorNode) || !el.contains(selection.focusNode)) return;
     var node = selection.focusNode;
     var offset = selection.focusOffset;
     var inside = edit.held.filter(function (n) { return el.contains(n); });
+    var texts = withText(inside);
+    if (!selection.isCollapsed && texts.length > 0) {
+      var range = selection.getRangeAt(0);
+      var lastText = texts[texts.length - 1];
+      if (range.comparePoint(texts[0], 0) === 0 && range.comparePoint(lastText, lastText.length) === 0) { edit.whole = true; return; }
+    }
     if (inside.indexOf(node) !== -1) {
       if (selection.anchorNode !== node) selection.collapse(node, offset);
       return;
@@ -1577,6 +1699,32 @@
     var before = inside.filter(function (n) { return point.comparePoint(n, n.length) <= 0; });
     if (before.length > 0) selection.collapse(before[before.length - 1], before[before.length - 1].length);
     else selection.collapse(inside[0], 0);
+  }
+
+  /** The text nodes of `nodes` that hold a letter, a digit or any mark: whitespace between elements aside. */
+  function withText(nodes) {
+    return nodes.filter(function (n) { return norm(n.data) !== ''; });
+  }
+
+  /**
+   * A select-all replaced (D16.5): the first held node with text takes `text`
+   * and every other held node is emptied, so no node moves and every tag stays;
+   * the caret lands after the text and the value is proposed — the typed words
+   * followed by the element's tags, `See the HTML chapter<1></1>`.
+   */
+  function replaceWhole(text) {
+    var inside = edit.held.filter(function (n) { return edit.el.contains(n); });
+    var first = withText(inside)[0] || inside[0];
+    // The sentence form never lets a placeholder tag be typed.
+    if (first === undefined || placeholders(text) > 0) return;
+    inside.forEach(function (node) {
+      var data = node === first ? text : '';
+      if (node.data !== data) node.data = data;
+      edit.wrote.set(node, node.data);
+    });
+    getSelection().collapse(first, first.data.length);
+    normalizeCaret();
+    propose();
   }
 
   /**
@@ -1647,6 +1795,12 @@
     if (edit === null) return;
     if (!judged()) { event.preventDefault(); return; }
     var type = event.inputType;
+    if (edit.whole && (type === 'insertText' || type === 'insertFromPaste' || type === 'deleteContentBackward' || type === 'deleteContentForward')) {
+      event.preventDefault();
+      var typed = type === 'insertText' ? event.data : type === 'insertFromPaste' && event.dataTransfer ? event.dataTransfer.getData('text/plain') : '';
+      replaceWhole(String(typed || '').replace(LINE_BREAKS, ' '));
+      return;
+    }
     if (COMPOSING.indexOf(type) !== -1) {
       // Safari may deliver `insertFromComposition` after `compositionend`: the method's write is then judged
       // in a task of its own, once the browser has made it.
@@ -1781,6 +1935,7 @@
     edit.ownText = edit.el.textContent;
     edit.last = edit.nodes.map(function (n) { return n.nodeType === 3 ? n.data : null; });
     edit.attached = edit.nodes.map(function (n) { return n.parentNode === edit.el; });
+    noteCaret();
     if (!edit.composing) propose();
   }
   function onCompositionStart() { if (edit !== null) edit.composing = true; }
@@ -1792,13 +1947,58 @@
   }
   function propose() {
     edit.proposed = true;
-    var value = edit.form === 'sentence' || edit.islands ? taggedValue(edit.el) : typedValue(edit.el, edit.oneLine);
+    var value = edit.form === 'sentence' ? taggedValue(edit.el, edit.filled)
+      : edit.islands ? (edit.tagged ? taggedValue(edit.el) : runsValue(edit))
+        : typedValue(edit.el, edit.oneLine);
     if (edit.form === 'sentence') edit.value = value;
     tell({ stet: 'typed', key: edit.key, locale: edit.locale, entry: edit.entry, value: value });
   }
-  function onEditMutation() {
+  /**
+   * Condition 3 for the in-place and runs forms, with the redraw rule (D16.4,
+   * Q9): a page write that sets a held text node to the words it held when the
+   * edit began, or to the page's own words under a draft layered on it then,
+   * redraws the same text, so the typed text goes back into the node with the
+   * caret where the editor left it, and the edit goes on. In the runs form a
+   * held node the page's renderer re-placed beside its island (a keyed renderer
+   * re-inserts the node it keeps before the island it finds in its place) goes
+   * back into the island the same way. Any other change of the element's text
+   * that no marked keystroke explains ends the edit `lost`.
+   */
+  function onEditMutation(records) {
     if (edit === null || edit.pending) return;
-    if (edit.el.textContent !== edit.ownText) end('lost');
+    if (records !== undefined) records.forEach(redraw);
+    if (edit !== null && edit.el.textContent !== edit.ownText) end('lost');
+  }
+  function redraw(record) {
+    if (record.type === 'childList') {
+      if (edit.islands) Array.prototype.forEach.call(record.addedNodes, replaced);
+      return;
+    }
+    var node = record.target;
+    var i = record.type === 'characterData' ? edit.nodes.indexOf(node) : -1;
+    if (i === -1 || node.data === edit.last[i] || (node.data !== edit.saved[i] && node.data !== edit.data[i])) return;
+    node.data = edit.last[i];
+    caretBack(node);
+  }
+  function replaced(node) {
+    var i = edit.nodes.indexOf(node);
+    var island = i === -1 ? null : edit.islands[i];
+    if (island === null || node.parentNode === island || node.parentNode !== island.parentNode) return;
+    island.appendChild(node);
+    caretBack(node);
+  }
+  /** The caret back where the editor left it in `node` after a put-back; the put-back is the agent's own, so neither observer hears it. */
+  function caretBack(node) {
+    var at = edit.caret;
+    if (at !== null && at.node === node) getSelection().collapse(node, Math.min(at.offset, node.data.length));
+    settle();
+    edit.observer.takeRecords();
+  }
+  /** Where the caret stands in the element under an in-place or runs edit, read on every `selectionchange`: a page write moves it before the redraw rule can read it. */
+  function noteCaret() {
+    if (edit === null || edit.form === 'sentence') return;
+    var selection = getSelection();
+    if (selection !== null && selection.rangeCount > 0 && edit.el.contains(selection.focusNode)) edit.caret = { node: selection.focusNode, offset: selection.focusOffset };
   }
   function watchConnected() {
     if (edit !== null && !edit.el.isConnected) end(goneHow(edit));
@@ -1832,9 +2032,30 @@
       else if (judged()) sentenceInsert(null, ' ');
       return;
     }
+    if ((event.metaKey || event.ctrlKey) && !event.altKey && (event.key === 'a' || event.key === 'A')) { event.preventDefault(); selectEdited(); return; }
     if ((event.metaKey || event.ctrlKey) && /^[biu]$/i.test(event.key)) event.preventDefault();
     // An island never merges into the page's markup beside it.
     if (edit.islands && (event.key === 'Backspace' || event.key === 'Delete') && atIslandEdge(event.key === 'Backspace')) event.preventDefault();
+  }
+
+  /**
+   * Cmd/Ctrl+A in an edit selects the edited text alone, never the page
+   * (D16.5): the held text in the sentence form, the island holding the caret
+   * in the runs form, the element's text in the in-place form, each from the
+   * start of its first text node with text to the end of its last.
+   */
+  function selectEdited() {
+    var focus = getSelection().focusNode;
+    var scope = edit.islands
+      ? edit.islands.filter(function (island) { return island.contains(focus); })[0] || edit.islands.filter(function (island) { return norm(island.textContent) !== ''; })[0]
+      : edit.el;
+    if (scope === undefined) return;
+    var texts = withText(edit.form === 'sentence' ? edit.held.filter(function (n) { return edit.el.contains(n); }) : textNodesOf(scope));
+    if (texts.length === 0) return;
+    var lastText = texts[texts.length - 1];
+    getSelection().setBaseAndExtent(texts[0], 0, lastText, lastText.length);
+    if (edit.form === 'sentence') normalizeCaret();
+    else noteCaret();
   }
 
   /** Whether the caret stands at the start (`start`) or the end of its island, with nothing selected. */
@@ -1878,8 +2099,8 @@
     el.removeAttribute('contenteditable');
     el.removeAttribute('spellcheck');
     editListeners(el, 'removeEventListener', e.form);
+    document.removeEventListener('selectionchange', e.form === 'sentence' ? normalizeCaret : noteCaret);
     if (e.form === 'sentence') {
-      document.removeEventListener('selectionchange', normalizeCaret);
       restoreOwnWrites(e.held, e.wrote, e.original, e.parents);
     } else if (e.islands) {
       e.islands.forEach(function (island, i) {
@@ -1966,9 +2187,14 @@
       return;
     }
     var lent = lend(selEl);
-    if (data.form === 'runs') startRuns(selEl, data.key, data.locale, data.entry, data.oneLine);
+    // A node's own words: what the page held under a swap lent to the edit, else its text now (D16.4).
+    var savedOf = function (node) {
+      var swap = lent.filter(function (l) { return l.swap.node === node; })[0];
+      return swap === undefined ? node.data : swap.swap.text;
+    };
+    if (data.form === 'runs') startRuns(selEl, data.key, data.locale, data.entry, data.oneLine, savedOf);
     else if (data.form === 'sentence') startSentence(selEl, data.key, data.locale, data.entry);
-    else startInplace(selEl, hit.node, data.key, data.locale, data.entry, data.oneLine);
+    else startInplace(selEl, hit.node, data.key, data.locale, data.entry, data.oneLine, savedOf);
     edit.lent = lent;
   }
 
@@ -1995,6 +2221,10 @@
     var map = new Map();
     if (value) Object.keys(value).forEach(function (key) { map.set(key, value[key]); });
     return map;
+  }
+  /** The mark attributes as the reads message names them: one or more `data-*` names. */
+  function isAttributes(value) {
+    return isTexts(value) && value.length > 0 && value.every(function (name) { return /^data-[a-z][a-z0-9-]*$/.test(name); });
   }
   // A list entry's index or a record field's name.
   var isEntry = function (value) {
@@ -2070,6 +2300,9 @@
       runCensus();
     }
     else if (data.stet === 'reads' && typeof data.route === 'string' && (data.keys === null || isTexts(data.keys))) {
+      // The mark attributes go with every reads message; one of the wrong shape leaves `data-stet` alone.
+      markAttrs = isAttributes(data.attributes) ? data.attributes.slice() : ['data-stet'];
+      MARKED = markedSelector(markAttrs);
       // Sites or coincident keys of the wrong shape cost the placing, never the narrowing.
       var placing = isRenders(data.renders) && isTexts(data.coincident);
       reads = data.keys === null ? null : {

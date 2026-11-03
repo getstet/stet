@@ -2435,13 +2435,18 @@ async function loadRouteReads(route) {
 /**
  * The open route's reads, sent to the agent so its census matches only the keys
  * a file of the page reads: the keys where the reads are complete and are this
- * page's, else none, and the agent matches every key as before.
+ * page's, else none, and the agent matches every key as before. The attributes
+ * a mark is read on go with them: the config's own key attribute beside
+ * `data-stet` (D16.1).
  */
 function postReads() {
   if (S.frameRoute === null) return;
   const reads = S.routeReads;
   const keys = reads !== null && reads.complete && reads.route === framePath() ? reads.keys.filter(declared) : null;
-  postToPreview({ stet: 'reads', route: S.frameRoute, keys: keys, renders: keys === null ? null : reads.renders, coincident: keys === null ? null : reads.coincident });
+  // `data-stet` alone is the agent's own default, so a project that names no attribute sends none.
+  const marks = ready() && S.site.config.reads && Array.isArray(S.site.config.reads.attributes) ? S.site.config.reads.attributes : ['data-stet'];
+  postToPreview(Object.assign({ stet: 'reads', route: S.frameRoute, keys: keys, renders: keys === null ? null : reads.renders, coincident: keys === null ? null : reads.coincident },
+    marks.length === 1 && marks[0] === 'data-stet' ? {} : { attributes: marks }));
 }
 /** Whether the open page's census ran with every key because its reads are incomplete or failed. */
 function readsUnknown() {
@@ -3086,7 +3091,9 @@ function hitsOf(keys) {
   for (const k of keys) {
     if (!k || typeof k !== 'object' || !declared(k.key) || !isEntry(k.entry)) continue;
     if (k.attr !== null && k.attr !== undefined && typeof k.attr !== 'string') continue;
-    out.push({ key: k.key, attr: typeof k.attr === 'string' ? k.attr : null, by: typeof k.by === 'string' ? k.by : '', entry: k.entry, inplace: k.inplace === true, sure: k.sure === true });
+    const hit = { key: k.key, attr: typeof k.attr === 'string' ? k.attr : null, by: typeof k.by === 'string' ? k.by : '', entry: k.entry, inplace: k.inplace === true, sure: k.sure === true };
+    if (Number.isInteger(k.runs) && k.runs > 1) hit.runs = k.runs;
+    out.push(hit);
   }
   return out;
 }
@@ -3151,8 +3158,9 @@ function choosePick(hit, again, rect, sel) {
   // The page numbers a sentence's elements in the order they show, so a value that orders its tags otherwise is typed in its field.
   const sentence = hit.by !== 'mark' && (keyDef(key) || {}).tags !== undefined;
   if (hit.attr === null && hit.inplace && (!sentence || tagsInOrder(entryText(key, S.locale, hit.entry)))) {
-    // A sentence key (one declaring tags) is typed in its element without moving a page node (D18).
-    const form = hit.by === 'mark' ? 'runs' : sentence ? 'sentence' : 'inplace';
+    // A sentence key (one declaring tags) is typed in its element without moving a page node (D18); a plain key whose
+    // words fill an element's runs is typed run by run, as a mark is (D16.3).
+    const form = hit.by === 'mark' || (hit.by === 'element' && !sentence) ? 'runs' : sentence ? 'sentence' : 'inplace';
     postToPreview(Object.assign({ stet: 'edit', key: key, locale: S.locale }, hit.entry === undefined ? {} : { entry: hit.entry },
       { form: form, oneLine: entryText(key, S.locale, hit.entry).indexOf('\n') === -1 }));
     S.edit = { key: key, locale: S.locale, entry: hit.entry, form: form, before: S.draft[S.locale + ' ' + key], rect: rect };
@@ -3309,7 +3317,7 @@ function alsoLine(key, kind) {
   const found = S.census !== null && own(S.census.found, key) ? S.census.found[key] : 0;
   return found > 1 ? 'also on ' + plural(found - 1, 'other spot') : '';
 }
-/** The label `<kind> · <key>` over the copy under the pointer, with where else the key shows. */
+/** The label `<kind> · <key>` over the copy under the pointer, `· <n> runs` where its text is split across elements, with where else the key shows. */
 function paintHover() {
   const label = document.getElementById('hoverlabel');
   const h = S.hover;
@@ -3320,7 +3328,7 @@ function paintHover() {
     if (seen.indexOf(hit.key) !== -1) continue;
     seen.push(hit.key);
     const kind = elementKind(h.tag, hit.attr);
-    lines.push(kind + ' · ' + hit.key);
+    lines.push(kind + ' · ' + hit.key + (hit.runs === undefined ? '' : ' · ' + hit.runs + ' runs'));
     const also = alsoLine(hit.key, kind);
     if (also !== '') lines.push(also);
   }
