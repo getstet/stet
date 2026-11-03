@@ -413,7 +413,7 @@ function surfaceSources(cwd: string, config: StetConfig): { file: string; source
       // a `data-stet="<key>"` is not a read to un-wire and naming it would put a
       // caution on every page the removal already handles. The mark goes; a
       // mention of the key in prose or in a script is left to be found.
-      found.push({ file, source: html && file.endsWith('.html') ? stripMarks(text, markAttributes(config)) : text });
+      found.push({ file, source: html && /\.html?$/.test(file) ? stripMarks(text, markAttributes(config)) : text });
     } catch {
       // A file the walk listed and this read cannot open mentions nothing.
     }

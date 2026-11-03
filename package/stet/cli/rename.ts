@@ -78,7 +78,7 @@ import {
   type PlanEntry,
 } from './key-plan.js';
 import { planReadRenames, stetModuleTest, type Occurrence } from './key-reads.js';
-import { siteReads, usageFiles } from './key-usage.js';
+import { ownFiles, siteReads, usageDialect, usageFiles } from './key-usage.js';
 import type { CliIo } from './main.js';
 import { renameRecorded } from './meta.js';
 import { htmlPageOf, pageOfFile } from './pages.js';
@@ -899,8 +899,9 @@ export function markRenames(
 /**
  * The static-HTML host: the marks (`markRenames`) and, where the config names
  * read functions (`reads`), every call of one in the files the usage scan reads
- * — the source git lists, the copy tables and generated outputs aside — its
- * key-name literal rewritten as `readRenames` rewrites a read. Any other
+ * — the source git lists, the generated outputs aside — and in the copy tables
+ * stet does not generate, its key-name literal rewritten as `readRenames`
+ * rewrites a read (a table's own property names move with the key). Any other
  * occurrence in code is blocked, as on a JavaScript host; a read under a prefix
  * a leaving key opens with is listed (`listed`) and left as it is. A document's
  * inline scripts are read in the text the mark edits left.
@@ -913,13 +914,14 @@ export async function htmlRenames(
   only?: OnlyAt,
 ): Promise<HostRenames> {
   const marks = markRenames(cwd, config, renames, only);
-  const functions = config.reads?.functions ?? [];
-  const attributes = markAttributes(config);
-  if (functions.length === 0) return marks;
+  if ((config.reads?.functions ?? []).length === 0) return marks;
   const ts = await loadTypescript();
   const declared = new Set(Object.keys(descriptor.keys));
   const out: HostRenames = { ...marks, edited: [...marks.edited], listed: [] };
-  for (const rel of usageFiles(cwd, config)) {
+  // A table listed in `copyModules` and not generated is kept by hand: its property names move with the key.
+  const generated = ownFiles(config);
+  const tables = new Set(filesForGlobs(cwd, config.copyModules).filter((rel) => !generated.has(rel)));
+  for (const rel of new Set([...usageFiles(cwd, config), ...tables])) {
     const prior = out.edited.findIndex((e) => e.rel === rel);
     let source: string;
     try {
@@ -927,7 +929,7 @@ export async function htmlRenames(
     } catch {
       continue;
     }
-    const text = planFileRenames(out, { ts, file: rel, source, dialect: dialectOf(rel), renames, isStetModule: () => false, copyModule: false, declared, functions, attributes }, only);
+    const text = planFileRenames(out, readInput(ts, config, rel, source, renames, declared, () => false, tables.has(rel)), only);
     if (text === null) continue;
     const before = prior === -1 ? source : readFileSync(join(cwd, rel), 'utf8');
     const entry = { rel, text, diff: formatDiff(rel, before, text) };
@@ -965,7 +967,8 @@ export async function readRenames(
   only?: OnlyAt,
 ): Promise<HostRenames> {
   const ts = await loadTypescript();
-  const own = new Set([config.codegen.registry, config.codegen.dts, config.codegen.defaults, config.codegen.resolved, config.readPath.file]);
+  // The batch writes the generated files and the read path names no key; a copy table is walked, its property names move with the key.
+  const own = ownFiles(config);
   const modules = filesForGlobs(cwd, config.copyModules);
   const isStetModule = stetModuleTest(cwd, [config.readPath.file, ...modules]);
   const out: HostRenames = { edited: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
@@ -980,25 +983,35 @@ export async function readRenames(
     } catch {
       continue;
     }
-    const text = planFileRenames(
-      out,
-      {
-        ts,
-        file: rel,
-        source,
-        dialect: dialectOf(rel),
-        renames,
-        isStetModule: isStetModule(rel),
-        copyModule: config.copyModules.some((glob) => matchGlob(glob, rel)),
-        declared,
-        functions: config.reads?.functions ?? [],
-        attributes: markAttributes(config),
-      },
-      only,
-    );
+    const text = planFileRenames(out, readInput(ts, config, rel, source, renames, declared, isStetModule(rel), config.copyModules.some((glob) => matchGlob(glob, rel))), only);
     if (text !== null) out.edited.push({ rel, text, diff: formatDiff(rel, source, text) });
   }
   return out;
+}
+
+/** What `planReadRenames` takes for one host file: the file, the project's read functions and its mark attributes. */
+function readInput(
+  ts: typeof import('typescript'),
+  config: StetConfig,
+  rel: string,
+  source: string,
+  renames: ReadonlyMap<string, string>,
+  declared: ReadonlySet<string>,
+  isStetModule: (spec: string) => boolean,
+  copyModule: boolean,
+): Parameters<typeof planReadRenames>[0] {
+  return {
+    ts,
+    file: rel,
+    source,
+    dialect: usageDialect(rel),
+    renames,
+    isStetModule,
+    copyModule,
+    declared,
+    functions: config.reads?.functions ?? [],
+    attributes: markAttributes(config),
+  };
 }
 
 /**

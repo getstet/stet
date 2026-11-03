@@ -34,7 +34,7 @@ import type * as TS from 'typescript';
 import { escapeRegExp } from '../src/seo.js';
 import { normalizeNoExt, pathAliasMappings, resolveSpecifier, type ReadFunction } from './config.js';
 import { lineIndex } from './html-host.js';
-import { dialectCode, openTag, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
+import { dialectCode, markupTags, openTag, openTagAttrs, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
 import { occurrenceIsAmbiguous, occurrenceIsKey, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 
 /**
@@ -200,6 +200,40 @@ export function configuredReadForm(functions: readonly ReadFunction[]): RegExp |
   if (functions.length === 0) return null;
   const names = [...new Set(functions.map((f) => f.name))].sort((a, b) => b.length - a.length);
   return new RegExp(`(?<![\\w$.])(${names.map((name) => name.split('.').map(escapeRegExp).join('\\s*\\.\\s*')).join('|')})\\s*\\(`, 'g');
+}
+
+/** The head object of a configured function (`TS` of `TS.tx`) and its last segment; none for a bare name. */
+export function splitName(name: string): { head: string; last: string } | null {
+  const dot = name.lastIndexOf('.');
+  return dot < 0 ? null : { head: name.slice(0, dot), last: name.slice(dot + 1) };
+}
+
+/** The text of a configured function's name as a pattern, where it was written: `TS.tx` (and `TS?.tx`, `TS["tx"]`), or a bare name followed by a call's opening. */
+export function mentionPattern(name: string): RegExp {
+  const split = splitName(name);
+  if (split === null) {
+    // A call's opening only: a bare name as a word turns up in prose (`don't`), and a trailing apostrophe is the contraction's.
+    return new RegExp(`(?<![\\w$.])(?<![\\w$]['’])(?:(?:window|self|globalThis)\\s*\\.\\s*)?${escapeRegExp(name)}\\s*(?:\\?\\.\\s*)?(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(`, 'g');
+  }
+  const head = split.head.split('.').map(escapeRegExp).join('\\s*\\??\\.\\s*');
+  const last = escapeRegExp(split.last);
+  return new RegExp(`(?<![\\w$])${head}(?:\\s*\\??\\.\\s*${last}(?![\\w$])|\\s*\\??\\.?\\s*\\[\\s*(['"])${last}\\1\\s*\\])`, 'g');
+}
+
+/** Whether the attribute value around `at` writes a call of a configured function (the usage scan's own test of text it cannot read as code). */
+function readsInAttribute(source: string, at: number, functions: readonly ReadFunction[]): boolean {
+  const value = attributeValueAt(source, at);
+  return value !== undefined && functions.some((f) => mentionPattern(f.name).test(value));
+}
+
+/** The value of the attribute of an open tag that holds offset `at`; undefined where `at` sits in no attribute value. */
+function attributeValueAt(source: string, at: number): string | undefined {
+  for (const tag of markupTags(source)) {
+    if (tag.close || at < tag.start) continue;
+    if (at >= tag.end) continue;
+    return openTagAttrs(source, tag).find((a) => a.quoted && at >= a.valueStart && at < a.valueEnd)?.value;
+  }
+  return undefined;
 }
 
 /**
@@ -448,7 +482,9 @@ export function planReadRenames(input: {
       const line = lineOf(at);
       const occ: Occurrence = { file, line, at, key, text: lineText(at).trim() };
       if (!within(code, at) || within(nonCode, at)) {
-        out.mentions.push(occ);
+        // A configured read inside an attribute no rule names as code (`x-text`, `hx-on:click`, `srcdoc`) is a read the usage scan calls one: renaming past it leaves it on the old name.
+        if (dialect !== null && !within(code, at) && readsInAttribute(source, at, functions)) out.blocked.push(occ);
+        else out.mentions.push(occ);
         continue;
       }
       // Two declared keys that share segments in this text (`a.b` and `b.c` in `a.b.c`): which one it means cannot be told.

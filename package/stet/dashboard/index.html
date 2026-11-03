@@ -201,6 +201,8 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
 .derive{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .derive .in{flex:1 1 90px;width:auto}
 .plist{padding:7px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px;display:flex;flex-direction:column;gap:4px}
+/* A line above the fields can leave them at a fractional offset; the browser scrolls a whole pixel, so a field would stop a quarter pixel short of the edge. The margin keeps it fully in view. */
+#main [data-act-input],#main [data-act-change]{scroll-margin:1px}
 .kline{padding:7px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px;display:flex;flex-direction:column;gap:2px;overflow-wrap:anywhere}
 .tagged{position:relative}
 .tagged textarea,.tagmirror{scrollbar-gutter:stable}
