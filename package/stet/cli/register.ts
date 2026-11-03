@@ -33,7 +33,7 @@ import {
   writeText,
 } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, keyJoiner, loadConfig, markAttributes, refuseUnresolvableAlias, type StetConfig } from './config.js';
+import { isHtmlHost, keyJoiner, loadConfig, markAttributes, refuseInCopyFrom, refuseUnresolvableAlias, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { planHtmlRegister, type ChosenName, type HtmlRegisterPlan } from './html-host.js';
 import { isHeadKind, kindOf, roleOf, type Place } from './key-names.js';
@@ -89,6 +89,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   const naming: Naming = { ...(planIn === undefined ? {} : { planIn }), ...(planOut === undefined ? {} : { planOut }) };
 
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'register');
   const report = new HostTextReport();
   if (planOut !== undefined) refusePlanOut(io.cwd, planOut);
 

@@ -10,7 +10,7 @@
  * (§13.1's table lists phase-2 and phase-3 fields this change does not read).
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, resolve as resolvePath } from 'node:path';
 
 import type { Placeholders } from '../src/placeholders.js';
@@ -558,6 +558,9 @@ export function loadConfig(cwd: string): StetConfig {
       if (typeof file !== 'string' || file === '') return fail();
       if (format !== 'script' && format !== 'esm' && format !== 'json') return fail();
       if (format !== 'json' && (typeof name !== 'string' || name === '')) return fail();
+      // The name is written into the output as code: a script binds a dotted global, a module one export.
+      if (format === 'script' && !READ_NAME.test(name as string)) return fail();
+      if (format === 'esm' && !/^[A-Za-z_$][\w$]*$/.test(name as string)) return fail();
       if (values !== undefined && values !== 'value' && values !== 'value-status') return fail();
       if (only !== undefined && (!Array.isArray(only) || only.some((p) => typeof p !== 'string'))) return fail();
       // A config that writes outside its repo is the one way stet would write host source it does not own.
@@ -855,6 +858,43 @@ function host(source: Record<string, unknown>): 'html' | undefined {
     );
   }
   return 'html';
+}
+
+/**
+ * The checkout a `copyFrom` config reads its copy from: the owner's folder and
+ * its config, through which the descriptor, the snapshot and the status file
+ * are read. Null where the config names none. The owner must hold a config of
+ * its own, be another folder, and own its copy itself — a chain would make
+ * "the owner" a question with more than one answer.
+ */
+export function resolveCopyFrom(cwd: string, config: Pick<StetConfig, 'copyFrom'>): { owner: string; config: StetConfig } | null {
+  const named = config.copyFrom;
+  if (named === undefined) return null;
+  const owner = resolvePath(cwd, named);
+  if (!existsSync(join(owner, CONFIG_FILE))) {
+    throw new CliError(`${CONFIG_FILE}: copyFrom names ${named}, which holds no ${CONFIG_FILE}`);
+  }
+  if (realpathSync(owner) === realpathSync(cwd)) throw new CliError(`${CONFIG_FILE}: copyFrom names itself`);
+  const ownerConfig = loadConfig(owner);
+  if (ownerConfig.copyFrom !== undefined) {
+    throw new CliError(`${CONFIG_FILE}: copyFrom names ${named}, which reads its own copy from elsewhere — name the owner`);
+  }
+  return { owner, config: ownerConfig };
+}
+
+/**
+ * The one guard every writer runs where it loads its project: a checkout that
+ * reads its copy from another changes none of it, so the command is sent to
+ * the owner before anything is read or written.
+ */
+export function refuseInCopyFrom(config: Pick<StetConfig, 'copyFrom'>, command: string): void {
+  const refusal = copyFromRefusal(config, command);
+  if (refusal !== null) throw new CliError(refusal);
+}
+
+/** The line a writer answers in a checkout that reads its copy from another; null elsewhere. The dashboard answers it as a 409. */
+export function copyFromRefusal(config: Pick<StetConfig, 'copyFrom'>, command: string): string | null {
+  return config.copyFrom === undefined ? null : `this checkout reads its copy from ${config.copyFrom}; run stet ${command} there`;
 }
 
 /**

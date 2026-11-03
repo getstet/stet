@@ -63,8 +63,10 @@ export async function runList(args: string[], io: CliIo): Promise<number> {
     }
 
     // The status column belongs to a snapshot-only project that tracks approval: its file exists.
+    // A checkout reading its copy from another shows the owner's.
+    const forms = project.owner ?? { path: io.cwd, config: project.config };
     const approvals: StatusFile | null =
-      !isStoreBacked(project.environment.block) && existsSync(join(io.cwd, project.config.statusPath)) ? loadStatus(io.cwd, project.config) : null;
+      !isStoreBacked(project.environment.block) && existsSync(join(forms.path, forms.config.statusPath)) ? loadStatus(forms.path, forms.config) : null;
 
     const rows: ListRow[] = [];
     for (const key of Object.keys(project.descriptor.keys).sort()) {

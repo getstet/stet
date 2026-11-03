@@ -29,7 +29,7 @@ import { DEFAULT_TARGET, type KeyDef } from '../src/types.js';
 import { flag, parse, positionalsAround, required, text } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { loadConfig, rawConfigPlan, type StetConfig } from './config.js';
+import { loadConfig, rawConfigPlan, refuseInCopyFrom } from './config.js';
 import { KEY_NAME, NAME_PART } from './key-names.js';
 import type { CliIo } from './main.js';
 import { CliError, HostTextReport, Report, UsageError } from './report.js';
@@ -54,12 +54,6 @@ export interface ImportRow {
   approved: boolean;
   skipped?: string;
 }
-
-/**
- * The C5 guard a `copyFrom` checkout answers every writer with. A no-op until
- * C5 of 0.9.0 replaces it with `config.ts`' `refuseInCopyFrom`.
- */
-function refuseInCopyFrom(_config: StetConfig, _command: string): void {}
 
 export async function runImport(args: string[], io: CliIo): Promise<number> {
   const parsed = parse(

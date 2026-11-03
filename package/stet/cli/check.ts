@@ -22,8 +22,9 @@ import {
 import { checkCurrency, loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
-import { isHtmlHost, loadConfig, markAttributes, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, markAttributes, resolveCopyFrom, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
+import { generateOutput, outputSource } from './generated.js';
 import { checkDocuments, markedNowhere, proposeHtml } from './html-host.js';
 import { keyUsage } from './key-usage.js';
 import type { CliIo } from './main.js';
@@ -50,6 +51,11 @@ export async function runCheck(args: string[], io: CliIo): Promise<number> {
  * every caller awaits it before reading the report.
  */
 export async function check(config: StetConfig, cwd: string, report: Report): Promise<void> {
+  const owner = resolveCopyFrom(cwd, config);
+  if (owner !== null) {
+    checkCopyFrom(config, cwd, owner, report);
+    return;
+  }
   const descriptor = descriptorOf(config, cwd, report);
   if (!descriptor) return;
   const snapshot = snapshotOf(config, cwd, report);
@@ -57,8 +63,8 @@ export async function check(config: StetConfig, cwd: string, report: Report): Pr
 
   currency(descriptor, snapshot, report);
   statusFile(config, cwd, descriptor, report);
-  // On an html host the generated files ARE the marked documents: there is no
-  // codegen files to regenerate and compare.
+  // On an html host the generated files ARE the marked documents and the
+  // generated outputs: there are no codegen files to regenerate and compare.
   if (isHtmlHost(config)) {
     const files = filesForGlobs(cwd, config.managedSurfaces);
     const attributes = markAttributes(config);
@@ -66,10 +72,41 @@ export async function check(config: StetConfig, cwd: string, report: Report): Pr
     const carried = new Set(proposeHtml(cwd, files, attributes).claimed.map((mark) => mark.key));
     const named = markedNowhere(descriptor, snapshot, carried).length === 0 ? null : await namedKeys(config, cwd, descriptor, report);
     checkDocuments(cwd, files, descriptor, snapshot, report, named, attributes);
+    generated(config, cwd, descriptor, snapshot, statusOrNull(cwd, config), report, false);
   } else {
-    generated(config, cwd, descriptor, snapshot, report);
+    generated(config, cwd, descriptor, snapshot, statusOrNull(cwd, config), report, true);
   }
   values(descriptor, snapshot, report);
+}
+
+/**
+ * A checkout that reads its copy from another: the owner's currency, status
+ * and values are the owner's to report, so this checkout checks what it owns —
+ * its generated outputs and, on an html host, its documents — against the
+ * owner's forms, and never a codegen file it does not hold. Every key is the
+ * owner's to keep, so a key this checkout's pages never mark is no finding.
+ */
+function checkCopyFrom(config: StetConfig, cwd: string, owner: { owner: string; config: StetConfig }, report: Report): void {
+  report.line(`copy: read from ${config.copyFrom}`);
+  const descriptor = descriptorOf(owner.config, owner.owner, report);
+  if (!descriptor) return;
+  const snapshot = snapshotOf(owner.config, owner.owner, report);
+  if (!snapshot) return;
+  if (isHtmlHost(config)) {
+    const files = filesForGlobs(cwd, config.managedSurfaces);
+    checkDocuments(cwd, files, descriptor, snapshot, report, new Set(Object.keys(descriptor.keys)), markAttributes(config));
+  }
+  generated(config, cwd, descriptor, snapshot, statusOrNull(owner.owner, owner.config), report, false);
+}
+
+/** The status file a writer passes the generated outputs, or null where it cannot be read — `statusFile` reports that. */
+function statusOrNull(cwd: string, config: StetConfig): StatusFile | null {
+  try {
+    return loadStatus(cwd, config);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    return null;
+  }
 }
 
 /**
@@ -195,46 +232,70 @@ function statusFile(config: StetConfig, cwd: string, descriptor: Descriptor, rep
  * snapshot-derived defaults module, which only `pull` rewrites. A finding that
  * named the wrong command sent the reader around a loop the command could not
  * close.
+ *
+ * The codegen files are a JavaScript host's own; every host checks the outputs
+ * its config's `generated` lists. A `json` output has no header to carry a
+ * hash, so it is regenerated and compared: current, or it differs.
  */
 function generated(
   config: StetConfig,
   cwd: string,
   descriptor: Descriptor,
   snapshot: Snapshot,
+  status: StatusFile | null,
   report: Report,
+  codegen: boolean,
 ): void {
-  const files: { path: string; generate: () => string; source: unknown; remedy: string }[] = [
-    {
-      path: config.codegen.registry,
-      source: descriptor,
-      generate: () => generateRegistry(descriptor).keysTs,
-      remedy: 'stet upgrade',
-    },
-    {
-      // The ambient union is the one file that TYPES a key, so a stale one
-      // keeps `copy('removed_key')` compiling in the host — exactly the residue
-      // a removal that outran its codegen leaves behind. It carries the same
-      // generated header the registry does, so it currency-checks the same way,
-      // and `upgrade` writes both unconditionally.
-      path: config.codegen.dts,
-      source: descriptor,
-      generate: () => generateRegistry(descriptor).dts,
-      remedy: 'stet upgrade',
-    },
-    {
-      path: config.codegen.defaults,
-      source: snapshot,
-      generate: () => generateDefaultsModule(snapshot),
-      remedy: 'stet pull',
-    },
-    {
-      // The client mount's map: both forms are its source, and `pull` rewrites
-      // it from them on both hosts' arms.
-      path: config.codegen.resolved,
-      source: { descriptor, snapshot },
-      generate: () => generateResolvedModule(descriptor, snapshot),
-      remedy: 'stet pull',
-    },
+  const files: { path: string; generate: () => string; source: unknown; remedy: string; header: boolean }[] = [
+    ...(codegen
+      ? [
+          {
+            path: config.codegen.registry,
+            source: descriptor,
+            generate: () => generateRegistry(descriptor).keysTs,
+            remedy: 'stet upgrade',
+            header: true,
+          },
+          {
+            // The ambient union is the one file that TYPES a key, so a stale one
+            // keeps `copy('removed_key')` compiling in the host — exactly the residue
+            // a removal that outran its codegen leaves behind. It carries the same
+            // generated header the registry does, so it currency-checks the same way,
+            // and `upgrade` writes both unconditionally.
+            path: config.codegen.dts,
+            source: descriptor,
+            generate: () => generateRegistry(descriptor).dts,
+            remedy: 'stet upgrade',
+            header: true,
+          },
+          {
+            path: config.codegen.defaults,
+            source: snapshot,
+            generate: () => generateDefaultsModule(snapshot),
+            remedy: 'stet pull',
+            header: true,
+          },
+          {
+            // The client mount's map: both forms are its source, and `pull` rewrites
+            // it from them on both hosts' arms.
+            path: config.codegen.resolved,
+            source: { descriptor, snapshot },
+            generate: () => generateResolvedModule(descriptor, snapshot),
+            remedy: 'stet pull',
+            header: true,
+          },
+        ]
+      : []),
+    ...config.generated.map((entry) => {
+      const inputs = [entry, descriptor, snapshot, status, config.placeholders, config.locales.default] as const;
+      return {
+        path: entry.file,
+        source: outputSource(...inputs),
+        generate: () => generateOutput(...inputs),
+        remedy: 'stet pull',
+        header: entry.format !== 'json',
+      };
+    }),
   ];
 
   const states: Record<string, string> = {};
@@ -247,6 +308,13 @@ function generated(
       states[file.path] = 'absent';
       continue;
     }
+    if (!file.header) {
+      const current = text === file.generate();
+      if (current) report.line(`generated: ${file.path} current`);
+      else report.error('config', `${file.path}: differs from the snapshot — run ${file.remedy}`);
+      states[file.path] = current ? 'current' : 'differs';
+      continue;
+    }
     const state = checkGeneratedCurrent(text, file.source, file.generate);
     if (state.status === 'staleSource') {
       report.error('config', `${file.path}: stale — its source moved; run ${file.remedy}`);
@@ -257,7 +325,7 @@ function generated(
     }
     states[file.path] = state.status;
   }
-  report.data('generated', states);
+  if (files.length > 0) report.data('generated', states);
 }
 
 /** Every committed value, through the same validator `stet draft` runs. */

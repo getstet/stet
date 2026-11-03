@@ -73,7 +73,7 @@ export async function runDraft(args: string[], io: CliIo): Promise<number> {
   const locale = text(values, 'locale') ?? 'default';
   const publishAt = stamp(text(values, 'publish-at'));
 
-  const project = await loadProject(io, { env: text(values, 'env') });
+  const project = await loadProject(io, { env: text(values, 'env'), writer: 'draft' });
   try {
     // Own property, never a bare index: the key comes off the command line, and
     // `keys['constructor']` answers with a function from the prototype — which
@@ -139,7 +139,7 @@ export async function runPublish(args: string[], io: CliIo): Promise<number> {
 
   const key = required(positionals, 'publish', 'key');
   const locale = text(values, 'locale') ?? 'default';
-  const project = await loadProject(io, { env });
+  const project = await loadProject(io, { env, writer: 'publish' });
   try {
     const report = new Report();
     report.environment(project.environment.name);
@@ -201,7 +201,7 @@ function draftsPass(
  * edited value.
  */
 async function publishDue(io: CliIo, editor: string, env: string | undefined): Promise<number> {
-  const project = await loadProject(io, { env });
+  const project = await loadProject(io, { env, writer: 'publish' });
   try {
     const report = new Report();
     report.environment(project.environment.name);
@@ -402,7 +402,7 @@ async function demoteEmptyChanges(
 export async function runSeed(args: string[], io: CliIo): Promise<number> {
   const { values, positionals } = parse(args, { ...ENV_OPTION });
   noPositionals(positionals, 'seed');
-  const project = await loadProject(io, { env: text(values, 'env') });
+  const project = await loadProject(io, { env: text(values, 'env'), writer: 'seed' });
   try {
       const report = new Report();
       report.environment(project.environment.name);

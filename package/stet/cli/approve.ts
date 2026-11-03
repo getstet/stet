@@ -11,7 +11,7 @@
 import { parse, text } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { loadConfig } from './config.js';
+import { loadConfig, refuseInCopyFrom } from './config.js';
 import type { CliIo } from './main.js';
 import { CliError, Report, UsageError } from './report.js';
 import { approveKeys, gitUserName, loadStatus } from './status.js';
@@ -24,6 +24,7 @@ export async function runApprove(args: string[], io: CliIo): Promise<number> {
   if (keys.length === 0) throw new UsageError('stet approve needs at least one key');
 
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'approve');
   if (isStoreBacked(config.store)) throw new CliError(STORE_BACKED_APPROVAL);
   const report = new Report();
   const descriptor = descriptorOf(config, io.cwd, report);

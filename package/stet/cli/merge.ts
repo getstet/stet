@@ -16,7 +16,7 @@ import type { Descriptor, KeyDef } from '../src/types.js';
 import { flag, parse, text as argText } from './args.js';
 import { rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, refuseInCopyFrom, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
 import { hostRefusals, htmlRenames, keyMoveWrites, listedLine, readRenames, rewrittenLine, slotOrBrand, type HostRenames } from './rename.js';
 import { storeRowsLine } from './remove.js';
@@ -42,6 +42,7 @@ export async function runMerge(args: string[], io: CliIo): Promise<number> {
 
   const report = new HostTextReport();
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'merge');
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);

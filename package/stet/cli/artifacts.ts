@@ -17,6 +17,7 @@ import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { isHtmlHost, markAttributes, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
+import { generateOutput } from './generated.js';
 import { planDocuments } from './html-host.js';
 import { CliError, UsageError, type Report } from './report.js';
 import { completeStatus, statusPlan, type StatusFile } from './status.js';
@@ -159,22 +160,29 @@ export function writePlanned(
  * The forms that ride beside the descriptor and the snapshot: the approval
  * status file, planned over `completeStatus` so it holds every declared key —
  * null while the file does not exist and nothing is approved, and always null
- * on a store-backed project, where publishing is the approval.
+ * on a store-backed project, where publishing is the approval — and one write
+ * per generated output, from the snapshot's default locale.
  */
 export function planSideForms(
   cwd: string,
-  config: Pick<StetConfig, 'statusPath' | 'store'>,
+  config: Pick<StetConfig, 'statusPath' | 'store' | 'generated' | 'placeholders' | 'locales'>,
   descriptor: Descriptor,
-  _snapshot: Snapshot,
+  snapshot: Snapshot,
   status: StatusFile | null,
 ): { status: WritePlan | null; generated: WritePlan[] } {
   const held = status === null || isStoreBacked(config.store) ? null : status;
-  return { status: held === null ? null : statusPlan(cwd, config, completeStatus(held, descriptor)), generated: [] };
+  const generated = config.generated.map((entry) =>
+    asUpdate(
+      planWrite(join(cwd, entry.file), generateOutput(entry, descriptor, snapshot, status, config.placeholders, config.locales.default), entry.file),
+    ),
+  );
+  return { status: held === null ? null : statusPlan(cwd, config, completeStatus(held, descriptor)), generated };
 }
 
 /**
  * The repo forms as one update batch — the descriptor, the snapshot, the
- * regenerated codegen files and, once one exists, the status file.
+ * regenerated codegen files, once one exists the status file, and the
+ * generated outputs.
  *
  * The three commands that write keys write exactly these six, and a batch that
  * missed one would leave a permanent finding: `generateRegistry` stamps the
@@ -189,14 +197,22 @@ export function planSideForms(
  * leaves behind.
  *
  * `config.ts`'s runtime import of this module is one runtime edge between the
- * two; `isHtmlHost` is the other, and it runs the other way, and `status.ts`
- * and `store.ts` each run back the same way (a function called, never a value
- * read at load). This module also reaches `html-host.ts` and `files.ts` at
+ * two; `isHtmlHost` is the other, and it runs the other way, and `status.ts`,
+ * `store.ts` and `generated.ts` (through `status.ts`) each run back the same
+ * way (a function called, never a value read at load). This module also reaches `html-host.ts` and `files.ts` at
  * runtime — one way, since neither of those imports anything from here.
+ *
+ * A checkout that reads its copy from another (`copyFrom`) owns its generated
+ * outputs alone, whatever its `host`: the forms passed are the owner's, and
+ * the batch is those outputs and nothing else — never a descriptor, snapshot
+ * or codegen file planned into a checkout that owns none of them.
  */
 export function planRepoForms(
   cwd: string,
-  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces' | 'reads' | 'statusPath' | 'store'>,
+  config: Pick<
+    StetConfig,
+    'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces' | 'reads' | 'statusPath' | 'store' | 'generated' | 'placeholders' | 'locales' | 'copyFrom'
+  >,
   descriptor: Descriptor,
   snapshot: Snapshot,
   status: StatusFile | null,
@@ -204,6 +220,7 @@ export function planRepoForms(
 ): WritePlan[] {
   const at = (rel: string): string => join(cwd, rel);
   const side = planSideForms(cwd, config, descriptor, snapshot, status);
+  if (config.copyFrom !== undefined) return side.generated;
   const sideWrites = [...(side.status === null ? [] : [side.status]), ...side.generated];
   // On the static-HTML host the repo forms are the descriptor, the snapshot and
   // the MARKED DOCUMENTS: there are no codegen files, and each document is

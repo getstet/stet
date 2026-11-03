@@ -15339,3 +15339,33 @@ describe('the approval status in the dashboard routes (add-plain-js-hosts, C4)',
     expect(store.exists('content/status.json')).toBe(false);
   });
 });
+
+describe('a copyFrom checkout in the dashboard (add-plain-js-hosts, C5)', () => {
+  it("P5.3 its keys are the owner's, and a save, an approval and a commit answer 409 with the writer's line", async () => {
+    const owner = gitHost({ config: { project: 't' } });
+    const worker = gitHost({ config: null });
+    rmSync(join(worker.cwd, 'content'), { recursive: true, force: true });
+    const from = relative(worker.cwd, owner.cwd);
+    write(
+      worker.cwd,
+      'stet.config.json',
+      JSON.stringify({ project: 't', copyFrom: from, generated: [{ file: 'src/strings.mjs', format: 'esm', name: 'STRINGS', only: ['hero_'] }] }),
+    );
+    const { handler } = handlerOver([worker.cwd]);
+    const body = await get(handler, `/api/site${site(worker)}`);
+    expect(body.copyFrom).toBe(from);
+    expect(Object.keys(body.descriptor.keys)).toContain('hero_headline');
+    const held = owner.file('content/defaults.json');
+    for (const [route, payload] of [
+      ['save', { values: [{ key: 'hero_headline', value: 'From the worker' }] }],
+      ['approve', { key: 'hero_headline' }],
+      ['commit', { files: ['src/strings.mjs'], message: 'x' }],
+    ] as const) {
+      const answer = await post(handler, `/api/site/${route}${site(worker)}`, payload);
+      expect(answer.status, route).toBe(409);
+      expect(answer.body['error']).toBe(`this checkout reads its copy from ${from}; run stet dev there`);
+    }
+    expect(owner.file('content/defaults.json')).toBe(held);
+    expect(owner.exists('content/status.json')).toBe(false);
+  });
+});

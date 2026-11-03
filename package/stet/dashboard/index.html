@@ -1596,7 +1596,15 @@ function dark(title, line, fixture) {
 // --- Content -----------------------------------------------------------------
 /** The key column: the key list, the editor and History. The pane beside it is painted by `paintPane`. */
 function vContent() {
-  return keyList() + editorColumn();
+  return keyList() + (S.site.copyFrom ? copyFromColumn() : editorColumn());
+}
+/** A project that reads its copy from another checkout: the owner's keys listed, and in the editor's place where they are edited. */
+function copyFromColumn() {
+  const files = (S.site.config.generated || []).join(', ');
+  return '<div class="edcol" style="display:flex;flex-direction:column;gap:11px;min-width:0"><div class="card"><div class="cb">' +
+    '<p class="note" id="copyfrom" style="margin:0">' +
+    esc('This project reads its copy from ' + S.site.copyFrom + '. Edit it there; stet pull here refreshes ' + files + '.') +
+    '</p></div></div></div>';
 }
 
 function keyList() {

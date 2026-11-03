@@ -57,6 +57,7 @@ import {
   keyJoiner,
   loadConfig,
   markAttributes,
+  refuseInCopyFrom,
   selectStoreBlock,
   type StetConfig,
 } from './config.js';
@@ -135,6 +136,7 @@ export async function runRename(args: string[], io: CliIo): Promise<number> {
 
   const report = new HostTextReport();
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'rename');
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);

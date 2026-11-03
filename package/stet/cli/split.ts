@@ -21,7 +21,7 @@ import { flag, parse, text as argText } from './args.js';
 import { astroPlaceName } from './astro-rewrite.js';
 import { rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, keyJoiner, loadConfig, markAttributes, type StetConfig } from './config.js';
+import { isHtmlHost, keyJoiner, loadConfig, markAttributes, refuseInCopyFrom, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { htmlBaseName, proposeHtml } from './html-host.js';
 import { numberNames } from './key-names.js';
@@ -52,6 +52,7 @@ export async function runSplit(args: string[], io: CliIo): Promise<number> {
 
   const report = new HostTextReport();
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'split');
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);

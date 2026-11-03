@@ -10,7 +10,7 @@
 import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, join, relative } from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
@@ -3883,5 +3883,165 @@ describe('the approval status consumers (add-plain-js-hosts, C4)', () => {
     host.out.length = 0;
     expect(await host.run('list')).toBe(0);
     expect(host.out[0]).toMatch(/status$/);
+  });
+});
+
+describe('generated outputs and copyFrom (add-plain-js-hosts, C5)', () => {
+  const editSnapshot = (host: Host, key: string, value: string): void => {
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as { default: Record<string, unknown> };
+    snapshot.default[key] = value;
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+  };
+  const reset = (host: Host): void => {
+    host.out.length = 0;
+    host.err.length = 0;
+  };
+
+  it('P5.2 pull writes the outputs; check reports current, stale, hand-edited, not generated and the json differs line; approve rewrites a value-status output in the same batch', async () => {
+    const host = makeHost({
+      config: {
+        project: 't',
+        generated: [
+          { file: 'public/copy.js', format: 'script', name: 'TS.copyTable', values: 'value-status' },
+          { file: 'public/strings.json', format: 'json', only: ['hero_'] },
+        ],
+      },
+    });
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).toContain('public/copy.js: not generated — run stet pull');
+    expect(host.stderr()).toContain('public/strings.json: not generated — run stet pull');
+    reset(host);
+    expect(await host.run('pull')).toBe(0);
+    expect(host.out).toEqual(expect.arrayContaining(['wrote public/copy.js', 'wrote public/strings.json']));
+    expect(host.file('public/copy.js')).toContain('  "hero_headline": ["Never miss a post again.", "proposed"],');
+    expect(Object.keys(JSON.parse(host.file('public/strings.json')) as object)).toEqual(['hero_body', 'hero_headline']);
+    reset(host);
+    expect(await host.run('check')).toBe(0);
+    expect(host.out).toEqual(expect.arrayContaining(['generated: public/copy.js current', 'generated: public/strings.json current']));
+    // A second pull leaves both as they are.
+    reset(host);
+    expect(await host.run('pull')).toBe(0);
+    expect(host.out.join('\n')).not.toMatch(/wrote public\//);
+
+    editSnapshot(host, 'hero_headline', 'A new headline');
+    reset(host);
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('public/copy.js: stale — its source moved; run stet pull');
+    expect(host.stderr()).toContain('public/strings.json: differs from the snapshot — run stet pull');
+    expect(await host.run('pull')).toBe(0);
+    reset(host);
+    expect(await host.run('check')).toBe(0);
+
+    writeFileSync(join(host.cwd, 'public/copy.js'), host.file('public/copy.js').replace('A new headline', 'Edited by hand'));
+    reset(host);
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('public/copy.js: hand-edited — run stet pull instead of editing');
+    expect(await host.run('pull')).toBe(0);
+
+    reset(host);
+    expect(await host.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(0);
+    expect(host.out).toEqual(expect.arrayContaining(['wrote content/status.json', 'wrote public/copy.js']));
+    expect(host.file('public/copy.js')).toContain('  "hero_headline": ["A new headline", "approved"],');
+    reset(host);
+    expect(await host.run('check')).toBe(0);
+    expect(host.out).toContain('generated: public/copy.js current');
+  });
+
+  it('P5.5 a generated file outside the checkout is refused at load, and nothing is written', async () => {
+    const host = makeHost({ config: { project: 't', generated: [{ file: '../c5-outside-copy.json', format: 'json' }] } });
+    const before = host.file('content/defaults.json');
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('stet.config.json: generated[0].file must be inside this checkout — a second checkout generates its own file through copyFrom');
+    expect(existsSync(join(host.cwd, '..', 'c5-outside-copy.json'))).toBe(false);
+    expect(host.file('content/defaults.json')).toBe(before);
+  });
+
+  /** An owner checkout and a thin second checkout reading its copy: the second holds a config and nothing else. */
+  const pair = (): { owner: Host; worker: Host; from: string } => {
+    const owner = makeHost({ config: { project: 't' } });
+    const worker = makeHost({ config: null });
+    rmSync(join(worker.cwd, 'content'), { recursive: true, force: true });
+    const from = relative(worker.cwd, owner.cwd);
+    writeFileSync(
+      join(worker.cwd, 'stet.config.json'),
+      JSON.stringify({ project: 't', copyFrom: from, generated: [{ file: 'src/strings.mjs', format: 'esm', name: 'STRINGS', only: ['hero_', 'pricing_'] }] }),
+    );
+    return { owner, worker, from };
+  };
+  const OWNER_FORMS = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts', 'content/resolved.ts'];
+  const CODEGEN = /content\/(keys\.ts|stet-env\.d\.ts|defaults\.ts|resolved\.ts)/;
+
+  it('P5.3 a copyFrom checkout checks and pulls its own output, lists the owner\'s keys, and every writer answers the writer\'s line', async () => {
+    const { owner, worker, from } = pair();
+    expect(await worker.run('check')).toBe(0);
+    expect(worker.out).toContain(`copy: read from ${from}`);
+    expect(worker.stderr()).toContain('src/strings.mjs: not generated — run stet pull');
+    reset(worker);
+    expect(await worker.run('pull')).toBe(0);
+    expect(worker.out).toContain('wrote src/strings.mjs');
+    expect(worker.file('src/strings.mjs')).toContain('\nexport const STRINGS = {\n');
+    expect(worker.file('src/strings.mjs')).toContain('  "hero_headline": "Never miss a post again.",');
+    reset(worker);
+    expect(await worker.run('check')).toBe(0);
+    expect(worker.out).toContain('generated: src/strings.mjs current');
+
+    editSnapshot(owner, 'hero_headline', 'A new headline');
+    reset(worker);
+    expect(await worker.run('check')).toBe(1);
+    expect(worker.out).toContain(`copy: read from ${from}`);
+    expect(worker.stderr()).toContain('src/strings.mjs: stale — its source moved; run stet pull');
+
+    reset(worker);
+    expect(await worker.run('list')).toBe(0);
+    expect(worker.stdout()).toContain('hero_headline');
+    expect(worker.stdout()).toContain('welcome__subject');
+
+    const held = OWNER_FORMS.map((rel) => owner.file(rel));
+    writeFileSync(join(worker.cwd, 'strings.json'), JSON.stringify({ hero_headline: 'From the worker' }));
+    for (const [command, args] of [
+      ['approve', ['approve', 'hero_headline', '--by', 'nj-io']],
+      ['rename', ['rename', 'hero_headline', 'hero_title', '--write']],
+      ['import', ['import', 'strings.json', '--write']],
+    ] as const) {
+      reset(worker);
+      expect(await worker.run(...args), command).toBe(1);
+      expect(worker.stderr()).toContain(`this checkout reads its copy from ${from}; run stet ${command} there`);
+    }
+    expect(OWNER_FORMS.map((rel) => owner.file(rel))).toEqual(held);
+    expect(worker.exists('content')).toBe(false);
+  });
+
+  it('P5.4 copyFrom naming a folder with no config, this folder, or an owner that reads from elsewhere is a config error', async () => {
+    const at = (copyFrom: string): Host => {
+      const host = makeHost({ config: null });
+      rmSync(join(host.cwd, 'content'), { recursive: true, force: true });
+      writeFileSync(join(host.cwd, 'stet.config.json'), JSON.stringify({ project: 't', copyFrom }));
+      return host;
+    };
+    const nowhere = at('../c5-no-such-owner');
+    expect(await nowhere.run('check')).toBe(1);
+    expect(nowhere.stderr()).toContain('stet.config.json: copyFrom names ../c5-no-such-owner, which holds no stet.config.json');
+    const itself = at('.');
+    expect(await itself.run('check')).toBe(1);
+    expect(itself.stderr()).toContain('stet.config.json: copyFrom names itself');
+    const { worker: middle } = pair();
+    const chained = at('x');
+    writeFileSync(join(chained.cwd, 'stet.config.json'), JSON.stringify({ project: 't', copyFrom: relative(chained.cwd, middle.cwd) }));
+    expect(await chained.run('check')).toBe(1);
+    expect(chained.stderr()).toContain(`stet.config.json: copyFrom names ${relative(chained.cwd, middle.cwd)}, which reads its own copy from elsewhere — name the owner`);
+  });
+
+  it('P5.7 a copyFrom checkout with no host of its own: pull writes its generated file and nothing else, and check names no codegen file', async () => {
+    const { owner, worker } = pair();
+    const held = OWNER_FORMS.map((rel) => owner.file(rel));
+    expect(await worker.run('pull')).toBe(0);
+    expect(worker.out).toEqual(['wrote src/strings.mjs']);
+    expect(worker.exists('content')).toBe(false);
+    for (const rel of OWNER_FORMS) expect(worker.exists(rel), rel).toBe(false);
+    expect(OWNER_FORMS.map((rel) => owner.file(rel))).toEqual(held);
+    reset(worker);
+    expect(await worker.run('check')).toBe(0);
+    expect(`${worker.stdout()}\n${worker.stderr()}`).not.toMatch(CODEGEN);
+    expect(worker.stderr()).not.toContain('not generated');
   });
 });

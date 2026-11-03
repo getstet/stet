@@ -22,7 +22,7 @@ import type { StoreRow } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter, StoreError } from '../src/store.js';
 import type { Descriptor } from '../src/types.js';
-import { loadConfig, selectStoreBlock, type StetConfig, type StoreBlock } from './config.js';
+import { loadConfig, refuseInCopyFrom, resolveCopyFrom, selectStoreBlock, type StetConfig, type StoreBlock } from './config.js';
 import type { CliIo } from './main.js';
 import { CliError } from './report.js';
 import { contactsBlock, contactsConfig, isStoreBacked, resolveStore } from './store.js';
@@ -39,6 +39,12 @@ export interface LoadedProject {
   descriptor: Descriptor;
   descriptorWarnings: DescriptorWarning[];
   snapshot: Snapshot;
+  /**
+   * Where the descriptor, the snapshot and the status file were read: the
+   * owner's folder and config where this checkout names `copyFrom`, else null
+   * (this checkout and `config`).
+   */
+  owner: { path: string; config: StetConfig } | null;
   store: StoreAdapter;
   /**
    * Which store connection this load selected, and the block behind it. Command
@@ -83,6 +89,8 @@ export interface LoadProjectOptions {
   tolerateStoreConfig?: boolean;
   /** `--env <name>`; absent selects the bare `store` block. */
   env?: string;
+  /** The command a writer is: a checkout that reads its copy from another refuses it before anything is read. */
+  writer?: string;
 }
 
 /**
@@ -131,12 +139,17 @@ export async function loadProject(
   opts: LoadProjectOptions = {},
 ): Promise<LoadedProject> {
   const config = opts.config ?? loadConfig(io.cwd);
+  if (opts.writer !== undefined) refuseInCopyFrom(config, opts.writer);
   // Selection FIRST, before injection is even looked up: an unknown `--env` is
   // a usage error whether or not a store was handed to us, so a typo can never
   // ride an injected adapter past the check.
   const environment = selectStoreBlock(config, opts.env);
-  const { descriptor, warnings } = readDescriptor(io.cwd, config.descriptorPath);
-  const snapshot = readSnapshot(io.cwd, config.snapshotPath);
+  // A checkout naming `copyFrom` reads the owner's forms through the owner's config.
+  const resolved = resolveCopyFrom(io.cwd, config);
+  const owner = resolved === null ? null : { path: resolved.owner, config: resolved.config };
+  const formsAt = owner ?? { path: io.cwd, config };
+  const { descriptor, warnings } = readDescriptor(formsAt.path, formsAt.config.descriptorPath);
+  const snapshot = readSnapshot(formsAt.path, formsAt.config.snapshotPath);
 
   let store: StoreAdapter;
   let storeProblem: string | undefined;
@@ -160,6 +173,7 @@ export async function loadProject(
     descriptor,
     descriptorWarnings: warnings,
     snapshot,
+    owner,
     store,
     environment,
     async readRows(q = {}): Promise<RowsAnswer> {

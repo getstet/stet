@@ -49,7 +49,7 @@ import { flag, parse, positionalsAround, refuseEnv } from './args.js';
 import { asUpdate, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { componentCache, readableAs, readAstroHead, astroHeadEdits, rereadsClean, type AstroHead } from './astro-rewrite.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, markAttributes, refuseUnresolvableAlias, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, markAttributes, refuseInCopyFrom, refuseUnresolvableAlias, type StetConfig } from './config.js';
 import { filesForGlobs, walk } from './files.js';
 import { proposeHtml } from './html-host.js';
 import { NAME_PART, wordsOf } from './key-names.js';
@@ -940,6 +940,7 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
   const names = around.after;
 
   const config = loadConfig(io.cwd);
+  if (apply) refuseInCopyFrom(config, 'pages scan --apply');
   const report = new Report();
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io, { json });

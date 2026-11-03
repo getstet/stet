@@ -43,7 +43,7 @@ import { validateSave, VARIABLE } from '../src/validate.js';
 import { flag, parse, positionalsAround, refuseEnv, text } from './args.js';
 import { asUpdate, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { loadConfig, rawConfigPlan, type StetConfig } from './config.js';
+import { loadConfig, rawConfigPlan, refuseInCopyFrom, type StetConfig } from './config.js';
 import { containedPointer, outsideLine } from './email-render.js';
 import { filesForGlobs } from './files.js';
 import { gitFiles } from './git.js';
@@ -203,6 +203,7 @@ export async function runEmailExtract(args: string[], io: CliIo): Promise<number
   }
 
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'email extract');
   const report = new Report();
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io, { json });

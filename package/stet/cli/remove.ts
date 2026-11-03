@@ -34,7 +34,7 @@ import type { Descriptor, KeyDef, PageDef } from '../src/types.js';
 import { flag, parse, refuseEnv } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { checkValues, descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, markAttributes, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, markAttributes, refuseInCopyFrom, type StetConfig } from './config.js';
 import { proposeHtml, stripMarks } from './html-host.js';
 import type { CliIo } from './main.js';
 import { clip, CliError, Report, UsageError } from './report.js';
@@ -61,6 +61,7 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
   // prints check's own error string.
   const report = new Report();
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'remove');
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);

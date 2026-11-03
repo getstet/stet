@@ -24,7 +24,17 @@ import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { writeJsonDeterministic } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { CONFIG_FILE, defaultStoreBlock, isHtmlHost, loadConfig, selectStoreBlock, STORE_ADAPTERS, type StetConfig, type StoreBlock } from './config.js';
+import {
+  CONFIG_FILE,
+  defaultStoreBlock,
+  isHtmlHost,
+  loadConfig,
+  resolveCopyFrom,
+  selectStoreBlock,
+  STORE_ADAPTERS,
+  type StetConfig,
+  type StoreBlock,
+} from './config.js';
 import { gitState } from './git.js';
 import type { CliIo } from './main.js';
 import { CliError, Report } from './report.js';
@@ -227,6 +237,10 @@ export type SiteState =
       project: string;
       /** The config's router: the page names a JavaScript host by it. */
       router: StetConfig['router'];
+      /** The config's `copyFrom` as written: the copy is read from there, and the site is read-only here. */
+      copyFrom?: string;
+      /** The owner's folder and config the forms were read through, where `copyFrom` is set. */
+      owner?: { path: string; config: StetConfig };
     };
 
 /**
@@ -246,15 +260,20 @@ export function loadSite(entry: WorkspaceEntry): SiteState {
   if (!existsSync(join(path, CONFIG_FILE))) return { state: 'not-adopted', name, ...named, path, id };
 
   let config: StetConfig;
+  let owner: { path: string; config: StetConfig } | undefined;
   try {
     config = loadConfig(path);
+    const resolved = resolveCopyFrom(path, config);
+    if (resolved !== null) owner = { path: resolved.owner, config: resolved.config };
   } catch (error) {
     return { state: 'broken', name, ...named, path, id, message: (error as Error).message };
   }
 
+  // A checkout naming `copyFrom` reads the owner's forms through the owner's config.
   const report = new Report();
-  const descriptor = descriptorOf(config, path, report);
-  const snapshot = descriptor === null ? null : snapshotOf(config, path, report);
+  const formsAt = owner ?? { path, config };
+  const descriptor = descriptorOf(formsAt.config, formsAt.path, report);
+  const snapshot = descriptor === null ? null : snapshotOf(formsAt.config, formsAt.path, report);
   if (descriptor === null || snapshot === null) {
     const errors = report.findings.filter((f) => f.level === 'error').map((f) => f.message);
     return { state: 'broken', name, ...named, path, id, message: errors.join('; ') };
@@ -278,6 +297,7 @@ export function loadSite(entry: WorkspaceEntry): SiteState {
     git: gitState(path),
     project: config.project,
     router: config.router,
+    ...(owner === undefined ? {} : { copyFrom: config.copyFrom as string, owner }),
   };
 }
 

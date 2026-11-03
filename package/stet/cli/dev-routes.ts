@@ -36,7 +36,7 @@ import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js
 import { STORE_BACKED_APPROVAL } from './approve.js';
 import { check } from './check.js';
 import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
-import { markAttributes, pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
+import { copyFromRefusal, markAttributes, pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
 import { isBarePackage } from './email-extract.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, uncommittedStatus, type GitState } from './git.js';
@@ -230,7 +230,7 @@ function listing(ctx: DevContext): SiteState[] {
 /** A site's listing row: everything but the two big forms, which `GET /api/site` carries. */
 function summary(site: SiteState): Record<string, unknown> {
   if (site.state !== 'ready') return { ...site };
-  const { descriptor: _descriptor, snapshot: _snapshot, config: _config, ...rest } = site;
+  const { descriptor: _descriptor, snapshot: _snapshot, config: _config, owner: _owner, ...rest } = site;
   return rest;
 }
 
@@ -449,6 +449,9 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
   // The email preview runs host code and writes nothing: outside the queue.
   if (req.method === 'POST' && route === 'site/email-preview') return withSite(ctx, url, (site) => emailPreview(ctx, req, site), false);
   return withSite(ctx, url, async (site, entry) => {
+    // A checkout reading its copy from another changes none of it: every route that writes the forms answers the writer's line.
+    const refusal = site.state === 'ready' && COPY_WRITES.has(`${req.method} ${route}`) ? copyFromRefusal(site.config, 'dev') : null;
+    if (refusal !== null) return json({ error: refusal }, 409);
     switch (`${req.method} ${route}`) {
       case 'GET site':
         return await siteReply(site, entry, ctx.launched);
@@ -514,6 +517,18 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
   });
 }
 
+/** The routes that write a site's forms or commit them, which a `copyFrom` checkout refuses. */
+const COPY_WRITES: ReadonlySet<string> = new Set([
+  'POST site/save',
+  'POST site/approve',
+  'POST site/commit',
+  'POST site/merge',
+  'POST site/split',
+  'POST site/restore',
+  'POST site/pages/declare',
+  'POST site/remove',
+]);
+
 /** A site that is not loadable is answered with what it is, on every route that needs its forms. */
 function requireReady(site: SiteState): Extract<SiteState, { state: 'ready' }> {
   if (site.state === 'ready') return site;
@@ -565,6 +580,7 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
       descriptorPath: config.descriptorPath,
       snapshotPath: config.snapshotPath,
       managedSurfaces: config.managedSurfaces,
+      generated: config.generated.map((entry) => entry.file),
       store: { adapter: config.store?.adapter ?? 'snapshot' },
     },
     environments,
@@ -587,13 +603,16 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
  */
 function statusPayload(site: Ready): { status: StatusFile | null; approvable: boolean; approver: string | null } {
   if (site.mode !== 'snapshot') return { status: null, approvable: false, approver: null };
-  const approver = gitUserName(site.path);
-  if (!existsSync(join(site.path, site.config.statusPath))) return { status: null, approvable: true, approver };
+  // A checkout reading its copy from another shows the owner's status and approves nothing.
+  const at = site.owner ?? { path: site.path, config: site.config };
+  const approvable = site.owner === undefined;
+  const approver = approvable ? gitUserName(site.path) : null;
+  if (!existsSync(join(at.path, at.config.statusPath))) return { status: null, approvable, approver };
   try {
-    return { status: loadStatus(site.path, site.config), approvable: true, approver };
+    return { status: loadStatus(at.path, at.config), approvable, approver };
   } catch (error) {
     if (!(error instanceof CliError)) throw error;
-    return { status: null, approvable: true, approver };
+    return { status: null, approvable, approver };
   }
 }
 
@@ -1085,12 +1104,15 @@ function keyMoves(
  * The forms stet writes on this site, enumerated once for the commit's accept
  * set and the pending list: the descriptor and the snapshot, then either the
  * codegen files or — on the static-HTML host — the managed globs whose marked
- * documents count.
+ * documents count, then the status file and the generated outputs.
  */
 function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
   const { config } = site;
+  const outputs = config.generated.map((entry) => entry.file);
+  // A checkout reading its copy from another writes its generated outputs alone.
+  if (site.owner !== undefined) return { files: outputs.map(gitSpelling), globs: [] };
   if (site.host === 'html') {
-    return { files: [config.descriptorPath, config.snapshotPath, config.statusPath].map(gitSpelling), globs: config.managedSurfaces };
+    return { files: [config.descriptorPath, config.snapshotPath, config.statusPath, ...outputs].map(gitSpelling), globs: config.managedSurfaces };
   }
   return {
     files: [
@@ -1101,6 +1123,7 @@ function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
       config.codegen.defaults,
       config.codegen.resolved,
       config.statusPath,
+      ...outputs,
     ].map(gitSpelling),
     globs: [],
   };
