@@ -21,14 +21,14 @@ import { flag, parse, text as argText } from './args.js';
 import { astroPlaceName } from './astro-rewrite.js';
 import { rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, keyJoiner, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, keyJoiner, loadConfig, markAttributes, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { htmlBaseName, proposeHtml } from './html-host.js';
 import { numberNames } from './key-names.js';
 import { planProblems, type NamingPlan } from './key-plan.js';
 import type { CliIo } from './main.js';
 import { htmlPageOf, pageOfFile } from './pages.js';
-import { accessorBaseName, hostRefusals, keyMoveWrites, markRenames, readRenames, slotOrBrand, type HostRenames, type OnlyAt } from './rename.js';
+import { accessorBaseName, hostRefusals, htmlRenames, keyMoveWrites, readRenames, slotOrBrand, type HostRenames, type OnlyAt } from './rename.js';
 import { HostTextReport, UsageError } from './report.js';
 import { dialectOf, loadTypescript, scanSource } from './source-scan.js';
 
@@ -110,7 +110,7 @@ export async function planSplit(
 
   const renames = new Map([[key, next]]);
   const move = (only?: OnlyAt): Promise<HostRenames> | HostRenames =>
-    isHtmlHost(config) ? markRenames(cwd, config, renames, only) : readRenames(cwd, config, renames, new Set(Object.keys(descriptor.keys)), only);
+    isHtmlHost(config) ? htmlRenames(cwd, config, renames, descriptor, only) : readRenames(cwd, config, renames, new Set(Object.keys(descriptor.keys)), only);
   const all = await move();
   const here = await move(at);
   // A place is a line that marks or reads the key; two marks on one line are one place.
@@ -147,7 +147,7 @@ export async function proposedSplitName(
 ): Promise<string | null> {
   let base: string | null = null;
   if (isHtmlHost(config)) {
-    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces).filter((file) => file === at.file));
+    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces).filter((file) => file === at.file), markAttributes(config));
     const mark = set.claimed.find((m) => m.key === key && m.line === at.line);
     if (mark !== undefined) base = htmlBaseName(htmlPageOf(cwd, mark.file, descriptor.pages), mark, keyJoiner(config));
   } else {

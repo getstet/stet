@@ -11,6 +11,8 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { bindingsOf, codeOf, dialectCode, planReadRenames, readFormAt, stetModuleTest, within } from '../cli/key-reads.js';
+import { loadConfig } from '../cli/config.js';
+import { readRenames } from '../cli/rename.js';
 import { applyFileEdits } from '../cli/rewrite.js';
 import { dialectOf, loadTypescript, type Dialect } from '../cli/source-scan.js';
 
@@ -442,5 +444,25 @@ describe('stetModuleTest', () => {
     expect(test('@/lib/content')).toBe(true);
     expect(test('../lib/content')).toBe(true);
     expect(test('@/lib/other')).toBe(false);
+  });
+});
+
+describe('a configured read function is a read form (D8)', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('P3.9 rename rewrites TS.tx("a.b") and the key argument of { name: "i18n.t", key: 1 }, and leaves a comment a mention', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stet-reads-'));
+    made.push(dir);
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    writeFileSync(join(dir, 'stet.config.json'), JSON.stringify({ managedSurfaces: ['src/*.js'], reads: { functions: ['TS.tx', { name: 'i18n.t', key: 1 }] } }));
+    writeFileSync(join(dir, 'src/screen.js'), ['// a.b is the headline', 'TS.tx("a.b");', 'i18n.t(locale, "a.b");', 'i18n.t("a.b", locale);', ''].join('\n'));
+    const host = await readRenames(dir, loadConfig(dir), new Map([['a.b', 'a.c']]), new Set(['a.b']));
+    expect(host.rewritten.map((o) => o.line)).toEqual([2, 3]);
+    expect(host.mentions.map((o) => o.line)).toEqual([1]);
+    expect(host.blocked.map((o) => o.line)).toEqual([4]);
+    expect(host.edited[0]?.text).toBe(['// a.b is the headline', 'TS.tx("a.c");', 'i18n.t(locale, "a.c");', 'i18n.t("a.b", locale);', ''].join('\n'));
   });
 });

@@ -22,11 +22,13 @@ import {
 import { checkCurrency, loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, markAttributes, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
-import { checkDocuments } from './html-host.js';
+import { checkDocuments, markedNowhere, proposeHtml } from './html-host.js';
+import { keyUsage } from './key-usage.js';
 import type { CliIo } from './main.js';
-import { Report } from './report.js';
+import { CliError, Report } from './report.js';
+import { TS_BROKEN } from './source-scan.js';
 import { validateValue } from './validate.js';
 
 export async function runCheck(args: string[], io: CliIo): Promise<number> {
@@ -36,12 +38,16 @@ export async function runCheck(args: string[], io: CliIo): Promise<number> {
 
   const report = new Report();
   const config = loadConfig(io.cwd);
-  check(config, io.cwd, report);
+  await check(config, io.cwd, report);
   return report.emit(io, { json: flag(values, 'json') });
 }
 
-/** The check itself, so `doctor` reports the same facts without a second implementation. */
-export function check(config: StetConfig, cwd: string, report: Report): void {
+/**
+ * The check itself, so `doctor` reports the same facts without a second
+ * implementation. Async on every arm, since the html arm runs the usage scan:
+ * every caller awaits it before reading the report.
+ */
+export async function check(config: StetConfig, cwd: string, report: Report): Promise<void> {
   const descriptor = descriptorOf(config, cwd, report);
   if (!descriptor) return;
   const snapshot = snapshotOf(config, cwd, report);
@@ -51,11 +57,32 @@ export function check(config: StetConfig, cwd: string, report: Report): void {
   // On an html host the generated files ARE the marked documents: there is no
   // codegen files to regenerate and compare.
   if (isHtmlHost(config)) {
-    checkDocuments(cwd, filesForGlobs(cwd, config.managedSurfaces), descriptor, snapshot, report);
+    const files = filesForGlobs(cwd, config.managedSurfaces);
+    const attributes = markAttributes(config);
+    // The usage scan runs only where a key is marked nowhere: the one finding it changes.
+    const carried = new Set(proposeHtml(cwd, files, attributes).claimed.map((mark) => mark.key));
+    const named = markedNowhere(descriptor, snapshot, carried).length === 0 ? null : await namedKeys(config, cwd, descriptor, report);
+    checkDocuments(cwd, files, descriptor, snapshot, report, named, attributes);
   } else {
     generated(config, cwd, descriptor, snapshot, report);
   }
   values(descriptor, snapshot, report);
+}
+
+/**
+ * The keys the source names or may reach — `read` or `unknown` in the usage
+ * scan — which need no mark on an html host. Null where the compiler does not
+ * load: every unmarked key then warns as before, and the scan's line says why.
+ */
+async function namedKeys(config: StetConfig, cwd: string, descriptor: Descriptor, report: Report): Promise<Set<string> | null> {
+  try {
+    const usage = await keyUsage(cwd, config, descriptor);
+    return new Set(Object.entries(usage.keys).filter(([, state]) => state.state !== 'not_found').map(([key]) => key));
+  } catch (error) {
+    if (!(error instanceof CliError) || error.message !== TS_BROKEN) throw error;
+    report.line(TS_BROKEN);
+    return null;
+  }
 }
 
 /**

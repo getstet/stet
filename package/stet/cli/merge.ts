@@ -18,7 +18,7 @@ import { rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
 import type { CliIo } from './main.js';
-import { hostRefusals, keyMoveWrites, markRenames, readRenames, slotOrBrand, type HostRenames } from './rename.js';
+import { hostRefusals, htmlRenames, keyMoveWrites, listedLine, readRenames, rewrittenLine, slotOrBrand, type HostRenames } from './rename.js';
 import { storeRowsLine } from './remove.js';
 import { HostTextReport, UsageError } from './report.js';
 
@@ -53,9 +53,8 @@ export async function runMerge(args: string[], io: CliIo): Promise<number> {
     return report.emit(io);
   }
   report.line(`merge ${leaving} into ${into}`);
-  for (const occ of plan.host.rewritten) {
-    report.line(isHtmlHost(config) ? `  ${occ.file}:${occ.line} the mark is renamed` : `  ${occ.file}:${occ.line} ${occ.text}`);
-  }
+  for (const occ of plan.host.rewritten) report.line(rewrittenLine(config, occ));
+  for (const occ of plan.host.listed ?? []) report.line(listedLine(occ));
   for (const line of plan.follows) report.line(`  ${line}`);
   storeRowsLine(config, report);
   if (!flag(values, 'write')) {
@@ -122,7 +121,7 @@ export async function planMerge(
   }
 
   const renames = new Map([[leaving, into]]);
-  const host = isHtmlHost(config) ? markRenames(cwd, config, renames) : await readRenames(cwd, config, renames, new Set(Object.keys(descriptor.keys)));
+  const host = isHtmlHost(config) ? await htmlRenames(cwd, config, renames, descriptor) : await readRenames(cwd, config, renames, new Set(Object.keys(descriptor.keys)));
   refused.push(...hostRefusals(host, leaving));
   if (refused.length > 0) return { refused };
 

@@ -31,7 +31,8 @@ import { join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { normalizeNoExt, pathAliasMappings, resolveSpecifier } from './config.js';
+import { escapeRegExp } from '../src/seo.js';
+import { normalizeNoExt, pathAliasMappings, resolveSpecifier, type ReadFunction } from './config.js';
 import { lineIndex } from './html-host.js';
 import { dialectCode, openTag, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
 import { parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
@@ -198,10 +199,77 @@ const ELEMENT_READ = /(?<![\w$.])(copy|copyMap)\s*\[\s*(['"`])$/;
 const HOOK_CALL = /useCopy\s*\(\s*\)\s*\(\s*(['"`])$/;
 
 /**
- * The binding a read form ends at `at` through, or null where the text before
- * `at` is no read form or the key's own closing quote does not follow.
+ * The call opening of the project's configured read functions (`TS.tx(`,
+ * `t (`), the written name in group 1, whitespace allowed around its dots;
+ * null where none is configured. Built once per file a rename reads.
  */
-export function readFormAt(source: string, at: number, key: string): string | null {
+export function configuredReadForm(functions: readonly ReadFunction[]): RegExp | null {
+  if (functions.length === 0) return null;
+  const names = [...new Set(functions.map((f) => f.name))].sort((a, b) => b.length - a.length);
+  return new RegExp(`(?<![\\w$.])(${names.map((name) => name.split('.').map(escapeRegExp).join('\\s*\\.\\s*')).join('|')})\\s*\\(`, 'g');
+}
+
+/** How far back from a key a configured call's opening is looked for. */
+const CALL_REACH = 400;
+
+/**
+ * The configured function whose key argument is the literal opening just
+ * before `at` — `TS.tx("<key>")`, or `i18n.t(locale, "<key>")` for a key at
+ * index 1 — by its configured name; null where none is. The argument list is
+ * walked by commas outside quotes and brackets.
+ */
+function configuredCallAt(source: string, at: number, key: string, form: RegExp, functions: readonly ReadFunction[]): string | null {
+  const quote = source[at - 1];
+  if ((quote !== '"' && quote !== "'" && quote !== '`') || source[at + key.length] !== quote) return null;
+  const from = Math.max(0, at - CALL_REACH);
+  for (const m of source.slice(from, at).matchAll(form)) {
+    const written = (m[1] as string).replace(/\s+/g, '');
+    const fn = functions.find((f) => f.name === written);
+    if (fn === undefined) continue;
+    // Walk the arguments from just past the `(` to the quote that opens the key.
+    let index = 0;
+    let depth = 0;
+    let start = from + (m.index as number) + m[0].length;
+    let i = start;
+    let inQuote: string | null = null;
+    for (; i < at - 1; i += 1) {
+      const c = source[i] as string;
+      if (inQuote !== null) {
+        if (c === '\\') i += 1;
+        else if (c === inQuote) inQuote = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === '`') inQuote = c;
+      else if (c === '(' || c === '[' || c === '{') depth += 1;
+      else if (c === ')' || c === ']' || c === '}') {
+        if (depth === 0) break;
+        depth -= 1;
+      } else if (c === ',' && depth === 0) {
+        index += 1;
+        start = i + 1;
+      }
+    }
+    if (i === at - 1 && inQuote === null && depth === 0 && index === fn.key && source.slice(start, at - 1).trim() === '') return fn.name;
+  }
+  return null;
+}
+
+/**
+ * The binding a read form ends at `at` through, or null where the text before
+ * `at` is no read form or the key's own closing quote does not follow. A call
+ * of a configured read function is tested first and answered by its configured
+ * name (`configured`, from `configuredReadForm`).
+ */
+export function readFormAt(
+  source: string,
+  at: number,
+  key: string,
+  configured?: { form: RegExp; functions: readonly ReadFunction[] },
+): string | null {
+  if (configured !== undefined) {
+    const name = configuredCallAt(source, at, key, configured.form, configured.functions);
+    if (name !== null) return name;
+  }
   const before = source.slice(Math.max(0, at - 120), at);
   const after = source[at + key.length] ?? '';
   const prop = PROPERTY_READ.exec(before);
@@ -298,8 +366,13 @@ export function planReadRenames(input: {
   copyModule: boolean;
   /** Every declared key, so an occurrence that is the head of a longer dotted key is that key's, not this one's. */
   declared?: ReadonlySet<string>;
+  /** The project's configured read functions (`reads.functions`): a call of one is a read form stet rewrites. */
+  functions?: readonly ReadFunction[];
 }): ReadRenames {
   const { ts, file, source, dialect, renames, isStetModule, copyModule, declared } = input;
+  const functions = input.functions ?? [];
+  const form = configuredReadForm(functions);
+  const configured = form === null ? undefined : { form, functions };
   const out: ReadRenames = { edits: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
   if (renames.size === 0) return out;
 
@@ -374,11 +447,13 @@ export function planReadRenames(input: {
         }
         continue;
       }
-      const through = readFormAt(source, at, key);
+      const through = readFormAt(source, at, key, configured);
       const client = clientScripts.find((c) => within([c.span], at));
       const scope = client?.bindings ?? bindings;
-      const binding = through === null || through === 'useCopy' ? null : scope.get(through);
-      if (through === 'useCopy' || binding === 'stet') {
+      // A configured function is a read whatever binds its name: the config binds it.
+      const isConfigured = through !== null && functions.some((f) => f.name === through);
+      const binding = through === null || through === 'useCopy' || isConfigured ? null : scope.get(through);
+      if (through === 'useCopy' || isConfigured || binding === 'stet') {
         out.edits.push({ pos: at, end: at + key.length, text: next });
         out.rewritten.push(occ);
       } else if (binding === 'none' && client !== undefined) {

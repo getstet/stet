@@ -6,7 +6,7 @@
 import { noindexes, resolvedString } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor, PageDef } from '../src/types.js';
-import { attrOf, attrValueOf, htmlBaseName, parentsOf, readDocument, sectionWordOf, type Document, type Element } from './html-host.js';
+import { attrValueOf, DATA_STET, htmlBaseName, parentsOf, readDocument, sectionWordOf, type Document, type Element } from './html-host.js';
 import { numberNames } from './key-names.js';
 import { DOCTYPE } from './lighthouse-fix.js';
 import { CATEGORIES, type LighthouseResult } from './lighthouse-run.js';
@@ -92,6 +92,10 @@ export interface PageContext {
   file: string | null;
   /** `--fix` runs, so a fix line points at the plan printed below. */
   fix: boolean;
+  /** The joiner the naming rule puts between a name's parts (`keyJoiner`); `_` where absent. */
+  joiner?: '_' | '.';
+  /** The attributes a mark is read under (`markAttributes`); `data-stet` alone where absent. */
+  attributes?: readonly string[];
 }
 
 /**
@@ -183,7 +187,7 @@ function listed(names: string[]): string {
 
 /** The key a mark on the element names, or the first key holding its text on a JavaScript host. */
 function keyOf(el: Element | null, node: Record<string, unknown> | undefined, context: PageContext): string | undefined {
-  if (el !== null) return attrOf(el, 'data-stet');
+  if (el !== null) return el.attrs.find((a) => (context.attributes ?? DATA_STET).includes(a.name))?.value;
   if (context.router === 'html') return undefined;
   const label = str(node?.['nodeLabel']);
   return label === undefined ? undefined : sharedTextIndex(context.descriptor, context.snapshot).get(label)?.[0];
@@ -225,7 +229,7 @@ function remedyOf(
     case 'select-name': {
       const base = `has no label — ${shaped === null ? 'wrap it in a <label>' : labelRemedy(shaped)}`;
       if (context.router !== 'html' || el === null || context.document === null || context.page === null) return { text: base, place: true };
-      const name = htmlBaseName(context.page, { sectionWord: sectionWordOf(el, parentsOf(context.document)), role: 'label', kind: 'element', tag: 'label' });
+      const name = htmlBaseName(context.page, { sectionWord: sectionWordOf(el, parentsOf(context.document)), role: 'label', kind: 'element', tag: 'label' }, context.joiner);
       const [numbered] = numberNames([name], (n) => Object.hasOwn(context.descriptor.keys, n));
       return { text: `${base}; stet register adopts its words as ${numbered as string}`, place: true };
     }

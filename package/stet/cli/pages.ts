@@ -49,7 +49,7 @@ import { flag, parse, positionalsAround, refuseEnv } from './args.js';
 import { asUpdate, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { componentCache, readableAs, readAstroHead, astroHeadEdits, rereadsClean, type AstroHead } from './astro-rewrite.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, refuseUnresolvableAlias, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, markAttributes, refuseUnresolvableAlias, type StetConfig } from './config.js';
 import { filesForGlobs, walk } from './files.js';
 import { proposeHtml } from './html-host.js';
 import { NAME_PART, wordsOf } from './key-names.js';
@@ -276,7 +276,7 @@ export function proposePages(
     seed?: boolean;
     /** Read each html page's MARKS and bind its title and description to them. */
     bind?: boolean;
-    config?: Pick<StetConfig, 'managedSurfaces'>;
+    config?: Pick<StetConfig, 'managedSurfaces' | 'reads'>;
     /** Read each `.astro` page's title and description, under `seed`. */
     astro?: { ts: typeof import('typescript'); config: StetConfig };
   } = {},
@@ -309,6 +309,7 @@ export function proposePages(
       ? boundFields(
           cwd,
           files.filter((f) => f.arm === 'html').map((f) => f.file),
+          options.config === undefined ? undefined : markAttributes(options.config),
         )
       : new Map<string, { title?: string; description?: string }>();
 
@@ -495,9 +496,10 @@ export function proposePages(
 function boundFields(
   cwd: string,
   files: string[],
+  attributes?: readonly string[],
 ): Map<string, { title?: string; description?: string }> {
   const bound = new Map<string, { title?: string; description?: string }>();
-  const set = proposeHtml(cwd, files);
+  const set = proposeHtml(cwd, files, attributes);
   for (const mark of set.claimed) {
     const field =
       mark.kind === 'element' && mark.tag === 'title'

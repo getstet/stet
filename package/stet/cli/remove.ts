@@ -34,7 +34,7 @@ import type { Descriptor, KeyDef, PageDef } from '../src/types.js';
 import { flag, parse, refuseEnv } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { checkValues, descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, markAttributes, type StetConfig } from './config.js';
 import { proposeHtml, stripMarks } from './html-host.js';
 import type { CliIo } from './main.js';
 import { clip, CliError, Report, UsageError } from './report.js';
@@ -203,7 +203,7 @@ export function planRemoval(
   // names each one the batch will strip. The text stays where it is; only the
   // attribute goes.
   if (isHtmlHost(config)) {
-    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces));
+    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces), markAttributes(config));
     const marks = set.claimed.filter((mark) => keys.includes(mark.key));
     if (marks.length > 0) {
       for (const mark of marks) {
@@ -408,7 +408,7 @@ function surfaceSources(cwd: string, config: StetConfig): { file: string; source
       // a `data-stet="<key>"` is not a read to un-wire and naming it would put a
       // caution on every page the removal already handles. The mark goes; a
       // mention of the key in prose or in a script is left to be found.
-      found.push({ file, source: html && file.endsWith('.html') ? stripMarks(text) : text });
+      found.push({ file, source: html && file.endsWith('.html') ? stripMarks(text, markAttributes(config)) : text });
     } catch {
       // A file the walk listed and this read cannot open mentions nothing.
     }
