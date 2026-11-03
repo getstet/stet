@@ -268,6 +268,12 @@ function readsInUnreadText(source: string, at: number, functions: readonly ReadF
   return value !== undefined && functions.some((f) => mentionPattern(f.name).test(value));
 }
 
+/** Whether the key at `at` is the argument of a configured call written in an HTML document's element text (`<p>{{ TS.tx("a.b") }}</p>`, `<textarea>`, `<noscript>`, a template-engine `raw` block), outside its comments: text the usage scan cannot read, whose call a rename would leave on the old key. */
+function readsInHtmlText(source: string, at: number, key: string, dialect: Dialect, configured: { form: RegExp; functions: readonly ReadFunction[] } | undefined): boolean {
+  if (dialect !== 'html' || configured === undefined || readFormAt(source, at, key, configured) === null) return false;
+  return ![...source.matchAll(/<!--[\s\S]*?-->/g)].some((c) => at >= c.index && at < c.index + c[0].length);
+}
+
 /** The body of the `<script>` element that holds offset `at`; undefined where `at` sits in none. The caller has found `at` outside the file's code, so a body here is one of a type the scan does not parse. */
 function scriptBodyAt(source: string, at: number): string | undefined {
   const lower = source.toLowerCase();
@@ -500,22 +506,36 @@ export function planReadRenames(input: {
   const props = new Map<string, number[]>();
   const rows = new Map<number, Span>();
   const survivors = new Set<string>();
+  // A leaving key's property in an object a merge does not read (`adopted` below): a mention, left as it is.
+  const foreign = new Set<number>();
   if (copyModule && dialect === null) {
     const targets = new Set(renames.values());
     const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
+    const found: Array<{ key: string; at: number; node: TS.Node; table: TS.Node }> = [];
     const visit = (node: TS.Node): void => {
       if (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) {
         const name = node.name;
         const key = propText(ts, name);
-        if (renames.has(key)) {
-          const at = ts.isStringLiteral(name) ? name.getStart(sf) + 1 : name.getStart(sf);
-          props.set(key, [...(props.get(key) ?? []), at]);
-          rows.set(at, rowSpan(source, node.getStart(sf), node.end));
-        } else if (targets.has(key)) survivors.add(key);
+        if (renames.has(key)) found.push({ key, at: ts.isStringLiteral(name) ? name.getStart(sf) + 1 : name.getStart(sf), node, table: node.parent });
+        else if (targets.has(key)) found.push({ key, at: -1, node, table: node.parent });
       }
       ts.forEachChild(node, visit);
     };
     visit(sf);
+    // A merge reads one table of the file: the one holding the survivor's row, else the first holding a leaving key's. Another object that happens to carry the leaving key is no copy of it.
+    const adopted = input.merge === true ? (found.find((f) => f.at === -1) ?? found.find((f) => f.at !== -1))?.table : undefined;
+    for (const f of found) {
+      if (adopted !== undefined && f.table !== adopted) {
+        if (f.at !== -1) foreign.add(f.at);
+        continue;
+      }
+      if (f.at === -1) {
+        survivors.add(f.key);
+        continue;
+      }
+      props.set(f.key, [...(props.get(f.key) ?? []), f.at]);
+      rows.set(f.at, rowSpan(source, f.node.getStart(sf), f.node.end));
+    }
   }
 
   const lineOf = lineIndex(source);
@@ -545,7 +565,7 @@ export function planReadRenames(input: {
       const occ: Occurrence = { file, line, at, key, text: lineText(at).trim() };
       if (!within(code, at) || within(nonCode, at)) {
         // A configured read inside an attribute no rule names as code (`x-text`, `hx-on:click`, `srcdoc`) or a script of a type the scan does not parse (`text/template`) is a read the usage scan calls one: renaming past it leaves it on the old name.
-        if (dialect !== null && !within(code, at) && readsInUnreadText(source, at, functions)) out.blocked.push(occ);
+        if (dialect !== null && !within(code, at) && (readsInUnreadText(source, at, functions) || readsInHtmlText(source, at, key, dialect, configured))) out.blocked.push(occ);
         else out.mentions.push(occ);
         continue;
       }
@@ -557,6 +577,10 @@ export function planReadRenames(input: {
       if (markPropAt(source, at, key, markProp)) {
         out.edits.push({ pos: at, end: at + key.length, text: next });
         out.rewritten.push(occ);
+        continue;
+      }
+      if (foreign.has(at)) {
+        out.mentions.push(occ);
         continue;
       }
       const own = props.get(key);

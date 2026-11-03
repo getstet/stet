@@ -41,7 +41,8 @@ export function warnUnmatchedOnly(entries: readonly GeneratedOutput[], descripto
   entries.forEach((entry, i) => {
     for (const name of entry.only ?? []) {
       if (keys.some((key) => (/[._]$/.test(name) ? key.startsWith(name) : key === name))) continue;
-      report.warn('config', `generated[${i}].only: "${name}" matches no key — end it with . or _ to keep every key under it`);
+      const hint = /[._]$/.test(name) ? '' : ' — end it with . or _ to keep every key under it';
+      report.warn('config', `generated[${i}].only: "${name}" matches no key${hint}`);
     }
   });
 }
