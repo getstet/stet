@@ -122,7 +122,9 @@ export async function planMerge(
   }
 
   const renames = new Map([[leaving, into]]);
-  const host = isHtmlHost(config) ? await htmlRenames(cwd, config, renames, descriptor) : await readRenames(cwd, config, renames, new Set(Object.keys(descriptor.keys)));
+  const host = isHtmlHost(config)
+    ? await htmlRenames(cwd, config, renames, descriptor, undefined, true)
+    : await readRenames(cwd, config, renames, new Set(Object.keys(descriptor.keys)), undefined, true);
   refused.push(...hostRefusals(host, leaving));
   if (refused.length > 0) return { refused };
 

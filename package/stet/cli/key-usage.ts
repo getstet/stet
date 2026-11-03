@@ -28,7 +28,10 @@
  * `TS[k]`, `import { t as tr }`) is a cause, and so is any mention of a
  * configured function in text the parse does not read as code (a string handed
  * to `eval`, a directive attribute, a `text/babel` script). An html page's
- * inline handlers and `javascript:` URLs are code. The hook
+ * inline handlers and `javascript:` URLs are code. On a project that sets
+ * `reads.attribute`, a spelling of that attribute no literal shows (markup
+ * built from pieces, `attr(name, expr)`, a `dataset` alias, a computed
+ * `setAttribute` name, a props spread) is a cause too. The hook
  * handed on as a value, and a string that points at the snapshot or a
  * generated data module by path, are causes. A top-level `var` of a classic
  * script that another file assigns or declares again, or writes through the
@@ -52,7 +55,7 @@ import { filesForGlobs } from './files.js';
 import { gitData, gitFiles } from './git.js';
 import { lineIndex } from './html-host.js';
 import { codeOf, mentionPattern, splitName, within, type Span } from './key-reads.js';
-import { HTML_COMMENT, readAttrs, type Dialect } from './markup.js';
+import { HTML_COMMENT, HTML_TAGS, readAttrs, type Dialect } from './markup.js';
 import { dialectOf, keysIn, loadTypescript, MAX_SOURCE_BYTES, packageNames, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 import { insideCheckout, servableFile } from './static-files.js';
 import { escapeRegExp } from '../src/seo.js';
@@ -270,7 +273,7 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
   const facts = new Map<string, FileFacts>();
   const listed = new Set<string>();
   const unopened: string[] = [];
-  const { files: sources, tooLarge, texts } = sourceFiles(cwd, config, config.reads !== undefined);
+  const { files: sources, tooLarge, texts, lost } = sourceFiles(cwd, config, config.reads !== undefined);
   const settle = (rel: string, found: FileFacts | null | 'grew' | 'unopened'): void => {
     if (found === 'grew') tooLarge.push(rel);
     else if (found === 'unopened') unopened.push(rel);
@@ -450,6 +453,13 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
   }
   for (const rel of tooLarge) out.set(rel, { named: [], serverCode: false, prefixes: [], causes: [{ text: TOO_LARGE, file: rel, line: 1 }] });
   for (const rel of unopened) out.set(rel, { named: [], serverCode: false, prefixes: [], causes: [{ text: UNOPENED, file: rel, line: 1 }] });
+  // A script a document serves that is no readable file here: what it reads stays possible.
+  for (const { file, line } of lost) {
+    const cause = { text: UNOPENED, file, line };
+    const held = out.get(file);
+    if (held === undefined) out.set(file, { named: [], serverCode: false, prefixes: [], causes: [cause] });
+    else held.causes.push(cause);
+  }
   return { files: out, read: parsed };
 }
 
@@ -766,22 +776,29 @@ export const isGenerated = (text: string): boolean => text.startsWith(GENERATED)
  * otherwise be called not found.
  *
  * With `beyond` (a project that sets `reads`), the scripts the managed pages
- * serve through `<script src>` join the list whether or not git lists them,
- * and the text git lists that is not source (`texts`, minus images, fonts and
- * prose) is kept for the mention pass alone.
+ * serve through `<script src>`, and the files those import, join the list
+ * whether or not git lists them (`lost` names a served script that is no
+ * readable file), and the text git lists that is not source (`texts`, minus
+ * images, fonts and prose) is kept for the mention pass alone.
  */
 function sourceFiles(
   cwd: string,
   config: StetConfig,
   beyond = false,
-): { files: Array<{ rel: string; stamp: string }>; tooLarge: string[]; texts: Array<{ rel: string; stamp: string }> } {
+): {
+  files: Array<{ rel: string; stamp: string }>;
+  tooLarge: string[];
+  texts: Array<{ rel: string; stamp: string }>;
+  lost: Array<{ file: string; line: number }>;
+} {
   const listed = gitFiles(cwd, ['--cached', '--others', '--exclude-standard']);
   const paths = listed === null ? filesForGlobs(cwd, ['**/*']) : [...new Set(listed)].sort();
   const own = ownFiles(config, cwd);
   const out: Array<{ rel: string; stamp: string }> = [];
   const texts: Array<{ rel: string; stamp: string }> = [];
   const tooLarge: string[] = [];
-  for (const rel of beyond ? [...new Set([...paths, ...servedScripts(cwd, config)])] : paths) {
+  const served = beyond ? servedScripts(cwd, config) : { files: [], lost: [] };
+  for (const rel of beyond ? [...new Set([...paths, ...served.files])] : paths) {
     const source = SOURCE.test(rel);
     // The config names the read functions, and the status file names keys: neither is a script.
     const text = !source && beyond && !NOT_SCRIPT.test(rel) && rel !== CONFIG_FILE && rel !== config.statusPath;
@@ -804,16 +821,26 @@ function sourceFiles(
     }
     (source ? out : texts).push({ rel, stamp: `${stat.size}:${stat.mtimeMs}` });
   }
-  return { files: out, tooLarge, texts };
+  return { files: out, tooLarge, texts, lost: served.lost };
 }
+
+/** How many imports deep a served script's relative imports are followed. */
+const IMPORT_DEPTH = 8;
+
+/** A module specifier in script text: `import "x"`, `import … from "x"`, `export … from "x"`, `import("x")`, in groups 2, 4 and 6. Text in a comment or string matches too: the files it adds are only read. */
+const IMPORT_SPECIFIER = /\bimport\s*\(\s*(['"])([^'"\n]+)\1\s*\)|\b(?:import|export)\b[^'"();]*?\bfrom\s*(['"])([^'"\n]+)\3|\bimport\s*(['"])([^'"\n]+)\5/g;
 
 /**
  * The scripts the managed documents load through a same-origin `<script src>`
- * that land on a file of the checkout, repo-relative, sorted: a served file
- * counts for the scan though git ignores it (a build output).
+ * that land on a file of the checkout, repo-relative, sorted, and the files
+ * those scripts reach by a relative import or re-export, static or dynamic
+ * (`followImports`): a served file counts for the scan though git ignores it
+ * (a build output). `lost` lists each such `<script src>` that lands on no
+ * readable file of the checkout, by document and line.
  */
-function servedScripts(cwd: string, config: StetConfig): string[] {
+function servedScripts(cwd: string, config: StetConfig): { files: string[]; lost: Array<{ file: string; line: number }> } {
   const out = new Set<string>();
+  const lost: Array<{ file: string; line: number }> = [];
   for (const rel of filesForGlobs(cwd, config.managedSurfaces)) {
     if (!/\.html?$/.test(rel)) continue;
     let source: string;
@@ -822,9 +849,57 @@ function servedScripts(cwd: string, config: StetConfig): string[] {
     } catch {
       continue;
     }
-    for (const file of documentScripts(cwd, { file: rel, source }).files) out.add(file);
+    const scripts = documentScripts(cwd, { file: rel, source });
+    for (const file of scripts.files) out.add(file);
+    const lineAt = lineIndex(source);
+    for (const at of scripts.lost) lost.push({ file: rel, line: lineAt(at) });
   }
-  return [...out].sort();
+  for (const file of followImports(cwd, [...out])) out.add(file);
+  return { files: [...out].sort(), lost };
+}
+
+/**
+ * The files `entries` reach by a relative import, re-export or dynamic
+ * `import()`, resolved as the static arm serves a URL (`servableFile`), so a
+ * file outside the checkout is never entered. Breadth-first to `IMPORT_DEPTH`
+ * levels, each file once; the entries themselves are not in the answer.
+ */
+function followImports(cwd: string, entries: readonly string[]): string[] {
+  const root = realpathSync(cwd);
+  const seen = new Set(entries);
+  const found: string[] = [];
+  let level = [...entries];
+  for (let depth = 0; depth < IMPORT_DEPTH && level.length > 0; depth++) {
+    const next: string[] = [];
+    for (const rel of level) {
+      let text: string;
+      try {
+        const abs = join(cwd, rel);
+        if (statSync(abs).size > MAX_SOURCE_BYTES) continue;
+        text = readFileSync(abs, 'utf8');
+      } catch {
+        continue;
+      }
+      for (const m of text.matchAll(IMPORT_SPECIFIER)) {
+        const spec = m[2] ?? m[4] ?? m[6];
+        if (spec === undefined || !/^\.{1,2}\//.test(spec)) continue;
+        let url: URL;
+        try {
+          url = new URL(spec, `http://stet.invalid/${rel}`);
+        } catch {
+          continue;
+        }
+        const abs = servableFile(cwd, url.pathname);
+        const target = abs === null ? null : relative(root, abs).split(sep).join('/');
+        if (target === null || seen.has(target)) continue;
+        seen.add(target);
+        found.push(target);
+        next.push(target);
+      }
+    }
+    level = next;
+  }
+  return found;
 }
 
 /**
@@ -832,10 +907,12 @@ function servedScripts(cwd: string, config: StetConfig): string[] {
  * `<script src>` whose URL is same-origin, resolved against the document's own
  * path as the static arm serves it, and lands on a file inside the checkout
  * (`servableFile`). `missing` where a same-origin script names no such file —
- * a built asset, say — whose reads stet cannot know.
+ * a built asset, say — whose reads stet cannot know; `lost` is the offset of
+ * each such `<script>` tag.
  */
-export function documentScripts(cwd: string, document: { file: string; source: string }): { files: string[]; missing: boolean } {
+export function documentScripts(cwd: string, document: { file: string; source: string }): { files: string[]; missing: boolean; lost: number[] } {
   const files: string[] = [];
+  const lost: number[] = [];
   let missing = false;
   // `servableFile` answers the real path, so the checkout's own is the base its paths are relative to.
   const root = realpathSync(cwd);
@@ -856,15 +933,30 @@ export function documentScripts(cwd: string, document: { file: string; source: s
     if (url.origin !== 'http://stet.invalid') continue;
     const abs = servableFile(cwd, url.pathname);
     const rel = abs === null ? null : relative(root, abs).split(sep).join('/');
-    if (rel === null) missing = true;
-    else if (!files.includes(rel)) files.push(rel);
+    if (rel === null) {
+      missing = true;
+      lost.push(m.index);
+    } else if (!files.includes(rel)) files.push(rel);
   }
-  return { files, missing };
+  return { files, missing, lost };
 }
 
 /** The files the usage scan reads (`sourceFiles`), repo-relative, sorted; a file past the size ceiling is not among them. */
 export function usageFiles(cwd: string, config: StetConfig): string[] {
   return sourceFiles(cwd, config).files.map((file) => file.rel);
+}
+
+/**
+ * The files the scan reads beyond `usageFiles`, on a project that sets `reads`:
+ * the text git lists that is no source (read for the calls it may hold) and the
+ * scripts a managed page serves, or those scripts import, though git ignores
+ * them. Sorted; none without `reads`.
+ */
+export function usageBeyond(cwd: string, config: StetConfig): string[] {
+  if (config.reads === undefined) return [];
+  const own = new Set(usageFiles(cwd, config));
+  const all = sourceFiles(cwd, config, true);
+  return [...all.files, ...all.texts].map((file) => file.rel).filter((rel) => !own.has(rel)).sort();
 }
 
 /** `cwd` relative to the repository's top, `/`-ended; the folder's own name where it is the top or git cannot say. */
@@ -1042,7 +1134,7 @@ function readFacts(
   const names = new Set(configured.map((f) => f.name));
   const heads = new Set(configured.flatMap((f) => splitName(f.name)?.head ?? []));
   const marks = attributes.filter((a) => a !== 'data-stet');
-  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured, names, heads, marks, spelled: [], leaned: new Set() };
+  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured, names, heads, marks, spelled: [], blind: new Set(), leaned: new Set() };
   for (const sf of trees.values()) noteGlobals(ts, sf, facts);
 
   if (dialect === null) {
@@ -1106,6 +1198,8 @@ interface WalkContext {
   marks: readonly string[];
   /** Where the walk met a configured function's name written as code, by absolute offset: what `unreadMentions` counts as accounted for. */
   spelled: Array<{ name: string; start: number; end: number }>;
+  /** The key attributes this file already raised a cause for (`attributeBackstop`): one cause each. */
+  blind: Set<string>;
   /** The top-level names of a classic script that the resolution in hand leaned on (`localOf`). */
   leaned: Set<string>;
 }
@@ -1453,7 +1547,7 @@ function walkUses(ctx: WalkContext, tree: Tree, roots: ReadonlyMap<string, strin
       recordCall(ctx, node);
       scope.reads.push(...configuredRead(ctx, tree, node));
     }
-    if (ctx.marks.length > 0) scope.reads.push(...attributeRead(ctx, tree, node));
+    if (ctx.marks.length > 0) scope.reads.push(...attributeRead(ctx, tree, node), ...attributeBackstop(ctx, tree, node));
     if (ctx.configured.length > 0) {
       scope.reads.push(...configuredReferences(ctx, tree, node, aliases, scope));
       if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
@@ -1608,6 +1702,115 @@ function attributeRead(ctx: WalkContext, tree: Tree, node: TS.Node): Read[] {
   }
   if (attribute === undefined || value === undefined || isLiteral(ts, unwrap(ts, value))) return [];
   return [computedRead(ctx, tree, value, `${attribute} set from ${value.getText(sf)}`, value)];
+}
+
+/** Calls that only look an attribute up or select by it: the attribute's name in their argument writes nothing. */
+const ATTRIBUTE_LOOKUPS = new Set(['querySelector', 'querySelectorAll', 'closest', 'matches', 'getAttribute', 'getAttributeNS', 'hasAttribute', 'hasAttributeNS', 'removeAttribute', 'removeAttributeNS', 'removeAttr']);
+/** jQuery's selectors: a read unless the string builds markup or sets (`=` in it). */
+const SELECTOR_CALLS = new Set(['$', 'jQuery', 'find', 'filter', 'is', 'not', 'has']);
+/** Calls that take an attribute's name and then its value. */
+const ATTRIBUTE_SETTERS = new Set(['attr', 'prop', 'data', 'setAttribute', 'setAttributeNS']);
+/** Calls that put an attribute node on an element, whatever name the node carries. */
+const ATTRIBUTE_NODES = new Set(['setAttributeNode', 'setAttributeNodeNS', 'setNamedItem']);
+
+/**
+ * The backstop for the spellings of the project's key attribute that
+ * `attributeRead` cannot follow, on a project that sets one. Each is a cause
+ * (`<attribute> in text the scan cannot read`), once per attribute and file:
+ * the keys it may set stay possible.
+ *
+ * - a string or template chunk that spells the attribute (case aside) and is
+ *   neither a form `attributeRead` follows, nor an argument of a lookup or
+ *   selector (`querySelector`, `getAttribute`, `$('[data-copy]')`), nor a
+ *   markup or `name, value` pair whose value is a literal;
+ * - `setAttribute`/`setAttributeNS` with a computed attribute name and a
+ *   computed value, and any `setAttributeNode`;
+ * - jQuery's `.data("copy", expr)`;
+ * - a `dataset` that is aliased (`var d = el.dataset`, `d = el.dataset`) or
+ *   handed to `Object.assign` or `extend`, and a computed `dataset[name] = …`;
+ * - a spread into the props of a hyperscript call (`h('p', { ...props })`) or a JSX tag.
+ */
+function attributeBackstop(ctx: WalkContext, tree: Tree, node: TS.Node): Read[] {
+  const { ts, marks } = ctx;
+  const { sf, base } = tree;
+  const cause = (at: TS.Node, attribute: string): Read[] => {
+    if (ctx.blind.has(attribute)) return [];
+    ctx.blind.add(attribute);
+    return [{ root: CONFIGURED, line: ctx.lineOf(base + at.getStart(sf)), text: `${attribute} in text the scan cannot read`.slice(0, CAUSE_TEXT), prefixes: [] }];
+  };
+  const first = marks[0] as string;
+  const lastName = (callee: TS.Expression): string | undefined => {
+    const at = unwrap(ts, callee);
+    return ts.isIdentifier(at) ? at.text : ts.isPropertyAccessExpression(at) ? at.name.text : undefined;
+  };
+  const stringy = ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node);
+  if (stringy) {
+    const text = (node as TS.StringLiteral).text;
+    const lower = text.toLowerCase();
+    const hit = marks.find((mark) => lower.includes(mark.toLowerCase()));
+    if (hit === undefined) return [];
+    // The forms `attributeRead` follows: the attribute as a prop name, or the first argument of `setAttribute`.
+    const holder = ts.isComputedPropertyName(node.parent) ? node.parent.parent : node.parent;
+    const propName = ts.isPropertyAssignment(holder) && (holder.name === node || holder.name === node.parent);
+    if (marks.includes(text) && (propName || (ts.isCallExpression(holder) && lastName(holder.expression) === 'setAttribute' && holder.arguments[0] === node))) return [];
+    // A prop of the attribute (or of one of its `-label`, `-placeholder` kind) with a literal value: the key it names is pass 1's.
+    if (propName && isLiteral(ts, unwrap(ts, holder.initializer))) return [];
+    // Every spelling of the attribute in the chunk is followed by a complete quoted value: markup or a selector with a literal.
+    const spelt = new RegExp(escapeRegExp(hit), 'gi');
+    let literal = true;
+    for (const m of text.matchAll(spelt)) if (!/^[\w-]*\s*=\s*(["'])[^"']*\1/.test(text.slice(m.index + hit.length))) literal = false;
+    if (literal) return [];
+    // The call the chunk is (part of) an argument of: `querySelector('[data-copy="' + k + '"]')`.
+    let at: TS.Node = node;
+    while (ts.isTemplateSpan(at.parent) || ts.isTemplateExpression(at.parent) || ts.isParenthesizedExpression(at.parent) || (ts.isBinaryExpression(at.parent) && at.parent.operatorToken.kind === ts.SyntaxKind.PlusToken)) at = at.parent;
+    const call = ts.isCallExpression(at.parent) && at.parent.arguments.includes(at as TS.Expression) ? at.parent : undefined;
+    const name = call === undefined ? undefined : lastName(call.expression);
+    if (call !== undefined && name !== undefined) {
+      if (ATTRIBUTE_LOOKUPS.has(name)) return [];
+      if (SELECTOR_CALLS.has(name) && !text.includes('=')) return [];
+      if (ATTRIBUTE_SETTERS.has(name) && at === node) {
+        const nameAt = name === 'setAttributeNS' ? 1 : 0;
+        const value = call.arguments[nameAt + 1];
+        if (call.arguments[nameAt] === node && (value === undefined || isLiteral(ts, unwrap(ts, value)))) return [];
+      }
+    }
+    return cause(node, hit);
+  }
+  if (ts.isCallExpression(node)) {
+    const name = lastName(node.expression);
+    if (name === undefined) return [];
+    if (ATTRIBUTE_NODES.has(name)) return cause(node, first);
+    const nameAt = name === 'setAttributeNS' ? 1 : 0;
+    const [attribute, value] = [node.arguments[nameAt], node.arguments[nameAt + 1]];
+    if ((name === 'setAttribute' || name === 'setAttributeNS') && attribute !== undefined && !isLiteral(ts, unwrap(ts, attribute)) && value !== undefined && !isLiteral(ts, unwrap(ts, value))) return cause(node, first);
+    // jQuery's `.data("copy", expr)` sets the data the attribute's `dataset` name stands for.
+    if (name === 'data' && isLiteral(ts, attribute) && value !== undefined && !isLiteral(ts, unwrap(ts, value))) {
+      const dataName = (text: string): string => text.toLowerCase().replace(/^data-/, '').replace(/-/g, '');
+      if (marks.some((mark) => dataName(mark) === dataName(attribute.text))) return cause(node, first);
+    }
+    return [];
+  }
+  if (ts.isPropertyAccessExpression(node) && node.name.text === 'dataset') {
+    const p = node.parent;
+    const aliased =
+      (ts.isVariableDeclaration(p) && p.initializer === node && !ts.isObjectBindingPattern(p.name)) ||
+      (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.right === node) ||
+      (ts.isCallExpression(p) && p.arguments[0] === node && ['assign', 'extend', 'merge'].includes(lastName(p.expression) ?? ''));
+    return aliased ? cause(node, first) : [];
+  }
+  if (ts.isElementAccessExpression(node) && !isLiteral(ts, node.argumentExpression)) {
+    const holder = unwrap(ts, node.expression);
+    const target = ts.isBinaryExpression(node.parent) && node.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && node.parent.left === node;
+    return target && ts.isPropertyAccessExpression(holder) && holder.name.text === 'dataset' ? cause(node, first) : [];
+  }
+  if (ts.isSpreadAssignment(node)) {
+    const object = node.parent;
+    const call = ts.isObjectLiteralExpression(object) ? object.parent : undefined;
+    const tag = call !== undefined && ts.isCallExpression(call) && call.arguments.length > 1 && call.arguments.includes(object as TS.Expression) ? call.arguments[0] : undefined;
+    return tag !== undefined && isLiteral(ts, tag) && HTML_TAGS.has(tag.text.toLowerCase()) ? cause(node, first) : [];
+  }
+  if (ts.isJsxSpreadAttribute(node)) return cause(node, first);
+  return [];
 }
 
 /**
