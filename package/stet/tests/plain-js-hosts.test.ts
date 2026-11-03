@@ -13,11 +13,11 @@ import { check } from '../cli/check.js';
 import { keyUsage, namedKeys, usageCache } from '../cli/key-usage.js';
 import { planProblems } from '../cli/key-plan.js';
 import { baseName } from '../cli/key-names.js';
-import { keyPattern } from '../cli/key-reads.js';
+import { keyPattern, planReadRenames } from '../cli/key-reads.js';
 import { Report } from '../cli/report.js';
 import { planDocumentFix } from '../cli/lighthouse-fix.js';
-import { readDocument } from '../cli/html-host.js';
-import { loadTypescript, mentionsToken, occurrenceIsKey } from '../cli/source-scan.js';
+import { planDocuments, readDocument } from '../cli/html-host.js';
+import { keysIn, loadTypescript, mentionsToken, occurrenceIsAmbiguous, occurrenceIsKey } from '../cli/source-scan.js';
 import { approveKeys, completeStatus, loadStatus, renameStatus, resetChanged, statusPlan, type StatusFile } from '../cli/status.js';
 import { generateRegistry } from '../src/codegen.js';
 import { deriveLabel, loadDescriptor } from '../src/descriptor.js';
@@ -514,8 +514,11 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
     const usage = await keyUsage(computed, loadConfig(computed), descriptorOf());
     expect(usage.causes.map((c) => c.file)).toEqual(['index.html']);
     expect(usage.keys['privacy.body']?.state).toBe('unknown');
+    // An attribute no rule names as code is not read as code, but a mention of the function in it is a cause (Q76): it may be a directive.
     const prose = host({ 'index.html': PAGE('  <p title="TS.tx(\'home.title\')" class="onclick">Go</p>') }, { reads });
-    expect((await keyUsage(prose, loadConfig(prose), descriptorOf())).keys['home.title']?.state).toBe('not_found');
+    const proseUsage = await keyUsage(prose, loadConfig(prose), descriptorOf());
+    expect(proseUsage.keys['home.title']?.state).toBe('unknown');
+    expect(proseUsage.causes.map((c) => c.text)).toEqual(['TS.tx in text the scan cannot read']);
 
     const page = PAGE('  <p data-stet="c.d">Text of c.d</p>\n  <button onclick="TS.tx(\'a.b\')">Go</button>\n  <a href="javascript:TS.tx(\'a.b\')">Link</a>');
     const html = await makeHtmlHost({
@@ -621,6 +624,194 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
     expect(occurrenceIsKey(src, src.indexOf('home.title') + 5, 'title', declared)).toBe(false);
     expect(occurrenceIsKey(src, src.indexOf('"title"') + 1, 'title', declared)).toBe(true);
     expect(mentionsToken('TS.tx("home.title")', 'title', declared)).toBe(false);
+  });
+
+  // fix round C: the usage scan's backstop on a project with `reads` (Q76), the commands that follow it (Q77-Q79, Q66).
+  const privacyOf = async (files: Record<string, string>, functions: string[] = ['TS.t', 'TS.tx', 't']): Promise<{ state: string | undefined; causes: number }> => {
+    const dir = host(files, { reads: { functions } });
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    return { state: usage.keys['privacy.body']?.state, causes: usage.causes.length };
+  };
+
+  it('V1c the head object of a configured function that leaves the file, a computed member, or an import rename is a cause; a definition, an assignment target and typeof are not', async () => {
+    const pick = 'var k = pick();\n';
+    const call = 'T.tx("waitlist.use." + k);';
+    const causes: Record<string, { file?: string; src: string }> = {
+      iife_dollar: { src: `${pick}(function ($) { $.tx("waitlist.use." + k); })(window.TS);\n` },
+      arg_head: { src: `${pick}function run(ts) { ts.tx("waitlist.use." + k); }\nrun(TS);\n` },
+      prop_value_head: { src: `${pick}var o = { ts: TS };\no.ts.tx("waitlist.use." + k);\n` },
+      shorthand_head: { src: 'var o = { TS };\n' },
+      spread_head: { src: 'var o = { ...TS };\n' },
+      assign_copy: { src: 'var o = Object.assign({}, TS);\n' },
+      return_head: { src: 'function get() { return TS; }\n' },
+      export_default_head: { file: 's.mjs', src: 'export default TS;\n' },
+      module_exports_head: { src: 'module.exports = TS;\n' },
+      win_destructure_head: { src: `${pick}var { TS: T } = window;\n${call}\n` },
+      win_destructure_assign: { src: `${pick}var T;\n({ TS: T } = window);\n${call}\n` },
+      computed_member: { src: `${pick}TS[k]("waitlist.use." + k);\n` },
+      computed_member_tpl: { src: `${pick}TS[\`t\${k}\`]("waitlist.use." + k);\n` },
+      computed_member_concat: { src: `${pick}TS["t" + "x"]("waitlist.use." + k);\n` },
+      esm_import_alias_bare: { file: 's.mjs', src: `${pick}import { t as tr } from "./i18n.mjs";\ntr("waitlist.use." + k);\n` },
+      esm_reexport_alias_bare: { file: 's.mjs', src: 'export { t as translate } from "./i18n.mjs";\n' },
+      esm_import_alias_dotted: { file: 's.mjs', src: `${pick}import { TS as T } from "./ts.mjs";\n${call}\n` },
+      esm_default_import: { file: 's.mjs', src: `${pick}import T from "./ts.mjs";\n${call}\n` },
+      esm_ns_import: { file: 's.mjs', src: `${pick}import * as T from "./ts.mjs";\n${call}\n` },
+    };
+    for (const [name, { file, src }] of Object.entries(causes)) {
+      expect.soft(await privacyOf({ [file ?? 's.js']: src }), name).toEqual({ state: 'unknown', causes: expect.any(Number) });
+      expect.soft((await privacyOf({ [file ?? 's.js']: src })).causes, name).toBeGreaterThan(0);
+    }
+    const quiet: Record<string, { file?: string; src: string }> = {
+      plain_declaration: { src: 'var TS = window.TS;\nTS.tx("home.title");\n' },
+      self_assign: { src: 'window.TS = window.TS || {};\nTS.tx = function (key) { return key; };\nTS.tx("home.title");\n' },
+      typeof_guard: { src: 'if (typeof TS !== "undefined" && typeof window.TS === "object") { TS.tx("home.title"); }\n' },
+      iife_same_name: { src: '(function (TS) { TS.tx("home.title"); })(window.TS);\n' },
+      destructure_same: { src: 'var { TS } = window;\nTS.tx("home.title");\n' },
+      import_same_name: { file: 's.mjs', src: 'import { t } from "./i18n.mjs";\nimport { TS } from "./ts.mjs";\nt("home.title");\nTS.tx("home.title");\n' },
+      // Q65: a bare configured name that resolves to a declaration in the file is that declaration.
+      param_named_t: { src: 'function f(t) { return t("waitlist.title"); }\nitems.map((t) => render(t));\n' },
+      function_named_t: { src: 'function t(k) { return k; }\nt("home.title");\nlist.map(t);\n' },
+      local_named_t: { src: 'function g() { var t = 1; return use(t); }\n' },
+    };
+    for (const [name, { file, src }] of Object.entries(quiet)) expect.soft(await privacyOf({ [file ?? 's.js']: src }), name).toEqual({ state: 'not_found', causes: 0 });
+  });
+
+  it('V1d a configured function named in text the parse cannot read is a cause, one per file and function; comments and prose are not', async () => {
+    const page = (inner: string): string => PAGE(inner);
+    const hidden: Record<string, string> = {
+      eval_str: page('  <script>eval("TS.tx(\'waitlist.use.\' + k)");</script>'),
+      setTimeout_str: page('  <script>setTimeout("TS.tx(k)", 0);</script>'),
+      new_Function: page('  <script>new Function("TS.tx(k)")();</script>'),
+      innerHTML_handler: page('  <script>el.innerHTML = \'<button onclick="TS.tx(k)">x</button>\';</script>'),
+      hyper_onclick_str: page('  <script>h("button", { onclick: "TS.tx(k)" });</script>'),
+      srcdoc: page('  <iframe srcdoc="&lt;script&gt;TS.tx(k)&lt;/script&gt;"></iframe>'),
+      form_action: page('  <form action="javascript:TS.tx(k)"></form>'),
+      formaction: page('  <button formaction="javascript:TS.tx(k)">x</button>'),
+      alpine_xtext: page('  <p x-text="TS.tx(k)"></p>'),
+      alpine_at: page('  <button @click="TS.tx(k)">x</button>'),
+      alpine_xon: page('  <button x-on:click="TS.tx(k)">x</button>'),
+      vue_bind: page('  <p :title="TS.tx(k)"></p>'),
+      htmx_on: page('  <button hx-on:click="TS.tx(k)">x</button>'),
+      script_babel: page('  <script type="text/babel">TS.tx(k);</script>'),
+      script_jsx: page('  <script type="text/jsx">TS.tx(k);</script>'),
+      bare_name_attr: page('  <p x-text="t(k)"></p>'),
+      window_prefixed_str: page('  <script>eval("window.TS.tx(k)");</script>'),
+    };
+    for (const [name, html] of Object.entries(hidden)) expect.soft(await privacyOf({ 'index.html': html }), name).toEqual({ state: 'unknown', causes: 1 });
+    // One cause per file and function, however many mentions.
+    const twice = await privacyOf({ 'index.html': page('  <p x-text="TS.tx(a)"></p>\n  <p x-text="TS.tx(b)"></p>') });
+    expect(twice).toEqual({ state: 'unknown', causes: 1 });
+    const seen: Record<string, string> = {
+      script_call: page('  <script>TS.tx("home.title");</script>'),
+      js_comment: page('  <script>// TS.tx(k) is how copy is read\nvar a = 1;</script>'),
+      html_comment: page('  <!-- TS.tx(k) -->'),
+      handler: page('  <button onclick="TS.tx(\'home.title\')">x</button>'),
+      prose_apostrophe: page('  <p>Don\'t (really) do it</p>'),
+      own_definition: page('  <script>window.TS = window.TS || {};\nTS.tx = function (k) { return k; };</script>'),
+    };
+    for (const [name, html] of Object.entries(seen)) expect.soft(await privacyOf({ 'index.html': html }), name).toEqual({ state: 'not_found', causes: 0 });
+  });
+
+  it('V3b a global written through the global object is an assignment', async () => {
+    const reads = { functions: ['TS.tx'] };
+    const dead = async (files: Record<string, string>): Promise<string | undefined> => {
+      const dir = host(files, { reads });
+      return (await keyUsage(dir, loadConfig(dir), descriptorOf())).keys['privacy.body']?.state;
+    };
+    const base = 'var KEY = "waitlist.title";\nTS.tx(KEY);\n';
+    expect(await dead({ 's.js': base })).toBe('not_found');
+    for (const write of ['window.KEY = pick();', 'globalThis.KEY = pick();', 'window["KEY"] = pick();']) {
+      expect.soft(await dead({ 's.js': base, 'other.js': `${write}\n` }), `other file ${write}`).toBe('unknown');
+      expect.soft(await dead({ 's.js': `var KEY = "waitlist.title";\n${write}\nTS.tx(KEY);\n` }), `same file ${write}`).toBe('unknown');
+    }
+  });
+
+  it('V4b remove and rename on a JavaScript host with reads see a read in a file outside the declared surfaces', async () => {
+    const host = makeAdoptionHost();
+    expect(await host.run('init', '--yes')).toBe(0);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const config = JSON.parse(host.file('stet.config.json')) as Record<string, unknown>;
+    host.write('stet.config.json', JSON.stringify({ ...config, reads: { functions: ['TS.t'] } }, null, 2));
+    const key = Object.keys((JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, unknown> }).keys).find((k) => !k.startsWith('brand__')) as string;
+    host.write('lib/util.js', `TS.t("${key}");\n`);
+    host.out.length = 0;
+    expect(await host.run('remove', key)).toBe(0);
+    expect(host.stdout()).toContain(`lib/util.js mentions "${key}"`);
+    host.out.length = 0;
+    expect(await host.run('rename', key, 'zz_new', '--write')).toBe(0);
+    expect(host.file('lib/util.js')).toBe('TS.t("zz_new");\n');
+  });
+
+  it('V10b two declared keys that overlap inside one string make the occurrence ambiguous: rename refuses it', async () => {
+    const ts = await loadTypescript();
+    const declared = new Set(['a.b', 'b.c']);
+    expect(keysIn('a.b.c', declared)).toEqual(['a.b', 'b.c']);
+    const src = 'TS.tx("a.b.c");\n';
+    expect(occurrenceIsAmbiguous(src, src.indexOf('a.b.c'), 'a.b', declared)).toBe(true);
+    expect(occurrenceIsAmbiguous(src, src.indexOf('b.c'), 'b.c', declared)).toBe(true);
+    expect(occurrenceIsAmbiguous('TS.tx("a.b");\n', 7, 'a.b', declared)).toBe(false);
+    // `copy.a.b.c` is the property read that takes a key's text and leaves the rest: the half it would rewrite is the other key's too.
+    const plan = (names: ReadonlySet<string>) =>
+      planReadRenames({
+        ts: ts,
+        file: 'app/a.ts',
+        source: 'import { copy } from "../copy";\ncopy.a.b.c;\n',
+        dialect: null,
+        renames: new Map([['a.b', 'a.z']]),
+        isStetModule: (spec) => spec === '../copy',
+        copyModule: false,
+        declared: names,
+      });
+    const both = plan(declared);
+    expect(both.blocked).toHaveLength(1);
+    expect(both.edits).toEqual([]);
+    expect(plan(new Set(['a.b'])).edits).toHaveLength(1);
+  });
+
+  it('Q79 rename rewrites the string value of a prop named by the configured attribute', async () => {
+    const make = (src: string) =>
+      makeHtmlHost({
+        files: { 'screen.js': src },
+        keys: { 'a.b': { shape: 'text', target: 'web' } },
+        defaults: { 'a.b': 'Text of a.b' },
+        config: { reads: { functions: ['TS.tx'], attribute: 'data-copy' } },
+      });
+    for (const [before, after] of [
+      ['h("p", { "data-copy": "a.b" }, "x");', 'h("p", { "data-copy": "a.z" }, "x");'],
+      ["h('p', { 'data-copy': 'a.b' });", "h('p', { 'data-copy': 'a.z' });"],
+      ['h("p", { "data-stet": "a.b" });', 'h("p", { "data-stet": "a.z" });'],
+    ] as const) {
+      const html = await make(`${before}\n`);
+      expect.soft(await html.run('rename', 'a.b', 'a.z', '--write'), before).toBe(0);
+      expect.soft(html.file('screen.js'), before).toBe(`${after}\n`);
+    }
+    const other = await make('h("p", { "data-other": "a.b" });\n');
+    expect(await other.run('rename', 'a.b', 'a.z', '--write')).toBe(1);
+  });
+
+  it('Q66 eject and the regenerator never strip a mark of the configured attribute, declared or not; a data-stet mark that names no key is stripped', async () => {
+    const page = PAGE(
+      '  <b data-copy="a.b">Old a.b</b>\n  <i data-stet="c.d">Old c.d</i>\n  <u data-copy="ghost.one">Old ghost1</u>\n  <s data-stet="ghost.two">Old ghost2</s>',
+    );
+    const make = () =>
+      makeHtmlHost({
+        files: { 'index.html': page },
+        keys: { 'a.b': { shape: 'text', target: 'web' }, 'c.d': { shape: 'text', target: 'web' } },
+        defaults: { 'a.b': 'New a.b', 'c.d': 'New c.d' },
+        config: { reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+      });
+    const ejected = await make();
+    expect(await ejected.run('eject', '--write')).toBe(0);
+    expect(ejected.file('index.html')).toContain('<b data-copy="a.b">New a.b</b>');
+    expect(ejected.file('index.html')).toContain('<u data-copy="ghost.one">Old ghost1</u>');
+    expect(ejected.file('index.html')).toContain('<s>Old ghost2</s>');
+    expect(ejected.stdout()).not.toContain('data-copy="ghost.one" names no key');
+    expect(ejected.stdout()).toContain('data-stet="ghost.two" names no key');
+    // The regenerator `pull` runs is `planDocuments`.
+    const pulled = await make();
+    const { writes } = planDocuments(pulled.cwd, ['index.html'], loadDescriptor(JSON.parse(pulled.file('content/descriptor.json'))), { default: { 'a.b': 'New a.b', 'c.d': 'New c.d' } }, new Report(), ['data-copy', 'data-stet']);
+    expect(writes[0]?.text).toContain('<u data-copy="ghost.one">Old ghost1</u>');
+    expect(writes[0]?.text).toContain('<s>Old ghost2</s>');
   });
 
   it('Q44 the head edits mint the page keys under the project\'s joiner', () => {

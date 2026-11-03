@@ -1692,10 +1692,13 @@ export function planDocuments(
   for (const document of set.documents) {
     const edits: Edit[] = [];
     for (const mark of set.claimed.filter((m) => m.document === document)) {
-      // A mark naming no declared key is STRIPPED and its text kept — how
-      // `remove` drops a mark, and how a typo'd hand-written one becomes
-      // visible rather than silently ignored.
+      // A `data-stet` mark naming no declared key is STRIPPED and its text
+      // kept — how `remove` drops a mark, and how a typo'd hand-written one
+      // becomes visible rather than silently ignored. The project's own
+      // attribute is the site's runtime, read by its scripts: it is left as
+      // written, and `check` names it.
       if (!Object.hasOwn(descriptor.keys, mark.key)) {
+        if (markOf(mark.attribute, DATA_STET) === null) continue;
         const attr = mark.element.attrs.find((a) => a.name === mark.attribute);
         if (attr === undefined) continue;
         let from = attr.start;

@@ -24,11 +24,15 @@
  * configured read functions (`reads.functions`, `TS.tx(…)`) is a read whatever
  * binds its name and however it is spelled (`window.TS.tx`, `TS?.tx`,
  * `TS["tx"]`): the config binds it; any other reference to the function or to
- * its head object (`items.map(TS.tx)`, `var { tx } = TS`, `T = TS`) is a cause.
- * An html page's inline handlers and `javascript:` URLs are code. The hook
+ * its head object (`items.map(TS.tx)`, `var { tx } = TS`, `T = TS`, `run(TS)`,
+ * `TS[k]`, `import { t as tr }`) is a cause, and so is any mention of a
+ * configured function in text the parse does not read as code (a string handed
+ * to `eval`, a directive attribute, a `text/babel` script). An html page's
+ * inline handlers and `javascript:` URLs are code. The hook
  * handed on as a value, and a string that points at the snapshot or a
  * generated data module by path, are causes. A top-level `var` of a classic
- * script that another file assigns or declares again is not once-assigned.
+ * script that another file assigns or declares again, or writes through the
+ * global object (`window.k = …`), is not once-assigned.
  * Comments, JSX text and prose are never code.
  * The scan reads and never writes.
  *
@@ -903,7 +907,9 @@ function readFacts(
   };
   const lineOf = lineIndex(source);
   const keyList = [...declared];
-  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured, leaned: new Set() };
+  const names = new Set(configured.map((f) => f.name));
+  const heads = new Set(configured.flatMap((f) => splitName(f.name)?.head ?? []));
+  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured, names, heads, spelled: [], leaned: new Set() };
   for (const sf of trees.values()) noteGlobals(ts, sf, facts);
 
   if (dialect === null) {
@@ -937,6 +943,9 @@ function readFacts(
     );
     for (const r of regions) if (r.region.own === true) facts.scopes.push(scopeOf(ctx, [r.tree], []));
   }
+  // Text the parse never read, which may still call a configured function.
+  const comments = dialect === null ? [] : [...source.matchAll(/<!--[\s\S]*?-->/g)].map((m) => ({ start: m.index, end: m.index + m[0].length }));
+  facts.scopes[0]?.reads.push(...unreadMentions(ctx, source, spanTest([...code.nonCode, ...comments])));
   return facts;
 }
 
@@ -957,6 +966,11 @@ interface WalkContext {
   needles: PathNeedles;
   /** The project's own read functions (`reads.functions`). */
   configured: readonly ReadFunction[];
+  /** The written names of the configured functions, and the head objects of the dotted ones. */
+  names: ReadonlySet<string>;
+  heads: ReadonlySet<string>;
+  /** Where the walk met a configured function's name written as code, by absolute offset: what `unreadMentions` counts as accounted for. */
+  spelled: Array<{ name: string; start: number; end: number }>;
   /** The top-level names of a classic script that the resolution in hand leaned on (`localOf`). */
   leaned: Set<string>;
 }
@@ -1304,7 +1318,13 @@ function walkUses(ctx: WalkContext, tree: Tree, roots: ReadonlyMap<string, strin
       recordCall(ctx, node);
       scope.reads.push(...configuredRead(ctx, tree, node));
     }
-    if (ctx.configured.length > 0) scope.reads.push(...configuredReferences(ctx, tree, node, aliases));
+    if (ctx.configured.length > 0) {
+      scope.reads.push(...configuredReferences(ctx, tree, node, aliases, scope));
+      if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+        const written = calleeName(ts, node);
+        if (written !== undefined && ctx.names.has(written)) ctx.spelled.push({ name: written, start: base + node.getStart(sf), end: base + node.end });
+      }
+    }
     if (
       (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) &&
       namesData(needles, node.text) &&
@@ -1419,8 +1439,15 @@ function configuredRead(ctx: WalkContext, tree: Tree, call: TS.CallExpression): 
  * that head object (`var T = TS; T.tx(…)`). Only the outermost access of a
  * chain is judged; the function's own definition (`TS.tx = …`, `function t`) and
  * a `typeof` test are no use of it.
+ *
+ * The head object itself is judged the same way (`headUse`): it may only be the
+ * object of a member access, a `typeof` operand, or written to itself
+ * (`var TS = window.TS`, `window.TS = window.TS || {}`). Anywhere else it
+ * leaves the file by a name the scan cannot follow. An import that renames a
+ * configured name or head (`import { t as tr }`, `export { t as x }`) is an
+ * alias, and so is a default or namespace import used as `T.tx`.
  */
-function configuredReferences(ctx: WalkContext, tree: Tree, node: TS.Node, aliases: ReadonlyMap<string, string>): Read[] {
+function configuredReferences(ctx: WalkContext, tree: Tree, node: TS.Node, aliases: ReadonlyMap<string, string>, scope: Scope): Read[] {
   const { ts, lineOf } = ctx;
   const { sf, base } = tree;
   const cause = (at: TS.Node, name: string): Read[] => [
@@ -1428,25 +1455,33 @@ function configuredReferences(ctx: WalkContext, tree: Tree, node: TS.Node, alias
   ];
   const names = ctx.configured.map((f) => f.name);
 
-  // `var { tx } = TS`, `({ tx } = TS)`.
-  let pattern: Array<string | null> | null = null;
+  // `import { t as tr }`, `export { t as tr } from`: the function goes on under another name.
+  if (ts.isImportSpecifier(node) || ts.isExportSpecifier(node)) {
+    if (node.propertyName === undefined) return [];
+    const imported = node.propertyName.text;
+    return imported !== node.name.text && (names.includes(imported) || ctx.heads.has(imported)) ? cause(node, imported) : [];
+  }
+
+  // `var { tx } = TS`, `({ tx } = TS)`, `var { TS: T } = window`.
+  let pattern: Array<{ member: string | null; local: string | null }> | null = null;
   let source: TS.Expression | undefined;
   if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name)) {
     source = node.initializer;
-    pattern = node.name.elements.map((el) =>
-      el.dotDotDotToken !== undefined || (el.propertyName !== undefined && !ts.isIdentifier(el.propertyName) && !ts.isStringLiteral(el.propertyName))
-        ? null
-        : el.propertyName === undefined
-          ? ts.isIdentifier(el.name)
-            ? el.name.text
-            : null
-          : (el.propertyName as TS.Identifier | TS.StringLiteral).text,
-    );
+    pattern = node.name.elements.map((el) => {
+      const local = ts.isIdentifier(el.name) ? el.name.text : null;
+      if (el.dotDotDotToken !== undefined || (el.propertyName !== undefined && !ts.isIdentifier(el.propertyName) && !ts.isStringLiteral(el.propertyName))) return { member: null, local };
+      return { member: el.propertyName === undefined ? local : (el.propertyName as TS.Identifier | TS.StringLiteral).text, local };
+    });
   } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isObjectLiteralExpression(unwrap(ts, node.left))) {
     source = node.right;
-    pattern = (unwrap(ts, node.left) as TS.ObjectLiteralExpression).properties.map((prop) =>
-      ts.isShorthandPropertyAssignment(prop) ? prop.name.text : ts.isPropertyAssignment(prop) && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) ? prop.name.text : null,
-    );
+    pattern = (unwrap(ts, node.left) as TS.ObjectLiteralExpression).properties.map((prop) => {
+      if (ts.isShorthandPropertyAssignment(prop)) return { member: prop.name.text, local: prop.name.text };
+      if (ts.isPropertyAssignment(prop) && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name))) {
+        const value = unwrap(ts, prop.initializer);
+        return { member: prop.name.text, local: ts.isIdentifier(value) ? value.text : null };
+      }
+      return { member: null, local: null };
+    });
   }
   if (pattern !== null && source !== undefined) {
     const head = calleeName(ts, source);
@@ -1455,17 +1490,29 @@ function configuredReferences(ctx: WalkContext, tree: Tree, node: TS.Node, alias
     for (const name of names) {
       const split = splitName(name);
       // A member that is not named (a rest element, a computed key) may be the function.
-      if (split !== null && split.head === root && pattern.some((member) => member === null || member === split.last)) out.push(...cause(node, name));
+      if (split !== null && split.head === root && pattern.some((el) => el.member === null || el.member === split.last)) out.push(...cause(node, name));
+    }
+    // The head object pulled off the global object under another name: `var { TS: T } = window`.
+    if (head === 'window' || head === 'self' || head === 'globalThis') {
+      for (const h of ctx.heads) if (pattern.some((el) => (el.member === null || el.member === h) && el.local !== h)) out.push(...cause(node, h));
     }
     return out;
+  }
+
+  // `import T from "./ts.mjs"; T.tx(…)`, `import * as T from …`: a module object whose member is a configured function's name.
+  if (ts.isIdentifier(node) && ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node && isReference(ts, node)) {
+    const member = node.parent.name.text;
+    const bound = scope.imports.some((i) => i.local === node.text && (i.imported === 'default' || i.imported === '*'));
+    if (bound && !ctx.heads.has(node.text) && names.some((name) => splitName(name)?.last === member)) return cause(node.parent, `${node.text}.${member}`);
   }
 
   if (!(ts.isIdentifier(node) ? isReference(ts, node) : ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))) return [];
   const top = climb(ts, node as TS.Expression);
   const up = top.parent;
+  const written = calleeName(ts, node as TS.Expression);
+  if (written !== undefined && (ctx.heads.has(written) || aliases.has(written))) return headUse(ctx, top, written, cause(node, written), cause(up, `${written}[…]`));
   // Only the outermost access of a chain: `TS.tx` inside `TS.tx.call` is judged there.
   if ((ts.isPropertyAccessExpression(up) || ts.isElementAccessExpression(up)) && up.expression === top) return [];
-  const written = calleeName(ts, node as TS.Expression);
   if (written === undefined) return [];
   // A name bound to the head object stands for it.
   const dot = written.indexOf('.');
@@ -1482,6 +1529,93 @@ function configuredReferences(ctx: WalkContext, tree: Tree, node: TS.Node, alias
   if (ts.isBinaryExpression(up) && up.operatorToken.kind === ts.SyntaxKind.EqualsToken && up.left === top) return [];
   if (ts.isTypeOfExpression(up)) return [];
   return cause(node, fn);
+}
+
+/**
+ * A reference to the head object of a configured function (`TS`, a name bound
+ * to it), judged by where it sits: the object of a member access (`TS.tx`, and
+ * `TS["tx"]`), a `typeof` operand, an assignment target, or a value that
+ * flows back into the head itself (`var TS = window.TS`, `window.TS =
+ * window.TS || {}`, an immediately called function's parameter of that name)
+ * is no use of it. A computed member (`TS[k]`) may be any function of the
+ * head; every other place hands the head on.
+ */
+function headUse(ctx: WalkContext, top: TS.Expression, head: string, onValue: Read[], onComputed: Read[]): Read[] {
+  const { ts } = ctx;
+  const up = top.parent;
+  if (ts.isPropertyAccessExpression(up) && up.expression === top) return [];
+  if (ts.isElementAccessExpression(up) && up.expression === top) return isLiteral(ts, up.argumentExpression) ? [] : onComputed;
+  if (ts.isTypeOfExpression(up)) return [];
+  if (ts.isBinaryExpression(up) && up.left === top && up.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && up.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return [];
+  if (ts.isCallExpression(up) && up.arguments.includes(top)) {
+    const callee = unwrap(ts, up.expression);
+    if (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) {
+      const param = callee.parameters[up.arguments.indexOf(top)];
+      if (param !== undefined && ts.isIdentifier(param.name) && param.name.text === head) return [];
+    }
+  }
+  // The value goes on through `||`, `&&`, `??`, a conditional and parentheses to where it lands.
+  let at: TS.Node = top;
+  for (;;) {
+    const p: TS.Node = at.parent;
+    const passes =
+      ts.isParenthesizedExpression(p) ||
+      ts.isAsExpression(p) ||
+      ts.isNonNullExpression(p) ||
+      (ts.isBinaryExpression(p) &&
+        (p.operatorToken.kind === ts.SyntaxKind.BarBarToken || p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken || p.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) ||
+      (ts.isConditionalExpression(p) && (p.whenTrue === at || p.whenFalse === at));
+    if (!passes) break;
+    at = p;
+  }
+  const landing = at.parent;
+  if (ts.isVariableDeclaration(landing) && landing.initializer === at && ts.isIdentifier(landing.name) && landing.name.text === head) return [];
+  if (ts.isBinaryExpression(landing) && landing.operatorToken.kind === ts.SyntaxKind.EqualsToken && landing.right === at && calleeName(ts, landing.left) === head) return [];
+  return onValue;
+}
+
+/** The text of a configured function's name as a pattern, where it was written: `TS.tx` (and `TS?.tx`, `TS["tx"]`), or a bare name followed by a call's opening. */
+function mentionPattern(name: string): RegExp {
+  const split = splitName(name);
+  if (split === null) {
+    // A call's opening only: a bare name as a word turns up in prose (`don't`), and a trailing apostrophe is the contraction's.
+    return new RegExp(`(?<![\\w$.])(?<![\\w$]['’])(?:(?:window|self|globalThis)\\s*\\.\\s*)?${escapeRegExp(name)}\\s*(?:\\?\\.\\s*)?(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(`, 'g');
+  }
+  const head = split.head.split('.').map(escapeRegExp).join('\\s*\\??\\.\\s*');
+  const last = escapeRegExp(split.last);
+  return new RegExp(`(?<![\\w$])${head}(?:\\s*\\??\\.\\s*${last}(?![\\w$])|\\s*\\??\\.?\\s*\\[\\s*(['"])${last}\\1\\s*\\])`, 'g');
+}
+
+/**
+ * The backstop for text the parse never reads as code: a configured function's
+ * name written in a string handed to `eval` or `setTimeout`, in an attribute no
+ * rule names as code (`x-text`, `@click`, `srcdoc`, `formaction`), in a script
+ * of a type the scan does not parse (`text/babel`). Each mention outside a
+ * comment that the walk did not meet as code (`ctx.spelled`) makes one cause per
+ * function, at the first such line: the call may read any key.
+ */
+function unreadMentions(ctx: WalkContext, source: string, inComment: (at: number) => boolean): Read[] {
+  const out: Read[] = [];
+  for (const name of ctx.names) {
+    const seen = ctx.spelled.filter((s) => s.name === name).sort((a, b) => a.start - b.start);
+    const accounted = (at: number): boolean => {
+      let lo = 0;
+      let hi = seen.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if ((seen[mid] as { start: number }).start <= at) lo = mid + 1;
+        else hi = mid;
+      }
+      const before = seen[lo - 1];
+      return before !== undefined && at < before.end;
+    };
+    for (const m of source.matchAll(mentionPattern(name))) {
+      if (accounted(m.index) || inComment(m.index)) continue;
+      out.push({ root: CONFIGURED, line: ctx.lineOf(m.index), text: `${name} in text the scan cannot read`.slice(0, CAUSE_TEXT), prefixes: [] });
+      break;
+    }
+  }
+  return out;
 }
 
 /**
@@ -2021,6 +2155,14 @@ function assignedNames(ts: typeof import('typescript'), sf: TS.SourceFile): Set<
           else if (ts.isSpreadAssignment(prop)) target(prop.expression);
         }
       } else if (ts.isBinaryExpression(at) && at.operatorToken.kind === ts.SyntaxKind.EqualsToken) target(at.left);
+      else if (ts.isPropertyAccessExpression(at) || ts.isElementAccessExpression(at)) {
+        // A global written through the global object: `window.k = …`, `globalThis["k"] = …`.
+        const object = unwrap(ts, at.expression);
+        if (ts.isIdentifier(object) && (object.text === 'window' || object.text === 'self' || object.text === 'globalThis')) {
+          if (ts.isPropertyAccessExpression(at)) found.add(at.name.text);
+          else if (isLiteral(ts, at.argumentExpression)) found.add(at.argumentExpression.text);
+        }
+      }
     };
     const walk = (node: TS.Node): void => {
       if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) target(node.left);

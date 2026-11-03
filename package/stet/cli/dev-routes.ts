@@ -2383,12 +2383,13 @@ function anyNode(ts: typeof import('typescript'), rel: string, text: string, pre
  * Whether a script loads another one the route reads cannot follow: it creates
  * a script element (`createElement('script')`) or one by a computed name, assigns
  * or sets a `src` or an attribute by a computed name, writes a string holding a
- * `<script` tag, runs `eval` or `new Function`, or calls `importScripts` — the
+ * `<script` tag, runs `eval` or `new Function`, or calls `importScripts`, starts
+ * a `Worker`, `SharedWorker` or service worker, or calls `getScript` — the
  * static arm's `importsLazily`. A library loaded from a list of files this way
  * is read by nothing, so the route is incomplete.
  */
 export function loadsScripts(ts: typeof import('typescript'), rel: string, text: string): boolean {
-  if (!/\bcreateElement\b|\.src\b|\bimportScripts\b|\bsetAttribute\b|<script|\beval\b|\bFunction\b/i.test(text)) return false;
+  if (!/\bcreateElement\b|\bsrc\b|\bimportScripts\b|\bsetAttribute\b|<script|\beval\b|\bFunction\b|\bWorker\b|\bSharedWorker\b|\bserviceWorker\b|\bgetScript\b/i.test(text)) return false;
   const literal = (node: TS.Node | undefined, value?: string): boolean =>
     node !== undefined && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && (value === undefined || node.text.toLowerCase() === value);
   return anyNode(ts, rel, text, (node) => {
@@ -2397,15 +2398,31 @@ export function loadsScripts(ts: typeof import('typescript'), rel: string, text:
     }
     if (ts.isIdentifier(node)) return node.text === 'eval';
     if ((ts.isNewExpression(node) || ts.isCallExpression(node)) && ts.isIdentifier(node.expression) && node.expression.text === 'Function') return true;
+    // `new Worker("w.js")`, `new SharedWorker(…)`: a script the page starts.
+    if (ts.isNewExpression(node)) {
+      const callee = ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression;
+      return ts.isIdentifier(callee) && (callee.text === 'Worker' || callee.text === 'SharedWorker');
+    }
     if (ts.isCallExpression(node)) {
-      if (ts.isIdentifier(node.expression)) return node.expression.text === 'importScripts';
+      if (ts.isIdentifier(node.expression)) return node.expression.text === 'importScripts' || node.expression.text === 'getScript';
       if (!ts.isPropertyAccessExpression(node.expression)) return false;
       const first = node.arguments[0];
-      if (node.expression.name.text === 'createElement') return !literal(first) || literal(first, 'script');
-      if (node.expression.name.text === 'setAttribute') return !literal(first) || literal(first, 'src');
+      const callee = node.expression;
+      if (callee.name.text === 'createElement') return !literal(first) || literal(first, 'script');
+      if (callee.name.text === 'setAttribute') return !literal(first) || literal(first, 'src');
+      if (callee.name.text === 'getScript') return true;
+      // `navigator.serviceWorker.register("sw.js")`.
+      if (callee.name.text === 'register') return ts.isPropertyAccessExpression(callee.expression) ? callee.expression.name.text === 'serviceWorker' : ts.isIdentifier(callee.expression) && callee.expression.text === 'serviceWorker';
+      // `Object.assign(el, { src })`.
+      if (callee.name.text === 'assign') {
+        return node.arguments.some((arg) => ts.isObjectLiteralExpression(arg) && arg.properties.some((prop) => prop.name !== undefined && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) && prop.name.text.toLowerCase() === 'src'));
+      }
       return false;
     }
-    return ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isPropertyAccessExpression(node.left) && node.left.name.text === 'src';
+    if (!ts.isBinaryExpression(node) || node.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return false;
+    // `el.src = …` and `el["src"] = …`.
+    if (ts.isPropertyAccessExpression(node.left)) return node.left.name.text === 'src';
+    return ts.isElementAccessExpression(node.left) && literal(node.left.argumentExpression, 'src');
   });
 }
 

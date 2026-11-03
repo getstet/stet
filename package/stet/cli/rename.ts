@@ -914,6 +914,7 @@ export async function htmlRenames(
 ): Promise<HostRenames> {
   const marks = markRenames(cwd, config, renames, only);
   const functions = config.reads?.functions ?? [];
+  const attributes = markAttributes(config);
   if (functions.length === 0) return marks;
   const ts = await loadTypescript();
   const declared = new Set(Object.keys(descriptor.keys));
@@ -926,7 +927,7 @@ export async function htmlRenames(
     } catch {
       continue;
     }
-    const text = planFileRenames(out, { ts, file: rel, source, dialect: dialectOf(rel), renames, isStetModule: () => false, copyModule: false, declared, functions }, only);
+    const text = planFileRenames(out, { ts, file: rel, source, dialect: dialectOf(rel), renames, isStetModule: () => false, copyModule: false, declared, functions, attributes }, only);
     if (text === null) continue;
     const before = prior === -1 ? source : readFileSync(join(cwd, rel), 'utf8');
     const entry = { rel, text, diff: formatDiff(rel, before, text) };
@@ -968,7 +969,9 @@ export async function readRenames(
   const modules = filesForGlobs(cwd, config.copyModules);
   const isStetModule = stetModuleTest(cwd, [config.readPath.file, ...modules]);
   const out: HostRenames = { edited: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
-  const files = filesForGlobs(cwd, [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules]);
+  const files = new Set(filesForGlobs(cwd, [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules]));
+  // A host that names its read functions has reads outside the declared surfaces: the scripts the usage scan reads are surfaces too.
+  if (config.reads !== undefined) for (const rel of usageFiles(cwd, config)) files.add(rel);
   for (const rel of files) {
     if (own.has(rel)) continue;
     let source: string;
@@ -989,6 +992,7 @@ export async function readRenames(
         copyModule: config.copyModules.some((glob) => matchGlob(glob, rel)),
         declared,
         functions: config.reads?.functions ?? [],
+        attributes: markAttributes(config),
       },
       only,
     );

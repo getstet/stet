@@ -35,7 +35,7 @@ import { escapeRegExp } from '../src/seo.js';
 import { normalizeNoExt, pathAliasMappings, resolveSpecifier, type ReadFunction } from './config.js';
 import { lineIndex } from './html-host.js';
 import { dialectCode, openTag, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
-import { occurrenceIsKey, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
+import { occurrenceIsAmbiguous, occurrenceIsKey, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 
 /**
  * A read of a key: `copy.get('<key>')`, `copy('<key>')` or `get('<key>')`, and
@@ -202,6 +202,23 @@ export function configuredReadForm(functions: readonly ReadFunction[]): RegExp |
   return new RegExp(`(?<![\\w$.])(${names.map((name) => name.split('.').map(escapeRegExp).join('\\s*\\.\\s*')).join('|')})\\s*\\(`, 'g');
 }
 
+/**
+ * The before-text pattern of a prop named by one of the mark attributes
+ * (`{ "data-copy": "` or `{ data-copy: '`), each ending where the key begins;
+ * null where no attribute is given.
+ */
+function markPropForm(attributes: readonly string[]): RegExp | null {
+  if (attributes.length === 0) return null;
+  return new RegExp(`(?<![\\w$-])["']?(?:${attributes.map(escapeRegExp).join('|')})["']?\\s*:\\s*$`);
+}
+
+/** Whether the key at `at` is the whole string value of a prop `form` (`markPropForm`) matches. */
+function markPropAt(source: string, at: number, key: string, form: RegExp | null): boolean {
+  const quote = source[at - 1];
+  if (form === null || (quote !== '"' && quote !== "'" && quote !== '`') || source[at + key.length] !== quote) return false;
+  return form.test(source.slice(Math.max(0, at - 80), at - 1));
+}
+
 /** How far back from a key a configured call's opening is looked for. */
 const CALL_REACH = 400;
 
@@ -361,11 +378,14 @@ export function planReadRenames(input: {
   declared?: ReadonlySet<string>;
   /** The project's configured read functions (`reads.functions`): a call of one is a read form stet rewrites. */
   functions?: readonly ReadFunction[];
+  /** The mark attributes (`markAttributes`): the string value of a prop named by one is a read form stet rewrites. */
+  attributes?: readonly string[];
 }): ReadRenames {
   const { ts, file, source, dialect, renames, isStetModule, copyModule, declared } = input;
   const functions = input.functions ?? [];
   const form = configuredReadForm(functions);
   const configured = form === null ? undefined : { form, functions };
+  const markProp = markPropForm(input.attributes ?? []);
   const out: ReadRenames = { edits: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
   if (renames.size === 0) return out;
 
@@ -429,6 +449,16 @@ export function planReadRenames(input: {
       const occ: Occurrence = { file, line, at, key, text: lineText(at).trim() };
       if (!within(code, at) || within(nonCode, at)) {
         out.mentions.push(occ);
+        continue;
+      }
+      // Two declared keys that share segments in this text (`a.b` and `b.c` in `a.b.c`): which one it means cannot be told.
+      if (occurrenceIsAmbiguous(source, at, key, declared)) {
+        out.blocked.push(occ);
+        continue;
+      }
+      if (markPropAt(source, at, key, markProp)) {
+        out.edits.push({ pos: at, end: at + key.length, text: next });
+        out.rewritten.push(occ);
         continue;
       }
       const own = props.get(key);

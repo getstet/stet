@@ -3023,27 +3023,43 @@ export function mentionsToken(source: string, token: string, declared?: Readonly
  * run: each contiguous run of its dot-delimited segments that is a key, the
  * longest first at every start, and none that sits inside a longer one already
  * taken — so `obj.home_title` names `home_title`, `"home.title"` names
- * `home.title` and not a flat `title`.
+ * `home.title` and not a flat `title`. Two keys that share segments without
+ * one holding the other (`a.b` and `b.c` in `a.b.c`) are both named and both
+ * `ambiguous`: which one the text means cannot be told.
  */
-export function keyRunsIn(token: string, declared: ReadonlySet<string>): Array<{ key: string; at: number }> {
+export function keyRunsIn(token: string, declared: ReadonlySet<string>): Array<{ key: string; at: number; ambiguous?: true }> {
   const parts = token.split('.');
   const starts = parts.map((_, i) => parts.slice(0, i).reduce((sum, part) => sum + part.length + 1, 0));
-  const taken: Array<[number, number]> = [];
-  const out: Array<{ key: string; at: number }> = [];
+  const taken: Array<{ from: number; to: number; run: { key: string; at: number; ambiguous?: true } }> = [];
   for (let i = 0; i < parts.length; i += 1) {
     for (let j = parts.length; j > i; j -= 1) {
-      if (taken.some(([a, b]) => a <= i && j <= b)) continue;
+      if (taken.some((t) => t.from <= i && j <= t.to)) continue;
       const key = parts.slice(i, j).join('.');
       if (!declared.has(key)) continue;
-      taken.push([i, j]);
-      out.push({ key, at: starts[i] as number });
+      const run: { key: string; at: number; ambiguous?: true } = { key, at: starts[i] as number };
+      for (const t of taken) {
+        if (t.from < j && i < t.to) {
+          run.ambiguous = true;
+          t.run.ambiguous = true;
+        }
+      }
+      taken.push({ from: i, to: j, run });
     }
   }
-  return out;
+  return taken.map((t) => t.run);
 }
 
 /** The declared keys a dotted token run names (`keyRunsIn`). */
 export const keysIn = (token: string, declared: ReadonlySet<string>): string[] => keyRunsIn(token, declared).map((run) => run.key);
+
+/** The key runs of the word-and-dot run round `at`, and where that run starts. */
+function runAround(source: string, at: number, declared: ReadonlySet<string>): { runs: ReturnType<typeof keyRunsIn>; start: number } | null {
+  let start = at;
+  while (start > 0 && /[\w$.]/.test(source[start - 1] as string)) start -= 1;
+  while (start < at && source[start] === '.') start += 1; // a spread's dots
+  const run = /^[\w$]+(?:\.[\w$]+)*/.exec(source.slice(start))?.[0];
+  return run === undefined ? null : { runs: keyRunsIn(run, declared), start };
+}
 
 /**
  * Whether the text of `key` at `at` is that key and not part of another: the
@@ -3054,11 +3070,15 @@ export const keysIn = (token: string, declared: ReadonlySet<string>): string[] =
  */
 export function occurrenceIsKey(source: string, at: number, key: string, declared: ReadonlySet<string> | undefined): boolean {
   if (declared === undefined || !declared.has(key)) return true;
-  let start = at;
-  while (start > 0 && /[\w$.]/.test(source[start - 1] as string)) start -= 1;
-  while (start < at && source[start] === '.') start += 1; // a spread's dots
-  const run = /^[\w$]+(?:\.[\w$]+)*/.exec(source.slice(start))?.[0];
-  return run === undefined || keyRunsIn(run, declared).some((found) => found.key === key && found.at === at - start);
+  const found = runAround(source, at, declared);
+  return found === null || found.runs.some((run) => run.key === key && run.at === at - found.start);
+}
+
+/** Whether the key at `at` shares segments with another declared key in the same run (`a.b` and `b.c` in `a.b.c`), so the text does not say which it means. */
+export function occurrenceIsAmbiguous(source: string, at: number, key: string, declared: ReadonlySet<string> | undefined): boolean {
+  if (declared === undefined || !declared.has(key)) return false;
+  const found = runAround(source, at, declared);
+  return found !== null && found.runs.some((run) => run.key === key && run.at === at - found.start && run.ambiguous === true);
 }
 
 /**

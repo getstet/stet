@@ -14471,10 +14471,17 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
       'el.setAttribute(attr, value);',
       'fetch(u).then(eval);',
       'var f = new Function("return 1");',
+      'var w = new Worker("w.js");',
+      'var w = new SharedWorker("w.js");',
+      'navigator.serviceWorker.register("sw.js");',
+      '$.getScript("x.js");',
+      's["src"] = f;',
+      'Object.assign(s, { src: f });',
+      'Object.assign(s, { src });',
     ];
     for (const loader of loaders) {
       const host = await plainHost({ 'index.html': plainPage(`${marked}\n  <script src="s.js"></script>`), 's.js': `${loader}\n` });
-      expect((await routeReadsOf(handlerOver([host.cwd]).handler, host)).complete, loader).toBe(false);
+      expect.soft((await routeReadsOf(handlerOver([host.cwd]).handler, host)).complete, loader).toBe(false);
     }
     const plain = await plainHost({ 'index.html': plainPage(`${marked}\n  <script src="s.js"></script>`), 's.js': 'var el = document.createElement("div"); el.setAttribute("class", "x");\n' });
     expect((await routeReadsOf(handlerOver([plain.cwd]).handler, plain)).complete).toBe(true);

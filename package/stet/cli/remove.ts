@@ -403,9 +403,9 @@ function surfaceSources(cwd: string, config: StetConfig): { file: string; source
   const globs = [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules];
   const found: { file: string; source: string }[] = [];
   const html = isHtmlHost(config);
-  // On an html host that names its read functions, the scripts it reads copy in are surfaces too.
+  // On a host that names its read functions, the scripts it reads copy in are surfaces too.
   const files = new Set(filesForGlobs(cwd, globs));
-  if (html && config.reads !== undefined) for (const file of usageFiles(cwd, config)) files.add(file);
+  if (config.reads !== undefined) for (const file of usageFiles(cwd, config)) files.add(file);
   for (const file of files) {
     try {
       const text = readFileSync(join(cwd, file), 'utf8');
