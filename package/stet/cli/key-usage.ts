@@ -42,18 +42,19 @@
  * (`UsageCache`) and re-reads a file only when its size or mtime moves.
  */
 
-import { closeSync, lstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
-import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath } from 'node:path';
+import { closeSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync, type Stats } from 'node:fs';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { markAttributes, resolveSpecifier, type ReadFunction, type StetConfig } from './config.js';
+import { CONFIG_FILE, markAttributes, resolveSpecifier, type ReadFunction, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { gitData, gitFiles } from './git.js';
 import { lineIndex } from './html-host.js';
-import { codeOf, within, type Span } from './key-reads.js';
+import { codeOf, mentionPattern, splitName, within, type Span } from './key-reads.js';
+import { HTML_COMMENT, readAttrs, type Dialect } from './markup.js';
 import { dialectOf, keysIn, loadTypescript, MAX_SOURCE_BYTES, packageNames, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
-import { insideCheckout } from './static-files.js';
+import { insideCheckout, servableFile } from './static-files.js';
 import { escapeRegExp } from '../src/seo.js';
 import type { Descriptor } from '../src/types.js';
 
@@ -93,7 +94,7 @@ export interface KeyUsage {
 export interface UsageCache {
   /** The declared key set the facts were read against; a change clears them. */
   keys: string;
-  files: Map<string, { stamp: string; facts: FileFacts | null | 'grew' }>;
+  files: Map<string, { stamp: string; facts: FileFacts | null | 'grew' | 'unopened' }>;
 }
 
 export function usageCache(): UsageCache {
@@ -101,7 +102,11 @@ export function usageCache(): UsageCache {
 }
 
 /** The source files the scan reads. */
-const SOURCE = /\.(?:[cm]?[jt]sx?|astro|vue|svelte|mdx|html)$/;
+const SOURCE = /\.(?:[cm]?[jt]sx?|astro|vue|svelte|mdx|html?)$/;
+/** Files a page does not run: images, fonts, media, archives, source maps and prose. The text beyond the source list is read for the calls it may hold, except these. */
+const NOT_SCRIPT = /\.(?:png|jpe?g|gif|webp|avif|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp[34]|webm|mov|wav|ogg|pdf|zip|gz|tgz|br|wasm|map|md|markdown|txt|rst|lock)$/i;
+/** The dialect the usage scan reads a file as: `.htm` is HTML under its older extension. */
+export const usageDialect = (rel: string): Dialect | null => (rel.endsWith('.htm') ? 'html' : dialectOf(rel));
 /** Whether a repo-relative path is a source file the scan reads, by its extension. */
 export const isSourceFile = (rel: string): boolean => SOURCE.test(rel);
 
@@ -118,6 +123,9 @@ const UNREADABLE = 'too deeply nested to read';
 
 /** The cause a file past `MAX_SOURCE_BYTES` raises: it is never opened, so a key it names stays possible. */
 const TOO_LARGE = 'over 5 MB, so the scan skipped it';
+
+/** The cause a file git lists but the scan cannot open raises: whatever it reads stays possible. */
+const UNOPENED = 'could not be read';
 
 /** A cause's source text is cut here. */
 const CAUSE_TEXT = 40;
@@ -241,7 +249,7 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
   const needles = pathNeedles(config);
   const configured = config.reads?.functions ?? [];
   const attributes = markAttributes(config);
-  // The config's read functions and mark attributes change what a file yields, so they stamp the facts too.
+  // The config's read functions, mark attributes and whether it sets `reads` at all change what a file yields, so they stamp the facts too.
   const stamp = [
     ...[...declared].sort(),
     '',
@@ -251,6 +259,7 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
     ...configured.map((f) => `${f.name}:${f.key}`),
     '',
     ...attributes,
+    config.reads === undefined ? 'no reads' : 'reads',
   ].join('\n');
   if (cache.keys !== stamp) {
     cache.keys = stamp;
@@ -260,18 +269,36 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
   // Step 1: the files, each read and parsed only where its stamp moved.
   const facts = new Map<string, FileFacts>();
   const listed = new Set<string>();
-  const { files: sources, tooLarge } = sourceFiles(cwd, config);
+  const unopened: string[] = [];
+  const { files: sources, tooLarge, texts } = sourceFiles(cwd, config, config.reads !== undefined);
+  const settle = (rel: string, found: FileFacts | null | 'grew' | 'unopened'): void => {
+    if (found === 'grew') tooLarge.push(rel);
+    else if (found === 'unopened') unopened.push(rel);
+    else if (found !== null) facts.set(rel, found);
+  };
   for (const { rel, stamp: fileStamp } of sources) {
     listed.add(rel);
     const held = cache.files.get(rel);
-    let found: FileFacts | null | 'grew';
+    let found: FileFacts | null | 'grew' | 'unopened';
     if (held !== undefined && held.stamp === fileStamp) found = held.facts;
     else {
-      found = factsOf(ts, cwd, rel, declared, needles, configured, attributes);
+      found = factsOf(ts, cwd, rel, declared, needles, configured, attributes, config.reads !== undefined);
       cache.files.set(rel, { stamp: fileStamp, facts: found });
     }
-    if (found === 'grew') tooLarge.push(rel);
-    else if (found !== null) facts.set(rel, found);
+    settle(rel, found);
+  }
+  // Text the scan does not parse (a template, a script served though git ignores it) is read for the calls it may hold, by the mention pass alone.
+  const parsed = facts.size;
+  for (const { rel, stamp: fileStamp } of texts) {
+    listed.add(rel);
+    const held = cache.files.get(rel);
+    let found: FileFacts | null | 'grew' | 'unopened';
+    if (held !== undefined && held.stamp === fileStamp) found = held.facts;
+    else {
+      found = textFactsOf(cwd, rel, configured);
+      cache.files.set(rel, { stamp: fileStamp, facts: found });
+    }
+    settle(rel, found);
   }
   for (const rel of [...cache.files.keys()]) if (!listed.has(rel)) cache.files.delete(rel);
 
@@ -422,7 +449,8 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
     }
   }
   for (const rel of tooLarge) out.set(rel, { named: [], serverCode: false, prefixes: [], causes: [{ text: TOO_LARGE, file: rel, line: 1 }] });
-  return { files: out, read: facts.size };
+  for (const rel of unopened) out.set(rel, { named: [], serverCode: false, prefixes: [], causes: [{ text: UNOPENED, file: rel, line: 1 }] });
+  return { files: out, read: parsed };
 }
 
 /**
@@ -489,7 +517,7 @@ export function namedKeys(
   declared: ReadonlySet<string>,
   attributes: readonly string[] = ['data-stet'],
 ): Set<string> {
-  const code = codeOf(ts, file, source, dialectOf(file));
+  const code = codeOf(ts, file, source, usageDialect(file));
   return code === null ? new Set() : namesIn(file, source, code.code, code.nonCode, declared, attributes);
 }
 
@@ -504,7 +532,7 @@ function namesIn(file: string, source: string, code: Span[], nonCode: Span[], de
     if (!inCode(m.index) || inNonCode(m.index)) continue;
     for (const key of keysIn(m[0], declared)) named.add(key);
   }
-  if (file.endsWith('.html')) {
+  if (/\.html?$/.test(file)) {
     for (const m of source.matchAll(markPattern(attributes))) if (declared.has(m[1] as string)) named.add(m[1] as string);
   }
   return named;
@@ -736,15 +764,28 @@ export const isGenerated = (text: string): boolean => text.startsWith(GENERATED)
  * Each kept file carries its stamp. A file over `MAX_SOURCE_BYTES` is not kept
  * and is not opened: it is listed in `tooLarge`, since a key it names would
  * otherwise be called not found.
+ *
+ * With `beyond` (a project that sets `reads`), the scripts the managed pages
+ * serve through `<script src>` join the list whether or not git lists them,
+ * and the text git lists that is not source (`texts`, minus images, fonts and
+ * prose) is kept for the mention pass alone.
  */
-function sourceFiles(cwd: string, config: StetConfig): { files: Array<{ rel: string; stamp: string }>; tooLarge: string[] } {
+function sourceFiles(
+  cwd: string,
+  config: StetConfig,
+  beyond = false,
+): { files: Array<{ rel: string; stamp: string }>; tooLarge: string[]; texts: Array<{ rel: string; stamp: string }> } {
   const listed = gitFiles(cwd, ['--cached', '--others', '--exclude-standard']);
   const paths = listed === null ? filesForGlobs(cwd, ['**/*']) : [...new Set(listed)].sort();
   const own = ownFiles(config, cwd);
   const out: Array<{ rel: string; stamp: string }> = [];
+  const texts: Array<{ rel: string; stamp: string }> = [];
   const tooLarge: string[] = [];
-  for (const rel of paths) {
-    if (!SOURCE.test(rel) || own.has(rel) || rel.startsWith('.stet/')) continue;
+  for (const rel of beyond ? [...new Set([...paths, ...servedScripts(cwd, config)])] : paths) {
+    const source = SOURCE.test(rel);
+    // The config names the read functions, and the status file names keys: neither is a script.
+    const text = !source && beyond && !NOT_SCRIPT.test(rel) && rel !== CONFIG_FILE && rel !== config.statusPath;
+    if ((!source && !text) || own.has(rel) || rel.startsWith('.stet/')) continue;
     const abs = join(cwd, rel);
     let stat: Stats;
     try {
@@ -758,12 +799,67 @@ function sourceFiles(cwd: string, config: StetConfig): { files: Array<{ rel: str
     }
     if (!stat.isFile()) continue;
     if (stat.size > MAX_SOURCE_BYTES) {
-      tooLarge.push(rel);
+      if (source) tooLarge.push(rel);
       continue;
     }
-    out.push({ rel, stamp: `${stat.size}:${stat.mtimeMs}` });
+    (source ? out : texts).push({ rel, stamp: `${stat.size}:${stat.mtimeMs}` });
   }
-  return { files: out, tooLarge };
+  return { files: out, tooLarge, texts };
+}
+
+/**
+ * The scripts the managed documents load through a same-origin `<script src>`
+ * that land on a file of the checkout, repo-relative, sorted: a served file
+ * counts for the scan though git ignores it (a build output).
+ */
+function servedScripts(cwd: string, config: StetConfig): string[] {
+  const out = new Set<string>();
+  for (const rel of filesForGlobs(cwd, config.managedSurfaces)) {
+    if (!/\.html?$/.test(rel)) continue;
+    let source: string;
+    try {
+      source = readFileSync(join(cwd, rel), 'utf8');
+    } catch {
+      continue;
+    }
+    for (const file of documentScripts(cwd, { file: rel, source }).files) out.add(file);
+  }
+  return [...out].sort();
+}
+
+/**
+ * The scripts a static document loads that the route reads follow: each
+ * `<script src>` whose URL is same-origin, resolved against the document's own
+ * path as the static arm serves it, and lands on a file inside the checkout
+ * (`servableFile`). `missing` where a same-origin script names no such file —
+ * a built asset, say — whose reads stet cannot know.
+ */
+export function documentScripts(cwd: string, document: { file: string; source: string }): { files: string[]; missing: boolean } {
+  const files: string[] = [];
+  let missing = false;
+  // `servableFile` answers the real path, so the checkout's own is the base its paths are relative to.
+  const root = realpathSync(cwd);
+  // The reader blanks a script whole, tag and body, so the tags are read off the source, comments aside, each body skipped.
+  const source = document.source.replace(HTML_COMMENT, (comment) => ' '.repeat(comment.length));
+  const open = /<script\b([^>]*)>/gi;
+  for (let m = open.exec(source); m !== null; m = open.exec(source)) {
+    const close = source.toLowerCase().indexOf('</script', open.lastIndex);
+    const src = readAttrs(source, m.index + '<script'.length, m[1] as string).find((a) => a.name === 'src')?.value.trim();
+    if (close !== -1) open.lastIndex = close;
+    if (src === undefined || src === '') continue;
+    let url: URL;
+    try {
+      url = new URL(src, `http://stet.invalid/${document.file}`);
+    } catch {
+      continue;
+    }
+    if (url.origin !== 'http://stet.invalid') continue;
+    const abs = servableFile(cwd, url.pathname);
+    const rel = abs === null ? null : relative(root, abs).split(sep).join('/');
+    if (rel === null) missing = true;
+    else if (!files.includes(rel)) files.push(rel);
+  }
+  return { files, missing };
 }
 
 /** The files the usage scan reads (`sourceFiles`), repo-relative, sorted; a file past the size ceiling is not among them. */
@@ -824,9 +920,9 @@ const isStetPackage = (spec: string): boolean => spec === '@getstet/stet' || spe
 /**
  * One file's facts: its named keys, whether it is server code or exempt, its
  * re-exports, and per scope its imports and its binding reads, B1 and B2
- * settled as far as the file alone can. Null for a generated module or a file
- * that cannot be read; `'grew'` for a file whose bytes passed the ceiling
- * after the stat that let it through.
+ * settled as far as the file alone can. Null for a generated module (`readHeaded`
+ * reads it as source); `'unopened'` for a file that cannot be read; `'grew'` for a
+ * file whose bytes passed the ceiling after the stat that let it through.
  */
 function factsOf(
   ts: typeof import('typescript'),
@@ -836,17 +932,18 @@ function factsOf(
   needles: PathNeedles,
   configured: readonly ReadFunction[] = [],
   attributes: readonly string[] = ['data-stet'],
-): FileFacts | null | 'grew' {
-  const abs = join(cwd, rel);
+  readHeaded = false,
+): FileFacts | null | 'grew' | 'unopened' {
   let source: string;
   try {
-    if (isGenerated(headOf(abs))) return null;
-    const bytes = readFileSync(abs);
+    // A module headed as stet's own that no config names is skipped, except on a project that sets `reads`: there a header leading a hand-kept script (a concatenation) hides its reads.
+    if (!readHeaded && isGenerated(headOf(join(cwd, rel)))) return null;
+    const bytes = readFileSync(join(cwd, rel));
     // The file grew since the stat that passed it: skipped like one the stat caught.
     if (bytes.length > MAX_SOURCE_BYTES) return 'grew';
     source = bytes.toString('utf8');
   } catch {
-    return null;
+    return 'unopened';
   }
   try {
     return readFacts(ts, rel, source, declared, needles, configured, attributes);
@@ -873,6 +970,41 @@ function factsOf(
   }
 }
 
+/**
+ * The facts of a file the scan does not parse: no names, no scopes' reads but
+ * the mention pass over its text, one cause per configured function it writes
+ * (`unreadMentions`). Null for a file that holds a NUL byte, which is no text.
+ */
+function textFactsOf(cwd: string, rel: string, configured: readonly ReadFunction[]): FileFacts | null | 'grew' | 'unopened' {
+  let source: string;
+  try {
+    const bytes = readFileSync(join(cwd, rel));
+    if (bytes.length > MAX_SOURCE_BYTES) return 'grew';
+    if (bytes.subarray(0, 8192).includes(0)) return null;
+    source = bytes.toString('utf8');
+  } catch {
+    return 'unopened';
+  }
+  const facts: FileFacts = {
+    named: [],
+    serverCode: false,
+    exempt: false,
+    importsStet: false,
+    reexports: [],
+    renames: [],
+    scopes: [{ imports: [], reads: [], exported: [], wrappers: [], exportedNames: [], aliased: [], loose: [] }],
+    calls: new Map(),
+    values: new Set(),
+    pathReads: [],
+    assigns: new Set(),
+    topNames: new Set(),
+  };
+  const names = new Set(configured.map((f) => f.name));
+  const ctx = { lineOf: lineIndex(source), names, spelled: [] };
+  (facts.scopes[0] as Scope).reads.push(...unreadMentions(ctx, source, () => false, (name) => `${name} in a file the scan does not read`));
+  return facts;
+}
+
 function readFacts(
   ts: typeof import('typescript'),
   rel: string,
@@ -882,7 +1014,7 @@ function readFacts(
   configured: readonly ReadFunction[] = [],
   attributes: readonly string[] = ['data-stet'],
 ): FileFacts | null {
-  const dialect = dialectOf(rel);
+  const dialect = usageDialect(rel);
   const trees = new Map<number, TS.SourceFile>();
   const code = codeOf(ts, rel, source, dialect, (name, text, base) => {
     const sf = ts.createSourceFile(name, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, name));
@@ -909,7 +1041,8 @@ function readFacts(
   const keyList = [...declared];
   const names = new Set(configured.map((f) => f.name));
   const heads = new Set(configured.flatMap((f) => splitName(f.name)?.head ?? []));
-  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured, names, heads, spelled: [], leaned: new Set() };
+  const marks = attributes.filter((a) => a !== 'data-stet');
+  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured, names, heads, marks, spelled: [], leaned: new Set() };
   for (const sf of trees.values()) noteGlobals(ts, sf, facts);
 
   if (dialect === null) {
@@ -969,6 +1102,8 @@ interface WalkContext {
   /** The written names of the configured functions, and the head objects of the dotted ones. */
   names: ReadonlySet<string>;
   heads: ReadonlySet<string>;
+  /** The project's own key attribute (`reads.attribute`), when it sets one beside `data-stet`: a computed value of it is a computed read. */
+  marks: readonly string[];
   /** Where the walk met a configured function's name written as code, by absolute offset: what `unreadMentions` counts as accounted for. */
   spelled: Array<{ name: string; start: number; end: number }>;
   /** The top-level names of a classic script that the resolution in hand leaned on (`localOf`). */
@@ -1318,6 +1453,7 @@ function walkUses(ctx: WalkContext, tree: Tree, roots: ReadonlyMap<string, strin
       recordCall(ctx, node);
       scope.reads.push(...configuredRead(ctx, tree, node));
     }
+    if (ctx.marks.length > 0) scope.reads.push(...attributeRead(ctx, tree, node));
     if (ctx.configured.length > 0) {
       scope.reads.push(...configuredReferences(ctx, tree, node, aliases, scope));
       if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
@@ -1373,12 +1509,6 @@ export function calleeName(ts: typeof import('typescript'), expr: TS.Expression)
   return name?.replace(/^(?:(?:window|self|globalThis)\.)+(?=[^.])/, '');
 }
 
-/** The head object of a configured function (`TS` of `TS.tx`) and its last segment; none for a bare name. */
-function splitName(name: string): { head: string; last: string } | null {
-  const dot = name.lastIndexOf('.');
-  return dot < 0 ? null : { head: name.slice(0, dot), last: name.slice(dot + 1) };
-}
-
 /** Names bound to the head object of a configured function (`var T = TS`), by name. A name bound to its own head (`var TS = window.TS`) is no alias. */
 function headAliases(ctx: WalkContext, sf: TS.SourceFile): Map<string, string> {
   const { ts, configured } = ctx;
@@ -1407,19 +1537,28 @@ function headAliases(ctx: WalkContext, sf: TS.SourceFile): Map<string, string> {
  * prefixes as a stet binding's is; a call with no key argument is a cause.
  */
 function configuredRead(ctx: WalkContext, tree: Tree, call: TS.CallExpression): Read[] {
-  const { ts, lineOf } = ctx;
+  const { ts } = ctx;
   if (ctx.configured.length === 0) return [];
-  const { sf, base } = tree;
   const callee = calleeName(ts, call.expression);
   const fn = callee === undefined ? undefined : ctx.configured.find((f) => f.name === callee);
   if (fn === undefined) return [];
   const arg = call.arguments[fn.key];
   if (arg !== undefined && isLiteral(ts, arg)) return [];
+  return [computedRead(ctx, tree, call, call.getText(tree.sf), arg)];
+}
+
+/**
+ * A read whose key is not a literal: `arg`, followed one hop and given its
+ * prefixes as a stet binding's is; with no key expression (`arg` undefined), a
+ * cause. `at` places it and `text` names it.
+ */
+function computedRead(ctx: WalkContext, tree: Tree, at: TS.Node, text: string, arg: TS.Expression | undefined): Read {
+  const { sf, base } = tree;
   ctx.leaned.clear();
   const out: Read = {
     root: CONFIGURED,
-    line: lineOf(base + call.getStart(sf)),
-    text: call.getText(sf).replace(/\s+/g, ' ').slice(0, CAUSE_TEXT),
+    line: ctx.lineOf(base + at.getStart(sf)),
+    text: text.replace(/\s+/g, ' ').slice(0, CAUSE_TEXT),
     prefixes: arg === undefined ? [] : prefixOfArgument(ctx, arg),
   };
   if (arg !== undefined) {
@@ -1428,7 +1567,47 @@ function configuredRead(ctx: WalkContext, tree: Tree, call: TS.CallExpression): 
     else if (placed !== null) out.adapter = placed;
   }
   if (ctx.leaned.size > 0) out.global = [...ctx.leaned];
-  return [out];
+  return out;
+}
+
+/**
+ * A computed value of the project's key attribute: a prop of that name in an
+ * object literal (`h('p', { 'data-copy': 'a.' + k })`), a JSX attribute with an
+ * expression, `setAttribute('data-copy', expr)` and `el.dataset.copy = expr`.
+ * It is a computed read as a configured call with a computed key is — the
+ * prefix it opens with makes the keys under it unknown, else it is a cause. A
+ * literal value is pass 1's to name.
+ */
+function attributeRead(ctx: WalkContext, tree: Tree, node: TS.Node): Read[] {
+  const { ts, marks } = ctx;
+  const { sf } = tree;
+  const named = (name: TS.Node | undefined): string | undefined =>
+    name !== undefined && (ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name) || ts.isIdentifier(name)) ? name.text : undefined;
+  // `data-copy` of `el.dataset.copy`, `data-my-key` of `el.dataset.myKey`.
+  const datasetOf = (mark: string): string => mark.replace(/^data-/, '').replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+  let attribute: string | undefined;
+  let value: TS.Expression | undefined;
+  if (ts.isPropertyAssignment(node)) {
+    const name = ts.isComputedPropertyName(node.name) ? named(unwrap(ts, node.name.expression)) : named(node.name);
+    if (name !== undefined && marks.includes(name)) [attribute, value] = [name, node.initializer];
+  } else if (ts.isJsxAttribute(node)) {
+    const name = node.name.getText(sf);
+    if (marks.includes(name) && node.initializer !== undefined && ts.isJsxExpression(node.initializer)) [attribute, value] = [name, node.initializer.expression];
+  } else if (ts.isCallExpression(node)) {
+    const callee = unwrap(ts, node.expression);
+    const [first, second] = node.arguments;
+    if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'setAttribute' && isLiteral(ts, first) && marks.includes(first.text)) [attribute, value] = [first.text, second];
+  } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    const left = unwrap(ts, node.left);
+    const field = ts.isPropertyAccessExpression(left) ? left.name.text : ts.isElementAccessExpression(left) && isLiteral(ts, left.argumentExpression) ? left.argumentExpression.text : undefined;
+    const holder = ts.isPropertyAccessExpression(left) || ts.isElementAccessExpression(left) ? unwrap(ts, left.expression) : undefined;
+    if (field !== undefined && holder !== undefined && ts.isPropertyAccessExpression(holder) && holder.name.text === 'dataset') {
+      attribute = marks.find((mark) => datasetOf(mark) === field);
+      value = node.right;
+    }
+  }
+  if (attribute === undefined || value === undefined || isLiteral(ts, unwrap(ts, value))) return [];
+  return [computedRead(ctx, tree, value, `${attribute} set from ${value.getText(sf)}`, value)];
 }
 
 /**
@@ -1441,7 +1620,8 @@ function configuredRead(ctx: WalkContext, tree: Tree, call: TS.CallExpression): 
  * a `typeof` test are no use of it.
  *
  * The head object itself is judged the same way (`headUse`): it may only be the
- * object of a member access, a `typeof` operand, or written to itself
+ * object of a member access, a `typeof` operand, a truth test (`if (TS)`,
+ * `TS && TS.tx(…)`, `!TS`), or written to itself
  * (`var TS = window.TS`, `window.TS = window.TS || {}`). Anywhere else it
  * leaves the file by a name the scan cannot follow. An import that renames a
  * configured name or head (`import { t as tr }`, `export { t as x }`) is an
@@ -1532,6 +1712,20 @@ function configuredReferences(ctx: WalkContext, tree: Tree, node: TS.Node, alias
 }
 
 /**
+ * Whether an expression is only asked whether it is there: the test of an
+ * `if`, a loop or a conditional, the operand of `!`, or the left of `&&`, which
+ * passes on only a falsy value. Nothing of it reaches anywhere else.
+ */
+function truthTested(ts: typeof import('typescript'), top: TS.Expression): boolean {
+  const up = top.parent;
+  if (ts.isPrefixUnaryExpression(up)) return up.operator === ts.SyntaxKind.ExclamationToken;
+  if (ts.isIfStatement(up) || ts.isWhileStatement(up) || ts.isDoStatement(up)) return up.expression === top;
+  if (ts.isForStatement(up)) return up.condition === top;
+  if (ts.isConditionalExpression(up)) return up.condition === top;
+  return ts.isBinaryExpression(up) && up.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken && up.left === top;
+}
+
+/**
  * A reference to the head object of a configured function (`TS`, a name bound
  * to it), judged by where it sits: the object of a member access (`TS.tx`, and
  * `TS["tx"]`), a `typeof` operand, an assignment target, or a value that
@@ -1546,6 +1740,7 @@ function headUse(ctx: WalkContext, top: TS.Expression, head: string, onValue: Re
   if (ts.isPropertyAccessExpression(up) && up.expression === top) return [];
   if (ts.isElementAccessExpression(up) && up.expression === top) return isLiteral(ts, up.argumentExpression) ? [] : onComputed;
   if (ts.isTypeOfExpression(up)) return [];
+  if (truthTested(ts, top)) return [];
   if (ts.isBinaryExpression(up) && up.left === top && up.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && up.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return [];
   if (ts.isCallExpression(up) && up.arguments.includes(top)) {
     const callee = unwrap(ts, up.expression);
@@ -1574,18 +1769,6 @@ function headUse(ctx: WalkContext, top: TS.Expression, head: string, onValue: Re
   return onValue;
 }
 
-/** The text of a configured function's name as a pattern, where it was written: `TS.tx` (and `TS?.tx`, `TS["tx"]`), or a bare name followed by a call's opening. */
-function mentionPattern(name: string): RegExp {
-  const split = splitName(name);
-  if (split === null) {
-    // A call's opening only: a bare name as a word turns up in prose (`don't`), and a trailing apostrophe is the contraction's.
-    return new RegExp(`(?<![\\w$.])(?<![\\w$]['’])(?:(?:window|self|globalThis)\\s*\\.\\s*)?${escapeRegExp(name)}\\s*(?:\\?\\.\\s*)?(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(`, 'g');
-  }
-  const head = split.head.split('.').map(escapeRegExp).join('\\s*\\??\\.\\s*');
-  const last = escapeRegExp(split.last);
-  return new RegExp(`(?<![\\w$])${head}(?:\\s*\\??\\.\\s*${last}(?![\\w$])|\\s*\\??\\.?\\s*\\[\\s*(['"])${last}\\1\\s*\\])`, 'g');
-}
-
 /**
  * The backstop for text the parse never reads as code: a configured function's
  * name written in a string handed to `eval` or `setTimeout`, in an attribute no
@@ -1594,7 +1777,12 @@ function mentionPattern(name: string): RegExp {
  * comment that the walk did not meet as code (`ctx.spelled`) makes one cause per
  * function, at the first such line: the call may read any key.
  */
-function unreadMentions(ctx: WalkContext, source: string, inComment: (at: number) => boolean): Read[] {
+function unreadMentions(
+  ctx: Pick<WalkContext, 'lineOf' | 'names' | 'spelled'>,
+  source: string,
+  inComment: (at: number) => boolean,
+  textOf: (name: string) => string = (name) => `${name} in text the scan cannot read`,
+): Read[] {
   const out: Read[] = [];
   for (const name of ctx.names) {
     const seen = ctx.spelled.filter((s) => s.name === name).sort((a, b) => a.start - b.start);
@@ -1611,7 +1799,7 @@ function unreadMentions(ctx: WalkContext, source: string, inComment: (at: number
     };
     for (const m of source.matchAll(mentionPattern(name))) {
       if (accounted(m.index) || inComment(m.index)) continue;
-      out.push({ root: CONFIGURED, line: ctx.lineOf(m.index), text: `${name} in text the scan cannot read`.slice(0, CAUSE_TEXT), prefixes: [] });
+      out.push({ root: CONFIGURED, line: ctx.lineOf(m.index), text: textOf(name).slice(0, CAUSE_TEXT), prefixes: [] });
       break;
     }
   }

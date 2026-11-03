@@ -821,6 +821,153 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
     const plain = planDocumentFix(doc, { page: 'home', keys: new Set() });
     expect('skip' in plain ? [] : plain.mints.map((m) => m.key)).toEqual(['home_page_title', 'home_meta_description']);
   });
+
+  it('F3 a computed value of the configured attribute is a computed read: a prefix makes its keys unknown, else it is a cause', async () => {
+    const keys = ['a.b', 'c.d', 'dead.key', 'x.y'];
+    const usageOf = async (src: string, reads: Record<string, unknown> = { functions: ['TS.tx'], attribute: 'data-copy' }) => {
+      const dir = host({ 'screen.js': `var k = pick();\n${src}\n` }, { reads });
+      return keyUsage(dir, loadConfig(dir), descriptorOf(keys));
+    };
+    const prefixed: Array<[string, string, string]> = [
+      ["h('p', { 'data-copy': 'a.' + k });", 'a.b', 'a.'],
+      ["el.setAttribute('data-copy', 'c.' + k);", 'c.d', 'c.'],
+      ["el.dataset.copy = 'dead.' + k;", 'dead.key', 'dead.'],
+    ];
+    for (const [src, key, prefix] of prefixed) {
+      const usage = await usageOf(src);
+      expect.soft(usage.keys[key], src).toEqual({ state: 'unknown', prefix: { prefix, file: 'screen.js', line: 2 } });
+      expect.soft(usage.keys['x.y'], `${src} x.y`).toEqual({ state: 'not_found' });
+      expect.soft(usage.causes, `${src} causes`).toEqual([]);
+    }
+    // No prefix to learn: a cause, which opens every key nothing names.
+    for (const src of ["h('p', { 'data-copy': pick() });", "el.setAttribute('data-copy', pick());", 'el.dataset.copy = pick();']) {
+      const usage = await usageOf(src);
+      expect.soft(usage.causes.length, src).toBe(1);
+      expect.soft(usage.keys['x.y']?.state, src).toBe('unknown');
+    }
+    // A literal value is named by pass 1 and raises nothing; a project that sets no attribute never reads the prop.
+    const literal = await usageOf("h('p', { 'data-copy': 'a.b' });");
+    expect(literal.keys['a.b']?.state).toBe('read');
+    expect(literal.causes).toEqual([]);
+    const unset = await usageOf("h('p', { 'data-copy': 'a.' + k });", { functions: ['TS.tx'] });
+    expect(unset.keys['a.b']?.state).toBe('not_found');
+    expect(unset.causes).toEqual([]);
+  });
+
+  it('F4 a file the scan opens or reads as text is never silent: .htm is read, a template and a script served though git ignores it are read for calls, an unreadable file and a header-led file are not skipped', async () => {
+    const reads = { reads: { functions: ['TS.tx'] } };
+    const keys = descriptorOf([...KEYS, 'c.d']);
+    const usageOf = async (files: Record<string, string>, config: Record<string, unknown> = reads) => {
+      const dir = host(files, config);
+      return { dir, usage: await keyUsage(dir, loadConfig(dir), keys) };
+    };
+    // .htm is HTML.
+    const htm = await usageOf({ 'about.htm': PAGE('  <script>TS.tx("c.d")</script>') });
+    expect.soft(htm.usage.keys['c.d']?.state).toBe('read');
+    // A template the scan does not parse: the call it writes is a cause, one per file and function; prose and images are not scanned.
+    const njk = await usageOf({ 'tpl/page.njk': '<script>TS.tx("dead.key")</script>\n<script>TS.tx(k)</script>\n', 'README.md': 'Call TS.tx(key) to read.\n', 'logo.png': 'TS.tx(' });
+    expect.soft(njk.usage.causes).toEqual([{ text: 'TS.tx in a file the scan does not read', file: 'tpl/page.njk', line: 1 }]);
+    expect.soft(njk.usage.keys['privacy.body']?.state).toBe('unknown');
+    expect.soft(njk.usage.files).toBe(0);
+    // A project that sets no reads keeps reading only its source.
+    const plain = await usageOf({ 'tpl/page.njk': '<script>TS.tx(k)</script>\n' }, {});
+    expect.soft(plain.usage.causes).toEqual([]);
+    // A script a managed page serves counts though git ignores it.
+    const served = await usageOf({ 'index.html': PAGE('  <script src="screen.js"></script>'), 'screen.js': 'TS.tx("waitlist.title");\n', '.gitignore': 'screen.js\n' });
+    expect.soft(served.usage.keys['waitlist.title']?.state).toBe('read');
+    expect.soft(served.usage.files).toBe(2);
+    const unserved = await usageOf({ 'index.html': PAGE('  <p>x</p>'), 'screen.js': 'TS.tx("waitlist.title");\n', '.gitignore': 'screen.js\n' });
+    expect.soft(unserved.usage.keys['waitlist.title']?.state).toBe('not_found');
+    // A file the scan cannot open is a cause.
+    const locked = await usageOf({ 'screen.js': 'TS.tx("waitlist.title");\n' });
+    chmodSync(join(locked.dir, 'screen.js'), 0o000);
+    try {
+      const again = await keyUsage(locked.dir, loadConfig(locked.dir), keys);
+      expect.soft(again.causes).toEqual([{ text: 'could not be read', file: 'screen.js', line: 1 }]);
+      expect.soft(again.keys['privacy.body']?.state).toBe('unknown');
+    } finally {
+      chmodSync(join(locked.dir, 'screen.js'), 0o644);
+    }
+    // A tracked file that opens with stet's header and is no declared output is source.
+    const led = await usageOf({ 'screen.js': '// generated by stet — a concatenation\nTS.tx("waitlist.title");\n' });
+    expect.soft(led.usage.keys['waitlist.title']?.state).toBe('read');
+  });
+
+  it('Q83 a bare head reference used only as a truth test is no use of it', async () => {
+    const quiet: Record<string, string> = {
+      if_window: 'if (window.TS) { TS.tx("home.title"); }\n',
+      and_guard: 'TS && TS.tx("home.title");\n',
+      not_test: 'var off = !TS;\n',
+      ternary_test: 'var on = TS ? 1 : 2;\n',
+      while_test: 'while (TS) { break; }\n',
+    };
+    for (const [name, src] of Object.entries(quiet)) expect.soft(await privacyOf({ 's.js': src }), name).toEqual({ state: 'not_found', causes: 0 });
+    // A value that flows on stays a cause: the right of `&&`, the left of `||`, a ternary arm.
+    const loud: Record<string, string> = {
+      and_right: 'var o = ready && TS;\n',
+      or_left: 'var o = TS || {};\n',
+      ternary_arm: 'var o = ready ? TS : null;\n',
+    };
+    for (const [name, src] of Object.entries(loud)) expect.soft((await privacyOf({ 's.js': src })).causes, name).toBeGreaterThan(0);
+  });
+
+  it('F5 rename on an html host with reads also renames the property of a copy table stet does not generate', async () => {
+    const table = 'window.TS = window.TS || {};\nTS.copyTable = {\n  "a.b": "First words",\n  "c.d": "Other words"\n};\n';
+    const html = await makeHtmlHost({
+      files: { 'screen.js': '(function(){var TS=window.TS; TS.t("a.b");})();\n', 'copy.js': table },
+      keys: { 'a.b': { shape: 'text', target: 'web' }, 'c.d': { shape: 'text', target: 'web' } },
+      defaults: { 'a.b': 'First words', 'c.d': 'Other words' },
+      config: { reads: { functions: ['TS.t'] }, copyModules: ['copy.js'] },
+    });
+    expect(await html.run('rename', 'a.b', 'a.z', '--write')).toBe(0);
+    expect(html.file('screen.js')).toContain('TS.t("a.z")');
+    expect(html.file('copy.js')).toContain('"a.z": "First words"');
+    expect(html.file('copy.js')).not.toContain('"a.b"');
+    html.out.length = 0;
+    await html.run('scan');
+    expect(html.stdout()).not.toContain('diverged');
+  });
+
+  it('F6 rename refuses a configured read inside a directive attribute and names it', async () => {
+    const page = PAGE('  <p x-text="TS.tx(\'a.b\')">x</p>');
+    const html = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys: { 'a.b': { shape: 'text', target: 'web' } },
+      defaults: { 'a.b': 'Text of a.b' },
+      config: { reads: { functions: ['TS.tx'] } },
+    });
+    expect(await html.run('rename', 'a.b', 'a.z', '--write')).toBe(1);
+    expect(html.stdout() + html.stderr()).toContain('index.html:');
+    expect(html.file('index.html')).toBe(page);
+    // Prose that merely writes the key stays a mention the rename leaves alone.
+    const prose = await makeHtmlHost({
+      files: { 'index.html': PAGE('  <p title="the key a.b">x</p>') },
+      keys: { 'a.b': { shape: 'text', target: 'web' } },
+      defaults: { 'a.b': 'Text of a.b' },
+      config: { reads: { functions: ['TS.tx'] } },
+    });
+    expect(await prose.run('rename', 'a.b', 'a.z', '--write')).toBe(0);
+  });
+
+  it('F7 on a JavaScript host a generated output inside a managed surface does not block the rename of a key it holds', async () => {
+    const host = makeAdoptionHost();
+    expect(await host.run('init', '--yes')).toBe(0);
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const config = JSON.parse(host.file('stet.config.json')) as { managedSurfaces: string[] };
+    host.write(
+      'stet.config.json',
+      JSON.stringify({ ...config, managedSurfaces: [...config.managedSurfaces, 'src/**/*.js'], reads: { functions: ['TS.t'] }, generated: [{ file: 'src/strings.js', format: 'esm', name: 'STRINGS' }] }, null, 2),
+    );
+    const key = Object.keys((JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, unknown> }).keys).find((k) => !k.startsWith('brand__')) as string;
+    host.write('src/app.js', `TS.t("${key}");\n`);
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('src/strings.js')).toContain(`"${key}"`);
+    host.out.length = 0;
+    expect(await host.run('rename', key, 'zz_new', '--write')).toBe(0);
+    expect(host.file('src/app.js')).toBe('TS.t("zz_new");\n');
+    expect(host.file('src/strings.js')).toContain('"zz_new"');
+    expect(host.file('src/strings.js')).not.toContain(`"${key}"`);
+  });
 });
 
 describe('add-plain-js-hosts (0.9.0) C5', () => {
