@@ -20,6 +20,7 @@ import type { Descriptor } from '../src/types.js';
 import { asUpdate, planJson, type WritePlan } from './artifacts.js';
 import type { StetConfig } from './config.js';
 import { gitData } from './git.js';
+import { KEY_NAME } from './key-names.js';
 import { CliError } from './report.js';
 
 export type KeyStatus = { status: 'proposed' } | { status: 'approved'; at: string; by: string };
@@ -43,6 +44,7 @@ export function loadStatus(cwd: string, config: Pick<StetConfig, 'statusPath'>):
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return refuse('must be a JSON object of key → status');
   const file: StatusFile = {};
   for (const [key, entry] of Object.entries(raw)) {
+    if (!KEY_NAME.test(key)) return refuse(`${key} is not a key name`);
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return refuse(`${key} must be an object`);
     const word = (entry as Record<string, unknown>)['status'];
     // An approved entry missing its date or approver loads as it stands: `check` reports it.

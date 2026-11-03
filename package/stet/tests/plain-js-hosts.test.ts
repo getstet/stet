@@ -1,13 +1,13 @@
 // add-plain-js-hosts (0.9.0), chunks C1 and C3: the dotted key grammar, the config, the status file module; configured reads, the attribute mark, the no-mark pass.
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { planRepoForms, writePlanned } from '../cli/artifacts.js';
-import { defaultConfig, loadConfig } from '../cli/config.js';
+import { defaultConfig, loadConfig, rawConfigPlan } from '../cli/config.js';
 import { check } from '../cli/check.js';
 import { keyUsage, namedKeys, usageCache } from '../cli/key-usage.js';
 import { planProblems } from '../cli/key-plan.js';
@@ -19,7 +19,7 @@ import { approveKeys, completeStatus, loadStatus, renameStatus, resetChanged, st
 import { generateRegistry } from '../src/codegen.js';
 import { deriveLabel, loadDescriptor } from '../src/descriptor.js';
 import type { Descriptor } from '../src/types.js';
-import { cleanupCliHosts, makeHtmlHost } from '../conformance/cli-host.js';
+import { cleanupCliHosts, makeAdoptionHost, makeHtmlHost } from '../conformance/cli-host.js';
 
 const made: string[] = [];
 afterAll(() => {
@@ -49,6 +49,13 @@ function host(files: Record<string, string>, config: Record<string, unknown>): s
   }
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['add', '-A'], { cwd: dir });
+  return dir;
+}
+
+/** A project holding only a config, for the cases that parse it: no git, which `loadConfig` never reads. */
+function configHost(config: Record<string, unknown>): string {
+  const dir = tempDir();
+  writeFileSync(join(dir, 'stet.config.json'), JSON.stringify({ host: 'html', managedSurfaces: ['*.html'], ...config }));
   return dir;
 }
 
@@ -115,7 +122,7 @@ describe('add-plain-js-hosts (0.9.0) C1', () => {
   });
 
   it('P3.1 the config parses, defaults and refuses', () => {
-    const dir = host({}, { reads: { functions: ['TS.t', { name: 'TS.tx', key: 0 }, { name: 'i18n.copy.t', key: 2 }, 't'], attribute: 'data-copy' }, placeholders: '{name}', keyStyle: 'dotted', statusPath: 'copy/status.json', copyFrom: '../owner', scan: { builders: ['h', 'el'] } });
+    const dir = configHost({ reads: { functions: ['TS.t', { name: 'TS.tx', key: 0 }, { name: 'i18n.copy.t', key: 2 }, 't'], attribute: 'data-copy' }, placeholders: '{name}', keyStyle: 'dotted', statusPath: 'copy/status.json', copyFrom: '../owner', scan: { builders: ['h', 'el'] } });
     const config = loadConfig(dir);
     expect(config.reads).toEqual({
       functions: [{ name: 'TS.t', key: 0 }, { name: 'TS.tx', key: 0 }, { name: 'i18n.copy.t', key: 2 }, { name: 't', key: 0 }],
@@ -126,20 +133,20 @@ describe('add-plain-js-hosts (0.9.0) C1', () => {
     expect(config.statusPath).toBe('copy/status.json');
     expect(config.copyFrom).toBe('../owner');
     expect(config.scan.builders).toEqual(['h', 'el']);
-    expect(() => loadConfig(host({}, { scan: { builders: 'h' } }))).toThrow(/stet\.config\.json: scan\.builders must be an array of strings/);
-    const bare = loadConfig(host({}, {}));
+    expect(() => loadConfig(configHost({ scan: { builders: 'h' } }))).toThrow(/stet\.config\.json: scan\.builders must be an array of strings/);
+    const bare = loadConfig(configHost({}));
     expect(bare).toMatchObject({ placeholders: '{{name}}', keyStyle: 'underscore', generated: [], statusPath: 'content/status.json' });
     expect(bare.reads).toBeUndefined();
     expect(bare.copyFrom).toBeUndefined();
     expect(bare.scan.builders).toBeUndefined();
-    expect(loadConfig(host({}, { reads: { functions: ['t'] } })).reads).toEqual({ functions: [{ name: 't', key: 0 }] });
-    expect(loadConfig(host({}, { generated: [{ file: 'a/x.js', format: 'script', name: 'TS.copyTable' }, { file: 'x.json', format: 'json', values: 'value-status', only: ['home.'] }] })).generated).toEqual([
+    expect(loadConfig(configHost({ reads: { functions: ['t'] } })).reads).toEqual({ functions: [{ name: 't', key: 0 }] });
+    expect(loadConfig(configHost({ generated: [{ file: 'a/x.js', format: 'script', name: 'TS.copyTable' }, { file: 'x.json', format: 'json', values: 'value-status', only: ['home.'] }] })).generated).toEqual([
       { file: 'a/x.js', format: 'script', name: 'TS.copyTable', values: 'value' },
       { file: 'x.json', format: 'json', values: 'value-status', only: ['home.'] },
     ]);
 
     const refuse = (config: Record<string, unknown>, message: RegExp): void => {
-      expect(() => loadConfig(host({}, config))).toThrow(message);
+      expect(() => loadConfig(configHost(config))).toThrow(message);
     };
     refuse({ reads: { functions: [] } }, /stet\.config\.json: reads\.functions must be a list of function names, such as "t" or "TS\.t"/);
     refuse({ reads: { functions: ['not a name'] } }, /reads\.functions must be a list of function names/);
@@ -151,13 +158,17 @@ describe('add-plain-js-hosts (0.9.0) C1', () => {
     refuse({ generated: [{ file: 'x.js', format: 'script' }] }, /stet\.config\.json: generated\[0\] needs a file, a format \(script, esm or json\) and, for script and esm, a name/);
     refuse({ generated: [{ file: 'x.json', format: 'json' }, { file: 'x.js', format: 'cjs', name: 'T' }] }, /generated\[1\] needs a file/);
     refuse({ copyFrom: ' ' }, /stet\.config\.json: copyFrom must name a folder holding stet\.config\.json/);
+    // The status file is a path stet writes: non-empty and inside the checkout.
+    for (const statusPath of ['', '../x/status.json', 'a/../../status.json', '/tmp/status.json']) {
+      refuse({ statusPath }, /stet\.config\.json: statusPath must be a file path inside this checkout/);
+    }
     // Outside the checkout: a relative climb and an absolute path.
     const inside = /stet\.config\.json: generated\[0\]\.file must be inside this checkout — a second checkout generates its own file through copyFrom/;
     refuse({ generated: [{ file: '../other/strings.mjs', format: 'esm', name: 'S' }] }, inside);
     refuse({ generated: [{ file: 'a/../../strings.mjs', format: 'esm', name: 'S' }] }, inside);
     refuse({ generated: [{ file: '/tmp/strings.mjs', format: 'esm', name: 'S' }] }, inside);
     // A segment that merely starts with two dots stays inside.
-    expect(loadConfig(host({}, { generated: [{ file: '..strings.mjs', format: 'esm', name: 'S' }] })).generated).toHaveLength(1);
+    expect(loadConfig(configHost({ generated: [{ file: '..strings.mjs', format: 'esm', name: 'S' }] })).generated).toHaveLength(1);
   });
 });
 
@@ -216,6 +227,9 @@ describe('the status file module (D3)', () => {
     expect(() => loadStatus(cwd, config)).toThrow(/content\/status\.json/);
     writeFileSync(join(cwd, 'content/status.json'), '{ nope');
     expect(() => loadStatus(cwd, config)).toThrow(/content\/status\.json/);
+    // A key outside the key grammar is refused, `__proto__` included, rather than dropped or re-parenting the loaded object.
+    writeFileSync(join(cwd, 'content/status.json'), '{"__proto__":{"status":"proposed"},"a":{"status":"proposed"}}');
+    expect(() => loadStatus(cwd, config)).toThrow(/content\/status\.json: __proto__ is not a key name/);
   });
 
   const MARKED = '<!DOCTYPE html>\n<html lang="en">\n<head><title>Site</title></head>\n<body>\n  <h1 data-stet="home_title">Hello</h1>\n  <p data-stet="home_body">World</p>\n</body>\n</html>\n';
@@ -247,12 +261,12 @@ describe('the status file module (D3)', () => {
     expect(adopted.exists('content/status.json')).toBe(false);
   });
 
-  it('P4.2 planRepoForms writes the status file in the same batch as the snapshot, and a refused batch leaves it unwritten', () => {
+  it('P4.2 planRepoForms writes the status file in the same batch as the snapshot, and a status file that cannot be written leaves every form unwritten', () => {
     const cwd = tempDir();
     const descriptor = loadDescriptor({ version: 1, keys: { a: { shape: 'text', target: 'web' } } });
     const status: StatusFile = { a: approved('nj-io', '2026-11-02') };
     const plans = planRepoForms(cwd, defaultConfig(), descriptor, { default: { a: 'A' } }, status, new Report());
-    expect(plans.map((p) => p.label)).toEqual([
+    const forms = [
       'content/descriptor.json',
       'content/defaults.json',
       'content/keys.ts',
@@ -260,20 +274,37 @@ describe('the status file module (D3)', () => {
       'content/defaults.ts',
       'content/resolved.ts',
       'content/status.json',
-    ]);
+    ];
+    expect(plans.map((p) => p.label)).toEqual(forms);
     writePlanned(plans);
     expect(JSON.parse(readFileSync(join(cwd, 'content/status.json'), 'utf8'))).toEqual(status);
     // No approval and no file: the batch has no sixth form.
     expect(planRepoForms(tempDir(), defaultConfig(), descriptor, { default: { a: 'A' } }, {}, new Report()).map((p) => p.label)).not.toContain('content/status.json');
 
-    // A page that cannot be regenerated refuses the whole batch, the status file with it.
-    const html = tempDir();
-    const page = readFileSync(fileURLToPath(new URL('./fixtures/html-host/index.html', import.meta.url)), 'utf8');
-    writeFileSync(join(html, 'index.html'), page.replace('<h1>', '<h1 data-stet="hero">'), 'utf8');
-    const config = { ...defaultConfig(), host: 'html' as const, managedSurfaces: ['**/*.html'] };
-    const rich = loadDescriptor({ version: 1, keys: { hero: { shape: 'text', target: 'web', tags: 1 } } });
-    expect(() => planRepoForms(html, config, rich, { default: { hero: 'A heading with no placeholder at all.' } }, { hero: approved('nj-io', '2026-11-02') }, new Report())).toThrow(/could not be regenerated/);
-    expect(existsSync(join(html, 'content/status.json'))).toBe(false);
+    // A status file in a read-only folder fails at write time: the descriptor, snapshot and codegen files do not exist after.
+    const locked = tempDir();
+    mkdirSync(join(locked, 'content/ro'), { recursive: true });
+    chmodSync(join(locked, 'content/ro'), 0o555);
+    try {
+      const config = { ...defaultConfig(), statusPath: 'content/ro/status.json' };
+      expect(() => writePlanned(planRepoForms(locked, config, descriptor, { default: { a: 'A' } }, status, new Report()))).toThrow();
+      for (const rel of forms.slice(0, -1)) expect(existsSync(join(locked, rel)), rel).toBe(false);
+      expect(existsSync(join(locked, 'content/ro/status.json'))).toBe(false);
+    } finally {
+      chmodSync(join(locked, 'content/ro'), 0o755);
+    }
+  });
+
+  it('P1.9 init and a config planned from none write none of the four 0.9.0 defaults', async () => {
+    const fresh = makeAdoptionHost();
+    expect(await fresh.run('init', '--yes')).toBe(0);
+    const written = JSON.parse(fresh.file('stet.config.json')) as Record<string, unknown>;
+    for (const field of ['placeholders', 'keyStyle', 'generated', 'statusPath']) expect(written, field).not.toHaveProperty(field);
+    expect(written).toHaveProperty('descriptorPath');
+    // The no-config path of `email extract` and `import` is `rawConfigPlan`.
+    const planned = JSON.parse(rawConfigPlan(tempDir(), () => {}).text) as Record<string, unknown>;
+    for (const field of ['placeholders', 'keyStyle', 'generated', 'statusPath']) expect(planned, field).not.toHaveProperty(field);
+    expect(planned).toHaveProperty('descriptorPath');
   });
 });
 

@@ -11,8 +11,8 @@ import { VARIABLE } from './validate.js';
 /** The placeholder grammar a host reads: stet stores `{{name}}`; a `{name}` host converts at import and generation. */
 export type Placeholders = '{{name}}' | '{name}';
 
-/** A single-brace variable, never one half of a doubled `{{name}}`. */
-const SINGLE = /(?<!\{)\{([A-Za-z_]\w*)\}(?!\})/g;
+/** A single-brace variable, never one half of a doubled `{{name}}`; a name is what `VARIABLE` accepts, a digit start included. */
+const SINGLE = /(?<!\{)\{([a-zA-Z0-9_]+)\}(?!\})/g;
 
 /** `{name}` → `{{name}}` for a `{name}` host; the value unchanged for `{{name}}`. A `{{name}}` already doubled in a `{name}` value is left as it is. */
 export function toStet(value: string, grammar: Placeholders): string {

@@ -1,0 +1,8 @@
+{
+  "default": {
+    "home.title": "Make your whole ad campaign.",
+    "waitlist.count": "{{n}} people are waiting",
+    "waitlist.use.music_videos": "Music videos",
+    "waitlist_use": "What will you make?"
+  }
+}

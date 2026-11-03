@@ -27,6 +27,9 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
     expect(toStet('{a} {b}', '{name}')).toBe('{{a}} {{b}}');
     expect(toStet('a { b and {} and { c }', '{name}')).toBe('a { b and {} and { c }');
     expect(toStet('{n} people', '{{name}}')).toBe('{n} people');
+    // A name is what the stored grammar accepts, a digit start included.
+    expect(toStet('{1} of {2b}', '{name}')).toBe('{{1}} of {{2b}}');
+    expect(toHost('{{1}} of {{2b}}', '{name}')).toBe('{1} of {2b}');
     expect(toHost('{{n}} people are waiting', '{name}')).toBe('{n} people are waiting');
     expect(toHost('{{a}} {{b}}', '{name}')).toBe('{a} {b}');
     expect(toHost('a { b', '{name}')).toBe('a { b');
@@ -35,21 +38,58 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
     expect(varsOf('{n} and a { b')).toEqual([]);
   });
 
-  it('P2.2 a pair proposes its element 0 under the property name, an object its value member, and neither proposes a sibling', async () => {
-    const result = await scanModule(
-      'design/data/copy.js',
-      'window.TS = window.TS || {};\n' +
-        'TS.copyTable = {\n' +
-        '  "home.title": ["Make your whole ad campaign.", "approved"],\n' +
-        '  "home.lead": { value: "Every variant, one run.", note: 1, hint: "A note for the writer only." },\n' +
-        '  "home.sub": "A bare string reads as it always has.",\n' +
-        '};\n',
-    );
-    expect(result.literals.map((l) => [l.proposedKey, l.text, l.shape, l.form ?? null])).toEqual([
+  it('P2.2 in a uniform table a pair proposes its element 0 under the property name and an object its value member, and neither proposes a sibling', async () => {
+    const shape = async (source: string): Promise<Array<[string | undefined, string, string, string | null]>> =>
+      (await scanModule('design/data/copy.js', source)).literals.map((l) => [l.proposedKey, l.text, l.shape, l.form ?? null]);
+    // Every member a pair, one with a cast element.
+    expect(
+      await shape(
+        'window.TS = window.TS || {};\n' +
+          'TS.copyTable = {\n' +
+          '  "home.title": ["Make your whole ad campaign.", "approved"],\n' +
+          '  "home.sub": ["Every variant, one run." as const, "ask"],\n' +
+          '};\n',
+      ),
+    ).toEqual([
       ['home.title', 'Make your whole ad campaign.', 'property', 'pair'],
-      ['home.lead', 'Every variant, one run.', 'property', 'object'],
-      ['home.sub', 'A bare string reads as it always has.', 'property', null],
+      ['home.sub', 'Every variant, one run.', 'property', 'pair'],
     ]);
+    // Every member an object with a string `value`.
+    expect(
+      await shape(
+        'TS.copyTable = {\n' +
+          '  "home.lead": { value: "Every variant, one run.", note: 1, hint: "A note for the writer only." },\n' +
+          '  "home.tail": { value: "Last words on the page.", hint: "Another note." },\n' +
+          '};\n',
+      ),
+    ).toEqual([
+      ['home.lead', 'Every variant, one run.', 'property', 'object'],
+      ['home.tail', 'Last words on the page.', 'property', 'object'],
+    ]);
+  });
+
+  it('P2.2b a pair or an object in an ordinary object, a mixed table or a lone member reads as it did before', async () => {
+    const keys = async (source: string): Promise<string[]> => (await scanModule('copy.js', source)).literals.map((l) => `${l.proposedKey}|${l.form ?? ''}`);
+    // A list in an object of unlike members.
+    expect(await keys('export const plan = { title: "Pricing page headline", features: ["Fast shipping", "Cheap prices"] };\n')).toEqual([
+      'title|',
+      'fast_shipping|',
+      'cheap_prices|',
+    ]);
+    // An object with a `value` beside a bare string.
+    expect(await keys('export const t = { cta: { value: "Buy now", label: "Purchase button" }, home: "Welcome home" };\n')).toEqual([
+      'value|',
+      'label|',
+      'home|',
+    ]);
+    // One pair among bare strings: its status word is copy again.
+    expect(await keys('export const t = { "home.title": ["Make your ad", "approved"], "home.sub": "A bare string here" };\n')).toEqual([
+      'make_your_ad|',
+      'approved|',
+      'home.sub|',
+    ]);
+    // A table of one member is no evidence of a table.
+    expect(await keys('export const t = { features: ["Fast shipping", "Cheap prices"] };\n')).toEqual(['fast_shipping|', 'cheap_prices|']);
   });
 
   it('P2.3 import from JSON, a classic script, an ES module; --export, the default export and the refusals', async () => {
@@ -119,7 +159,10 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
     ]);
     expect(host.err).toEqual(['error: import: 1 keys differ — nothing written; pass --replace to take the file\'s values, or --only to leave them out']);
 
+    host.out.length = 0;
     expect(await host.run('import', 't.json', '--replace', '--write')).toBe(0);
+    expect(host.out).toContain('  home.title  differs: "B" — the snapshot holds "A"');
+    expect(host.out.some((line) => line.includes('pass --replace'))).toBe(false);
     expect(JSON.parse(host.file('content/defaults.json')).default['home.title']).toBe('B');
   });
 
@@ -206,5 +249,69 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
     expect(await host.run('import', 'probe.mjs')).toBe(0);
     expect(host.out[2]).toBe('  a.b  "undefined undefined undefined"');
     expect(readFileSync(join(host.cwd, 'content/descriptor.json'), 'utf8')).toBe(before['content/descriptor.json']);
+  });
+
+  it('P2.8b a file that hangs the host stack answers inside the ceiling and writes nothing', async () => {
+    const host = await site({
+      'throw-proxy.mjs': 'throw new Proxy({}, { get() { while (true) {} } });\n',
+      'throw-getter.mjs': 'throw { get message() { while (true) {} } };\n',
+      'proto-default.mjs': 'Object.defineProperty(Object.prototype, "default", { get() { while (true) {} } });\nexport const S = { "a.b": "Alpha" };\n',
+      'trap.mjs': 'export const S = new Proxy({}, { getOwnPropertyDescriptor() { while (true) {} } });\n',
+    });
+    const before = forms(host);
+    for (const file of ['throw-proxy.mjs', 'throw-getter.mjs']) {
+      expect(await host.run('import', file, '--write')).toBe(1);
+      expect(host.stderr()).toContain(`import: ${file} could not be evaluated: an error that could not be read`);
+    }
+    expect(await host.run('import', 'trap.mjs', '--export', 'S.x', '--write')).toBe(1);
+    expect(host.stderr()).toContain('import: trap.mjs could not be evaluated:');
+    // An accessor the file put on Object.prototype never runs on stet's stack: the table imports as it stands.
+    host.out.length = 0;
+    expect(await host.run('import', 'proto-default.mjs')).toBe(0);
+    expect(host.out[2]).toBe('  a.b  "Alpha"');
+    expect(forms(host)).toEqual(before);
+  }, 30_000);
+
+  it('P2.8c a table past the size cap, or one the file made unreadable, is refused', async () => {
+    const host = await site({
+      'big.mjs': 'export const S = { "a.b": "x".repeat(2 ** 25) };\n',
+      'json.mjs': 'JSON.stringify = () => ({ toString() { while (true) {} } });\nexport const S = { "a.b": "Alpha" };\n',
+    });
+    const before = forms(host);
+    expect(await host.run('import', 'big.mjs', '--write')).toBe(1);
+    expect(host.stderr()).toContain('import: big.mjs could not be evaluated: the table is too large');
+    expect(await host.run('import', 'json.mjs', '--write')).toBe(1);
+    expect(host.stderr()).toContain('import: json.mjs could not be evaluated: the table could not be read as data');
+    expect(forms(host)).toEqual(before);
+  }, 30_000);
+
+  it('P2.9 a module whose comment holds an export line imports its real export; a second declarator exports too; unsupported syntax is named', async () => {
+    const host = await site({
+      'comment.mjs': 'export default { "d.e": "Default words" };\n/*\nexport const X = { "x.y": "in a comment" };\n*/\n',
+      'second.mjs': 'export const A = { "a.b": "Alpha" }, B = { "b.c": "Beta" };\n',
+      'destructure.mjs': 'export const { A } = { A: { "a.b": "x" } };\n',
+      'await.mjs': 'export const A = { "a.b": await Promise.resolve("x") };\n',
+    });
+    expect(await host.run('import', 'comment.mjs')).toBe(0);
+    expect(host.out[2]).toBe('  d.e  "Default words"');
+    host.out.length = 0;
+    expect(await host.run('import', 'second.mjs', '--export', 'B')).toBe(0);
+    expect(host.out[2]).toBe('  b.c  "Beta"');
+    expect(await host.run('import', 'destructure.mjs')).toBe(1);
+    expect(host.stderr()).toContain('import: destructure.mjs could not be evaluated: a destructuring export is not supported — export each name on its own');
+    expect(await host.run('import', 'await.mjs')).toBe(1);
+    expect(host.stderr()).toContain('import: await.mjs could not be evaluated: top-level await is not supported');
+  });
+
+  it('P2.10 a declared key with no default is filled without --replace', async () => {
+    const host = await site(
+      { 't.json': JSON.stringify({ 'home.title': 'Welcome', 'home.lead': 'Lead words' }) },
+      {},
+      { 'home.title': { shape: 'text', target: 'web' }, 'home.lead': { shape: 'text', target: 'web' } },
+      { 'home.lead': 'Lead words' },
+    );
+    expect(await host.run('import', 't.json', '--write')).toBe(0);
+    expect(host.out.slice(0, 3)).toEqual(['import: 2 keys from t.json', '  new 1 · same 1 · differs 0 · skipped 0', '  home.title  "Welcome"']);
+    expect(JSON.parse(host.file('content/defaults.json')).default['home.title']).toBe('Welcome');
   });
 });

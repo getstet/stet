@@ -26,7 +26,6 @@ import { dirname, join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
 import { plainOf } from '../src/placeholder.js';
 import { escapeRegExp } from '../src/seo.js';
 import type { Descriptor } from '../src/types.js';
@@ -36,6 +35,7 @@ import {
   isHeadKind,
   itemReader,
   itemWord,
+  KEY_NAME,
   looseHeadingRole,
   metaCopyNameOf,
   roleOf,
@@ -380,15 +380,6 @@ const SEND_DENY = new Set(['from', 'to', 'cc', 'bcc', 'replyTo', 'reply_to', 'ht
 const I18N_ELEMENTS = new Set(['Trans']);
 
 const IGNORE_MARKER = 'stet-ignore-next-line';
-
-/**
- * The descriptor's own key grammar, compiled once — the schema's `keyName`
- * pattern, read from the generated zero-dependency module rather than
- * `descriptor.ts`'s re-export, which would drag `ajv` into this file's graph.
- * A copy module's property name proposes ITSELF as a key, so the question
- * "could this name be a key" has to be answered by the thing that decides it.
- */
-const KEY_NAME = new RegExp(DESCRIPTOR_SCHEMA.$defs.keyName.pattern);
 
 /**
  * The named HTML entities worth decoding so a seeded default matches what render
@@ -2152,27 +2143,46 @@ export async function scanModule(
       if (parent === undefined || !ts.isPropertyAssignment(parent) || parent.initializer !== node) return undefined;
       return ts.isObjectLiteralExpression(parent.parent) ? parent : undefined;
     };
+    const bare = (e: TS.Expression): TS.Expression =>
+      ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e) ? bare(e.expression) : e;
+    /** A `[value, meta]` pair: two string literals, either one cast or parenthesised. */
+    const isPair = (e: TS.Expression): boolean => {
+      const a = bare(e);
+      return ts.isArrayLiteralExpression(a) && a.elements.length === 2 && a.elements.every((x) => ts.isStringLiteralLike(bare(x)));
+    };
+    /** A `{ value: "…", … }` object: a string `value` member beside any others. */
+    const isValued = (e: TS.Expression): boolean => {
+      const o = bare(e);
+      return (
+        ts.isObjectLiteralExpression(o) &&
+        o.properties.some((p) => ts.isPropertyAssignment(p) && propName(ts, p.name) === 'value' && ts.isStringLiteralLike(bare(p.initializer)))
+      );
+    };
+    /** A table reads as `[value, meta]` pairs or `{ value }` objects only when it has at least two members and every one has the shape. */
+    const uniform = (table: TS.Node, shaped: (e: TS.Expression) => boolean): boolean => {
+      const members = (table as TS.ObjectLiteralExpression).properties;
+      return members.length >= 2 && members.every((m) => ts.isPropertyAssignment(m) && shaped(m.initializer));
+    };
     const node = climb(lit);
     const parent: TS.Node | undefined = node.parent;
-    // `"home.title": ["Make your whole ad campaign.", "approved"]`: element 0 is the value. Only the
-    // two-string pair reads so: a one-element list (`classes: ['x']`) or a longer one stays the
-    // literals it always was.
+    // `"home.title": ["Make your whole ad campaign.", "approved"]`: element 0 is the value, where
+    // every member of the enclosing table is such a pair. A two-string list in an ordinary object
+    // (`features: ['Fast', 'Cheap']`) or a longer or shorter one stays the literals it always was.
     if (parent !== undefined && ts.isArrayLiteralExpression(parent)) {
       const pair = propertyOf(climb(parent));
-      if (pair === undefined || parent.elements.length !== 2 || !parent.elements.every((e) => ts.isStringLiteralLike(e))) return undefined;
+      if (pair === undefined || !uniform(pair.parent, isPair)) return undefined;
       return parent.elements[0] === node ? { name: propName(ts, pair.name), form: 'pair' } : null;
     }
     const own = propertyOf(node);
     if (own === undefined) return undefined;
-    // `"home.lead": { value: "Every variant, one run.", note: "…" }`: the `value` member is the value.
+    // `"home.lead": { value: "Every variant, one run.", note: "…" }`: the `value` member is the value,
+    // where every member of the enclosing table is such an object.
     const holder = own.parent as TS.ObjectLiteralExpression;
     const outer = propertyOf(climb(holder));
-    const bare = (e: TS.Expression): TS.Expression =>
-      ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e) ? bare(e.expression) : e;
     const valued = holder.properties.find(
       (p): p is TS.PropertyAssignment => ts.isPropertyAssignment(p) && propName(ts, p.name) === 'value' && ts.isStringLiteralLike(bare(p.initializer)),
     );
-    if (outer !== undefined && valued !== undefined) {
+    if (outer !== undefined && valued !== undefined && uniform(outer.parent, isValued)) {
       return valued === own ? { name: propName(ts, outer.name), form: 'object' } : null;
     }
     return { name: propName(ts, own.name) };

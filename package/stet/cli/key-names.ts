@@ -18,6 +18,8 @@
 // key — html-host, source-scan, pages, register, scan, rename, the dashboard's
 // routes — can import it without closing a ring.
 
+import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
+
 /** Where a key renders: a file and line, and the element's tag and attribute where stet can read them. */
 export interface Place {
   file: string;
@@ -150,6 +152,15 @@ export function wordsOf(raw: string): string {
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
 }
+
+/**
+ * The descriptor's own key grammar, compiled once — the schema's `keyName`
+ * pattern, read from the generated zero-dependency module rather than
+ * `descriptor.ts`'s re-export, which would drag `ajv` into a file's graph.
+ * A copy module's property name proposes ITSELF as a key, so the question
+ * "could this name be a key" has to be answered by the thing that decides it.
+ */
+export const KEY_NAME = new RegExp(DESCRIPTOR_SCHEMA.$defs.keyName.pattern);
 
 /** A descriptor name part: lowercase letters and digits in words joined by single underscores. */
 export const NAME_PART = /^[a-z0-9]+(?:_[a-z0-9]+)*$/;

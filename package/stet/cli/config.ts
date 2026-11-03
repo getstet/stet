@@ -13,6 +13,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, resolve as resolvePath } from 'node:path';
 
+import type { Placeholders } from '../src/placeholders.js';
 import { SEO_SEVERITY } from '../src/seo.js';
 import type { SeoRule } from '../src/seo.js';
 import { asUpdate, planJson, writeJsonDeterministic, type WritePlan } from './artifacts.js';
@@ -30,9 +31,6 @@ export interface ReadFunction {
   name: string;
   key: number;
 }
-
-/** The placeholder grammar a host reads: stet stores `{{name}}`; a `{name}` host converts at import and generation. */
-export type Placeholders = '{{name}}' | '{name}';
 
 /** The joiner the naming rule puts between a name's parts. */
 export type KeyStyle = 'underscore' | 'dotted';
@@ -344,7 +342,7 @@ export function rawConfigPlan(cwd: string, edit: (raw: Record<string, unknown>) 
   const path = join(cwd, CONFIG_FILE);
   const raw: Record<string, unknown> = existsSync(path)
     ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>)
-    : { ...defaultConfig() };
+    : withoutNewDefaults(defaultConfig());
   edit(raw);
   return asUpdate(planJson(path, raw, CONFIG_FILE));
 }
@@ -355,6 +353,16 @@ export const DEFAULT_ROOT_LAYOUT = 'app/layout.tsx';
 /** The forms secret's variable name: the configured one, else `STET_FORMS_SECRET`. */
 export function formsSecretEnvOf(config: Pick<StetConfig, 'formsSecretEnv'>): string {
   return config.formsSecretEnv ?? 'STET_FORMS_SECRET';
+}
+
+/**
+ * A config as a new `stet.config.json` carries it: the four settings of 0.9.0
+ * (`placeholders`, `keyStyle`, `generated`, `statusPath`) leave out their
+ * defaults, so a project that sets none of them gains none.
+ */
+export function withoutNewDefaults(config: StetConfig): Record<string, unknown> {
+  const { placeholders: _placeholders, keyStyle: _keyStyle, generated: _generated, statusPath: _statusPath, ...rest } = config;
+  return rest;
 }
 
 export function defaultConfig(): StetConfig {
@@ -553,8 +561,7 @@ export function loadConfig(cwd: string): StetConfig {
       if (values !== undefined && values !== 'value' && values !== 'value-status') return fail();
       if (only !== undefined && (!Array.isArray(only) || only.some((p) => typeof p !== 'string'))) return fail();
       // A config that writes outside its repo is the one way stet would write host source it does not own.
-      const at = posix.normalize(file.replace(/\\/g, '/'));
-      if (isAbsolute(file) || at === '..' || at.startsWith('../')) {
+      if (!insideCheckout(file)) {
         throw new CliError(
           `${CONFIG_FILE}: generated[${i}].file must be inside this checkout — a second checkout generates its own file through copyFrom`,
         );
@@ -574,6 +581,9 @@ export function loadConfig(cwd: string): StetConfig {
     config.copyFrom = copyFrom;
   }
   config.statusPath = str(source, 'statusPath', config.statusPath);
+  if (config.statusPath === '' || !insideCheckout(config.statusPath)) {
+    throw new CliError(`${CONFIG_FILE}: statusPath must be a file path inside this checkout`);
+  }
 
   const readPath = obj(source, 'readPath');
   if (readPath) {
@@ -889,6 +899,12 @@ export function isLanguageTag(value: string): boolean {
   if ((value.split('-')[0] as string).length === 3 && primary.length === 2) return false;
   if (BARE_SUBTAGS.has(primary)) return true;
   return new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }).of(primary) !== undefined;
+}
+
+/** A relative path that stays inside the checkout it is read from. */
+function insideCheckout(file: string): boolean {
+  const at = posix.normalize(file.replace(/\\/g, '/'));
+  return !(isAbsolute(file) || at === '..' || at.startsWith('../'));
 }
 
 function str(

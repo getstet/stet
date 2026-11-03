@@ -11,8 +11,11 @@
  * `export`s into the script's own bindings — `vm.SourceTextModule` exists only
  * behind `--experimental-vm-modules`, a flag the CLI cannot pass itself — and a
  * module that imports another is refused, since nothing outside the file is
- * ever read. The chosen object leaves the context as JSON written inside it,
- * so no getter or proxy of the host's runs in stet's realm.
+ * ever read. Everything the file's objects can run — a getter, a proxy trap, an
+ * inherited accessor, a replaced `JSON.stringify`, a thrown value's `message` —
+ * runs INSIDE the context under the ceiling: the table is picked and written as
+ * one JSON string there, and stet's realm only checks that it is a string of
+ * bounded length and parses it.
  *
  * Offline by contract: the loading path is `check`'s own, as `remove`'s is.
  */
@@ -21,25 +24,24 @@ import { readFileSync } from 'node:fs';
 import { extname, resolve } from 'node:path';
 import vm from 'node:vm';
 
-import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
 import { toStet, varsOf, type Placeholders } from '../src/placeholders.js';
 import { DEFAULT_TARGET, type KeyDef } from '../src/types.js';
 import { flag, parse, positionalsAround, required, text } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { loadConfig, rawConfigPlan, type StetConfig } from './config.js';
-import { NAME_PART } from './key-names.js';
+import { KEY_NAME, NAME_PART } from './key-names.js';
 import type { CliIo } from './main.js';
 import { CliError, HostTextReport, Report, UsageError } from './report.js';
 import { approveKeys, gitUserName, loadStatus, type StatusFile } from './status.js';
 import { isStoreBacked } from './store.js';
 import { validateValue } from './validate.js';
 
-/** The key grammar, as the schema states it. */
-const KEY_NAME = new RegExp(DESCRIPTOR_SCHEMA.$defs.keyName.pattern);
-
 /** How long a file's top level may run before it is refused as an evaluation error. */
 const EVALUATE_MS = 2000;
+
+/** The longest JSON string the context may hand back, in characters. */
+const MAX_JSON = 16 * 1024 * 1024;
 
 /** The binding a module's default export takes once its `export default` is rewritten. */
 const DEFAULT_BINDING = '__stet_default';
@@ -95,8 +97,15 @@ export async function runImport(args: string[], io: CliIo): Promise<number> {
   const locale = config.locales.default;
   const defaults: Record<string, unknown> = { ...(snapshot[locale] ?? {}) };
   const held = (key: string): unknown => (Object.hasOwn(defaults, key) ? defaults[key] : undefined);
+  // A declared key with no default is being filled, which overwrites nothing.
   const kindOf = (row: ImportRow): 'new' | 'same' | 'differs' | 'skipped' =>
-    row.value === undefined ? 'skipped' : !Object.hasOwn(descriptor.keys, row.key) ? 'new' : held(row.key) === row.value ? 'same' : 'differs';
+    row.value === undefined
+      ? 'skipped'
+      : !Object.hasOwn(descriptor.keys, row.key) || held(row.key) === undefined
+        ? 'new'
+        : held(row.key) === row.value
+          ? 'same'
+          : 'differs';
   const count = (kind: string): number => rows.filter((row) => kindOf(row) === kind).length;
   const differing = count('differs');
   // The rows this import writes a value for, and the approvals it records.
@@ -112,7 +121,7 @@ export async function runImport(args: string[], io: CliIo): Promise<number> {
       report.line(`  ${row.key}  ${JSON.stringify(row.value)}${vars.length === 0 ? '' : `  vars: ${vars.join(', ')}`}`);
     } else if (kind === 'differs') {
       report.line(
-        `  ${row.key}  differs: ${JSON.stringify(row.value)} — the snapshot holds ${JSON.stringify(held(row.key) ?? '')}; pass --replace to take the file's`,
+        `  ${row.key}  differs: ${JSON.stringify(row.value)} — the snapshot holds ${JSON.stringify(held(row.key))}${replace ? '' : "; pass --replace to take the file's"}`,
       );
     } else if (kind === 'skipped') {
       report.line(`  ${row.key}  skipped: ${row.skipped}`);
@@ -210,6 +219,48 @@ export function importRows(object: Record<string, unknown>, opts: { only: readon
   return rows;
 }
 
+/**
+ * The selection of the table, run INSIDE the context: `request` is the
+ * `--export` path or '' for the default export, the only object, or the one a
+ * classic script left on `window`. Properties are read as data (never through
+ * a getter) and the answer is ONE string, so stet's realm never touches an
+ * object the file made. `several` marks an ambiguous file.
+ */
+function pickScript(request: string): string {
+  return `(function (request) {
+  var own = function (o, k) {
+    if (o === null || (typeof o !== 'object' && typeof o !== 'function')) return undefined;
+    var d = Object.getOwnPropertyDescriptor(o, k);
+    return d && 'value' in d ? d.value : undefined;
+  };
+  var table = function (v) { return v !== null && typeof v === 'object' && !Array.isArray(v); };
+  var exps = own(globalThis, '__stet_exports') || {};
+  var globals = {};
+  Object.keys(globalThis).forEach(function (n) {
+    if (n !== 'window' && n !== 'globalThis' && n !== '__stet_exports') globals[n] = own(globalThis, n);
+  });
+  var picked, label;
+  if (request !== '') {
+    var path = request.split('.');
+    var at = Object.prototype.hasOwnProperty.call(exps, path[0]) ? exps : globals;
+    path.forEach(function (p) { at = own(at, p); });
+    picked = at;
+    label = request;
+  } else if (table(own(exps, 'default'))) {
+    picked = own(exps, 'default');
+    label = 'default';
+  } else {
+    var offered = Object.keys(exps).length > 0 ? exps : globals;
+    var names = Object.keys(offered).filter(function (n) { return table(own(offered, n)); });
+    if (names.length > 1) return JSON.stringify({ several: true });
+    label = names[0];
+    picked = label === undefined ? undefined : own(offered, label);
+  }
+  if (!table(picked)) return JSON.stringify({});
+  return JSON.stringify({ label: label, object: picked }, function (k, v) { return typeof v === 'function' || v === undefined ? { '\\u0000': 0 } : v; });
+})(${JSON.stringify(request)})`;
+}
+
 /** The object `--export` names in a file (or the one the file offers alone), with the name the plan's header shows. */
 function readTable(cwd: string, file: string, exportName: string | undefined): { object: Record<string, unknown>; label: string | undefined } {
   let source: string;
@@ -225,39 +276,40 @@ function readTable(cwd: string, file: string, exportName: string | undefined): {
     } catch (error) {
       throw new CliError(`import: ${file} could not be evaluated: ${(error as Error).message}`);
     }
-    const object = exportName === undefined ? root : walk(root, exportName.split('.'));
-    if (!isTable(object)) throw new CliError(`import: ${file} exports no ${exportName ?? 'object'}`);
-    return { object, label: exportName };
+    let at = root;
+    for (const part of exportName === undefined ? [] : exportName.split('.')) {
+      at = at !== null && typeof at === 'object' && Object.hasOwn(at, part) ? (at as Record<string, unknown>)[part] : undefined;
+    }
+    if (!isTable(at)) throw new CliError(`import: ${file} exports no ${exportName ?? 'object'}`);
+    return { object: at, label: exportName };
   }
-  const { exports, globals, context } = evaluateSource(file, source);
-  let picked: unknown;
-  let label: string | undefined;
-  if (exportName !== undefined) {
-    const path = exportName.split('.');
-    const head = path[0] as string;
-    picked = walk(Object.hasOwn(exports, head) ? exports : globals, path);
-    label = exportName;
-  } else if (isTable(exports['default'])) {
-    picked = exports['default'];
-    label = 'default';
-  } else {
-    // A classic script exports nothing; the objects it leaves on `window` stand in for exports.
-    const offered = Object.keys(exports).length > 0 ? exports : globals;
-    const objects = Object.keys(offered).filter((name) => isTable(offered[name]));
-    if (objects.length > 1) throw new CliError(`import: ${file} exports several objects — name one with --export`);
-    label = objects[0];
-    picked = label === undefined ? undefined : offered[label];
+  const context = evaluateSource(file, source);
+  let json: unknown;
+  try {
+    json = new vm.Script(pickScript(exportName ?? '')).runInContext(context, { timeout: EVALUATE_MS, displayErrors: false });
+  } catch (error) {
+    throw new CliError(`import: ${file} could not be evaluated: ${thrownMessage(context, error)}`);
   }
-  if (!isTable(picked)) throw new CliError(`import: ${file} exports no ${exportName ?? 'object'}`);
-  return { object: copyOut(file, context, picked), label };
+  if (typeof json !== 'string') throw new CliError(`import: ${file} could not be evaluated: the table could not be read as data`);
+  if (json.length > MAX_JSON) throw new CliError(`import: ${file} could not be evaluated: the table is too large`);
+  let picked: { object?: unknown; label?: unknown; several?: unknown };
+  try {
+    picked = JSON.parse(json) as typeof picked;
+  } catch {
+    throw new CliError(`import: ${file} could not be evaluated: the table could not be read as data`);
+  }
+  if (picked.several === true) throw new CliError(`import: ${file} exports several objects — name one with --export`);
+  if (!isTable(picked.object)) throw new CliError(`import: ${file} exports no ${exportName ?? 'object'}`);
+  return { object: picked.object, label: typeof picked.label === 'string' ? picked.label : undefined };
 }
 
 /**
- * A file's top level run in a context of its own: the bindings its `export`s
- * name, and the globals it left behind. `window` and `globalThis` are the
- * context itself; nothing of stet's process is reachable from inside.
+ * A file's top level run in a context of its own, and the context it ran in:
+ * the bindings its `export`s name sit on `__stet_exports` and the globals it
+ * left behind stay on the context. `window` and `globalThis` are the context
+ * itself; nothing of stet's process is reachable from inside.
  */
-export function evaluateSource(file: string, source: string): { exports: Record<string, unknown>; globals: Record<string, unknown>; context: vm.Context } {
+export function evaluateSource(file: string, source: string): vm.Context {
   const spec = importedSpecifier(source);
   if (spec !== null) throw new CliError(`import: ${file} imports ${spec} — import a module that stands alone`);
   const { script, names } = scriptOf(source);
@@ -265,19 +317,24 @@ export function evaluateSource(file: string, source: string): { exports: Record<
   sandbox['window'] = sandbox;
   sandbox['globalThis'] = sandbox;
   const context = vm.createContext(sandbox, { microtaskMode: 'afterEvaluate' });
-  const binding = names.map(([exported, local]) => `${JSON.stringify(exported)}: ${local}`).join(', ');
+  // Each name is read through a guard: a line that looks like an `export` inside a comment or a
+  // template names a binding that does not exist, which must not fail a valid module.
+  const binding = names
+    .map(([exported, local]) => `${JSON.stringify(exported)}: (function () { try { return ${local}; } catch (_) { return undefined; } })()`)
+    .join(', ');
+  let compiled: vm.Script;
   try {
-    new vm.Script(`${script}\n;globalThis.__stet_exports = { ${binding} };`, { filename: file }).runInContext(context, { timeout: EVALUATE_MS });
+    compiled = new vm.Script(`${script}\n;globalThis.__stet_exports = { ${binding} };`, { filename: file });
   } catch (error) {
-    throw new CliError(`import: ${file} could not be evaluated: ${messageOf(error)}`);
+    // A compile error is the host realm's own SyntaxError, so its message is plain text.
+    throw new CliError(`import: ${file} could not be evaluated: ${limitOf(source, script) ?? (error as Error).message}`);
   }
-  const exports = (dataOf(sandbox, '__stet_exports') ?? {}) as Record<string, unknown>;
-  const globals: Record<string, unknown> = {};
-  for (const name of Object.keys(sandbox)) {
-    if (name === 'window' || name === 'globalThis' || name === '__stet_exports') continue;
-    globals[name] = dataOf(sandbox, name);
+  try {
+    compiled.runInContext(context, { timeout: EVALUATE_MS, displayErrors: false });
+  } catch (error) {
+    throw new CliError(`import: ${file} could not be evaluated: ${thrownMessage(context, error)}`);
   }
-  return { exports, globals, context };
+  return context;
 }
 
 /** The first module a file imports or re-exports from, as written; null for a file that stands alone. */
@@ -290,6 +347,21 @@ function importedSpecifier(source: string): string | null {
 }
 
 /**
+ * The module syntax the rewrite cannot run, named where a script fails to
+ * compile and uses it; undefined for any other syntax error. Top-level `await`
+ * is the failure that compiles once the script sits inside an async function.
+ */
+function limitOf(source: string, script: string): string | undefined {
+  if (/^[ \t]*export\s+(?:const|let|var)\s*[{[]/m.test(source)) return 'a destructuring export is not supported — export each name on its own';
+  try {
+    new vm.Script(`(async function () {\n${script}\n})`);
+    return 'top-level await is not supported';
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * An ES module's text as a classic script: each `export` declaration loses its
  * keyword, `export default` binds `__stet_default`, an `export { a, b as c }`
  * list goes; `names` pairs each exported name with the binding that holds it.
@@ -299,8 +371,9 @@ function scriptOf(source: string): { script: string; names: Array<[string, strin
   const names: Array<[string, string]> = [];
   let script = source.replace(
     /^(\s*)export\s+((?:async\s+)?function\*?|const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm,
-    (_m, space: string, kind: string, name: string) => {
+    (_m, space: string, kind: string, name: string, at: number) => {
       names.push([name, name]);
+      for (const more of declaredAfter(source, at + _m.length)) names.push([more, more]);
       return `${space}${kind} ${name}`;
     },
   );
@@ -318,31 +391,46 @@ function scriptOf(source: string): { script: string; names: Array<[string, strin
   return { script, names };
 }
 
-/** The chosen object as plain data, written to JSON inside the context under the same ceiling, so a getter or proxy of the host's never runs in stet's realm. A function or `undefined` value comes out as an object with no `value`, which the rows skip. */
-function copyOut(file: string, context: vm.Context, picked: unknown): Record<string, unknown> {
-  (context as Record<string, unknown>)['__stet_pick'] = picked;
-  try {
-    const json = new vm.Script(
-      'JSON.stringify(__stet_pick, function (k, v) { return typeof v === "function" || v === undefined ? { "\\u0000": 0 } : v; })',
-    ).runInContext(context, { timeout: EVALUATE_MS }) as string;
-    return JSON.parse(json) as Record<string, unknown>;
-  } catch (error) {
-    throw new CliError(`import: ${file} could not be evaluated: ${messageOf(error)}`);
+/**
+ * The names a declaration goes on to declare after its first: the identifiers
+ * that follow a comma at the declaration's own depth, up to its `;` or the
+ * line that ends it (`export const a = 1, b = 2`). Strings, template literals
+ * and comments are skipped over; a name found in error binds to nothing and
+ * reads as undefined.
+ */
+function declaredAfter(source: string, from: number): string[] {
+  const found: string[] = [];
+  let depth = 0;
+  let last = '';
+  for (let i = from; i < source.length; i += 1) {
+    const ch = source[i] as string;
+    if (ch === '"' || ch === "'" || ch === '`') {
+      for (i += 1; i < source.length && source[i] !== ch; i += 1) if (source[i] === '\\') i += 1;
+      last = ch;
+    } else if (ch === '/' && (source[i + 1] === '/' || source[i + 1] === '*')) {
+      const end = source[i + 1] === '/' ? source.indexOf('\n', i) : source.indexOf('*/', i + 2) + 1;
+      if (end <= 0) break;
+      i = source[i + 1] === '/' ? end - 1 : end;
+    } else if ('([{'.includes(ch)) {
+      depth += 1;
+      last = ch;
+    } else if (')]}'.includes(ch)) {
+      depth -= 1;
+      last = ch;
+      if (depth < 0) break;
+    } else if (depth === 0 && ch === ';') {
+      break;
+    } else if (depth === 0 && ch === '\n' && !',=+-*/%&|^?:<>.'.includes(last) && last !== '') {
+      break;
+    } else if (depth === 0 && ch === ',') {
+      const next = /^\s*([A-Za-z_$][\w$]*)\s*(?==|,|;|\n|$)/.exec(source.slice(i + 1));
+      if (next !== null) found.push(next[1] as string);
+      last = ch;
+    } else if (!/\s/.test(ch)) {
+      last = ch;
+    }
   }
-}
-
-/** A data property's value, never a getter's: reading one would run the host's code outside the ceiling. */
-function dataOf(holder: unknown, name: string): unknown {
-  if (holder === null || typeof holder !== 'object') return undefined;
-  const found = Object.getOwnPropertyDescriptor(holder, name);
-  return found !== undefined && 'value' in found ? found.value : undefined;
-}
-
-/** A dotted path walked over data properties; undefined where any step is missing. */
-function walk(root: unknown, path: readonly string[]): unknown {
-  let at = root;
-  for (const part of path) at = dataOf(at, part);
-  return at;
+  return found;
 }
 
 /** An object that can hold rows: not null, not a list, not a function. */
@@ -350,8 +438,21 @@ function isTable(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** An error's message, whichever realm threw it. */
-function messageOf(error: unknown): string {
-  const message = (error as { message?: unknown } | null)?.message;
-  return typeof message === 'string' ? message : String(error);
+/**
+ * The message of whatever a file's code threw, read inside the context under
+ * the ceiling: a thrown proxy, a looping `message` getter or a throw of the
+ * file's own never runs on stet's stack. An unreadable value answers with a
+ * fixed phrase.
+ */
+function thrownMessage(context: vm.Context, error: unknown): string {
+  try {
+    (context as Record<string, unknown>)['__stet_thrown'] = error;
+    return String(
+      new vm.Script(
+        '(function (e) { try { var m = e !== null && typeof e === "object" ? e.message : undefined; return typeof m === "string" ? m : String(e); } catch (_) { return "an error that could not be read"; } })(__stet_thrown)',
+      ).runInContext(context, { timeout: EVALUATE_MS, displayErrors: false }),
+    );
+  } catch {
+    return 'an error that could not be read';
+  }
 }

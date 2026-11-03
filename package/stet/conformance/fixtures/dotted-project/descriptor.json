@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "keys": {
+    "home.title": { "shape": "text", "target": "web", "label": "Title", "section": "Home" },
+    "waitlist.count": { "shape": "text", "target": "web", "vars": ["n"], "section": "Waitlist" },
+    "waitlist.use.music_videos": { "shape": "text", "target": "web", "label": "Music videos", "section": "Waitlist" },
+    "waitlist_use": { "shape": "text", "target": "web", "section": "Waitlist" }
+  }
+}
