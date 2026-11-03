@@ -581,6 +581,8 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
       snapshotPath: config.snapshotPath,
       managedSurfaces: config.managedSurfaces,
       generated: config.generated.map((entry) => entry.file),
+      // The attributes the preview reads a mark on (D16.1): the config's own key attribute beside data-stet.
+      reads: { attributes: markAttributes(config) },
       store: { adapter: config.store?.adapter ?? 'snapshot' },
     },
     environments,
