@@ -3796,3 +3796,92 @@ describe('list --json: the unread-key badge (D6, 5.6)', () => {
     }
   });
 });
+
+describe('the approval status consumers (add-plain-js-hosts, C4)', () => {
+  const approvedAt = (by: string): { status: 'approved'; at: string; by: string } => ({ status: 'approved', at: '2026-11-02', by });
+
+  it('P4.3 approve prints the two lines, writes the file in the repo batch, answers `already`, refuses store-backed', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    expect(await host.run('approve', 'hero_headline', 'welcome__subject', '--by', 'nj-io')).toBe(0);
+    const today = new Date().toISOString().slice(0, 10);
+    expect(host.out).toContain(`approved hero_headline (nj-io, ${today})`);
+    expect(host.out).toContain(`approved welcome__subject (nj-io, ${today})`);
+    const file = JSON.parse(host.file('content/status.json')) as Record<string, { status: string; by?: string }>;
+    expect(file['hero_headline']).toEqual({ status: 'approved', at: today, by: 'nj-io' });
+    // The file holds every declared key, the unapproved ones proposed.
+    expect(Object.values(file).filter((e) => e.status === 'proposed').length).toBeGreaterThan(0);
+    const before = host.file('content/status.json');
+    host.out.length = 0;
+    expect(await host.run('approve', 'hero_headline', '--by', 'someone-else')).toBe(0);
+    expect(host.out).toContain(`hero_headline is already approved (nj-io, ${today})`);
+    expect(host.file('content/status.json')).toBe(before);
+    // An undeclared key is refused with the line the other key commands use.
+    expect(await host.run('approve', 'nope', '--by', 'nj-io')).toBe(1);
+    expect(host.stderr()).toContain('"nope" is not a key in content/descriptor.json');
+    expect(host.file('content/status.json')).toBe(before);
+
+    const store = makeHost({ config: { store: { adapter: 'memory' } } });
+    expect(await store.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(1);
+    expect(store.stderr()).toContain('approve: this project is store-backed — publishing is its approval');
+    expect(store.exists('content/status.json')).toBe(false);
+  });
+
+  it('P4.5 list prints the status column and --json the field on a snapshot-only project with a status file; neither on store-backed', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    writeFileSync(join(host.cwd, 'content/status.json'), JSON.stringify({ hero_headline: approvedAt('nj-io') }));
+    expect(await host.run('list')).toBe(0);
+    const lines = host.out.join('\n').split('\n');
+    expect(lines[0]).toMatch(/draft +status$/);
+    expect(lines.find((l) => l.startsWith('hero_headline'))).toMatch(/approved 2026-11-02$/);
+    expect(lines.find((l) => l.startsWith('welcome__subject'))).toMatch(/proposed$/);
+    host.out.length = 0;
+    expect(await host.run('list', '--json')).toBe(0);
+    const rows = host.json<{ rows: Array<{ key: string; status?: unknown }> }>().rows;
+    expect(rows.find((r) => r.key === 'hero_headline')?.status).toEqual(approvedAt('nj-io'));
+    expect(rows.find((r) => r.key === 'welcome__subject')?.status).toEqual({ status: 'proposed' });
+
+    const store = makeHost({ config: { store: { adapter: 'memory' } } });
+    writeFileSync(join(store.cwd, 'content/status.json'), JSON.stringify({ hero_headline: approvedAt('nj-io') }));
+    expect(await store.run('list')).toBe(0);
+    expect(store.out[0]).not.toContain('status');
+    store.out.length = 0;
+    expect(await store.run('list', '--json')).toBe(0);
+    expect(store.json<{ rows: Array<Record<string, unknown>> }>().rows.every((r) => !('status' in r))).toBe(true);
+  });
+
+  it('P4.6 check reports a stale entry (warn), an approved entry with no date or approver (error), and a status file on a store-backed project (warn)', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    writeFileSync(join(host.cwd, 'content/status.json'), JSON.stringify({ gone_key: { status: 'proposed' }, hero_headline: { status: 'approved' } }));
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('gone_key: in content/status.json, not in the descriptor — stale');
+    expect(host.stderr()).toContain('hero_headline: approved with no date or approver');
+    host.err.length = 0;
+    writeFileSync(join(host.cwd, 'content/status.json'), JSON.stringify({ hero_headline: { status: 'approved', at: '2026-11-02', by: 'nj-io' } }));
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).not.toContain('status.json');
+    writeFileSync(join(host.cwd, 'content/status.json'), JSON.stringify({ hero_headline: { status: 'approved', at: 'yesterday', by: 'nj-io' } }));
+    expect(await host.run('check')).toBe(1);
+
+    const store = makeHost({ config: { store: { adapter: 'memory' } } });
+    writeFileSync(join(store.cwd, 'content/status.json'), '{}');
+    expect(await store.run('check')).toBe(0);
+    expect(store.stderr()).toContain('content/status.json: a store-backed project keeps draft and published as its approval — remove the file');
+  });
+
+  it('P4.8 a snapshot-only site with no status file shows no status anywhere, rename writes none, and the first approval brings the column', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    expect(await host.run('list')).toBe(0);
+    expect(host.out[0]).not.toContain('status');
+    host.out.length = 0;
+    expect(await host.run('list', '--json')).toBe(0);
+    expect(host.json<{ rows: Array<Record<string, unknown>> }>().rows.every((r) => !('status' in r))).toBe(true);
+    expect(await host.run('rename', 'hero_headline', 'hero_title', '--write')).toBe(0);
+    expect(host.exists('content/status.json')).toBe(false);
+    host.out.length = 0;
+    expect(await host.run('approve', 'hero_title', '--by', 'nj-io')).toBe(0);
+    expect(host.exists('content/status.json')).toBe(true);
+    host.out.length = 0;
+    expect(await host.run('list')).toBe(0);
+    expect(host.out[0]).toMatch(/status$/);
+  });
+});

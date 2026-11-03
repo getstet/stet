@@ -123,7 +123,7 @@ body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-ev
 /* Wider, they sit above it: the note keeps one line for itself, and the block holds its height while the pointer is in the frame.
    One line plus the note's own 6 px top and bottom padding, since the page boxes border-box (`*{box-sizing:border-box}`). */
 @media(min-width:761px){#panenote{min-height:calc(1lh + 12px)}}
-@media(max-width:760px){#gitbar .btn,.hdr [data-act="theme"],[data-act="addSite"]{min-height:36px}}
+@media(max-width:760px){#gitbar .btn,.hdr [data-act="theme"],[data-act="addSite"],[data-act^="approve:"]{min-height:36px}}
 /* At 760 px and narrower, with a project open, the sidebar is one row that opens the list. */
 #sidetoggle{display:none}
 @media(max-width:760px){.shell.picked #sidetoggle{display:block;width:100%;min-height:36px;text-align:left;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.shell.picked:not(.sideopen) .side>:not(#sidetoggle){display:none}.shell.picked .side{padding:6px 9px}}
@@ -513,6 +513,13 @@ const TABS = [
 const MACHINE_TABS = ['Health', 'Setup'];
 const ready = () => !!(S.site && S.site.state === 'ready');
 const storeBacked = () => !!(ready() && S.site.mode !== 'snapshot');
+// Approval: a snapshot-only site tracks it once its status file exists (the badge, the filter, the dashed outline), and offers Approve whether or not the file does, since the first approval creates it.
+const tracking = () => !!(ready() && S.site.status && typeof S.site.status === 'object');
+const approvable = () => !!(ready() && S.site.approvable === true);
+/** A key's entry in the status file; an absent entry is proposed. */
+const approval = (id) => (tracking() && own(S.site.status, id) ? S.site.status[id] : { status: 'proposed' });
+/** Whether the key shows as proposed: a derived key follows its source's words and takes no approval of its own. */
+const proposed = (id) => tracking() && approval(id).status !== 'approved' && (keyDef(id) || {}).derivesFrom === undefined;
 const keyDef = (id) => (ready() && Object.prototype.hasOwnProperty.call(S.site.descriptor.keys, id))
   ? S.site.descriptor.keys[id] : null;
 
@@ -1153,12 +1160,16 @@ function groups() {
 }
 function keysInGroup(id) {
   if (id === 'all') return ready() ? Object.keys(S.site.descriptor.keys).sort() : [];
+  if (id === 'proposed') return ready() ? Object.keys(S.site.descriptor.keys).sort().filter(proposed) : [];
+  if (id === 'approved') return ready() ? Object.keys(S.site.descriptor.keys).sort().filter((key) => tracking() && approval(key).status === 'approved') : [];
   if (id === 'page') return pageKeys();
   const group = groups().find((g) => g.id === id);
   return group ? group.keys : [];
 }
-/** The selector's choices: every key, the open page's, then the groups. */
-const listChoices = () => [{ id: 'all', label: 'All keys' }, { id: 'page', label: 'This page' }].concat(groups());
+/** The selector's choices: every key, the open page's, the two approval states where the site tracks them, then the groups. */
+const listChoices = () => [{ id: 'all', label: 'All keys' }, { id: 'page', label: 'This page' }]
+  .concat(tracking() ? [{ id: 'proposed', label: 'Proposed' }, { id: 'approved', label: 'Approved' }] : [])
+  .concat(groups());
 /**
  * The keys of the page the preview shows: those its files read, where the route
  * reads answered for it, and those the last census found on it.
@@ -1622,10 +1633,14 @@ function keyRows(items) {
               : '';
     const group = S.q ? '<span class="bdg">' + esc((all.find((g) => g.keys.indexOf(id) !== -1) || {}).label || '') + '</span>' : '';
     return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
-      '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + draftBadge(id) + healthBadge(id) + usageBadges(id) + group + '</span>' +
+      '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + statusBadge(id) + draftBadge(id) + healthBadge(id) + usageBadges(id) + group + '</span>' +
       '<span class="s">' + (kinds.length === 0 ? '' : '<span class="kd">' + esc(kinds.join(' · ')) + '</span>') +
       '<span class="v">' + esc(rowPreview(value)) + '</span></span></button>';
   }).join('');
+}
+/** The `proposed` badge, on a site that tracks approval; an approved key carries none. */
+function statusBadge(id) {
+  return proposed(id) ? '<span class="bdg">proposed</span>' : '';
 }
 /** A saved draft's author and when it was first saved, on a store-backed site's row. */
 function draftBadge(id) {
@@ -1785,8 +1800,9 @@ function editorCard() {
     '<span class="bdg">' + esc(def.target || '') + '</span>' +
     '<span class="bdg">' + esc(def.shape || 'text') + '</span>' +
     (edited(id) ? '<span class="bdg d">edited</span>' : '') +
+    statusBadge(id) +
     (S.locale !== 'default' ? '<span class="bdg b">' + esc(S.locale) + '</span>' : '') +
-    '</span></div>' + kindLine(id) + sharedBlock(id) + placeList(id);
+    '</span></div>' + approveLine(id) + kindLine(id) + sharedBlock(id) + placeList(id);
 
   const fallback = (S.locale !== 'default' && value === undefined && defaultValue(id) !== undefined)
     ? '<div class="inf">falls back to default — ' + esc(String(shown(defaultValue(id))).slice(0, 90)) + '</div>'
@@ -1796,6 +1812,19 @@ function editorCard() {
     findingsBlock(id) + '</div>' + saveBar(id);
 }
 
+/**
+ * Under the editor's header on a site that can approve: Approve with the line
+ * naming whose name it records, and once approved who approved it and when.
+ */
+function approveLine(id) {
+  if (!approvable() || (keyDef(id) || {}).derivesFrom !== undefined) return '';
+  const entry = approval(id);
+  if (entry.status === 'approved') return '<div class="kline">' + esc('Approved ' + entry.at + ' by ' + entry.by) + '</div>';
+  const name = S.site.approver;
+  return '<div class="kline"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+    '<button class="btn sm" data-act="approve:' + esc(id) + '">Approve</button>' +
+    (name ? '<span class="muted">' + esc('Approving records your name from git (' + name + ').') + '</span>' : '') + '</div></div>';
+}
 /** Under the editor's header: what element the key is and where, what it derives from, and what derives from it. */
 function kindLine(id) {
   const def = keyDef(id) || {};
@@ -2674,6 +2703,8 @@ function locateKey(scroll) {
     scroll: scroll,
     // Dashed where a match is a guess, and where no file of the route reads the key.
     guess: !S.confirmed.has(S.sel) || S.warn === S.sel,
+    // And a proposed key is outlined dashed: nobody has approved those words.
+    ...(proposed(S.sel) ? { dashed: true } : {}),
     ...(def.tags === undefined ? {} : { tags: def.tags }),
   });
   postLayer();
@@ -4447,6 +4478,7 @@ const ACTIONS = {
   putBack: (el, i) => { void guard(putBack(Number(i))); },
   push: () => { void guard(push()); },
   removePlan: (el, id) => { void guard(removeKey(id, false)); },
+  approve: (el, id) => { void guard(approveKey(id)); },
   sameLink: () => { void guard(linkThem()); },
   sameKeep: () => { S.same = null; render(); },
   saveAnyway: () => { S.overLimit = null; void guard(save(true)); },
@@ -4783,6 +4815,7 @@ async function save(anyway) {
   const wrote = res.body.written || [];
   takePending(res.body);
   takeGit(res.body.at);
+  takeStatus(res.body.status);
   S.site.snapshot = mergedSnapshot(values);
   postCensus();
   void guard(loadUsage());
@@ -4814,6 +4847,25 @@ async function useTheirs(i) {
   S.staleKeys = S.staleKeys.filter((other) => other !== k);
   draftChanged();
   await refreshSite();
+}
+
+/** The entries a save or an approval answered, kept in the status the page shows; a null answer is a site that tracks nothing. */
+function takeStatus(entries) {
+  if (!entries || typeof entries !== 'object') return;
+  S.site.status = Object.assign({}, S.site.status || {}, entries);
+}
+
+/** Approve pressed: the key approved by git's name, the file it creates or rewrites taken back whole. */
+async function approveKey(id) {
+  const res = await post('/api/site/approve' + query(), { key: id });
+  if (!res.ok) { S.message = res.body.error || 'the approval was refused'; render(); return; }
+  S.message = '';
+  takePending(res.body);
+  takeGit(res.body.at);
+  S.site.status = res.body.status;
+  tst(res.body.already ? id + ' was already approved' : 'Approved ' + id);
+  render();
+  locateKey(false);
 }
 
 /** The commit lists a reply carried, kept where it names them. */
@@ -4851,6 +4903,7 @@ async function putBack(i) {
   }
   takePending(res.body);
   takeGit(res.body.at);
+  takeStatus(res.body.status);
   S.site.snapshot = mergedSnapshot([{ key: k.key, locale: k.locale, value: k.head }]);
   await openCommitPanel();
   await loadPreview(htmlHost() ? { reload: true } : undefined);
@@ -5375,6 +5428,18 @@ shell.addEventListener('focusin', (event) => {
   const act = el.getAttribute === undefined ? null : (el.getAttribute('data-act-input') || el.getAttribute('data-act-change'));
   focusKey = act;
   focusAt = el.selectionStart === undefined || el.selectionStart === null ? 0 : el.selectionStart;
+});
+// Condition 2: a click on a part of the page that takes no focus blurs the field
+// with no `focusin` after it, so the remembered field would be pulled back on
+// the next repaint. A blur that moves focus nowhere clears the key one task
+// later, unless a repaint replaced the field by then: a replaced field is no
+// longer connected, and a repaint's own blur keeps the key.
+shell.addEventListener('focusout', (event) => {
+  if (event.relatedTarget !== null) return;
+  const el = event.target;
+  setTimeout(() => {
+    if (el.isConnected && document.activeElement === document.body) { focusKey = null; focusAt = null; }
+  }, 0);
 });
 shell.addEventListener('keyup', (event) => {
   const el = event.target;

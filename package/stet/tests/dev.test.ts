@@ -15212,3 +15212,75 @@ describe('REVIEW probe: a second stet write to one page file (PD14)', () => {
     expect(pending).toContain('src/pages/about.astro');
   });
 });
+
+describe('the approval status in the dashboard routes (add-plain-js-hosts, C4)', () => {
+  const approved = { status: 'approved', at: '2026-11-02', by: 'nj-io' };
+  const statusHost = (file: Record<string, unknown> | null, config: Record<string, unknown> = { project: 't' }): CliHost => {
+    const host = gitHost({ config });
+    if (file !== null) write(host.cwd, 'content/status.json', JSON.stringify(file));
+    return host;
+  };
+
+  it('P4.4 a save of a changed value resets the key to proposed in one batch; the same value saved again leaves the approval', async () => {
+    const host = statusHost({ hero_headline: approved, welcome__subject: approved });
+    const { handler } = handlerOver([host.cwd]);
+    const changed = await post(handler, `/api/site/save${site(host)}`, { values: [{ key: 'hero_headline', value: 'A new headline' }] });
+    expect(changed.status).toBe(200);
+    expect(changed.body['written']).toEqual(expect.arrayContaining(['content/defaults.json', 'content/status.json']));
+    expect(changed.body['status']).toEqual({ hero_headline: { status: 'proposed' } });
+    const file = JSON.parse(host.file('content/status.json'));
+    expect(file['hero_headline']).toEqual({ status: 'proposed' });
+    expect(file['welcome__subject']).toEqual(approved);
+    // Approving again, then saving the same words, leaves the approval and writes nothing.
+    const again = await post(handler, `/api/site/approve${site(host)}`, { key: 'hero_headline' });
+    expect(again.status).toBe(200);
+    const same = await post(handler, `/api/site/save${site(host)}`, { values: [{ key: 'hero_headline', value: 'A new headline' }] });
+    expect(same.body['written']).toEqual([]);
+    expect(same.body['status']).toEqual({ hero_headline: expect.objectContaining({ status: 'approved' }) });
+    // Old words back do not restore the approval of the first.
+    const back = await post(handler, `/api/site/save${site(host)}`, { values: [{ key: 'hero_headline', value: 'Never miss a post again.' }] });
+    expect(back.body['status']).toEqual({ hero_headline: { status: 'proposed' } });
+  });
+
+  it('P4.8 the site payload: status null and approvable true with no file, the file once it exists, null and not approvable when store-backed', async () => {
+    const bare = statusHost(null);
+    const { handler } = handlerOver([bare.cwd]);
+    const none = await get(handler, `/api/site${site(bare)}`);
+    expect(none.status).toBeNull();
+    expect(none.approvable).toBe(true);
+    // The first approval creates the file, and the payload then carries it.
+    const first = await post(handler, `/api/site/approve${site(bare)}`, { key: 'hero_headline' });
+    expect(first.status).toBe(200);
+    expect(first.body['entry']).toMatchObject({ status: 'approved', by: 'dev' });
+    expect(bare.exists('content/status.json')).toBe(true);
+    const some = await get(handler, `/api/site${site(bare)}`);
+    expect(some.approvable).toBe(true);
+    expect(some.status.hero_headline).toMatchObject({ status: 'approved', by: 'dev' });
+    expect(some.status.welcome__subject).toEqual({ status: 'proposed' });
+    // The Commit panel lists the status file beside the snapshot.
+    expect((await get(handler, `/api/site/carries${site(bare)}`)).files).toContain('content/status.json');
+
+    const store = statusHost(null, { store: { adapter: 'memory' } });
+    const held = await get(handlerOver([store.cwd]).handler, `/api/site${site(store)}`);
+    expect(held.status).toBeNull();
+    expect(held.approvable).toBe(false);
+  });
+
+  it('P4.7 the approve route refuses an undeclared key and a store-backed site, writing nothing', async () => {
+    const host = statusHost({ hero_headline: approved });
+    const { handler } = handlerOver([host.cwd]);
+    const before = host.file('content/status.json');
+    const undeclared = await post(handler, `/api/site/approve${site(host)}`, { key: 'nope' });
+    expect(undeclared.status).toBe(400);
+    expect(undeclared.body['error']).toBe('undeclared key: nope');
+    const inherited = await post(handler, `/api/site/approve${site(host)}`, { key: 'constructor' });
+    expect(inherited.status).toBe(400);
+    expect(host.file('content/status.json')).toBe(before);
+
+    const store = statusHost(null, { store: { adapter: 'memory' } });
+    const refused = await post(handlerOver([store.cwd]).handler, `/api/site/approve${site(store)}`, { key: 'hero_headline' });
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('approve: this project is store-backed — publishing is its approval');
+    expect(store.exists('content/status.json')).toBe(false);
+  });
+});
