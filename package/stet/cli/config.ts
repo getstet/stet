@@ -19,6 +19,7 @@ import type { SeoRule } from '../src/seo.js';
 import { asUpdate, planJson, writeJsonDeterministic, type WritePlan } from './artifacts.js';
 import { filesForGlobs } from './files.js';
 import { CliError, UsageError } from './report.js';
+import { landsOnFile } from './static-files.js';
 
 export const CONFIG_FILE = 'stet.config.json';
 
@@ -671,26 +672,44 @@ export function loadConfig(cwd: string): StetConfig {
 function refuseKeptOutputs(config: StetConfig, cwd: string): void {
   if (config.generated.length === 0) return;
   const at = (rel: string): string => posix.normalize(rel.replace(/\\/g, '/')).toLowerCase();
-  const kept = new Set(
-    [
-      CONFIG_FILE,
-      config.descriptorPath,
-      config.snapshotPath,
-      config.bundlePath,
-      config.statusPath,
-      config.readPath.file,
-      ...Object.values(config.codegen),
-      ...(isHtmlHost(config) ? filesForGlobs(cwd, config.managedSurfaces).filter((file) => file.endsWith('.html')) : []),
-    ].map(at),
-  );
+  const kept = new Set(keptFiles(config, cwd).map(at));
   const seen = new Set<string>();
   config.generated.forEach((entry, i) => {
     const file = at(entry.file);
-    if (kept.has(file) || seen.has(file)) {
+    if (kept.has(file) || seen.has(file) || keptFileReached(config, cwd, entry.file) !== null) {
       throw new CliError(`${CONFIG_FILE}: generated[${i}].file names a file stet already keeps — ${entry.file}`);
     }
     seen.add(file);
   });
+}
+
+/** The settings that name the files stet keeps. */
+export type KeptConfig = Pick<
+  StetConfig,
+  'descriptorPath' | 'snapshotPath' | 'bundlePath' | 'statusPath' | 'readPath' | 'codegen' | 'host' | 'managedSurfaces'
+>;
+
+/** The files stet keeps for itself, repo-relative: nothing a generated output may be written over. */
+export function keptFiles(config: KeptConfig, cwd: string): string[] {
+  return [
+    CONFIG_FILE,
+    config.descriptorPath,
+    config.snapshotPath,
+    config.bundlePath,
+    config.statusPath,
+    config.readPath.file,
+    ...Object.values(config.codegen),
+    ...(isHtmlHost(config) ? filesForGlobs(cwd, config.managedSurfaces).filter((file) => file.endsWith('.html')) : []),
+  ];
+}
+
+/**
+ * The kept file a generated output reaches by real path or inode — through a
+ * symlinked folder inside the checkout, say — or null. The name check cannot
+ * see it, so the load and the planner each ask again.
+ */
+export function keptFileReached(config: KeptConfig, cwd: string, file: string): string | null {
+  return keptFiles(config, cwd).find((kept) => landsOnFile(cwd, file, kept)) ?? null;
 }
 
 /**

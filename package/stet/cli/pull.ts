@@ -37,6 +37,7 @@ import {
 } from './artifacts.js';
 import { ENV_OPTION, noPositionals, parse, text } from './args.js';
 import { isHtmlHost } from './config.js';
+import { warnUnmatchedOnly } from './generated.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence, type LoadedProject } from './project.js';
 import { Report } from './report.js';
@@ -70,6 +71,7 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
 
     const { config, descriptor, snapshot } = project;
     const keys = Object.keys(descriptor.keys).sort();
+    warnUnmatchedOnly(config.generated, descriptor, report);
     const enabled = config.locales.enabled;
 
     const merged: Snapshot = {};
@@ -180,6 +182,7 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
  * codegen file of its own.
  */
 function pullOutputs(io: CliIo, project: LoadedProject, owner: NonNullable<LoadedProject['owner']>, report: Report): number {
+  warnUnmatchedOnly(project.config.generated, project.descriptor, report);
   let written: string[];
   let unchanged: string[];
   try {

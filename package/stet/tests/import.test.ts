@@ -1,6 +1,6 @@
 // add-plain-js-hosts (0.9.0), chunk C2: `stet import`, the copy module's pair and object shapes, placeholders converted on the way in.
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
@@ -377,6 +377,17 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
     rmSync(join(planned.cwd, 'content'), { recursive: true });
     expect(await planned.run('import', 't.json')).toBe(0);
     expect(planned.exists('content/descriptor.json')).toBe(false);
+  });
+
+  it('N5 import --write in a folder with no stet.config.json is refused like any other command, and the tree is unchanged', async () => {
+    const host = await site({ 't.json': JSON.stringify({ 'home.title': 'Welcome' }) });
+    rmSync(join(host.cwd, 'stet.config.json'));
+    rmSync(join(host.cwd, 'content'), { recursive: true });
+    const tree = (dir: string): string[] => readdirSync(dir, { recursive: true, encoding: 'utf8' }).sort();
+    const before = tree(host.cwd);
+    expect(await host.run('import', 't.json', '--write')).toBe(1);
+    expect(host.stderr()).toContain('is this a stet project?');
+    expect(tree(host.cwd)).toEqual(before);
   });
 
   it('Q98 under the default grammar a value with {name} text prints one hint naming the setting; under {name} it prints none', async () => {

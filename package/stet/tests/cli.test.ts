@@ -8,7 +8,7 @@
  * that walk (`conformance/cli-host.ts`), so both drive an identical project.
  */
 import { spawnSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, relative } from 'node:path';
 
@@ -4017,6 +4017,40 @@ describe('generated outputs and copyFrom (add-plain-js-hosts, C5)', () => {
       expect(host.stderr()).toContain(INSIDE);
       expect(readFileSync(foreign, 'utf8')).toBe('{}\n');
     });
+  });
+
+  it('N1a a generated output reached through a symlinked folder inside the checkout onto a file stet keeps is refused, and the file is byte-equal', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    expect(await host.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(0);
+    const status = host.file('content/status.json');
+    symlinkSync('content', join(host.cwd, 'alias'));
+    writeFileSync(join(host.cwd, 'stet.config.json'), JSON.stringify({ project: 't', generated: [{ file: 'alias/status.json', format: 'json' }] }));
+    reset(host);
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('stet.config.json: generated[0].file names a file stet already keeps — alias/status.json');
+    expect(host.file('content/status.json')).toBe(status);
+  });
+
+  it('N1b a generated output that is a hard link to a file outside the checkout is refused, and the outside file is byte-equal', async () => {
+    await withOutside(async (outside) => {
+      const foreign = join(outside, 'foreign.json');
+      writeFileSync(foreign, '{}\n');
+      const host = makeHost({ config: { project: 't', generated: [{ file: 'strings.json', format: 'json' }] } });
+      linkSync(foreign, join(host.cwd, 'strings.json'));
+      expect(await host.run('pull')).toBe(1);
+      expect(host.stderr()).toContain('stet.config.json: generated[0].file strings.json is a hard link — stet writes only files with one name');
+      expect(readFileSync(foreign, 'utf8')).toBe('{}\n');
+    });
+  });
+
+  it('N7 check and pull each print one warning for an only entry that matches no key, and the exit codes stay', async () => {
+    const warning = 'generated[0].only: "home" matches no key — end it with . or _ to keep every key under it';
+    const host = makeHost({ config: { project: 't', generated: [{ file: 'strings.json', format: 'json', only: ['home'] }] } });
+    expect(await host.run('pull')).toBe(0);
+    expect([...host.out, host.stderr()].join('\n').split(warning).length - 1).toBe(1);
+    reset(host);
+    expect(await host.run('check')).toBe(0);
+    expect([...host.out, host.stderr()].join('\n').split(warning).length - 1).toBe(1);
   });
 
   it('P5.5e a status file whose folder is a symlink to a folder outside the checkout is refused: an approval writes nowhere', async () => {
