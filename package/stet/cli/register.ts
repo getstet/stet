@@ -17,6 +17,7 @@
 
 import { join, resolve as resolvePath } from 'node:path';
 
+import { toStet, varsOf } from '../src/placeholders.js';
 import { headLimitsFor } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
@@ -53,7 +54,8 @@ import { clip, collapseLines, lineCol, plural, CliError, HostTextReport, Report,
 import { loadStatus } from './status.js';
 import { applyFileEdits, formatDiff, jsxReads, jsxRichClean, planRewrite, type Edit } from './rewrite.js';
 import { printProviderSnippet } from './provider-mount.js';
-import { classifyAdoption, leadingOrder, planJsxRun, seedOf, targetFor } from './register-run.js';
+import { classifyAdoption, leadingOrder, planJsxRun, seedOf, sharedTextIndex, targetFor } from './register-run.js';
+import { screenRun, type ScreenRun } from './scan.js';
 import { loadTypescript, type LocatedLiteral } from './source-scan.js';
 import { validateValue } from './validate.js';
 
@@ -99,7 +101,7 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     if (!htmlDescriptor) return report.emit(io);
     const htmlSnapshot = snapshotOf(config, io.cwd, report);
     if (!htmlSnapshot) return report.emit(io);
-    return registerHtml({ io, config, descriptor: htmlDescriptor, snapshot: htmlSnapshot, write, report, naming });
+    return await registerHtml({ io, config, descriptor: htmlDescriptor, snapshot: htmlSnapshot, write, report, naming });
   }
 
   const descriptor = descriptorOf(config, io.cwd, report);
@@ -129,6 +131,8 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
     ...(forcedKind === undefined ? {} : { forcedKind }),
   });
   const { adoptable, nameOf, reused: reusedLiterals, sharedWith, refusals, dialectFiles, skips, structured, dataFindings, modules, propertyNames, mount } = jsxRun;
+  // The texts the declared keys hold before the run, as `scan` reads them: a screen's text one holds is recorded already.
+  const held = sharedTextIndex(descriptor, snapshot);
   // The fallback warns named the layout; the snippet names the edit, once.
   if (jsxRun.mountUnlocated && config.rootLayout !== undefined && config.router !== 'astro') {
     report.line(`${config.rootLayout}: could not locate the wrap point unambiguously — mount the CopyProvider by hand:`);
@@ -320,7 +324,9 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       // silently, and every later comparison is against a name the module does
       // not use.
       const key = literal.proposedKey;
-      const verdict = classifyAdoption(descriptor, snapshot, key, literal.text);
+      // A `{name}` host's table reads in its own spelling; the snapshot holds the stored `{{name}}` (Q37).
+      const value = toStet(literal.text, config.placeholders);
+      const verdict = classifyAdoption(descriptor, snapshot, key, value);
       // Idempotence, mechanized rather than asserted: run two classifies
       // everything adopted and adds nothing.
       if (verdict === 'adopted') continue;
@@ -335,10 +341,12 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
         continue;
       }
 
-      // Tentatively add so the save gate can read the key's rules; revert on any refusal.
-      descriptor.keys[key] = { shape: 'text', target };
-      (snapshot['default'] ??= {})[key] = literal.text;
-      if (!validateValue(descriptor, snapshot, key, literal.text, 'default', report)) {
+      // Tentatively add so the save gate can read the key's rules; revert on any refusal. The variables a
+      // conversion wrote are declared, as `import` declares them; a value it left alone is gated as written.
+      const vars = value === literal.text ? [] : varsOf(value);
+      descriptor.keys[key] = { shape: 'text', target, ...(vars.length === 0 ? {} : { vars }) };
+      (snapshot['default'] ??= {})[key] = value;
+      if (!validateValue(descriptor, snapshot, key, value, 'default', report)) {
         delete descriptor.keys[key];
         delete snapshot['default']?.[key];
         continue;
@@ -348,6 +356,18 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
       added += 1;
     }
   }
+
+  // The JavaScript screens, adopted as record and read by hand (D15).
+  const screens = await screenRun({
+    cwd: io.cwd,
+    config,
+    files: filesForGlobs(io.cwd, config.managedSurfaces),
+    parsed: jsxRun.parsed,
+    pages: descriptor.pages,
+    held,
+    taken: (name) => Object.hasOwn(descriptor.keys, name) || propertyNames.has(name),
+  });
+  if (screens !== null) added += adoptScreens({ screens, config, descriptor, snapshot, report, applying });
 
   const extensions = [...new Set(dialectFiles.map((f) => f.slice(f.lastIndexOf('.'))))].sort();
   for (const line of collapseLines(
@@ -427,6 +447,37 @@ export async function runRegister(args: string[], io: CliIo): Promise<number> {
   return report.emit(io);
 }
 
+/**
+ * A run's JavaScript screen copy declared as record (D15): each proposal's key
+ * with its text as the value, through the save gate, and the line that says the
+ * host reads it by hand through its first configured read function. The screen
+ * is never rewritten. Answers how many keys it added.
+ */
+function adoptScreens(d: { screens: ScreenRun; config: StetConfig; descriptor: Descriptor; snapshot: Snapshot; report: Report; applying: boolean }): number {
+  const { screens, config, descriptor, snapshot, report, applying } = d;
+  const through = config.reads?.functions[0]?.name ?? 'copy';
+  const landed = new Set<string>();
+  for (const [file, scan] of screens.byFile) {
+    for (const literal of scan.literals) {
+      const key = screens.nameOf.get(literal) as string;
+      if (!landed.has(key)) {
+        // Tentatively add so the save gate can read the key's rules; revert on any refusal.
+        descriptor.keys[key] = { shape: 'text', target: targetFor(file, config), ...(literal.sectionWord === null ? {} : { section: literal.sectionWord }) };
+        (snapshot['default'] ??= {})[key] = literal.text;
+        if (!validateValue(descriptor, snapshot, key, literal.text, 'default', report)) {
+          delete descriptor.keys[key];
+          delete snapshot['default']?.[key];
+          continue;
+        }
+        landed.add(key);
+        report.line(`${applying ? 'adopted' : 'adopts'} ${key} = ${clip(literal.text, ADOPTED_EXCERPT)}`);
+      }
+      report.line(`${file}:${literal.place.line}: ${JSON.stringify(clip(literal.text, ADOPTED_EXCERPT))} — read it through ${through} by hand`);
+    }
+  }
+  return landed.size;
+}
+
 /** The closing line of a JavaScript run that does not apply: what `--write` would do. */
 function pendingLine(run: { planOnly: boolean; added: number; printedDiffs: number }): string {
   if (run.planOnly) return 'register: run with --write to apply the plan';
@@ -451,7 +502,7 @@ function notRewrittenLine(file: string, line: number, text: string, reason: stri
  * written without its mark is half a batch, and the next `check` would report
  * every such key as marked in no document.
  */
-function registerHtml(d: {
+async function registerHtml(d: {
   io: CliIo;
   config: StetConfig;
   descriptor: Descriptor;
@@ -459,7 +510,7 @@ function registerHtml(d: {
   write: boolean;
   report: Report;
   naming: Naming;
-}): number {
+}): Promise<number> {
   const { io, config, descriptor, snapshot, write, report, naming } = d;
   const files = filesForGlobs(io.cwd, config.managedSurfaces);
   const pageOf = (file: string): string => htmlPageOf(io.cwd, file, descriptor.pages);
@@ -505,6 +556,8 @@ function registerHtml(d: {
     chosen = resolved.chosen;
   }
 
+  // The texts the declared keys hold before the run, as `scan` reads them: a screen's text one holds is recorded already.
+  const held = sharedTextIndex(descriptor, snapshot);
   const plan = run({ descriptor, snapshot }, report, chosen);
   for (const document of plan.edited) {
     if (document.diff !== '') report.line(document.diff);
@@ -517,9 +570,12 @@ function registerHtml(d: {
     );
   }
   for (const { key, max } of plan.limited) report.line(`${key}: limit ${max} added`);
+  // The JavaScript screens the surfaces name, adopted as record and read by hand (D15).
+  const screens = await screenRun({ cwd: io.cwd, config, files, pages: descriptor.pages, held, taken: (name) => Object.hasOwn(descriptor.keys, name) });
+  const screenKeys = screens === null ? 0 : adoptScreens({ screens, config, descriptor, snapshot, report, applying: write });
   const converted = plan.converted.length;
   const limited = plan.limited.length;
-  if (plan.marked === 0 && converted === 0 && limited === 0) {
+  if (plan.marked === 0 && converted === 0 && limited === 0 && screenKeys === 0) {
     report.line('register: nothing to adopt');
     return report.emit(io);
   }
@@ -530,6 +586,7 @@ function registerHtml(d: {
         : [`apply ${plural(plan.marked, 'mark')} across ${plural(plan.edited.length, 'document')}`]),
       ...(converted === 0 ? [] : [`derive ${plural(converted, 'key')} from the page's visible text`]),
       ...(limited === 0 ? [] : [`add the SEO limit to ${plural(limited, 'key')}`]),
+      ...(screenKeys === 0 ? [] : [`add ${plural(screenKeys, 'key')}`]),
     ];
     const listed = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts.at(-1) as string}` : (parts[0] as string);
     report.line(`register: run with --write to ${listed}`);
@@ -558,7 +615,8 @@ function registerHtml(d: {
     );
   }
   if (limited > 0) report.line(`wrote ${config.descriptorPath}: the SEO limit added to ${plural(limited, 'key')}`);
-  report.line('register: applied');
+  if (screenKeys > 0) report.line(`wrote ${config.descriptorPath} and ${config.snapshotPath}: ${plural(screenKeys, 'key')} added`);
+  report.line(plan.marked + converted + limited === 0 ? 'register: adopted as record — there are no source edits to apply' : 'register: applied');
   return report.emit(io);
 }
 
