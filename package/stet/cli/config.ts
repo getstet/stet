@@ -17,6 +17,7 @@ import type { Placeholders } from '../src/placeholders.js';
 import { SEO_SEVERITY } from '../src/seo.js';
 import type { SeoRule } from '../src/seo.js';
 import { asUpdate, planJson, writeJsonDeterministic, type WritePlan } from './artifacts.js';
+import { filesForGlobs } from './files.js';
 import { CliError, UsageError } from './report.js';
 
 export const CONFIG_FILE = 'stet.config.json';
@@ -42,7 +43,7 @@ export interface GeneratedOutput {
   /** The global or export the table is bound to; required for `script` and `esm`. */
   name?: string;
   values: 'value' | 'value-status';
-  /** Key prefixes and exact names kept; absent keeps every key. */
+  /** Key names kept: an entry ending in `.` is a prefix, any other an exact key; absent keeps every web key. */
   only?: string[];
 }
 
@@ -655,7 +656,41 @@ export function loadConfig(cwd: string): StetConfig {
     config.seoCheck = map;
   }
 
+  refuseKeptOutputs(config, cwd);
   return config;
+}
+
+/**
+ * A generated output may not sit on a file stet keeps for itself — the config,
+ * the descriptor, the snapshot, the bundle, the status file, the read path, a
+ * codegen file, or (on an html host) a managed `.html` document — nor on another
+ * output's file: the first `pull` would replace it, and two outputs at one path
+ * would disagree for ever. Compared in lower case, since the file systems that
+ * fold case would reach the same file.
+ */
+function refuseKeptOutputs(config: StetConfig, cwd: string): void {
+  if (config.generated.length === 0) return;
+  const at = (rel: string): string => posix.normalize(rel.replace(/\\/g, '/')).toLowerCase();
+  const kept = new Set(
+    [
+      CONFIG_FILE,
+      config.descriptorPath,
+      config.snapshotPath,
+      config.bundlePath,
+      config.statusPath,
+      config.readPath.file,
+      ...Object.values(config.codegen),
+      ...(isHtmlHost(config) ? filesForGlobs(cwd, config.managedSurfaces).filter((file) => file.endsWith('.html')) : []),
+    ].map(at),
+  );
+  const seen = new Set<string>();
+  config.generated.forEach((entry, i) => {
+    const file = at(entry.file);
+    if (kept.has(file) || seen.has(file)) {
+      throw new CliError(`${CONFIG_FILE}: generated[${i}].file names a file stet already keeps — ${entry.file}`);
+    }
+    seen.add(file);
+  });
 }
 
 /**

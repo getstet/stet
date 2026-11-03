@@ -15,12 +15,13 @@ import { dirname, join } from 'node:path';
 import { canonicalize, embeddedHash, generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
-import { isHtmlHost, markAttributes, type StetConfig } from './config.js';
+import { CONFIG_FILE, isHtmlHost, markAttributes, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { generateOutput } from './generated.js';
 import { planDocuments } from './html-host.js';
 import { CliError, UsageError, type Report } from './report.js';
 import { completeStatus, statusPlan, type StatusFile } from './status.js';
+import { containsPath } from './static-files.js';
 import { isStoreBacked } from './store.js';
 
 /** JSON, keys sorted at every depth, two-space indent, one trailing newline. */
@@ -161,25 +162,65 @@ export function writePlanned(
  * status file, planned over `completeStatus` so it holds every declared key —
  * null while the file does not exist and nothing is approved, and always null
  * on a store-backed project, where publishing is the approval — and one write
- * per generated output, from the snapshot's default locale. A `script` or
- * `esm` output already on disk without stet's header is the host's own file:
- * its plan stays `differs`, so the batch refuses rather than replace it. A
- * `json` output has no header to tell by and is updated.
+ * per generated output, from the snapshot's default locale.
+ *
+ * Every file written here stays inside the checkout BY REAL PATH: a symlinked
+ * folder or file, or a `copyFrom` checkout whose path runs through a link into
+ * its owner, is refused before a byte is planned, since `config.ts` can only
+ * test the path as written.
+ *
+ * A `script` or `esm` output already on disk without stet's header is the
+ * host's own file: its plan stays `differs`, so the batch refuses rather than
+ * replace it. A `json` output has no header to tell by, so a file that differs
+ * is updated only when it parses as a JSON object whose keys are all keys this
+ * output writes or the descriptor on disk declares (stet's earlier output, which
+ * a removal or a rename leaves holding a key the new text no longer has, or a
+ * subset of it); any other content is the host's own and the plan stays `differs`.
  */
 export function planSideForms(
   cwd: string,
-  config: Pick<StetConfig, 'statusPath' | 'store' | 'generated' | 'placeholders' | 'locales'>,
+  config: Pick<StetConfig, 'descriptorPath' | 'statusPath' | 'store' | 'generated' | 'placeholders' | 'locales'>,
   descriptor: Descriptor,
   snapshot: Snapshot,
   status: StatusFile | null,
 ): { status: WritePlan | null; generated: WritePlan[] } {
   const held = status === null || isStoreBacked(config.store) ? null : status;
-  const generated = config.generated.map((entry) => {
+  const generated = config.generated.map((entry, i) => {
+    if (!containsPath(cwd, entry.file)) {
+      throw new CliError(`${CONFIG_FILE}: generated[${i}].file must be inside this checkout — a second checkout generates its own file through copyFrom`);
+    }
     const plan = planWrite(join(cwd, entry.file), generateOutput(entry, descriptor, snapshot, status, config.placeholders, config.locales.default), entry.file);
-    const handKept = plan.status === 'differs' && entry.format !== 'json' && embeddedHash(readFileSync(plan.path, 'utf8')) === null;
-    return handKept ? plan : asUpdate(plan);
+    return plan.status === 'differs' && isHostsOwn(entry.format, plan, () => declaredOnDisk(cwd, config.descriptorPath)) ? plan : asUpdate(plan);
   });
-  return { status: held === null ? null : statusPlan(cwd, config, completeStatus(held, descriptor)), generated };
+  const statusWrite = held === null ? null : statusPlan(cwd, config, completeStatus(held, descriptor));
+  if (statusWrite !== null && !containsPath(cwd, config.statusPath)) {
+    throw new CliError(`${CONFIG_FILE}: statusPath must be a file path inside this checkout`);
+  }
+  return { status: statusWrite, generated };
+}
+
+/** Whether the file a differing output plan found is the host's own: a script or module with no stet header, or JSON holding a key neither this output writes nor the descriptor declares. */
+function isHostsOwn(format: 'script' | 'esm' | 'json', plan: WritePlan, declared: () => Set<string>): boolean {
+  const text = readFileSync(plan.path, 'utf8');
+  if (format !== 'json') return embeddedHash(text) === null;
+  try {
+    const held: unknown = JSON.parse(text);
+    if (held === null || typeof held !== 'object' || Array.isArray(held)) return true;
+    const known = new Set([...Object.keys(JSON.parse(plan.text) as object), ...declared()]);
+    return Object.keys(held).some((key) => !known.has(key));
+  } catch {
+    return true;
+  }
+}
+
+/** The keys the descriptor on disk declares, before this batch writes; none where it cannot be read. */
+function declaredOnDisk(cwd: string, descriptorPath: string): Set<string> {
+  try {
+    const keys = (JSON.parse(readFileSync(join(cwd, descriptorPath), 'utf8')) as { keys?: unknown }).keys;
+    return new Set(keys !== null && typeof keys === 'object' ? Object.keys(keys) : []);
+  } catch {
+    return new Set();
+  }
 }
 
 /**

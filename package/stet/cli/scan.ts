@@ -176,7 +176,12 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   const declared = [...new Set([...surfaceGlobs, ...moduleGlobs])];
   // A generated output is stet's own file: it is never a surface or a copy module, whatever glob matches it.
   const outputs = new Set(config.generated.map((entry) => posix.normalize(entry.file)));
-  const perGlob = declared.map((glob) => ({ glob, matched: filesForGlobs(io.cwd, [glob]).filter((file) => !outputs.has(file)) }));
+  // A glob whose every match is an output is not a dead glob: the output was bound to it (a copy module that `pull` now writes).
+  const perGlob = declared.map((glob) => {
+    const found = filesForGlobs(io.cwd, [glob]);
+    const matched = found.filter((file) => !outputs.has(file));
+    return { glob, matched, outputsOnly: found.length > 0 && matched.length === 0 };
+  });
   const files = [...new Set(perGlob.flatMap((entry) => entry.matched))].sort();
 
   // Each read at most once, and only where something asks. The descriptor is
@@ -540,10 +545,10 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   // A run that scanned nothing must never read as a clean bill. Ahead of the
   // `--baseline` return, so a baseline written over nothing warns too; silent
   // where NOTHING is declared, which is the bare repo's own contract.
-  for (const { glob, matched } of perGlob) {
-    if (matched.length === 0) report.warn('scan', `glob matched no files: ${glob}`);
+  for (const { glob, matched, outputsOnly } of perGlob) {
+    if (matched.length === 0 && !outputsOnly) report.warn('scan', `glob matched no files: ${glob}`);
   }
-  if (perGlob.length > 0 && files.length === 0) {
+  if (perGlob.length > 0 && files.length === 0 && !perGlob.every((entry) => entry.outputsOnly)) {
     report.warn('scan', 'the declared globs matched no files — nothing was scanned');
   }
   // The second zero-shape, the same class: files MATCHED and the parser

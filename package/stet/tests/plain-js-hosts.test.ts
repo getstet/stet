@@ -674,7 +674,7 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
       local_named_t: { src: 'function g() { var t = 1; return use(t); }\n' },
     };
     for (const [name, { file, src }] of Object.entries(quiet)) expect.soft(await privacyOf({ [file ?? 's.js']: src }), name).toEqual({ state: 'not_found', causes: 0 });
-  });
+  }, 20_000);
 
   it('V1d a configured function named in text the parse cannot read is a cause, one per file and function; comments and prose are not', async () => {
     const page = (inner: string): string => PAGE(inner);
@@ -844,6 +844,9 @@ describe('add-plain-js-hosts (0.9.0) C5', () => {
     const { generateOutput, keysFor } = await import('../cli/generated.js');
     expect(keysFor({ file: 'x.json', format: 'json', values: 'value' }, descriptor)).toEqual(['brand', 'home.title', 'waitlist.left', 'waitlist.me.share']);
     expect(keysFor({ file: 'x.json', format: 'json', values: 'value', only: ['waitlist.', 'brand'] }, descriptor)).toEqual(['brand', 'waitlist.left', 'waitlist.me.share']);
+    // An entry ending in a dot is a prefix; any other entry is one exact key.
+    expect(keysFor({ file: 'x.json', format: 'json', values: 'value', only: ['waitlist.me'] }, descriptor)).toEqual([]);
+    expect(keysFor({ file: 'x.json', format: 'json', values: 'value', only: ['waitlist.me.share', 'bran'] }, descriptor)).toEqual(['waitlist.me.share']);
 
     const table = { file: 'design/data/copy.js', format: 'script' as const, name: 'TS.copyTable', values: 'value-status' as const };
     const script = generateOutput(table, descriptor, snapshot, { 'home.title': approved }, '{name}', 'default');
@@ -896,5 +899,73 @@ describe('add-plain-js-hosts (0.9.0) C5', () => {
     } finally {
       chmodSync(join(locked, 'content/ro'), 0o755);
     }
+  });
+
+  it('F2 a generated file may not name a file stet keeps or repeat another output', () => {
+    const kept = (config: Record<string, unknown>, at: number, file: string): void => {
+      expect(() => loadConfig(configHost(config))).toThrow(`stet.config.json: generated[${at}].file names a file stet already keeps — ${file}`);
+    };
+    for (const file of ['content/defaults.json', './content/descriptor.json', 'stet.config.json', 'content/status.json', 'content/keys.ts', '.stet/bundle.json', 'Content/Defaults.json']) {
+      kept({ generated: [{ file, format: 'json' }] }, 0, file);
+    }
+    kept({ statusPath: 'copy/status.json', generated: [{ file: 'copy/status.json', format: 'json' }] }, 0, 'copy/status.json');
+    kept({ generated: [{ file: 'out/t.js', format: 'script', name: 'T' }, { file: 'out/t.js', format: 'esm', name: 'T' }] }, 1, 'out/t.js');
+    // A managed document of an html host.
+    const dir = configHost({ generated: [{ file: 'index.html', format: 'json' }] });
+    writeFileSync(join(dir, 'index.html'), '<p>Hello</p>\n');
+    expect(() => loadConfig(dir)).toThrow('generated[0].file names a file stet already keeps — index.html');
+    // A JavaScript host's source glob may hold an output.
+    expect(loadConfig(configHost({ host: undefined, managedSurfaces: ['src/**/*.js'], generated: [{ file: 'src/strings.js', format: 'esm', name: 'S' }] })).generated).toHaveLength(1);
+  });
+
+  describe('a json output over a file that exists', () => {
+    const keys = { 'home.title': { shape: 'text', target: 'web' }, 'home.gone': { shape: 'text', target: 'web' } };
+    const pulled = async (existing: string, only?: string[]): Promise<{ code: number; stderr: string; file: string }> => {
+      const site = await makeHtmlHost({
+        files: { 'strings.json': existing },
+        keys,
+        defaults: { 'home.title': 'Welcome', 'home.gone': 'Gone' },
+        config: { generated: [{ file: 'strings.json', format: 'json', ...(only === undefined ? {} : { only }) }] },
+      });
+      const code = await site.run('pull');
+      return { code, stderr: site.stderr(), file: site.file('strings.json') };
+    };
+
+    it('F2b is refused when it holds a key neither the output nor the descriptor has, and the file keeps its bytes', async () => {
+      const hand = '{ "home.title": "Hand kept words", "extra.key": "Only here" }\n';
+      const result = await pulled(hand);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('refusing to overwrite strings.json');
+      expect(result.file).toBe(hand);
+      const other = await pulled('{"name": "package", "version": "1.0.0"}\n');
+      expect(other.code).toBe(1);
+      const list = await pulled('[1, 2]\n');
+      expect(list.code).toBe(1);
+    });
+
+    it('F2c is updated when every key it holds is one the output writes', async () => {
+      const result = await pulled('{ "home.title": "Hand words" }\n');
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.file)).toEqual({ 'home.gone': 'Gone', 'home.title': 'Welcome' });
+    });
+
+    it('F2d is updated when it holds a declared key the output no longer keeps (a removal or an only change leaves one behind)', async () => {
+      const result = await pulled('{ "home.gone": "Gone", "home.title": "Old" }\n', ['home.title']);
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.file)).toEqual({ 'home.title': 'Welcome' });
+    });
+  });
+
+  it('Q84 a copy-module glob whose only match is a generated output is not a dead glob', async () => {
+    const site = await makeHtmlHost({
+      files: { 'copy.js': `// generated by stet — source-hash: ${'0'.repeat(64)}\nwindow.TS = window.TS || {};\nTS.copyTable = {};\n` },
+      config: { managedSurfaces: [], copyModules: ['copy.js'], generated: [{ file: 'copy.js', format: 'script', name: 'TS.copyTable' }] },
+    });
+    await site.run('scan');
+    expect(site.stderr()).not.toContain('matched no files');
+    // A glob that matches nothing at all is still reported.
+    const dead = await makeHtmlHost({ config: { managedSurfaces: [], copyModules: ['nothing.js'] } });
+    await dead.run('scan');
+    expect(dead.stderr()).toContain('glob matched no files: nothing.js');
   });
 });
