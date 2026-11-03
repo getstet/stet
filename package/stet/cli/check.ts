@@ -9,7 +9,7 @@
  * `src/`; check loads the files, runs them in order, and reports.
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { checkDescriptorStructure, loadDescriptorWithWarnings } from '../src/descriptor.js';
@@ -29,6 +29,8 @@ import { keyUsage } from './key-usage.js';
 import type { CliIo } from './main.js';
 import { CliError, Report } from './report.js';
 import { TS_BROKEN } from './source-scan.js';
+import { loadStatus, type StatusFile } from './status.js';
+import { isStoreBacked } from './store.js';
 import { validateValue } from './validate.js';
 
 export async function runCheck(args: string[], io: CliIo): Promise<number> {
@@ -54,6 +56,7 @@ export async function check(config: StetConfig, cwd: string, report: Report): Pr
   if (!snapshot) return;
 
   currency(descriptor, snapshot, report);
+  statusFile(config, cwd, descriptor, report);
   // On an html host the generated files ARE the marked documents: there is no
   // codegen files to regenerate and compare.
   if (isHtmlHost(config)) {
@@ -150,6 +153,35 @@ function currency(descriptor: Descriptor, snapshot: Snapshot, report: Report): v
     missing: currencyReport.missing,
     stale: currencyReport.orphans,
   });
+}
+
+/**
+ * The approval status file's soundness, where the file exists: an entry whose
+ * key the descriptor no longer declares is stale (a warn), an approved entry
+ * without its date or approver is an error, and on a store-backed project the
+ * file itself is a warn, since draft and published are that project's approval.
+ */
+function statusFile(config: StetConfig, cwd: string, descriptor: Descriptor, report: Report): void {
+  if (!existsSync(join(cwd, config.statusPath))) return;
+  if (isStoreBacked(config.store)) {
+    report.warn('config', `${config.statusPath}: a store-backed project keeps draft and published as its approval — remove the file`);
+    return;
+  }
+  let file: StatusFile;
+  try {
+    file = loadStatus(cwd, config);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    report.error('config', error.message);
+    return;
+  }
+  for (const [key, entry] of Object.entries(file)) {
+    if (!Object.hasOwn(descriptor.keys, key)) {
+      report.warn('config', `${key}: in ${config.statusPath}, not in the descriptor — stale`, key);
+    } else if (entry.status === 'approved' && !(/^\d{4}-\d{2}-\d{2}$/.test(entry.at ?? '') && typeof entry.by === 'string' && entry.by !== '')) {
+      report.error('config', `${key}: approved with no date or approver`, key);
+    }
+  }
 }
 
 /**

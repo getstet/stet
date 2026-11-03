@@ -33,6 +33,7 @@ import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
 import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
+import { STORE_BACKED_APPROVAL } from './approve.js';
 import { check } from './check.js';
 import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
 import { markAttributes, pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
@@ -66,7 +67,7 @@ import { applyPages, auditablePages, fileRoute, pagesCompiler, proposeForHost, r
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
-import { loadStatus, type StatusFile } from './status.js';
+import { approveKeys, gitUserName, loadStatus, resetChanged, statusOf, type StatusFile } from './status.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { elementPath, HTML_COMMENT, markupBraces, maskExpressions, readAttrs, selfClosedRaw } from './markup.js';
@@ -453,6 +454,8 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
         return await siteReply(site, entry, ctx.launched);
       case 'POST site/save':
         return await save(ctx, req, site, entry);
+      case 'POST site/approve':
+        return await approve(req, site, entry);
       case 'POST site/commit':
         return await commit(ctx, req, site);
       case 'POST site/push':
@@ -565,6 +568,7 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
       store: { adapter: config.store?.adapter ?? 'snapshot' },
     },
     environments,
+    ...statusPayload(site),
     previewReads: await previewReads(site, env),
     dev: devDefaults(config, entry),
     previewDefault: routerPreviewCommand(config),
@@ -572,6 +576,25 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
     ...pendingSplit(site),
     git: { ...site.git, live: liveOf(site.path, site.git.branch) },
   });
+}
+
+/**
+ * The approval status the page shows: the status file where this snapshot-only
+ * site has one, else null, and whether Approve is offered — on every
+ * snapshot-only site, the file or not, since the first approval is what creates
+ * it — and the name an approval records, git's `user.name`. A store-backed site has neither: draft and published are its approval. A
+ * file that cannot be read is no status here; `check` names it.
+ */
+function statusPayload(site: Ready): { status: StatusFile | null; approvable: boolean; approver: string | null } {
+  if (site.mode !== 'snapshot') return { status: null, approvable: false, approver: null };
+  const approver = gitUserName(site.path);
+  if (!existsSync(join(site.path, site.config.statusPath))) return { status: null, approvable: true, approver };
+  try {
+    return { status: loadStatus(site.path, site.config), approvable: true, approver };
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    return { status: null, approvable: true, approver };
+  }
 }
 
 /**
@@ -764,14 +787,50 @@ async function save(ctx: DevContext, req: Request, site: SiteState, listed: Work
   }
 
   const report = new Report();
-  const { written, unchanged } = applyForms(ready.path, config, descriptor, next, report, 'dashboard save');
+  // A changed default-locale value goes back to proposed in the same batch as the value.
+  const status = resetChanged(loadStatus(ready.path, config), ready.snapshot, next, config.locales.default);
+  const { written, unchanged } = applyForms(ready.path, config, descriptor, next, report, 'dashboard save', status);
   const touched = body['touch'] === false ? null : touchReadPath(ready);
+  const tracked = existsSync(join(ready.path, config.statusPath));
   return json({
     written,
     unchanged,
     touched,
     same,
+    status: tracked ? Object.fromEntries([...new Set(edits.map((edit) => edit.key))].map((key) => [key, statusOf(status, key)])) : null,
     findings: [...gate.findings, ...report.findings],
+    at: gitState(ready.path),
+    ...pendingSplit(ready),
+  });
+}
+
+/**
+ * `POST site/approve` `{ key }` — `stet approve`'s path over the dashboard's
+ * site: the named key approved by git's `user.name` today, written through the
+ * whole repo batch so a generated output that hashes the status words moves
+ * with it. The reply carries the key's entry and the status file as it now
+ * stands, since the first approval brings every declared key into the file.
+ */
+async function approve(req: Request, site: SiteState, listed: WorkspaceEntry): Promise<Response> {
+  if (requireReady(site).mode !== 'snapshot') return json({ error: STORE_BACKED_APPROVAL }, 409);
+  const body = await readJson(req);
+  const key = reqStr(body, 'key');
+  // Read again after the body, as a save does: the files may have moved while it streamed in.
+  const ready = requireReady(loadSite(listed));
+  if (!Object.hasOwn(ready.descriptor.keys, key)) return json({ error: `undeclared key: ${key}` }, 400);
+  const by = gitUserName(ready.path);
+  if (by === null) return json({ error: 'approve: git has no user.name here — set one so the approval records who made it' }, 409);
+  const { file, already } = approveKeys(loadStatus(ready.path, ready.config), [key], by);
+  const report = new Report();
+  const { written } = applyForms(ready.path, ready.config, ready.descriptor, ready.snapshot, report, 'dashboard approve', file);
+  const status = loadStatus(ready.path, ready.config);
+  return json({
+    key,
+    entry: statusOf(status, key),
+    already: already.length > 0,
+    status,
+    written,
+    findings: report.findings,
     at: gitState(ready.path),
     ...pendingSplit(ready),
   });
@@ -1031,7 +1090,7 @@ function keyMoves(
 function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
   const { config } = site;
   if (site.host === 'html') {
-    return { files: [config.descriptorPath, config.snapshotPath].map(gitSpelling), globs: config.managedSurfaces };
+    return { files: [config.descriptorPath, config.snapshotPath, config.statusPath].map(gitSpelling), globs: config.managedSurfaces };
   }
   return {
     files: [
@@ -1041,6 +1100,7 @@ function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
       config.codegen.dts,
       config.codegen.defaults,
       config.codegen.resolved,
+      config.statusPath,
     ].map(gitSpelling),
     globs: [],
   };
