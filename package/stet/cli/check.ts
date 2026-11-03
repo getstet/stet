@@ -25,7 +25,7 @@ import type { Descriptor } from '../src/types.js';
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { isHtmlHost, loadConfig, markAttributes, resolveCopyFrom, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
-import { generateOutput, outputSource } from './generated.js';
+import { generateOutput, outputSource, warnUnmatchedOnly } from './generated.js';
 import { checkDocuments, markedNowhere, proposeHtml } from './html-host.js';
 import { keyUsage } from './key-usage.js';
 import type { CliIo } from './main.js';
@@ -247,6 +247,7 @@ function generated(
   report: Report,
   codegen: boolean,
 ): void {
+  warnUnmatchedOnly(config.generated, descriptor, report);
   const files: { path: string; generate: () => string; source: unknown; remedy: string; header: boolean; output?: true }[] = [
     ...(codegen
       ? [

@@ -17,6 +17,7 @@ import { toHost, type Placeholders } from '../src/placeholders.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
 import type { GeneratedOutput } from './config.js';
+import type { Report } from './report.js';
 import { statusOf, type StatusFile } from './status.js';
 
 /**
@@ -32,6 +33,17 @@ export function keysFor(entry: GeneratedOutput, descriptor: Descriptor): string[
       only === undefined ? descriptor.keys[key]?.target === DEFAULT_TARGET : only.some((name) => (/[._]$/.test(name) ? key.startsWith(name) : key === name)),
     )
     .sort();
+}
+
+/** One warning per `only` entry that names no key: under the prefix rule an entry that does not end in `.` or `_` is one exact key, so `home` keeps nothing where `home.` keeps a section. */
+export function warnUnmatchedOnly(entries: readonly GeneratedOutput[], descriptor: Descriptor, report: Report): void {
+  const keys = Object.keys(descriptor.keys);
+  entries.forEach((entry, i) => {
+    for (const name of entry.only ?? []) {
+      if (keys.some((key) => (/[._]$/.test(name) ? key.startsWith(name) : key === name))) continue;
+      report.warn('config', `generated[${i}].only: "${name}" matches no key — end it with . or _ to keep every key under it`);
+    }
+  });
 }
 
 /**

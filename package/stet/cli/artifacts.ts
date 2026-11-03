@@ -9,13 +9,13 @@
  * construction.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { canonicalize, embeddedHash, generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
-import { CONFIG_FILE, isHtmlHost, markAttributes, type StetConfig } from './config.js';
+import { CONFIG_FILE, isHtmlHost, keptFileReached, markAttributes, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { generateOutput } from './generated.js';
 import { planDocuments } from './html-host.js';
@@ -179,7 +179,7 @@ export function writePlanned(
  */
 export function planSideForms(
   cwd: string,
-  config: Pick<StetConfig, 'descriptorPath' | 'statusPath' | 'store' | 'generated' | 'placeholders' | 'locales'>,
+  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'bundlePath' | 'statusPath' | 'readPath' | 'codegen' | 'host' | 'managedSurfaces' | 'store' | 'generated' | 'placeholders' | 'locales'>,
   descriptor: Descriptor,
   snapshot: Snapshot,
   status: StatusFile | null,
@@ -189,7 +189,13 @@ export function planSideForms(
     if (!containsPath(cwd, entry.file)) {
       throw new CliError(`${CONFIG_FILE}: generated[${i}].file must be inside this checkout — a second checkout generates its own file through copyFrom`);
     }
+    if (keptFileReached(config, cwd, entry.file) !== null) {
+      throw new CliError(`${CONFIG_FILE}: generated[${i}].file names a file stet already keeps — ${entry.file}`);
+    }
     const plan = planWrite(join(cwd, entry.file), generateOutput(entry, descriptor, snapshot, status, config.placeholders, config.locales.default), entry.file);
+    if (plan.status !== 'unchanged' && existsSync(plan.path) && statSync(plan.path).nlink > 1) {
+      throw new CliError(`${CONFIG_FILE}: generated[${i}].file ${entry.file} is a hard link — stet writes only files with one name`);
+    }
     return plan.status === 'differs' && isHostsOwn(entry.format, plan, () => declaredOnDisk(cwd, config.descriptorPath)) ? plan : asUpdate(plan);
   });
   const statusWrite = held === null ? null : statusPlan(cwd, config, completeStatus(held, descriptor));
@@ -272,7 +278,7 @@ export function planRepoForms(
   cwd: string,
   config: Pick<
     StetConfig,
-    'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces' | 'reads' | 'statusPath' | 'store' | 'generated' | 'placeholders' | 'locales' | 'copyFrom'
+    'descriptorPath' | 'snapshotPath' | 'bundlePath' | 'readPath' | 'codegen' | 'host' | 'managedSurfaces' | 'reads' | 'statusPath' | 'store' | 'generated' | 'placeholders' | 'locales' | 'copyFrom'
   >,
   descriptor: Descriptor,
   snapshot: Snapshot,

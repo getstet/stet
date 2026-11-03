@@ -34,7 +34,7 @@ import { DEFAULT_TARGET, type KeyDef } from '../src/types.js';
 import { flag, parse, positionalsAround, required, text } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { loadConfig, rawConfigPlan, refuseInCopyFrom } from './config.js';
+import { CONFIG_FILE, loadConfig, rawConfigPlan, refuseInCopyFrom } from './config.js';
 import { KEY_NAME, NAME_PART } from './key-names.js';
 import type { CliIo } from './main.js';
 import { CliError, clip, HostTextReport, Report, UsageError } from './report.js';
@@ -93,6 +93,10 @@ export async function runImport(args: string[], io: CliIo): Promise<number> {
   const config = loadConfig(io.cwd);
   refuseInCopyFrom(config, 'import');
   const report = new HostTextReport();
+  // Without a config the folder is no stet project: the same line `pull` prints for it.
+  if (!existsSync(join(io.cwd, CONFIG_FILE))) {
+    throw new CliError(`no descriptor at ${config.descriptorPath} — is this a stet project? (looked in ${io.cwd})`);
+  }
   // The first command after the config can be this one: a form that does not exist yet starts empty, as `init` plans it, and the batch writes it.
   const descriptor = existsSync(join(io.cwd, config.descriptorPath)) ? descriptorOf(config, io.cwd, report) : loadDescriptor({ version: 1, keys: {} });
   if (!descriptor) return report.emit(io);
