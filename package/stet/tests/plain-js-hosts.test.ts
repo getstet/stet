@@ -869,6 +869,10 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
       "h('p', { ...props });",
       'el.setAttribute("DATA-COPY", k);',
       'var a = document.createAttribute("data-copy"); a.value = k;',
+      'var { dataset } = el; dataset.copy = k;',
+      'Reflect.set(el.dataset, "copy", k);',
+      'Object.defineProperty(el.dataset, "copy", { value: k });',
+      'el.dataset.copy += k;',
     ];
     for (const src of unseen) {
       const usage = await usageOf(src);
@@ -892,6 +896,10 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
       "el.innerHTML = '<p data-copy=\"a.b\">x</p>';",
       'var { copy } = el.dataset;',
       'el.dataset.other = k;',
+      'var v = el.dataset.copy;',
+      'var has = "x" in el.dataset;',
+      'var ks = Object.keys(el.dataset);',
+      'el.dataset.other += k;',
     ];
     for (const src of quiet) {
       const usage = await usageOf(src);
@@ -1033,6 +1041,10 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
     const last = await make('window.TS = window.TS || {};\nTS.copyTable = {\n  "c.d": "Other words",\n  "home.lead": "Same words",\n  "home.title": "Same words"\n};\n');
     expect(await last.run('merge', 'home.title', '--into', 'home.lead', '--write')).toBe(0);
     expect(last.file('copy.js')).toBe('window.TS = window.TS || {};\nTS.copyTable = {\n  "c.d": "Other words",\n  "home.lead": "Same words"\n};\n');
+    // Another object in the file that carries the leaving key's name is no copy of it: only the table holding the survivor's row is read (H3b).
+    const other = await make('window.TS = window.TS || {};\nTS.copyTable = {\n  "home.lead": "Same words"\n};\nTS.other = {"home.title": "x"};\n');
+    expect(await other.run('merge', 'home.title', '--into', 'home.lead', '--write')).toBe(0);
+    expect(other.file('copy.js')).toBe('window.TS = window.TS || {};\nTS.copyTable = {\n  "home.lead": "Same words"\n};\nTS.other = {"home.title": "x"};\n');
     // A table without the survivor's row takes it over from the leaving key's.
     const bare = await make('window.TS = window.TS || {};\nTS.copyTable = {\n  "home.title": "Same words"\n};\n');
     expect(await bare.run('merge', 'home.title', '--into', 'home.lead', '--write')).toBe(0);
@@ -1071,6 +1083,19 @@ describe('add-plain-js-hosts (0.9.0) C3', () => {
       expect.soft(await block.run('rename', 'a.b', 'a.z', '--write'), type).toBe(1);
       expect.soft(block.stdout() + block.stderr(), type).toContain('index.html:');
       expect.soft(block.file('index.html'), type).toBe(body);
+    }
+    // The same call in element text, which the scan also calls unknown: a template-engine brace, a textarea, a noscript, a raw block (H1).
+    for (const text of ["<p>{{ TS.tx('a.b') }}</p>", "<textarea>TS.tx('a.b')</textarea>", "<noscript>TS.tx('a.b')</noscript>", "{% raw %}TS.tx('a.b'){% endraw %}"]) {
+      const body = PAGE(`  ${text}`);
+      const element = await makeHtmlHost({
+        files: { 'index.html': body },
+        keys: { 'a.b': { shape: 'text', target: 'web' } },
+        defaults: { 'a.b': 'Text of a.b' },
+        config: { reads: { functions: ['TS.tx'] } },
+      });
+      expect.soft(await element.run('rename', 'a.b', 'a.z', '--write'), text).toBe(1);
+      expect.soft(element.stdout() + element.stderr(), text).toContain('index.html:');
+      expect.soft(element.file('index.html'), text).toBe(body);
     }
   });
 

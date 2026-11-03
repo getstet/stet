@@ -4051,6 +4051,12 @@ describe('generated outputs and copyFrom (add-plain-js-hosts, C5)', () => {
     reset(host);
     expect(await host.run('check')).toBe(0);
     expect([...host.out, host.stderr()].join('\n').split(warning).length - 1).toBe(1);
+    // An entry that already ends in a joiner is a prefix: the hint would tell it what it did.
+    const prefix = makeHost({ config: { project: 't', generated: [{ file: 'strings.json', format: 'json', only: ['nothere.'] }] } });
+    expect(await prefix.run('pull')).toBe(0);
+    const lines = [...prefix.out, prefix.stderr()].join('\n');
+    expect(lines).toContain('generated[0].only: "nothere." matches no key');
+    expect(lines).not.toContain('end it with');
   });
 
   it('P5.5e a status file whose folder is a symlink to a folder outside the checkout is refused: an approval writes nowhere', async () => {

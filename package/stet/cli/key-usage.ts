@@ -1664,6 +1664,9 @@ function computedRead(ctx: WalkContext, tree: Tree, at: TS.Node, text: string, a
   return out;
 }
 
+/** `data-copy` of `el.dataset.copy`, `data-my-key` of `el.dataset.myKey`. */
+const datasetOf = (mark: string): string => mark.replace(/^data-/, '').replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+
 /**
  * A computed value of the project's key attribute: a prop of that name in an
  * object literal (`h('p', { 'data-copy': 'a.' + k })`), a JSX attribute with an
@@ -1677,8 +1680,6 @@ function attributeRead(ctx: WalkContext, tree: Tree, node: TS.Node): Read[] {
   const { sf } = tree;
   const named = (name: TS.Node | undefined): string | undefined =>
     name !== undefined && (ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name) || ts.isIdentifier(name)) ? name.text : undefined;
-  // `data-copy` of `el.dataset.copy`, `data-my-key` of `el.dataset.myKey`.
-  const datasetOf = (mark: string): string => mark.replace(/^data-/, '').replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
   let attribute: string | undefined;
   let value: TS.Expression | undefined;
   if (ts.isPropertyAssignment(node)) {
@@ -1790,18 +1791,48 @@ function attributeBackstop(ctx: WalkContext, tree: Tree, node: TS.Node): Read[] 
     }
     return [];
   }
+  // The `data-*` attribute's dataset name: a write the walk cannot place by key is a cause.
+  const dataMark = marks.find((mark) => mark.toLowerCase().startsWith('data-'));
+  const datasetHolder = (access: TS.Expression): boolean => {
+    const holder = unwrap(ts, access);
+    return ts.isPropertyAccessExpression(holder) && holder.name.text === 'dataset';
+  };
+  /** The node is written to by an assignment of any operator, or by `++`/`--`. */
+  const written = (target: TS.Node, plain: boolean): boolean => {
+    const p = target.parent;
+    if (ts.isBinaryExpression(p) && p.left === target) {
+      const op = p.operatorToken.kind;
+      return op === ts.SyntaxKind.EqualsToken ? plain : op >= ts.SyntaxKind.FirstAssignment && op <= ts.SyntaxKind.LastAssignment;
+    }
+    return (ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) && p.operand === target && (p.operator === ts.SyntaxKind.PlusPlusToken || p.operator === ts.SyntaxKind.MinusMinusToken);
+  };
   if (ts.isPropertyAccessExpression(node) && node.name.text === 'dataset') {
     const p = node.parent;
     const aliased =
       (ts.isVariableDeclaration(p) && p.initializer === node && !ts.isObjectBindingPattern(p.name)) ||
       (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.right === node) ||
-      (ts.isCallExpression(p) && p.arguments[0] === node && ['assign', 'extend', 'merge'].includes(lastName(p.expression) ?? ''));
+      (ts.isCallExpression(p) && p.arguments[0] === node && ['assign', 'extend', 'merge'].includes(lastName(p.expression) ?? '')) ||
+      // `Reflect.set(el.dataset, …)`, `Object.defineProperty(el.dataset, …)`: a write by a name the walk does not see.
+      (ts.isCallExpression(p) && p.arguments.includes(node) && dataMark !== undefined && /^defineProperty|^defineProperties$/.test(lastName(p.expression) ?? '')) ||
+      (ts.isCallExpression(p) && p.arguments.includes(node) && dataMark !== undefined && ts.isPropertyAccessExpression(p.expression) && ts.isIdentifier(p.expression.expression) && p.expression.expression.text === 'Reflect');
     return aliased ? cause(node, first) : [];
   }
+  if (dataMark !== undefined) {
+    // `var { dataset } = el`, `({ dataset } = el)`, `function f({ dataset })`: the dataset itself leaves under a name of its own.
+    const bound =
+      (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && (node.propertyName ?? node.name).getText(sf) === 'dataset') ||
+      (ts.isShorthandPropertyAssignment(node) && node.name.text === 'dataset' && ts.isBinaryExpression(node.parent.parent) && node.parent.parent.left === node.parent) ||
+      (ts.isPropertyAssignment(node) && ts.isIdentifier(node.name) && node.name.text === 'dataset' && ts.isBinaryExpression(node.parent.parent) && node.parent.parent.left === node.parent);
+    if (bound) return cause(node, dataMark);
+    // `el.dataset.copy += k`, `el.dataset.copy++`: the value the attribute held is built on, whatever it was.
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const field = ts.isPropertyAccessExpression(node) ? node.name.text : isLiteral(ts, node.argumentExpression) ? node.argumentExpression.text : undefined;
+      const mark = field === undefined ? undefined : marks.find((m) => datasetOf(m) === field);
+      if (mark !== undefined && datasetHolder(node.expression) && written(node, false)) return cause(node, mark);
+    }
+  }
   if (ts.isElementAccessExpression(node) && !isLiteral(ts, node.argumentExpression)) {
-    const holder = unwrap(ts, node.expression);
-    const target = ts.isBinaryExpression(node.parent) && node.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && node.parent.left === node;
-    return target && ts.isPropertyAccessExpression(holder) && holder.name.text === 'dataset' ? cause(node, first) : [];
+    return written(node, true) && datasetHolder(node.expression) ? cause(node, first) : [];
   }
   if (ts.isSpreadAssignment(node)) {
     const object = node.parent;
