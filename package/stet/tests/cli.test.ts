@@ -3884,6 +3884,27 @@ describe('the approval status consumers (add-plain-js-hosts, C4)', () => {
     expect(await host.run('list')).toBe(0);
     expect(host.out[0]).toMatch(/status$/);
   });
+
+  it('P4.9 approve refuses a derived key, naming its source, and writes nothing', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, unknown> };
+    descriptor.keys['hero_echo'] = { shape: 'text', target: 'web', derivesFrom: 'hero_headline', tmpl: '{v}!' };
+    writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(descriptor, null, 2));
+    expect(await host.run('approve', 'hero_headline', 'hero_echo', '--by', 'nj-io')).toBe(1);
+    expect(host.stderr()).toContain('approve: hero_echo derives from hero_headline — approve the source');
+    expect(host.exists('content/status.json')).toBe(false);
+  });
+
+  it('P4.10 an approval on hand-formatted forms writes the status file alone', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    for (const rel of ['content/descriptor.json', 'content/defaults.json']) {
+      writeFileSync(join(host.cwd, rel), JSON.stringify(JSON.parse(host.file(rel)), null, 4));
+    }
+    const before = [host.file('content/descriptor.json'), host.file('content/defaults.json')];
+    expect(await host.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(0);
+    expect(host.out.filter((line) => line.startsWith('wrote '))).toEqual(['wrote content/status.json']);
+    expect([host.file('content/descriptor.json'), host.file('content/defaults.json')]).toEqual(before);
+  });
 });
 
 describe('generated outputs and copyFrom (add-plain-js-hosts, C5)', () => {
@@ -4043,5 +4064,23 @@ describe('generated outputs and copyFrom (add-plain-js-hosts, C5)', () => {
     expect(await worker.run('check')).toBe(0);
     expect(`${worker.stdout()}\n${worker.stderr()}`).not.toMatch(CODEGEN);
     expect(worker.stderr()).not.toContain('not generated');
+  });
+
+  it('Q67 a script output already on disk without stet\'s header is never overwritten: pull refuses, and a stet-written one updates', async () => {
+    const host = makeHost({ config: { project: 't', generated: [{ file: 'public/copy.js', format: 'script', name: 'TS.copyTable' }] } });
+    const handKept = 'window.TS = window.TS || {};\nTS.copyTable = { hero_headline: "Hand kept words" };\n';
+    mkdirSync(join(host.cwd, 'public'), { recursive: true });
+    writeFileSync(join(host.cwd, 'public/copy.js'), handKept);
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('refusing to overwrite public/copy.js');
+    expect(host.file('public/copy.js')).toBe(handKept);
+    // Moved aside, the first pull writes the output with stet's header, and a later one updates it.
+    rmSync(join(host.cwd, 'public/copy.js'));
+    reset(host);
+    expect(await host.run('pull')).toBe(0);
+    editSnapshot(host, 'hero_headline', 'A new headline');
+    reset(host);
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('public/copy.js')).toContain('"A new headline"');
   });
 });

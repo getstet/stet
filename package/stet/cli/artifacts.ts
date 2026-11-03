@@ -12,7 +12,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { canonicalize, generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
+import { canonicalize, embeddedHash, generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { isHtmlHost, markAttributes, type StetConfig } from './config.js';
@@ -161,7 +161,10 @@ export function writePlanned(
  * status file, planned over `completeStatus` so it holds every declared key —
  * null while the file does not exist and nothing is approved, and always null
  * on a store-backed project, where publishing is the approval — and one write
- * per generated output, from the snapshot's default locale.
+ * per generated output, from the snapshot's default locale. A `script` or
+ * `esm` output already on disk without stet's header is the host's own file:
+ * its plan stays `differs`, so the batch refuses rather than replace it. A
+ * `json` output has no header to tell by and is updated.
  */
 export function planSideForms(
   cwd: string,
@@ -171,12 +174,29 @@ export function planSideForms(
   status: StatusFile | null,
 ): { status: WritePlan | null; generated: WritePlan[] } {
   const held = status === null || isStoreBacked(config.store) ? null : status;
-  const generated = config.generated.map((entry) =>
-    asUpdate(
-      planWrite(join(cwd, entry.file), generateOutput(entry, descriptor, snapshot, status, config.placeholders, config.locales.default), entry.file),
-    ),
-  );
+  const generated = config.generated.map((entry) => {
+    const plan = planWrite(join(cwd, entry.file), generateOutput(entry, descriptor, snapshot, status, config.placeholders, config.locales.default), entry.file);
+    const handKept = plan.status === 'differs' && entry.format !== 'json' && embeddedHash(readFileSync(plan.path, 'utf8')) === null;
+    return handKept ? plan : asUpdate(plan);
+  });
   return { status: held === null ? null : statusPlan(cwd, config, completeStatus(held, descriptor)), generated };
+}
+
+/**
+ * The JSON forms named by `labels` left as they are on disk when what the plan
+ * would write parses to the same content — a hand-formatted descriptor or
+ * snapshot an approval did not change keeps its bytes.
+ */
+export function keepFormatting(plans: WritePlan[], labels: readonly string[]): WritePlan[] {
+  const same = (plan: WritePlan): boolean => {
+    try {
+      const canon = (text: string): string => JSON.stringify(canonicalize(JSON.parse(text)));
+      return canon(readFileSync(plan.path, 'utf8')) === canon(plan.text);
+    } catch {
+      return false;
+    }
+  };
+  return plans.map((plan) => (labels.includes(plan.label) && plan.status === 'write' && existsSync(plan.path) && same(plan) ? { ...plan, status: 'unchanged' as const } : plan));
 }
 
 /**

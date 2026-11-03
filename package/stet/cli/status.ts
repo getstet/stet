@@ -54,6 +54,11 @@ export function loadStatus(cwd: string, config: Pick<StetConfig, 'statusPath'>):
   return file;
 }
 
+/** The status file where this project tracks approval — null for a store-backed project and while the file does not exist; a malformed file is a CliError. */
+export function trackedStatus(cwd: string, config: Pick<StetConfig, 'statusPath'>, storeBacked: boolean): StatusFile | null {
+  return storeBacked || !existsSync(join(cwd, config.statusPath)) ? null : loadStatus(cwd, config);
+}
+
 /** A key's status: an absent entry is `proposed`. */
 export function statusOf(file: StatusFile, key: string): KeyStatus {
   return Object.hasOwn(file, key) ? (file[key] as KeyStatus) : PROPOSED;

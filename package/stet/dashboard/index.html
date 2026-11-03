@@ -1623,6 +1623,7 @@ function keyList() {
     '<span class="bdg" id="keycount">' + items.length + '</span></div>' + selector + localeSelector +
     '<input class="in sm" id="ksearch" style="margin-top:6px" placeholder="Search…" value="' + esc(S.q) + '" data-act-input="search"></div>' +
     (line === '' ? '' : '<p class="note" id="siteline" style="margin:8px 12px">' + esc(line) + '</p>') +
+    statusNotice() +
     '<div class="scroll" id="keyrows">' + keyRows(items) + '</div></div>';
 }
 /** The key list's rows, each with its badges; repainted on its own as a census or the scan answers. */
@@ -1713,6 +1714,13 @@ function pageList() {
 /** A page counts as checked once a census came from it and its reads answered complete. */
 const checked = (route) => S.seen.routes.has(route) && S.seen.read.has(route);
 /** The line above the key list while a read stet cannot follow stands: up to three, then the rest as a count. */
+/** A status file that cannot be read: its path and the reason, and what still works. */
+function statusNotice() {
+  const why = ready() && typeof S.site.statusError === 'string' ? S.site.statusError : '';
+  if (why === '') return '';
+  return '<p class="note" id="statuserror" style="margin:8px 12px">' +
+    esc('Approving is off: ' + why + '. Fix the file to approve keys again. Saves still go through and leave it as it is.') + '</p>';
+}
 function siteLine() {
   const causes = (S.usage && Array.isArray(S.usage.causes)) ? S.usage.causes : [];
   if (causes.length === 0) return '';
@@ -1827,7 +1835,10 @@ function editorCard() {
 function approveLine(id) {
   if (!approvable() || (keyDef(id) || {}).derivesFrom !== undefined) return '';
   const entry = approval(id);
-  if (entry.status === 'approved') return '<div class="kline">' + esc('Approved ' + entry.at + ' by ' + entry.by) + '</div>';
+  if (entry.status === 'approved') {
+    const who = entry.at && entry.by ? ' ' + entry.at + ' by ' + entry.by : '';
+    return '<div class="kline">' + esc('Approved' + who) + '</div>';
+  }
   const name = S.site.approver;
   return '<div class="kline"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
     '<button class="btn sm" data-act="approve:' + esc(id) + '">Approve</button>' +

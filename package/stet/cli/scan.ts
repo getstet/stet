@@ -27,6 +27,7 @@ import { isHtmlHost, keyJoiner, loadConfig, markAttributes, type StetConfig } fr
 import { isRegistryFile, proposeTemplates, templateExports, type ExtractSkip } from './email-extract.js';
 import { filesForGlobs } from './files.js';
 import { htmlBaseName, planHtmlRegister, proposeHtml } from './html-host.js';
+import { calleeName } from './key-usage.js';
 import { numberNames } from './key-names.js';
 import { classifyAdoption, isRecord, planJsxRun, sharedTextIndex, type Adoption } from './register-run.js';
 import type { CliIo } from './main.js';
@@ -34,6 +35,7 @@ import { detectPagesRoots, htmlPageOf, pageOfFile, proposePages } from './pages.
 import { CliError, clip, lineCol, plural, posixRelative, Report } from './report.js';
 import {
   astroFindings,
+  copyTablesOf,
   dialectOf,
   isJsxFile,
   loadTypescript,
@@ -172,7 +174,9 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   const surfaceGlobs = [...new Set(config.managedSurfaces)];
   const moduleGlobs = [...new Set(config.copyModules)];
   const declared = [...new Set([...surfaceGlobs, ...moduleGlobs])];
-  const perGlob = declared.map((glob) => ({ glob, matched: filesForGlobs(io.cwd, [glob]) }));
+  // A generated output is stet's own file: it is never a surface or a copy module, whatever glob matches it.
+  const outputs = new Set(config.generated.map((entry) => posix.normalize(entry.file)));
+  const perGlob = declared.map((glob) => ({ glob, matched: filesForGlobs(io.cwd, [glob]).filter((file) => !outputs.has(file)) }));
   const files = [...new Set(perGlob.flatMap((entry) => entry.matched))].sort();
 
   // Each read at most once, and only where something asks. The descriptor is
@@ -197,8 +201,26 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   }
   let neededCompiler = false;
 
-  const i18nLines = (file: string, source: string, skips: { pos: number }[]): void => {
+  // A call of a configured read function is a read of a stet key, not catalog copy: it prints no i18n line.
+  const readNames = new Set((config.reads?.functions ?? []).map((f) => f.name));
+  const readTs = compilerRefusal === null && readNames.size > 0 ? await loadTypescript() : null;
+  const insideRead = (sf: TS.SourceFile, pos: number): boolean => {
+    if (readTs === null) return false;
+    let found = false;
+    const visit = (node: TS.Node): void => {
+      if (found || node.getStart(sf) > pos || node.end <= pos) return;
+      const callee = readTs.isCallExpression(node) ? node.expression : readTs.isTaggedTemplateExpression(node) ? node.tag : undefined;
+      const name = callee === undefined ? undefined : calleeName(readTs, callee);
+      if (name !== undefined && readNames.has(name)) found = true;
+      else readTs.forEachChild(node, visit);
+    };
+    visit(sf);
+    return found;
+  };
+  const i18nLines = (file: string, source: string, skips: { pos: number }[], parsed?: TS.SourceFile): void => {
+    const sf = readTs === null || skips.length === 0 ? null : (parsed ?? readTs.createSourceFile(file, source, readTs.ScriptTarget.Latest, true, scriptKindFor(readTs, file)));
     for (const skip of skips) {
+      if (sf !== null && insideRead(sf, skip.pos)) continue;
       const { line } = lineCol(source, skip.pos);
       report.line(`${file}:${line}: i18n copy — outside stet's v1 scope, not a key`);
     }
@@ -376,7 +398,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
         continue;
       }
       handoff = { sourceFile: result.sourceFile, claimed: result.claimed };
-      i18nLines(file, source, result.i18nSkips);
+      i18nLines(file, source, result.i18nSkips, result.sourceFile);
       // Display strings in module-scope data: reported like the dialects' text, no key proposed.
       for (const found of result.data) {
         if (baselined({ file, context: 'data', text: found.text })) continue;
@@ -426,7 +448,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     // classifications, neither of them twice: the JSX walk above owns every
     // position it classified, and the module walk covers what it leaves.
     if (isModule) {
-      const result = run?.modules.get(file) ?? (await scanModule(file, source, handoff));
+      const result = run?.modules.get(file) ?? (await scanModule(file, source, { ...handoff, tables: copyTablesOf(config) }));
       if (result.parseErrors) {
         report.line(`${file}: could not be parsed cleanly — reported, not scanned`);
         refused += 1;
@@ -440,7 +462,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
       if (!isSurface && isJsxFile(file)) {
         report.warn('scan', `${file}: JSX not scanned — the file is a copy module only; add it to managedSurfaces`);
       }
-      i18nLines(file, source, result.i18nSkips);
+      i18nLines(file, source, result.i18nSkips, handoff?.sourceFile);
       const descriptor = descriptorOnce();
       const snapshot = snapshotOnce();
       for (const literal of result.literals) {
@@ -608,7 +630,7 @@ export async function screenRun(input: {
     }
     if (result.parseErrors) continue;
     const scan = scanScreen(ts, result.sourceFile, { ...options, ...(page === undefined ? {} : { page }) });
-    scan.literals = scan.literals.filter((literal) => input.held?.get(literal.text) === undefined);
+    scan.literals = scan.literals.filter((literal) => input.held?.get(toStet(literal.text, config.placeholders)) === undefined);
     out.byFile.set(file, scan);
     for (const literal of scan.literals) {
       if (first.has(literal.text)) continue;

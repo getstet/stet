@@ -1361,7 +1361,7 @@ function walkUses(ctx: WalkContext, tree: Tree, roots: ReadonlyMap<string, strin
  * `.x`, a leading `window.`, `self.` or `globalThis.` dropped. Undefined for
  * any other expression.
  */
-function calleeName(ts: typeof import('typescript'), expr: TS.Expression): string | undefined {
+export function calleeName(ts: typeof import('typescript'), expr: TS.Expression): string | undefined {
   const at = unwrap(ts, expr);
   let name: string | undefined;
   if (ts.isIdentifier(at)) name = at.text;

@@ -66,6 +66,7 @@ import {
   type MarkupTag,
   type Span as MarkupSpan,
 } from './markup.js';
+import { calleeName } from './key-usage.js';
 import { CliError } from './report.js';
 // The markup layer's names this module's importers read from here.
 export { BOGUS_COMMENT, blankNonMarkup, CDATA_SECTION, CODE_FENCE, ESM_LINE, FRONTMATTER, HTML_COMMENT, type Dialect } from './markup.js';
@@ -1974,9 +1975,15 @@ export interface HyperscriptElement {
   tag: string;
   props?: TS.ObjectLiteralExpression;
   children: readonly TS.Expression[];
-  /** Named in `scan.builders`, or given props: an element beyond doubt, which `log("div", "x")` is not. */
+  /** Named in `scan.builders`, or a hyperscript call given props: an element beyond doubt, which `h("div", "x")` is not. */
   sure: boolean;
 }
+
+/** The last segment of a callee that is hyperscript (`h`, `React.createElement`): any other call is an element only through `scan.builders`. */
+const HYPERSCRIPT_CALLEES: ReadonlySet<string> = new Set(['h', 'm', 'el', 'html', 'createElement', 'jsx', 'jsxs']);
+
+/** The elements whose children are code: a screen proposes none of it as copy. */
+const OPAQUE_TAGS: ReadonlySet<string> = new Set(['script', 'style']);
 
 /** The copy props a hyperscript element carries: the JSX walk's copy attributes a visitor reads. */
 const SCREEN_PROPS: ReadonlySet<string> = new Set([...COPY_ATTRS].filter((name) => ['placeholder', 'title', 'alt', 'aria-label'].includes(name)));
@@ -1988,12 +1995,15 @@ const DOM_COPY: Record<string, string | undefined> = { textContent: undefined, i
 const CUSTOM_ELEMENT = /^(?!aria-|data-)[a-z][a-z0-9]*-[a-z0-9-]*$/;
 
 /**
- * A call read as a hyperscript element (D15): a first argument naming an HTML
- * element (`HTML_TAGS`) or a custom one, then an optional object literal of
- * props (or `null`) and the children; or any call of a name in
- * `scan.builders`, whose first argument may be a component (`h(Card, …)`). A
- * call of a configured read function is a read and never an element. Null for
- * any other call.
+ * A call read as a hyperscript element (D15): a call whose last callee segment
+ * is in `HYPERSCRIPT_CALLEES`, with a first argument naming an HTML element
+ * (`HTML_TAGS`) or a custom one, then an optional object literal of props (or
+ * `null`) and the children; or any call of a name in `scan.builders`, whose
+ * first argument may be a component (`h(Card, …)`). Props make a hyperscript
+ * call sure. A call of a configured read function is a read and never an
+ * element, and so is every other call, whatever its first argument
+ * (`log("div", { a: 1 }, "…")`). Callees are named as `calleeName` folds them.
+ * Null for any call that is not an element.
  */
 export function hyperscriptElement(
   ts: typeof import('typescript'),
@@ -2001,12 +2011,12 @@ export function hyperscriptElement(
   call: TS.CallExpression,
   opts: Pick<ScreenOptions, 'reads' | 'builders'>,
 ): HyperscriptElement | null {
-  const callee = call.expression.getText(sf).replace(/\s+/g, '');
+  const callee = calleeName(ts, call.expression) ?? call.expression.getText(sf).replace(/\s+/g, '');
   const [first, second] = call.arguments;
   if (first === undefined || opts.reads.includes(callee)) return null;
   const built = opts.builders.includes(callee);
   const named = ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first) ? first.text : undefined;
-  if (!built && (named === undefined || !(HTML_TAGS.has(named) || CUSTOM_ELEMENT.test(named)))) return null;
+  if (!built && (!HYPERSCRIPT_CALLEES.has(callee.slice(callee.lastIndexOf('.') + 1)) || named === undefined || !(HTML_TAGS.has(named) || CUSTOM_ELEMENT.test(named)))) return null;
   const props = second !== undefined && (ts.isObjectLiteralExpression(second) || second.kind === ts.SyntaxKind.NullKeyword);
   return {
     tag: named ?? first.getText(sf),
@@ -2026,8 +2036,8 @@ export function hyperscriptElement(
  * DOM copy property, or `setAttribute`'s value for a copy attribute, is copy
  * with the role from the property. An `innerHTML` or `insertAdjacentHTML`
  * fragment is read by the dialect detector as possible copy, and so is the
- * string child of a call that is an element only by its shape and sits in no
- * element (`log("div", "x")`).
+ * string child of a hyperscript call given no props that sits in no element
+ * (`h("div", "x")`).
  */
 export function scanScreen(ts: typeof import('typescript'), sf: TS.SourceFile, opts: ScreenOptions): ScreenScan {
   const file = sf.fileName;
@@ -2052,7 +2062,7 @@ export function scanScreen(ts: typeof import('typescript'), sf: TS.SourceFile, o
   const propOf = (el: HyperscriptElement, name: string): TS.PropertyAssignment | undefined =>
     el.props?.properties.find((p): p is TS.PropertyAssignment => ts.isPropertyAssignment(p) && propName(ts, p.name) === name);
   const textOf = (el: HyperscriptElement): string =>
-    el.children.map((c) => (isString(c) ? c.text : ts.isCallExpression(c) && elementOf(c) !== null ? textOf(elementOf(c) as HyperscriptElement) : '')).join('');
+    OPAQUE_TAGS.has(el.tag) ? '' : el.children.map((c) => (isString(c) ? c.text : ts.isCallExpression(c) && elementOf(c) !== null ? textOf(elementOf(c) as HyperscriptElement) : '')).join('');
   const firstHeading = (el: HyperscriptElement): HyperscriptElement | undefined => {
     let found: HyperscriptElement | undefined;
     const look = (n: TS.Node): void => {
@@ -2112,7 +2122,8 @@ export function scanScreen(ts: typeof import('typescript'), sf: TS.SourceFile, o
           push((prop as TS.PropertyAssignment).initializer as TS.StringLiteral, chain, name);
         }
       }
-      if (!opts.attributes.some((a) => propOf(el, a) !== undefined)) {
+      // A `<style>` or `<script>` child is code, not words.
+      if (!OPAQUE_TAGS.has(el.tag) && !opts.attributes.some((a) => propOf(el, a) !== undefined)) {
         for (const child of el.children) {
           if (!isString(child)) continue;
           if (sure) push(child, chain);
@@ -2131,7 +2142,7 @@ export function scanScreen(ts: typeof import('typescript'), sf: TS.SourceFile, o
       if (property === 'innerHTML') fragment(node.right);
       else if (Object.hasOwn(DOM_COPY, property) && isString(node.right)) {
         // `document.title` is the page's title, every other `title` an element's tooltip.
-        const pageTitle = property === 'title' && node.left.expression.getText(sf) === 'document';
+        const pageTitle = property === 'title' && calleeName(ts, node.left.expression) === 'document';
         push(node.right, [], pageTitle ? undefined : DOM_COPY[property], pageTitle ? 'title' : undefined);
       }
     }
@@ -2193,6 +2204,11 @@ export interface ModuleScanResult {
   parseErrors: boolean;
 }
 
+/** Whether a project's copy modules may hold `[value, meta]` pair and `{ value }` object tables: it sets `reads` or `generated`. */
+export function copyTablesOf(config: { reads?: unknown; generated: readonly unknown[] }): boolean {
+  return config.reads !== undefined || config.generated.length > 0;
+}
+
 /**
  * One DECLARED COPY MODULE, walked for the string literals its host means as
  * copy — the sibling of `scanSource` for the files the JSX locator has nothing
@@ -2218,6 +2234,10 @@ export interface ModuleScanResult {
  * stand on their own, for a `.tsx` declared as a copy module and nothing else,
  * where no JSX walk ran and there is nothing to hand over.
  *
+ * A table of `[value, meta]` pairs or `{ value }` objects is read as one only when
+ * `opts.tables` is set (`copyTablesOf`: the project sets `reads` or `generated`);
+ * every other project reads its copy modules as they were always read.
+ *
  * The rewrite-only fields of a returned literal are inert — no enclosing body,
  * no `copy` binding, no import position — because a module finding is adopted
  * as RECORD and its source is never edited. `register`'s runtime guard is what
@@ -2226,7 +2246,7 @@ export interface ModuleScanResult {
 export async function scanModule(
   file: string,
   source: string,
-  opts: { sourceFile?: TS.SourceFile; claimed?: readonly Span[] } = {},
+  opts: { sourceFile?: TS.SourceFile; claimed?: readonly Span[]; tables?: boolean } = {},
 ): Promise<ModuleScanResult> {
   const ts = await loadTypescript();
   const sf =
@@ -2379,7 +2399,7 @@ export async function scanModule(
     // (`features: ['Fast', 'Cheap']`) or a longer or shorter one stays the literals it always was.
     if (parent !== undefined && ts.isArrayLiteralExpression(parent)) {
       const pair = propertyOf(climb(parent));
-      if (pair === undefined || !uniform(pair.parent, isPair)) return undefined;
+      if (opts.tables !== true || pair === undefined || !uniform(pair.parent, isPair)) return undefined;
       return parent.elements[0] === node ? { name: propName(ts, pair.name), form: 'pair' } : null;
     }
     const own = propertyOf(node);
@@ -2391,7 +2411,7 @@ export async function scanModule(
     const valued = holder.properties.find(
       (p): p is TS.PropertyAssignment => ts.isPropertyAssignment(p) && propName(ts, p.name) === 'value' && ts.isStringLiteralLike(bare(p.initializer)),
     );
-    if (outer !== undefined && valued !== undefined && uniform(outer.parent, isValued)) {
+    if (opts.tables === true && outer !== undefined && valued !== undefined && uniform(outer.parent, isValued)) {
       return valued === own ? { name: propName(ts, outer.name), form: 'object' } : null;
     }
     return { name: propName(ts, own.name) };
