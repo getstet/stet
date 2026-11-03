@@ -17,8 +17,8 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { closeSync, existsSync, openSync, readFileSync, utimesSync } from 'node:fs';
-import { dirname, join, posix } from 'node:path';
+import { closeSync, existsSync, openSync, readFileSync, realpathSync, utimesSync } from 'node:fs';
+import { dirname, join, posix, relative, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
@@ -35,7 +35,7 @@ import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
 import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
-import { pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
+import { markAttributes, pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
 import { isBarePackage } from './email-extract.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, uncommittedStatus, type GitState } from './git.js';
@@ -60,7 +60,7 @@ import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
 import { codeOf, dialectCode, KEY_READ, keyPattern, longerKeyAt, nonCodeOf, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
-import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache } from './key-usage.js';
+import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache, type UsagePrefix } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
 import { applyPages, auditablePages, fileRoute, pagesCompiler, proposeForHost, routeFiles, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
@@ -69,7 +69,7 @@ import { keyMoveWrites, type HostRenames } from './rename.js';
 import { loadStatus, type StatusFile } from './status.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
-import { elementPath, markupBraces, maskExpressions, selfClosedRaw } from './markup.js';
+import { elementPath, HTML_COMMENT, markupBraces, maskExpressions, readAttrs, selfClosedRaw } from './markup.js';
 import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, packageNames, richPartsBindingAt, scriptKindFor } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
@@ -1164,7 +1164,7 @@ function stetWrittenForms(site: Ready, files: string[]): Set<string> {
   // of this process's memory — so a document written by a previous run is
   // still committable after a restart.
   const managed = filesForGlobs(site.path, globs).filter((file) => files.includes(file));
-  for (const mark of proposeHtml(site.path, managed).claimed) labels.add(mark.file);
+  for (const mark of proposeHtml(site.path, managed, markAttributes(site.config)).claimed) labels.add(mark.file);
   return labels;
 }
 
@@ -1493,7 +1493,7 @@ function documentsAt(site: Ready, rev: string): HtmlProposalSet {
     const shown = gitData(site.path, ['show', `${rev}:./${file}`]);
     if (shown.code === 0) sources.push({ file, source: shown.stdout });
   }
-  return proposeHtmlSources(sources);
+  return proposeHtmlSources(sources, markAttributes(site.config));
 }
 
 /** Each key's first mark in a claim pass, in file then document order. */
@@ -2043,7 +2043,7 @@ async function closeProxy(ctx: DevContext, path: string): Promise<void> {
 function marks(site: SiteState): Response {
   const ready = requireReady(site);
   if (ready.host !== 'html') return json({ documents: [], keys: {}, places: keyReads(ready) });
-  const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
+  const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces), markAttributes(ready.config));
   const pages = new Map<string, string>();
   for (const [name, page] of Object.entries(ready.descriptor.pages ?? {})) pages.set(normalizeRoute(page.route), name);
   const documents = set.documents.map((document) => ({
@@ -2085,8 +2085,11 @@ function usageCacheOf(ctx: DevContext, path: string): UsageCache {
 
 /**
  * The keys one route's files read: on the static-HTML host the marks of the
- * document served at the route, complete where every web text key the
- * descriptor declares is marked in some document; on a JavaScript host the reads `siteReads`
+ * document served at the route and what its own scripts read (`documentScripts`,
+ * followed through their imports and read by `siteReads`), complete where every
+ * web text key the descriptor declares is marked in some document or named in
+ * the source, and none of the document's scripts holds a cause, loads a script
+ * stet cannot follow (`loadsScripts`) or could not be read; on a JavaScript host the reads `siteReads`
  * settles for the route's page files (`routeFiles`) and everything they import,
  * through the host's path aliases: the keys each file names, and every declared
  * key under a prefix it reads. `complete` is false where the walk met a file it
@@ -2099,16 +2102,47 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
   if (route === null) throw new UsageError('route is required');
   const unmapped = { route, files: [], keys: [], complete: false, renders: {}, coincident: [] };
   if (ready.host === 'html') {
-    const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
+    const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces), markAttributes(ready.config));
     const document = set.documents.find((d) => normalizeRoute(servedRoute(d.file)) === normalizeRoute(route));
     if (document === undefined) return json(unmapped);
-    const keys = [...new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key))].sort();
+    const keys = new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key));
     // A declared key no document marks is rendered by something other than the HTML (the page's own script), so the marks are not the page's whole reads.
     const marked = new Set(set.claimed.map((mark) => mark.key));
-    const markedEverywhere = Object.entries(ready.descriptor.keys).every(
-      ([key, def]) => def.shape !== 'text' || def.target !== DEFAULT_TARGET || def.derivesFrom !== undefined || marked.has(key),
-    );
-    return json({ route, files: [document.file], keys, complete: markedEverywhere, renders: {}, coincident: [] });
+    const webText = Object.entries(ready.descriptor.keys)
+      .filter(([, def]) => def.shape === 'text' && def.target === DEFAULT_TARGET && def.derivesFrom === undefined)
+      .map(([key]) => key);
+    const scripts = documentScripts(ready.path, document);
+    if (scripts.files.length === 0 && !scripts.missing) {
+      return json({ route, files: [document.file], keys: [...keys].sort(), complete: webText.every((key) => marked.has(key)), renders: {}, coincident: [] });
+    }
+    const ts = await loadTypescript();
+    let chain: Chain;
+    try {
+      chain = importClosure(ts, ready.path, scripts.files, undefined, (rel) => insideCheckout(ready.path, join(ready.path, rel)) !== null);
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      return json({ route, files: [document.file, ...scripts.files], keys: [...keys].sort(), complete: false, renders: {}, coincident: [] });
+    }
+    const declaredKeys = Object.keys(ready.descriptor.keys);
+    const reads = await siteReads(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path));
+    const under = (prefixes: readonly UsagePrefix[]): string[] => declaredKeys.filter((key) => prefixes.some((p) => key.startsWith(p.prefix)));
+    let complete = !chain.boundary && !scripts.missing;
+    for (const rel of [document.file, ...chain.files.map((file) => file.rel)]) {
+      const read = reads.files.get(rel);
+      // A script the scan did not read (ignored by git, outside the source extensions): its reads are not known.
+      if (read === undefined) {
+        if (rel !== document.file) complete = false;
+        continue;
+      }
+      for (const key of [...read.named, ...under(read.prefixes)]) keys.add(key);
+      if (read.causes.length > 0) complete = false;
+    }
+    for (const file of chain.files) if (loadsScripts(ts, file.rel, file.text)) complete = false;
+    // Every web text key is marked somewhere or named by the source; one neither is rendered by something stet does not read.
+    const named = new Set<string>();
+    for (const read of reads.files.values()) for (const key of [...read.named, ...under(read.prefixes)]) named.add(key);
+    if (!webText.every((key) => marked.has(key) || named.has(key))) complete = false;
+    return json({ route, files: [document.file, ...chain.files.map((file) => file.rel)], keys: [...keys].sort(), complete, renders: {}, coincident: [] });
   }
   const files = routeFiles(ready.path, route, ready.config);
   if (files === null) return json(unmapped);
@@ -2139,7 +2173,7 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
   }
   const declaredKeys = Object.keys(ready.descriptor.keys);
   const declared = new Set(declaredKeys);
-  const own = ownFiles(ready.config);
+  const own = ownFiles(ready.config, ready.path);
   const reads = await siteReads(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path));
   const keys = new Set<string>();
   let complete = !chain.boundary;
@@ -2201,6 +2235,70 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
     })
     .sort();
   return json({ route, files, keys: [...keys].sort(), complete, renders, coincident });
+}
+
+/**
+ * The scripts a static document loads that the route reads follow: each
+ * `<script src>` whose URL is same-origin, resolved against the document's own
+ * path as the static arm serves it, and lands on a file inside the checkout
+ * (`servableFile`). `missing` where a same-origin script names no such file —
+ * a built asset, say — whose reads stet cannot know.
+ */
+export function documentScripts(cwd: string, document: Document): { files: string[]; missing: boolean } {
+  const files: string[] = [];
+  let missing = false;
+  // `servableFile` answers the real path, so the checkout's own is the base its paths are relative to.
+  const root = realpathSync(cwd);
+  // The reader blanks a script whole, tag and body, so the tags are read off the source, comments aside, each body skipped.
+  const source = document.source.replace(HTML_COMMENT, (comment) => ' '.repeat(comment.length));
+  const open = /<script\b([^>]*)>/gi;
+  for (let m = open.exec(source); m !== null; m = open.exec(source)) {
+    const close = source.toLowerCase().indexOf('</script', open.lastIndex);
+    const src = readAttrs(source, m.index + '<script'.length, m[1] as string).find((a) => a.name === 'src')?.value.trim();
+    if (close !== -1) open.lastIndex = close;
+    if (src === undefined || src === '') continue;
+    let url: URL;
+    try {
+      url = new URL(src, `http://stet.invalid/${document.file}`);
+    } catch {
+      continue;
+    }
+    if (url.origin !== 'http://stet.invalid') continue;
+    const abs = servableFile(cwd, url.pathname);
+    const rel = abs === null ? null : relative(root, abs).split(sep).join('/');
+    if (rel === null) missing = true;
+    else if (!files.includes(rel)) files.push(rel);
+  }
+  return { files, missing };
+}
+
+/**
+ * Whether a script loads another one the route reads cannot follow: it creates
+ * a script element (`createElement('script')`), assigns or sets a `src`, or
+ * calls `importScripts` — the static arm's `importsLazily`. A library loaded
+ * from a list of files this way is read by nothing, so the route is incomplete.
+ */
+export function loadsScripts(ts: typeof import('typescript'), rel: string, text: string): boolean {
+  if (!/\bcreateElement\b|\.src\b|\bimportScripts\b|\bsetAttribute\b/.test(text)) return false;
+  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
+  const literal = (node: TS.Node | undefined, value: string): boolean =>
+    node !== undefined && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && node.text.toLowerCase() === value;
+  const found = (node: TS.Node): boolean =>
+    (ts.isCallExpression(node) &&
+      ((ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'createElement' && literal(node.arguments[0], 'script')) ||
+        (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'setAttribute' && literal(node.arguments[0], 'src')) ||
+        (ts.isIdentifier(node.expression) && node.expression.text === 'importScripts'))) ||
+    (ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isPropertyAccessExpression(node.left) &&
+      node.left.name.text === 'src') ||
+    ts.forEachChild(node, found) === true;
+  try {
+    return found(sf);
+  } catch (error) {
+    if (error instanceof RangeError) return true; // too deeply nested to read: not known to be free of one
+    throw error;
+  }
 }
 
 /**
@@ -2978,7 +3076,7 @@ async function health(ctx: DevContext, url: URL, site: SiteState): Promise<Respo
   const at = gitState(ready.path);
   const doctor = await captured(ctx, ['doctor'], ready, env);
   const report = new Report();
-  check(ready.config, ready.path, report);
+  await check(ready.config, ready.path, report);
   const scan = await captured(ctx, ['scan', '--json'], ready);
   const audit = ready.mode === 'snapshot' ? null : (await captured(ctx, ['audit', '--json'], ready, env)).json;
   return json({

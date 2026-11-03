@@ -14385,6 +14385,59 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     expect(body.keys).toEqual(expect.arrayContaining(marksIn(host.cwd, 'index.html')));
   });
 
+  // add-plain-js-hosts C3 (D7): a static page's own scripts are read beside its marks.
+  const PLAIN_KEYS = ['home.title', 'waitlist.title', 'waitlist.use.ads', 'waitlist.use.other'];
+  const plainHost = (files: Record<string, string>, config: Record<string, unknown> = { reads: { functions: ['TS.t', 'TS.tx'] } }): Promise<CliHost> =>
+    makeHtmlHost({
+      files,
+      keys: Object.fromEntries(PLAIN_KEYS.map((k) => [k, { shape: 'text', target: 'web' }])),
+      defaults: Object.fromEntries(PLAIN_KEYS.map((k) => [k, `Text of ${k}`])),
+      config,
+    });
+  const plainPage = (body: string): string => `<!DOCTYPE html>\n<html lang="en">\n<head><title>Join</title></head>\n<body>\n${body}\n</body>\n</html>\n`;
+
+  it('P3.8 an html page with <script src="screen.js">: the script\'s named keys and prefixes join the route, complete where no cause stands', async () => {
+    const screen = 'var TS = window.TS;\nTS.t("waitlist.title");\n["ads", "other"].forEach(function (k) { TS.tx("waitlist.use." + k); });\n';
+    const host = await plainHost({
+      'index.html': plainPage('  <h1 data-stet="home.title">Text of home.title</h1>\n  <script src="screen.js"></script>'),
+      'screen.js': screen,
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: PLAIN_KEYS.slice().sort(), complete: true });
+
+    const caused = await plainHost({
+      'index.html': plainPage('  <h1 data-stet="home.title">Text of home.title</h1>\n  <script src="screen.js"></script>'),
+      'screen.js': `${screen}TS.tx(window.pick());\n`,
+    });
+    expect(await routeReadsOf(handlerOver([caused.cwd]).handler, caused)).toMatchObject({ keys: PLAIN_KEYS.slice().sort(), complete: false });
+  });
+
+  it('P3.12 with reads.attribute data-copy, the route reads a data-copy mark beside a data-stet one', async () => {
+    const host = await plainHost(
+      {
+        'index.html': plainPage(
+          '  <h1 data-copy="home.title">Text of home.title</h1>\n  <p data-stet="waitlist.title">Text of waitlist.title</p>\n' +
+            '  <i data-copy="waitlist.use.ads">Text of waitlist.use.ads</i>\n  <i data-stet="waitlist.use.other">Text of waitlist.use.other</i>',
+        ),
+      },
+      { reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+    );
+    expect(await routeReadsOf(handlerOver([host.cwd]).handler, host)).toMatchObject({ keys: PLAIN_KEYS.slice().sort(), complete: true });
+  });
+
+  it('P3.13 a followed script that creates script elements from a list leaves the route incomplete, though every key is found', async () => {
+    const loader = "var FILES = ['data/copy.js', 'c/header.js']; FILES.forEach(function (f) { var s = document.createElement('script'); s.src = f; document.head.appendChild(s); });\n";
+    const host = await plainHost({
+      'index.html': plainPage(
+        PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n') + '\n  <script src="ui/index.js"></script>',
+      ),
+      'ui/index.js': loader,
+    });
+    const body = await routeReadsOf(handlerOver([host.cwd]).handler, host);
+    expect(body.keys).toEqual(PLAIN_KEYS.slice().sort());
+    expect(body.complete).toBe(false);
+  });
+
   it('an alias that resolves nowhere makes the route incomplete', async () => {
     const host = nextSite();
     const { handler } = handlerOver([host.cwd]);

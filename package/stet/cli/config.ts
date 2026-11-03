@@ -324,6 +324,16 @@ export function keyJoiner(config: Pick<StetConfig, 'keyStyle'>): '_' | '.' {
 }
 
 /**
+ * The attributes a mark is read under: `data-stet`, and the config's own key
+ * attribute beside it (`reads.attribute`). Every writer writes `data-stet`, so
+ * no mark stet writes goes unread.
+ */
+export function markAttributes(config: Pick<StetConfig, 'reads'>): string[] {
+  const own = config.reads?.attribute;
+  return own === undefined || own === 'data-stet' ? ['data-stet'] : [own, 'data-stet'];
+}
+
+/**
  * The config file edited as RAW JSON, so no default and no unknown field is
  * rewritten: `loadConfig` fills in every default and ignores the fields later
  * changes own, and writing its result back would rewrite settings the caller

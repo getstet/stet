@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path';
 import { canonicalize, generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
-import { isHtmlHost, type StetConfig } from './config.js';
+import { isHtmlHost, markAttributes, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { planDocuments } from './html-host.js';
 import { CliError, UsageError, type Report } from './report.js';
@@ -196,7 +196,7 @@ export function planSideForms(
  */
 export function planRepoForms(
   cwd: string,
-  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces' | 'statusPath' | 'store'>,
+  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces' | 'reads' | 'statusPath' | 'store'>,
   descriptor: Descriptor,
   snapshot: Snapshot,
   status: StatusFile | null,
@@ -215,6 +215,7 @@ export function planRepoForms(
       descriptor,
       snapshot,
       report,
+      markAttributes(config),
     );
     // The batch NEVER runs with a document left half-true. This is the one place
     // the refusal lives, so every command that writes on this host inherits it.

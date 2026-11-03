@@ -32,7 +32,7 @@ import {
   writeText,
 } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, refuseUnresolvableAlias, type StetConfig } from './config.js';
+import { isHtmlHost, keyJoiner, loadConfig, markAttributes, refuseUnresolvableAlias, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { planHtmlRegister, type ChosenName, type HtmlRegisterPlan } from './html-host.js';
 import { isHeadKind, kindOf, roleOf, type Place } from './key-names.js';
@@ -475,6 +475,8 @@ function registerHtml(d: {
       snapshot: forms.snapshot,
       report: runReport,
       pageOf,
+      attributes: markAttributes(config),
+      joiner: keyJoiner(config),
       ...(chosen === undefined ? {} : { chosen }),
     });
 

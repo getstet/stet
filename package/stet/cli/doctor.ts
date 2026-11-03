@@ -83,7 +83,7 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
     // check`'s own output, folded in at warn: one implementation of the rules,
     // two contracts over them.
     const checks = new Report();
-    check(config, io.cwd, checks);
+    await check(config, io.cwd, checks);
     report.absorb(checks, 'warn');
     await compilerSection(io.cwd, config, report);
 

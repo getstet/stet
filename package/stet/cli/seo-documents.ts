@@ -15,7 +15,7 @@ import { resolve } from '../src/resolve.js';
 import { SEO_SEVERITY, type SeoFinding, type SeoRule } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
-import { isHtmlHost, isLanguageTag, type StetConfig } from './config.js';
+import { isHtmlHost, isLanguageTag, markAttributes, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { attrOf as attr, isFaulted, placeOf, proposeHtml, readDocument, stripMarks, valueOf, type Document, type Element } from './html-host.js';
 import { kindOf, type Place } from './key-names.js';
@@ -73,7 +73,8 @@ export async function documentRules(
     findings.push({ rule, severity: severity[rule], ...about, message });
   };
   if (isHtmlHost(config)) {
-    for (const document of proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces)).documents) documentFindings(document, emit);
+    const attributes = markAttributes(config);
+    for (const document of proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces), attributes).documents) documentFindings(document, emit, attributes);
   } else {
     await shellLang(cwd, config, emit);
   }
@@ -100,8 +101,8 @@ function nameOf(el: Element): string {
 }
 
 /** `<file>:<line> <open tag>`, the open tag as the source spells it with stet's marks taken out. */
-function where(document: Document, el: Element): string {
-  return `${document.file}:${document.lineAt(el.openStart)} ${stripMarks(document.source.slice(el.openStart, el.openEnd))}`;
+function where(document: Document, el: Element, attributes: readonly string[]): string {
+  return `${document.file}:${document.lineAt(el.openStart)} ${stripMarks(document.source.slice(el.openStart, el.openEnd), attributes)}`;
 }
 
 /** What an unlabelled control needs, by what it carries: an `id`, a `name` alone, or neither. */
@@ -112,7 +113,7 @@ export function labelRemedy(el: Element): string {
   return name !== undefined ? `give it id="${name}" and write a <label for="${name}">` : 'wrap it in a <label>';
 }
 
-function documentFindings(document: Document, emit: Emit): void {
+function documentFindings(document: Document, emit: Emit, attributes: readonly string[]): void {
   const all: Element[] = document.roots.flatMap((root) => [root, ...root.descendants]);
   const labelled = new Set(all.flatMap((el) => (el.tag === 'label' && attr(el, 'for') !== undefined ? [attr(el, 'for') as string] : [])));
   const insideLabel = new Set(all.filter((el) => el.tag === 'label').flatMap((el) => el.descendants));
@@ -136,7 +137,7 @@ function documentFindings(document: Document, emit: Emit): void {
         filled(attr(el, 'placeholder')) ||
         filled(attr(el, 'title'));
       if (!named) {
-        emit('missing-label', `${where(document, el)} has no label — ${labelRemedy(el)}, then run stet register`);
+        emit('missing-label', `${where(document, el, attributes)} has no label — ${labelRemedy(el)}, then run stet register`);
       }
     }
     const nameable =
@@ -145,16 +146,16 @@ function documentFindings(document: Document, emit: Emit): void {
       el.tag === 'iframe' ||
       (el.tag === 'input' && (type === 'button' || type === 'image'));
     if (nameable && ![nameOf(el), attr(el, 'aria-label'), attr(el, 'aria-labelledby'), attr(el, 'value'), attr(el, 'alt'), attr(el, 'title')].some(filled)) {
-      emit('missing-name', `${where(document, el)} has no accessible name — give it text, or an aria-label`);
+      emit('missing-name', `${where(document, el, attributes)} has no accessible name — give it text, or an aria-label`);
     }
     if (el.tag === 'img' && attr(el, 'alt') === undefined) {
       const role = attr(el, 'role');
       if (role !== 'presentation' && role !== 'none' && !filled(attr(el, 'aria-label')) && !filled(attr(el, 'aria-labelledby')) && !filled(attr(el, 'title'))) {
-        emit('missing-alt', `${where(document, el)} has no alt — write alt text, or alt="" for a decorative image`);
+        emit('missing-alt', `${where(document, el, attributes)} has no alt — write alt text, or alt="" for a decorative image`);
       }
     }
     if (/^h[1-6]$/.test(el.tag) && nameOf(el) === '' && !filled(attr(el, 'aria-label'))) {
-      emit('empty-heading', `${where(document, el)} is empty`);
+      emit('empty-heading', `${where(document, el, attributes)} is empty`);
     }
   }
 }
@@ -201,7 +202,7 @@ async function keyPlaces(cwd: string, config: StetConfig, descriptor: Descriptor
     if (Object.hasOwn(descriptor.keys, key)) out.set(key, [...(out.get(key) ?? []), found]);
   };
   if (isHtmlHost(config)) {
-    for (const mark of proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces)).claimed) {
+    for (const mark of proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces), markAttributes(config)).claimed) {
       const src = mark.tag === 'img' && mark.attr === 'alt' ? attr(mark.element, 'src') : undefined;
       add(mark.key, { place: placeOf(mark), ...(src === undefined ? {} : { src }) });
     }

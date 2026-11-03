@@ -142,10 +142,34 @@ const ATTR_COPY = ['alt', 'aria-label', 'title', 'placeholder'] as const;
 /** The attributes a `data-stet-<attr>` mark may name. */
 const MARKABLE_ATTRS = new Set<string>([...ATTR_COPY, 'content']);
 
-/** A mark, as it appears in source: `data-stet` or `data-stet-<attr>`. */
-const MARK_ATTR = /^data-stet(?:-([a-z-]+))?$/;
+/**
+ * The attributes a mark is read under where the caller names none. A project
+ * whose config names its own key attribute (`markAttributes`) reads that one
+ * beside `data-stet`; every writer writes `data-stet`.
+ */
+export const DATA_STET: readonly string[] = ['data-stet'];
 
-/** Every mark occurrence in raw source — the sweep that finds one inside a blanked or opaque span. */
+/**
+ * What an attribute name marks under `attributes`: the element (`{ base }`),
+ * or one of its attributes (`{ base, attr }`) for `<base>-<attr>`; null where
+ * the name is no mark.
+ */
+function markOf(name: string, attributes: readonly string[]): { base: string; attr?: string } | null {
+  for (const base of attributes) {
+    if (name === base) return { base };
+    if (name.startsWith(`${base}-`) && /^[a-z-]+$/.test(name.slice(base.length + 1))) return { base, attr: name.slice(base.length + 1) };
+  }
+  return null;
+}
+
+/** An element mark: the bare attribute, `data-stet` or the config's own. */
+const isElementMark = (name: string, attributes: readonly string[]): boolean => attributes.includes(name);
+
+/**
+ * Every `data-stet` occurrence in raw source — the sweep that finds one inside a
+ * blanked or opaque span. The config's own attribute is not swept: inside a
+ * script it is the page's own code (`'<b data-copy="…">'`), not a stet mark.
+ */
 const MARK_IN_SOURCE = /\bdata-stet(-[a-z-]+)?\s*=/g;
 
 /** Every mark attribute with its value, for the strip `eject` and a removed key need. */
@@ -272,6 +296,8 @@ export interface HtmlMark {
   tag: string;
   kind: 'element' | 'attribute';
   attr?: string;
+  /** The mark attribute as written: `data-stet`, `data-stet-alt`, or the config's own (`data-copy-placeholder`). */
+  attribute: string;
   /** The `name`/`property` of a `<meta>` whose `content` the mark binds. */
   metaName?: string;
   /** Inside an `<svg>`, where a `<title>` names the graphic rather than the page. */
@@ -295,6 +321,14 @@ export interface HtmlProposalSet {
   claimed: HtmlMark[];
   skips: HtmlSkip[];
   documents: Document[];
+  /** The attributes the marks were read under (`DATA_STET`, or `markAttributes`). */
+  attributes: readonly string[];
+  /**
+   * The first mark per document under the config's own attribute whose suffix
+   * names no attribute stet manages (`data-copy-label`): the page's own, read
+   * by nothing here, and named once by `check`.
+   */
+  unmanaged: Array<{ file: string; line: number; attribute: string; key: string }>;
 }
 
 // --- The reader -------------------------------------------------------------
@@ -762,7 +796,7 @@ interface Located {
  * run, decided top-down so a sentence stays whole and a pure container's
  * children are read on their own.
  */
-function locate(document: Document): Located {
+function locate(document: Document, attributes: readonly string[]): Located {
   const keyElements: Element[] = [];
   const strayMarks: Element[] = [];
   const structuralRuns: Element[] = [];
@@ -783,7 +817,7 @@ function locate(document: Document): Located {
     // the document with a message blaming the wrong thing. The bar belongs to
     // the proposal path alone; from here on a mark is honoured whatever the
     // element currently says.
-    const marked = el.attrs.filter((a) => a.name === 'data-stet').length;
+    const marked = el.attrs.filter((a) => isElementMark(a.name, attributes)).length;
     if (isFaulted(document, el)) {
       // The fault is already reported; the rest of the document reads normally.
       // A MARKED element here is named by `unpaired-markup` at mark scope (the
@@ -834,12 +868,12 @@ function locate(document: Document): Located {
   };
   for (const root of document.roots) visit(root);
 
-  // Every `data-stet` in the tree that did not land on a key element. A mark
+  // Every element mark in the tree that did not land on a key element. A mark
   // inside unpaired markup or doubled on one element has its own, accurate
   // reason and is not swept up here as well.
   const named = new Set<Element>([...faultedMarks, ...duplicateMarks, ...emptyMarks, ...preMarks]);
   const sweep = (el: Element): void => {
-    if (el.attrs.some((a) => a.name === 'data-stet') && !isKey.has(el) && !named.has(el)) {
+    if (el.attrs.some((a) => isElementMark(a.name, attributes)) && !isKey.has(el) && !named.has(el)) {
       strayMarks.push(el);
     }
     for (const child of el.children) sweep(child);
@@ -882,15 +916,16 @@ interface AttrCandidate {
  * every attribute a `data-stet-<attr>` mark names, whatever its value: the
  * item rule counts a marked attribute as a text though it fails the copy bar.
  */
-function attrCandidates(document: Document, options: { marked?: boolean } = {}): AttrCandidate[] {
+function attrCandidates(document: Document, attributes: readonly string[], options: { marked?: boolean } = {}): AttrCandidate[] {
   const found: AttrCandidate[] = [];
   const visit = (el: Element): void => {
     if (!isFaulted(document, el)) {
       const named = new Set<string>();
       if (options.marked === true) {
         for (const attr of el.attrs) {
-          const target = MARK_ATTR.exec(attr.name)?.[1];
-          if (target !== undefined) named.add(target);
+          const mark = markOf(attr.name, attributes);
+          // The config's own attribute marks only what stet manages; any other suffix is the page's.
+          if (mark?.attr !== undefined && (mark.base === 'data-stet' || MARKABLE_ATTRS.has(mark.attr))) named.add(mark.attr);
         }
       }
       for (const attr of el.attrs) {
@@ -920,7 +955,7 @@ function attrCandidates(document: Document, options: { marked?: boolean } = {}):
  * snapshot: a document's marks are the only read the walk makes, so the forms
  * the caller holds have nothing to contribute.
  */
-export function proposeHtml(cwd: string, files: string[]): HtmlProposalSet {
+export function proposeHtml(cwd: string, files: string[], attributes: readonly string[] = DATA_STET): HtmlProposalSet {
   const sources: Array<{ file: string; source: string }> = [];
   for (const file of [...files].filter((f) => f.endsWith('.html')).sort()) {
     try {
@@ -939,30 +974,31 @@ export function proposeHtml(cwd: string, files: string[]): HtmlProposalSet {
       );
     }
   }
-  return proposeHtmlSources(sources);
+  return proposeHtmlSources(sources, attributes);
 }
 
 /**
  * `proposeHtml`'s claim pass over sources the caller already holds — a
  * revision's documents read from git, with no temporary directory written.
  */
-export function proposeHtmlSources(sources: Array<{ file: string; source: string }>): HtmlProposalSet {
+export function proposeHtmlSources(sources: Array<{ file: string; source: string }>, attributes: readonly string[] = DATA_STET): HtmlProposalSet {
   const proposals: HtmlProposal[] = [];
   const claimed: HtmlMark[] = [];
   const skips: HtmlSkip[] = [];
   const documents: Document[] = [];
+  const unmanaged: HtmlProposalSet['unmanaged'] = [];
 
   for (const { file, source } of sources) {
     const document = readDocument(file, source);
     documents.push(document);
-    readOne(document, proposals, claimed, skips);
+    readOne(document, attributes, { proposals, claimed, skips, unmanaged });
   }
 
   const order = (a: { file: string; line: number }, b: { file: string; line: number }): number =>
     a.file.localeCompare(b.file) || a.line - b.line;
   proposals.sort(order);
   skips.sort(order);
-  return { proposals, claimed, skips, documents };
+  return { proposals, claimed, skips, documents, attributes, unmanaged };
 }
 
 /** Every element's parent in a document — the tree the tokenizer builds carries children alone. */
@@ -1085,10 +1121,10 @@ export function htmlBaseName(page: string, at: { sectionWord: string | null; ite
 
 function readOne(
   document: Document,
-  proposals: HtmlProposal[],
-  claimed: HtmlMark[],
-  skips: HtmlSkip[],
+  attributes: readonly string[],
+  into: Pick<HtmlProposalSet, 'proposals' | 'claimed' | 'skips' | 'unmanaged'>,
 ): void {
+  const { proposals, claimed, skips, unmanaged } = into;
   const {
     keyElements,
     strayMarks,
@@ -1098,7 +1134,7 @@ function readOne(
     duplicateMarks,
     emptyMarks,
     preMarks,
-  } = locate(document);
+  } = locate(document, attributes);
   const line = document.lineAt;
   // Every element inside an `<svg>`: a `<title>` there names the graphic, not the page.
   const svg = new Set<Element>();
@@ -1111,17 +1147,18 @@ function readOne(
   underSvg(document.roots, false);
   const parents = parentsOf(document);
   // Every element carrying a text — a key element, or a copy attribute, marked or not: the item rule's count.
-  const texts = new Set<Element>([...keyElements, ...attrCandidates(document, { marked: true }).map((c) => c.el)]);
+  const texts = new Set<Element>([...keyElements, ...attrCandidates(document, attributes, { marked: true }).map((c) => c.el)]);
   const items = htmlItems(parents, texts);
   const naming = (el: Element, place: Place): Naming => namingOf(el, parents, items, place);
 
   // Which attributes a `data-stet-<attr>` already binds, so an attribute is
   // proposed exactly once and a bound one is silent.
+  const elementMark = (el: Element): HtmlAttr | undefined => el.attrs.find((a) => isElementMark(a.name, attributes));
   const bound = new Set<string>();
   const markScopes: Array<{ start: number; end: number }> = [];
 
   for (const el of keyElements) {
-    const mark = el.attrs.find((a) => a.name === 'data-stet');
+    const mark = elementMark(el);
     const read = valueOf(el);
     const unknown = undecodedEntity(rawTextOf(el));
     if (mark !== undefined) {
@@ -1143,6 +1180,7 @@ function readOne(
         line: line(el.openStart),
         tag: el.tag,
         kind: 'element',
+        attribute: mark.name,
         ...(svg.has(el) ? { inSvg: true as const } : {}),
         key: mark.value,
         value: unknown === undefined ? read.value : null,
@@ -1182,12 +1220,18 @@ function readOne(
   }
 
   // Marks that name an attribute — bound where the attribute is one stet
-  // manages and carries a quoted value, refused otherwise.
+  // manages and carries a quoted value, refused otherwise. Under the config's
+  // own attribute, a suffix stet does not manage is the page's: named once, and
+  // otherwise left alone.
   const visitMarks = (el: Element): void => {
     for (const attr of el.attrs) {
-      const named = MARK_ATTR.exec(attr.name);
-      if (named === null || named[1] === undefined) continue;
-      const target = named[1];
+      const named = markOf(attr.name, attributes);
+      if (named === null || named.attr === undefined) continue;
+      const target = named.attr;
+      if (named.base !== 'data-stet' && !MARKABLE_ATTRS.has(target)) {
+        if (!unmanaged.some((u) => u.file === document.file)) unmanaged.push({ file: document.file, line: line(attr.start), attribute: attr.name, key: attr.value });
+        continue;
+      }
       const on = el.attrs.find((a) => a.name === target);
       const refused = !MARKABLE_ATTRS.has(target) || !attrIsCopy(el, target);
       if (refused || on === undefined || !on.quoted) {
@@ -1201,8 +1245,8 @@ function readOne(
             'mark-in-refused-context',
             'mark',
             refused
-              ? `data-stet-${target} names an attribute stet does not manage`
-              : `data-stet-${target} names an attribute this element does not carry quoted`,
+              ? `${attr.name} names an attribute stet does not manage`
+              : `${attr.name} names an attribute this element does not carry quoted`,
             refused ? 'remove the mark' : 'add the attribute with a quoted value, or remove the mark',
           ),
         );
@@ -1231,6 +1275,7 @@ function readOne(
         tag: el.tag,
         kind: 'attribute',
         attr: target,
+        attribute: attr.name,
         ...(metaName === null ? {} : { metaName }),
         key: attr.value,
         value: unknown === undefined ? text : null,
@@ -1250,7 +1295,7 @@ function readOne(
   };
   for (const root of document.roots) visitMarks(root);
 
-  for (const candidate of attrCandidates(document)) {
+  for (const candidate of attrCandidates(document, attributes)) {
     if (bound.has(`${candidate.el.openStart}:${candidate.attr.name}`)) continue;
     const text = attrValueOf(candidate.attr);
     const unknown = undecodedEntity(candidate.attr.value);
@@ -1291,11 +1336,16 @@ function readOne(
     });
   }
 
+  // A mark as written in a message: `data-stet="hero"`, or under the config's own attribute.
+  const markText = (el: Element): string => {
+    const mark = elementMark(el);
+    return `${mark?.name ?? 'data-stet'}="${mark?.value ?? ''}"`;
+  };
+
   for (const el of strayMarks) {
-    const key = el.attrs.find((a) => a.name === 'data-stet')?.value ?? '';
     const detail = holdsBlankedSpan(document, el)
-      ? `data-stet="${key}" sits on <${el.tag}>, whose content holds a script, style or comment stet does not manage`
-      : `data-stet="${key}" sits on <${el.tag}>, which holds no text of its own`;
+      ? `${markText(el)} sits on <${el.tag}>, whose content holds a script, style or comment stet does not manage`
+      : `${markText(el)} sits on <${el.tag}>, which holds no text of its own`;
     const remedy = holdsBlankedSpan(document, el)
       ? 'move the mark onto an element that holds text alone'
       : 'move the mark onto the element that holds the text';
@@ -1304,8 +1354,6 @@ function readOne(
     );
   }
 
-  const markKey = (el: Element): string => el.attrs.find((a) => a.name === 'data-stet')?.value ?? '';
-
   for (const el of emptyMarks) {
     skips.push(
       skipOf(
@@ -1313,7 +1361,7 @@ function readOne(
         el.openStart,
         'mark-on-non-key-element',
         'mark',
-        `data-stet="${markKey(el)}" sits on <${el.tag}>, which has no content to hold text`,
+        `${markText(el)} sits on <${el.tag}>, which has no content to hold text`,
         'mark a copy attribute with data-stet-<attr> instead',
       ),
     );
@@ -1326,7 +1374,7 @@ function readOne(
         el.openStart,
         'mark-on-non-key-element',
         'mark',
-        `data-stet="${markKey(el)}" sits on <pre>, whose whitespace stet does not manage`,
+        `${markText(el)} sits on <pre>, whose whitespace stet does not manage`,
         'mark the elements around it instead',
       ),
     );
@@ -1339,7 +1387,7 @@ function readOne(
         el.openStart,
         'mark-on-non-key-element',
         'mark',
-        `<${el.tag}> carries two data-stet marks`,
+        `<${el.tag}> carries two ${[...new Set(el.attrs.filter((a) => isElementMark(a.name, attributes)).map((a) => a.name))].join(' and ')} marks`,
         'keep one',
       ),
     );
@@ -1362,7 +1410,7 @@ function readOne(
   // it is scan's to name, because scan's contract is to report every run it did
   // not adopt and silence would read as "stet has this covered".
   for (const el of blankedRuns) {
-    if (el.attrs.some((a) => a.name === 'data-stet')) continue;
+    if (elementMark(el) !== undefined) continue;
     skips.push(
       skipOf(
         document,
@@ -1461,12 +1509,12 @@ function escapeBody(text: string): string {
  * `<p>` among them. `readDocument` already records every attribute's exact
  * offsets; this deletes those and nothing else.
  */
-export function stripMarks(text: string): string {
+export function stripMarks(text: string, attributes: readonly string[] = DATA_STET): string {
   const document = readDocument('', text);
   const edits: Edit[] = [];
   const visit = (el: Element): void => {
     for (const attr of el.attrs) {
-      if (!MARK_ATTR.test(attr.name)) continue;
+      if (markOf(attr.name, attributes) === null) continue;
       let from = attr.start;
       while (from > 0 && /[ \t]/.test(text.charAt(from - 1))) from -= 1;
       edits.push({ pos: from, end: attr.end, text: '' });
@@ -1635,8 +1683,9 @@ export function planDocuments(
   descriptor: Descriptor,
   snapshot: Snapshot,
   report: Report,
+  attributes: readonly string[] = DATA_STET,
 ): { writes: Array<{ abs: string; text: string; rel: string }>; skips: HtmlSkip[] } {
-  const set = proposeHtml(cwd, files);
+  const set = proposeHtml(cwd, files, attributes);
   const skips = set.skips.filter((s) => s.scope === 'mark');
   const writes: Array<{ abs: string; text: string; rel: string }> = [];
 
@@ -1647,15 +1696,13 @@ export function planDocuments(
       // `remove` drops a mark, and how a typo'd hand-written one becomes
       // visible rather than silently ignored.
       if (!Object.hasOwn(descriptor.keys, mark.key)) {
-        const attr = mark.element.attrs.find(
-          (a) => a.name === (mark.kind === 'element' ? 'data-stet' : `data-stet-${mark.attr}`),
-        );
+        const attr = mark.element.attrs.find((a) => a.name === mark.attribute);
         if (attr === undefined) continue;
         let from = attr.start;
         while (from > 0 && /[ \t]/.test(document.source.charAt(from - 1))) from -= 1;
         edits.push({ pos: from, end: attr.end, text: '' });
         report.line(
-          `${document.file}:${mark.line}: data-stet="${mark.key}" names no key — the mark is removed and the text stays`,
+          `${document.file}:${mark.line}: ${mark.attribute}="${mark.key}" names no key — the mark is removed and the text stays`,
         );
         continue;
       }
@@ -1975,9 +2022,11 @@ export function planHtmlRegister(input: {
   set?: HtmlProposalSet;
   /** The joiner the naming rule puts between a name's parts (`keyJoiner`); `_` where absent. */
   joiner?: '_' | '.';
+  /** The attributes marks are read under (`markAttributes`); new marks are written as `data-stet` whatever they are. */
+  attributes?: readonly string[];
 }): HtmlRegisterPlan {
   const { cwd, files, descriptor, snapshot, report, pageOf, chosen, joiner } = input;
-  const set = input.set ?? proposeHtml(cwd, files);
+  const set = input.set ?? proposeHtml(cwd, files, input.attributes);
   // The names the descriptor held before the run: a role name never lands on one.
   const before = new Set(Object.keys(descriptor.keys));
   const defaults = (): Record<string, unknown> => snapshot['default'] ?? {};
@@ -2269,6 +2318,13 @@ export function planHtmlRegister(input: {
 
 // --- check's documents ------------------------------------------------------
 
+/** The declared web keys holding a value that no mark in `carried` names, sorted: what the unmarked-key warn is about. */
+export function markedNowhere(descriptor: Descriptor, snapshot: Snapshot, carried: ReadonlySet<string>): string[] {
+  return Object.keys(descriptor.keys)
+    .sort()
+    .filter((key) => descriptor.keys[key]?.target === DEFAULT_TARGET && typeof markValue(descriptor, snapshot, key) === 'string' && !carried.has(key));
+}
+
 /**
  * The generated-file check on an html host: every mark walked, two states.
  *
@@ -2278,8 +2334,10 @@ export function planHtmlRegister(input: {
  * entities and collapses whitespace on the document side first, so an entity
  * spelling or a reindent is never drift.
  *
- * The unmarked-key warn is provable HERE and only here: on this host the mark
- * is the only read, so a key no document carries is genuinely rendered nowhere.
+ * The unmarked-key warn: a key no document carries and nothing in the source
+ * names. `named` is the keys the usage scan calls `read` or `unknown` (a
+ * script's configured read, a learnt prefix, a standing cause), which need no
+ * mark; null where the scan could not run, and every unmarked key warns.
  */
 export function checkDocuments(
   cwd: string,
@@ -2287,8 +2345,10 @@ export function checkDocuments(
   descriptor: Descriptor,
   snapshot: Snapshot,
   report: Report,
+  named: ReadonlySet<string> | null = null,
+  attributes: readonly string[] = DATA_STET,
 ): void {
-  const set = proposeHtml(cwd, files);
+  const set = proposeHtml(cwd, files, attributes);
   const states: Record<string, { marks: number; status: string }> = {};
   const carried = new Set<string>();
   const sources = visibleSources(set, descriptor, snapshot);
@@ -2305,7 +2365,7 @@ export function checkDocuments(
       if (!Object.hasOwn(descriptor.keys, mark.key)) {
         report.error(
           'config',
-          `${document.file}:${mark.line} data-stet="${mark.key}" names no descriptor key — run stet register, or remove the mark`,
+          `${document.file}:${mark.line} ${mark.attribute}="${mark.key}" names no descriptor key — run stet register, or remove the mark`,
           mark.key,
           { at: { file: document.file, line: mark.line } },
         );
@@ -2341,6 +2401,9 @@ export function checkDocuments(
       );
       clean = false;
     }
+    for (const own of set.unmanaged.filter((u) => u.file === document.file)) {
+      report.warn('config', `${own.file}:${own.line} ${own.attribute}="${own.key}" names no attribute stet manages — the mark stays the page's`);
+    }
     if (clean) report.line(`document: ${document.file} current (${marks.length} marks)`);
     states[document.file] = { marks: marks.length, status: clean ? 'current' : 'differs' };
     // A literal head text one word away from a visible text: made to match, register links them.
@@ -2358,14 +2421,8 @@ export function checkDocuments(
     }
   }
 
-  const dead: string[] = [];
-  for (const key of Object.keys(descriptor.keys).sort()) {
-    const def = descriptor.keys[key];
-    if (def === undefined || def.target !== DEFAULT_TARGET) continue;
-    if (typeof markValue(descriptor, snapshot, key) !== 'string' || carried.has(key)) continue;
-    report.warn('config', `${key}: marked in no document`, key);
-    dead.push(key);
-  }
+  const dead = markedNowhere(descriptor, snapshot, carried).filter((key) => named?.has(key) !== true);
+  for (const key of dead) report.warn('config', `${key}: marked in no document`, key);
   if (dead.length > 0) {
     report.warn(
       'config',

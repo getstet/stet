@@ -1,4 +1,4 @@
-// add-plain-js-hosts (0.9.0), chunk C1: the dotted key grammar, the config, the status file module.
+// add-plain-js-hosts (0.9.0), chunks C1 and C3: the dotted key grammar, the config, the status file module; configured reads, the attribute mark, the no-mark pass.
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,7 +8,8 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { planRepoForms, writePlanned } from '../cli/artifacts.js';
 import { defaultConfig, loadConfig } from '../cli/config.js';
-import { namedKeys } from '../cli/key-usage.js';
+import { check } from '../cli/check.js';
+import { keyUsage, namedKeys, usageCache } from '../cli/key-usage.js';
 import { planProblems } from '../cli/key-plan.js';
 import { baseName } from '../cli/key-names.js';
 import { keyPattern, longerKeyAt } from '../cli/key-reads.js';
@@ -17,6 +18,7 @@ import { loadTypescript, mentionsToken } from '../cli/source-scan.js';
 import { approveKeys, completeStatus, loadStatus, renameStatus, resetChanged, statusPlan, type StatusFile } from '../cli/status.js';
 import { generateRegistry } from '../src/codegen.js';
 import { deriveLabel, loadDescriptor } from '../src/descriptor.js';
+import type { Descriptor } from '../src/types.js';
 import { cleanupCliHosts, makeHtmlHost } from '../conformance/cli-host.js';
 
 const made: string[] = [];
@@ -272,5 +274,170 @@ describe('the status file module (D3)', () => {
     const rich = loadDescriptor({ version: 1, keys: { hero: { shape: 'text', target: 'web', tags: 1 } } });
     expect(() => planRepoForms(html, config, rich, { default: { hero: 'A heading with no placeholder at all.' } }, { hero: approved('nj-io', '2026-11-02') }, new Report())).toThrow(/could not be regenerated/);
     expect(existsSync(join(html, 'content/status.json'))).toBe(false);
+  });
+});
+
+describe('add-plain-js-hosts (0.9.0) C3', () => {
+  const descriptorOf = (keys: readonly string[] = KEYS): Descriptor =>
+    loadDescriptor({ version: 1, keys: Object.fromEntries(keys.map((k) => [k, { shape: 'text', target: 'web' }])) });
+
+  // topshine's shape (D5): a literal, a computed call, and a parameter followed through a `var` map.
+  const SCREEN = [
+    '(function () {',
+    '  "use strict";',
+    '  var TS = window.TS;',
+    '  var USES = [["ads", "megaphone"], ["other", "sparkle"]];',
+    '  var ERRORS = { rate: "waitlist.refused.rate" };',
+    '  var msg = function (key, extra) { return h("p", extra || {}, TS.tx(key)); };',
+    '  function title() { return TS.t("home.title"); }',
+    '  USES.map(function (k) { return TS.tx("waitlist.use." + k[0]); });',
+    '  if (u.error) msg(ERRORS[u.error], { key: "msg" });',
+    '})();',
+  ].join('\n');
+
+  it('P3.2 topshine-shaped reads: a literal is read, a computed call learns its prefix, a parameter follows one hop through a var map', async () => {
+    const dir = host({ 'screen.js': SCREEN }, { reads: { functions: ['TS.t', 'TS.tx'], attribute: 'data-copy' } });
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    expect(usage.keys['home.title']?.state).toBe('read');
+    expect(usage.keys['waitlist.refused.rate']?.state).toBe('read');
+    expect(usage.keys['waitlist.use.ads']?.state).toBe('unknown');
+    expect(usage.keys['waitlist.use.ads']?.prefix).toEqual({ prefix: 'waitlist.use.', file: 'screen.js', line: 8 });
+    expect(usage.causes).toEqual([]);
+    expect(usage.keys['privacy.body']?.state).toBe('not_found');
+  });
+
+  it('P3.3 a configured call with no literal head and no hop is the one cause', async () => {
+    const dir = host({ 'screen.js': 'var TS = window.TS;\nTS.tx(window.pick());\n' }, { reads: { functions: ['TS.tx'] } });
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    expect(usage.causes).toEqual([{ text: 'TS.tx(window.pick())', file: 'screen.js', line: 2 }]);
+    expect(usage.keys['privacy.body']?.state).toBe('unknown');
+  });
+
+  it('P3.4 without the config the same screen leaves a computed call unseen (0.8.1)', async () => {
+    const dir = host({ 'screen.js': SCREEN }, {});
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    expect(usage.keys['waitlist.use.ads']?.state).toBe('not_found');
+    expect(usage.causes).toEqual([]);
+  });
+
+  it('P3.5 the copy table is not a reader: a key declared only in a copyModules file is not_found and the file is not counted', async () => {
+    const table = 'window.TS = window.TS || {};\nTS.copyTable = {\n  "waitlist.title": ["Join", "new"],\n  "home.title": ["Make it", "approved"]\n};\n';
+    const dir = host({ 'data/copy.js': table }, { copyModules: ['data/copy.js'], reads: { functions: ['TS.t'] } });
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    expect(usage.keys['waitlist.title']?.state).toBe('not_found');
+    expect(usage.files).toBe(0);
+  });
+
+  it('P3.6 data-copy and data-copy-placeholder name their keys in the scan; data-copy-label is reported once by check', async () => {
+    const page =
+      '<!DOCTYPE html>\n<html lang="en">\n<head><title>Join</title></head>\n<body>\n' +
+      '  <button data-copy="waitlist.title">Text of waitlist.title</button>\n' +
+      '  <input data-copy-placeholder="privacy.body" placeholder="Text of privacy.body">\n' +
+      '  <label data-copy-label="home.title">Email</label>\n' +
+      '  <label data-copy-label="waitlist.refused.rate">Name</label>\n' +
+      '</body>\n</html>\n';
+    const dir = host({ 'index.html': page }, { reads: { functions: ['TS.t'], attribute: 'data-copy' } });
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    expect(usage.keys['waitlist.title']?.state).toBe('read');
+    expect(usage.keys['privacy.body']?.state).toBe('read');
+
+    const report = new Report();
+    await check(loadConfig(dir), dir, report);
+    expect(report.findings.map((f) => f.message).filter((l) => /names no attribute stet manages/.test(l))).toEqual([
+      'index.html:7 data-copy-label="home.title" names no attribute stet manages — the mark stays the page\'s',
+    ]);
+    expect(report.findings.filter((f) => f.level === 'error')).toEqual([]);
+  });
+
+  it('P3.7 check on an html host with reads: a key a script names warns nothing; a key named nowhere keeps both lines', async () => {
+    const page = '<!DOCTYPE html>\n<html lang="en">\n<head><title>Join</title></head>\n<body>\n  <p data-stet="privacy.body">Text of privacy.body</p>\n</body>\n</html>\n';
+    const keys = ['home.title', 'waitlist.title', 'privacy.body'];
+    const dir = host({ 'index.html': page, 'screen.js': 'var TS = window.TS;\nTS.t("home.title");\n' }, { reads: { functions: ['TS.t'] } });
+    writeFileSync(join(dir, 'content/descriptor.json'), JSON.stringify({ version: 1, keys: Object.fromEntries(keys.map((k) => [k, { shape: 'text', target: 'web' }])) }));
+    writeFileSync(join(dir, 'content/defaults.json'), JSON.stringify({ default: Object.fromEntries(keys.map((k) => [k, `Text of ${k}`])) }));
+    const report = new Report();
+    await check(loadConfig(dir), dir, report);
+    const warns = report.findings.filter((f) => f.level === 'warn' && /no mark|no document/.test(f.message)).map((f) => f.message);
+    expect(warns).toEqual([
+      'waitlist.title: marked in no document',
+      '1 key has no mark — stet remove waitlist.title drops it, or mark it in the page',
+    ]);
+  });
+
+  it('P3.10 a change to the configured functions between two scans is seen by the second (the cache stamp)', async () => {
+    const dir = host({ 'screen.js': SCREEN }, {});
+    const cache = usageCache();
+    expect((await keyUsage(dir, loadConfig(dir), descriptorOf(), cache)).keys['waitlist.use.ads']?.state).toBe('not_found');
+    writeFileSync(join(dir, 'stet.config.json'), JSON.stringify({ host: 'html', managedSurfaces: ['*.html'], reads: { functions: ['TS.t', 'TS.tx'] } }));
+    expect((await keyUsage(dir, loadConfig(dir), descriptorOf(), cache)).keys['waitlist.use.ads']?.state).toBe('unknown');
+  });
+
+  it('P3.11 two files each declaring msg: each adapter is judged by its own file\'s calls', async () => {
+    const waitlist = [
+      '(function () {',
+      '  var TS = window.TS;',
+      '  var ERRORS = { rate: "waitlist.refused.rate" };',
+      '  var msg = function (key) { return TS.tx(key); };',
+      '  msg("home.title");',
+      '  if (u.error) msg(ERRORS[u.error]);',
+      '})();',
+    ].join('\n');
+    const statusLine = [
+      '(function () {',
+      '  var TS = window.TS;',
+      '  function want() { return msg("ended", "waitlist.title"); }',
+      '  function msg(id, key) { return { id: id, text: TS.t(key) }; }',
+      '  window.want = want;',
+      '})();',
+    ].join('\n');
+    const dir = host({ 'screens/waitlist.js': waitlist, 'ui/status-line.js': statusLine }, { reads: { functions: ['TS.t', 'TS.tx'] } });
+    const usage = await keyUsage(dir, loadConfig(dir), descriptorOf());
+    expect(usage.causes).toEqual([]);
+    for (const key of ['waitlist.title', 'home.title', 'waitlist.refused.rate']) expect(usage.keys[key]?.state, key).toBe('read');
+  });
+
+  it('Q30 rename on an html host with reads rewrites a configured call in a JS screen and lists a read under the key\'s prefix', async () => {
+    const page = '<!DOCTYPE html>\n<html lang="en">\n<head><title>Join</title></head>\n<body>\n  <p data-stet="c.d">Text of c.d</p>\n  <script src="screen.js"></script>\n</body>\n</html>\n';
+    const screen = 'var TS = window.TS;\nTS.tx("a.b");\n["x", "y"].forEach(function (k) { TS.tx("a." + k); });\n';
+    const keys = { 'a.b': { shape: 'text', target: 'web' }, 'c.d': { shape: 'text', target: 'web' } };
+    const html = await makeHtmlHost({
+      files: { 'index.html': page, 'screen.js': screen },
+      keys,
+      defaults: { 'a.b': 'Text of a.b', 'c.d': 'Text of c.d' },
+      config: { reads: { functions: ['TS.tx'] } },
+    });
+    expect(await html.run('rename', 'a.b', 'a.c', '--write')).toBe(0);
+    expect(html.file('screen.js')).toBe('var TS = window.TS;\nTS.tx("a.c");\n["x", "y"].forEach(function (k) { TS.tx("a." + k); });\n');
+    expect(html.stdout()).toContain('screen.js:3 reads keys under a prefix of "a.b"');
+    expect(Object.keys(JSON.parse(html.file('content/descriptor.json')).keys)).toEqual(['a.c', 'c.d']);
+  });
+
+  it('P3.12 with reads.attribute data-copy, data-copy and data-stet marks are both read; register --write writes data-stet', async () => {
+    const page =
+      '<!DOCTYPE html>\n<html lang="en">\n<head><title>Join the list</title></head>\n<body>\n' +
+      '  <b data-copy="a.b">Bold words here</b>\n' +
+      '  <i data-stet="c.d">Italic words here</i>\n' +
+      '  <p>A new paragraph the register run adopts.</p>\n' +
+      '</body>\n</html>\n';
+    const keys = { 'a.b': { shape: 'text', target: 'web' }, 'c.d': { shape: 'text', target: 'web' } };
+    const html = await makeHtmlHost({
+      files: { 'index.html': page },
+      keys,
+      defaults: { 'a.b': 'Bold words here', 'c.d': 'Italic words here' },
+      config: { reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+    });
+    const usage = await keyUsage(html.cwd, loadConfig(html.cwd), loadDescriptor({ version: 1, keys }));
+    expect(usage.keys['a.b']?.state).toBe('read');
+    expect(usage.keys['c.d']?.state).toBe('read');
+    expect(await html.run('check')).toBe(0);
+    expect(html.stdout()).toContain('document: index.html current (2 marks)');
+    expect(html.stderr()).not.toContain('marked in no document');
+
+    expect(await html.run('register', '--from', 'scan', '--write')).toBe(0);
+    const after = html.file('index.html');
+    expect(after).toContain('<b data-copy="a.b">Bold words here</b>');
+    expect(after).toMatch(/<p data-stet="[a-z0-9_.]+">A new paragraph the register run adopts\.<\/p>/);
+    expect(after).not.toMatch(/data-copy="(?!a\.b")/);
+    expect(await html.run('check')).toBe(0);
   });
 });
