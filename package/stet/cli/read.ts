@@ -10,16 +10,13 @@
  * absence is a failure: a diff against nothing reports nonsense.
  */
 
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
-
 import { activeRow, localeChain, resolve, type StoreRow } from '../src/resolve.js';
 import { ENV_OPTION, flag, noPositionals, parse, required, text } from './args.js';
 import { keyUsage, type KeyUsage, type UsageState } from './key-usage.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence, type LoadedProject } from './project.js';
 import { CliError, Report } from './report.js';
-import { loadStatus, statusOf, type KeyStatus, type StatusFile } from './status.js';
+import { statusOf, trackedStatus, type KeyStatus, type StatusFile } from './status.js';
 import { isStoreBacked } from './store.js';
 
 interface ListRow {
@@ -65,8 +62,7 @@ export async function runList(args: string[], io: CliIo): Promise<number> {
     // The status column belongs to a snapshot-only project that tracks approval: its file exists.
     // A checkout reading its copy from another shows the owner's.
     const forms = project.owner ?? { path: io.cwd, config: project.config };
-    const approvals: StatusFile | null =
-      !isStoreBacked(project.environment.block) && existsSync(join(forms.path, forms.config.statusPath)) ? loadStatus(forms.path, forms.config) : null;
+    const approvals: StatusFile | null = trackedStatus(forms.path, forms.config, isStoreBacked(project.environment.block));
 
     const rows: ListRow[] = [];
     for (const key of Object.keys(project.descriptor.keys).sort()) {

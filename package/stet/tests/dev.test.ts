@@ -15340,6 +15340,49 @@ describe('the approval status in the dashboard routes (add-plain-js-hosts, C4)',
   });
 });
 
+describe('the approval status in the dashboard routes (add-plain-js-hosts, fix D)', () => {
+  const statusHost = (): CliHost => gitHost({ config: { project: 't' } });
+
+  it('P4.11 a malformed status file shows as a notice with Approve off, a save goes through and leaves it as it is, and approve answers 409', async () => {
+    const host = statusHost();
+    write(host.cwd, 'content/status.json', '{ nope');
+    const { handler } = handlerOver([host.cwd]);
+    const payload = await get(handler, `/api/site${site(host)}`);
+    expect(payload.status).toBeNull();
+    expect(payload.approvable).toBe(false);
+    expect(payload.statusError).toContain('content/status.json: not valid JSON');
+    const saved = await post(handler, `/api/site/save${site(host)}`, { values: [{ key: 'hero_headline', value: 'A new headline' }] });
+    expect(saved.status).toBe(200);
+    expect(saved.body['written']).toContain('content/defaults.json');
+    expect(saved.body['written']).not.toContain('content/status.json');
+    expect(saved.body['status']).toBeNull();
+    expect(host.file('content/status.json')).toBe('{ nope');
+    const refused = await post(handler, `/api/site/approve${site(host)}`, { key: 'hero_headline' });
+    expect(refused.status).toBe(409);
+    expect(host.file('content/status.json')).toBe('{ nope');
+  });
+
+  it('P4.12 the approve route refuses a derived key, and an approval leaves hand-formatted forms alone', async () => {
+    const host = statusHost();
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, unknown> };
+    descriptor.keys['hero_echo'] = { shape: 'text', target: 'web', derivesFrom: 'hero_headline', tmpl: '{v}!' };
+    write(host.cwd, 'content/descriptor.json', JSON.stringify(descriptor, null, 4));
+    write(host.cwd, 'content/defaults.json', JSON.stringify(JSON.parse(host.file('content/defaults.json')), null, 4));
+    const before = [host.file('content/descriptor.json'), host.file('content/defaults.json')];
+    const { handler } = handlerOver([host.cwd]);
+    const derived = await post(handler, `/api/site/approve${site(host)}`, { key: 'hero_echo' });
+    expect(derived.status).toBe(400);
+    expect(derived.body['error']).toBe('approve: hero_echo derives from hero_headline — approve the source');
+    expect(host.exists('content/status.json')).toBe(false);
+    const approved = await post(handler, `/api/site/approve${site(host)}`, { key: 'hero_headline' });
+    expect(approved.status).toBe(200);
+    expect(approved.body['written']).toContain('content/status.json');
+    expect(approved.body['written']).not.toContain('content/descriptor.json');
+    expect(approved.body['written']).not.toContain('content/defaults.json');
+    expect([host.file('content/descriptor.json'), host.file('content/defaults.json')]).toEqual(before);
+  });
+});
+
 describe('a copyFrom checkout in the dashboard (add-plain-js-hosts, C5)', () => {
   it("P5.3 its keys are the owner's, and a save, an approval and a commit answer 409 with the writer's line", async () => {
     const owner = gitHost({ config: { project: 't' } });

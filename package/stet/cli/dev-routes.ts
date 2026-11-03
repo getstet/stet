@@ -32,8 +32,8 @@ import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
 import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
-import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
-import { STORE_BACKED_APPROVAL } from './approve.js';
+import { keepFormatting, planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
+import { derivedApproval, STORE_BACKED_APPROVAL } from './approve.js';
 import { check } from './check.js';
 import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
 import { copyFromRefusal, markAttributes, pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
@@ -67,7 +67,7 @@ import { applyPages, auditablePages, fileRoute, pagesCompiler, proposeForHost, r
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
-import { approveKeys, gitUserName, loadStatus, resetChanged, statusOf, type StatusFile } from './status.js';
+import { approveKeys, gitUserName, loadStatus, resetChanged, statusOf, trackedStatus, type StatusFile } from './status.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { elementPath, HTML_COMMENT, markupBraces, maskExpressions, readAttrs, selfClosedRaw } from './markup.js';
@@ -599,20 +599,20 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
  * site has one, else null, and whether Approve is offered — on every
  * snapshot-only site, the file or not, since the first approval is what creates
  * it — and the name an approval records, git's `user.name`. A store-backed site has neither: draft and published are its approval. A
- * file that cannot be read is no status here; `check` names it.
+ * file that cannot be read is no status here and Approve is off; the page shows
+ * the reason as `statusError`, and a save goes through without touching the file.
  */
-function statusPayload(site: Ready): { status: StatusFile | null; approvable: boolean; approver: string | null } {
+function statusPayload(site: Ready): { status: StatusFile | null; approvable: boolean; approver: string | null; statusError?: string } {
   if (site.mode !== 'snapshot') return { status: null, approvable: false, approver: null };
   // A checkout reading its copy from another shows the owner's status and approves nothing.
   const at = site.owner ?? { path: site.path, config: site.config };
   const approvable = site.owner === undefined;
   const approver = approvable ? gitUserName(site.path) : null;
-  if (!existsSync(join(at.path, at.config.statusPath))) return { status: null, approvable, approver };
   try {
-    return { status: loadStatus(at.path, at.config), approvable, approver };
+    return { status: trackedStatus(at.path, at.config, false), approvable, approver };
   } catch (error) {
     if (!(error instanceof CliError)) throw error;
-    return { status: null, approvable, approver };
+    return { status: null, approvable: false, approver, statusError: error.message };
   }
 }
 
@@ -806,17 +806,25 @@ async function save(ctx: DevContext, req: Request, site: SiteState, listed: Work
   }
 
   const report = new Report();
+  // A status file that cannot be read is left alone: the save goes through without it.
+  let held: StatusFile | null = null;
+  try {
+    held = trackedStatus(ready.path, config, false);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    // A `value-status` output hashes the status words, so it cannot be written without them.
+    if (config.generated.some((entry) => entry.values === 'value-status')) return json({ error: error.message }, 409);
+  }
   // A changed default-locale value goes back to proposed in the same batch as the value.
-  const status = resetChanged(loadStatus(ready.path, config), ready.snapshot, next, config.locales.default);
+  const status = held === null ? null : resetChanged(held, ready.snapshot, next, config.locales.default);
   const { written, unchanged } = applyForms(ready.path, config, descriptor, next, report, 'dashboard save', status);
   const touched = body['touch'] === false ? null : touchReadPath(ready);
-  const tracked = existsSync(join(ready.path, config.statusPath));
   return json({
     written,
     unchanged,
     touched,
     same,
-    status: tracked ? Object.fromEntries([...new Set(edits.map((edit) => edit.key))].map((key) => [key, statusOf(status, key)])) : null,
+    status: status !== null ? Object.fromEntries([...new Set(edits.map((edit) => edit.key))].map((key) => [key, statusOf(status, key)])) : null,
     findings: [...gate.findings, ...report.findings],
     at: gitState(ready.path),
     ...pendingSplit(ready),
@@ -837,11 +845,13 @@ async function approve(req: Request, site: SiteState, listed: WorkspaceEntry): P
   // Read again after the body, as a save does: the files may have moved while it streamed in.
   const ready = requireReady(loadSite(listed));
   if (!Object.hasOwn(ready.descriptor.keys, key)) return json({ error: `undeclared key: ${key}` }, 400);
+  const from = ready.descriptor.keys[key]?.derivesFrom;
+  if (from !== undefined) return json({ error: derivedApproval(key, from) }, 400);
   const by = gitUserName(ready.path);
   if (by === null) return json({ error: 'approve: git has no user.name here — set one so the approval records who made it' }, 409);
   const { file, already } = approveKeys(loadStatus(ready.path, ready.config), [key], by);
   const report = new Report();
-  const { written } = applyForms(ready.path, ready.config, ready.descriptor, ready.snapshot, report, 'dashboard approve', file);
+  const { written } = applyForms(ready.path, ready.config, ready.descriptor, ready.snapshot, report, 'dashboard approve', file, true);
   const status = loadStatus(ready.path, ready.config);
   return json({
     key,
@@ -869,10 +879,13 @@ function applyForms(
   snapshot: Snapshot,
   report: Report,
   label: string,
-  status: StatusFile = loadStatus(path, config),
+  status: StatusFile | null = loadStatus(path, config),
+  /** Leave the descriptor's and snapshot's bytes alone where their content is unchanged — an approval moves neither. */
+  keepBytes = false,
 ): { written: string[]; unchanged: string[] } {
   try {
-    return writePlanned(planRepoForms(path, config, descriptor, snapshot, status, report));
+    const plans = planRepoForms(path, config, descriptor, snapshot, status, report);
+    return writePlanned(keepBytes ? keepFormatting(plans, [config.descriptorPath, config.snapshotPath]) : plans);
   } catch (error) {
     rethrowBatchFailure(label, error);
     // `rethrowBatchFailure` always throws; TypeScript cannot see it.

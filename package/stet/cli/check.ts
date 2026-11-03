@@ -30,7 +30,7 @@ import { keyUsage } from './key-usage.js';
 import type { CliIo } from './main.js';
 import { CliError, Report } from './report.js';
 import { TS_BROKEN } from './source-scan.js';
-import { loadStatus, type StatusFile } from './status.js';
+import { loadStatus, trackedStatus, type StatusFile } from './status.js';
 import { isStoreBacked } from './store.js';
 import { validateValue } from './validate.js';
 
@@ -99,10 +99,10 @@ function checkCopyFrom(config: StetConfig, cwd: string, owner: { owner: string; 
   generated(config, cwd, descriptor, snapshot, statusOrNull(owner.owner, owner.config), report, false);
 }
 
-/** The status file a writer passes the generated outputs, or null where it cannot be read — `statusFile` reports that. */
-function statusOrNull(cwd: string, config: StetConfig): StatusFile | null {
+/** The status file a writer passes the generated outputs, or null where there is none or it cannot be read — `statusFile` reports that. */
+export function statusOrNull(cwd: string, config: StetConfig): StatusFile | null {
   try {
-    return loadStatus(cwd, config);
+    return trackedStatus(cwd, config, isStoreBacked(config.store));
   } catch (error) {
     if (!(error instanceof CliError)) throw error;
     return null;

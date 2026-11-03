@@ -27,12 +27,13 @@ import {
   asUpdate,
   planJson,
   planRepoForms,
+  planSideForms,
   planWrite,
   rethrowBatchFailure,
   writePlanned,
   writeText,
 } from './artifacts.js';
-import { descriptorOf, snapshotOf } from './check.js';
+import { descriptorOf, snapshotOf, statusOrNull } from './check.js';
 import { isHtmlHost, keyJoiner, loadConfig, markAttributes, refuseInCopyFrom, refuseUnresolvableAlias, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { planHtmlRegister, type ChosenName, type HtmlRegisterPlan } from './html-host.js';
@@ -462,10 +463,18 @@ function adoptScreens(d: { screens: ScreenRun; config: StetConfig; descriptor: D
     for (const literal of scan.literals) {
       const key = screens.nameOf.get(literal) as string;
       if (!landed.has(key)) {
+        // A `{name}` host's screen text reads in its own spelling; the snapshot holds the stored `{{name}}` (Q37).
+        const value = toStet(literal.text, config.placeholders);
+        const vars = value === literal.text ? [] : varsOf(value);
         // Tentatively add so the save gate can read the key's rules; revert on any refusal.
-        descriptor.keys[key] = { shape: 'text', target: targetFor(file, config), ...(literal.sectionWord === null ? {} : { section: literal.sectionWord }) };
-        (snapshot['default'] ??= {})[key] = literal.text;
-        if (!validateValue(descriptor, snapshot, key, literal.text, 'default', report)) {
+        descriptor.keys[key] = {
+          shape: 'text',
+          target: targetFor(file, config),
+          ...(literal.sectionWord === null ? {} : { section: literal.sectionWord }),
+          ...(vars.length === 0 ? {} : { vars }),
+        };
+        (snapshot['default'] ??= {})[key] = value;
+        if (!validateValue(descriptor, snapshot, key, value, 'default', report)) {
           delete descriptor.keys[key];
           delete snapshot['default']?.[key];
           continue;
@@ -557,9 +566,9 @@ async function registerHtml(d: {
     chosen = resolved.chosen;
   }
 
-  // The texts the declared keys hold before the run, as `scan` reads them: a screen's text one holds is recorded already.
-  const held = sharedTextIndex(descriptor, snapshot);
   const plan = run({ descriptor, snapshot }, report, chosen);
+  // The texts the declared keys hold after the run, as `scan` reads them: a screen's text one holds, a page's keys included, is recorded already.
+  const held = sharedTextIndex(descriptor, snapshot);
   for (const document of plan.edited) {
     if (document.diff !== '') report.line(document.diff);
   }
@@ -598,6 +607,7 @@ async function registerHtml(d: {
       asUpdate(planJson(join(io.cwd, config.descriptorPath), descriptor, config.descriptorPath)),
       asUpdate(planJson(join(io.cwd, config.snapshotPath), snapshot, config.snapshotPath)),
       ...plan.edited.map((e) => asUpdate(planWrite(e.abs, e.text, e.rel))),
+      ...planSideForms(io.cwd, config, descriptor, snapshot, statusOrNull(io.cwd, config)).generated,
     ]);
   } catch (error) {
     rethrowBatchFailure('stet register --write', error);

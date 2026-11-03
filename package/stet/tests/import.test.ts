@@ -1,8 +1,10 @@
 // add-plain-js-hosts (0.9.0), chunk C2: `stet import`, the copy module's pair and object shapes, placeholders converted on the way in.
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
+import { packageRoot } from '../cli/installed.js';
 import { scanModule } from '../cli/source-scan.js';
 import { cleanupCliHosts, makeHtmlHost, type CliHost } from '../conformance/cli-host.js';
 
@@ -40,7 +42,7 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
 
   it('P2.2 in a uniform table a pair proposes its element 0 under the property name and an object its value member, and neither proposes a sibling', async () => {
     const shape = async (source: string): Promise<Array<[string | undefined, string, string, string | null]>> =>
-      (await scanModule('design/data/copy.js', source)).literals.map((l) => [l.proposedKey, l.text, l.shape, l.form ?? null]);
+      (await scanModule('design/data/copy.js', source, { tables: true })).literals.map((l) => [l.proposedKey, l.text, l.shape, l.form ?? null]);
     // Every member a pair, one with a cast element.
     expect(
       await shape(
@@ -69,7 +71,7 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
   });
 
   it('P2.2b a pair or an object in an ordinary object, a mixed table or a lone member reads as it did before', async () => {
-    const keys = async (source: string): Promise<string[]> => (await scanModule('copy.js', source)).literals.map((l) => `${l.proposedKey}|${l.form ?? ''}`);
+    const keys = async (source: string): Promise<string[]> => (await scanModule('copy.js', source, { tables: true })).literals.map((l) => `${l.proposedKey}|${l.form ?? ''}`);
     // A list in an object of unlike members.
     expect(await keys('export const plan = { title: "Pricing page headline", features: ["Fast shipping", "Cheap prices"] };\n')).toEqual([
       'title|',
@@ -90,6 +92,20 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
     ]);
     // A table of one member is no evidence of a table.
     expect(await keys('export const t = { features: ["Fast shipping", "Cheap prices"] };\n')).toEqual(['fast_shipping|', 'cheap_prices|']);
+  });
+
+  it('P2.2c without reads or generated a table of pairs or objects reads as it did in 0.8.1', async () => {
+    const { copyTablesOf } = await import('../cli/source-scan.js');
+    const keys = async (source: string, tables?: boolean): Promise<string[]> =>
+      (await scanModule('copy.js', source, tables === undefined ? {} : { tables })).literals.map((l) => l.proposedKey as string);
+    const nav = 'export const nav = { primary: ["Home page", "About us"], secondary: ["Terms of use", "Privacy policy"] };\n';
+    expect(await keys(nav)).toEqual(['home_page', 'about_us', 'terms_of_use', 'privacy_policy']);
+    expect(await keys(nav, true)).toEqual(['primary', 'secondary']);
+    const objects = 'export const t = { x: { value: "Buy now", label: "Purchase button" }, y: { value: "Sell now", label: "Sale button" } };\n';
+    expect(await keys(objects)).toEqual(['value', 'label', 'sell_now', 'sale_button']);
+    expect(copyTablesOf({ generated: [] })).toBe(false);
+    expect(copyTablesOf({ reads: {}, generated: [] })).toBe(true);
+    expect(copyTablesOf({ generated: [{}] })).toBe(true);
   });
 
   it('P2.3 import from JSON, a classic script, an ES module; --export, the default export and the refusals', async () => {
@@ -179,7 +195,7 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
         'design/data/copy.js': `window.TS = window.TS || {};\nTS.copyTable = {\n${rows.join('\n')}\n};\n`,
         'index.html': '<!doctype html><html><body><section id="hero"><h2>Pick the plan that fits you</h2></section></body></html>\n',
       },
-      { placeholders: '{name}', copyModules: ['design/data/copy.js'] },
+      { placeholders: '{name}', copyModules: ['design/data/copy.js'], reads: { functions: ['TS.t'], attribute: 'data-copy' } },
     );
     expect(await host.run('import', 'design/data/copy.js', '--export', 'TS.copyTable', '--only', 'home.', 'waitlist.', '--section', 'design', '--by', 'nj-io', '--write')).toBe(0);
     expect(host.out[0]).toBe('import: 43 keys from design/data/copy.js (TS.copyTable)');
@@ -314,4 +330,65 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
     expect(host.out.slice(0, 3)).toEqual(['import: 2 keys from t.json', '  new 1 · same 1 · differs 0 · skipped 0', '  home.title  "Welcome"']);
     expect(JSON.parse(host.file('content/defaults.json')).default['home.title']).toBe('Welcome');
   });
+
+  it('P2.8d a setter on the thrown-value carrier never runs: the file is refused with its message', async () => {
+    const host = await site({
+      's1.js': 'Object.defineProperty(globalThis, "__stet_thrown", { set(v) { while (true) {} }, configurable: true });\nthrow new Error("boom");\n',
+    });
+    // A loop on the host stack ignores vitest's timeout, so the CLI runs as a child under its own.
+    const child = importChild(host.cwd, 's1.js');
+    expect(child.status).toBe(1);
+    expect(child.stderr).toContain('import: s1.js could not be evaluated: boom');
+  }, 30_000);
+
+  it('P2.8e a file of 200,000 blank lines imports inside the ceiling', async () => {
+    const host = await site({ 'r1.js': `${'\n'.repeat(200_000)}export const T = { "a.b": "x" };\n` });
+    const child = importChild(host.cwd, 'r1.js');
+    expect(child.status).toBe(0);
+    expect(child.stdout).toContain('  a.b  "x"');
+  }, 30_000);
+
+  it('P2.11 a declared derived key is skipped, and the snapshot is byte-equal', async () => {
+    const host = await site(
+      { 'imp.json': JSON.stringify({ 'home.sub': 'Hand written sub' }) },
+      {},
+      {
+        'home.lead': { shape: 'text', target: 'web' },
+        'home.sub': { shape: 'text', target: 'web', derivesFrom: 'home.lead', tmpl: '{v} More.' },
+      },
+      { 'home.lead': 'Lead words' },
+    );
+    const before = host.file('content/defaults.json');
+    expect(await host.run('import', 'imp.json', '--write')).toBe(0);
+    expect(host.out).toContain('  new 0 · same 0 · differs 0 · skipped 1');
+    expect(host.out).toContain('  home.sub  skipped: derives from home.lead — edit its template');
+    expect(host.file('content/defaults.json')).toBe(before);
+  });
+
+  it('P2.12 a top-level return answers the compiler, not the await line', async () => {
+    const host = await site({
+      'ret.mjs': 'export const T = { "a.b": "x" };\nif (T) { return; }\n',
+      'str.mjs': 'export const T = { "a.b": "await it" }; // await\nif (T) { return; }\n',
+    });
+    for (const file of ['ret.mjs', 'str.mjs']) {
+      expect(await host.run('import', file)).toBe(1);
+      expect(host.stderr()).toContain(`import: ${file} could not be evaluated:`);
+    }
+    expect(host.stderr()).not.toContain('top-level await');
+  });
+
+  it('P2.13 a 100,000-character value prints a plan line under 400 characters', async () => {
+    const host = await site({ 'long.json': JSON.stringify({ 'a.b': 'x'.repeat(100_000) }) });
+    expect(await host.run('import', 'long.json')).toBe(0);
+    const line = host.out.find((l) => l.startsWith('  a.b  ')) as string;
+    expect(line.length).toBeLessThan(400);
+  });
 });
+
+/** The built bin importing a file, under a ten-second kill: a hang on the host stack shows as a null status. */
+function importChild(cwd: string, file: string): { status: number | null; stdout: string; stderr: string } {
+  const bin = join(packageRoot(), 'dist', 'cli', 'main.js');
+  expect(existsSync(bin), 'build first: npm run build').toBe(true);
+  const child = spawnSync(process.execPath, [bin, 'import', file], { cwd, encoding: 'utf8', timeout: 10_000 });
+  return { status: child.status, stdout: child.stdout, stderr: child.stderr };
+}

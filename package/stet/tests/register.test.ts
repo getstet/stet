@@ -3917,3 +3917,50 @@ describe('register — a copy module on a {name} host seeds the stored form (Q37
     expect(second.out.at(-1)).toBe('register: nothing to adopt');
   });
 });
+
+describe('register — screens and generated outputs on a plain-JavaScript host (add-plain-js-hosts, fix D)', () => {
+  const homeHtml = '<!doctype html>\n<html><head></head><body>\n<p>First paragraph here</p>\n<script src="home.js"></script></body></html>\n';
+
+  it('C6-1 a {name} host seeds a screen text in the stored form with its variable declared, and a second scan proposes nothing', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html': '<!doctype html>\n<html><head></head><body><script src="screens/page.js"></script></body></html>\n',
+        'screens/page.js': 'h("p", { class: "x" }, "Hi {name}, welcome back");\n',
+      },
+      config: { managedSurfaces: ['screens/*.js'], keyStyle: 'dotted', placeholders: '{name}', reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const key = Object.keys(JSON.parse(host.file('content/descriptor.json')).keys).find((k) => k.startsWith('page.'));
+    expect(JSON.parse(host.file('content/defaults.json')).default[key as string]).toBe('Hi {{name}}, welcome back');
+    expect(JSON.parse(host.file('content/descriptor.json')).keys[key as string].vars).toEqual(['name']);
+    host.err.length = 0;
+    expect(await host.run('scan')).toBe(0);
+    expect(host.err.join('\n')).not.toContain('Hi {name}');
+  });
+
+  it('C6-6 a screen text equal to a page element text adds no second key, and scan and register agree', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': homeHtml, 'home.js': 'el.textContent = "First paragraph here";\n' },
+      config: { managedSurfaces: ['index.html', 'home.js'], keyStyle: 'dotted', reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+    });
+    expect(await host.run('scan')).toBe(0);
+    expect(host.err.filter((l) => l.includes('home.js') && l.includes('First paragraph here'))).toEqual([]);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.out.join('\n')).not.toContain('read it through');
+    const holders = Object.values(JSON.parse(host.file('content/defaults.json')).default).filter((value) => value === 'First paragraph here');
+    expect(holders).toHaveLength(1);
+  });
+
+  it('Q68 html register writes the generated outputs in its batch, so check stays current', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': homeHtml },
+      config: { generated: [{ file: 'public/copy.js', format: 'script', name: 'TS.copyTable' }] },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.file('public/copy.js')).toContain('"First paragraph here"');
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(host.err.join('\n')).not.toContain('public/copy.js');
+  });
+});

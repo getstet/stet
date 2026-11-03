@@ -11,7 +11,9 @@
  * `export`s into the script's own bindings — `vm.SourceTextModule` exists only
  * behind `--experimental-vm-modules`, a flag the CLI cannot pass itself — and a
  * module that imports another is refused, since nothing outside the file is
- * ever read. Everything the file's objects can run — a getter, a proxy trap, an
+ * ever read. The `export` rewrite works on lines, so a template literal holding
+ * a line that opens with `export` is edited as the file's own code would be: that
+ * word is dropped from the string. Everything the file's objects can run — a getter, a proxy trap, an
  * inherited accessor, a replaced `JSON.stringify`, a thrown value's `message` —
  * runs INSIDE the context under the ceiling: the table is picked and written as
  * one JSON string there, and stet's realm only checks that it is a string of
@@ -20,6 +22,7 @@
  * Offline by contract: the loading path is `check`'s own, as `remove`'s is.
  */
 
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { extname, resolve } from 'node:path';
 import vm from 'node:vm';
@@ -32,7 +35,7 @@ import { descriptorOf, snapshotOf } from './check.js';
 import { loadConfig, rawConfigPlan, refuseInCopyFrom } from './config.js';
 import { KEY_NAME, NAME_PART } from './key-names.js';
 import type { CliIo } from './main.js';
-import { CliError, HostTextReport, Report, UsageError } from './report.js';
+import { CliError, clip, HostTextReport, Report, UsageError } from './report.js';
 import { approveKeys, gitUserName, loadStatus, type StatusFile } from './status.js';
 import { isStoreBacked } from './store.js';
 import { validateValue } from './validate.js';
@@ -42,6 +45,15 @@ const EVALUATE_MS = 2000;
 
 /** The longest JSON string the context may hand back, in characters. */
 const MAX_JSON = 16 * 1024 * 1024;
+
+/** How much of a value one plan line shows. */
+const SHOWN = 200;
+
+/** The longest span of text one pre-scan pattern or `declaredAfter` reads for a single statement. */
+const STATEMENT = 64 * 1024;
+
+/** The text `declaredAfter` may read across all the exports of one file, so a file of open declarations cannot make the scan quadratic. */
+const SCAN_BUDGET = 16 * 1024 * 1024;
 
 /** The binding a module's default export takes once its `export default` is rewritten. */
 const DEFAULT_BINDING = '__stet_default';
@@ -87,6 +99,14 @@ export async function runImport(args: string[], io: CliIo): Promise<number> {
 
   const { object, label } = readTable(io.cwd, file, text(values, 'export'));
   const rows = importRows(object, { only, placeholders: config.placeholders });
+  // A derived key has no words of its own: its text follows its source's template.
+  for (const row of rows) {
+    const from = Object.hasOwn(descriptor.keys, row.key) ? descriptor.keys[row.key]?.derivesFrom : undefined;
+    if (row.value === undefined || from === undefined) continue;
+    delete row.value;
+    row.approved = false;
+    row.skipped = `derives from ${from} — edit its template`;
+  }
 
   const locale = config.locales.default;
   const defaults: Record<string, unknown> = { ...(snapshot[locale] ?? {}) };
@@ -112,10 +132,10 @@ export async function runImport(args: string[], io: CliIo): Promise<number> {
     const kind = kindOf(row);
     if (kind === 'new') {
       const vars = varsOf(row.value as string);
-      report.line(`  ${row.key}  ${JSON.stringify(row.value)}${vars.length === 0 ? '' : `  vars: ${vars.join(', ')}`}`);
+      report.line(`  ${row.key}  ${shown(row.value as string)}${vars.length === 0 ? '' : `  vars: ${vars.join(', ')}`}`);
     } else if (kind === 'differs') {
       report.line(
-        `  ${row.key}  differs: ${JSON.stringify(row.value)} — the snapshot holds ${JSON.stringify(held(row.key))}${replace ? '' : "; pass --replace to take the file's"}`,
+        `  ${row.key}  differs: ${shown(row.value as string)} — the snapshot holds ${shown(held(row.key))}${replace ? '' : "; pass --replace to take the file's"}`,
       );
     } else if (kind === 'skipped') {
       report.line(`  ${row.key}  skipped: ${row.skipped}`);
@@ -181,6 +201,11 @@ export async function runImport(args: string[], io: CliIo): Promise<number> {
   }
   for (const name of wrote) report.line(`wrote ${name}`);
   return report.emit(io);
+}
+
+/** A value as a plan line quotes it: whole while it is short, else clipped. */
+function shown(value: unknown): string {
+  return typeof value === 'string' && value.length > SHOWN ? JSON.stringify(clip(value, SHOWN)) : JSON.stringify(value);
 }
 
 /**
@@ -334,8 +359,8 @@ export function evaluateSource(file: string, source: string): vm.Context {
 /** The first module a file imports or re-exports from, as written; null for a file that stands alone. */
 function importedSpecifier(source: string): string | null {
   const found =
-    /^[ \t]*import\b[^'";]*?(['"])([^'"\n]+)\1/m.exec(source) ??
-    /^[ \t]*export\s+(?:\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s*from\s*(['"])([^'"\n]+)\1/m.exec(source) ??
+    /^[ \t]*import\b[^'";]{0,2000}?(['"])([^'"\n]+)\1/m.exec(source) ??
+    /^[ \t]*export\s+(?:\*(?:\s+as\s+[\w$]+)?|\{[^}]{0,2000}\})\s*from\s*(['"])([^'"\n]+)\1/m.exec(source) ??
     /\bimport\s*\(\s*(['"`])([^'"`\n]+)\1/.exec(source);
   return found === null ? null : (found[2] as string);
 }
@@ -343,16 +368,40 @@ function importedSpecifier(source: string): string | null {
 /**
  * The module syntax the rewrite cannot run, named where a script fails to
  * compile and uses it; undefined for any other syntax error. Top-level `await`
- * is the failure that compiles once the script sits inside an async function.
+ * is the failure that compiles once the script sits inside an async function,
+ * and is named only where the script holds an `await` outside strings and
+ * comments (a top-level `return` compiles there too, and gets the compiler's own line).
  */
 function limitOf(source: string, script: string): string | undefined {
   if (/^[ \t]*export\s+(?:const|let|var)\s*[{[]/m.test(source)) return 'a destructuring export is not supported — export each name on its own';
+  if (!hasAwaitToken(script)) return undefined;
   try {
     new vm.Script(`(async function () {\n${script}\n})`);
     return 'top-level await is not supported';
   } catch {
     return undefined;
   }
+}
+
+/** Whether a script holds an `await` word outside its comments and the text of its string and template literals. */
+function hasAwaitToken(script: string): boolean {
+  for (let i = 0; i < script.length; i += 1) {
+    const ch = script[i] as string;
+    if (ch === '"' || ch === "'" || ch === '`') {
+      for (i += 1; i < script.length && script[i] !== ch; i += 1) if (script[i] === '\\') i += 1;
+    } else if (ch === '/' && script[i + 1] === '/') {
+      const end = script.indexOf('\n', i);
+      if (end < 0) return false;
+      i = end;
+    } else if (ch === '/' && script[i + 1] === '*') {
+      const end = script.indexOf('*/', i + 2);
+      if (end < 0) return false;
+      i = end + 1;
+    } else if (script.startsWith('await', i) && !/[\w$]/.test(script[i - 1] ?? '') && !/[\w$]/.test(script[i + 5] ?? '')) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -363,19 +412,20 @@ function limitOf(source: string, script: string): string | undefined {
  */
 function scriptOf(source: string): { script: string; names: Array<[string, string]> } {
   const names: Array<[string, string]> = [];
+  const budget = { left: SCAN_BUDGET };
   let script = source.replace(
-    /^(\s*)export\s+((?:async\s+)?function\*?|const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm,
+    /^([ \t]*)export\s+((?:async\s+)?function\*?|const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm,
     (_m, space: string, kind: string, name: string, at: number) => {
       names.push([name, name]);
-      for (const more of declaredAfter(source, at + _m.length)) names.push([more, more]);
+      for (const more of declaredAfter(source, at + _m.length, budget)) names.push([more, more]);
       return `${space}${kind} ${name}`;
     },
   );
-  script = script.replace(/^(\s*)export\s+default\s+/gm, (_m, space: string) => {
+  script = script.replace(/^([ \t]*)export\s+default\s+/gm, (_m, space: string) => {
     names.push(['default', DEFAULT_BINDING]);
     return `${space}const ${DEFAULT_BINDING} = `;
   });
-  script = script.replace(/^\s*export\s*\{([^}]*)\}\s*;?/gm, (_m, list: string) => {
+  script = script.replace(/^[ \t]*export[ \t]*\{([^}]{0,2000})\}[ \t]*;?/gm, (_m, list: string) => {
     for (const part of list.split(',')) {
       const [local, exported] = part.trim().split(/\s+as\s+/);
       if (local !== undefined && local !== '') names.push([exported ?? local, local]);
@@ -390,16 +440,19 @@ function scriptOf(source: string): { script: string; names: Array<[string, strin
  * that follow a comma at the declaration's own depth, up to its `;` or the
  * line that ends it (`export const a = 1, b = 2`). Strings, template literals
  * and comments are skipped over; a name found in error binds to nothing and
- * reads as undefined.
+ * reads as undefined. One declaration is read for at most `STATEMENT` characters
+ * and all of a file's declarations for `budget.left`.
  */
-function declaredAfter(source: string, from: number): string[] {
+function declaredAfter(source: string, from: number, budget: { left: number }): string[] {
   const found: string[] = [];
   let depth = 0;
   let last = '';
-  for (let i = from; i < source.length; i += 1) {
+  const stop = Math.min(source.length, from + STATEMENT, from + budget.left);
+  budget.left -= stop - from;
+  for (let i = from; i < stop; i += 1) {
     const ch = source[i] as string;
     if (ch === '"' || ch === "'" || ch === '`') {
-      for (i += 1; i < source.length && source[i] !== ch; i += 1) if (source[i] === '\\') i += 1;
+      for (i += 1; i < stop && source[i] !== ch; i += 1) if (source[i] === '\\') i += 1;
       last = ch;
     } else if (ch === '/' && (source[i + 1] === '/' || source[i + 1] === '*')) {
       const end = source[i + 1] === '/' ? source.indexOf('\n', i) : source.indexOf('*/', i + 2) + 1;
@@ -417,7 +470,7 @@ function declaredAfter(source: string, from: number): string[] {
     } else if (depth === 0 && ch === '\n' && !',=+-*/%&|^?:<>.'.includes(last) && last !== '') {
       break;
     } else if (depth === 0 && ch === ',') {
-      const next = /^\s*([A-Za-z_$][\w$]*)\s*(?==|,|;|\n|$)/.exec(source.slice(i + 1));
+      const next = /^\s*([A-Za-z_$][\w$]*)\s*(?==|,|;|\n|$)/.exec(source.slice(i + 1, i + 1 + 256));
       if (next !== null) found.push(next[1] as string);
       last = ch;
     } else if (!/\s/.test(ch)) {
@@ -439,11 +492,13 @@ function isTable(value: unknown): value is Record<string, unknown> {
  * fixed phrase.
  */
 function thrownMessage(context: vm.Context, error: unknown): string {
+  // The carrier's name is minted per call: a file cannot define a setter under a name it has no way to learn.
+  const carrier = `__stet_${randomBytes(8).toString('hex')}`;
   try {
-    (context as Record<string, unknown>)['__stet_thrown'] = error;
+    (context as Record<string, unknown>)[carrier] = error;
     return String(
       new vm.Script(
-        '(function (e) { try { var m = e !== null && typeof e === "object" ? e.message : undefined; return typeof m === "string" ? m : String(e); } catch (_) { return "an error that could not be read"; } })(__stet_thrown)',
+        `(function (e) { try { var m = e !== null && typeof e === "object" ? e.message : undefined; return typeof m === "string" ? m : String(e); } catch (_) { return "an error that could not be read"; } })(${carrier})`,
       ).runInContext(context, { timeout: EVALUATE_MS, displayErrors: false }),
     );
   } catch {

@@ -9,7 +9,7 @@
  */
 
 import { parse, text } from './args.js';
-import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
+import { keepFormatting, planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
 import { loadConfig, refuseInCopyFrom } from './config.js';
 import type { CliIo } from './main.js';
@@ -18,6 +18,11 @@ import { approveKeys, gitUserName, loadStatus } from './status.js';
 import { isStoreBacked } from './store.js';
 
 export const STORE_BACKED_APPROVAL = 'approve: this project is store-backed — publishing is its approval';
+
+/** What a derived key's approval is refused with: it has no words of its own to approve. */
+export function derivedApproval(key: string, source: string): string {
+  return `approve: ${key} derives from ${source} — approve the source`;
+}
 
 export async function runApprove(args: string[], io: CliIo): Promise<number> {
   const { values, positionals: keys } = parse(args, { by: 'string' }, ['by']);
@@ -33,6 +38,8 @@ export async function runApprove(args: string[], io: CliIo): Promise<number> {
   if (!snapshot) return report.emit(io);
   for (const key of keys) {
     if (!Object.hasOwn(descriptor.keys, key)) throw new CliError(`"${key}" is not a key in ${config.descriptorPath}`);
+    const from = descriptor.keys[key]?.derivesFrom;
+    if (from !== undefined) throw new CliError(derivedApproval(key, from));
   }
   const by = text(values, 'by') ?? gitUserName(io.cwd);
   if (by === null) throw new CliError('approve: --by NAME is needed — git has no user.name here');
@@ -45,7 +52,8 @@ export async function runApprove(args: string[], io: CliIo): Promise<number> {
   };
   let written: string[];
   try {
-    ({ written } = writePlanned(planRepoForms(io.cwd, config, descriptor, snapshot, approved.file, report)));
+    // An approval changes the status file alone: the descriptor and snapshot keep their bytes.
+    ({ written } = writePlanned(keepFormatting(planRepoForms(io.cwd, config, descriptor, snapshot, approved.file, report), [config.descriptorPath, config.snapshotPath])));
   } catch (error) {
     rethrowBatchFailure('stet approve', error);
   }
