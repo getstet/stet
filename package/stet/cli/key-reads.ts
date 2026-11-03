@@ -55,6 +55,48 @@ export function keyPattern(key: string, flags = ''): RegExp {
   return new RegExp(`(?<![\\w$])${key.replace(/[.$]/g, '\\$&')}(?![\\w$])`, flags);
 }
 
+/**
+ * The text a property row takes up, to remove it: the property, the comma that
+ * follows it (else the one before it, for a last row), and its whole line where
+ * nothing else sits on it.
+ */
+function rowSpan(source: string, start: number, end: number): Span {
+  let from = start;
+  let to = end;
+  let after = to;
+  while (/\s/.test(source[after] ?? '')) after += 1;
+  if (source[after] === ',') to = after + 1;
+  else {
+    let before = from;
+    while (before > 0 && /\s/.test(source[before - 1] ?? '')) before -= 1;
+    if (source[before - 1] === ',') from = before - 1;
+  }
+  const lineStart = source.lastIndexOf('\n', from - 1) + 1;
+  const found = source.indexOf('\n', to);
+  const lineEnd = found === -1 ? source.length : found;
+  if (source.slice(lineStart, from).trim() === '' && source.slice(to, lineEnd).trim() === '') return { start: lineStart, end: Math.min(lineEnd + 1, source.length) };
+  return { start: from, end: to };
+}
+
+/**
+ * Every whole-word occurrence of a leaving key in a file the usage scan reads
+ * only as text (a template, a script served though git ignores it), each a
+ * mention: such a file is never rewritten.
+ */
+export function textMentions(file: string, source: string, renames: ReadonlyMap<string, string>, declared?: ReadonlySet<string>): Occurrence[] {
+  const lineOf = lineIndex(source);
+  const out: Occurrence[] = [];
+  for (const key of renames.keys()) {
+    for (const m of source.matchAll(keyPattern(key, 'g'))) {
+      if (!occurrenceIsKey(source, m.index, key, declared)) continue;
+      const end = source.indexOf('\n', m.index);
+      const text = source.slice(source.lastIndexOf('\n', m.index - 1) + 1, end === -1 ? source.length : end).trim();
+      out.push({ file, line: lineOf(m.index), at: m.index, key, text });
+    }
+  }
+  return out;
+}
+
 export { dialectCode, within, type Span } from './markup.js';
 
 /**
@@ -220,10 +262,21 @@ export function mentionPattern(name: string): RegExp {
   return new RegExp(`(?<![\\w$])${head}(?:\\s*\\??\\.\\s*${last}(?![\\w$])|\\s*\\??\\.?\\s*\\[\\s*(['"])${last}\\1\\s*\\])`, 'g');
 }
 
-/** Whether the attribute value around `at` writes a call of a configured function (the usage scan's own test of text it cannot read as code). */
-function readsInAttribute(source: string, at: number, functions: readonly ReadFunction[]): boolean {
-  const value = attributeValueAt(source, at);
+/** Whether the attribute value or the script body of a type that is no JavaScript (`text/template`, `application/json`) around `at` writes a call of a configured function (the usage scan's own test of text it cannot read as code). */
+function readsInUnreadText(source: string, at: number, functions: readonly ReadFunction[]): boolean {
+  const value = attributeValueAt(source, at) ?? scriptBodyAt(source, at);
   return value !== undefined && functions.some((f) => mentionPattern(f.name).test(value));
+}
+
+/** The body of the `<script>` element that holds offset `at`; undefined where `at` sits in none. The caller has found `at` outside the file's code, so a body here is one of a type the scan does not parse. */
+function scriptBodyAt(source: string, at: number): string | undefined {
+  const lower = source.toLowerCase();
+  for (const tag of markupTags(source)) {
+    if (tag.close || tag.selfClosing || tag.name.toLowerCase() !== 'script' || at < tag.end) continue;
+    const close = lower.indexOf('</script', tag.end);
+    if (at < (close === -1 ? source.length : close)) return source.slice(tag.end, close === -1 ? source.length : close);
+  }
+  return undefined;
 }
 
 /** The value of the attribute of an open tag that holds offset `at`; undefined where `at` sits in no attribute value. */
@@ -414,6 +467,8 @@ export function planReadRenames(input: {
   functions?: readonly ReadFunction[];
   /** The mark attributes (`markAttributes`): the string value of a prop named by one is a read form stet rewrites. */
   attributes?: readonly string[];
+  /** The renames are merges: a copy table's own row of a leaving key is removed where the table already holds the survivor's row, never renamed over it. */
+  merge?: boolean;
 }): ReadRenames {
   const { ts, file, source, dialect, renames, isStetModule, copyModule, declared } = input;
   const functions = input.functions ?? [];
@@ -440,16 +495,23 @@ export function planReadRenames(input: {
     .map((r) => ({ span: r, bindings: bindingsOf(ts, scriptFile, [r.text], isStetModule) }));
 
   // A declared copy module's own property, named for the key it is: renamed
-  // with it where the module holds exactly one such property.
+  // with it where the module holds exactly one such property — or, in a merge
+  // where the module also holds the survivor's, removed with its row.
   const props = new Map<string, number[]>();
+  const rows = new Map<number, Span>();
+  const survivors = new Set<string>();
   if (copyModule && dialect === null) {
+    const targets = new Set(renames.values());
     const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
     const visit = (node: TS.Node): void => {
-      if ((ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) && renames.has(propText(ts, node.name))) {
+      if (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) {
         const name = node.name;
-        const at = ts.isStringLiteral(name) ? name.getStart(sf) + 1 : name.getStart(sf);
         const key = propText(ts, name);
-        props.set(key, [...(props.get(key) ?? []), at]);
+        if (renames.has(key)) {
+          const at = ts.isStringLiteral(name) ? name.getStart(sf) + 1 : name.getStart(sf);
+          props.set(key, [...(props.get(key) ?? []), at]);
+          rows.set(at, rowSpan(source, node.getStart(sf), node.end));
+        } else if (targets.has(key)) survivors.add(key);
       }
       ts.forEachChild(node, visit);
     };
@@ -482,8 +544,8 @@ export function planReadRenames(input: {
       const line = lineOf(at);
       const occ: Occurrence = { file, line, at, key, text: lineText(at).trim() };
       if (!within(code, at) || within(nonCode, at)) {
-        // A configured read inside an attribute no rule names as code (`x-text`, `hx-on:click`, `srcdoc`) is a read the usage scan calls one: renaming past it leaves it on the old name.
-        if (dialect !== null && !within(code, at) && readsInAttribute(source, at, functions)) out.blocked.push(occ);
+        // A configured read inside an attribute no rule names as code (`x-text`, `hx-on:click`, `srcdoc`) or a script of a type the scan does not parse (`text/template`) is a read the usage scan calls one: renaming past it leaves it on the old name.
+        if (dialect !== null && !within(code, at) && readsInUnreadText(source, at, functions)) out.blocked.push(occ);
         else out.mentions.push(occ);
         continue;
       }
@@ -500,7 +562,8 @@ export function planReadRenames(input: {
       const own = props.get(key);
       if (own !== undefined && own.includes(at)) {
         if (own.length === 1) {
-          out.edits.push({ pos: at, end: at + key.length, text: next });
+          const row = input.merge === true && survivors.has(next) ? rows.get(at) : undefined;
+          out.edits.push(row === undefined ? { pos: at, end: at + key.length, text: next } : { pos: row.start, end: row.end, text: '' });
           out.rewritten.push(occ);
         } else {
           out.blocked.push(occ);

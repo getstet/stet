@@ -77,8 +77,8 @@ import {
   type NamingPlan,
   type PlanEntry,
 } from './key-plan.js';
-import { planReadRenames, stetModuleTest, type Occurrence } from './key-reads.js';
-import { ownFiles, siteReads, usageDialect, usageFiles } from './key-usage.js';
+import { planReadRenames, stetModuleTest, textMentions, type Occurrence } from './key-reads.js';
+import { ownFiles, siteReads, usageBeyond, usageDialect, usageFiles } from './key-usage.js';
 import type { CliIo } from './main.js';
 import { renameRecorded } from './meta.js';
 import { htmlPageOf, pageOfFile } from './pages.js';
@@ -912,6 +912,7 @@ export async function htmlRenames(
   renames: ReadonlyMap<string, string>,
   descriptor: Descriptor,
   only?: OnlyAt,
+  merge = false,
 ): Promise<HostRenames> {
   const marks = markRenames(cwd, config, renames, only);
   if ((config.reads?.functions ?? []).length === 0) return marks;
@@ -929,13 +930,14 @@ export async function htmlRenames(
     } catch {
       continue;
     }
-    const text = planFileRenames(out, readInput(ts, config, rel, source, renames, declared, () => false, tables.has(rel)), only);
+    const text = planFileRenames(out, readInput(ts, config, rel, source, renames, declared, () => false, tables.has(rel), merge), only);
     if (text === null) continue;
     const before = prior === -1 ? source : readFileSync(join(cwd, rel), 'utf8');
     const entry = { rel, text, diff: formatDiff(rel, before, text) };
     if (prior === -1) out.edited.push(entry);
     else out.edited[prior] = entry;
   }
+  out.mentions.push(...beyondMentions(cwd, config, renames, declared, only));
   if (only === undefined) {
     const site = await siteReads(cwd, config, descriptor);
     for (const [rel, read] of site.files) {
@@ -965,6 +967,7 @@ export async function readRenames(
   renames: ReadonlyMap<string, string>,
   declared: ReadonlySet<string>,
   only?: OnlyAt,
+  merge = false,
 ): Promise<HostRenames> {
   const ts = await loadTypescript();
   // The batch writes the generated files and the read path names no key; a copy table is walked, its property names move with the key.
@@ -983,10 +986,33 @@ export async function readRenames(
     } catch {
       continue;
     }
-    const text = planFileRenames(out, readInput(ts, config, rel, source, renames, declared, isStetModule(rel), config.copyModules.some((glob) => matchGlob(glob, rel))), only);
+    const text = planFileRenames(out, readInput(ts, config, rel, source, renames, declared, isStetModule(rel), config.copyModules.some((glob) => matchGlob(glob, rel)), merge), only);
     if (text !== null) out.edited.push({ rel, text, diff: formatDiff(rel, source, text) });
   }
+  out.mentions.push(...beyondMentions(cwd, config, renames, declared, only));
   return out;
+}
+
+/**
+ * The leaving keys in the files the usage scan reads beyond the source git
+ * lists (`usageBeyond`): text it reads for the calls it may hold, and scripts a
+ * page serves though git ignores them. A rename rewrites none of them, so each
+ * occurrence is a mention — with `only`, the one at that file and line.
+ */
+function beyondMentions(cwd: string, config: StetConfig, renames: ReadonlyMap<string, string>, declared: ReadonlySet<string>, only?: OnlyAt): Occurrence[] {
+  const out: Occurrence[] = [];
+  for (const rel of usageBeyond(cwd, config)) {
+    let source: string;
+    try {
+      const bytes = readFileSync(join(cwd, rel));
+      if (bytes.subarray(0, 8192).includes(0)) continue;
+      source = bytes.toString('utf8');
+    } catch {
+      continue;
+    }
+    out.push(...textMentions(rel, source, renames, declared));
+  }
+  return only === undefined ? out : out.filter((o) => o.file === only.file && o.line === only.line);
 }
 
 /** What `planReadRenames` takes for one host file: the file, the project's read functions and its mark attributes. */
@@ -999,6 +1025,7 @@ function readInput(
   declared: ReadonlySet<string>,
   isStetModule: (spec: string) => boolean,
   copyModule: boolean,
+  merge = false,
 ): Parameters<typeof planReadRenames>[0] {
   return {
     ts,
@@ -1011,6 +1038,7 @@ function readInput(
     declared,
     functions: config.reads?.functions ?? [],
     attributes: markAttributes(config),
+    merge,
   };
 }
 
