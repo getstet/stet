@@ -19,11 +19,18 @@ import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
 import type { GeneratedOutput } from './config.js';
 import { statusOf, type StatusFile } from './status.js';
 
-/** The keys an entry keeps: every declared web key, or those equal to or opening with one of `only`. */
+/**
+ * The keys an entry keeps: every declared web key, or those `only` names. An
+ * `only` entry ending in `.` or `_` is a prefix (the two joiners of the naming
+ * rule); any other entry is one exact key, so `waitlist.leave` keeps that key
+ * and not `waitlist.leave.ask`.
+ */
 export function keysFor(entry: GeneratedOutput, descriptor: Descriptor): string[] {
   const { only } = entry;
   return Object.keys(descriptor.keys)
-    .filter((key) => (only === undefined ? descriptor.keys[key]?.target === DEFAULT_TARGET : only.some((prefix) => key.startsWith(prefix))))
+    .filter((key) =>
+      only === undefined ? descriptor.keys[key]?.target === DEFAULT_TARGET : only.some((name) => (/[._]$/.test(name) ? key.startsWith(name) : key === name)),
+    )
     .sort();
 }
 

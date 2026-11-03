@@ -23,11 +23,13 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { extname, resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { extname, join, resolve } from 'node:path';
 import vm from 'node:vm';
 
+import { loadDescriptor } from '../src/descriptor.js';
 import { toStet, varsOf, type Placeholders } from '../src/placeholders.js';
+import { loadSnapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, type KeyDef } from '../src/types.js';
 import { flag, parse, positionalsAround, required, text } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
@@ -91,9 +93,10 @@ export async function runImport(args: string[], io: CliIo): Promise<number> {
   const config = loadConfig(io.cwd);
   refuseInCopyFrom(config, 'import');
   const report = new HostTextReport();
-  const descriptor = descriptorOf(config, io.cwd, report);
+  // The first command after the config can be this one: a form that does not exist yet starts empty, as `init` plans it, and the batch writes it.
+  const descriptor = existsSync(join(io.cwd, config.descriptorPath)) ? descriptorOf(config, io.cwd, report) : loadDescriptor({ version: 1, keys: {} });
   if (!descriptor) return report.emit(io);
-  const snapshot = snapshotOf(config, io.cwd, report);
+  const snapshot = existsSync(join(io.cwd, config.snapshotPath)) ? snapshotOf(config, io.cwd, report) : loadSnapshot({ default: {} });
   if (!snapshot) return report.emit(io);
   const snapshotOnly = !isStoreBacked(config.store);
 
@@ -140,6 +143,13 @@ export async function runImport(args: string[], io: CliIo): Promise<number> {
     } else if (kind === 'skipped') {
       report.line(`  ${row.key}  skipped: ${row.skipped}`);
     }
+  }
+  // `{n}` under the default grammar is plain text: no variable is declared and nothing guards it.
+  const singleBraced = config.placeholders === '{{name}}' ? rows.filter((row) => row.value !== undefined && toStet(row.value, '{name}') !== row.value).length : 0;
+  if (singleBraced > 0) {
+    report.line(
+      `  ${singleBraced} ${singleBraced === 1 ? 'value carries a {name} placeholder' : 'values carry {name} placeholders'} — set "placeholders": "{name}" in stet.config.json to declare ${singleBraced === 1 ? 'it' : 'them'} as variables`,
+    );
   }
   if (snapshotOnly) {
     const approvedWritten = written.filter((row) => row.approved).length;

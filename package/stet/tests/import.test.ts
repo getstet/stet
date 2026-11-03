@@ -1,6 +1,6 @@
 // add-plain-js-hosts (0.9.0), chunk C2: `stet import`, the copy module's pair and object shapes, placeholders converted on the way in.
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
@@ -365,6 +365,31 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
     expect(host.file('content/defaults.json')).toBe(before);
   });
 
+  it('Q95 import is the first command after the config: with no content folder it starts from empty forms and writes them', async () => {
+    const host = await site({ 't.json': JSON.stringify({ 'home.title': 'Welcome', 'home.lead': 'Lead words' }) });
+    rmSync(join(host.cwd, 'content'), { recursive: true });
+    expect(await host.run('import', 't.json', '--write')).toBe(0);
+    expect(host.out.slice(0, 2)).toEqual(['import: 2 keys from t.json', '  new 2 · same 0 · differs 0 · skipped 0']);
+    expect(Object.keys(JSON.parse(host.file('content/descriptor.json')).keys).sort()).toEqual(['home.lead', 'home.title']);
+    expect(JSON.parse(host.file('content/defaults.json')).default['home.title']).toBe('Welcome');
+    // A plan alone writes nothing, folder included.
+    const planned = await site({ 't.json': JSON.stringify({ 'home.title': 'Welcome' }) });
+    rmSync(join(planned.cwd, 'content'), { recursive: true });
+    expect(await planned.run('import', 't.json')).toBe(0);
+    expect(planned.exists('content/descriptor.json')).toBe(false);
+  });
+
+  it('Q98 under the default grammar a value with {name} text prints one hint naming the setting; under {name} it prints none', async () => {
+    const table = { 't.json': JSON.stringify({ 'home.count': '{n} people are waiting', 'home.sub': '{m} more', 'home.plain': 'No braces' }) };
+    const hint = '  2 values carry {name} placeholders — set "placeholders": "{name}" in stet.config.json to declare them as variables';
+    const plain = await site(table);
+    expect(await plain.run('import', 't.json')).toBe(0);
+    expect(plain.out.filter((line) => line.includes('placeholders'))).toEqual([hint]);
+    const declared = await site(table, { placeholders: '{name}' });
+    expect(await declared.run('import', 't.json')).toBe(0);
+    expect(declared.out.filter((line) => line.includes('placeholders'))).toEqual([]);
+  });
+
   it('P2.12 a top-level return answers the compiler, not the await line', async () => {
     const host = await site({
       'ret.mjs': 'export const T = { "a.b": "x" };\nif (T) { return; }\n',
@@ -389,6 +414,9 @@ describe('add-plain-js-hosts (0.9.0) C2', () => {
 function importChild(cwd: string, file: string): { status: number | null; stdout: string; stderr: string } {
   const bin = join(packageRoot(), 'dist', 'cli', 'main.js');
   expect(existsSync(bin), 'build first: npm run build').toBe(true);
+  // A child runs the BUILD: a source edited since the last build would leave it green on the old code.
+  const built = statSync(join(packageRoot(), 'dist', 'cli', 'import.js')).mtimeMs;
+  expect(built, 'cli/import.ts changed since the last build: npm run build').toBeGreaterThanOrEqual(statSync(join(packageRoot(), 'cli', 'import.ts')).mtimeMs);
   const child = spawnSync(process.execPath, [bin, 'import', file], { cwd, encoding: 'utf8', timeout: 10_000 });
   return { status: child.status, stdout: child.stdout, stderr: child.stderr };
 }

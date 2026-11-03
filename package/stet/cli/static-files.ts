@@ -4,8 +4,11 @@
  * `stet audit lighthouse`'s documents server share it.
  */
 
-import { realpathSync, statSync } from 'node:fs';
-import { join, resolve as resolvePath, sep } from 'node:path';
+import { lstatSync, realpathSync, statSync } from 'node:fs';
+import { dirname, join, resolve as resolvePath, sep } from 'node:path';
+
+/** Whether the real path `real` is the real root or lies under it. */
+const withinRoot = (realRoot: string, real: string): boolean => real === realRoot || real.startsWith(realRoot + sep);
 
 /**
  * A path inside the checkout that names a readable file, or null.
@@ -23,11 +26,45 @@ export function insideCheckout(root: string, target: string): string | null {
   } catch {
     return null;
   }
-  if (real !== realRoot && !real.startsWith(realRoot + sep)) return null;
+  if (!withinRoot(realRoot, real)) return null;
   try {
     return statSync(real).isFile() ? real : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Whether a path stet is about to WRITE stays inside the checkout, by real path.
+ *
+ * The target need not exist: its nearest existing ancestor is resolved
+ * (symlinks and letter case included, through the native `realpath`) and must
+ * lie under the checkout's own real path. A symlink at the target itself, or at
+ * any component that dangles, is refused, since `writeFile` would follow it out.
+ */
+export function containsPath(root: string, target: string): boolean {
+  let realRoot: string;
+  try {
+    realRoot = realpathSync.native(root);
+  } catch {
+    return false;
+  }
+  const written = resolvePath(root, target);
+  const linked = (path: string): boolean => {
+    try {
+      return lstatSync(path).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  if (linked(written)) return false;
+  for (let at = written; ; at = dirname(at)) {
+    try {
+      return withinRoot(realRoot, realpathSync.native(at));
+    } catch {
+      // A link that dangles is a way out; anything else is a path not made yet.
+      if (linked(at) || dirname(at) === at) return false;
+    }
   }
 }
 

@@ -66,7 +66,7 @@ Each entry of `generated` is a file stet writes from the committed snapshot, bes
 | `format` | `script` (a classic script that binds `name` on `window`), `esm` (an export called `name`) or `json`. |
 | `name` | The global or export. Required for `script` and `esm`; `TS.copyTable` makes `window.TS` if the page has not. |
 | `values` | `value` (the default) writes `"key": "text"`; `value-status` writes `"key": ["text", "approved"]`. |
-| `only` | Key names and prefixes to keep; absent keeps every key. |
+| `only` | Key names to keep: a name ending in `.` or `_` is a prefix; any other name is one exact key. Absent keeps every key. |
 
 A `script` or `esm` output carries a header with a hash of everything it was generated from. `stet check` says `<file>: stale — its source moved; run stet pull` when an input moved, `<file>: hand-edited — run stet pull instead of editing` when the body changed, and `<file>: not generated — run stet pull` when the file is missing. A `json` output has no header: it is current, or `<file>: differs from the snapshot — run stet pull`.
 
