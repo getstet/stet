@@ -844,9 +844,12 @@ describe('add-plain-js-hosts (0.9.0) C5', () => {
     const { generateOutput, keysFor } = await import('../cli/generated.js');
     expect(keysFor({ file: 'x.json', format: 'json', values: 'value' }, descriptor)).toEqual(['brand', 'home.title', 'waitlist.left', 'waitlist.me.share']);
     expect(keysFor({ file: 'x.json', format: 'json', values: 'value', only: ['waitlist.', 'brand'] }, descriptor)).toEqual(['brand', 'waitlist.left', 'waitlist.me.share']);
-    // An entry ending in a dot is a prefix; any other entry is one exact key.
+    // An entry ending in a dot or an underscore is a prefix; any other entry is one exact key.
     expect(keysFor({ file: 'x.json', format: 'json', values: 'value', only: ['waitlist.me'] }, descriptor)).toEqual([]);
     expect(keysFor({ file: 'x.json', format: 'json', values: 'value', only: ['waitlist.me.share', 'bran'] }, descriptor)).toEqual(['waitlist.me.share']);
+    const flat = loadDescriptor({ version: 1, keys: { hero_title: { shape: 'text', target: 'web' }, hero_title_more: { shape: 'text', target: 'web' }, pricing_price: { shape: 'text', target: 'web' } } });
+    expect(keysFor({ file: 'x.json', format: 'json', values: 'value', only: ['hero_'] }, flat)).toEqual(['hero_title', 'hero_title_more']);
+    expect(keysFor({ file: 'x.json', format: 'json', values: 'value', only: ['hero_title'] }, flat)).toEqual(['hero_title']);
 
     const table = { file: 'design/data/copy.js', format: 'script' as const, name: 'TS.copyTable', values: 'value-status' as const };
     const script = generateOutput(table, descriptor, snapshot, { 'home.title': approved }, '{name}', 'default');

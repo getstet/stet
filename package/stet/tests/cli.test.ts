@@ -3924,7 +3924,7 @@ describe('generated outputs and copyFrom (add-plain-js-hosts, C5)', () => {
         project: 't',
         generated: [
           { file: 'public/copy.js', format: 'script', name: 'TS.copyTable', values: 'value-status' },
-          { file: 'public/strings.json', format: 'json', only: ['hero_headline', 'hero_body'] },
+          { file: 'public/strings.json', format: 'json', only: ['hero_'] },
         ],
       },
     });
@@ -4054,7 +4054,7 @@ describe('generated outputs and copyFrom (add-plain-js-hosts, C5)', () => {
     const from = relative(worker.cwd, owner.cwd);
     writeFileSync(
       join(worker.cwd, 'stet.config.json'),
-      JSON.stringify({ project: 't', copyFrom: from, generated: [{ file: 'src/strings.mjs', format: 'esm', name: 'STRINGS', only: ['hero_headline', 'hero_body', 'pricing_tier_name', 'pricing_price'] }] }),
+      JSON.stringify({ project: 't', copyFrom: from, generated: [{ file: 'src/strings.mjs', format: 'esm', name: 'STRINGS', only: ['hero_', 'pricing_'] }] }),
     );
     return { owner, worker, from };
   };

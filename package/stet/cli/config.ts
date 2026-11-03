@@ -43,7 +43,7 @@ export interface GeneratedOutput {
   /** The global or export the table is bound to; required for `script` and `esm`. */
   name?: string;
   values: 'value' | 'value-status';
-  /** Key names kept: an entry ending in `.` is a prefix, any other an exact key; absent keeps every web key. */
+  /** Key names kept: an entry ending in `.` or `_` is a prefix, any other an exact key; absent keeps every web key. */
   only?: string[];
 }
 
