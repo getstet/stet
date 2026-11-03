@@ -24,6 +24,7 @@ import { lineCol, type Report } from './report.js';
 import { applyFileEdits, jsxReads, jsxRichClean, planRewrite } from './rewrite.js';
 import {
   componentName,
+  copyTablesOf,
   dialectOf,
   isJsxFile,
   loadTypescript,
@@ -376,7 +377,7 @@ export async function planJsxRun(input: {
   for (const file of filesForGlobs(cwd, config.copyModules)) {
     const handoff = parsed.get(file);
     if (handoff === null) continue;
-    const result = await scanModule(file, readFileSync(join(cwd, file), 'utf8'), handoff);
+    const result = await scanModule(file, readFileSync(join(cwd, file), 'utf8'), { ...handoff, tables: copyTablesOf(config) });
     modules.set(file, result);
     for (const literal of result.literals) {
       if (literal.shape === 'property' || literal.shape === 'plain') propertyNames.set(literal.proposedKey, file);

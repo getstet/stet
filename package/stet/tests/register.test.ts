@@ -3952,6 +3952,20 @@ describe('register — screens and generated outputs on a plain-JavaScript host 
     expect(holders).toHaveLength(1);
   });
 
+  it('Q71 register reads a table of pairs as one only on a project that sets reads or generated', async () => {
+    const nav = 'export const nav = { primary: ["Home page", "About us"], secondary: ["Terms of use", "Privacy policy"] };\n';
+    const keysOf = async (extra: Record<string, unknown>): Promise<string[]> => {
+      const dir = project({ copyModules: ['src/nav.js'] });
+      const config = JSON.parse(read(dir, 'stet.config.json')) as Record<string, unknown>;
+      write(dir, 'stet.config.json', JSON.stringify({ ...config, ...extra }));
+      write(dir, 'src/nav.js', nav);
+      expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+      return Object.keys(descriptor(dir).keys).sort();
+    };
+    expect(await keysOf({})).toEqual(expect.arrayContaining(['about_us', 'privacy_policy']));
+    expect(await keysOf({ reads: { functions: ['TS.t'], attribute: 'data-copy' } })).toEqual(expect.arrayContaining(['primary', 'secondary']));
+  });
+
   it('Q68 html register writes the generated outputs in its batch, so check stays current', async () => {
     const host = await makeHtmlHost({
       files: { 'index.html': homeHtml },
