@@ -319,7 +319,8 @@ export function unraw(page: string): string {
  * matter, script bodies and MDX's ESM lines are TypeScript regions, returned
  * apart so the caller can take their comments out with the compiler; tag
  * interiors outside their quoted values, and braces, are expressions. A
- * `.html` file on a JavaScript host evaluates only its scripts.
+ * `.html` file on a JavaScript host evaluates its scripts and the code in its
+ * tags: `on*` handler values and `javascript:` URLs (`handlerSpans`).
  *
  * One walk over the markup, so a `<script>` inside a raw element is raw too.
  * An open tag closes where `closing` says, quotes and braces respected, so
@@ -387,6 +388,7 @@ export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]
       const { end, name, selfClosing } = openTag(source, i);
       const tag = source.slice(i, end);
       if (dialect !== 'html') expressions.push(...tagCode(source, i, end, dialect, braces));
+      else scripts.push(...handlerSpans(source, i, end));
       if (name === 'script' || name === 'style') {
         if (selfClosing) {
           i = end;
@@ -439,6 +441,30 @@ export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]
     i += 1;
   }
   return { scripts, expressions, braces, raws };
+}
+
+/**
+ * The attribute values of an html open tag the browser runs as code: an `on*`
+ * handler's value and the code after `javascript:` in an `href` or `src`. Each
+ * is a client script of its own, as an inline `<script>` is.
+ */
+function handlerSpans(source: string, start: number, end: number): Array<Span & { own: true }> {
+  const name = /^<[A-Za-z][\w:.-]*/.exec(source.slice(start, end))?.[0] as string;
+  const base = start + name.length;
+  const out: Array<Span & { own: true }> = [];
+  for (const attr of readAttrs(source, base, source.slice(base, source.charAt(end - 1) === '>' ? end - 1 : end))) {
+    if (attr.valueEnd <= attr.valueStart) continue;
+    let from = attr.valueStart;
+    if (/^on[a-z]+$/.test(attr.name)) {
+      // A handler's whole value is code.
+    } else if (attr.name === 'href' || attr.name === 'src') {
+      const scheme = /^\s*javascript:/i.exec(source.slice(attr.valueStart, attr.valueEnd));
+      if (scheme === null) continue;
+      from += scheme[0].length;
+    } else continue;
+    out.push({ start: from, end: attr.valueEnd, own: true });
+  }
+  return out;
 }
 
 /** A Vue directive: its quoted value is an expression. */

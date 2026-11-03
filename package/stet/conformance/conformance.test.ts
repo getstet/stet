@@ -7952,7 +7952,7 @@ describe('adoption', () => {
     // Plan-only touches nothing.
     const beforePlan = html.file('index.html');
     expect(await html.run('eject')).toBe(0);
-    expect(html.stdout()).toContain('document: index.html — every mark removed, the text stays');
+    expect(html.stdout()).toContain('document: index.html — every data-stet mark removed, the text stays');
     expect(html.stdout()).not.toContain('un-rewrite');
     expect(html.file('index.html')).toBe(beforePlan);
 

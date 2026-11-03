@@ -22,9 +22,14 @@
  * under another name. The accessors a host builds with `createServerCopy` and
  * `createAccessor` are bindings too. A call through one of the project's
  * configured read functions (`reads.functions`, `TS.tx(…)`) is a read whatever
- * binds its name: the config binds it. The hook handed on as a value, and a
- * string that points at the snapshot or a generated data module by path, are
- * causes. Comments, JSX text and prose are never code.
+ * binds its name and however it is spelled (`window.TS.tx`, `TS?.tx`,
+ * `TS["tx"]`): the config binds it; any other reference to the function or to
+ * its head object (`items.map(TS.tx)`, `var { tx } = TS`, `T = TS`) is a cause.
+ * An html page's inline handlers and `javascript:` URLs are code. The hook
+ * handed on as a value, and a string that points at the snapshot or a
+ * generated data module by path, are causes. A top-level `var` of a classic
+ * script that another file assigns or declares again is not once-assigned.
+ * Comments, JSX text and prose are never code.
  * The scan reads and never writes.
  *
  * Per file, one parse: `codeOf` makes each tree through this module's `parse`,
@@ -43,7 +48,7 @@ import { filesForGlobs } from './files.js';
 import { gitData, gitFiles } from './git.js';
 import { lineIndex } from './html-host.js';
 import { codeOf, within, type Span } from './key-reads.js';
-import { dialectOf, loadTypescript, MAX_SOURCE_BYTES, packageNames, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
+import { dialectOf, keysIn, loadTypescript, MAX_SOURCE_BYTES, packageNames, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 import { insideCheckout } from './static-files.js';
 import { escapeRegExp } from '../src/seo.js';
 import type { Descriptor } from '../src/types.js';
@@ -157,6 +162,8 @@ interface Read {
   value?: { member?: string };
   /** The read is an argument of a call of a function imported from `@getstet/stet`, or of `Object.keys`. */
   exemptArg?: true;
+  /** Top-level `var`/`let` names of a classic script the read was placed or given its prefixes through: another file that assigns or redeclares one makes the read a cause. */
+  global?: string[];
 }
 
 /** One binding scope: a TypeScript file, a dialect component's scripts and markup, or a client script of its own. */
@@ -197,6 +204,10 @@ export interface FileFacts {
   values: Set<string>;
   /** Strings that name the snapshot or a generated data module by path, outside an import: the data is read by a route unseen. */
   pathReads: Array<{ line: number; text: string }>;
+  /** Every name the file assigns to, anywhere (`k = …`, `[k] = …`, `k++`). */
+  assigns: Set<string>;
+  /** The names a classic script declares at its top level: its globals, which another script may declare again. */
+  topNames: Set<string>;
 }
 
 /** What a string names when it points at the snapshot or a generated data module: their file names, and the folder they sit in. */
@@ -359,6 +370,11 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
     }
     return count > 0;
   };
+  // A classic script's top-level `var` is every script's global: another file that assigns it, or declares it again, may leave any value in it.
+  const touchedElsewhere = (names: readonly string[], own: string): boolean => {
+    for (const [rel, file] of facts) if (rel !== own && names.some((name) => file.assigns.has(name) || file.topNames.has(name))) return true;
+    return false;
+  };
   // A file that imports stet hands its generated data whole to stet's own
   // functions by design: only a read rooted at one of those modules, as an
   // argument of such a call, is exempt there.
@@ -385,11 +401,13 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
         if (!bound(rel, scope, read.root)) continue;
         if (read.hook !== undefined && hookBound(rel, scope, read.hook.member === undefined ? `${read.root}()` : `${read.root}.${read.hook.member}()`)) continue;
         if (file.importsStet && read.exemptArg === true && dataRooted(rel, scope, read.root)) continue;
-        if (read.placed === true) continue;
-        if (read.adapter !== undefined && adapterHolds(read.adapter.name, read.adapter.index, read.adapter.file)) continue;
-        if (read.prefixes.length > 0) {
-          for (const prefix of read.prefixes) prefixes.push({ prefix, file: rel, line: read.line });
-          continue;
+        if (read.global === undefined || !touchedElsewhere(read.global, rel)) {
+          if (read.placed === true) continue;
+          if (read.adapter !== undefined && adapterHolds(read.adapter.name, read.adapter.index, read.adapter.file)) continue;
+          if (read.prefixes.length > 0) {
+            for (const prefix of read.prefixes) prefixes.push({ prefix, file: rel, line: read.line });
+            continue;
+          }
         }
         causes.push({ text: read.text, file: rel, line: read.line });
       }
@@ -486,29 +504,6 @@ function namesIn(file: string, source: string, code: Span[], nonCode: Span[], de
     for (const m of source.matchAll(markPattern(attributes))) if (declared.has(m[1] as string)) named.add(m[1] as string);
   }
   return named;
-}
-
-/**
- * The declared keys a dotted token run names: each contiguous run of its
- * dot-delimited segments that is a key, the longest first at every start, and
- * none that sits inside a longer one already taken — so `obj.home_title` names
- * `home_title`, `"home.title"` names `home.title` and not a flat `title`.
- */
-export function keysIn(token: string, declared: ReadonlySet<string>): string[] {
-  const parts = token.split('.');
-  if (parts.length === 1) return declared.has(token) ? [token] : [];
-  const taken: Array<[number, number]> = [];
-  const out: string[] = [];
-  for (let i = 0; i < parts.length; i += 1) {
-    for (let j = parts.length; j > i; j -= 1) {
-      if (taken.some(([a, b]) => a <= i && j <= b)) continue;
-      const key = parts.slice(i, j).join('.');
-      if (!declared.has(key)) continue;
-      taken.push([i, j]);
-      out.push(key);
-    }
-  }
-  return out;
 }
 
 /** `within`, by binary search over the merged spans. */
@@ -702,12 +697,15 @@ function moduleTest(
 
 /**
  * The files stet writes or owns, which hold no read of copy: the read path, the
- * descriptor, the snapshot, every file `codegen` names, and the copy tables —
- * every `copyModules` file and every `generated` output, which declare keys and
- * read none. Repo-relative. The copy modules are listed where `cwd` is given.
+ * descriptor, the snapshot, every file `codegen` names, and the `generated`
+ * outputs — which declare keys and read none. Repo-relative. The copy modules
+ * are listed where `cwd` is given and the project sets `reads` or `generated`,
+ * which is what makes a copy table a table and no reader; a project that sets
+ * neither keeps reading them as 0.8.x did.
  */
 export function ownFiles(config: StetConfig, cwd?: string): Set<string> {
   const { registry, defaults, dts, resolved } = config.codegen;
+  const tables = cwd !== undefined && (config.reads !== undefined || config.generated.length > 0);
   return new Set(
     [
       config.readPath.file,
@@ -717,7 +715,7 @@ export function ownFiles(config: StetConfig, cwd?: string): Set<string> {
       defaults,
       dts,
       resolved,
-      ...(cwd === undefined ? [] : filesForGlobs(cwd, config.copyModules)),
+      ...(tables ? filesForGlobs(cwd, config.copyModules) : []),
       ...config.generated.map((g) => g.file),
     ].map((rel) => posix.normalize(rel)),
   );
@@ -865,6 +863,8 @@ function factsOf(
       calls: new Map(),
       values: new Set(),
       pathReads: [],
+      assigns: new Set(),
+      topNames: new Set(),
     };
   }
 }
@@ -898,10 +898,13 @@ function readFacts(
     calls: new Map(),
     values: new Set(),
     pathReads: [],
+    assigns: new Set(),
+    topNames: new Set(),
   };
   const lineOf = lineIndex(source);
   const keyList = [...declared];
-  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured };
+  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured, leaned: new Set() };
+  for (const sf of trees.values()) noteGlobals(ts, sf, facts);
 
   if (dialect === null) {
     const sf = trees.get(0) as TS.SourceFile;
@@ -954,6 +957,8 @@ interface WalkContext {
   needles: PathNeedles;
   /** The project's own read functions (`reads.functions`). */
   configured: readonly ReadFunction[];
+  /** The top-level names of a classic script that the resolution in hand leaned on (`localOf`). */
+  leaned: Set<string>;
 }
 
 /** Markup text the compiler could not take as one expression: read by tokens. */
@@ -1293,11 +1298,13 @@ function isReference(ts: typeof import('typescript'), id: TS.Identifier): boolea
 function walkUses(ctx: WalkContext, tree: Tree, roots: ReadonlyMap<string, string[]>, scope: Scope): void {
   const { ts, facts, needles, lineOf } = ctx;
   const { sf, base } = tree;
+  const aliases = headAliases(ctx, sf);
   const visit = (node: TS.Node): void => {
     if (ts.isCallExpression(node)) {
       recordCall(ctx, node);
       scope.reads.push(...configuredRead(ctx, tree, node));
     }
+    if (ctx.configured.length > 0) scope.reads.push(...configuredReferences(ctx, tree, node, aliases));
     if (
       (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) &&
       namesData(needles, node.text) &&
@@ -1329,8 +1336,52 @@ function walkUses(ctx: WalkContext, tree: Tree, roots: ReadonlyMap<string, strin
 }
 
 /**
+ * A callee's written name with the spellings that reach one function folded
+ * together: parentheses and assertions dropped, `?.` read as `.`, `["x"]` as
+ * `.x`, a leading `window.`, `self.` or `globalThis.` dropped. Undefined for
+ * any other expression.
+ */
+function calleeName(ts: typeof import('typescript'), expr: TS.Expression): string | undefined {
+  const at = unwrap(ts, expr);
+  let name: string | undefined;
+  if (ts.isIdentifier(at)) name = at.text;
+  else if (ts.isPropertyAccessExpression(at) || (ts.isElementAccessExpression(at) && isLiteral(ts, at.argumentExpression))) {
+    const object = calleeName(ts, at.expression);
+    const member = ts.isPropertyAccessExpression(at) ? at.name.text : (at as TS.ElementAccessExpression).argumentExpression;
+    name = object === undefined ? undefined : `${object}.${typeof member === 'string' ? member : (member as TS.StringLiteral).text}`;
+  }
+  return name?.replace(/^(?:(?:window|self|globalThis)\.)+(?=[^.])/, '');
+}
+
+/** The head object of a configured function (`TS` of `TS.tx`) and its last segment; none for a bare name. */
+function splitName(name: string): { head: string; last: string } | null {
+  const dot = name.lastIndexOf('.');
+  return dot < 0 ? null : { head: name.slice(0, dot), last: name.slice(dot + 1) };
+}
+
+/** Names bound to the head object of a configured function (`var T = TS`), by name. A name bound to its own head (`var TS = window.TS`) is no alias. */
+function headAliases(ctx: WalkContext, sf: TS.SourceFile): Map<string, string> {
+  const { ts, configured } = ctx;
+  const out = new Map<string, string>();
+  if (configured.length === 0) return out;
+  const heads = new Set(configured.flatMap((f) => splitName(f.name)?.head ?? []));
+  if (heads.size === 0) return out;
+  const note = (name: TS.Node, value: TS.Expression | undefined): void => {
+    const head = value === undefined ? undefined : calleeName(ts, value);
+    if (ts.isIdentifier(name) && head !== undefined && heads.has(head) && name.text !== head) out.set(name.text, head);
+  };
+  const visit = (node: TS.Node): void => {
+    if (ts.isVariableDeclaration(node)) note(node.name, node.initializer);
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) note(unwrap(ts, node.left), node.right);
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+/**
  * A call through one of the project's configured read functions (`TS.tx(…)`,
- * `t(…)`), matched by the callee's written name, whitespace aside: a key-name
+ * `t(…)`), matched by the callee's name as `calleeName` folds it: a key-name
  * literal at the key argument is pass 1's to name and reads nothing here; any
  * other argument is a read with no literal key, followed one hop and given its
  * prefixes as a stet binding's is; a call with no key argument is a cause.
@@ -1339,11 +1390,12 @@ function configuredRead(ctx: WalkContext, tree: Tree, call: TS.CallExpression): 
   const { ts, lineOf } = ctx;
   if (ctx.configured.length === 0) return [];
   const { sf, base } = tree;
-  const callee = call.expression.getText(sf).replace(/\s+/g, '');
-  const fn = ctx.configured.find((f) => f.name === callee);
+  const callee = calleeName(ts, call.expression);
+  const fn = callee === undefined ? undefined : ctx.configured.find((f) => f.name === callee);
   if (fn === undefined) return [];
   const arg = call.arguments[fn.key];
   if (arg !== undefined && isLiteral(ts, arg)) return [];
+  ctx.leaned.clear();
   const out: Read = {
     root: CONFIGURED,
     line: lineOf(base + call.getStart(sf)),
@@ -1355,7 +1407,81 @@ function configuredRead(ctx: WalkContext, tree: Tree, call: TS.CallExpression): 
     if (placed === 'keys') out.placed = true;
     else if (placed !== null) out.adapter = placed;
   }
+  if (ctx.leaned.size > 0) out.global = [...ctx.leaned];
   return [out];
+}
+
+/**
+ * Every other way a configured read function is reached, which the scan cannot
+ * follow and so raises as a cause: the function used as a value (`items.map(TS.tx)`,
+ * `var t = TS.tx`, `TS.tx.call(…)`, `.apply`, `.bind`), pulled off its head
+ * object by destructuring (`var { tx } = TS`), or reached through a name bound to
+ * that head object (`var T = TS; T.tx(…)`). Only the outermost access of a
+ * chain is judged; the function's own definition (`TS.tx = …`, `function t`) and
+ * a `typeof` test are no use of it.
+ */
+function configuredReferences(ctx: WalkContext, tree: Tree, node: TS.Node, aliases: ReadonlyMap<string, string>): Read[] {
+  const { ts, lineOf } = ctx;
+  const { sf, base } = tree;
+  const cause = (at: TS.Node, name: string): Read[] => [
+    { root: CONFIGURED, line: lineOf(base + at.getStart(sf)), text: `${name} used as a value`.slice(0, CAUSE_TEXT), prefixes: [] },
+  ];
+  const names = ctx.configured.map((f) => f.name);
+
+  // `var { tx } = TS`, `({ tx } = TS)`.
+  let pattern: Array<string | null> | null = null;
+  let source: TS.Expression | undefined;
+  if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name)) {
+    source = node.initializer;
+    pattern = node.name.elements.map((el) =>
+      el.dotDotDotToken !== undefined || (el.propertyName !== undefined && !ts.isIdentifier(el.propertyName) && !ts.isStringLiteral(el.propertyName))
+        ? null
+        : el.propertyName === undefined
+          ? ts.isIdentifier(el.name)
+            ? el.name.text
+            : null
+          : (el.propertyName as TS.Identifier | TS.StringLiteral).text,
+    );
+  } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isObjectLiteralExpression(unwrap(ts, node.left))) {
+    source = node.right;
+    pattern = (unwrap(ts, node.left) as TS.ObjectLiteralExpression).properties.map((prop) =>
+      ts.isShorthandPropertyAssignment(prop) ? prop.name.text : ts.isPropertyAssignment(prop) && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) ? prop.name.text : null,
+    );
+  }
+  if (pattern !== null && source !== undefined) {
+    const head = calleeName(ts, source);
+    const root = head === undefined ? undefined : (aliases.get(head) ?? head);
+    const out: Read[] = [];
+    for (const name of names) {
+      const split = splitName(name);
+      // A member that is not named (a rest element, a computed key) may be the function.
+      if (split !== null && split.head === root && pattern.some((member) => member === null || member === split.last)) out.push(...cause(node, name));
+    }
+    return out;
+  }
+
+  if (!(ts.isIdentifier(node) ? isReference(ts, node) : ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))) return [];
+  const top = climb(ts, node as TS.Expression);
+  const up = top.parent;
+  // Only the outermost access of a chain: `TS.tx` inside `TS.tx.call` is judged there.
+  if ((ts.isPropertyAccessExpression(up) || ts.isElementAccessExpression(up)) && up.expression === top) return [];
+  const written = calleeName(ts, node as TS.Expression);
+  if (written === undefined) return [];
+  // A name bound to the head object stands for it.
+  const dot = written.indexOf('.');
+  const alias = aliases.get(dot < 0 ? written : written.slice(0, dot));
+  const name = alias !== undefined && dot >= 0 ? `${alias}${written.slice(dot)}` : written;
+  const method = /\.(?:call|apply|bind)$/.test(name) ? name.replace(/\.(?:call|apply|bind)$/, '') : undefined;
+  const fn = names.find((candidate) => candidate === name);
+  if (method !== undefined && names.includes(method)) return cause(node, method);
+  if (fn === undefined) return [];
+  if (alias !== undefined) return cause(node, fn);
+  // A bare name the file declares itself (a parameter `t`, a local `t`) is that declaration, whose own initializer is judged where it is written.
+  if (ts.isIdentifier(node) && resolveLocal(ts, node) !== null) return [];
+  if (ts.isCallExpression(up) && up.expression === top) return [];
+  if (ts.isBinaryExpression(up) && up.operatorToken.kind === ts.SyntaxKind.EqualsToken && up.left === top) return [];
+  if (ts.isTypeOfExpression(up)) return [];
+  return cause(node, fn);
 }
 
 /**
@@ -1430,7 +1556,15 @@ function widen(ctx: WalkContext, from: TS.Expression): TS.Expression {
  * is a candidate of its own, judged under the root `<root>()`.
  */
 function classify(ctx: WalkContext, scope: Scope, tree: Tree, id: TS.Identifier, root: string): Read[] {
+  const reads = classifyReference(ctx, scope, tree, id, root);
+  // Whatever global a once-assigned answer leaned on while these reads were built stays with them.
+  if (ctx.leaned.size > 0) for (const read of reads) read.global = [...ctx.leaned];
+  return reads;
+}
+
+function classifyReference(ctx: WalkContext, scope: Scope, tree: Tree, id: TS.Identifier, root: string): Read[] {
   const { ts } = ctx;
+  ctx.leaned.clear();
   const use = widen(ctx, id);
   const out = classifyUse(ctx, scope, tree, use, root);
   const p = use.parent;
@@ -1622,7 +1756,7 @@ function placement(ctx: WalkContext, arg: TS.Expression): 'keys' | { name: strin
     return isLiteral(ts, u) && ctx.declared.has(u.text);
   };
   const constInit = (id: TS.Identifier): TS.Expression | undefined => {
-    const local = resolveLocal(ts, id);
+    const local = localOf(ctx, id);
     return local?.kind === 'const' && local.init !== undefined ? unwrap(ts, local.init) : undefined;
   };
   const keyArray = (node: TS.Expression): boolean => {
@@ -1638,7 +1772,7 @@ function placement(ctx: WalkContext, arg: TS.Expression): 'keys' | { name: strin
   };
 
   if (ts.isIdentifier(at)) {
-    const local = resolveLocal(ts, at);
+    const local = localOf(ctx, at);
     if (local === null) return null;
     if (local.kind === 'const') return isKey(local.init) ? 'keys' : null;
     if (local.kind === 'forof') return keyArray(local.stmt.expression) ? 'keys' : null;
@@ -1812,7 +1946,7 @@ function prefixesOfSiblings(ctx: WalkContext, args: readonly TS.Expression[], us
       return;
     }
     if (hop && ts.isIdentifier(at) && isReference(ts, at)) {
-      const local = resolveLocal(ts, at);
+      const local = localOf(ctx, at);
       if (local?.kind === 'const' && local.init !== undefined) {
         list(local.init, false);
         return;
@@ -1833,7 +1967,7 @@ function opening(ctx: WalkContext, node: TS.Expression, hop: boolean): string | 
   if (ts.isTemplateExpression(at)) return at.head.text;
   if (ts.isBinaryExpression(at) && at.operatorToken.kind === ts.SyntaxKind.PlusToken) return opening(ctx, at.left, hop);
   if (hop && ts.isIdentifier(at) && isReference(ts, at)) {
-    const local = resolveLocal(ts, at);
+    const local = localOf(ctx, at);
     if (local?.kind === 'const' && local.init !== undefined) return opening(ctx, local.init, false);
   }
   return undefined;
@@ -1846,7 +1980,7 @@ function prefixes(ctx: WalkContext, heads: readonly string[]): string[] {
 }
 
 type Local =
-  | { kind: 'const'; init: TS.Expression | undefined }
+  | { kind: 'const'; init: TS.Expression | undefined; /** Set for a top-level `var` or `let` of a classic script: a global, which another script may reassign. */ global?: string }
   | { kind: 'param'; fn: TS.SignatureDeclaration; index: number }
   | { kind: 'forof'; stmt: TS.ForOfStatement }
   | { kind: 'other' };
@@ -1857,15 +1991,36 @@ function patternDeclares(ts: typeof import('typescript'), pattern: TS.BindingNam
   return pattern.elements.some((el) => !ts.isOmittedExpression(el) && patternDeclares(ts, el.name, name));
 }
 
-/** The names a file assigns to after their declaration (`x = …`, `x += …`, `x++`, `for (x in …)`), computed once per tree. */
+/** How many variable declarations in `scope` (function boundaries aside) declare `name`: a second `var k` in the same scope is a reassignment. */
+function declarationsIn(ts: typeof import('typescript'), scope: TS.Node, name: string): number {
+  let count = 0;
+  const visit = (node: TS.Node): void => {
+    if (ts.isVariableDeclaration(node) && patternDeclares(ts, node.name, name)) count += 1;
+    if (!ts.isFunctionLike(node) || node === scope) ts.forEachChild(node, visit);
+  };
+  visit(scope);
+  return count;
+}
+
+/** The names a file assigns to after their declaration (`x = …`, `x += …`, `x++`, `({ x } = …)`, `[x] = …`, `for (x in …)`), computed once per tree. */
 const ASSIGNED = new WeakMap<TS.SourceFile, Set<string>>();
-function reassigned(ts: typeof import('typescript'), sf: TS.SourceFile, name: string): boolean {
+function assignedNames(ts: typeof import('typescript'), sf: TS.SourceFile): Set<string> {
   let names = ASSIGNED.get(sf);
   if (names === undefined) {
     const found = new Set<string>();
+    // The names an assignment target binds: an identifier, or those inside an array or object pattern, a default or a rest.
     const target = (e: TS.Expression): void => {
       const at = unwrap(ts, e);
       if (ts.isIdentifier(at)) found.add(at.text);
+      else if (ts.isArrayLiteralExpression(at)) {
+        for (const el of at.elements) target(ts.isSpreadElement(el) ? el.expression : el);
+      } else if (ts.isObjectLiteralExpression(at)) {
+        for (const prop of at.properties) {
+          if (ts.isShorthandPropertyAssignment(prop)) found.add(prop.name.text);
+          else if (ts.isPropertyAssignment(prop)) target(prop.initializer);
+          else if (ts.isSpreadAssignment(prop)) target(prop.expression);
+        }
+      } else if (ts.isBinaryExpression(at) && at.operatorToken.kind === ts.SyntaxKind.EqualsToken) target(at.left);
     };
     const walk = (node: TS.Node): void => {
       if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) target(node.left);
@@ -1876,7 +2031,27 @@ function reassigned(ts: typeof import('typescript'), sf: TS.SourceFile, name: st
     walk(sf);
     ASSIGNED.set(sf, (names = found));
   }
-  return names.has(name);
+  return names;
+}
+
+const reassigned = (ts: typeof import('typescript'), sf: TS.SourceFile, name: string): boolean => assignedNames(ts, sf).has(name);
+
+/**
+ * What a tree adds to its file's globals: every name it assigns, and — when it
+ * is a classic script, not a module — the names it declares at its top level.
+ * Another file's once-assigned rule reads them (`touchedElsewhere`).
+ */
+function noteGlobals(ts: typeof import('typescript'), sf: TS.SourceFile, facts: FileFacts): void {
+  for (const name of assignedNames(ts, sf)) facts.assigns.add(name);
+  if (ts.isExternalModule(sf)) return;
+  const bind = (pattern: TS.BindingName): void => {
+    if (ts.isIdentifier(pattern)) facts.topNames.add(pattern.text);
+    else for (const el of pattern.elements) if (!ts.isOmittedExpression(el)) bind(el.name);
+  };
+  for (const stmt of sf.statements) {
+    if (ts.isVariableStatement(stmt)) for (const decl of stmt.declarationList.declarations) bind(decl.name);
+    else if (ts.isFunctionDeclaration(stmt) && stmt.name !== undefined) facts.topNames.add(stmt.name.text);
+  }
 }
 
 /**
@@ -1896,6 +2071,13 @@ function ownFunction(ts: typeof import('typescript'), decl: TS.FunctionDeclarati
   const defaulted = sf.statements.some((stmt) => ts.isExportAssignment(stmt) && ts.isIdentifier(unwrap(ts, stmt.expression)) && (unwrap(ts, stmt.expression) as TS.Identifier).text === name);
   if (listed || defaulted) return false;
   return statement.parent !== sf || ts.isExternalModule(sf);
+}
+
+/** `resolveLocal`, noting on the context the global a once-assigned answer leans on. */
+function localOf(ctx: WalkContext, id: TS.Identifier): Local | null {
+  const local = resolveLocal(ctx.ts, id);
+  if (local?.kind === 'const' && local.global !== undefined) ctx.leaned.add(local.global);
+  return local;
 }
 
 /** The declaration an identifier refers to, by the nearest enclosing scope that declares its name; null where none in the file does. */
@@ -1925,8 +2107,11 @@ function resolveLocal(ts: typeof import('typescript'), id: TS.Identifier): Local
         if (ts.isVariableStatement(stmt)) {
           for (const decl of stmt.declarationList.declarations) {
             if (!patternDeclares(ts, decl.name, name)) continue;
-            const isConst = (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0 || (decl.initializer !== undefined && !reassigned(ts, id.getSourceFile(), name));
-            return isConst && ts.isIdentifier(decl.name) ? { kind: 'const', init: decl.initializer } : { kind: 'other' };
+            const declaredConst = (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0;
+            // Declared again in this scope, or assigned later: not once-assigned.
+            const isConst = declaredConst || (decl.initializer !== undefined && !reassigned(ts, id.getSourceFile(), name) && declarationsIn(ts, scope, name) === 1);
+            if (!isConst || !ts.isIdentifier(decl.name)) return { kind: 'other' };
+            return { kind: 'const', init: decl.initializer, ...(!declaredConst && ts.isSourceFile(scope) && !ts.isExternalModule(scope) ? { global: name } : {}) };
           }
         } else if ((ts.isFunctionDeclaration(stmt) || ts.isClassDeclaration(stmt) || ts.isEnumDeclaration(stmt)) && stmt.name?.text === name) {
           return { kind: 'other' };

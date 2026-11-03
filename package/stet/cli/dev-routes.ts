@@ -58,7 +58,7 @@ import {
 } from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
-import { codeOf, dialectCode, KEY_READ, keyPattern, longerKeyAt, nonCodeOf, within, type Span } from './key-reads.js';
+import { codeOf, dialectCode, KEY_READ, keyPattern, nonCodeOf, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
 import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache, type UsagePrefix } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
@@ -70,7 +70,7 @@ import { loadStatus, type StatusFile } from './status.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { elementPath, HTML_COMMENT, markupBraces, maskExpressions, readAttrs, selfClosedRaw } from './markup.js';
-import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, packageNames, richPartsBindingAt, scriptKindFor } from './source-scan.js';
+import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, occurrenceIsKey, packageNames, richPartsBindingAt, scriptKindFor } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -2112,7 +2112,11 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
       .filter(([, def]) => def.shape === 'text' && def.target === DEFAULT_TARGET && def.derivesFrom === undefined)
       .map(([key]) => key);
     const scripts = documentScripts(ready.path, document);
-    if (scripts.files.length === 0 && !scripts.missing) {
+    // The document's own code: its inline scripts and the handlers its tags carry.
+    const inline = dialectCode(document.source, 'html')
+      .scripts.map((span) => document.source.slice(span.start, span.end))
+      .filter((text) => text.trim() !== '');
+    if (scripts.files.length === 0 && !scripts.missing && inline.length === 0) {
       return json({ route, files: [document.file], keys: [...keys].sort(), complete: webText.every((key) => marked.has(key)), renders: {}, coincident: [] });
     }
     const ts = await loadTypescript();
@@ -2126,8 +2130,11 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
     const declaredKeys = Object.keys(ready.descriptor.keys);
     const reads = await siteReads(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path));
     const under = (prefixes: readonly UsagePrefix[]): string[] => declaredKeys.filter((key) => prefixes.some((p) => key.startsWith(p.prefix)));
+    // The files stet writes name every key and read none: a copy table or a generated file a page loads is no script to follow.
+    const own = ownFiles(ready.config, ready.path);
+    const followed = chain.files.filter((file) => !own.has(file.rel) && !isGenerated(file.text));
     let complete = !chain.boundary && !scripts.missing;
-    for (const rel of [document.file, ...chain.files.map((file) => file.rel)]) {
+    for (const rel of [document.file, ...followed.map((file) => file.rel)]) {
       const read = reads.files.get(rel);
       // A script the scan did not read (ignored by git, outside the source extensions): its reads are not known.
       if (read === undefined) {
@@ -2137,7 +2144,8 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
       for (const key of [...read.named, ...under(read.prefixes)]) keys.add(key);
       if (read.causes.length > 0) complete = false;
     }
-    for (const file of chain.files) if (loadsScripts(ts, file.rel, file.text)) complete = false;
+    for (const text of inline) if (loadsScripts(ts, `${document.file}.js`, text) || importsLazily(ts, `${document.file}.js`, text)) complete = false;
+    for (const file of followed) if (loadsScripts(ts, file.rel, file.text) || importsLazily(ts, file.rel, file.text)) complete = false;
     // Every web text key is marked somewhere or named by the source; one neither is rendered by something stet does not read.
     const named = new Set<string>();
     for (const read of reads.files.values()) for (const key of [...read.named, ...under(read.prefixes)]) named.add(key);
@@ -2273,32 +2281,49 @@ export function documentScripts(cwd: string, document: Document): { files: strin
 }
 
 /**
- * Whether a script loads another one the route reads cannot follow: it creates
- * a script element (`createElement('script')`), assigns or sets a `src`, or
- * calls `importScripts` — the static arm's `importsLazily`. A library loaded
- * from a list of files this way is read by nothing, so the route is incomplete.
+ * Whether any node of a file, parsed as its extension says, satisfies `pred`;
+ * true where the file nests past the compiler's recursion, since it is then not
+ * known to be free of one.
  */
-export function loadsScripts(ts: typeof import('typescript'), rel: string, text: string): boolean {
-  if (!/\bcreateElement\b|\.src\b|\bimportScripts\b|\bsetAttribute\b/.test(text)) return false;
+function anyNode(ts: typeof import('typescript'), rel: string, text: string, pred: (node: TS.Node) => boolean): boolean {
   const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
-  const literal = (node: TS.Node | undefined, value: string): boolean =>
-    node !== undefined && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && node.text.toLowerCase() === value;
-  const found = (node: TS.Node): boolean =>
-    (ts.isCallExpression(node) &&
-      ((ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'createElement' && literal(node.arguments[0], 'script')) ||
-        (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'setAttribute' && literal(node.arguments[0], 'src')) ||
-        (ts.isIdentifier(node.expression) && node.expression.text === 'importScripts'))) ||
-    (ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      ts.isPropertyAccessExpression(node.left) &&
-      node.left.name.text === 'src') ||
-    ts.forEachChild(node, found) === true;
+  const found = (node: TS.Node): boolean => pred(node) || ts.forEachChild(node, found) === true;
   try {
     return found(sf);
   } catch (error) {
-    if (error instanceof RangeError) return true; // too deeply nested to read: not known to be free of one
+    if (error instanceof RangeError) return true;
     throw error;
   }
+}
+
+/**
+ * Whether a script loads another one the route reads cannot follow: it creates
+ * a script element (`createElement('script')`) or one by a computed name, assigns
+ * or sets a `src` or an attribute by a computed name, writes a string holding a
+ * `<script` tag, runs `eval` or `new Function`, or calls `importScripts` — the
+ * static arm's `importsLazily`. A library loaded from a list of files this way
+ * is read by nothing, so the route is incomplete.
+ */
+export function loadsScripts(ts: typeof import('typescript'), rel: string, text: string): boolean {
+  if (!/\bcreateElement\b|\.src\b|\bimportScripts\b|\bsetAttribute\b|<script|\beval\b|\bFunction\b/i.test(text)) return false;
+  const literal = (node: TS.Node | undefined, value?: string): boolean =>
+    node !== undefined && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && (value === undefined || node.text.toLowerCase() === value);
+  return anyNode(ts, rel, text, (node) => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
+      return /<script/i.test(node.text);
+    }
+    if (ts.isIdentifier(node)) return node.text === 'eval';
+    if ((ts.isNewExpression(node) || ts.isCallExpression(node)) && ts.isIdentifier(node.expression) && node.expression.text === 'Function') return true;
+    if (ts.isCallExpression(node)) {
+      if (ts.isIdentifier(node.expression)) return node.expression.text === 'importScripts';
+      if (!ts.isPropertyAccessExpression(node.expression)) return false;
+      const first = node.arguments[0];
+      if (node.expression.name.text === 'createElement') return !literal(first) || literal(first, 'script');
+      if (node.expression.name.text === 'setAttribute') return !literal(first) || literal(first, 'src');
+      return false;
+    }
+    return ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isPropertyAccessExpression(node.left) && node.left.name.text === 'src';
+  });
 }
 
 /**
@@ -2307,23 +2332,18 @@ export function loadsScripts(ts: typeof import('typescript'), rel: string, text:
  */
 export function importsLazily(ts: typeof import('typescript'), rel: string, text: string): boolean {
   if (!/\b(?:import|require)\s*\(|\bimport\.meta\.glob|\bAstro\.glob/.test(text)) return false;
-  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
   const globbed = (callee: TS.Expression): boolean =>
     ts.isPropertyAccessExpression(callee) &&
     callee.name.text === 'glob' &&
     (ts.isMetaProperty(callee.expression) || (ts.isIdentifier(callee.expression) && callee.expression.text === 'Astro'));
-  const found = (node: TS.Node): boolean =>
-    (ts.isCallExpression(node) &&
-      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
-        (ts.isIdentifier(node.expression) && node.expression.text === 'require') ||
-        globbed(node.expression))) ||
-    ts.forEachChild(node, found) === true;
-  try {
-    return found(sf);
-  } catch (error) {
-    if (error instanceof RangeError) return true; // too deeply nested to read: not known to be free of one
-    throw error;
-  }
+  return anyNode(
+    ts,
+    rel,
+    text,
+    (node) =>
+      ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === 'require') || globbed(node.expression)),
+  );
 }
 
 /**
@@ -2571,7 +2591,7 @@ export function renderSites(ts: typeof import('typescript'), file: string, sourc
   for (const [key, entry] of out) {
     if (entry.open) continue;
     let named = 0;
-    for (const m of source.matchAll(keyPattern(key, 'g'))) if (longerKeyAt(source, m.index, key, declared) === null && inCode(m.index)) named += 1;
+    for (const m of source.matchAll(keyPattern(key, 'g'))) if (occurrenceIsKey(source, m.index, key, declared) && inCode(m.index)) named += 1;
     if (named > (classified.get(key) ?? 0)) entry.open = true;
   }
   return out;

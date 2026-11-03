@@ -251,14 +251,14 @@ function remedyOf(
       if (emptyKey(context, pageKey)) return { text: `${pageKey} is empty`, place: false, key: pageKey };
       const tag = title ? 'title' : 'description';
       if (context.router === 'html' && context.page !== null) {
-        const [bound] = numberNames([`${context.page}_${title ? 'page_title' : 'meta_description'}`], (n) => Object.hasOwn(context.descriptor.keys, n));
+        const [bound] = numberNames([`${context.page}${context.joiner ?? '_'}${title ? 'page_title' : 'meta_description'}`], (n) => Object.hasOwn(context.descriptor.keys, n));
         return { text: `${file} has no ${tag} ${viaFix}, bound to ${bound as string}`, place: false, key: bound as string };
       }
       if ((context.router === 'app' || context.router === 'pages') && context.file !== null) {
         return { text: `set ${tag} in the metadata export of ${context.file}`, place: false };
       }
       if (context.router === 'astro' && context.file !== null && context.page !== null) {
-        const [bound] = numberNames([`${context.page}_${title ? 'page_title' : 'meta_description'}`], (n) => Object.hasOwn(context.descriptor.keys, n));
+        const [bound] = numberNames([`${context.page}${context.joiner ?? '_'}${title ? 'page_title' : 'meta_description'}`], (n) => Object.hasOwn(context.descriptor.keys, n));
         const element = title ? `<title data-stet="${bound as string}"></title>` : `<meta name="description" content="" data-stet-content="${bound as string}">`;
         return { text: `add ${element} to ${context.file}`, place: false, key: bound as string };
       }

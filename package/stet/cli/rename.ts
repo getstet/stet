@@ -916,7 +916,6 @@ export async function htmlRenames(
   const ts = await loadTypescript();
   const declared = new Set(Object.keys(descriptor.keys));
   const out: HostRenames = { ...marks, edited: [...marks.edited], listed: [] };
-  const here = (o: Occurrence): boolean => only === undefined || (o.file === only.file && o.line === only.line);
   for (const rel of usageFiles(cwd, config)) {
     const prior = out.edited.findIndex((e) => e.rel === rel);
     let source: string;
@@ -925,15 +924,8 @@ export async function htmlRenames(
     } catch {
       continue;
     }
-    const found = planReadRenames({ ts, file: rel, source, dialect: dialectOf(rel), renames, isStetModule: () => false, copyModule: false, declared, functions });
-    const rewritten = found.rewritten.filter(here);
-    const edits = only === undefined ? found.edits : found.edits.filter((e) => rewritten.some((o) => o.at === e.pos));
-    out.rewritten.push(...rewritten);
-    out.blocked.push(...found.blocked.filter(here));
-    out.mentions.push(...found.mentions.filter(here));
-    out.unparsed.push(...found.unparsed.filter(here));
-    if (edits.length === 0) continue;
-    const text = applyFileEdits(source, edits);
+    const text = planFileRenames(out, { ts, file: rel, source, dialect: dialectOf(rel), renames, isStetModule: () => false, copyModule: false, declared, functions }, only);
+    if (text === null) continue;
     const before = prior === -1 ? source : readFileSync(join(cwd, rel), 'utf8');
     const entry = { rel, text, diff: formatDiff(rel, before, text) };
     if (prior === -1) out.edited.push(entry);
@@ -983,29 +975,40 @@ export async function readRenames(
     } catch {
       continue;
     }
-    const found = planReadRenames({
-      ts,
-      file: rel,
-      source,
-      dialect: dialectOf(rel),
-      renames,
-      isStetModule: isStetModule(rel),
-      copyModule: config.copyModules.some((glob) => matchGlob(glob, rel)),
-      declared,
-      functions: config.reads?.functions ?? [],
-    });
-    const here = (o: Occurrence): boolean => only === undefined || (o.file === only.file && o.line === only.line);
-    const rewritten = found.rewritten.filter(here);
-    // `planReadRenames` pushes a rewrite's occurrence and its edit at one position.
-    const edits = only === undefined ? found.edits : found.edits.filter((e) => rewritten.some((o) => o.at === e.pos));
-    out.rewritten.push(...rewritten);
-    out.blocked.push(...found.blocked.filter(here));
-    out.mentions.push(...found.mentions.filter(here));
-    out.unparsed.push(...found.unparsed.filter(here));
-    if (edits.length > 0) {
-      const text = applyFileEdits(source, edits);
-      out.edited.push({ rel, text, diff: formatDiff(rel, source, text) });
-    }
+    const text = planFileRenames(
+      out,
+      {
+        ts,
+        file: rel,
+        source,
+        dialect: dialectOf(rel),
+        renames,
+        isStetModule: isStetModule(rel),
+        copyModule: config.copyModules.some((glob) => matchGlob(glob, rel)),
+        declared,
+        functions: config.reads?.functions ?? [],
+      },
+      only,
+    );
+    if (text !== null) out.edited.push({ rel, text, diff: formatDiff(rel, source, text) });
   }
   return out;
+}
+
+/**
+ * One file's reads sorted by `planReadRenames` into `out` — with `only`, the
+ * occurrences at that file and line alone, a rewritten one keeping its edit
+ * (the position both carry) — and the file's text with its edits applied, null
+ * where none applies.
+ */
+function planFileRenames(out: HostRenames, input: Parameters<typeof planReadRenames>[0], only: OnlyAt | undefined): string | null {
+  const found = planReadRenames(input);
+  const here = (o: Occurrence): boolean => only === undefined || (o.file === only.file && o.line === only.line);
+  const rewritten = found.rewritten.filter(here);
+  const edits = only === undefined ? found.edits : found.edits.filter((e) => rewritten.some((o) => o.at === e.pos));
+  out.rewritten.push(...rewritten);
+  out.blocked.push(...found.blocked.filter(here));
+  out.mentions.push(...found.mentions.filter(here));
+  out.unparsed.push(...found.unparsed.filter(here));
+  return edits.length === 0 ? null : applyFileEdits(input.source, edits);
 }
