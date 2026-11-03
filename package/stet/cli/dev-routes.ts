@@ -17,8 +17,8 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { closeSync, existsSync, openSync, readFileSync, realpathSync, utimesSync } from 'node:fs';
-import { dirname, join, posix, relative, sep } from 'node:path';
+import { closeSync, existsSync, openSync, readFileSync, utimesSync } from 'node:fs';
+import { dirname, join, posix } from 'node:path';
 
 import type * as TS from 'typescript';
 
@@ -61,7 +61,7 @@ import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
 import { codeOf, dialectCode, KEY_READ, keyPattern, nonCodeOf, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
-import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache, type UsagePrefix } from './key-usage.js';
+import { declaresAlias, documentScripts, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache, type UsagePrefix } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
 import { applyPages, auditablePages, fileRoute, pagesCompiler, proposeForHost, routeFiles, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
@@ -70,7 +70,7 @@ import { keyMoveWrites, type HostRenames } from './rename.js';
 import { approveKeys, gitUserName, loadStatus, resetChanged, statusOf, trackedStatus, type StatusFile } from './status.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
-import { elementPath, HTML_COMMENT, markupBraces, maskExpressions, readAttrs, selfClosedRaw } from './markup.js';
+import { elementPath, markupBraces, maskExpressions, selfClosedRaw } from './markup.js';
 import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, occurrenceIsKey, packageNames, richPartsBindingAt, scriptKindFor } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
@@ -2341,41 +2341,6 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
     })
     .sort();
   return json({ route, files, keys: [...keys].sort(), complete, renders, coincident });
-}
-
-/**
- * The scripts a static document loads that the route reads follow: each
- * `<script src>` whose URL is same-origin, resolved against the document's own
- * path as the static arm serves it, and lands on a file inside the checkout
- * (`servableFile`). `missing` where a same-origin script names no such file —
- * a built asset, say — whose reads stet cannot know.
- */
-export function documentScripts(cwd: string, document: Document): { files: string[]; missing: boolean } {
-  const files: string[] = [];
-  let missing = false;
-  // `servableFile` answers the real path, so the checkout's own is the base its paths are relative to.
-  const root = realpathSync(cwd);
-  // The reader blanks a script whole, tag and body, so the tags are read off the source, comments aside, each body skipped.
-  const source = document.source.replace(HTML_COMMENT, (comment) => ' '.repeat(comment.length));
-  const open = /<script\b([^>]*)>/gi;
-  for (let m = open.exec(source); m !== null; m = open.exec(source)) {
-    const close = source.toLowerCase().indexOf('</script', open.lastIndex);
-    const src = readAttrs(source, m.index + '<script'.length, m[1] as string).find((a) => a.name === 'src')?.value.trim();
-    if (close !== -1) open.lastIndex = close;
-    if (src === undefined || src === '') continue;
-    let url: URL;
-    try {
-      url = new URL(src, `http://stet.invalid/${document.file}`);
-    } catch {
-      continue;
-    }
-    if (url.origin !== 'http://stet.invalid') continue;
-    const abs = servableFile(cwd, url.pathname);
-    const rel = abs === null ? null : relative(root, abs).split(sep).join('/');
-    if (rel === null) missing = true;
-    else if (!files.includes(rel)) files.push(rel);
-  }
-  return { files, missing };
 }
 
 /**
