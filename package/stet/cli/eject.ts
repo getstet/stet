@@ -41,7 +41,7 @@ import {
   planGuidanceRemoval,
 } from './agents.js';
 import { flag, ENV_OPTION, noPositionals, parse, text as argText } from './args.js';
-import { writeJsonDeterministic, writeText } from './artifacts.js';
+import { asUpdate, planJson, planWrite, rethrowBatchFailure, writeJsonDeterministic, writePlanned, writeText } from './artifacts.js';
 import {
   CONFIG_FILE,
   HOST_MIGRATIONS,
@@ -52,16 +52,19 @@ import {
   selectStoreBlock,
   type StetConfig,
 } from './config.js';
+import { planAstroUnrewrite } from './astro-rewrite.js';
 import { planDocuments, stripMarks } from './html-host.js';
 import { removeFromGate } from './hook.js';
+import { stetModuleTest } from './key-reads.js';
+import { unraw } from './markup.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence } from './project.js';
 import { unmountEdits } from './provider-mount.js';
 import { walk } from './pages.js';
 import { CliError, Report, collapseLines, posixRelative } from './report.js';
-import { applyFileEdits, dominantEol, formatDiff, unRewriteFile, type Edit } from './rewrite.js';
+import { applyFileEdits, dominantEol, formatDiff, jsxUnrewrittenClean, landedAt, unRewriteFile, UNREWRITE_UNCLEAN, type Edit } from './rewrite.js';
 import { filesForGlobs } from './scan.js';
-import { TS7_REFUSAL, isDialectFile, loadTypescript, matchGlob, scanSource, scriptKindFor } from './source-scan.js';
+import { isDialectFile, loadTypescript, matchGlob, scanSource, scriptKindFor } from './source-scan.js';
 import { isStoreBacked } from './store.js';
 
 const HISTORY_FILE = 'stet-history.json';
@@ -108,11 +111,17 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       surfaceText.set(file, readFileSync(abs, 'utf8'));
     }
     // The compiler-less probe that decides whether typescript is needed at all.
-    // A register rewrite always inserts an import this pattern matches, and the
+    // A JSX register rewrite always inserts an import this pattern matches, and the
     // provider mount hangs off `import { CopyProvider } from '@getstet/stet/react'` — so
-    // zero matching HOST files is provably nothing to un-rewrite.
+    // zero matching HOST files is provably nothing to un-rewrite. An Astro file
+    // register rewrote by property reads through a declared copy module, which
+    // it imported already, so that import counts too (D15).
+    const copyModule = stetModuleTest(io.cwd, filesForGlobs(io.cwd, config.copyModules));
     const importers = [...surfaceText]
-      .filter(([file, text]) => !stetWritten.has(file) && stetImports.test(text))
+      .filter(
+        ([file, text]) =>
+          !stetWritten.has(file) && (stetImports.test(text) || (file.endsWith('.astro') && importSpecifiers(text).some(copyModule(file)))),
+      )
       .map(([file]) => file);
     // typescript is loaded BEFORE anything is written — its absence must abort
     // at the plan, not halfway through — and only where there is something to
@@ -129,17 +138,15 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
       try {
         ts = await loadTypescript();
       } catch (error) {
-        // A resolved-but-API-less typescript is a different fault with its own
-        // remedy; only an ABSENT compiler routes to the count-and-refuse path.
-        if (!(error instanceof CliError) || error.message === TS7_REFUSAL) throw error;
+        if (!(error instanceof CliError)) throw error;
         if (write) {
           throw new CliError(
             `eject --write cannot reverse the accessor calls without typescript: ${importers.length} ` +
-              'file(s) import stet or the read path. Install it (npm i -D typescript) and re-run',
+              'file(s) import stet or the read path. Reinstall stet (npm i @getstet/stet) and re-run',
           );
         }
         report.line(
-          'un-rewrite: unverifiable — typescript is not installed ' +
+          "un-rewrite: unverifiable — stet's TypeScript compiler did not load " +
             `(${importers.length} file(s) import the accessor)`,
         );
       }
@@ -176,10 +183,32 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
     // refusals can collapse to one line. They flush as one block below, above
     // the closing lines instead of interleaved with the diffs.
     const refusals: string[] = [];
+    // A file whose reads eject cannot prove: named with its reason here, and a
+    // survivor below, so the run refuses before any write (D15).
+    const unproven: string[] = [];
+    const refuse = (file: string, reason: string): void => {
+      unproven.push(file);
+      report.line(`${file}: ${reason} — restore its reads by hand, then re-run eject`);
+    };
     let leaves = 0;
     if (ts !== null) {
       for (const [file, source] of surfaceText) {
         const abs = join(io.cwd, file);
+        // An Astro file is read by the Astro un-rewrite, never by the TSX walk, which refuses it.
+        if (file.endsWith('.astro')) {
+          const planned = planAstroUnrewrite({ ts, cwd: io.cwd, config, file, source, values });
+          if ('refused' in planned) {
+            refuse(file, planned.refused);
+            continue;
+          }
+          if (planned.edits.length === 0) continue;
+          edited.set(file, planned.edited);
+          leaves += planned.reads;
+          report.line(`${file}: un-rewrite`);
+          const diff = formatDiff(file, source, planned.edited);
+          if (diff !== '') report.line(diff);
+          continue;
+        }
         const result = await scanSource(file, source, { readPathImport: config.readPath.import });
         // `undefined === file` is never true, so an Astro host's absent layout
         // simply matches nothing and the unwrap path is unreachable.
@@ -204,6 +233,10 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
         const inBlock = (span: { pos: number; end: number }): boolean => exact !== null && span.pos >= exact.block.pos && span.end <= exact.block.end;
         const spans = [...result.stetImportSpans, ...result.copyDeclSpans].filter((span) => !inBlock(span));
         const un = unRewriteFile(source, result.accessorCalls, values, spans);
+        if (un.refused !== undefined) {
+          refuse(file, un.refused);
+          continue;
+        }
         for (const call of un.skipped) foreign.push(`${file}: left copy('${call.key}') untouched — a foreign copy binding, not stet's`);
         const extra: Edit[] = [];
         if (exact !== null) {
@@ -217,6 +250,15 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
         const combined = [...un.edits, ...extra];
         if (combined.length === 0) continue;
         const out = applyFileEdits(source, combined);
+        // Each sentence put back reads back as its key's value, where it landed.
+        const restored = un.sentences.map(({ edit, value }) => {
+          const at = landedAt(combined, edit);
+          return { at, end: at + edit.text.length, value };
+        });
+        if (restored.length > 0 && !(await jsxUnrewrittenClean(ts, file, out, restored))) {
+          refuse(file, UNREWRITE_UNCLEAN);
+          continue;
+        }
         edited.set(file, out);
         leaves += result.accessorCalls.length - un.skipped.length;
         report.line(`${file}: un-rewrite${isLayout ? ' + unwrap CopyProvider' : ''}`);
@@ -271,6 +313,7 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
     // line and the survivors refusal. The zero-shape keeps its kept lines —
     // there the compiler was never needed, so the verdict stands.
     const unverifiable = ts === null && importers.length > 0;
+    survivors.push(...unproven);
     const kept = unverifiable ? [] : deletions.filter((rel) => (deletionConsumers.get(rel)?.length ?? 0) > 0);
     const removable = deletions.filter((rel) => !kept.includes(rel));
     for (const rel of removable) report.line(`delete ${rel}`);
@@ -313,10 +356,18 @@ export async function runEject(args: string[], io: CliIo): Promise<number> {
     // (1) The snapshot + regenerated defaults and resolved modules.
     report.line(`snapshot: ${Object.keys(merged[config.locales.default] ?? {}).length} default key(s) → ${config.snapshotPath}, + ${config.codegen.defaults}`);
     if (write) {
-      writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
-      writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged));
-      writeText(join(io.cwd, config.codegen.resolved), generateResolvedModule(descriptor, merged));
-      for (const [file, out] of edited) writeText(join(io.cwd, file), out);
+      // ONE batch, with rollback: the snapshot, the regenerated modules and every
+      // un-rewritten host file land together or not at all. The deletions follow it.
+      try {
+        writePlanned([
+          asUpdate(planJson(join(io.cwd, config.snapshotPath), merged, config.snapshotPath)),
+          asUpdate(planWrite(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged), config.codegen.defaults)),
+          asUpdate(planWrite(join(io.cwd, config.codegen.resolved), generateResolvedModule(descriptor, merged), config.codegen.resolved)),
+          ...[...edited].map(([file, out]) => asUpdate(planWrite(join(io.cwd, file), out, file))),
+        ]);
+      } catch (error) {
+        rethrowBatchFailure('stet eject', error);
+      }
       // `force` because a file already gone is a completed deletion: a racing
       // remove must not throw here, after the snapshot has been written.
       for (const rel of removable) rmSync(join(io.cwd, rel), { force: true });
@@ -556,7 +607,8 @@ function backstop(
     // A consumer is any importer stet did not write itself — eject deletes or
     // regenerates its own files, so those are never what keeps one alive.
     if (!consumers.stetWritten.has(rel)) {
-      for (const spec of importSpecifiers(text)) {
+      // An Astro `is:raw` element's content is text Astro prints as written (a code sample), never an import.
+      for (const spec of importSpecifiers(rel.endsWith('.astro') ? unraw(text) : text)) {
         for (const candidate of resolveSpecifier(spec, rel, cwd, aliases)) {
           const deletion = byTarget.get(candidate);
           if (deletion === undefined || deletion === rel) continue;
@@ -659,8 +711,14 @@ function ejectHtml(d: {
   const keys = Object.keys(merged[config.locales.default] ?? {}).length;
   report.line(`snapshot: ${keys} default key(s) → ${config.snapshotPath}`);
   if (write && refusal === null) {
-    writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
-    for (const [file, text] of stripped) writeText(join(io.cwd, file), text);
+    try {
+      writePlanned([
+        asUpdate(planJson(join(io.cwd, config.snapshotPath), merged, config.snapshotPath)),
+        ...[...stripped].map(([file, text]) => asUpdate(planWrite(join(io.cwd, file), text, file))),
+      ]);
+    } catch (error) {
+      rethrowBatchFailure('stet eject', error);
+    }
   }
 
   // What stays: the config, the descriptor and the snapshot. No registry on

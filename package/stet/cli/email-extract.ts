@@ -56,6 +56,7 @@ import {
   isI18nCall,
   jsxTextSuppression,
   loadTypescript,
+  parseDiagnosticsOf,
   propName,
   scriptKindFor,
   undecodedEntity,
@@ -515,8 +516,7 @@ function proposeFile(ts: typeof import('typescript'), ctx: FileContext): Templat
   const typed = !/\.(js|jsx)$/.test(file);
 
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
-  const diagnostics = (sf as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics ?? [];
-  if (diagnostics.length > 0) {
+  if (parseDiagnosticsOf(sf).length > 0) {
     return skip('no-template-export', 'the compiler could not parse this file cleanly, so nothing in it is readable');
   }
 

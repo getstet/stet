@@ -1,7 +1,8 @@
 /**
- * Doctor's wrapper-chain check where the compiler is not there — the degraded
- * path, in both of the shapes that reach it: a `typescript` carrying no
- * compiler API (TS7's package root), and no `typescript` at all.
+ * Doctor's wrapper-chain check where stet's own compiler is not there — the
+ * degraded path, in the shapes that reach it: a `typescript` carrying no
+ * compiler API (TS7's package root), no `typescript` at all, and one whose
+ * import throws. All three are one broken install and get the one reinstall line.
  *
  * Its own file because `vi.mock` is file-scoped, and this mock must not shadow
  * the real compiler every other chain case parses with (the same reason
@@ -39,7 +40,7 @@ const shapes = vi.hoisted(() => ({
 
 vi.mock('typescript', shapes.ts7);
 
-import { TS7_REFUSAL } from '../cli/source-scan.js';
+import { TS_BROKEN } from '../cli/source-scan.js';
 import {
   MARKETING,
   chainProject as project,
@@ -49,6 +50,9 @@ import {
 } from './helpers/chain-project.js';
 
 afterAll(cleanupChainProjects);
+
+/** The one line a broken install of stet's compiler gets, spelled out. */
+const LINE = 'stet could not load the TypeScript compiler it ships with — reinstall stet: npm i @getstet/stet';
 
 /** Both limits, in the words the line states them in. */
 const LIMITS =
@@ -89,12 +93,12 @@ function unreachableTokenProject(): string {
 }
 
 describe('doctor — the wrapper chain without a compiler', () => {
-  it('gives a TypeScript 7 host the refusal, not an install line', async () => {
+  it('reads a copy with no compiler API as the same broken install', async () => {
     const result = await doctor(unreachableTokenProject());
-    // The host HAS typescript. "not installed (npm i -D typescript)" would name
-    // the one remedy that changes nothing — so the line carries the refusal
-    // `loadTypescript` itself raises, with the version that works.
-    expect(result.out).toContain(`wrapper chains: degraded — ${TS7_REFUSAL}${LIMITS}`);
+    // stet ships its own typescript, so a resolution with no compiler API is a
+    // replaced or damaged install, and the line says to reinstall stet.
+    expect(TS_BROKEN).toBe(LINE);
+    expect(result.out).toContain(`wrapper chains: degraded — ${LINE}${LIMITS}`);
     // One file searched, not two, and the token counted as UNCHECKED.
     expect(result.out).toContain('wrapper chain (welcome): 1 file(s), 1 declared token(s), 1 unchecked');
     // The claim is true, so warning here would be crying wolf.
@@ -102,9 +106,9 @@ describe('doctor — the wrapper chain without a compiler', () => {
     expect(result.code).toBe(0);
   });
 
-  it('states the install remedy where typescript is genuinely absent', async () => {
+  it('states the reinstall line where typescript is absent', async () => {
     const result = await withoutTypescript(async () => doctor(unreachableTokenProject()));
-    expect(result.out).toContain(`wrapper chains: degraded — typescript is not installed (npm i -D typescript)${LIMITS}`);
+    expect(result.out).toContain(`wrapper chains: degraded — ${LINE}${LIMITS}`);
     // The same degraded semantics: the chain is one file, the token it cannot
     // reach is unchecked rather than unfound, and nothing is warned.
     expect(result.out).toContain('wrapper chain (welcome): 1 file(s), 1 declared token(s), 1 unchecked');
@@ -168,37 +172,35 @@ function astroHost(copyModules: string[]): string {
 }
 
 describe('doctor — the compiler scan and register need', () => {
-  const NOT_INSTALLED = (where: string): string =>
-    `typescript: not installed — stet scan and stet register read ${where} with it; npm i -D typescript`;
+  const NOT_LOADED = (where: string): string => `${LINE}. stet scan and stet register read ${where} with it`;
 
-  it('names the copy module and the install where typescript is absent, and exits 0', async () => {
+  it('names the copy module and the reinstall line where typescript is absent, and exits 0', async () => {
     const result = await withoutTypescript(async () => doctor(astroHost(['src/copy.ts'])));
-    expect(result.err).toContain(NOT_INSTALLED('src/copy.ts'));
+    expect(result.err).toContain(NOT_LOADED('src/copy.ts'));
     expect(result.code).toBe(0);
   });
 
   it('counts the other files the compiler would read', async () => {
     const result = await withoutTypescript(async () => doctor(astroHost(['src/copy.ts', 'src/more.ts'])));
-    expect(result.err).toContain(NOT_INSTALLED('src/copy.ts and 1 other file'));
+    expect(result.err).toContain(NOT_LOADED('src/copy.ts and 1 other file'));
     expect(result.code).toBe(0);
   });
 
   it('says nothing where every declared file is a dialect file', async () => {
     const result = await withoutTypescript(async () => doctor(astroHost([])));
-    expect(`${result.out}\n${result.err}`).not.toContain('typescript:');
+    expect(`${result.out}\n${result.err}`).not.toContain(LINE);
     expect(result.code).toBe(0);
   });
 
-  it('reads a typescript whose import throws as not installed, and never stops on it', async () => {
+  it('reads a typescript whose import throws as the same broken install, and never stops on it', async () => {
     const result = await withoutTypescript(async () => doctor(astroHost(['src/copy.ts'])), shapes.broken);
-    expect(result.err).toContain(NOT_INSTALLED('src/copy.ts'));
+    expect(result.err).toContain(NOT_LOADED('src/copy.ts'));
     expect(result.code).toBe(0);
   });
 
-  it('gives a TypeScript 7 host the refusal, not the install line', async () => {
+  it('reads a copy with no compiler API as the same broken install', async () => {
     const result = await doctor(astroHost(['src/copy.ts']));
-    expect(result.err).toContain(`${TS7_REFUSAL} — stet scan and stet register read src/copy.ts with it`);
-    expect(result.err).not.toContain('typescript: not installed');
+    expect(result.err).toContain(NOT_LOADED('src/copy.ts'));
     expect(result.code).toBe(0);
   });
 });

@@ -89,7 +89,10 @@ const EMITTED_FROM_MJS = ['.mts'];
  *
  * A string-literal dynamic `import()` or `require()` is an edge, because a
  * bundler follows both; a computed one throws rather than vanishing, since a
- * guard that silently drops what it cannot read vouches for nothing. A relative
+ * guard that silently drops what it cannot read vouches for nothing. A bare
+ * name passed to a call result (`createRequire(import.meta.url)('x')`) is an
+ * edge too; a loader bound to a variable first (`const load = createRequire(…)`)
+ * is not followed. A relative
  * specifier that resolves to no source file throws for the same reason.
  *
  * `new URL('./x.js', import.meta.url)` is a module or asset reference to webpack
@@ -174,6 +177,16 @@ function runtimeSpecifiers(path: string): string[] {
         specs.push(literalArgument(node, `unanalyzable dynamic import in ${path}`));
       } else if (ts.isIdentifier(node.expression) && node.expression.text === 'require') {
         specs.push(literalArgument(node, `unanalyzable require in ${path}`));
+      } else if (ts.isCallExpression(node.expression)) {
+        // A loader held in a call result — `createRequire(import.meta.url)('x')`
+        // — loads exactly as `require('x')` does. Any call result can hold one,
+        // so only a lone string-literal argument counts, and only a bare name:
+        // a curried call with some other argument is not a load, and a relative
+        // path would need the module's own base to resolve.
+        const only = node.arguments[0];
+        if (node.arguments.length === 1 && only !== undefined && ts.isStringLiteral(only) && !only.text.startsWith('.')) {
+          specs.push(only.text);
+        }
       }
     } else if (ts.isNewExpression(node)) {
       if (ts.isIdentifier(node.expression) && node.expression.text === 'URL' && namesImportMeta(node)) {

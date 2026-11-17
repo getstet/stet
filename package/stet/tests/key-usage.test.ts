@@ -662,6 +662,25 @@ describe('the @getstet/stet exemption covers reads of the generated data alone (
   });
 });
 
+describe('the generated data handed to a stet element as a prop is no unreadable read (route-reads)', () => {
+  const layout = (mount: string): string =>
+    `import { CopyProvider } from '@getstet/stet/react';\nimport descriptorJson from '../content/descriptor.json';\nimport { RESOLVED } from '../content/resolved';\nexport default function Root({ children }: { children: React.ReactNode }) {\n  return <html><body>${mount}</body></html>;\n}\n`;
+  const withLayout = (mount: string): Record<string, string> => ({
+    'content/resolved.ts': "export const RESOLVED = { hero_title: 'a' } as const;\n",
+    'app/layout.tsx': layout(mount),
+  });
+
+  it('resolved on the provider register mounts', async () => {
+    const usage = await usageOf(host(withLayout('<CopyProvider descriptor={descriptorJson as never} resolved={RESOLVED}>{children}</CopyProvider>')));
+    expect(usage.causes).toEqual([]);
+  });
+
+  it('the same data handed to an element that is not stet\'s stays a cause', async () => {
+    const usage = await usageOf(host(withLayout('<Mine resolved={RESOLVED}>{children}</Mine>')));
+    expect(usage.causes).toHaveLength(1);
+  });
+});
+
 describe('require and import() declare bindings like an import (R-require, F11)', () => {
   const dynamic = (rel: string, text: string): Record<string, string> => ({ [rel]: text });
 
@@ -919,6 +938,31 @@ describe('a file too deeply nested to read (F2)', () => {
     const usage = await usageOf(host({ 'app/deep.ts': nested }));
     expect(usage.causes).toEqual([{ text: 'too deeply nested to read', file: 'app/deep.ts', line: 1 }]);
     expect(states(usage)).toEqual({ hero_title: 'read', hero_sub: 'unknown', hero_cta: 'unknown', nav_label: 'unknown', footer_note: 'unknown' });
+  });
+});
+
+describe('a read whose argument picks between key names (8o L5)', () => {
+  const page = (body: string): Record<string, string> => ({ 'app/page.tsx': `import { copy } from '@/lib/content';\nexport default function P({ a, b, k }: { a: boolean; b: boolean; k: string }) { return <p>{${body}}</p>; }\n` });
+
+  it.each([
+    ['two literal arms', "copy(a ? 'hero_title' : 'hero_sub')", ['hero_title', 'hero_sub']],
+    ['a ternary in the else arm', "copy(a ? 'hero_title' : b ? 'hero_sub' : 'hero_cta')", ['hero_title', 'hero_sub', 'hero_cta']],
+    ['an element access of the map', "copy[a ? 'hero_title' : 'hero_sub']", ['hero_title', 'hero_sub']],
+  ])('%s: each key is read and no cause stands', async (_name, read, keys) => {
+    const usage = await usageOf(host(page(read)));
+    expect(usage.causes).toEqual([]);
+    for (const key of keys) expect(stateOf(usage, key)).toBe('read');
+    expect(stateOf(usage, 'footer_note')).toBe('not_found');
+  });
+
+  it.each([
+    ['a variable arm', "copy(a ? 'hero_title' : k)"],
+    ['a template arm', 'copy(a ? `hero_${k}` : \'hero_sub\')'],
+    ['a variable in a nested arm', "copy(a ? 'hero_title' : b ? k : 'hero_sub')"],
+  ])('%s: the read is a cause', async (_name, read) => {
+    const usage = await usageOf(host(page(read)));
+    expect(usage.causes).toHaveLength(1);
+    expect(stateOf(usage, 'footer_note')).toBe('unknown');
   });
 });
 

@@ -30,8 +30,8 @@ import { packageVersion } from './installed.js';
 import type { CliIo } from './main.js';
 import { readProjectMeta } from './meta.js';
 import { loadProject, openContactsStore, type LoadedProject, type OpenedContactsStore } from './project.js';
-import { Report, UsageError, formatFinding, plural, shapeOf } from './report.js';
-import { TS7_REFUSAL, carriesToken, dialectOf, loadTypescript, mentionsToken } from './source-scan.js';
+import { CliError, Report, UsageError, formatFinding, plural, shapeOf } from './report.js';
+import { TS_BROKEN, carriesToken, dialectOf, loadTypescript, mentionsToken } from './source-scan.js';
 import { contactsConfig, isStoreBacked } from './store.js';
 
 /** Whether a `process.version` string (`v22.19.0`) is at least `major.minor`. */
@@ -292,20 +292,16 @@ const FOOTER_ADDRESS_KEY = 'brand__footer_address';
 /**
  * The compiler the chain walk needs, or `null` with the degradation stated.
  *
- * `typescript` is an optional peer, and a host without it still gets an answer
+ * stet ships its own `typescript`; a broken install of it still gets an answer
  * rather than a skipped section — a coarser one, said out loud, because the
  * search that replaces the parse cannot tell a comment from code and the walk
  * that finds the wrapper files is itself a parse.
- *
- * A host on TypeScript 7 lands here too, and gets `loadTypescript`'s own
- * refusal rather than the install line: it HAS typescript, and telling it to
- * install typescript names the one remedy that changes nothing.
  */
 async function chainCompiler(report: Report): Promise<typeof import('typescript') | null> {
   try {
     return await loadTypescript();
   } catch (error) {
-    const cause = compilerCause(error) ?? 'typescript is not installed (npm i -D typescript)';
+    const cause = compilerLine(error);
     report.line(
       `wrapper chains: degraded — ${cause}. Each pointer file is searched on its own, as plain text; ` +
         'a token missing from it is reported unchecked rather than unfound, because the wrapper that would ' +
@@ -320,9 +316,9 @@ async function chainCompiler(report: Report): Promise<typeof import('typescript'
  *
  * A declared surface or copy module that is not a template-dialect file is
  * handed to the TypeScript compiler — scan's own branch — so a host declaring
- * `copyModules: ["src/copy.ts"]` without `typescript` installed fails every
- * scan, and the pre-commit gate with it. Doctor says so first, as a warn: it
- * never moves the exit, and a compiler that fails to load for any reason never
+ * `copyModules: ["src/copy.ts"]` fails every scan, and the pre-commit gate with
+ * it, when stet's own `typescript` does not load (a broken install). Doctor says
+ * so first, as a warn: it never moves the exit, and a compiler that fails to load for any reason never
  * stops the diagnosis.
  */
 async function compilerSection(cwd: string, config: StetConfig, report: Report): Promise<void> {
@@ -334,22 +330,13 @@ async function compilerSection(cwd: string, config: StetConfig, report: Report):
     await loadTypescript();
   } catch (error) {
     const where = needing.length === 1 ? first : `${first} and ${plural(needing.length - 1, 'other file')}`;
-    report.warn(
-      'config',
-      compilerCause(error) === TS7_REFUSAL
-        ? `${TS7_REFUSAL} — stet scan and stet register read ${where} with it`
-        : `typescript: not installed — stet scan and stet register read ${where} with it; npm i -D typescript`,
-    );
+    report.warn('config', `${compilerLine(error)}. stet scan and stet register read ${where} with it`);
   }
 }
 
-/**
- * Why `loadTypescript` failed, for doctor's two readers: TypeScript 7's
- * refusal, or null for every other failure — a missing, truncated or broken
- * install all read as not installed, and none of them stops doctor.
- */
-function compilerCause(error: unknown): typeof TS7_REFUSAL | null {
-  return error instanceof Error && error.message === TS7_REFUSAL ? TS7_REFUSAL : null;
+/** Why `loadTypescript` failed, for doctor's two readers: its own message, else the one reinstall line. */
+function compilerLine(error: unknown): string {
+  return error instanceof CliError ? error.message : TS_BROKEN;
 }
 
 /** The files a render pointer runs: its own and, where it declares one, its frame's. */

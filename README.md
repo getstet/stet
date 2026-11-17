@@ -148,11 +148,11 @@ The preview pane has an `Edit | Use` switch, set to Edit when the Content tab
 opens. In Edit, hovering copy rings it and names its key, and a click selects
 that key; the page's own handlers do not run, so a link does not navigate and a
 button does not fire. In Use the page behaves as it does without stet. E
-switches between the two when focus is in no field.
+switches between the two when focus is in no field. Words count as a key only where a file of the open page reads that key; where stet cannot tell, any text that matches a key can be picked, and the pane says so.
 
 A second click, a double click or Enter on selected copy edits the text where
-it stands, with the whole text selected so typing replaces it. Enter keeps the
-edit and Esc puts the text back. Copy that shares its element with other text,
+it stands, with the caret where you clicked. Typing in the page shows a count only near the key's limit. Enter keeps the
+edit and Esc puts the text back. A sentence with inline markup (bold, links, code, a highlighted word) is one key on React, Next and Astro sites: typing in the page changes its words and keeps its markup. Copy that shares its element with other text,
 a value carrying `{{name}}`, an attribute such as alt text, and every tap at a
 viewport 760 px wide or narrower open the dashboard's field instead, with the
 key's counter beside it. What is typed is an unsaved edit until Save; the page shows
@@ -238,7 +238,12 @@ person, and imports an existing list. Recipes and the SQL reference:
 ## Frameworks
 
 Next.js (both routers), React and Astro are first-class for scanning and
-adoption. A plain HTML site with no build is a host too: stet marks the
+adoption. On an Astro site, stet register rewrites text, copy attributes,
+component props and the front-matter data a page shows into key reads and
+lists what it cannot rewrite safely for adoption by hand; stet pages scan --apply
+binds each page's title and description to its SEO keys; stet eject puts them
+back as text. A plain HTML site
+with no build is a host too: stet marks the
 elements it manages and regenerates them from the committed snapshot. A head
 text that repeats a key the page shows — the share description that is the
 headline plus a sentence — is registered as derived from it, so an edit to the
@@ -249,8 +254,12 @@ stdlib-only Python helper ships in the package.
 ## Requirements
 
 Node.js 22 or later; `stet audit lighthouse` needs 22.19 or later, Google Chrome, and three dev dependencies a plain install leaves out:
-`npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. Scanning and adoption use the TypeScript compiler API, so
-projects using those commands need `typescript` 5 or 6 as a dev dependency.
+`npm i -D lighthouse@13 chrome-launcher@1 selfsigned@5`. stet installs its own copy of TypeScript 5 (about 24 MB) for
+scanning, adoption, key badges and the preview's page checks, so it works with whatever TypeScript the project has, or none.
+
+Upgrading from 0.8.0: a project that installed typescript only for stet can remove it.
+
+stet scan also reads attributes, component props, front matter and data, and reads a sentence split by inline tags as one, so a project with a scan baseline refreshes it with stet scan --baseline once it has adopted what it wants.
 
 Upgrading from 0.7.1: npm keeps lighthouse, chrome-launcher and
 selfsigned because the lockfile holds them. To drop them, delete their node_modules/ entries from package-lock.json

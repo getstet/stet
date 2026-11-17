@@ -139,11 +139,11 @@ describe('the preview agent', () => {
     expect(reply).toMatchObject({ found: 1, draft: 'shown' });
   });
 
-  it('waits for Save with a tagged draft for a key found by its text', async () => {
+  it('shows a tagged draft in the page’s own styling on the element whose whole text the key fills (D16)', async () => {
     const framed = await frame(PAGE);
     const reply = await framed.locate({ key: 'k_hello', texts: ['Hello big world'], tags: 1, draft: 'Hi <1>large</1> world' });
-    expect(reply).toMatchObject({ found: 1, by: 'text', draft: 'after-save' });
-    expect((framed.doc.getElementById('hello') as HTMLElement).innerHTML).toBe('Hello <b>big</b> world');
+    expect(reply).toMatchObject({ found: 1, by: 'text', draft: 'shown' });
+    expect((framed.doc.getElementById('hello') as HTMLElement).innerHTML).toBe('Hi <b>large</b> world');
   });
 
   it('waits for Save with a tagged draft found inside a longer paragraph', async () => {
@@ -693,6 +693,7 @@ interface CensusKey {
   key: string;
   texts: string[];
   parts?: Array<{ entry: number | string; texts: string[] }>;
+  tags?: number;
 }
 
 const sentOf = (framed: Framed, stet: string): Message[] => framed.sent.filter((m) => m['stet'] === stet);
@@ -1094,6 +1095,95 @@ describe('Edit mode (6.3)', () => {
     expect(sentOf(framed, 'pick').map((m) => m['again'])).toEqual([false, true, true]);
   });
 
+  it('R14: a click on text no key matches takes the ring off the selected copy and sends deselect, then unmanaged', async () => {
+    const { framed } = await handlerPage();
+    await setMode(framed, 'edit');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    press(framed, btn, 'click');
+    expect(btn.style.boxShadow).not.toBe('');
+    press(framed, framed.doc.getElementById('plain') as HTMLElement, 'click');
+    await tick();
+    expect(btn.style.boxShadow).toBe('');
+    expect(framed.sent.map((m) => m['stet']).filter((t) => t === 'pick' || t === 'deselect' || t === 'unmanaged')).toEqual(['pick', 'deselect', 'unmanaged']);
+  });
+
+  it('R14: a click on a container with no text of its own deselects and sends no unmanaged', async () => {
+    const { framed } = await handlerPage();
+    await setMode(framed, 'edit');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    press(framed, btn, 'click');
+    press(framed, framed.doc.body, 'click');
+    await tick();
+    expect(btn.style.boxShadow).toBe('');
+    expect(sentOf(framed, 'deselect')).toEqual([{ stet: 'deselect', channel: 'c1' }]);
+    expect(sentOf(framed, 'unmanaged')).toEqual([]);
+  });
+
+  it('R14: a click on no key’s copy ends an in-place edit kept, before it deselects', async () => {
+    const framed = await frame('<button id="btn">Start free trial</button><p id="plain">Text no key holds</p>');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    const node = btn.firstChild as Text;
+    await editOn(framed, btn, BUTTON, 'lab_button');
+    caret(framed, node, node.length);
+    await typeAtEnd(framed, btn, node, 'x');
+    press(framed, framed.doc.getElementById('plain') as HTMLElement, 'click');
+    await tick();
+    expect(btn.hasAttribute('contenteditable')).toBe(false);
+    expect(btn.style.boxShadow).toBe('');
+    expect(framed.sent.map((m) => m['stet']).filter((t) => t === 'edited' || t === 'deselect')).toEqual(['edited', 'deselect']);
+    expect(lastOf(framed, 'edited')).toMatchObject({ how: 'keep' });
+  });
+
+  it('R15: a second click that follows a native word selection sends the word, where it starts in the element’s text and how many of it came before', async () => {
+    const { framed } = await handlerPage();
+    await setMode(framed, 'edit');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    const node = btn.firstChild as Text;
+    press(framed, btn, 'click', { detail: 1 });
+    (framed.win.getSelection() as Selection).setBaseAndExtent(node, 6, node, 10);
+    press(framed, btn, 'click', { detail: 2 });
+    // A word the element holds more than once also says how many came before it.
+    (framed.win.getSelection() as Selection).setBaseAndExtent(node, 12, node, 13);
+    press(framed, btn, 'click', { detail: 2 });
+    // A collapsed selection, or one outside the element, sends nothing.
+    (framed.win.getSelection() as Selection).collapse(node, 3);
+    press(framed, btn, 'click', { detail: 3 });
+    (framed.win.getSelection() as Selection).selectAllChildren(framed.doc.getElementById('plain') as HTMLElement);
+    press(framed, btn, 'click', { detail: 4 });
+    await tick();
+    const picks = sentOf(framed, 'pick');
+    expect(picks[0]).not.toHaveProperty('sel');
+    expect(picks[1]?.['sel']).toEqual({ text: 'free', offset: 6, nth: 0 });
+    expect(picks[2]?.['sel']).toEqual({ text: 'r', offset: 12, nth: 2 });
+    expect(picks[3]).not.toHaveProperty('sel');
+    expect(picks[4]).not.toHaveProperty('sel');
+  });
+
+  it('R15: an in-place edit started with a word selected inside the element keeps the word selected; typing replaces it', async () => {
+    const framed = await frame('<button id="btn">Start free trial</button><p id="other">Other words</p>');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    const node = btn.firstChild as Text;
+    (framed.win.getSelection() as Selection).setBaseAndExtent(node, 6, node, 10);
+    await editOn(framed, btn, BUTTON, 'lab_button');
+    const selection = framed.win.getSelection() as Selection;
+    expect(btn.getAttribute('contenteditable')).toBe('plaintext-only');
+    expect([selection.isCollapsed, selection.toString()]).toEqual([false, 'free']);
+    await keystroke(framed, btn, () => {
+      node.data = 'Start Z trial';
+    });
+    await tick();
+    expect(sentOf(framed, 'typed').map((m) => m['value'])).toEqual(['Start Z trial']);
+  });
+
+  it('R15: a selection outside the element does not stop the caret from being placed', async () => {
+    const framed = await frame('<button id="btn">Start free trial</button><p id="other">Other words</p>');
+    const btn = framed.doc.getElementById('btn') as HTMLElement;
+    (framed.win.getSelection() as Selection).selectAllChildren(framed.doc.getElementById('other') as HTMLElement);
+    await editOn(framed, btn, BUTTON, 'lab_button');
+    const selection = framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.anchorNode === btn]).toEqual([true, true]);
+  });
+
   it('sends the selected element’s box when the frame scrolls, at most once a frame', async () => {
     const { framed } = await handlerPage();
     await setMode(framed, 'edit');
@@ -1151,10 +1241,11 @@ describe('the in-place edit (6.4)', () => {
   }
   const typedValues = (framed: Framed): unknown[] => sentOf(framed, 'typed').map((m) => m['value']);
 
-  it('starts with the element’s whole text selected', async () => {
+  it('starts with a collapsed caret, nothing selected', async () => {
     const { framed, btn } = await buttonEdit();
-    const range = (framed.win.getSelection() as Selection).getRangeAt(0);
-    expect([range.startContainer, range.startOffset, range.endContainer, range.endOffset]).toEqual([btn, 0, btn, btn.childNodes.length]);
+    // jsdom has no click point to ask the caret of: the caret stands after the last character.
+    const selection = framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.anchorNode === btn, selection.anchorOffset]).toEqual([true, true, btn.childNodes.length]);
     expect(framed.doc.activeElement).toBe(btn);
     expect(btn.getAttribute('spellcheck')).toBe('false');
   });
@@ -1556,6 +1647,32 @@ describe('the runs form on the html host (6.6)', () => {
     expect(h1.innerHTML).toBe(before);
   });
 
+  it('R15: a word selected inside one run when the edit starts stays selected in that run’s island; typing replaces it', async () => {
+    const framed = await frame(HEADLINE);
+    const h1 = framed.doc.querySelector('h1') as HTMLElement;
+    const tail = (framed.doc.querySelector('.tail') as HTMLElement).firstChild as Text;
+    (framed.win.getSelection() as Selection).setBaseAndExtent(tail, 4, tail, 7);
+    await editOn(framed, h1, HERO, 'hero', { form: 'runs' });
+    const islands = [...h1.querySelectorAll('[data-stet-island]')] as HTMLElement[];
+    const selection = framed.win.getSelection() as Selection;
+    expect([selection.isCollapsed, selection.toString(), framed.doc.activeElement === islands[1]]).toEqual([false, 'one', true]);
+    await keystroke(framed, islands[1] as HTMLElement, () => {
+      tail.data = ' in Z place.';
+    });
+    await tick();
+    expect(lastOf(framed, 'typed')?.['value']).toBe('Your site’s words<1> in Z place.</1>');
+  });
+
+  it('R15: a selection that spans two runs does not stop the caret from being placed', async () => {
+    const framed = await frame(HEADLINE);
+    const h1 = framed.doc.querySelector('h1') as HTMLElement;
+    const head = h1.firstChild as Text;
+    const tail = (framed.doc.querySelector('.tail') as HTMLElement).firstChild as Text;
+    (framed.win.getSelection() as Selection).setBaseAndExtent(head, 5, tail, 3);
+    await editOn(framed, h1, HERO, 'hero', { form: 'runs' });
+    expect((framed.win.getSelection() as Selection).isCollapsed).toBe(true);
+  });
+
   it('keeps a Backspace at an island’s start and a Delete at its end out of the markup beside it', async () => {
     const { framed, islands } = await runsEdit();
     const [first, second] = islands.map((island) => island.firstChild as Text) as [Text, Text];
@@ -1845,5 +1962,1032 @@ describe('an edit on an element showing a draft (additions)', () => {
     framed.send({ stet: 'clear' });
     await tick();
     expect(h1.textContent).toBe('Start free trial');
+  });
+});
+
+describe('fix-preview-editing (8o)', () => {
+  const MouseInit = (init: MouseEventInit): MouseEventInit => ({ bubbles: true, cancelable: true, ...init });
+  /** A pointer event on `el`, and the tick its message to the dashboard needs. */
+  async function over(framed: Framed, el: Element, type = 'pointerover', init: MouseEventInit = {}): Promise<void> {
+    el.dispatchEvent(new framed.win.MouseEvent(type, MouseInit(init)));
+    await tick();
+  }
+  /** A click on `el` and the tick its pick needs. */
+  async function clicked(framed: Framed, el: Element, init: MouseEventInit = {}): Promise<void> {
+    press(framed, el, 'click', init);
+    await tick();
+  }
+  /** The census as the agent last answered it, after `reads` for `route` (T2). */
+  async function readsOf(framed: Framed, route: string, keys: string[] | null): Promise<Message | undefined> {
+    framed.send({ stet: 'reads', route, keys });
+    await tick();
+    return lastOf(framed, 'census');
+  }
+  const stub = (framed: Framed, name: string, fn: unknown): void => {
+    (framed.doc as unknown as Record<string, unknown>)[name] = fn;
+  };
+  const hitKeys = (message: Message | undefined): unknown[] | undefined => (message?.['keys'] as Message[] | undefined)?.map((k) => k['key']);
+
+  describe('the route’s reads narrow the census (D2)', () => {
+    const PAGE_TWO = '<h3 id="c">Custody</h3><a id="n">Pricing</a>';
+    const TWO: CensusKey[] = [
+      { key: 'nav_custody', texts: ['Custody'] },
+      { key: 'nav_pricing', texts: ['Pricing'] },
+    ];
+
+    it('T2.1: reads narrow the census to the keys a file of the page reads', async () => {
+      const framed = await frame(PAGE_TWO);
+      const first = await censusOf(framed, TWO);
+      expect(first?.['found']).toEqual({ nav_custody: 1, nav_pricing: 1 });
+      const reply = await readsOf(framed, first?.['route'] as string, ['nav_pricing']);
+      expect(reply?.['found']).toEqual({ nav_pricing: 1 });
+    });
+
+    it('T2.2 (guard): reads for another path, and after a navigation, match every key', async () => {
+      const framed = await frame(PAGE_TWO, 'c1', '', AGENT, { url: 'http://127.0.0.1:5173/lab' });
+      await censusOf(framed, TWO);
+      expect((await readsOf(framed, '/elsewhere', ['nav_pricing']))?.['found']).toEqual({ nav_custody: 1, nav_pricing: 1 });
+      // This path's reads apply until the app navigates; the new path's census matches every key again.
+      await readsOf(framed, '/lab', ['nav_pricing']);
+      framed.win.history.pushState(null, '', '/x');
+      await tick(300);
+      expect(lastOf(framed, 'census')?.['found']).toEqual({ nav_custody: 1, nav_pricing: 1 });
+    });
+
+    it('T2.3 (guard): a mark stands whatever the reads name', async () => {
+      const framed = await frame('<h1 id="h" data-stet="hero_title">Title words</h1>');
+      await censusOf(framed, [{ key: 'hero_title', texts: ['Title words'] }]);
+      const reply = await readsOf(framed, framed.win.location.pathname, []);
+      expect(reply?.['found']).toEqual({ hero_title: 1 });
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('h') as Element);
+      expect(lastOf(framed, 'pick')?.['keys']).toMatchObject([{ key: 'hero_title', by: 'mark' }]);
+    });
+
+    it('T2.4: a key no file reads is no chooser, and a click names the one that is read', async () => {
+      const framed = await frame('<a id="n">Pricing</a>');
+      const keys: CensusKey[] = [
+        { key: 'nav_pricing', texts: ['Pricing'] },
+        { key: 'footer_pricing', texts: ['Pricing'] },
+      ];
+      const first = await censusOf(framed, keys);
+      expect(first?.['ambiguous']).toEqual([['nav_pricing', 'footer_pricing']]);
+      const reply = await readsOf(framed, first?.['route'] as string, ['nav_pricing']);
+      expect(reply?.['ambiguous']).toEqual([]);
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('n') as Element);
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['nav_pricing']);
+    });
+
+    it('reads that arrive before the census narrow the first census', async () => {
+      const framed = await frame(PAGE_TWO);
+      const route = framed.win.location.pathname;
+      const before = framed.sent.length;
+      framed.send({ stet: 'reads', route, keys: ['nav_pricing'] });
+      await tick();
+      expect(framed.sent.slice(before)).toEqual([]);
+      expect((await censusOf(framed, TWO))?.['found']).toEqual({ nav_pricing: 1 });
+    });
+
+    it('the last reads win, and null lifts the narrowing', async () => {
+      const framed = await frame(PAGE_TWO);
+      const route = framed.win.location.pathname;
+      await censusOf(framed, TWO);
+      expect((await readsOf(framed, route, ['nav_pricing']))?.['found']).toEqual({ nav_pricing: 1 });
+      expect((await readsOf(framed, route, ['nav_custody']))?.['found']).toEqual({ nav_custody: 1 });
+      expect((await readsOf(framed, route, []))?.['found']).toEqual({});
+      expect((await readsOf(framed, route, null))?.['found']).toEqual({ nav_custody: 1, nav_pricing: 1 });
+    });
+
+    it('takes no reads from another origin, or from the page itself', async () => {
+      const framed = await frame(PAGE_TWO);
+      const first = await censusOf(framed, TWO);
+      const before = framed.sent.length;
+      framed.send({ stet: 'reads', route: first?.['route'], keys: [] }, 'http://evil.example', undefined);
+      framed.send({ stet: 'reads', route: first?.['route'], keys: [] }, DASHBOARD, framed.win);
+      framed.send({ stet: 'reads', route: first?.['route'], keys: 'nav_pricing' });
+      await tick();
+      expect(framed.sent.slice(before)).toEqual([]);
+    });
+  });
+
+  describe('a value written over two lines (D4)', () => {
+    const SUFFIX: CensusKey[] = [{ key: 'hero_suffix', texts: ['across your sites\nin seconds.'] }];
+    const TWO_LINES = '<h1><span>Change the</span> <span id="a">across your sites</span><span id="b">in seconds.</span></h1>';
+
+    it('T4.1: two lines are found once, and hover names the key', async () => {
+      const framed = await frame(TWO_LINES);
+      expect((await censusOf(framed, SUFFIX))?.['found']).toEqual({ hero_suffix: 1 });
+      await setMode(framed, 'edit');
+      await over(framed, framed.doc.getElementById('b') as Element);
+      expect(lastOf(framed, 'hover')?.['keys']).toEqual([{ key: 'hero_suffix', attr: null, by: 'line' }]);
+    });
+
+    it('T4.2 (guard): one line alone is no match', async () => {
+      const framed = await frame('<p><span>across your sites</span></p>');
+      expect((await censusOf(framed, SUFFIX))?.['found']).toEqual({});
+    });
+
+    it('T4.3 (guard): a value found whole is not matched line by line', async () => {
+      const framed = await frame(TWO_LINES + '<p id="whole">across your sites in seconds.</p>');
+      expect((await censusOf(framed, SUFFIX))?.['found']).toEqual({ hero_suffix: 1 });
+      await setMode(framed, 'edit');
+      await over(framed, framed.doc.getElementById('whole') as Element);
+      expect(lastOf(framed, 'hover')?.['keys']).toEqual([{ key: 'hero_suffix', attr: null, by: 'whole' }]);
+      await over(framed, framed.doc.getElementById('b') as Element);
+      expect(lastOf(framed, 'hover')?.['keys']).toEqual([]);
+    });
+
+    it('T4.4: a line hit is never typed in place', async () => {
+      const framed = await frame(TWO_LINES);
+      await censusOf(framed, SUFFIX);
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('a') as Element);
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'hero_suffix', attr: null, by: 'line', inplace: false }]);
+    });
+
+    it('a line that is also another key’s whole text is still a line of the two-line value', async () => {
+      const framed = await frame(TWO_LINES);
+      const reply = await censusOf(framed, [...SUFFIX, { key: 'across', texts: ['across your sites'] }]);
+      expect(reply?.['found']).toEqual({ across: 1, hero_suffix: 1 });
+    });
+
+    it('a line standing in nested wrappers is one place, not several', async () => {
+      const framed = await frame(
+        '<h1><div><span id="a">across your sites</span></div><div><span id="b">in seconds.</span></div></h1>',
+      );
+      expect((await censusOf(framed, SUFFIX))?.['found']).toEqual({ hero_suffix: 1 });
+    });
+
+    it('lines split across inline elements match, numbered tags included', async () => {
+      const framed = await frame('<p><span id="a">Hello <b>big</b></span><span id="b">world</span></p>');
+      expect((await censusOf(framed, [{ key: 'k', texts: ['Hello <1>big</1>\nworld'] }]))?.['found']).toEqual({ k: 1 });
+    });
+
+    it('two short lines make a weak match', async () => {
+      const framed = await frame('<p><span>Go</span><span>On</span></p>');
+      const reply = await censusOf(framed, [{ key: 'w', texts: ['Go\nOn'] }]);
+      expect(reply?.['found']).toEqual({ w: 1 });
+      expect(reply?.['weak']).toEqual(['w']);
+    });
+
+    it('a key the route’s files do not read is not matched line by line', async () => {
+      const framed = await frame(TWO_LINES);
+      const first = await censusOf(framed, SUFFIX);
+      expect((await readsOf(framed, first?.['route'] as string, []))?.['found']).toEqual({});
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('b') as Element);
+      expect(lastOf(framed, 'unmanaged')).toBeTruthy();
+      expect(sentOf(framed, 'pick')).toEqual([]);
+    });
+
+    it('every entry of a key written over two lines is matched, not only the first', async () => {
+      const framed = await frame(
+        '<p><i id="a1">alpha one</i><i id="a2">alpha two</i></p><p><i id="b1">beta one</i><i id="b2">beta two</i></p>',
+      );
+      const reply = await censusOf(framed, [
+        { key: 'k', texts: [], parts: [{ entry: 0, texts: ['alpha one\nalpha two'] }, { entry: 1, texts: ['beta one\nbeta two'] }] },
+      ]);
+      expect(reply?.['entries']).toEqual({ k: [0, 1] });
+      expect(reply?.['found']).toEqual({ k: 2 });
+    });
+  });
+
+  describe('the visible word takes the click (D5)', () => {
+    const KEYS: CensusKey[] = [
+      { key: 'k_under', texts: ['site copy'] },
+      { key: 'k_top', texts: ['content'] },
+    ];
+    async function stacked(body: string, stack: (get: (id: string) => Element) => Element[]): Promise<Framed> {
+      const framed = await frame(body);
+      const get = (id: string): Element => framed.doc.getElementById(id) as Element;
+      stub(framed, 'elementsFromPoint', () => stack(get));
+      await censusOf(framed, KEYS);
+      await setMode(framed, 'edit');
+      return framed;
+    }
+    const click = (framed: Framed, id: string, init: MouseEventInit = { detail: 1 }): Promise<void> =>
+      clicked(framed, framed.doc.getElementById(id) as Element, { clientX: 5, clientY: 5, ...init });
+
+    it('T5.1: a transparent word stacked over a visible one gives the click to the visible one', async () => {
+      const framed = await stacked('<h1><span id="under">site copy</span><span id="top" style="opacity:0">content</span></h1>', (get) => [get('top'), get('under')]);
+      await click(framed, 'top');
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_under']);
+      await over(framed, framed.doc.getElementById('top') as Element);
+      expect(hitKeys(lastOf(framed, 'hover'))).toEqual(['k_under']);
+    });
+
+    it('T5.2: an element under a transparent ancestor is skipped', async () => {
+      const framed = await stacked(
+        '<h1><span id="under">site copy</span><div style="opacity:0"><span id="top">content</span></div></h1>',
+        (get) => [get('top'), get('under')],
+      );
+      await click(framed, 'top');
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_under']);
+    });
+
+    it('T5.3: visibility:hidden and no box are skipped', async () => {
+      const framed = await stacked(
+        '<h1><span id="under">site copy</span><span id="gone" hidden>content</span><span id="top" style="visibility:hidden">content</span></h1>',
+        (get) => [get('top'), get('gone'), get('under')],
+      );
+      await click(framed, 'top');
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_under']);
+    });
+
+    it('nothing in the stack seen names nothing', async () => {
+      const framed = await stacked(
+        '<h1><span id="top" style="opacity:0">content</span><span id="u" style="visibility:hidden">site copy</span></h1>',
+        (get) => [get('top'), get('u')],
+      );
+      await click(framed, 'top');
+      expect(sentOf(framed, 'pick')).toEqual([]);
+      expect(sentOf(framed, 'unmanaged')).toEqual([]);
+    });
+
+    it('an empty stack keeps the event’s target', async () => {
+      const framed = await stacked('<h1><span id="top">content</span></h1>', () => []);
+      await click(framed, 'top');
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_top']);
+    });
+
+    it('a double click goes through the stack too', async () => {
+      const framed = await stacked(
+        '<h1><span id="under">site copy</span><span id="top" style="opacity:0">content</span></h1>',
+        (get) => [get('top'), get('under')],
+      );
+      press(framed, framed.doc.getElementById('top') as Element, 'dblclick', { clientX: 5, clientY: 5, detail: 2 });
+      await tick();
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_under']);
+    });
+
+    it('T5.4 (guard): a click made by a key keeps its target', async () => {
+      const framed = await stacked('<h1><span id="under">site copy</span><span id="top" style="opacity:0">content</span></h1>', (get) => [get('under')]);
+      await click(framed, 'top', { detail: 0 });
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['k_top']);
+    });
+  });
+
+  describe('the pointer leaving the frame (D6)', () => {
+    const TWO_P = '<p id="p">Ship copy today</p><p id="q">Another line of copy</p>';
+    const KEYS: CensusKey[] = [
+      { key: 'k_p', texts: ['Ship copy today'] },
+      { key: 'k_q', texts: ['Another line of copy'] },
+    ];
+    const ringed = (el: Element | null): string => (el as HTMLElement).style.boxShadow;
+
+    it('T6.1: leaving clears the ring and says out', async () => {
+      const framed = await frame(TWO_P);
+      await censusOf(framed, KEYS);
+      await setMode(framed, 'edit');
+      const p = framed.doc.getElementById('p') as HTMLElement;
+      await over(framed, p);
+      expect(ringed(p)).not.toBe('');
+      await over(framed, p, 'pointerout', { relatedTarget: null });
+      await tick();
+      expect(ringed(p)).toBe('');
+      expect(sentOf(framed, 'out')).toHaveLength(1);
+    });
+
+    it('T6.2 (guard): moving inside the page sends nothing, and the ring moves as before', async () => {
+      const framed = await frame(TWO_P);
+      await censusOf(framed, KEYS);
+      await setMode(framed, 'edit');
+      const p = framed.doc.getElementById('p') as HTMLElement;
+      const q = framed.doc.getElementById('q') as HTMLElement;
+      await over(framed, p);
+      await over(framed, p, 'pointerout', { relatedTarget: q });
+      await over(framed, q);
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(0);
+      expect([ringed(p), ringed(q) === '']).toEqual(['', false]);
+    });
+
+    it('T6.3 (guard): a touch lift sends nothing', async () => {
+      const framed = await frame(TWO_P);
+      await censusOf(framed, KEYS);
+      await setMode(framed, 'edit');
+      const p = framed.doc.getElementById('p') as HTMLElement;
+      await over(framed, p);
+      const lift = new framed.win.MouseEvent('pointerout', MouseInit({ relatedTarget: null }));
+      Object.defineProperty(lift, 'pointerType', { value: 'touch' });
+      p.dispatchEvent(lift);
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(0);
+    });
+
+    it('a pen leaving says out, and Use mode listens to nothing', async () => {
+      const framed = await frame(TWO_P);
+      await censusOf(framed, KEYS);
+      const p = framed.doc.getElementById('p') as HTMLElement;
+      const leave = (pointerType?: string): void => {
+        const event = new framed.win.MouseEvent('pointerout', MouseInit({ relatedTarget: null }));
+        if (pointerType !== undefined) Object.defineProperty(event, 'pointerType', { value: pointerType });
+        p.dispatchEvent(event);
+      };
+      leave();
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(0);
+      await setMode(framed, 'edit');
+      leave('pen');
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(1);
+      await setMode(framed, 'use');
+      leave();
+      await tick();
+      expect(sentOf(framed, 'out')).toHaveLength(1);
+    });
+  });
+
+  describe('the caret where the editor clicked (D7)', () => {
+    const textOf = (el: Element): Text => el.firstChild as Text;
+    function caretStubs(framed: Framed, node: Text, ranged: number, positioned?: number): void {
+      stub(framed, 'caretRangeFromPoint', () => {
+        const range = framed.doc.createRange();
+        range.setStart(node, ranged);
+        return range;
+      });
+      if (positioned !== undefined) stub(framed, 'caretPositionFromPoint', () => ({ offsetNode: node, offset: positioned }));
+    }
+    /** Whether the selection is collapsed, whether it stands in `node`, and its offset. */
+    const selected = (framed: Framed, node: Node): [boolean, boolean, number] => {
+      const sel = framed.win.getSelection() as Selection;
+      return [sel.isCollapsed, sel.anchorNode === node, sel.anchorOffset];
+    };
+
+    it('T7.1: the caret is collapsed where the click landed', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      const btn = framed.doc.getElementById('btn') as HTMLElement;
+      caretStubs(framed, textOf(btn), 5);
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, btn, { clientX: 30, clientY: 8, detail: 1 });
+      await clicked(framed, btn, { clientX: 30, clientY: 8, detail: 2 });
+      framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+      await tick();
+      expect(selected(framed, textOf(btn))).toEqual([true, true, 5]);
+    });
+
+    it('T7.2: caretPositionFromPoint is preferred where both exist', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      const btn = framed.doc.getElementById('btn') as HTMLElement;
+      caretStubs(framed, textOf(btn), 5, 3);
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, btn, { clientX: 30, clientY: 8, detail: 1 });
+      framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+      await tick();
+      expect(selected(framed, textOf(btn))).toEqual([true, true, 3]);
+    });
+
+    it('T7.3: Enter starts the edit at the end of the text', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      const btn = framed.doc.getElementById('btn') as HTMLElement;
+      caretStubs(framed, textOf(btn), 5);
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, btn, { clientX: 30, clientY: 8, detail: 1 });
+      key(framed, framed.doc.body, { key: 'Enter' });
+      await tick();
+      framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+      await tick();
+      expect(selected(framed, btn)).toEqual([true, true, btn.childNodes.length]);
+    });
+
+    it('a caret point outside the element falls back to the end, by either API', async () => {
+      for (const api of ['caretPositionFromPoint', 'caretRangeFromPoint']) {
+        const framed = await frame('<button id="btn">Start free trial</button><p id="o">Other words</p>');
+        const btn = framed.doc.getElementById('btn') as HTMLElement;
+        const other = textOf(framed.doc.getElementById('o') as Element);
+        if (api === 'caretPositionFromPoint') stub(framed, api, () => ({ offsetNode: other, offset: 2 }));
+        else
+          stub(framed, api, () => {
+            const range = framed.doc.createRange();
+            range.setStart(other, 2);
+            return range;
+          });
+        await censusOf(framed, BUTTON);
+        await setMode(framed, 'edit');
+        await clicked(framed, btn, { clientX: 3, clientY: 3, detail: 1 });
+        framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+        await tick();
+        expect(selected(framed, btn), api).toEqual([true, true, btn.childNodes.length]);
+        closeFrames();
+      }
+    });
+
+    it('an Enter-started edit has no click point to ask for, and lands at the end', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      const btn = framed.doc.getElementById('btn') as HTMLElement;
+      caretStubs(framed, textOf(btn), 3, 3);
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, btn, { clientX: 3, clientY: 3, detail: 1 });
+      key(framed, framed.doc.body, { key: 'Enter' });
+      await tick();
+      framed.send({ stet: 'edit', key: 'lab_button', locale: 'default', form: 'inplace', oneLine: true });
+      await tick();
+      expect(selected(framed, btn)).toEqual([true, true, btn.childNodes.length]);
+    });
+
+    it('T7.4: the runs form puts the caret inside the island that was clicked', async () => {
+      const framed = await frame('<h1 data-stet="hero">Your site’s words<span class="tail"> in one place.</span></h1>');
+      const RECTS: Record<string, { left: number; right: number }> = { 'Your site’s words': { left: 0, right: 100 }, ' in one place.': { left: 100, right: 200 } };
+      (framed.win.Range.prototype as unknown as { getClientRects: (this: Range) => unknown[] }).getClientRects = function (this: Range) {
+        const rect = RECTS[this.commonAncestorContainer.textContent ?? ''];
+        return rect === undefined ? [] : [{ ...rect, top: 0, bottom: 20 }];
+      };
+      const h1 = framed.doc.querySelector('h1') as HTMLElement;
+      const tail = (h1.querySelector('.tail') as Element).firstChild as Text;
+      caretStubs(framed, tail, 4);
+      await censusOf(framed, [{ key: 'hero', texts: ['Your site’s words<1> in one place.</1>'] }]);
+      await setMode(framed, 'edit');
+      await clicked(framed, h1, { clientX: 150, clientY: 10, detail: 1 });
+      framed.send({ stet: 'edit', key: 'hero', locale: 'default', form: 'runs', oneLine: true });
+      await tick();
+      const islands = [...h1.querySelectorAll('[data-stet-island]')];
+      expect(islands).toHaveLength(2);
+      expect(selected(framed, tail)).toEqual([true, true, 4]);
+      expect((framed.win.getSelection() as Selection).anchorNode?.parentElement).toBe(islands[1]);
+    });
+  });
+
+  describe('an Enter pick is marked (D1, Starts)', () => {
+    it('T1.11: a pick made by Enter carries key: true, a click’s carries none', async () => {
+      const framed = await frame('<button id="btn">Start free trial</button>');
+      await censusOf(framed, BUTTON);
+      await setMode(framed, 'edit');
+      await clicked(framed, framed.doc.getElementById('btn') as Element);
+      expect(lastOf(framed, 'pick')).not.toHaveProperty('key');
+      key(framed, framed.doc.body, { key: 'Enter' });
+      await tick();
+      expect(sentOf(framed, 'pick')).toHaveLength(2);
+      expect(lastOf(framed, 'pick')).toMatchObject({ key: true, again: true });
+    });
+  });
+
+  describe('a match counts only where the key renders (D12)', () => {
+    /** `value` rebuilt in the frame's realm, as a structured clone from the dashboard arrives. */
+    const inFrame = (framed: Framed, value: unknown): any => framed.win.JSON.parse(JSON.stringify(value));
+    /** The census for `keys`, then the route's reads with `extra` (D12's `renders` and `coincident`); the census the reads bring. */
+    async function placed(framed: Framed, keys: CensusKey[], extra: Message, read: string[] | null = keys.map((k) => k.key)): Promise<Message | undefined> {
+      const first = await censusOf(framed, keys);
+      framed.send(inFrame(framed, { stet: 'reads', route: first?.['route'], keys: read, ...extra }));
+      await tick();
+      return lastOf(framed, 'census');
+    }
+    const site = (...levels: Array<[string, string[] | null]>): Message[] => levels.map(([tag, classes]) => ({ tag, classes }));
+    const INSTALL_PAGE = '<span id="i" class="install">npx x</span><span id="w" class="w">npx x</span>';
+    const INSTALL: CensusKey[] = [{ key: 'hero_install', texts: ['npx x'] }];
+    const INSTALL_READS = { renders: { hero_install: [site(['span', ['install']])] }, coincident: ['hero_install'] };
+    const byId = (framed: Framed, id: string): Element => framed.doc.getElementById(id) as Element;
+
+    it('T12.8: the class at level 0 decides; a pick where the key stands is sure, a click elsewhere names no key', async () => {
+      const framed = await frame(INSTALL_PAGE);
+      expect((await placed(framed, INSTALL, INSTALL_READS))?.['found']).toEqual({ hero_install: 1 });
+      await setMode(framed, 'edit');
+      await over(framed, byId(framed, 'i'));
+      expect(hitKeys(lastOf(framed, 'hover'))).toEqual(['hero_install']);
+      await over(framed, byId(framed, 'w'));
+      expect(lastOf(framed, 'hover')?.['keys']).toEqual([]);
+      await clicked(framed, byId(framed, 'i'));
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'hero_install', attr: null, by: 'whole', inplace: true, sure: true }]);
+      const before = framed.sent.length;
+      await clicked(framed, byId(framed, 'w'));
+      expect(framed.sent.slice(before).map((m) => m['stet'])).toEqual(['deselect', 'unmanaged']);
+    });
+
+    it('T12.8: any one of the classes the source writes is enough (a script took one off)', async () => {
+      const framed = await frame(INSTALL_PAGE);
+      const reply = await placed(framed, INSTALL, { renders: { hero_install: [site(['span', ['install', 'on']])] }, coincident: ['hero_install'] });
+      expect(reply?.['found']).toEqual({ hero_install: 1 });
+    });
+
+    const TITLES = '<div><h3 id="d">Site copy</h3></div><span><h3 id="s">Site copy</h3></span>';
+    const TITLE: CensusKey[] = [{ key: 'bento_1_t', texts: ['Site copy'] }];
+    const TITLE_SITE = { bento_1_t: [site(['h3', null], ['div', null])] };
+
+    it('T12.9: the parent’s tag decides', async () => {
+      const framed = await frame(TITLES);
+      expect((await placed(framed, TITLE, { renders: TITLE_SITE, coincident: ['bento_1_t'] }))?.['found']).toEqual({ bento_1_t: 1 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'd'));
+      expect(hitKeys(lastOf(framed, 'pick'))).toEqual(['bento_1_t']);
+      const before = framed.sent.length;
+      await clicked(framed, byId(framed, 's'));
+      expect(framed.sent.slice(before).map((m) => m['stet'])).toEqual(['deselect', 'unmanaged']);
+    });
+
+    it('T12.10: where nothing stands, every match stays and none is sure', async () => {
+      const framed = await frame(TITLES);
+      expect((await placed(framed, TITLE, { renders: { bento_1_t: [site(['em', null])] }, coincident: ['bento_1_t'] }))?.['found']).toEqual({ bento_1_t: 2 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'd'));
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'bento_1_t', attr: null, by: 'whole', inplace: true }]);
+      await clicked(framed, byId(framed, 's'));
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'bento_1_t', attr: null, by: 'whole', inplace: true }]);
+    });
+
+    it('T12.11: an attribute hit keeps the key placed, and the text hit elsewhere goes', async () => {
+      const framed = await frame('<img id="m" alt="Hello"><p id="p">Hello</p>');
+      expect((await placed(framed, [{ key: 'k', texts: ['Hello'] }], { renders: { k: [] }, coincident: ['k'] }))?.['found']).toEqual({ k: 1 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'm'));
+      expect(lastOf(framed, 'pick')?.['keys']).toMatchObject([{ key: 'k', attr: 'alt' }]);
+      const before = framed.sent.length;
+      await clicked(framed, byId(framed, 'p'));
+      expect(framed.sent.slice(before).map((m) => m['stet'])).toEqual(['deselect', 'unmanaged']);
+    });
+
+    it('T12.12: the parser’s tbody is passed over', async () => {
+      const keys: CensusKey[] = [{ key: 'k', texts: ['Hi there'] }];
+      // A cell's own parent is its row.
+      let framed = await frame('<table><tbody><tr><td>Hi there</td></tr></tbody></table><p>Hi there</p>');
+      expect((await placed(framed, keys, { renders: { k: [site(['td', null], ['tr', null])] }, coincident: ['k'] }))?.['found']).toEqual({ k: 1 });
+      // A row the source writes in its table stands though the parser put a tbody between them.
+      framed = await frame('<table><tr id="r"><td>Hi</td> <td>there</td></tr></table><p id="p">Hi there</p>');
+      expect((await placed(framed, keys, { renders: { k: [site(['tr', null], ['table', null])] }, coincident: ['k'] }))?.['found']).toEqual({ k: 1 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'r'));
+      expect(lastOf(framed, 'pick')?.['keys']).toMatchObject([{ key: 'k', sure: true }]);
+    });
+
+    it('T12.13: a dropped twin, per element', async () => {
+      const framed = await frame('<nav><a id="n">Pricing</a></nav><footer><a id="f">Pricing</a></footer>');
+      const keys: CensusKey[] = [
+        { key: 'nav_pricing', texts: ['Pricing'] },
+        { key: 'tier_pricing', texts: ['Pricing'] },
+      ];
+      const reply = await placed(framed, keys, { renders: { nav_pricing: [site(['a', null], ['nav', null])] }, coincident: ['nav_pricing'] });
+      expect(reply?.['found']).toEqual({ nav_pricing: 1, tier_pricing: 2 });
+      await setMode(framed, 'edit');
+      await over(framed, byId(framed, 'n'));
+      expect(hitKeys(lastOf(framed, 'hover'))).toEqual(['nav_pricing', 'tier_pricing']);
+      await over(framed, byId(framed, 'f'));
+      expect(hitKeys(lastOf(framed, 'hover'))).toEqual(['tier_pricing']);
+    });
+
+    it('T12.14 guard: no sites, no change', async () => {
+      const PAGE_TWO = '<h3 id="c">Custody</h3><a id="n">Pricing</a>';
+      const TWO: CensusKey[] = [
+        { key: 'nav_custody', texts: ['Custody'] },
+        { key: 'nav_pricing', texts: ['Pricing'] },
+      ];
+      const alone = await placed(await frame(PAGE_TWO), TWO, {}, ['nav_pricing']);
+      expect(alone?.['found']).toEqual({ nav_pricing: 1 });
+      expect(await placed(await frame(PAGE_TWO), TWO, { renders: {}, coincident: [] }, ['nav_pricing'])).toEqual(alone);
+      expect(await placed(await frame(PAGE_TWO), TWO, { renders: null, coincident: null }, ['nav_pricing'])).toEqual(alone);
+    });
+
+    it('T12.15 guard: a malformed renders is ignored and the keys still narrow; a dotted or underscored tag is accepted; constructor is a key like any other', async () => {
+      const PAGE = INSTALL_PAGE + '<p>Other</p>';
+      const KEYS: CensusKey[] = [...INSTALL, { key: 'other', texts: ['Other'] }];
+      const read = ['hero_install'];
+      // A site of three levels is malformed, so it drops nothing; on this page it would stand at the first span and drop the second.
+      const deep = '<main><div><span class="install">npx x</span></div></main><span class="w">npx x</span>';
+      const renders = { hero_install: [site(['span', ['install']], ['div', null], ['main', null])] };
+      expect((await placed(await frame(deep), KEYS, { renders, coincident: ['hero_install'] }, read))?.['found']).toEqual({ hero_install: 2 });
+      // A map whose prototype is not Object.prototype.
+      const framed = await frame(PAGE);
+      const first = await censusOf(framed, KEYS);
+      const message = inFrame(framed, { stet: 'reads', route: first?.['route'], keys: read, coincident: ['hero_install'] });
+      const odd = framed.win.Object.create(new framed.win.Object());
+      odd.hero_install = inFrame(framed, [site(['span', ['install']])]);
+      message.renders = odd;
+      framed.send(message);
+      await tick();
+      expect(lastOf(framed, 'census')?.['found']).toEqual({ hero_install: 2 });
+      // Tags HTML allows in a custom element's name.
+      const dotted = { hero_install: [site(['span', ['install']])], other: [site(['my.el', null]), site(['x_y', null])] };
+      expect((await placed(await frame(PAGE), KEYS, { renders: dotted, coincident: ['hero_install'] }, read))?.['found']).toEqual({ hero_install: 1 });
+      // An own key named constructor is matched by its own sites; absent, it never reads the prototype's.
+      const named: CensusKey[] = [{ key: 'constructor', texts: ['npx x'] }];
+      const own = { renders: { constructor: [site(['span', ['install']])] }, coincident: ['constructor'] };
+      expect((await placed(await frame(INSTALL_PAGE), named, own))?.['found']).toEqual({ constructor: 1 });
+      const absent = { renders: { hero_install: [site(['span', ['install']])] }, coincident: ['constructor'] };
+      expect((await placed(await frame(INSTALL_PAGE), named, absent))?.['found']).toEqual({ constructor: 2 });
+    });
+
+    it('T12.20: a key not coincident keeps every match, and those that stand are sure', async () => {
+      const framed = await frame(TITLES);
+      expect((await placed(framed, TITLE, { renders: TITLE_SITE, coincident: [] }))?.['found']).toEqual({ bento_1_t: 2 });
+      await setMode(framed, 'edit');
+      await clicked(framed, byId(framed, 'd'));
+      expect(lastOf(framed, 'pick')?.['keys']).toMatchObject([{ key: 'bento_1_t', sure: true }]);
+      await clicked(framed, byId(framed, 's'));
+      expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'bento_1_t', attr: null, by: 'whole', inplace: true }]);
+    });
+
+    it('T12.21: a chain the tree builder re-parented stands as the page parses it', async () => {
+      const framed = await frame('<p><div><span>Hello</span></div></p><h3>Hello</h3><em>Hello</em>');
+      const renders = { k: [site(['span', null], ['div', null]), site(['h3', null], ['body', null])] };
+      expect((await placed(framed, [{ key: 'k', texts: ['Hello'] }], { renders, coincident: ['k'] }))?.['found']).toEqual({ k: 2 });
+    });
+
+    it('T12.22: a draft is painted only where the key stands; locate outlines every match', async () => {
+      const framed = await frame(INSTALL_PAGE);
+      await placed(framed, INSTALL, INSTALL_READS);
+      framed.send({ stet: 'layer', drafts: [{ key: 'hero_install', texts: ['npx x'], draft: 'npm i stet' }] });
+      await tick();
+      expect([byId(framed, 'i').textContent, byId(framed, 'w').textContent]).toEqual(['npm i stet', 'npx x']);
+      framed.send({ stet: 'layer', drafts: [] });
+      await tick();
+      const answer = await framed.locate({ key: 'hero_install', texts: ['npx x'], draft: 'npm i stet' });
+      expect(answer).toMatchObject({ found: 2, draft: 'shown' });
+      expect([byId(framed, 'i'), byId(framed, 'w')].map((el) => [el.textContent, (el as HTMLElement).style.outline])).toEqual([
+        ['npm i stet', SOLID],
+        ['npx x', SOLID],
+      ]);
+
+      const loose = await frame(INSTALL_PAGE);
+      await placed(loose, INSTALL, { ...INSTALL_READS, coincident: [] });
+      await loose.locate({ key: 'hero_install', texts: ['npx x'], draft: 'npm i stet' });
+      expect([byId(loose, 'i').textContent, byId(loose, 'w').textContent]).toEqual(['npm i stet', 'npm i stet']);
+    });
+
+    it('T12.23: a head match is never dropped and never stands', async () => {
+      const framed = await frame('<p>Hello</p>', 'c1', '<title>Hello</title>');
+      const reply = await placed(framed, [{ key: 'k', texts: ['Hello'] }], { renders: { k: [site(['em', null])] }, coincident: ['k'] });
+      expect([reply?.['found'], reply?.['head']]).toEqual([{ k: 2 }, [{ key: 'k', where: 'title' }]]);
+    });
+  });
+});
+
+describe('typing a sentence key in the page (C9, D18)', () => {
+  const SENTENCE = '<p id="s">Install: run <b>npx x init</b> and answer.</p><p id="away" tabindex="-1">Away</p>';
+  const INSTALL: CensusKey[] = [{ key: 'install', texts: ['Install: run npx x init and answer.'], tags: 1 }];
+  const DRAFT = { key: 'install', texts: ['Install: run npx x init and answer.'], tags: 1 };
+
+  interface Sentence {
+    framed: Framed;
+    p: HTMLElement;
+    first: Text;
+    bold: Text;
+    last: Text;
+  }
+  /** The text nodes under `el`, in document order. */
+  const textsOf = (el: Element): Text[] => {
+    const walker = el.ownerDocument.createTreeWalker(el, 4);
+    const out: Text[] = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) out.push(node as Text);
+    return out;
+  };
+  /** The sentence page, its census, Edit, a click on the `p` and the page's `edit` in the sentence form; `before` runs ahead of the census. */
+  async function sentenceEdit(body = SENTENCE, keys = INSTALL, before?: (s: Sentence) => void | Promise<void>): Promise<Sentence> {
+    const framed = await frame(body);
+    const p = framed.doc.getElementById('s') as HTMLElement;
+    const [first, bold, last] = textsOf(p) as [Text, Text, Text];
+    const s = { framed, p, first, bold, last };
+    await before?.(s);
+    await editOn(framed, p, keys, (keys[0] as CensusKey).key, { form: 'sentence' });
+    return s;
+  }
+  type Span = [Node, number, Node, number];
+  /** A cancellable `beforeinput` at the sentence: `getTargetRanges` answers `ranges` as StaticRanges, and `paste` is its dataTransfer's text. */
+  function input(framed: Framed, host: Element, inputType: string, opts: { data?: string; ranges?: Span[]; paste?: string } = {}): InputEvent {
+    const event = new framed.win.InputEvent('beforeinput', { inputType, data: opts.data ?? null, bubbles: true, cancelable: true });
+    const ranges = (opts.ranges ?? []).map(
+      ([startContainer, startOffset, endContainer, endOffset]) => new framed.win.StaticRange({ startContainer, startOffset, endContainer, endOffset }),
+    );
+    Object.defineProperty(event, 'getTargetRanges', { value: () => ranges });
+    if (opts.paste !== undefined) Object.defineProperty(event, 'dataTransfer', { value: { getData: (type: string) => (type === 'text/plain' ? opts.paste : '') } });
+    host.dispatchEvent(event);
+    return event;
+  }
+  const select = (framed: Framed, anchor: Node, anchorOffset: number, focus: Node, focusOffset: number): void => {
+    (framed.win.getSelection() as Selection).setBaseAndExtent(anchor, anchorOffset, focus, focusOffset);
+  };
+  const selectionChanged = (framed: Framed): void => {
+    framed.doc.dispatchEvent(new framed.win.Event('selectionchange'));
+  };
+  /** The selection as collapsed or not, the text of its focus node (each run's differs) and its offset. */
+  const caretOf = (framed: Framed): [boolean, string | null, number] => {
+    const selection = framed.win.getSelection() as Selection;
+    return [selection.isCollapsed, selection.focusNode?.textContent ?? null, selection.focusOffset];
+  };
+  const datas = (s: Sentence): string[] => [s.first.data, s.bold.data, s.last.data];
+  const typedValues = (framed: Framed): unknown[] => sentOf(framed, 'typed').map((m) => m['value']);
+  const boldValue = (bold: string): string => 'Install: run <1>' + bold + '</1> and answer.';
+
+  it('T18.1: the census finds the sentence by its element, and the pick offers typing in place (check 3 F4)', async () => {
+    const framed = await frame(SENTENCE);
+    expect((await censusOf(framed, INSTALL))?.['found']).toEqual({ install: 1 });
+    await setMode(framed, 'edit');
+    press(framed, framed.doc.getElementById('s') as Element, 'click');
+    await tick();
+    expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'install', attr: null, by: 'element', inplace: true }]);
+  });
+
+  it('T18.2: starting moves no node', async () => {
+    let held: Array<[Node, Node | null]> = [];
+    const s = await sentenceEdit(SENTENCE, INSTALL, ({ framed, p, bold }) => {
+      held = [...p.querySelectorAll('*'), ...textsOf(p)].map((n): [Node, Node | null] => [n, n.parentNode]);
+      select(framed, bold, 0, bold, 3);
+    });
+    const now = [...s.p.querySelectorAll('*'), ...textsOf(s.p)];
+    expect(now.length).toBe(held.length);
+    now.forEach((n, i) => {
+      expect(n).toBe((held[i] as [Node, Node | null])[0]);
+      expect(n.parentNode).toBe((held[i] as [Node, Node | null])[1]);
+    });
+    expect(s.p.querySelector('[data-stet-island]')).toBeNull();
+    expect(s.p.getAttribute('contenteditable')).toBe('plaintext-only');
+    const selection = s.framed.win.getSelection() as Selection;
+    expect([selection.toString(), selection.anchorNode === s.bold]).toEqual(['npx', true]);
+  });
+
+  it('T18.3: an insert lands in its node', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, 4);
+    const event = input(s.framed, s.p, 'insertText', { data: 'y' });
+    await tick();
+    expect(event.defaultPrevented).toBe(true);
+    expect(s.bold.data).toBe('npx yx init');
+    expect(caretOf(s.framed)).toEqual([true, 'npx yx init', 5]);
+    expect(typedValues(s.framed)).toEqual(['Install: run <1>npx yx init</1> and answer.']);
+    expect([sentOf(s.framed, 'edited'), s.p.getAttribute('contenteditable')]).toEqual([[], 'plaintext-only']);
+  });
+
+  it('T18.4: edits that would cross or empty a run do nothing (check 4 K1)', async () => {
+    const s = await sentenceEdit();
+    const { framed, p, first, bold, last } = s;
+    const start = datas(s);
+    const nothing = (event: InputEvent): void => {
+      expect([event.inputType, event.defaultPrevented, datas(s)]).toEqual([event.inputType, true, start]);
+    };
+    // A range from the first run into the bold one.
+    select(framed, first, 5, bold, 2);
+    nothing(input(framed, p, 'deleteContentBackward', { ranges: [[first, 5, bold, 2]] }));
+    nothing(input(framed, p, 'insertText', { data: 'q', ranges: [[first, 5, bold, 2]] }));
+    // Backspace at the bold run's start: Firefox's and Safari's range in the run before, then Chrome's none.
+    caret(framed, bold, 0);
+    nothing(input(framed, p, 'deleteContentBackward', { ranges: [[first, first.length - 1, first, first.length]] }));
+    nothing(input(framed, p, 'deleteContentBackward'));
+    // A delete that would empty the bold run.
+    select(framed, bold, 0, bold, bold.length);
+    nothing(input(framed, p, 'deleteContentBackward'));
+    nothing(input(framed, p, 'deleteByCut', { ranges: [[bold, 0, bold, bold.length]] }));
+    caret(framed, bold, 2);
+    for (const kind of ['insertParagraph', 'historyUndo', 'formatBold']) nothing(input(framed, p, kind));
+    await tick();
+    expect(typedValues(framed)).toEqual([]);
+    caret(framed, first, first.length);
+    expect(input(framed, p, 'insertFromPaste', { paste: 'a\nb' }).defaultPrevented).toBe(true);
+    expect(first.data).toBe('Install: run a b');
+    // A placeholder tag is never typed: `<2` is prose, and the `>` that would close it does nothing.
+    caret(framed, bold, bold.length);
+    input(framed, p, 'insertText', { data: '<2' });
+    expect(bold.data).toBe('npx x init<2');
+    const typedBefore = typedValues(framed).length;
+    expect(input(framed, p, 'insertText', { data: '>' }).defaultPrevented).toBe(true);
+    expect([bold.data, typedValues(framed).length]).toEqual(['npx x init<2', typedBefore]);
+    // A plain `<b>` is prose and goes in.
+    caret(framed, last, 0);
+    input(framed, p, 'insertFromPaste', { paste: 'a <b> b' });
+    expect(last.data).toBe('a <b> b and answer.');
+  });
+
+  it('T18.4b: edits that follow the selection (check 4 K1)', async () => {
+    const body = '<p id="s">run more words <b>npx</b> ok 👍🏽</p>';
+    const s = await sentenceEdit(body, [{ key: 'words', texts: ['run more words npx ok 👍🏽'], tags: 1 }]);
+    const { framed, p, first, bold, last } = s;
+    caret(framed, first, 8);
+    input(framed, p, 'deleteWordBackward');
+    expect(datas(s)).toEqual(['run  words ', 'npx', ' ok 👍🏽']);
+    caret(framed, last, last.length);
+    input(framed, p, 'deleteContentBackward');
+    expect(last.data).toBe(' ok ');
+    select(framed, first, 0, first, 3);
+    input(framed, p, 'insertText', { data: 'go' });
+    expect(first.data).toBe('go  words ');
+    caret(framed, first, 2);
+    input(framed, p, 'insertReplacementText', { data: 'GO' });
+    expect(first.data).toBe('go  words ');
+    // iOS autocorrect's word replacement: a range inside the focus node.
+    input(framed, p, 'insertReplacementText', { data: 'GO', ranges: [[first, 0, first, 2]] });
+    expect([first.data, bold.data]).toEqual(['GO  words ', 'npx']);
+  });
+
+  it('T18.5: the selection stays inside one run', async () => {
+    const { framed, p, first, bold } = await sentenceEdit();
+    select(framed, first, 2, bold, 1);
+    selectionChanged(framed);
+    expect(caretOf(framed)).toEqual([true, bold.data, 1]);
+    caret(framed, p, 1);
+    selectionChanged(framed);
+    expect(caretOf(framed)).toEqual([true, first.data, first.length]);
+  });
+
+  it('T18.6: a change the agent did not make ends the edit, and only the agent’s own writes go back (check 4 K2, K14)', async () => {
+    const typeInto = (s: Sentence): void => {
+      caret(s.framed, s.first, 0);
+      input(s.framed, s.p, 'insertText', { data: 'A' });
+      caret(s.framed, s.bold, 0);
+      input(s.framed, s.p, 'insertText', { data: 'B' });
+    };
+    const s = await sentenceEdit();
+    typeInto(s);
+    await tick();
+    s.bold.data = 'X';
+    await tick();
+    expect(lastOf(s.framed, 'edited')).toEqual({
+      stet: 'edited',
+      key: 'install',
+      locale: 'default',
+      entry: undefined,
+      how: 'lost',
+      interrupted: true,
+      proposed: true,
+      channel: 'c1',
+    });
+    expect([s.first.data, s.bold.data, s.p.hasAttribute('contenteditable')]).toEqual(['Install: run ', 'X', false]);
+
+    // An edit started over a shown draft: its swaps are lent, and the one whose node holds the agent's text again is returned.
+    const lent = await sentenceEdit(SENTENCE, INSTALL, async ({ framed }) => {
+      await framed.locate({ ...DRAFT, draft: 'Install: go <1>npx x init</1> and answer.' });
+    });
+    expect(lent.first.data).toBe('Install: go ');
+    typeInto(lent);
+    await tick();
+    lent.bold.data = 'X';
+    await tick();
+    expect(lastOf(lent.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true, proposed: true });
+    expect([lent.first.data, lent.bold.data]).toEqual(['Install: go ', 'X']);
+    // The returned swap puts the page's words back on clear; the node the page rewrote is no longer the agent's.
+    lent.framed.send({ stet: 'clear' });
+    await tick();
+    expect([lent.first.data, lent.bold.data]).toEqual(['Install: run ', 'X']);
+
+    const appended = await sentenceEdit();
+    appended.p.appendChild(appended.framed.doc.createElement('span'));
+    await tick();
+    expect(lastOf(appended.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true, proposed: false });
+
+    const removed = await sentenceEdit();
+    removed.p.remove();
+    await tick();
+    expect(lastOf(removed.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+
+    const blurred = await sentenceEdit();
+    blurred.p.dispatchEvent(new blurred.framed.win.FocusEvent('focusout', { bubbles: true, relatedTarget: null }));
+    blurred.p.remove();
+    await tick();
+    expect(sentOf(blurred.framed, 'edited')).toHaveLength(1);
+    expect(lastOf(blurred.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+  });
+
+  it('T18.12: a framework write just before a keystroke ends the edit before the agent writes (check 4 K13)', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, 1);
+    s.bold.data = 'X';
+    input(s.framed, s.p, 'insertText', { data: 'y' });
+    await tick();
+    expect([s.bold.data, typedValues(s.framed)]).toEqual(['X', []]);
+    expect(lastOf(s.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true, proposed: false });
+  });
+
+  it('T18.7: the agent’s own writes never end it', async () => {
+    const s = await sentenceEdit();
+    const expected: string[] = [];
+    caret(s.framed, s.bold, s.bold.length);
+    for (const ch of 'abcde') {
+      input(s.framed, s.p, 'insertText', { data: ch });
+      expected.push(boldValue(s.bold.data));
+      if (ch === 'c') await tick();
+    }
+    for (let i = 0; i < 5; i += 1) {
+      input(s.framed, s.p, 'deleteContentBackward');
+      expected.push(boldValue(s.bold.data));
+      await tick(1);
+    }
+    await tick();
+    expect(s.bold.data).toBe('npx x init');
+    expect(typedValues(s.framed)).toEqual(expected);
+    expect(expected[4]).toBe(boldValue('npx x initabcde'));
+    expect([sentOf(s.framed, 'edited'), s.p.getAttribute('contenteditable')]).toEqual([[], 'plaintext-only']);
+  });
+
+  it('T18.8: a composition is the input method’s, judged when it ends (check 4 K8)', async () => {
+    const compose = (s: Sentence): void => {
+      caret(s.framed, s.bold, s.bold.length);
+      s.p.dispatchEvent(new s.framed.win.CompositionEvent('compositionstart', { bubbles: true }));
+    };
+    const end = (s: Sentence): void => {
+      s.p.dispatchEvent(new s.framed.win.CompositionEvent('compositionend', { bubbles: true }));
+    };
+    const s = await sentenceEdit();
+    compose(s);
+    expect(input(s.framed, s.p, 'insertCompositionText', { data: 'とう' }).defaultPrevented).toBe(false);
+    s.bold.data += 'とう';
+    await tick();
+    expect(input(s.framed, s.p, 'insertFromComposition', { data: '東京' }).defaultPrevented).toBe(false);
+    s.bold.data = 'npx x init東京';
+    caret(s.framed, s.bold, s.bold.length);
+    end(s);
+    await tick();
+    expect(typedValues(s.framed)).toEqual([boldValue('npx x init東京')]);
+    expect(sentOf(s.framed, 'edited')).toEqual([]);
+
+    // The caret ends in another run than the one composed into.
+    const away = await sentenceEdit();
+    compose(away);
+    away.bold.data += 'と';
+    caret(away.framed, away.first, 2);
+    end(away);
+    await tick();
+    expect(lastOf(away.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+
+    // A held node loses its parent while the method composes.
+    const moved = await sentenceEdit();
+    compose(moved);
+    moved.bold.data += 'と';
+    moved.first.remove();
+    end(moved);
+    await tick();
+    expect(lastOf(moved.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+
+    // Safari's order: `compositionend` first, then the `insertFromComposition` beforeinput and the browser's write.
+    const late = await sentenceEdit();
+    compose(late);
+    end(late);
+    expect(input(late.framed, late.p, 'insertFromComposition', { data: '東京' }).defaultPrevented).toBe(false);
+    late.bold.data = 'npx x init東京';
+    caret(late.framed, late.bold, late.bold.length);
+    await tick();
+    await tick();
+    expect(typedValues(late.framed)).toEqual([boldValue('npx x init東京')]);
+    expect(sentOf(late.framed, 'edited')).toEqual([]);
+    // The method is done: a page write to the node now ends the edit.
+    late.bold.data = 'zzz';
+    await tick();
+    expect(lastOf(late.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+  });
+
+  it('T18.9: keep and cancel put the agent’s writes back', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, 4);
+    input(s.framed, s.p, 'insertText', { data: 'y' });
+    // The dashboard's locate for the new draft: nothing is painted into the sentence under edit.
+    await s.framed.locate({ ...DRAFT, draft: boldValue('npx yx init') });
+    key(s.framed, s.p, { key: 'Enter' });
+    await tick();
+    expect(lastOf(s.framed, 'edited')).toMatchObject({ how: 'keep', proposed: true });
+    // The draft shows through its swap, which holds the page's own words underneath.
+    expect([s.bold.data, s.p.hasAttribute('contenteditable')]).toEqual(['npx yx init', false]);
+    s.framed.send({ stet: 'clear' });
+    await tick();
+    expect(s.bold.data).toBe('npx x init');
+
+    const cancelled = await sentenceEdit();
+    caret(cancelled.framed, cancelled.bold, 4);
+    input(cancelled.framed, cancelled.p, 'insertText', { data: 'y' });
+    key(cancelled.framed, cancelled.p, { key: 'Escape' });
+    await tick();
+    expect(lastOf(cancelled.framed, 'edited')).toMatchObject({ how: 'cancel', proposed: true });
+    expect(cancelled.bold.data).toBe('npx x init');
+
+    // A node the page changed in the meantime: the edit ends interrupted and the node is never written.
+    const rewritten = await sentenceEdit();
+    caret(rewritten.framed, rewritten.first, 0);
+    input(rewritten.framed, rewritten.p, 'insertText', { data: 'A' });
+    rewritten.bold.data = 'X';
+    key(rewritten.framed, rewritten.p, { key: 'Enter' });
+    await tick();
+    expect(lastOf(rewritten.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true, proposed: true });
+    expect([rewritten.first.data, rewritten.bold.data]).toEqual(['Install: run ', 'X']);
+  });
+
+  it('a framework write just before the space key ends the edit before the agent writes (check 4 K13)', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, 1);
+    s.bold.data = 'X';
+    key(s.framed, s.p, { key: ' ' });
+    await tick();
+    expect([s.bold.data, typedValues(s.framed)]).toEqual(['X', []]);
+    expect(lastOf(s.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+  });
+
+  it('a composition that wrote two held nodes ends interrupted, not proposed (check 4 K8)', async () => {
+    const s = await sentenceEdit();
+    caret(s.framed, s.bold, s.bold.length);
+    s.p.dispatchEvent(new s.framed.win.CompositionEvent('compositionstart', { bubbles: true }));
+    s.first.data += 'と';
+    s.bold.data += 'う';
+    caret(s.framed, s.bold, s.bold.length);
+    s.p.dispatchEvent(new s.framed.win.CompositionEvent('compositionend', { bubbles: true }));
+    await tick();
+    expect(typedValues(s.framed)).toEqual([]);
+    expect(lastOf(s.framed, 'edited')).toMatchObject({ how: 'lost', interrupted: true });
+  });
+
+  it('a sentence whose draft the layer paints stays in the census, so it can be picked again (small call 3)', async () => {
+    const body = '<p id="s">Install: run <b>npx x init</b> and answer.</p><p id="o">Other words here today.</p>';
+    const framed = await frame(body);
+    const keys: CensusKey[] = [...INSTALL, { key: 'other', texts: ['Other words here today.'] }];
+    await censusOf(framed, keys);
+    framed.send({ stet: 'layer', drafts: [{ ...DRAFT, draft: 'Install: go <1>npx x init</1> and answer.' }] });
+    await tick(300);
+    expect((framed.doc.getElementById('s') as HTMLElement).textContent).toBe('Install: go npx x init and answer.');
+    expect((await censusOf(framed, keys))?.['found']).toEqual({ other: 1, install: 1 });
   });
 });

@@ -6,8 +6,8 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { applyFileEdits, formatDiff, planRewrite, unRewriteFile } from '../cli/rewrite.js';
-import { scanSource } from '../cli/source-scan.js';
+import { applyFileEdits, formatDiff, jsxReads, jsxRichClean, planRewrite, unRewriteFile } from '../cli/rewrite.js';
+import { loadTypescript, scanSource } from '../cli/source-scan.js';
 
 const scan = (file: string, src: string) => scanSource(file, src, { readPathImport: '@/lib/content' });
 
@@ -332,5 +332,29 @@ describe('formatDiff', () => {
     const over = countPM(formatDiff('big.tsx', aOver, bOver));
     expect(over.plus).toBe(2001);
     expect(over.minus).toBe(2001);
+  });
+});
+
+describe('jsxRichClean — the JSX read-back (D16, T16.14)', () => {
+  /** T16.12's server page, with a plain heading beside its sentences. */
+  const SRC =
+    "const k = 'x';\nexport default function Page() {\n  return (\n    <main>\n      <h1>Plain words here</h1>\n      <p>Run <b>npx x init</b> now.</p>\n" +
+    '      <p>Keep <b key="x">this</b> key.</p>\n      <p>Mind <b data-k={k}>the</b> name.</p>\n    </main>\n  );\n}\n';
+  /** Every sentence of the page rewritten, the heading left as written. */
+  const planned = async (): Promise<{ after: string; reads: ReturnType<typeof jsxReads> }> => {
+    const r = await scan('app/page.tsx', SRC);
+    const landed = r.literals.filter((l) => l.context === 'jsx-rich').map((literal, i) => ({ literal, key: `sentence_${i + 1}` }));
+    expect(landed).toHaveLength(3);
+    const edits = landed.flatMap(({ literal, key }) => planRewrite(SRC, literal, key, 'server', '@/lib/content').edits);
+    return { after: applyFileEdits(SRC, edits), reads: jsxReads(edits, landed) };
+  };
+
+  it('holds for a clean rewrite, and fails a new syntax error, a planned read missing and another literal moved', async () => {
+    const ts = await loadTypescript();
+    const { after, reads } = await planned();
+    expect(await jsxRichClean(ts, 'app/page.tsx', SRC, after, reads)).toBe(true);
+    expect(await jsxRichClean(ts, 'app/page.tsx', SRC, after.replace('</main>', '</main'), reads)).toBe(false);
+    expect(await jsxRichClean(ts, 'app/page.tsx', SRC, after.replace("copy('sentence_2')", "copy('other_key')"), reads)).toBe(false);
+    expect(await jsxRichClean(ts, 'app/page.tsx', SRC, after.replace('Plain words here', 'Plain words hare'), reads)).toBe(false);
   });
 });

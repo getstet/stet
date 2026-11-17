@@ -2,12 +2,12 @@
  * A temp host project for the email commands — the one place that knows how to
  * give a throwaway directory a working `node_modules`.
  *
- * `stet email verify` renders through the HOST's own `typescript` and
- * `react-dom/server`, resolved by `createRequire` from the host's
- * `package.json`. A `mkdtemp` directory has neither, and nothing up its chain
- * does either, so a fixture host has to be given them: `deps: 'all'` links the
- * workspace's whole `node_modules`, and a named list links only those packages —
- * which is how the missing-dependency arm is produced at all.
+ * `stet email verify` transpiles with stet's own `typescript` and renders
+ * through the HOST's `react-dom/server`, resolved by `createRequire` from the
+ * host's `package.json`. A `mkdtemp` directory has no `react-dom`, and nothing
+ * up its chain does either, so a fixture host has to be given it: `deps: 'all'`
+ * links the workspace's whole `node_modules`, and a named list links only those
+ * packages — which is how the missing-dependency arm is produced at all.
  *
  * Consumers: `tests/email-render.test.ts`, `tests/email-extract.test.ts` and
  * `tests/email-verify.test.ts`.

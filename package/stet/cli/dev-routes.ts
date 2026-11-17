@@ -16,7 +16,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, existsSync, openSync, readFileSync, utimesSync } from 'node:fs';
 import { dirname, join, posix } from 'node:path';
 
@@ -27,17 +27,18 @@ import { bearerMatches, createStetHandler } from '../server/mount.js';
 import { route as normalizeRoute } from '../src/seo.js';
 import { DescriptorError, keyDefOf, loadDescriptor, loadDescriptorWithWarnings } from '../src/descriptor.js';
 import { canonicalize } from '../src/codegen.js';
+import { plainOf } from '../src/placeholder.js';
 import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
-import type { Descriptor } from '../src/types.js';
+import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { check } from './check.js';
 import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
 import { pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
 import { isBarePackage } from './email-extract.js';
 import { filesForGlobs, staticPrefix } from './files.js';
-import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, type GitState } from './git.js';
+import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, uncommittedStatus, type GitState } from './git.js';
 import {
   heldTextOf,
   isHeadText,
@@ -53,20 +54,22 @@ import {
   type Element,
   type HtmlMark,
   type HtmlProposalSet,
+  wordBoundedIndex,
 } from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
-import { closing, dialectCode, KEY_READ, nonCodeOf, openTag, within, type Span } from './key-reads.js';
+import { codeOf, dialectCode, KEY_READ, nonCodeOf, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
-import { isGenerated, keyUsage, namedKeys, ownFiles, usageCache, type UsageCache } from './key-usage.js';
+import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
-import { applyPages, auditablePages, fileRoute, proposeForHost, routeFiles, servedRoute } from './pages.js';
+import { applyPages, auditablePages, fileRoute, pagesCompiler, proposeForHost, routeFiles, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
-import { blankNonMarkup, dialectOf, loadTypescript, matchGlob, packageNames, scriptKindFor, type Dialect } from './source-scan.js';
+import { elementPath, markupBraces, maskExpressions, selfClosedRaw } from './markup.js';
+import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, packageNames, richPartsBindingAt, scriptKindFor } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -490,7 +493,7 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
       case 'GET site/usage':
         return await usage(ctx, site);
       case 'GET site/route-reads':
-        return await routeReads(url, site);
+        return await routeReads(ctx, url, site);
       case 'POST site/dev-start':
         return await devStart(ctx, site, entry);
       case 'POST site/dev-stop':
@@ -565,7 +568,7 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
     dev: devDefaults(config, entry),
     previewDefault: routerPreviewCommand(config),
     entry,
-    pending: pendingForms(site),
+    ...pendingSplit(site),
     git: { ...site.git, live: liveOf(site.path, site.git.branch) },
   });
 }
@@ -602,7 +605,7 @@ async function previewReads(site: Ready, env: NodeJS.ProcessEnv): Promise<{ snap
 /**
  * Whether `text` holds `value` as a quoted string outside every comment. The
  * comments are the TypeScript scanner's (`nonCodeOf`), so a `//` inside a
- * string is not one. Without `typescript` installed the text is read as it is.
+ * string is not one. Where stet's own `typescript` does not load the text is read as it is.
  */
 async function holdsLiteral(file: string, text: string, value: string): Promise<boolean> {
   const literals = ["'", '"', '`'].map((quote) => quote + value + quote);
@@ -769,7 +772,7 @@ async function save(ctx: DevContext, req: Request, site: SiteState, listed: Work
     same,
     findings: [...gate.findings, ...report.findings],
     at: gitState(ready.path),
-    pending: pendingForms(ready),
+    ...pendingSplit(ready),
   });
 }
 
@@ -846,7 +849,7 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
   // Every refusal carries the list as git reads it now, so the page never
   // keeps offering a Commit the server just refused.
   const refuse = (error: string, status: number, output?: string): Response =>
-    json({ error, ...(output === undefined ? {} : { output }), pending: pendingForms(ready) }, status);
+    json({ error, ...(output === undefined ? {} : { output }), ...pendingSplit(ready) }, status);
   if (!Array.isArray(files) || files.length === 0) return refuse('files is required', 400);
   // `git add` would stage the forms into the operation's own index — a merge
   // commit would then carry the stet edit — and mid-rebase the commit would
@@ -857,9 +860,10 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
 
   // Read from git now, not from the page's last reply: a list gone stale since
   // would otherwise commit a deletion or a file already committed elsewhere.
-  const pending = pendingForms(ready);
+  // An untracked host document is committed only where the caller names it.
+  const { pending, untracked } = pendingSplit(ready);
   for (const file of files) {
-    if (typeof file === 'string' && pending.includes(file)) continue;
+    if (typeof file === 'string' && (pending.includes(file) || untracked.includes(file))) continue;
     const form = typeof file === 'string' && stetWrittenForms(ready, [file]).has(file);
     return refuse(form ? `${String(file)} has nothing to commit` : `${String(file)} is not a stet-written form of this site`, 400);
   }
@@ -909,7 +913,7 @@ async function commit(ctx: DevContext, req: Request, site: SiteState): Promise<R
     short: git(ready.path, ['rev-parse', '--short', 'HEAD']).out.trim(),
     subject: git(ready.path, ['log', '-1', '--format=%s']).out.trim(),
     at: gitState(ready.path),
-    pending: pendingForms(ready),
+    ...pendingSplit(ready),
   });
 }
 
@@ -1046,27 +1050,75 @@ function gitSpelling(path: string): string {
 }
 
 /**
- * The committable files: the stet-written forms git reports as differing from
- * HEAD — staged, unstaged or untracked — deletions and unmerged paths left out,
- * a document counting only where it carries a mark. Read from the checkout
- * every time, so a reload, a restart or a save made in the terminal all give
- * the same answer.
+ * The committable files, split in two. `pending` holds the stet-written forms
+ * git reports as differing from HEAD — staged, unstaged or untracked —
+ * deletions and unmerged paths left out, a document counting only where it
+ * carries a mark. `untracked` holds the host documents and host files among
+ * them that git has never held: a page still being drafted is not committed
+ * unless its caller names it. stet's own forms (the descriptor, the snapshot,
+ * the codegen files) stay in `pending` even when untracked, so a first commit
+ * after `init` carries them. Read from the checkout every time, so a reload, a
+ * restart or a save made in the terminal all give the same answer.
  */
-function pendingForms(site: Ready): string[] {
+function pendingSplit(site: Ready): { pending: string[]; untracked: string[] } {
   const { files, globs } = stetFormPaths(site);
+  const recorded = hostWritten(site);
   // Git reads a glob its own way (`[` is a class to git and a character to
   // stet; `**` beside a name is a plain `*` to git), so git is asked only for
   // the folders the globs walk, as literal paths, and stet's own matcher picks
   // the documents.
   const roots = [...new Set(globs.map(staticPrefix))].map((root) => (root === '' ? '.' : `:(literal)${root}`));
-  const changed = uncommittedPaths(site.path, [...files, ...roots]).filter(
-    (file) => files.includes(file) || globs.some((glob) => matchGlob(glob, file)),
-  );
+  const asked = uncommittedStatus(site.path, [...files, ...roots, ...[...recorded.keys()].map((file) => `:(literal)${file}`)]);
+  // Git that cannot answer offers nothing, and the records wait for an answer that can.
+  if (asked === null) return { pending: [], untracked: [] };
+  forgetHostWrites(site, asked.map((entry) => entry.path));
+  const neverHeld = new Set(asked.filter((entry) => entry.untracked).map((entry) => entry.path));
+  const changed = asked.map((entry) => entry.path).filter((file) => files.includes(file) || globs.some((glob) => matchGlob(glob, file)) || recorded.has(file));
   // A document that cannot be read is left out, so one unreadable file never
   // stops the site opening.
   const readable = changed.filter((file) => files.includes(file) || canRead(join(site.path, file)));
   const accepted = stetWrittenForms(site, readable);
-  return readable.filter((file) => accepted.has(file));
+  // A host file stet's own route wrote is committable while its bytes are still the ones stet wrote.
+  const committable = readable.filter((file) => accepted.has(file) || (recorded.has(file) && hashOf(site, file) === recorded.get(file)));
+  const held = (file: string): boolean => neverHeld.has(file) && !files.includes(file);
+  return { pending: committable.filter((file) => !held(file)), untracked: committable.filter(held) };
+}
+
+/** The host source files stet's own routes wrote this run, by site path: each file and the sha256 of the bytes written. Lost when `stet dev` restarts. */
+const hostWrites = new Map<string, Map<string, string>>();
+
+function hashOf(site: Ready, file: string): string | null {
+  try {
+    return createHash('sha256').update(readFileSync(join(site.path, file))).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function hostWritten(site: Ready): Map<string, string> {
+  return hostWrites.get(site.path) ?? new Map();
+}
+
+/**
+ * Records the files a route of this server just wrote, each with the bytes now on disk; a file that already differed from HEAD before the write carries edits that are not stet's and is left out.
+ * A file dirty before only because stet's own earlier write left it so (its bytes before this write are the recorded ones) is still stet's. Nothing is recorded where git could not say what was dirty.
+ */
+function recordHostWrites(site: Ready, labels: string[], dirtyBefore: string[] | null, hashesBefore: Map<string, string | null>): void {
+  if (dirtyBefore === null) return;
+  const held = hostWrites.get(site.path) ?? new Map<string, string>();
+  for (const file of labels) {
+    if (dirtyBefore.includes(file) && !(held.has(file) && held.get(file) === hashesBefore.get(file))) continue;
+    const hash = hashOf(site, file);
+    if (hash !== null) held.set(file, hash);
+  }
+  hostWrites.set(site.path, held);
+}
+
+/** Drops a record whose file git no longer reports as differing from HEAD: it was committed, or put back. */
+function forgetHostWrites(site: Ready, differing: string[]): void {
+  const held = hostWrites.get(site.path);
+  if (held === undefined) return;
+  for (const file of [...held.keys()]) if (!differing.includes(file)) held.delete(file);
 }
 
 /** Opened, not asked: `access()` answers readable on some mounts (virtiofs, ACLs) where `open()` fails. */
@@ -1291,14 +1343,17 @@ function applyKeyMove(
   ready: Ready,
   plan: { descriptor: Descriptor; snapshot: Snapshot; host: HostRenames },
   label: string,
-): { written: string[]; touched: string | null; at: GitState; pending: string[] } {
+): { written: string[]; touched: string | null; at: GitState; pending: string[]; untracked: string[] } {
   const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, new Report()).filter((p) => p.status !== 'unchanged');
+  const dirtyBefore = uncommittedPaths(ready.path, changed.map((p) => `:(literal)${p.label}`));
+  const hashesBefore = new Map(changed.map((p) => [p.label, hashOf(ready, p.label)]));
   try {
     writePlanned(changed);
   } catch (error) {
     rethrowBatchFailure(label, error);
   }
-  return { written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), pending: pendingForms(ready) };
+  recordHostWrites(ready, changed.map((p) => p.label), dirtyBefore, hashesBefore);
+  return { written: changed.map((p) => p.label), touched: touchReadPath(ready), at: gitState(ready.path), ...pendingSplit(ready) };
 }
 
 /**
@@ -1375,7 +1430,8 @@ function carries(site: SiteState): Response {
     }
   }
   keys.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.locale < b.locale ? -1 : a.locale > b.locale ? 1 : 0));
-  return json({ keys, files: pendingForms(ready) });
+  const { pending, untracked } = pendingSplit(ready);
+  return json({ keys, files: pending, untracked });
 }
 
 /**
@@ -1623,11 +1679,11 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
   const body = await readJson(req);
   const sha = commitOf(ready, reqStr(body, 'sha'));
   const refuse = (error: string, output?: string): Response =>
-    json({ error, ...(output === undefined ? {} : { output }), at: gitState(ready.path), pending: pendingForms(ready) }, 409);
+    json({ error, ...(output === undefined ? {} : { output }), at: gitState(ready.path), ...pendingSplit(ready) }, 409);
   const { keys, before } = removedKeysOf(ready, sha);
   if (before === null || keys.length === 0) throw new UsageError(`${sha.slice(0, 7)} removed no key`);
   if (operationInProgress(ready.path)) return refuse('a merge, cherry-pick, revert or rebase is in progress — finish it in the terminal');
-  if (pendingForms(ready).length > 0) return refuse('Restore waits for the uncommitted stet files — commit them first');
+  if (pendingSplit(ready).pending.length > 0) return refuse('Restore waits for the uncommitted stet files — commit them first');
   // The revert's commit takes the whole index, so a staged change would ride along.
   if (gitData(ready.path, ['diff', '--cached', '--quiet']).code !== 0) return refuse('Restore waits for the staged changes — commit or unstage them first');
   const touched = gitData(ready.path, ['diff', '--name-only', `${sha}^`, sha]).stdout.split('\n').filter((f) => f !== '');
@@ -1645,7 +1701,7 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
       short: git(ready.path, ['rev-parse', '--short', 'HEAD']).out.trim(),
       subject: git(ready.path, ['log', '-1', '--format=%s']).out.trim(),
       at: gitState(ready.path),
-      pending: pendingForms(ready),
+      ...pendingSplit(ready),
     });
   const report = new Report();
 
@@ -1704,7 +1760,7 @@ async function restore(ctx: DevContext, req: Request, site: SiteState): Promise<
   const intent = await siteGitRun(ctx, ready, ['add', '-N', '--', ...literal]);
   if (intent.code !== 0) return refuse('git commit failed', intent.out);
   const made = await siteGitRun(ctx, ready, ['commit', '-m', message, '--', ...literal]);
-  if (made.code !== 0) return json({ error: 'git commit failed', output: made.out, markup, at: gitState(ready.path), pending: pendingForms(ready) }, 409);
+  if (made.code !== 0) return json({ error: 'git commit failed', output: made.out, markup, at: gitState(ready.path), ...pendingSplit(ready) }, 409);
   return done({ skipped: next.skipped, markup });
 }
 
@@ -2013,30 +2069,43 @@ function marks(site: SiteState): Response {
  */
 async function usage(ctx: DevContext, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
+  return json(await keyUsage(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path)));
+}
+
+/** A site's file facts, kept in `ctx` between requests: the usage and the route reads read through the same cache. */
+function usageCacheOf(ctx: DevContext, path: string): UsageCache {
   const caches = (ctx.usage ??= new Map());
-  const cache = caches.get(ready.path) ?? usageCache();
-  caches.set(ready.path, cache);
-  return json(await keyUsage(ready.path, ready.config, ready.descriptor, cache));
+  const cache = caches.get(path) ?? usageCache();
+  caches.set(path, cache);
+  return cache;
 }
 
 /**
  * The keys one route's files read: on the static-HTML host the marks of the
- * document served at the route; on a JavaScript host the keys named in the
- * route's page files (`routeFiles`) and everything they import, through the
- * host's path aliases. `complete` is false where the walk met a file it could
- * not follow or the route maps to no file.
+ * document served at the route, complete where every web text key the
+ * descriptor declares is marked in some document; on a JavaScript host the reads `siteReads`
+ * settles for the route's page files (`routeFiles`) and everything they import,
+ * through the host's path aliases: the keys each file names, and every declared
+ * key under a prefix it reads. `complete` is false where the walk met a file it
+ * could not follow, a file reads a key stet cannot name (a cause), loads
+ * modules lazily, or the route maps to no file.
  */
-async function routeReads(url: URL, site: SiteState): Promise<Response> {
+async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<Response> {
   const ready = requireReady(site);
   const route = url.searchParams.get('route');
   if (route === null) throw new UsageError('route is required');
-  const unmapped = { route, files: [], keys: [], complete: false };
+  const unmapped = { route, files: [], keys: [], complete: false, renders: {}, coincident: [] };
   if (ready.host === 'html') {
     const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
     const document = set.documents.find((d) => normalizeRoute(servedRoute(d.file)) === normalizeRoute(route));
     if (document === undefined) return json(unmapped);
     const keys = [...new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key))].sort();
-    return json({ route, files: [document.file], keys, complete: true });
+    // A declared key no document marks is rendered by something other than the HTML (the page's own script), so the marks are not the page's whole reads.
+    const marked = new Set(set.claimed.map((mark) => mark.key));
+    const markedEverywhere = Object.entries(ready.descriptor.keys).every(
+      ([key, def]) => def.shape !== 'text' || def.target !== DEFAULT_TARGET || def.derivesFrom !== undefined || marked.has(key),
+    );
+    return json({ route, files: [document.file], keys, complete: markedEverywhere, renders: {}, coincident: [] });
   }
   const files = routeFiles(ready.path, route, ready.config);
   if (files === null) return json(unmapped);
@@ -2052,6 +2121,8 @@ async function routeReads(url: URL, site: SiteState): Promise<Response> {
       const found = probeFile(ready.path, candidate);
       if (found !== null) return found;
     }
+    // A scheme the host's own `paths` declare is an alias that maps nowhere, not a module the framework provides.
+    if (mappings !== null && declaresAlias(spec, mappings.paths)) return null;
     return isBarePackage(spec) && packages(spec) ? undefined : null;
   };
   // A file nested past the compiler's recursion cannot be walked: the route
@@ -2061,32 +2132,90 @@ async function routeReads(url: URL, site: SiteState): Promise<Response> {
     chain = importClosure(ts, ready.path, files, alias, (rel) => insideCheckout(ready.path, join(ready.path, rel)) !== null);
   } catch (error) {
     if (!(error instanceof RangeError)) throw error;
-    return json({ route, files, keys: [], complete: false });
+    return json({ route, files, keys: [], complete: false, renders: {}, coincident: [] });
   }
-  const declared = new Set(Object.keys(ready.descriptor.keys));
+  const declaredKeys = Object.keys(ready.descriptor.keys);
+  const declared = new Set(declaredKeys);
   const own = ownFiles(ready.config);
+  const reads = await siteReads(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path));
   const keys = new Set<string>();
   let complete = !chain.boundary;
   for (const file of chain.files) {
     // The files stet writes name every key, and read none.
     if (own.has(file.rel) || isGenerated(file.text)) continue;
+    const read = reads.files.get(file.rel);
+    // A source file the scan did not read (ignored by git, reached through a symlinked folder):
+    // its names count, and its reads are not known.
+    if (read === undefined && isSourceFile(file.rel)) complete = false;
     try {
-      for (const key of namedKeys(ts, file.rel, file.text, declared)) keys.add(key);
-      if (importsLazily(ts, file.rel, file.text)) complete = false;
+      for (const key of read === undefined ? namedKeys(ts, file.rel, file.text, declared) : read.named) keys.add(key);
+      // A prefix read reads every declared key under it; a read the scan cannot settle reads keys stet cannot name.
+      for (const p of read?.prefixes ?? []) for (const key of declaredKeys) if (key.startsWith(p.prefix)) keys.add(key);
+      if ((read !== undefined && read.causes.length > 0) || importsLazily(ts, file.rel, file.text)) complete = false;
     } catch (error) {
       if (!(error instanceof RangeError)) throw error;
       complete = false;
     }
   }
-  return json({ route, files, keys: [...keys].sort(), complete });
+  // Where each key the route reads is written into an element's text: a key every read of which stet can place (D12).
+  const sites = new Map<string, SiteLevel[][]>();
+  const open = new Set<string>();
+  if (complete) {
+    for (const file of chain.files) {
+      if (own.has(file.rel) || isGenerated(file.text)) continue;
+      const read = reads.files.get(file.rel);
+      const named = read === undefined ? namedKeys(ts, file.rel, file.text, declared) : new Set(read.named);
+      for (const p of read?.prefixes ?? []) for (const key of declaredKeys) if (key.startsWith(p.prefix)) open.add(key);
+      let placed: FileSites | null = null;
+      try {
+        placed = PLACED.test(file.rel) ? renderSites(ts, file.rel, file.text, declared) : null;
+      } catch (error) {
+        if (!(error instanceof RangeError)) throw error;
+      }
+      for (const key of named) {
+        const at = placed?.get(key);
+        // A read stet cannot place, or a file whose reads it does not place at all: the key is open on this route.
+        if (at === undefined || at.open) open.add(key);
+        else sites.set(key, [...(sites.get(key) ?? []), ...at.sites]);
+      }
+    }
+  }
+  const renders = complete ? Object.fromEntries([...sites].filter(([key]) => !open.has(key) && keys.has(key))) : {};
+  // A placed key whose words a file of the route writes as text: one of its matches may be that text (R21).
+  const copyModule = (rel: string): boolean => ready.config.copyModules.some((glob) => matchGlob(glob, rel));
+  const shown = chain.files.filter((file) => !own.has(file.rel) && !isGenerated(file.text) && !copyModule(file.rel));
+  const texts = shown.map((file) => flatText(file.text));
+  // A sentence key's words, its tags dropped, against each file's text with its inline tags dropped (check 3 F20).
+  let sentences: string[] | undefined;
+  const coincident = Object.keys(renders)
+    .filter((key) => {
+      const value = heldTextOf(ready.descriptor, ready.snapshot, key);
+      if (value === null) return false;
+      const tagged = keyDefOf(ready.descriptor, key)?.tags !== undefined;
+      const words = flatText(tagged ? plainOf(value) : value);
+      const pool = tagged ? (sentences ??= shown.map((file) => flatText(file.text.replace(INLINE_TAG, '')))) : texts;
+      return words !== '' && pool.some((text) => wordBoundedIndex(text, words, JOINS_WORD) !== -1);
+    })
+    .sort();
+  return json({ route, files, keys: [...keys].sort(), complete, renders, coincident });
 }
 
-/** Whether a file holds a dynamic `import()` or a `require()` call: a module the walk would not see. */
+/**
+ * Whether a file holds a dynamic `import()`, a `require()` call or a glob import
+ * (`import.meta.glob(…)`, `Astro.glob(…)`): a module the walk would not see.
+ */
 export function importsLazily(ts: typeof import('typescript'), rel: string, text: string): boolean {
-  if (!/\b(?:import|require)\s*\(/.test(text)) return false;
+  if (!/\b(?:import|require)\s*\(|\bimport\.meta\.glob|\bAstro\.glob/.test(text)) return false;
   const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
+  const globbed = (callee: TS.Expression): boolean =>
+    ts.isPropertyAccessExpression(callee) &&
+    callee.name.text === 'glob' &&
+    (ts.isMetaProperty(callee.expression) || (ts.isIdentifier(callee.expression) && callee.expression.text === 'Astro'));
   const found = (node: TS.Node): boolean =>
-    (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) ||
+    (ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require') ||
+        globbed(node.expression))) ||
     ts.forEachChild(node, found) === true;
   try {
     return found(sf);
@@ -2184,53 +2313,6 @@ function readsIn(file: string, source: string, descriptor: Descriptor): Array<{ 
 }
 
 /**
- * A template dialect's markup with the inside of every `{…}` expression masked
- * with `_`, its outer braces and newlines kept: `content={copy.get('k')}` then
- * reads as one unquoted attribute value, where the quotes inside the expression
- * would otherwise end the attribute and the tag early. A brace opens only in the
- * markup `blankNonMarkup` leaves, so a `'{'` in frontmatter or a script opens
- * nothing, and ends where `closing` says, as the rename reads it. Every offset
- * stays put.
- */
-function maskExpressions(source: string, dialect: Dialect): string {
-  const markup = blankNonMarkup(source, dialect);
-  let out = '';
-  let from = 0;
-  for (let i = 0; i < source.length; i++) {
-    if (source[i] !== '{' || markup[i] === '\0') continue;
-    // The brace ends where `closing` says, as the rename's walk reads it.
-    const end = closing(source, i, '}');
-    out += source.slice(from, i + 1) + source.slice(i + 1, Math.max(i + 1, end - 1)).replace(/[^\n]/g, '_');
-    from = Math.max(i + 1, end - 1);
-    i = from - 1;
-  }
-  return out + source.slice(from);
-}
-
-/**
- * A template dialect's source with each self-closing `<script … />` and
- * `<style … />` blanked as a script body is: in a dialect the element has no
- * body, so the next close tag of its name must not end it and swallow the
- * markup between. The tag is read by `openTag`, as `dialectCode` reads it.
- * Every offset stays put.
- */
-function selfClosedRaw(source: string): string {
-  const spans: Array<{ start: number; end: number }> = [];
-  for (const m of source.matchAll(/<(?:script|style)\b/gi)) {
-    const tag = openTag(source, m.index);
-    if (tag.selfClosing) spans.push({ start: m.index, end: tag.end });
-  }
-  let out = '';
-  let from = 0;
-  for (const { start, end } of spans) {
-    if (start < from) continue;
-    out += source.slice(from, start) + source.slice(start, end).replace(/[^\n]/g, '\0');
-    from = end;
-  }
-  return out + source.slice(from);
-}
-
-/**
  * A `.vue` file with its top-level `<template>` open and close tags blanked to
  * spaces. The tokenizer reads `<template>` as opaque, as HTML defines it; in a
  * single-file component it is the markup itself. Every offset stays put.
@@ -2254,26 +2336,276 @@ function vueMarkup(source: string): string {
  * does: its tag, the attribute's name, and for a `<meta>`'s `content` the meta's
  * `name` or `property`, so a head read on a JavaScript host reads as its kind.
  */
-function elementAt(
-  roots: Element[],
-  at: number,
-  inSvg = false,
-): { tag?: string; attr?: string; meta?: string; svg?: true } {
-  for (const el of roots) {
-    if (at < el.openStart || at >= el.closeEnd) continue;
-    if (at < el.openEnd) {
-      const attr = el.attrs.find((a) => a.start <= at && at < a.end);
-      if (attr === undefined) return {};
-      const meta = attr.name === 'content' ? metaCopyName(el) : null;
-      return { tag: el.tag, attr: attr.name, ...(meta === null ? {} : { meta }) };
-    }
-    if (el.opaque) return {};
-    // A `<title>` inside an `<svg>` names the graphic, as on the static-HTML host.
-    const inner = elementAt(el.children, at, inSvg || el.tag === 'svg');
-    return inner.tag === undefined ? { tag: el.tag, ...(inSvg ? { svg: true as const } : {}) } : inner;
+function elementAt(roots: Element[], at: number): { tag?: string; attr?: string; meta?: string; svg?: true } {
+  const path = elementPath(roots, at);
+  const el = path[path.length - 1];
+  if (el === undefined) return {};
+  if (at < el.openEnd) {
+    const attr = el.attrs.find((a) => a.start <= at && at < a.end);
+    if (attr === undefined) return {};
+    const meta = attr.name === 'content' ? metaCopyName(el) : null;
+    return { tag: el.tag, attr: attr.name, ...(meta === null ? {} : { meta }) };
   }
-  return {};
+  if (el.opaque) return {};
+  // A `<title>` inside an `<svg>` names the graphic, as on the static-HTML host.
+  return { tag: el.tag, ...(path.slice(0, -1).some((up) => up.tag === 'svg') ? { svg: true as const } : {}) };
 }
+
+/** One level of where a key's value lands: the element's tag, and at the first level the classes its source writes (null where they are computed). */
+export interface SiteLevel {
+  tag: string;
+  classes: string[] | null;
+}
+/** A file's reads of each key: the render sites of its reads that write the value as an element's text, or `open` where any read is one stet cannot place. */
+export type FileSites = Map<string, { sites: SiteLevel[][]; open: boolean }>;
+
+/** The files whose reads `renderSites` places: Astro and the TypeScript family. A Vue, Svelte or MDX read is open. */
+const PLACED = /\.(?:astro|[cm]?[jt]sx?)$/;
+
+/** The children that close an open `p` in the browser's tree builder: everything that is not phrasing content (WHATWG "close a p element"). */
+const CLOSES_P = new Set([
+  'address', 'article', 'aside', 'blockquote', 'details', 'dialog', 'div', 'dl', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'main', 'menu', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'ul',
+]);
+/** The children a table part holds as written; the tree builder moves any other. */
+const TABLE_CHILDREN: Readonly<Record<string, readonly string[]>> = {
+  table: ['caption', 'colgroup', 'thead', 'tbody', 'tfoot', 'tr'],
+  thead: ['tr'],
+  tbody: ['tr'],
+  tfoot: ['tr'],
+  tr: ['td', 'th'],
+};
+const HEADING = /^h[1-6]$/;
+
+/** Whether the browser's tree builder closes or re-parents `parent` above `child`, so the source's nesting is not the page's. */
+function reparents(parent: string, child: string): boolean {
+  if (parent === 'p') return CLOSES_P.has(child);
+  if (HEADING.test(parent)) return HEADING.test(child);
+  if (parent === 'a' || parent === 'button' || parent === 'form') return child === parent;
+  const allowed = TABLE_CHILDREN[parent];
+  return allowed !== undefined && !allowed.includes(child);
+}
+
+/** The kinds of tag one tag closes when it opens inside it as written, each with the ancestors that make the inner tag a new scope instead. */
+const SELF_CLOSING: readonly { outer: readonly string[]; inner: readonly string[]; scope: readonly string[] }[] = [
+  { outer: ['li'], inner: ['li'], scope: ['ul', 'ol', 'menu'] },
+  { outer: ['dd', 'dt'], inner: ['dd', 'dt'], scope: ['dl'] },
+  { outer: ['option'], inner: ['option', 'optgroup'], scope: [] },
+  { outer: ['optgroup'], inner: ['optgroup'], scope: [] },
+  { outer: ['td', 'th'], inner: ['td', 'th'], scope: ['table'] },
+];
+/** Where a table part sits as written; the tree builder drops it, or moves it, under any other parent. */
+const TABLE_HOMES: Readonly<Record<string, readonly string[]>> = {
+  caption: ['table'],
+  colgroup: ['table'],
+  thead: ['table'],
+  tbody: ['table'],
+  tfoot: ['table'],
+  tr: ['table', 'thead', 'tbody', 'tfoot'],
+  td: ['tr'],
+  th: ['tr'],
+};
+
+/**
+ * Whether the tree builder repairs the markup along an element path (outermost
+ * first, null for a level that is not plain HTML) so the last element's place
+ * is not the source's: an ancestor it closes, or one it rebuilds, further up
+ * than the parent. The parent and child pairs `reparents` ends the chain at
+ * are not repairs here.
+ */
+function misnested(path: readonly (string | null)[]): boolean {
+  for (let j = 1; j < path.length; j += 1) {
+    const inner = path[j];
+    if (inner === null || inner === undefined) continue;
+    const parent = path[j - 1];
+    const home = TABLE_HOMES[inner];
+    if (home !== undefined && parent !== null && parent !== undefined && !home.includes(parent)) return true;
+    for (let i = j - 1; i >= 0; i -= 1) {
+      const outer = path[i];
+      if (outer === null || outer === undefined) continue;
+      const between = path.slice(i + 1, j);
+      if (
+        SELF_CLOSING.some((c) => c.outer.includes(outer) && c.inner.includes(inner) && !between.some((t) => t !== null && c.scope.includes(t))) ||
+        (i < j - 1 && reparents(outer, inner) && !TABLE_CHILDREN[outer])
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Where one read lands: an element's text (its chain, innermost first), an attribute, or somewhere stet cannot place. */
+type Placement = SiteLevel[] | 'inert' | 'open';
+
+/**
+ * Where each read of a declared key in one file of a route writes the key's
+ * value (D12): a read straight into an HTML element's text is a render site,
+ * the element's tag and classes and its parent's tag; a read into an HTML
+ * element's attribute is inert; any other read (front matter, a helper call, a
+ * component's prop or content, nested markup) opens the key. A key the file
+ * names more often than `KEY_READ` matches it (an alias, a destructure, a
+ * bracket, a key held in a variable) is open too. Throws a `RangeError` on
+ * markup nested past the compiler.
+ */
+export function renderSites(ts: typeof import('typescript'), file: string, source: string, declared: ReadonlySet<string>): FileSites {
+  const out: FileSites = new Map();
+  const code = codeOf(ts, file, source, dialectOf(file));
+  if (code === null) return out;
+  const inCode = (at: number): boolean => within(code.code, at) && !within(code.nonCode, at);
+  const place = file.endsWith('.astro') ? astroPlacement(file, source) : jsxPlacement(ts, file, source);
+  const classified = new Map<string, number>();
+  for (const found of source.matchAll(KEY_READ)) {
+    const key = found[2] ?? found[4] ?? found[5] ?? '';
+    // A read form in prose or a comment reads nothing.
+    if (!declared.has(key) || !inCode(found.index)) continue;
+    classified.set(key, (classified.get(key) ?? 0) + 1);
+    const at = place(found);
+    const entry = out.get(key) ?? { sites: [], open: false };
+    if (at === 'open') entry.open = true;
+    else if (at !== 'inert') entry.sites.push(at);
+    out.set(key, entry);
+  }
+  // A key named more often in the file's code than its classified reads is also read in a form they do not cover.
+  for (const [key, entry] of out) {
+    if (entry.open) continue;
+    let named = 0;
+    for (const m of source.matchAll(new RegExp(`(?<![\\w$])${key}(?![\\w$])`, 'g'))) if (inCode(m.index)) named += 1;
+    if (named > (classified.get(key) ?? 0)) entry.open = true;
+  }
+  return out;
+}
+
+/** An Astro element the page renders as itself: a lowercase source tag that is no slot, template, fragment or dotted name. */
+function htmlElement(source: string, el: Element): boolean {
+  return /[a-z]/.test(source[el.openStart + 1] ?? '') && !['slot', 'template', 'fragment'].includes(el.tag) && !el.tag.includes('.');
+}
+
+/** An Astro element's static classes: `[]` with no `class`, null where `class:list`, a braced `class` or a spread computes them. */
+function astroClasses(el: Element): string[] | null {
+  if (el.attrs.some((a) => a.name === 'class:list' || a.name.startsWith('{'))) return null;
+  const cls = el.attrs.find((a) => a.name === 'class');
+  if (cls === undefined) return [];
+  return !cls.quoted && cls.value.startsWith('{') ? null : cls.value.split(/\s+/).filter((c) => c !== '');
+}
+
+/** Each read of an Astro file placed by the markup around it. */
+function astroPlacement(file: string, source: string): (found: RegExpExecArray) => Placement {
+  const markup = selfClosedRaw(source);
+  const document = readDocument(file, maskExpressions(markup, 'astro'), 'astro');
+  const braces = markupBraces(markup, 'astro');
+  return (found) => {
+    if (document.faults.length > 0) return 'open';
+    const m = found.index;
+    const brace = braces.find((b) => b.start < m && m < b.end);
+    if (brace === undefined) return 'open';
+    const path = elementPath(document.roots, m);
+    const el = path[path.length - 1];
+    if (el === undefined) return 'open';
+    if (brace.inTag) {
+      if (m >= el.openEnd) return 'open';
+      const attr = el.attrs.find((a) => a.start <= m && m < a.end);
+      const printed = attr === undefined || attr.name.startsWith('{') || attr.name === 'set:html' || attr.name === 'set:text';
+      return htmlElement(source, el) && !printed ? 'inert' : 'open';
+    }
+    if (el.opaque || brace.start < el.openEnd || brace.end > el.contentEnd || !htmlElement(source, el)) return 'open';
+    // The brace's inside is the read alone: `{copy.k}`, `{ copy('k') }`, or a sentence key's
+    // `{richParts(copy.k, …)}`, the rest of which is its renderers (D16).
+    const inner = source.slice(brace.start + 1, brace.end - 1);
+    const at = m - brace.start - 1;
+    const close = found[5] !== undefined ? '' : '\\)\\s*';
+    const rich = /^\s*richParts\(\s*$/.test(inner.slice(0, at));
+    const rest = new RegExp(rich ? `^\\s*${close},` : `^\\s*${close}$`);
+    if ((!rich && !/^\s*$/.test(inner.slice(0, at))) || !rest.test(inner.slice(at + found[0].length))) return 'open';
+    if (misnested(path.map((up) => (htmlElement(source, up) ? up.tag : null)))) return 'open';
+    const chain: SiteLevel[] = [{ tag: el.tag, classes: astroClasses(el) }];
+    const parent = path[path.length - 2];
+    if (parent !== undefined && htmlElement(source, parent) && !reparents(parent.tag, el.tag)) chain.push({ tag: parent.tag, classes: null });
+    return chain;
+  };
+}
+
+/** Each read of a TypeScript-family file placed by the JSX around it. */
+function jsxPlacement(ts: typeof import('typescript'), file: string, source: string): (found: RegExpExecArray) => Placement {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
+  type Tagged = TS.JsxOpeningElement | TS.JsxSelfClosingElement;
+  const intrinsic = (el: Tagged): boolean => ts.isIdentifier(el.tagName) && /^[a-z]/.test(el.tagName.text);
+  const classes = (el: Tagged): string[] | null => {
+    let out: string[] | null = [];
+    for (const attr of el.attributes.properties) {
+      if (ts.isJsxSpreadAttribute(attr)) return null;
+      const name = attr.name.getText(sf);
+      if (name !== 'className' && name !== 'class') continue;
+      const value = attr.initializer !== undefined && ts.isJsxExpression(attr.initializer) ? attr.initializer.expression : attr.initializer;
+      out = value !== undefined && (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) ? value.text.split(/\s+/).filter((c) => c !== '') : null;
+    }
+    return out;
+  };
+  // The nodes a climb from one element to the next passes through: what renders a child element in place.
+  const passes = (node: TS.Node): boolean =>
+    ts.isJsxExpression(node) ||
+    ts.isJsxFragment(node) ||
+    ts.isParenthesizedExpression(node) ||
+    ts.isConditionalExpression(node) ||
+    (ts.isBinaryExpression(node) &&
+      [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken].includes(node.operatorToken.kind));
+  return (found) => {
+    const m = found.index;
+    const end = m + found[0].length;
+    let node: TS.Node = sf;
+    for (let next: TS.Node | undefined = sf; next !== undefined; ) {
+      node = next;
+      next = ts.forEachChild(node, (child) => (child.getStart(sf) <= m && end <= child.end ? child : undefined));
+    }
+    // The read itself: the call `copy('k')` or the access `copy.k`.
+    const call = found[5] === undefined;
+    let read: TS.Node | undefined = node;
+    while (read !== undefined && !(call ? ts.isCallExpression(read) && read.getStart(sf) === m : ts.isPropertyAccessExpression(read) && read.getStart(sf) === m && read.end === end)) {
+      read = read.parent;
+    }
+    if (read === undefined) return 'open';
+    // A sentence key's read is the first argument of a stet-bound `richParts(<read>, …)` filling the container (D16, J9).
+    const rich =
+      ts.isCallExpression(read.parent) &&
+      read.parent.arguments[0] === read &&
+      ts.isIdentifier(read.parent.expression) &&
+      read.parent.expression.text === 'richParts' &&
+      richPartsBindingAt(ts, sf, read.parent) === 'stet';
+    const holder = rich ? read.parent.parent : read.parent;
+    if (ts.isJsxExpression(holder) && holder.dotDotDotToken === undefined && ts.isJsxElement(holder.parent) && intrinsic(holder.parent.openingElement)) {
+      const el = holder.parent;
+      const tag = (el.openingElement.tagName as TS.Identifier).text.toLowerCase();
+      const chain: SiteLevel[] = [{ tag, classes: classes(el.openingElement) }];
+      // The elements above, nearest first: a tag for an HTML element, null for a component.
+      const above: (string | null)[] = [];
+      for (let up: TS.Node = el.parent; ; up = up.parent) {
+        while (passes(up)) up = up.parent;
+        if (!ts.isJsxElement(up)) break;
+        above.push(intrinsic(up.openingElement) ? (up.openingElement.tagName as TS.Identifier).text.toLowerCase() : null);
+      }
+      if (misnested([...above].reverse().concat(tag))) return 'open';
+      const parent = above[0];
+      if (parent !== null && parent !== undefined && !reparents(parent, tag)) chain.push({ tag: parent, classes: null });
+      return chain;
+    }
+    // An attribute of an HTML element, with no element or function between it and the read.
+    for (let up: TS.Node = holder; !ts.isSourceFile(up); up = up.parent) {
+      if (ts.isJsxAttribute(up)) {
+        const name = up.name.getText(sf);
+        return intrinsic(up.parent.parent) && name !== 'dangerouslySetInnerHTML' && name !== 'children' ? 'inert' : 'open';
+      }
+      if (ts.isJsxElement(up) || ts.isJsxSelfClosingElement(up) || ts.isJsxFragment(up) || ts.isFunctionLike(up)) return 'open';
+    }
+    return 'open';
+  };
+}
+
+/** An open or close tag of one of the inline elements a sentence joins (`INLINE`), as scan drops them from a sentence's text. */
+const INLINE_TAG = new RegExp(`</?(?:${[...INLINE].join('|')})(?=[\\s/>])[^>]*>`, 'g');
+/** Text as a page shows it, for the coincidence test: entities decoded, whitespace collapsed. */
+const flatText = (text: string): string => collapseWhitespace(decodeEntities(text));
+/** What continues a word for the coincidence test: a letter or digit, or a character that joins a name, path or package (`@getstet/stet`). */
+const JOINS_WORD = /[\p{L}\p{N}_$@/]/u;
 
 /** A route that names a scheme rather than a path — `https:`, `javascript:`, `file:`. */
 const ABSOLUTE_ROUTE = /^[a-z][a-z0-9+.-]*:/i;
@@ -2678,14 +3010,17 @@ async function declarePages(req: Request, site: SiteState): Promise<Response> {
   const raw = body['names'];
   const names = Array.isArray(raw) ? raw.map((name) => String(name)) : [];
 
-  const set = proposeForHost(ready.path, ready.config, ready.descriptor);
+  const set = proposeForHost(ready.path, ready.config, ready.descriptor, await pagesCompiler(ready.path, ready.config));
   if (set === null) {
     return json({ error: 'no routing convention detected — expected src/pages, app/ or pages/' }, 400);
   }
   const report = new Report();
-  applyPages(ready.path, ready.config, ready.descriptor, ready.snapshot, set, names, report);
+  const dirtyBefore = uncommittedPaths(ready.path, ['.']);
+  const hashesBefore = new Map([...hostWritten(ready).keys()].map((file) => [file, hashOf(ready, file)]));
+  const written = applyPages(ready.path, ready.config, ready.descriptor, ready.snapshot, set, names, report);
+  recordHostWrites(ready, written, dirtyBefore, hashesBefore);
   const touched = touchReadPath(ready);
-  return json({ lines: linesOf(report), findings: report.findings, touched, at: gitState(ready.path) });
+  return json({ lines: linesOf(report), findings: report.findings, written, touched, at: gitState(ready.path) });
 }
 
 /**

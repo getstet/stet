@@ -5,8 +5,8 @@
  * The template `welcome` has the slots headline, subject, preheader and
  * greeting (`{{name}}`, which its key requires). Its render pointer, the
  * template source and the snapshot are the caller's to change; the host
- * links the workspace's `node_modules`, so the runner can compile the
- * template with the host's own TypeScript.
+ * links the workspace's `node_modules`, so the runner can render the template
+ * (it compiles with stet's own TypeScript).
  *
  * Consumers: `tests/email-preview.test.ts` and `tests/dev.test.ts`.
  */
