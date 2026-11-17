@@ -21,7 +21,7 @@ import { flag, noPositionals, parse, refuseEnv, text } from './args.js';
 import { asUpdate, planJson, planWrite, rethrowBatchFailure, writeJsonDeterministic, writePlanned, type WritePlan } from './artifacts.js';
 import { startFront, type Front } from './audit-target.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, keyJoiner, loadConfig, markAttributes, type StetConfig } from './config.js';
 import { LOG_LINES } from './dev-routes.js';
 import { filesForGlobs } from './files.js';
 import { clientReadFiles, readPathImport } from './footprint.js';
@@ -588,6 +588,8 @@ function pageContext(cwd: string, config: StetConfig, descriptor: Descriptor, sn
     document,
     file: page.file ?? fileForPage(cwd, config, descriptor.pages, name ?? page.page),
     fix,
+    joiner: keyJoiner(config),
+    attributes: markAttributes(config),
   };
 }
 
@@ -761,7 +763,7 @@ async function planFixes(
       if (target.file === undefined || plans.some((plan) => 'file' in plan && plan.file === target.file)) continue;
       const document = readDocument(target.file, readFileSync(join(cwd, target.file), 'utf8'));
       const page = pageOfFile(cwd, target.file, descriptor.pages, { html: true }) ?? null;
-      const plan = planDocumentFix(document, { ...(config.language === undefined ? {} : { language: config.language }), page, keys });
+      const plan = planDocumentFix(document, { ...(config.language === undefined ? {} : { language: config.language }), page, keys, joiner: keyJoiner(config) });
       // A key minted for one document is taken for the next.
       if (!('skip' in plan)) for (const mint of plan.mints) keys.add(mint.key);
       plans.push(plan);

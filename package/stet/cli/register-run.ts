@@ -14,7 +14,7 @@ import { keyDefOf, pageKeyReferences } from '../src/descriptor.js';
 import type { Snapshot } from '../src/snapshot.js';
 import { DEFAULT_TARGET, EMAIL_TARGET, type Descriptor, type Target } from '../src/types.js';
 import { astroEdits, componentCache, planAstroFile, readableAs, rereadsClean, type AstroPlan } from './astro-rewrite.js';
-import type { StetConfig } from './config.js';
+import { keyJoiner, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { heldTextOf } from './html-host.js';
 import { isHeadKind, numberNames } from './key-names.js';
@@ -24,6 +24,7 @@ import { lineCol, type Report } from './report.js';
 import { applyFileEdits, jsxReads, jsxRichClean, planRewrite } from './rewrite.js';
 import {
   componentName,
+  copyTablesOf,
   dialectOf,
   isJsxFile,
   loadTypescript,
@@ -274,6 +275,7 @@ export async function planJsxRun(input: {
     const page = pageOfFile(cwd, file, descriptor.pages);
     const result = await scanSource(file, source, {
       readPathImport: config.readPath.import,
+      joiner: keyJoiner(config),
       ...(page === undefined ? {} : { page }),
     });
     if (result.parseErrors) {
@@ -375,7 +377,7 @@ export async function planJsxRun(input: {
   for (const file of filesForGlobs(cwd, config.copyModules)) {
     const handoff = parsed.get(file);
     if (handoff === null) continue;
-    const result = await scanModule(file, readFileSync(join(cwd, file), 'utf8'), handoff);
+    const result = await scanModule(file, readFileSync(join(cwd, file), 'utf8'), { ...handoff, tables: copyTablesOf(config) });
     modules.set(file, result);
     for (const literal of result.literals) {
       if (literal.shape === 'property' || literal.shape === 'plain') propertyNames.set(literal.proposedKey, file);

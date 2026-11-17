@@ -123,7 +123,7 @@ body.dragging{cursor:col-resize;user-select:none}body.dragging iframe{pointer-ev
 /* Wider, they sit above it: the note keeps one line for itself, and the block holds its height while the pointer is in the frame.
    One line plus the note's own 6 px top and bottom padding, since the page boxes border-box (`*{box-sizing:border-box}`). */
 @media(min-width:761px){#panenote{min-height:calc(1lh + 12px)}}
-@media(max-width:760px){#gitbar .btn,.hdr [data-act="theme"],[data-act="addSite"]{min-height:36px}}
+@media(max-width:760px){#gitbar .btn,.hdr [data-act="theme"],[data-act="addSite"],[data-act^="approve:"]{min-height:36px}}
 /* At 760 px and narrower, with a project open, the sidebar is one row that opens the list. */
 #sidetoggle{display:none}
 @media(max-width:760px){.shell.picked #sidetoggle{display:block;width:100%;min-height:36px;text-align:left;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.shell.picked:not(.sideopen) .side>:not(#sidetoggle){display:none}.shell.picked .side{padding:6px 9px}}
@@ -201,6 +201,8 @@ fieldset.rec legend{font-size:11px;color:hsl(var(--mf));padding:0 4px}
 .derive{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .derive .in{flex:1 1 90px;width:auto}
 .plist{padding:7px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px;display:flex;flex-direction:column;gap:4px}
+/* A line above the fields can leave them at a fractional offset; the browser scrolls a whole pixel, so a field would stop a quarter pixel short of the edge. The margin keeps it fully in view. */
+#main [data-act-input],#main [data-act-change]{scroll-margin:1px}
 .kline{padding:7px 12px;border-bottom:1px solid hsl(var(--bd));font-size:11.5px;display:flex;flex-direction:column;gap:2px;overflow-wrap:anywhere}
 .tagged{position:relative}
 .tagged textarea,.tagmirror{scrollbar-gutter:stable}
@@ -513,6 +515,13 @@ const TABS = [
 const MACHINE_TABS = ['Health', 'Setup'];
 const ready = () => !!(S.site && S.site.state === 'ready');
 const storeBacked = () => !!(ready() && S.site.mode !== 'snapshot');
+// Approval: a snapshot-only site tracks it once its status file exists (the badge, the filter, the dashed outline), and offers Approve whether or not the file does, since the first approval creates it.
+const tracking = () => !!(ready() && S.site.status && typeof S.site.status === 'object');
+const approvable = () => !!(ready() && S.site.approvable === true);
+/** A key's entry in the status file; an absent entry is proposed. */
+const approval = (id) => (tracking() && own(S.site.status, id) ? S.site.status[id] : { status: 'proposed' });
+/** Whether the key shows as proposed: a derived key follows its source's words and takes no approval of its own. */
+const proposed = (id) => tracking() && approval(id).status !== 'approved' && (keyDef(id) || {}).derivesFrom === undefined;
 const keyDef = (id) => (ready() && Object.prototype.hasOwnProperty.call(S.site.descriptor.keys, id))
   ? S.site.descriptor.keys[id] : null;
 
@@ -1113,7 +1122,7 @@ function named(id) {
 // whichever page names it; the rest group by the key's first underscore
 // segment, unmerged — `principle` and `principles` are two groups. A group is
 // `{ id, label, keys }`, and `S.group` holds an id.
-const prefixOf = (id) => (id.indexOf('_') === -1 ? id : id.slice(0, id.indexOf('_')));
+const prefixOf = (id) => { const sep = id.indexOf('.') === -1 ? '_' : '.'; return id.indexOf(sep) === -1 ? id : id.slice(0, id.indexOf(sep)); };
 function groups() {
   if (!ready()) return [];
   const descriptor = S.site.descriptor;
@@ -1153,12 +1162,16 @@ function groups() {
 }
 function keysInGroup(id) {
   if (id === 'all') return ready() ? Object.keys(S.site.descriptor.keys).sort() : [];
+  if (id === 'proposed') return ready() ? Object.keys(S.site.descriptor.keys).sort().filter(proposed) : [];
+  if (id === 'approved') return ready() ? Object.keys(S.site.descriptor.keys).sort().filter((key) => tracking() && approval(key).status === 'approved') : [];
   if (id === 'page') return pageKeys();
   const group = groups().find((g) => g.id === id);
   return group ? group.keys : [];
 }
-/** The selector's choices: every key, the open page's, then the groups. */
-const listChoices = () => [{ id: 'all', label: 'All keys' }, { id: 'page', label: 'This page' }].concat(groups());
+/** The selector's choices: every key, the open page's, the two approval states where the site tracks them, then the groups. */
+const listChoices = () => [{ id: 'all', label: 'All keys' }, { id: 'page', label: 'This page' }]
+  .concat(tracking() ? [{ id: 'proposed', label: 'Proposed' }, { id: 'approved', label: 'Approved' }] : [])
+  .concat(groups());
 /**
  * The keys of the page the preview shows: those its files read, where the route
  * reads answered for it, and those the last census found on it.
@@ -1585,7 +1598,15 @@ function dark(title, line, fixture) {
 // --- Content -----------------------------------------------------------------
 /** The key column: the key list, the editor and History. The pane beside it is painted by `paintPane`. */
 function vContent() {
-  return keyList() + editorColumn();
+  return keyList() + (S.site.copyFrom ? copyFromColumn() : editorColumn());
+}
+/** A project that reads its copy from another checkout: the owner's keys listed, and in the editor's place where they are edited. */
+function copyFromColumn() {
+  const files = (S.site.config.generated || []).join(', ');
+  return '<div class="edcol" style="display:flex;flex-direction:column;gap:11px;min-width:0"><div class="card"><div class="cb">' +
+    '<p class="note" id="copyfrom" style="margin:0">' +
+    esc('This project reads its copy from ' + S.site.copyFrom + '. Edit it there; stet pull here refreshes ' + files + '.') +
+    '</p></div></div></div>';
 }
 
 function keyList() {
@@ -1604,6 +1625,7 @@ function keyList() {
     '<span class="bdg" id="keycount">' + items.length + '</span></div>' + selector + localeSelector +
     '<input class="in sm" id="ksearch" style="margin-top:6px" placeholder="Search…" value="' + esc(S.q) + '" data-act-input="search"></div>' +
     (line === '' ? '' : '<p class="note" id="siteline" style="margin:8px 12px">' + esc(line) + '</p>') +
+    statusNotice() +
     '<div class="scroll" id="keyrows">' + keyRows(items) + '</div></div>';
 }
 /** The key list's rows, each with its badges; repainted on its own as a census or the scan answers. */
@@ -1622,10 +1644,14 @@ function keyRows(items) {
               : '';
     const group = S.q ? '<span class="bdg">' + esc((all.find((g) => g.keys.indexOf(id) !== -1) || {}).label || '') + '</span>' : '';
     return '<button class="row ' + (id === S.sel ? 'on' : '') + '" data-act="key:' + esc(id) + '">' +
-      '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + draftBadge(id) + healthBadge(id) + usageBadges(id) + group + '</span>' +
+      '<span class="t"><span class="k">' + esc(id) + '</span>' + badge + statusBadge(id) + draftBadge(id) + healthBadge(id) + usageBadges(id) + group + '</span>' +
       '<span class="s">' + (kinds.length === 0 ? '' : '<span class="kd">' + esc(kinds.join(' · ')) + '</span>') +
       '<span class="v">' + esc(rowPreview(value)) + '</span></span></button>';
   }).join('');
+}
+/** The `proposed` badge, on a site that tracks approval; an approved key carries none. */
+function statusBadge(id) {
+  return proposed(id) ? '<span class="bdg">proposed</span>' : '';
 }
 /** A saved draft's author and when it was first saved, on a store-backed site's row. */
 function draftBadge(id) {
@@ -1690,6 +1716,13 @@ function pageList() {
 /** A page counts as checked once a census came from it and its reads answered complete. */
 const checked = (route) => S.seen.routes.has(route) && S.seen.read.has(route);
 /** The line above the key list while a read stet cannot follow stands: up to three, then the rest as a count. */
+/** A status file that cannot be read: its path and the reason, and what still works. */
+function statusNotice() {
+  const why = ready() && typeof S.site.statusError === 'string' ? S.site.statusError : '';
+  if (why === '') return '';
+  return '<p class="note" id="statuserror" style="margin:8px 12px">' +
+    esc('Approving is off: ' + why + '. Fix the file to approve keys again. Saves still go through and leave it as it is.') + '</p>';
+}
 function siteLine() {
   const causes = (S.usage && Array.isArray(S.usage.causes)) ? S.usage.causes : [];
   if (causes.length === 0) return '';
@@ -1785,8 +1818,9 @@ function editorCard() {
     '<span class="bdg">' + esc(def.target || '') + '</span>' +
     '<span class="bdg">' + esc(def.shape || 'text') + '</span>' +
     (edited(id) ? '<span class="bdg d">edited</span>' : '') +
+    statusBadge(id) +
     (S.locale !== 'default' ? '<span class="bdg b">' + esc(S.locale) + '</span>' : '') +
-    '</span></div>' + kindLine(id) + sharedBlock(id) + placeList(id);
+    '</span></div>' + approveLine(id) + kindLine(id) + sharedBlock(id) + placeList(id);
 
   const fallback = (S.locale !== 'default' && value === undefined && defaultValue(id) !== undefined)
     ? '<div class="inf">falls back to default — ' + esc(String(shown(defaultValue(id))).slice(0, 90)) + '</div>'
@@ -1796,6 +1830,22 @@ function editorCard() {
     findingsBlock(id) + '</div>' + saveBar(id);
 }
 
+/**
+ * Under the editor's header on a site that can approve: Approve with the line
+ * naming whose name it records, and once approved who approved it and when.
+ */
+function approveLine(id) {
+  if (!approvable() || (keyDef(id) || {}).derivesFrom !== undefined) return '';
+  const entry = approval(id);
+  if (entry.status === 'approved') {
+    const who = entry.at && entry.by ? ' ' + entry.at + ' by ' + entry.by : '';
+    return '<div class="kline">' + esc('Approved' + who) + '</div>';
+  }
+  const name = S.site.approver;
+  return '<div class="kline"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+    '<button class="btn sm" data-act="approve:' + esc(id) + '">Approve</button>' +
+    (name ? '<span class="muted">' + esc('Approving records your name from git (' + name + ').') + '</span>' : '') + '</div></div>';
+}
 /** Under the editor's header: what element the key is and where, what it derives from, and what derives from it. */
 function kindLine(id) {
   const def = keyDef(id) || {};
@@ -2398,13 +2448,18 @@ async function loadRouteReads(route) {
 /**
  * The open route's reads, sent to the agent so its census matches only the keys
  * a file of the page reads: the keys where the reads are complete and are this
- * page's, else none, and the agent matches every key as before.
+ * page's, else none, and the agent matches every key as before. The attributes
+ * a mark is read on go with them: the config's own key attribute beside
+ * `data-stet` (D16.1).
  */
 function postReads() {
   if (S.frameRoute === null) return;
   const reads = S.routeReads;
   const keys = reads !== null && reads.complete && reads.route === framePath() ? reads.keys.filter(declared) : null;
-  postToPreview({ stet: 'reads', route: S.frameRoute, keys: keys, renders: keys === null ? null : reads.renders, coincident: keys === null ? null : reads.coincident });
+  // `data-stet` alone is the agent's own default, so a project that names no attribute sends none.
+  const marks = ready() && S.site.config.reads && Array.isArray(S.site.config.reads.attributes) ? S.site.config.reads.attributes : ['data-stet'];
+  postToPreview(Object.assign({ stet: 'reads', route: S.frameRoute, keys: keys, renders: keys === null ? null : reads.renders, coincident: keys === null ? null : reads.coincident },
+    marks.length === 1 && marks[0] === 'data-stet' ? {} : { attributes: marks }));
 }
 /** Whether the open page's census ran with every key because its reads are incomplete or failed. */
 function readsUnknown() {
@@ -2674,6 +2729,8 @@ function locateKey(scroll) {
     scroll: scroll,
     // Dashed where a match is a guess, and where no file of the route reads the key.
     guess: !S.confirmed.has(S.sel) || S.warn === S.sel,
+    // And a proposed key is outlined dashed: nobody has approved those words.
+    ...(proposed(S.sel) ? { dashed: true } : {}),
     ...(def.tags === undefined ? {} : { tags: def.tags }),
   });
   postLayer();
@@ -3047,7 +3104,9 @@ function hitsOf(keys) {
   for (const k of keys) {
     if (!k || typeof k !== 'object' || !declared(k.key) || !isEntry(k.entry)) continue;
     if (k.attr !== null && k.attr !== undefined && typeof k.attr !== 'string') continue;
-    out.push({ key: k.key, attr: typeof k.attr === 'string' ? k.attr : null, by: typeof k.by === 'string' ? k.by : '', entry: k.entry, inplace: k.inplace === true, sure: k.sure === true });
+    const hit = { key: k.key, attr: typeof k.attr === 'string' ? k.attr : null, by: typeof k.by === 'string' ? k.by : '', entry: k.entry, inplace: k.inplace === true, sure: k.sure === true };
+    if (Number.isInteger(k.runs) && k.runs > 1) hit.runs = k.runs;
+    out.push(hit);
   }
   return out;
 }
@@ -3112,8 +3171,9 @@ function choosePick(hit, again, rect, sel) {
   // The page numbers a sentence's elements in the order they show, so a value that orders its tags otherwise is typed in its field.
   const sentence = hit.by !== 'mark' && (keyDef(key) || {}).tags !== undefined;
   if (hit.attr === null && hit.inplace && (!sentence || tagsInOrder(entryText(key, S.locale, hit.entry)))) {
-    // A sentence key (one declaring tags) is typed in its element without moving a page node (D18).
-    const form = hit.by === 'mark' ? 'runs' : sentence ? 'sentence' : 'inplace';
+    // A sentence key (one declaring tags) is typed in its element without moving a page node (D18); a plain key whose
+    // words fill an element's runs is typed run by run, as a mark is (D16.3).
+    const form = hit.by === 'mark' || (hit.by === 'element' && !sentence) ? 'runs' : sentence ? 'sentence' : 'inplace';
     postToPreview(Object.assign({ stet: 'edit', key: key, locale: S.locale }, hit.entry === undefined ? {} : { entry: hit.entry },
       { form: form, oneLine: entryText(key, S.locale, hit.entry).indexOf('\n') === -1 }));
     S.edit = { key: key, locale: S.locale, entry: hit.entry, form: form, before: S.draft[S.locale + ' ' + key], rect: rect };
@@ -3270,7 +3330,7 @@ function alsoLine(key, kind) {
   const found = S.census !== null && own(S.census.found, key) ? S.census.found[key] : 0;
   return found > 1 ? 'also on ' + plural(found - 1, 'other spot') : '';
 }
-/** The label `<kind> · <key>` over the copy under the pointer, with where else the key shows. */
+/** The label `<kind> · <key>` over the copy under the pointer, `· <n> runs` where its text is split across elements, with where else the key shows. */
 function paintHover() {
   const label = document.getElementById('hoverlabel');
   const h = S.hover;
@@ -3281,7 +3341,7 @@ function paintHover() {
     if (seen.indexOf(hit.key) !== -1) continue;
     seen.push(hit.key);
     const kind = elementKind(h.tag, hit.attr);
-    lines.push(kind + ' · ' + hit.key);
+    lines.push(kind + ' · ' + hit.key + (hit.runs === undefined ? '' : ' · ' + hit.runs + ' runs'));
     const also = alsoLine(hit.key, kind);
     if (also !== '') lines.push(also);
   }
@@ -4447,6 +4507,7 @@ const ACTIONS = {
   putBack: (el, i) => { void guard(putBack(Number(i))); },
   push: () => { void guard(push()); },
   removePlan: (el, id) => { void guard(removeKey(id, false)); },
+  approve: (el, id) => { void guard(approveKey(id)); },
   sameLink: () => { void guard(linkThem()); },
   sameKeep: () => { S.same = null; render(); },
   saveAnyway: () => { S.overLimit = null; void guard(save(true)); },
@@ -4783,6 +4844,7 @@ async function save(anyway) {
   const wrote = res.body.written || [];
   takePending(res.body);
   takeGit(res.body.at);
+  takeStatus(res.body.status);
   S.site.snapshot = mergedSnapshot(values);
   postCensus();
   void guard(loadUsage());
@@ -4814,6 +4876,25 @@ async function useTheirs(i) {
   S.staleKeys = S.staleKeys.filter((other) => other !== k);
   draftChanged();
   await refreshSite();
+}
+
+/** The entries a save or an approval answered, kept in the status the page shows; a null answer is a site that tracks nothing. */
+function takeStatus(entries) {
+  if (!entries || typeof entries !== 'object') return;
+  S.site.status = Object.assign({}, S.site.status || {}, entries);
+}
+
+/** Approve pressed: the key approved by git's name, the file it creates or rewrites taken back whole. */
+async function approveKey(id) {
+  const res = await post('/api/site/approve' + query(), { key: id });
+  if (!res.ok) { S.message = res.body.error || 'the approval was refused'; render(); return; }
+  S.message = '';
+  takePending(res.body);
+  takeGit(res.body.at);
+  S.site.status = res.body.status;
+  tst(res.body.already ? id + ' was already approved' : 'Approved ' + id);
+  render();
+  locateKey(false);
 }
 
 /** The commit lists a reply carried, kept where it names them. */
@@ -4851,6 +4932,7 @@ async function putBack(i) {
   }
   takePending(res.body);
   takeGit(res.body.at);
+  takeStatus(res.body.status);
   S.site.snapshot = mergedSnapshot([{ key: k.key, locale: k.locale, value: k.head }]);
   await openCommitPanel();
   await loadPreview(htmlHost() ? { reload: true } : undefined);
@@ -5375,6 +5457,18 @@ shell.addEventListener('focusin', (event) => {
   const act = el.getAttribute === undefined ? null : (el.getAttribute('data-act-input') || el.getAttribute('data-act-change'));
   focusKey = act;
   focusAt = el.selectionStart === undefined || el.selectionStart === null ? 0 : el.selectionStart;
+});
+// Condition 2: a click on a part of the page that takes no focus blurs the field
+// with no `focusin` after it, so the remembered field would be pulled back on
+// the next repaint. A blur that moves focus nowhere clears the key one task
+// later, unless a repaint replaced the field by then: a replaced field is no
+// longer connected, and a repaint's own blur keeps the key.
+shell.addEventListener('focusout', (event) => {
+  if (event.relatedTarget !== null) return;
+  const el = event.target;
+  setTimeout(() => {
+    if (el.isConnected && document.activeElement === document.body) { focusKey = null; focusAt = null; }
+  }, 0);
 });
 shell.addEventListener('keyup', (event) => {
   const el = event.target;

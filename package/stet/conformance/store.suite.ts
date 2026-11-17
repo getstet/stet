@@ -391,6 +391,27 @@ export function runStoreConformance(name: string, makeAdapter: MakeAdapter): voi
       expect(ok(await store.read()).map((r) => r.key)).not.toContain('old_key');
     });
 
+    it('a dotted key is saved, read, narrowed to, listed and renamed like any other', async (ctx) => {
+      await needsWrites(ctx);
+      const store = await scope();
+      // A sibling that shares the dotted key's head: a filter that read the dot as a pattern, or a prefix, would take both.
+      const keys = ['waitlist.use.music_videos', 'waitlist.use.music', 'waitlist_use_music_videos'];
+      for (const key of keys) {
+        ok(await store.saveDraft({ key, value: `${key} value`, target: 'web', editor: 'neil' }));
+        ok(await store.publish({ key, editor: 'neil' }));
+      }
+      expect(ok(await store.read({ keys: ['waitlist.use.music_videos'] })).map((r) => r.key)).toEqual(['waitlist.use.music_videos']);
+      expect(ok(await store.read({ keys: ['waitlist.use.music_videos', 'waitlist.use.music'] })).map((r) => r.key).sort()).toEqual(['waitlist.use.music', 'waitlist.use.music_videos']);
+      expect(ok(await store.read()).map((r) => r.key).sort()).toEqual([...keys].sort());
+      const history = ok(await store.history({ key: 'waitlist.use.music_videos' }));
+      expect(history.rows.map((r) => r.value)).toEqual(['waitlist.use.music_videos value']);
+
+      ok(await store.rename({ oldKey: 'waitlist.use.music_videos', newKey: 'waitlist.use.videos', editor: 'neil' }));
+      expect(ok(await store.history({ key: 'waitlist.use.videos' })).rows).toHaveLength(1);
+      expect(ok(await store.history({ key: 'waitlist.use.music_videos' })).rows).toEqual([]);
+      expect(ok(await store.read({ keys: ['waitlist.use.music'] })).map((r) => r.value)).toEqual(['waitlist.use.music value']);
+    });
+
     it('history and recent order by id and page by keyset cursor', async (ctx) => {
       await needsWrites(ctx);
       const store = await scope();

@@ -49,7 +49,7 @@ import { flag, parse, positionalsAround, refuseEnv } from './args.js';
 import { asUpdate, planRepoForms, planWrite, rethrowBatchFailure, writePlanned, type WritePlan } from './artifacts.js';
 import { componentCache, readableAs, readAstroHead, astroHeadEdits, rereadsClean, type AstroHead } from './astro-rewrite.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, refuseUnresolvableAlias, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, markAttributes, refuseInCopyFrom, refuseUnresolvableAlias, type StetConfig } from './config.js';
 import { filesForGlobs, walk } from './files.js';
 import { proposeHtml } from './html-host.js';
 import { NAME_PART, wordsOf } from './key-names.js';
@@ -57,6 +57,7 @@ import type { CliIo } from './main.js';
 import { clip, plural, posixRelative, CliError, Report, UsageError } from './report.js';
 import { applyFileEdits } from './rewrite.js';
 import { loadTypescript } from './source-scan.js';
+import { loadStatus } from './status.js';
 import { servableFile } from './static-files.js';
 
 // --- The dirent walk --------------------------------------------------------
@@ -275,7 +276,7 @@ export function proposePages(
     seed?: boolean;
     /** Read each html page's MARKS and bind its title and description to them. */
     bind?: boolean;
-    config?: Pick<StetConfig, 'managedSurfaces'>;
+    config?: Pick<StetConfig, 'managedSurfaces' | 'reads'>;
     /** Read each `.astro` page's title and description, under `seed`. */
     astro?: { ts: typeof import('typescript'); config: StetConfig };
   } = {},
@@ -308,6 +309,7 @@ export function proposePages(
       ? boundFields(
           cwd,
           files.filter((f) => f.arm === 'html').map((f) => f.file),
+          options.config === undefined ? undefined : markAttributes(options.config),
         )
       : new Map<string, { title?: string; description?: string }>();
 
@@ -494,9 +496,10 @@ export function proposePages(
 function boundFields(
   cwd: string,
   files: string[],
+  attributes?: readonly string[],
 ): Map<string, { title?: string; description?: string }> {
   const bound = new Map<string, { title?: string; description?: string }>();
-  const set = proposeHtml(cwd, files);
+  const set = proposeHtml(cwd, files, attributes);
   for (const mark of set.claimed) {
     const field =
       mark.kind === 'element' && mark.tag === 'title'
@@ -937,6 +940,7 @@ export async function runPagesScan(args: string[], io: CliIo): Promise<number> {
   const names = around.after;
 
   const config = loadConfig(io.cwd);
+  if (apply) refuseInCopyFrom(config, 'pages scan --apply');
   const report = new Report();
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io, { json });
@@ -1270,7 +1274,7 @@ export function applyPages(
   let written: string[] = [];
   let unchanged: string[] = [];
   try {
-    ({ written, unchanged } = writePlanned([...planRepoForms(cwd, config, descriptor, snapshot, report), ...pageWrites]));
+    ({ written, unchanged } = writePlanned([...planRepoForms(cwd, config, descriptor, snapshot, loadStatus(cwd, config), report), ...pageWrites]));
   } catch (error) {
     rethrowBatchFailure('pages scan --apply', error);
   }

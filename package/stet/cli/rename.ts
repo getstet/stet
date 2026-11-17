@@ -34,6 +34,7 @@ import { dirname, join, resolve as resolvePath } from 'node:path';
 import { isNotSupported, isStoreError } from '../adapters/store-shared.js';
 import { DescriptorError, loadDescriptorWithWarnings, pageKeyReferences } from '../src/descriptor.js';
 import { resolve } from '../src/resolve.js';
+import { escapeRegExp } from '../src/seo.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
 import type { Descriptor, KeyDef } from '../src/types.js';
@@ -43,6 +44,7 @@ import {
   asUpdate,
   planJson,
   planRepoForms,
+  planSideForms,
   planWrite,
   rethrowBatchFailure,
   writePlanned,
@@ -52,7 +54,10 @@ import {
 import { descriptorOf, snapshotOf } from './check.js';
 import {
   isHtmlHost,
+  keyJoiner,
   loadConfig,
+  markAttributes,
+  refuseInCopyFrom,
   selectStoreBlock,
   type StetConfig,
 } from './config.js';
@@ -72,7 +77,8 @@ import {
   type NamingPlan,
   type PlanEntry,
 } from './key-plan.js';
-import { planReadRenames, stetModuleTest, type Occurrence } from './key-reads.js';
+import { planReadRenames, stetModuleTest, textMentions, type Occurrence } from './key-reads.js';
+import { ownFiles, siteReads, usageBeyond, usageDialect, usageFiles } from './key-usage.js';
 import type { CliIo } from './main.js';
 import { renameRecorded } from './meta.js';
 import { htmlPageOf, pageOfFile } from './pages.js';
@@ -80,6 +86,7 @@ import { injectedFor } from './project.js';
 import { CliError, HostTextReport, plural, Report, UsageError } from './report.js';
 import { applyFileEdits, formatDiff } from './rewrite.js';
 import { dialectOf, loadTypescript, matchGlob, scanSource, type LocatedAccessor } from './source-scan.js';
+import { loadStatus, renameStatus } from './status.js';
 import { isStoreBacked, resolveStore } from './store.js';
 import { resolveEditor } from './write.js';
 
@@ -129,6 +136,7 @@ export async function runRename(args: string[], io: CliIo): Promise<number> {
 
   const report = new HostTextReport();
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'rename');
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);
@@ -214,8 +222,12 @@ export async function runRename(args: string[], io: CliIo): Promise<number> {
       return report.emit(io);
     }
   }
-  const host = storeOnly ? null : isHtmlHost(config) ? markRenames(io.cwd, config, renames) : await readRenames(io.cwd, config, renames);
-  const plans: WritePlan[] = forms === null || host === null ? [] : keyMoveWrites(io.cwd, config, forms, host, report);
+  const host = storeOnly
+    ? null
+    : isHtmlHost(config)
+      ? await htmlRenames(io.cwd, config, renames, descriptor)
+      : await readRenames(io.cwd, config, renames, new Set(Object.keys(descriptor.keys)));
+  const plans: WritePlan[] = forms === null || host === null ? [] : keyMoveWrites(io.cwd, config, forms, host, renames, report);
   // Only the forms whose bytes change are written, and named.
   const changed = plans.filter((p) => p.status !== 'unchanged');
   const files = changed.map((p) => p.label);
@@ -236,11 +248,10 @@ export async function runRename(args: string[], io: CliIo): Promise<number> {
   for (const [old, next] of renames) {
     report.line(`rename ${old} → ${next}`);
     for (const line of forms?.follows.get(old) ?? []) report.line(`  ${line}`);
-    for (const occ of host?.rewritten.filter((o) => o.key === old) ?? []) {
-      report.line(isHtmlHost(config) ? `  ${occ.file}:${occ.line} the mark is renamed` : `  ${occ.file}:${occ.line} ${occ.text}`);
-    }
+    for (const occ of host?.rewritten.filter((o) => o.key === old) ?? []) report.line(rewrittenLine(config, occ));
     const mentioned = new Set((host?.mentions.filter((o) => o.key === old) ?? []).map((o) => `${o.file}:${o.line}`));
     for (const at of mentioned) report.line(`  ${at} mentions "${old}" in text — left as it is`);
+    for (const occ of host?.listed?.filter((o) => o.key === old) ?? []) report.line(listedLine(occ));
     for (const line of host === null ? [] : hostRefusals(host, old)) report.line(`  ${line}`);
   }
   if (host !== null && !isHtmlHost(config)) {
@@ -318,7 +329,7 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
     Object.hasOwn(descriptor.keys, key) && outside({ old: key, key, label: null, help: null }) === undefined;
   const placed = new Map<string, Placed>();
   if (isHtmlHost(config)) {
-    const set = proposeHtml(io.cwd, filesForGlobs(io.cwd, config.managedSurfaces));
+    const set = proposeHtml(io.cwd, filesForGlobs(io.cwd, config.managedSurfaces), markAttributes(config));
     const marks = set.claimed.filter((m) => eligible(m.key)).sort(markOrder);
     const docsOf = new Map<string, Set<string>>();
     for (const mark of marks) docsOf.set(mark.key, (docsOf.get(mark.key) ?? new Set<string>()).add(mark.file));
@@ -330,7 +341,7 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
         continue;
       }
       const page = (docsOf.get(mark.key)?.size ?? 0) > 1 ? SITE_PAGE : htmlPageOf(io.cwd, mark.file, descriptor.pages);
-      placed.set(mark.key, { base: htmlBaseName(page, mark), section: mark.sectionWord, places: [place] });
+      placed.set(mark.key, { base: htmlBaseName(page, mark, keyJoiner(config)), section: mark.sectionWord, places: [place] });
     }
   } else {
     for (const rel of filesForGlobs(io.cwd, config.managedSurfaces)) {
@@ -349,6 +360,7 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
       if (dialectOf(rel) !== null) continue;
       const result = await scanSource(rel, readFileSync(join(io.cwd, rel), 'utf8'), {
         readPathImport: config.readPath.import,
+        joiner: keyJoiner(config),
         ...(page === undefined ? {} : { page }),
       });
       if (result.parseErrors) continue;
@@ -359,7 +371,7 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
           had.places.push(call.place);
           continue;
         }
-        placed.set(call.key, { base: accessorBaseName(page, call), section: isHeadKind(call.place) ? null : call.section, places: [call.place] });
+        placed.set(call.key, { base: accessorBaseName(page, call, keyJoiner(config)), section: isHeadKind(call.place) ? null : call.section, places: [call.place] });
       }
     }
   }
@@ -410,13 +422,16 @@ async function runPropose(io: CliIo, file: string): Promise<number> {
 }
 
 /** An accessor call's role name before its number: register's naming of the element the call renders in. */
-export function accessorBaseName(page: string | undefined, call: LocatedAccessor): string {
-  return baseName({
-    ...(page === undefined ? {} : { page }),
-    ...(isHeadKind(call.place) ? {} : { section: call.section }),
-    ...(call.item === undefined ? {} : { item: call.item }),
-    role: call.role,
-  });
+export function accessorBaseName(page: string | undefined, call: LocatedAccessor, joiner: '_' | '.' = '_'): string {
+  return baseName(
+    {
+      ...(page === undefined ? {} : { page }),
+      ...(isHeadKind(call.place) ? {} : { section: call.section }),
+      ...(call.item === undefined ? {} : { item: call.item }),
+      role: call.role,
+    },
+    joiner,
+  );
 }
 
 /** A mark as the place a plan lists. */
@@ -768,27 +783,43 @@ export function renamedForms(
 
 /**
  * The one batch a key move writes — rename's, merge's and split's: the
- * descriptor and the snapshot, with the codegen files on a JavaScript host, and
- * every host file whose marks or reads change. On the static-HTML host the
- * documents change only where a mark is renamed: a moved key's text is the one
- * it had, so nothing is regenerated.
+ * descriptor and the snapshot, with the codegen files on a JavaScript host, the
+ * status file once the project has one (its entries moved with the keys in
+ * `moved`, old name → new), and every host file whose marks or reads change.
+ * On the static-HTML host the documents change only where a mark is renamed: a
+ * moved key's text is the one it had, so nothing is regenerated.
  */
 export function keyMoveWrites(
   cwd: string,
   config: StetConfig,
   forms: { descriptor: Descriptor; snapshot: Snapshot },
   host: HostRenames,
+  moved: ReadonlyMap<string, string>,
   report: Report,
 ): WritePlan[] {
+  const status = renameStatus(loadStatus(cwd, config), moved);
+  const side = planSideForms(cwd, config, forms.descriptor, forms.snapshot, status);
   return [
     ...(isHtmlHost(config)
       ? [
           asUpdate(planJson(join(cwd, config.descriptorPath), forms.descriptor, config.descriptorPath)),
           asUpdate(planJson(join(cwd, config.snapshotPath), forms.snapshot, config.snapshotPath)),
+          ...(side.status === null ? [] : [side.status]),
+          ...side.generated,
         ]
-      : planRepoForms(cwd, config, forms.descriptor, forms.snapshot, report)),
+      : planRepoForms(cwd, config, forms.descriptor, forms.snapshot, status, report)),
     ...host.edited.map((e) => asUpdate(planWrite(join(cwd, e.rel), e.text, e.rel))),
   ];
+}
+
+/** A rewritten place as rename and merge print it: a mark on the static-HTML host, else the line itself. */
+export function rewrittenLine(config: Pick<StetConfig, 'host'>, occ: Occurrence): string {
+  return isHtmlHost(config) && occ.text === '' ? `  ${occ.file}:${occ.line} the mark is renamed` : `  ${occ.file}:${occ.line} ${occ.text}`;
+}
+
+/** A read under a prefix the key opens with, as rename and merge print it: left as it is. */
+export function listedLine(occ: Occurrence): string {
+  return `  ${occ.file}:${occ.line} reads keys under a prefix of "${occ.key}" — stet leaves it as it is; check it still reads the new name`;
 }
 
 /** Each read of `key` stet cannot rewrite, then each it cannot parse, named with its line — rename's, merge's and split's words. */
@@ -809,6 +840,8 @@ export interface HostRenames {
   rewritten: Occurrence[];
   blocked: Occurrence[];
   mentions: Occurrence[];
+  /** Reads under a prefix a leaving key opens with (`TS.tx("a." + k)`): listed, never rewritten, and the move goes ahead. */
+  listed?: Occurrence[];
   /** Brace expressions that do not parse, in files holding a leaving key (`planReadRenames`). */
   unparsed: Occurrence[];
 }
@@ -820,8 +853,9 @@ export interface OnlyAt {
 }
 
 /**
- * The static-HTML host: every `data-stet` and `data-stet-<attr>` naming a leaving
- * key, its value replaced. The mark is the only read on this host, so nothing
+ * The static-HTML host: every mark naming a leaving key — `data-stet`,
+ * `data-stet-<attr>`, or the same under the config's own attribute — its value
+ * replaced under the attribute it carries. The mark is the only read on this host, so nothing
  * is blocked and nothing is a mention. With `only`, the marks at that file and
  * line alone, and no sweep for the key's other marks, which stay where they are.
  */
@@ -831,14 +865,14 @@ export function markRenames(
   renames: ReadonlyMap<string, string>,
   only?: OnlyAt,
 ): HostRenames {
-  const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces));
+  const attributes = markAttributes(config);
+  const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces), attributes);
   const out: HostRenames = { edited: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
   for (const document of set.documents) {
     const edits: Array<{ pos: number; end: number; text: string }> = [];
     const here = (m: HtmlMark): boolean => only === undefined || (m.file === only.file && m.line === only.line);
     for (const mark of set.claimed.filter((m) => m.document === document && renames.has(m.key) && here(m))) {
-      const name = mark.kind === 'element' ? 'data-stet' : `data-stet-${mark.attr as string}`;
-      const attr = mark.element.attrs.find((a) => a.name === name && a.value === mark.key);
+      const attr = mark.element.attrs.find((a) => a.name === mark.attribute && a.value === mark.key);
       if (attr === undefined) continue;
       edits.push({ pos: attr.valueStart, end: attr.valueEnd, text: renames.get(mark.key) as string });
       out.rewritten.push({ file: mark.file, line: mark.line, at: attr.valueStart, key: mark.key, text: '' });
@@ -848,7 +882,7 @@ export function markRenames(
     // A split moves one place and leaves the key's others, so it sweeps nothing.
     const lineAt = lineIndex(document.source);
     for (const [old] of only === undefined ? renames : []) {
-      const mark = new RegExp(`\\sdata-stet(?:-[a-z][a-z0-9-]*)?\\s*=\\s*(["']?)${old}\\1(?![\\w-])`, 'g');
+      const mark = new RegExp(`\\s(?:${attributes.map(escapeRegExp).join('|')})(?:-[a-z][a-z0-9-]*)?\\s*=\\s*(["']?)${escapeRegExp(old)}\\1(?![\\w-])`, 'g');
       for (const m of document.source.matchAll(mark)) {
         const at = m.index + m[0].length - old.length - (m[1] as string).length;
         if (edits.some((e) => e.pos === at)) continue;
@@ -858,6 +892,63 @@ export function markRenames(
     if (edits.length === 0) continue;
     const text = applyFileEdits(document.source, edits);
     out.edited.push({ rel: document.file, text, diff: formatDiff(document.file, document.source, text) });
+  }
+  return out;
+}
+
+/**
+ * The static-HTML host: the marks (`markRenames`) and, where the config names
+ * read functions (`reads`), every call of one in the files the usage scan reads
+ * — the source git lists, the generated outputs aside — and in the copy tables
+ * stet does not generate, its key-name literal rewritten as `readRenames`
+ * rewrites a read (a table's own property names move with the key). Any other
+ * occurrence in code is blocked, as on a JavaScript host; a read under a prefix
+ * a leaving key opens with is listed (`listed`) and left as it is. A document's
+ * inline scripts are read in the text the mark edits left.
+ */
+export async function htmlRenames(
+  cwd: string,
+  config: StetConfig,
+  renames: ReadonlyMap<string, string>,
+  descriptor: Descriptor,
+  only?: OnlyAt,
+  merge = false,
+): Promise<HostRenames> {
+  const marks = markRenames(cwd, config, renames, only);
+  if ((config.reads?.functions ?? []).length === 0) return marks;
+  const ts = await loadTypescript();
+  const declared = new Set(Object.keys(descriptor.keys));
+  const out: HostRenames = { ...marks, edited: [...marks.edited], listed: [] };
+  // A table listed in `copyModules` and not generated is kept by hand: its property names move with the key.
+  const generated = ownFiles(config);
+  const tables = new Set(filesForGlobs(cwd, config.copyModules).filter((rel) => !generated.has(rel)));
+  for (const rel of new Set([...usageFiles(cwd, config), ...tables])) {
+    const prior = out.edited.findIndex((e) => e.rel === rel);
+    let source: string;
+    try {
+      source = prior === -1 ? readFileSync(join(cwd, rel), 'utf8') : (out.edited[prior] as { text: string }).text;
+    } catch {
+      continue;
+    }
+    const text = planFileRenames(out, readInput(ts, config, rel, source, renames, declared, () => false, tables.has(rel), merge), only);
+    if (text === null) continue;
+    const before = prior === -1 ? source : readFileSync(join(cwd, rel), 'utf8');
+    const entry = { rel, text, diff: formatDiff(rel, before, text) };
+    if (prior === -1) out.edited.push(entry);
+    else out.edited[prior] = entry;
+  }
+  out.mentions.push(...beyondMentions(cwd, config, renames, declared, only));
+  if (only === undefined) {
+    const site = await siteReads(cwd, config, descriptor);
+    for (const [rel, read] of site.files) {
+      for (const p of read.prefixes) {
+        for (const [old] of renames) {
+          if (!old.startsWith(p.prefix)) continue;
+          const text = readFileSync(join(cwd, rel), 'utf8').split('\n')[p.line - 1]?.trim() ?? '';
+          out.listed?.push({ file: rel, line: p.line, at: 0, key: old, text });
+        }
+      }
+    }
   }
   return out;
 }
@@ -874,14 +965,19 @@ export async function readRenames(
   cwd: string,
   config: StetConfig,
   renames: ReadonlyMap<string, string>,
+  declared: ReadonlySet<string>,
   only?: OnlyAt,
+  merge = false,
 ): Promise<HostRenames> {
   const ts = await loadTypescript();
-  const own = new Set([config.codegen.registry, config.codegen.dts, config.codegen.defaults, config.codegen.resolved, config.readPath.file]);
+  // The batch writes the generated files and the read path names no key; a copy table is walked, its property names move with the key.
+  const own = ownFiles(config);
   const modules = filesForGlobs(cwd, config.copyModules);
   const isStetModule = stetModuleTest(cwd, [config.readPath.file, ...modules]);
   const out: HostRenames = { edited: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
-  const files = filesForGlobs(cwd, [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules]);
+  const files = new Set(filesForGlobs(cwd, [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules]));
+  // A host that names its read functions has reads outside the declared surfaces: the scripts the usage scan reads are surfaces too.
+  if (config.reads !== undefined) for (const rel of usageFiles(cwd, config)) files.add(rel);
   for (const rel of files) {
     if (own.has(rel)) continue;
     let source: string;
@@ -890,27 +986,76 @@ export async function readRenames(
     } catch {
       continue;
     }
-    const found = planReadRenames({
-      ts,
-      file: rel,
-      source,
-      dialect: dialectOf(rel),
-      renames,
-      isStetModule: isStetModule(rel),
-      copyModule: config.copyModules.some((glob) => matchGlob(glob, rel)),
-    });
-    const here = (o: Occurrence): boolean => only === undefined || (o.file === only.file && o.line === only.line);
-    const rewritten = found.rewritten.filter(here);
-    // `planReadRenames` pushes a rewrite's occurrence and its edit at one position.
-    const edits = only === undefined ? found.edits : found.edits.filter((e) => rewritten.some((o) => o.at === e.pos));
-    out.rewritten.push(...rewritten);
-    out.blocked.push(...found.blocked.filter(here));
-    out.mentions.push(...found.mentions.filter(here));
-    out.unparsed.push(...found.unparsed.filter(here));
-    if (edits.length > 0) {
-      const text = applyFileEdits(source, edits);
-      out.edited.push({ rel, text, diff: formatDiff(rel, source, text) });
-    }
+    const text = planFileRenames(out, readInput(ts, config, rel, source, renames, declared, isStetModule(rel), config.copyModules.some((glob) => matchGlob(glob, rel)), merge), only);
+    if (text !== null) out.edited.push({ rel, text, diff: formatDiff(rel, source, text) });
   }
+  out.mentions.push(...beyondMentions(cwd, config, renames, declared, only));
   return out;
+}
+
+/**
+ * The leaving keys in the files the usage scan reads beyond the source git
+ * lists (`usageBeyond`): text it reads for the calls it may hold, and scripts a
+ * page serves though git ignores them. A rename rewrites none of them, so each
+ * occurrence is a mention — with `only`, the one at that file and line.
+ */
+function beyondMentions(cwd: string, config: StetConfig, renames: ReadonlyMap<string, string>, declared: ReadonlySet<string>, only?: OnlyAt): Occurrence[] {
+  const out: Occurrence[] = [];
+  for (const rel of usageBeyond(cwd, config)) {
+    let source: string;
+    try {
+      const bytes = readFileSync(join(cwd, rel));
+      if (bytes.subarray(0, 8192).includes(0)) continue;
+      source = bytes.toString('utf8');
+    } catch {
+      continue;
+    }
+    out.push(...textMentions(rel, source, renames, declared));
+  }
+  return only === undefined ? out : out.filter((o) => o.file === only.file && o.line === only.line);
+}
+
+/** What `planReadRenames` takes for one host file: the file, the project's read functions and its mark attributes. */
+function readInput(
+  ts: typeof import('typescript'),
+  config: StetConfig,
+  rel: string,
+  source: string,
+  renames: ReadonlyMap<string, string>,
+  declared: ReadonlySet<string>,
+  isStetModule: (spec: string) => boolean,
+  copyModule: boolean,
+  merge = false,
+): Parameters<typeof planReadRenames>[0] {
+  return {
+    ts,
+    file: rel,
+    source,
+    dialect: usageDialect(rel),
+    renames,
+    isStetModule,
+    copyModule,
+    declared,
+    functions: config.reads?.functions ?? [],
+    attributes: markAttributes(config),
+    merge,
+  };
+}
+
+/**
+ * One file's reads sorted by `planReadRenames` into `out` — with `only`, the
+ * occurrences at that file and line alone, a rewritten one keeping its edit
+ * (the position both carry) — and the file's text with its edits applied, null
+ * where none applies.
+ */
+function planFileRenames(out: HostRenames, input: Parameters<typeof planReadRenames>[0], only: OnlyAt | undefined): string | null {
+  const found = planReadRenames(input);
+  const here = (o: Occurrence): boolean => only === undefined || (o.file === only.file && o.line === only.line);
+  const rewritten = found.rewritten.filter(here);
+  const edits = only === undefined ? found.edits : found.edits.filter((e) => rewritten.some((o) => o.at === e.pos));
+  out.rewritten.push(...rewritten);
+  out.blocked.push(...found.blocked.filter(here));
+  out.mentions.push(...found.mentions.filter(here));
+  out.unparsed.push(...found.unparsed.filter(here));
+  return edits.length === 0 ? null : applyFileEdits(input.source, edits);
 }

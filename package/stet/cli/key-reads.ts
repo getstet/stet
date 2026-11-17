@@ -31,20 +31,71 @@ import { join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { normalizeNoExt, pathAliasMappings, resolveSpecifier } from './config.js';
+import { escapeRegExp } from '../src/seo.js';
+import { normalizeNoExt, pathAliasMappings, resolveSpecifier, type ReadFunction } from './config.js';
 import { lineIndex } from './html-host.js';
-import { dialectCode, openTag, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
-import { parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
+import { dialectCode, markupTags, openTag, openTagAttrs, VOID_ELEMENTS, within, type Dialect, type Span } from './markup.js';
+import { occurrenceIsAmbiguous, occurrenceIsKey, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
 
 /**
  * A read of a key: `copy.get('<key>')`, `copy('<key>')` or `get('<key>')`, and
  * `copy.<key>`, `copy?.<key>` or `copyMap.<key>` — the accessor `register`
  * writes, the map the scaffolded read path exports, and the forms a host
  * re-exports them under. The call alternative comes before the property
- * alternative, so `copy.get('x')` reads `x`, not `get`.
+ * alternative, so `copy.get('x')` reads `x`, not `get`. The element form
+ * `copy['x']` is the LAST alternative (groups 6 and 7), so groups 1 to 5 mean
+ * what they always meant to every consumer: a dotted key has no property form,
+ * and this is the read it takes on a host that spells its map's keys out.
  */
 export const KEY_READ =
-  /\bcopy(?:Map)?\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1|\b(?:copy|get)\s*\(\s*(['"`])([^'"`\n]+)\3|\bcopy(?:Map)?\s*\??\.\s*([A-Za-z_$][\w$]*)/g;
+  /\bcopy(?:Map)?\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]+)\1|\b(?:copy|get)\s*\(\s*(['"`])([^'"`\n]+)\3|\bcopy(?:Map)?\s*\??\.\s*([A-Za-z_$][\w$]*)|\bcopy(?:Map)?\s*\[\s*(['"`])([^'"`\n]+)\6\s*\]/g;
+
+/** A key as a whole-word regex, its dots literal: `home.title` never matches `home_title`; a key that is the tail or head of a longer declared one is `occurrenceIsKey`'s to skip. */
+export function keyPattern(key: string, flags = ''): RegExp {
+  return new RegExp(`(?<![\\w$])${key.replace(/[.$]/g, '\\$&')}(?![\\w$])`, flags);
+}
+
+/**
+ * The text a property row takes up, to remove it: the property, the comma that
+ * follows it (else the one before it, for a last row), and its whole line where
+ * nothing else sits on it.
+ */
+function rowSpan(source: string, start: number, end: number): Span {
+  let from = start;
+  let to = end;
+  let after = to;
+  while (/\s/.test(source[after] ?? '')) after += 1;
+  if (source[after] === ',') to = after + 1;
+  else {
+    let before = from;
+    while (before > 0 && /\s/.test(source[before - 1] ?? '')) before -= 1;
+    if (source[before - 1] === ',') from = before - 1;
+  }
+  const lineStart = source.lastIndexOf('\n', from - 1) + 1;
+  const found = source.indexOf('\n', to);
+  const lineEnd = found === -1 ? source.length : found;
+  if (source.slice(lineStart, from).trim() === '' && source.slice(to, lineEnd).trim() === '') return { start: lineStart, end: Math.min(lineEnd + 1, source.length) };
+  return { start: from, end: to };
+}
+
+/**
+ * Every whole-word occurrence of a leaving key in a file the usage scan reads
+ * only as text (a template, a script served though git ignores it), each a
+ * mention: such a file is never rewritten.
+ */
+export function textMentions(file: string, source: string, renames: ReadonlyMap<string, string>, declared?: ReadonlySet<string>): Occurrence[] {
+  const lineOf = lineIndex(source);
+  const out: Occurrence[] = [];
+  for (const key of renames.keys()) {
+    for (const m of source.matchAll(keyPattern(key, 'g'))) {
+      if (!occurrenceIsKey(source, m.index, key, declared)) continue;
+      const end = source.indexOf('\n', m.index);
+      const text = source.slice(source.lastIndexOf('\n', m.index - 1) + 1, end === -1 ? source.length : end).trim();
+      out.push({ file, line: lineOf(m.index), at: m.index, key, text });
+    }
+  }
+  return out;
+}
 
 export { dialectCode, within, type Span } from './markup.js';
 
@@ -183,10 +234,145 @@ const ELEMENT_READ = /(?<![\w$.])(copy|copyMap)\s*\[\s*(['"`])$/;
 const HOOK_CALL = /useCopy\s*\(\s*\)\s*\(\s*(['"`])$/;
 
 /**
- * The binding a read form ends at `at` through, or null where the text before
- * `at` is no read form or the key's own closing quote does not follow.
+ * The call opening of the project's configured read functions (`TS.tx(`,
+ * `t (`), the written name in group 1, whitespace allowed around its dots;
+ * null where none is configured. Built once per file a rename reads.
  */
-export function readFormAt(source: string, at: number, key: string): string | null {
+export function configuredReadForm(functions: readonly ReadFunction[]): RegExp | null {
+  if (functions.length === 0) return null;
+  const names = [...new Set(functions.map((f) => f.name))].sort((a, b) => b.length - a.length);
+  return new RegExp(`(?<![\\w$.])(${names.map((name) => name.split('.').map(escapeRegExp).join('\\s*\\.\\s*')).join('|')})\\s*\\(`, 'g');
+}
+
+/** The head object of a configured function (`TS` of `TS.tx`) and its last segment; none for a bare name. */
+export function splitName(name: string): { head: string; last: string } | null {
+  const dot = name.lastIndexOf('.');
+  return dot < 0 ? null : { head: name.slice(0, dot), last: name.slice(dot + 1) };
+}
+
+/** The text of a configured function's name as a pattern, where it was written: `TS.tx` (and `TS?.tx`, `TS["tx"]`), or a bare name followed by a call's opening. */
+export function mentionPattern(name: string): RegExp {
+  const split = splitName(name);
+  if (split === null) {
+    // A call's opening only: a bare name as a word turns up in prose (`don't`), and a trailing apostrophe is the contraction's.
+    return new RegExp(`(?<![\\w$.])(?<![\\w$]['’])(?:(?:window|self|globalThis)\\s*\\.\\s*)?${escapeRegExp(name)}\\s*(?:\\?\\.\\s*)?(?:\\.\\s*(?:call|apply|bind)\\s*)?\\(`, 'g');
+  }
+  const head = split.head.split('.').map(escapeRegExp).join('\\s*\\??\\.\\s*');
+  const last = escapeRegExp(split.last);
+  return new RegExp(`(?<![\\w$])${head}(?:\\s*\\??\\.\\s*${last}(?![\\w$])|\\s*\\??\\.?\\s*\\[\\s*(['"])${last}\\1\\s*\\])`, 'g');
+}
+
+/** Whether the attribute value or the script body of a type that is no JavaScript (`text/template`, `application/json`) around `at` writes a call of a configured function (the usage scan's own test of text it cannot read as code). */
+function readsInUnreadText(source: string, at: number, functions: readonly ReadFunction[]): boolean {
+  const value = attributeValueAt(source, at) ?? scriptBodyAt(source, at);
+  return value !== undefined && functions.some((f) => mentionPattern(f.name).test(value));
+}
+
+/** Whether the key at `at` is the argument of a configured call written in an HTML document's element text (`<p>{{ TS.tx("a.b") }}</p>`, `<textarea>`, `<noscript>`, a template-engine `raw` block), outside its comments: text the usage scan cannot read, whose call a rename would leave on the old key. */
+function readsInHtmlText(source: string, at: number, key: string, dialect: Dialect, configured: { form: RegExp; functions: readonly ReadFunction[] } | undefined): boolean {
+  if (dialect !== 'html' || configured === undefined || readFormAt(source, at, key, configured) === null) return false;
+  return ![...source.matchAll(/<!--[\s\S]*?-->/g)].some((c) => at >= c.index && at < c.index + c[0].length);
+}
+
+/** The body of the `<script>` element that holds offset `at`; undefined where `at` sits in none. The caller has found `at` outside the file's code, so a body here is one of a type the scan does not parse. */
+function scriptBodyAt(source: string, at: number): string | undefined {
+  const lower = source.toLowerCase();
+  for (const tag of markupTags(source)) {
+    if (tag.close || tag.selfClosing || tag.name.toLowerCase() !== 'script' || at < tag.end) continue;
+    const close = lower.indexOf('</script', tag.end);
+    if (at < (close === -1 ? source.length : close)) return source.slice(tag.end, close === -1 ? source.length : close);
+  }
+  return undefined;
+}
+
+/** The value of the attribute of an open tag that holds offset `at`; undefined where `at` sits in no attribute value. */
+function attributeValueAt(source: string, at: number): string | undefined {
+  for (const tag of markupTags(source)) {
+    if (tag.close || at < tag.start) continue;
+    if (at >= tag.end) continue;
+    return openTagAttrs(source, tag).find((a) => a.quoted && at >= a.valueStart && at < a.valueEnd)?.value;
+  }
+  return undefined;
+}
+
+/**
+ * The before-text pattern of a prop named by one of the mark attributes
+ * (`{ "data-copy": "` or `{ data-copy: '`), each ending where the key begins;
+ * null where no attribute is given.
+ */
+function markPropForm(attributes: readonly string[]): RegExp | null {
+  if (attributes.length === 0) return null;
+  return new RegExp(`(?<![\\w$-])["']?(?:${attributes.map(escapeRegExp).join('|')})["']?\\s*:\\s*$`);
+}
+
+/** Whether the key at `at` is the whole string value of a prop `form` (`markPropForm`) matches. */
+function markPropAt(source: string, at: number, key: string, form: RegExp | null): boolean {
+  const quote = source[at - 1];
+  if (form === null || (quote !== '"' && quote !== "'" && quote !== '`') || source[at + key.length] !== quote) return false;
+  return form.test(source.slice(Math.max(0, at - 80), at - 1));
+}
+
+/** How far back from a key a configured call's opening is looked for. */
+const CALL_REACH = 400;
+
+/**
+ * The configured function whose key argument is the literal opening just
+ * before `at` — `TS.tx("<key>")`, or `i18n.t(locale, "<key>")` for a key at
+ * index 1 — by its configured name; null where none is. The argument list is
+ * walked by commas outside quotes and brackets.
+ */
+function configuredCallAt(source: string, at: number, key: string, form: RegExp, functions: readonly ReadFunction[]): string | null {
+  const quote = source[at - 1];
+  if ((quote !== '"' && quote !== "'" && quote !== '`') || source[at + key.length] !== quote) return null;
+  const from = Math.max(0, at - CALL_REACH);
+  for (const m of source.slice(from, at).matchAll(form)) {
+    const written = (m[1] as string).replace(/\s+/g, '');
+    const fn = functions.find((f) => f.name === written);
+    if (fn === undefined) continue;
+    // Walk the arguments from just past the `(` to the quote that opens the key.
+    let index = 0;
+    let depth = 0;
+    let start = from + (m.index as number) + m[0].length;
+    let i = start;
+    let inQuote: string | null = null;
+    for (; i < at - 1; i += 1) {
+      const c = source[i] as string;
+      if (inQuote !== null) {
+        if (c === '\\') i += 1;
+        else if (c === inQuote) inQuote = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === '`') inQuote = c;
+      else if (c === '(' || c === '[' || c === '{') depth += 1;
+      else if (c === ')' || c === ']' || c === '}') {
+        if (depth === 0) break;
+        depth -= 1;
+      } else if (c === ',' && depth === 0) {
+        index += 1;
+        start = i + 1;
+      }
+    }
+    if (i === at - 1 && inQuote === null && depth === 0 && index === fn.key && source.slice(start, at - 1).trim() === '') return fn.name;
+  }
+  return null;
+}
+
+/**
+ * The binding a read form ends at `at` through, or null where the text before
+ * `at` is no read form or the key's own closing quote does not follow. A call
+ * of a configured read function is tested first and answered by its configured
+ * name (`configured`, from `configuredReadForm`).
+ */
+export function readFormAt(
+  source: string,
+  at: number,
+  key: string,
+  configured?: { form: RegExp; functions: readonly ReadFunction[] },
+): string | null {
+  if (configured !== undefined) {
+    const name = configuredCallAt(source, at, key, configured.form, configured.functions);
+    if (name !== null) return name;
+  }
   const before = source.slice(Math.max(0, at - 120), at);
   const after = source[at + key.length] ?? '';
   const prop = PROPERTY_READ.exec(before);
@@ -281,8 +467,20 @@ export function planReadRenames(input: {
   renames: ReadonlyMap<string, string>;
   isStetModule: (spec: string) => boolean;
   copyModule: boolean;
+  /** Every declared key, so an occurrence that is the head of a longer dotted key is that key's, not this one's. */
+  declared?: ReadonlySet<string>;
+  /** The project's configured read functions (`reads.functions`): a call of one is a read form stet rewrites. */
+  functions?: readonly ReadFunction[];
+  /** The mark attributes (`markAttributes`): the string value of a prop named by one is a read form stet rewrites. */
+  attributes?: readonly string[];
+  /** The renames are merges: a copy table's own row of a leaving key is removed where the table already holds the survivor's row, never renamed over it. */
+  merge?: boolean;
 }): ReadRenames {
-  const { ts, file, source, dialect, renames, isStetModule, copyModule } = input;
+  const { ts, file, source, dialect, renames, isStetModule, copyModule, declared } = input;
+  const functions = input.functions ?? [];
+  const form = configuredReadForm(functions);
+  const configured = form === null ? undefined : { form, functions };
+  const markProp = markPropForm(input.attributes ?? []);
   const out: ReadRenames = { edits: [], rewritten: [], blocked: [], mentions: [], unparsed: [] };
   if (renames.size === 0) return out;
 
@@ -303,20 +501,41 @@ export function planReadRenames(input: {
     .map((r) => ({ span: r, bindings: bindingsOf(ts, scriptFile, [r.text], isStetModule) }));
 
   // A declared copy module's own property, named for the key it is: renamed
-  // with it where the module holds exactly one such property.
+  // with it where the module holds exactly one such property — or, in a merge
+  // where the module also holds the survivor's, removed with its row.
   const props = new Map<string, number[]>();
+  const rows = new Map<number, Span>();
+  const survivors = new Set<string>();
+  // A leaving key's property in an object a merge does not read (`adopted` below): a mention, left as it is.
+  const foreign = new Set<number>();
   if (copyModule && dialect === null) {
+    const targets = new Set(renames.values());
     const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(ts, file));
+    const found: Array<{ key: string; at: number; node: TS.Node; table: TS.Node }> = [];
     const visit = (node: TS.Node): void => {
-      if ((ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) && renames.has(propText(ts, node.name))) {
+      if (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) {
         const name = node.name;
-        const at = ts.isStringLiteral(name) ? name.getStart(sf) + 1 : name.getStart(sf);
         const key = propText(ts, name);
-        props.set(key, [...(props.get(key) ?? []), at]);
+        if (renames.has(key)) found.push({ key, at: ts.isStringLiteral(name) ? name.getStart(sf) + 1 : name.getStart(sf), node, table: node.parent });
+        else if (targets.has(key)) found.push({ key, at: -1, node, table: node.parent });
       }
       ts.forEachChild(node, visit);
     };
     visit(sf);
+    // A merge reads one table of the file: the one holding the survivor's row, else the first holding a leaving key's. Another object that happens to carry the leaving key is no copy of it.
+    const adopted = input.merge === true ? (found.find((f) => f.at === -1) ?? found.find((f) => f.at !== -1))?.table : undefined;
+    for (const f of found) {
+      if (adopted !== undefined && f.table !== adopted) {
+        if (f.at !== -1) foreign.add(f.at);
+        continue;
+      }
+      if (f.at === -1) {
+        survivors.add(f.key);
+        continue;
+      }
+      props.set(f.key, [...(props.get(f.key) ?? []), f.at]);
+      rows.set(f.at, rowSpan(source, f.node.getStart(sf), f.node.end));
+    }
   }
 
   const lineOf = lineIndex(source);
@@ -327,7 +546,8 @@ export function planReadRenames(input: {
 
   // The parse check: every brace expression the walk read in a file holding a
   // leaving key parses as one expression, or the file's sorting is refused.
-  const held = [...renames.keys()].find((key) => new RegExp(`(?<![\\w$])${key}(?![\\w$])`).test(source));
+  const holds = (key: string): boolean => [...source.matchAll(keyPattern(key, 'g'))].some((m) => occurrenceIsKey(source, m.index, key, declared));
+  const held = dialect === null ? undefined : [...renames.keys()].find(holds);
   if (held !== undefined && dialect !== null) {
     for (const brace of braces) {
       if (parsesAsExpression(ts, dialect, source.slice(brace.start, brace.end))) continue;
@@ -337,30 +557,50 @@ export function planReadRenames(input: {
   }
 
   for (const [key, next] of renames) {
-    const pattern = new RegExp(`(?<![\\w$])${key}(?![\\w$])`, 'g');
+    const pattern = keyPattern(key, 'g');
     for (const m of source.matchAll(pattern)) {
       const at = m.index;
+      if (!occurrenceIsKey(source, at, key, declared)) continue;
       const line = lineOf(at);
       const occ: Occurrence = { file, line, at, key, text: lineText(at).trim() };
       if (!within(code, at) || within(nonCode, at)) {
+        // A configured read inside an attribute no rule names as code (`x-text`, `hx-on:click`, `srcdoc`) or a script of a type the scan does not parse (`text/template`) is a read the usage scan calls one: renaming past it leaves it on the old name.
+        if (dialect !== null && !within(code, at) && (readsInUnreadText(source, at, functions) || readsInHtmlText(source, at, key, dialect, configured))) out.blocked.push(occ);
+        else out.mentions.push(occ);
+        continue;
+      }
+      // Two declared keys that share segments in this text (`a.b` and `b.c` in `a.b.c`): which one it means cannot be told.
+      if (occurrenceIsAmbiguous(source, at, key, declared)) {
+        out.blocked.push(occ);
+        continue;
+      }
+      if (markPropAt(source, at, key, markProp)) {
+        out.edits.push({ pos: at, end: at + key.length, text: next });
+        out.rewritten.push(occ);
+        continue;
+      }
+      if (foreign.has(at)) {
         out.mentions.push(occ);
         continue;
       }
       const own = props.get(key);
       if (own !== undefined && own.includes(at)) {
         if (own.length === 1) {
-          out.edits.push({ pos: at, end: at + key.length, text: next });
+          const row = input.merge === true && survivors.has(next) ? rows.get(at) : undefined;
+          out.edits.push(row === undefined ? { pos: at, end: at + key.length, text: next } : { pos: row.start, end: row.end, text: '' });
           out.rewritten.push(occ);
         } else {
           out.blocked.push(occ);
         }
         continue;
       }
-      const through = readFormAt(source, at, key);
+      const through = readFormAt(source, at, key, configured);
       const client = clientScripts.find((c) => within([c.span], at));
       const scope = client?.bindings ?? bindings;
-      const binding = through === null || through === 'useCopy' ? null : scope.get(through);
-      if (through === 'useCopy' || binding === 'stet') {
+      // A configured function is a read whatever binds its name: the config binds it.
+      const isConfigured = through !== null && functions.some((f) => f.name === through);
+      const binding = through === null || through === 'useCopy' || isConfigured ? null : scope.get(through);
+      if (through === 'useCopy' || isConfigured || binding === 'stet') {
         out.edits.push({ pos: at, end: at + key.length, text: next });
         out.rewritten.push(occ);
       } else if (binding === 'none' && client !== undefined) {

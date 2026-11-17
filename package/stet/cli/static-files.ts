@@ -4,8 +4,11 @@
  * `stet audit lighthouse`'s documents server share it.
  */
 
-import { realpathSync, statSync } from 'node:fs';
-import { join, resolve as resolvePath, sep } from 'node:path';
+import { lstatSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join, resolve as resolvePath, sep } from 'node:path';
+
+/** Whether the real path `real` is the real root or lies under it. */
+const withinRoot = (realRoot: string, real: string): boolean => real === realRoot || real.startsWith(realRoot + sep);
 
 /**
  * A path inside the checkout that names a readable file, or null.
@@ -23,11 +26,80 @@ export function insideCheckout(root: string, target: string): string | null {
   } catch {
     return null;
   }
-  if (real !== realRoot && !real.startsWith(realRoot + sep)) return null;
+  if (!withinRoot(realRoot, real)) return null;
   try {
     return statSync(real).isFile() ? real : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Whether a path stet is about to WRITE stays inside the checkout, by real path.
+ *
+ * The target need not exist: its nearest existing ancestor is resolved
+ * (symlinks and letter case included, through the native `realpath`) and must
+ * lie under the checkout's own real path. A symlink at the target itself, or at
+ * any component that dangles, is refused, since `writeFile` would follow it out.
+ */
+export function containsPath(root: string, target: string): boolean {
+  let realRoot: string;
+  try {
+    realRoot = realpathSync.native(root);
+  } catch {
+    return false;
+  }
+  const written = resolvePath(root, target);
+  const linked = (path: string): boolean => {
+    try {
+      return lstatSync(path).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  if (linked(written)) return false;
+  for (let at = written; ; at = dirname(at)) {
+    try {
+      return withinRoot(realRoot, realpathSync.native(at));
+    } catch {
+      // A link that dangles is a way out; anything else is a path not made yet.
+      if (linked(at) || dirname(at) === at) return false;
+    }
+  }
+}
+
+/**
+ * The real path a write to `target` would land on: its nearest existing
+ * ancestor resolved through the native `realpath`, the not-yet-made tail
+ * appended. Null where nothing on the way can be resolved.
+ */
+function realWriteTarget(root: string, target: string): string | null {
+  let tail = '';
+  for (let at = resolvePath(root, target); ; at = dirname(at)) {
+    try {
+      return join(realpathSync.native(at), tail);
+    } catch {
+      if (dirname(at) === at) return null;
+      tail = tail === '' ? basename(at) : join(basename(at), tail);
+    }
+  }
+}
+
+/**
+ * Whether writing `target` would land on the file `kept` names, by real path or
+ * by device and inode: a symlinked folder inside the checkout, or a hard link,
+ * reaches a file the path as written does not show.
+ */
+export function landsOnFile(root: string, target: string, kept: string): boolean {
+  const there = realWriteTarget(root, target);
+  if (there === null) return false;
+  if (there === realWriteTarget(root, kept)) return true;
+  try {
+    const a = statSync(there);
+    const b = statSync(resolvePath(root, kept));
+    return a.ino === b.ino && a.dev === b.dev;
+  } catch {
+    return false;
   }
 }
 

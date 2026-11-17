@@ -14,7 +14,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 
 import { isNotSupported, isStoreError } from '../adapters/store-shared.js';
 import { resolve } from '../src/resolve.js';
@@ -70,7 +70,10 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
         : `config: no ${CONFIG_FILE} in ${io.cwd} — every setting defaulted, mode snapshot-only`,
     );
     report.line('  (the config is read from the working directory only; there is no upward search)');
-    report.line(`descriptor: ${config.descriptorPath}, ${Object.keys(project.descriptor.keys).length} keys`);
+    // A checkout reading its copy from another names the owner's forms, under the path its config gives.
+    const forms = (pick: (c: StetConfig) => string): string =>
+      project.owner === null ? pick(config) : posix.join(config.copyFrom as string, pick(project.owner.config));
+    report.line(`descriptor: ${forms((c) => c.descriptorPath)}, ${Object.keys(project.descriptor.keys).length} keys`);
     if (isHtmlHost(config)) {
       report.line('host: html — the marked documents are the rendered form; publish = commit');
     }
@@ -83,7 +86,7 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
     // check`'s own output, folded in at warn: one implementation of the rules,
     // two contracts over them.
     const checks = new Report();
-    check(config, io.cwd, checks);
+    await check(config, io.cwd, checks);
     report.absorb(checks, 'warn');
     await compilerSection(io.cwd, config, report);
 
@@ -111,7 +114,7 @@ export async function runDoctor(args: string[], io: CliIo): Promise<number> {
         ...(name === 'default' ? [] : [`environment: ${name}`]),
         `store: ${selected?.adapter ?? 'none (snapshot-only)'}`,
         ...(isHtmlHost(config) ? ['host: html'] : []),
-        `descriptor: ${config.descriptorPath} · snapshot: ${config.snapshotPath}`,
+        `descriptor: ${forms((c) => c.descriptorPath)} · snapshot: ${forms((c) => c.snapshotPath)}`,
         // Through the one formatter, not a second copy of its template: this
         // block is store-controlled text on a human channel, and it travels
         // further than the terminal — an operator pastes it into an issue.

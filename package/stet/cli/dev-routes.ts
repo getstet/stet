@@ -32,10 +32,11 @@ import { resolve } from '../src/resolve.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { StoreAdapter } from '../src/store.js';
 import { DEFAULT_TARGET, type Descriptor } from '../src/types.js';
-import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
+import { keepFormatting, planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
+import { derivedApproval, STORE_BACKED_APPROVAL } from './approve.js';
 import { check } from './check.js';
 import { mountRenderer, mountSender, renderPreview, type LastRender } from './email-preview.js';
-import { pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
+import { copyFromRefusal, markAttributes, pathAliasMappings, resolveSpecifier, type StetConfig, type StoreBlock } from './config.js';
 import { isBarePackage } from './email-extract.js';
 import { filesForGlobs, staticPrefix } from './files.js';
 import { git, gitData, gitRun, gitState, operationInProgress, porcelainRecords, pushRemoteOf, runTool, uncommittedPaths, uncommittedStatus, type GitState } from './git.js';
@@ -58,18 +59,19 @@ import {
 } from './html-host.js';
 import { isHeadKind, kindOf, type Place as KeyPlace } from './key-names.js';
 import { importClosure, probeFile, type Chain } from './import-closure.js';
-import { codeOf, dialectCode, KEY_READ, nonCodeOf, within, type Span } from './key-reads.js';
+import { codeOf, dialectCode, KEY_READ, keyPattern, nonCodeOf, within, type Span } from './key-reads.js';
 import { keyHistory } from './key-history.js';
-import { declaresAlias, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache } from './key-usage.js';
+import { declaresAlias, documentScripts, isGenerated, isSourceFile, keyUsage, namedKeys, ownFiles, siteReads, usageCache, type UsageCache, type UsagePrefix } from './key-usage.js';
 import { runCli, type CliIo } from './main.js';
 import { applyPages, auditablePages, fileRoute, pagesCompiler, proposeForHost, routeFiles, servedRoute } from './pages.js';
 import { planMerge } from './merge.js';
 import { planRemoval } from './remove.js';
 import { keyMoveWrites, type HostRenames } from './rename.js';
+import { approveKeys, gitUserName, loadStatus, resetChanged, statusOf, trackedStatus, type StatusFile } from './status.js';
 import { sharedTextIndex } from './register-run.js';
 import { parseAt, planSplit, proposedSplitName } from './split.js';
 import { elementPath, markupBraces, maskExpressions, selfClosedRaw } from './markup.js';
-import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, packageNames, richPartsBindingAt, scriptKindFor } from './source-scan.js';
+import { collapseWhitespace, decodeEntities, dialectOf, INLINE, loadTypescript, matchGlob, occurrenceIsKey, packageNames, richPartsBindingAt, scriptKindFor } from './source-scan.js';
 import { contentTypeOf, insideCheckout, servableFile } from './static-files.js';
 import { resolveStore } from './store.js';
 import { CliError, plural, Report, UsageError } from './report.js';
@@ -228,7 +230,7 @@ function listing(ctx: DevContext): SiteState[] {
 /** A site's listing row: everything but the two big forms, which `GET /api/site` carries. */
 function summary(site: SiteState): Record<string, unknown> {
   if (site.state !== 'ready') return { ...site };
-  const { descriptor: _descriptor, snapshot: _snapshot, config: _config, ...rest } = site;
+  const { descriptor: _descriptor, snapshot: _snapshot, config: _config, owner: _owner, ...rest } = site;
   return rest;
 }
 
@@ -447,11 +449,16 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
   // The email preview runs host code and writes nothing: outside the queue.
   if (req.method === 'POST' && route === 'site/email-preview') return withSite(ctx, url, (site) => emailPreview(ctx, req, site), false);
   return withSite(ctx, url, async (site, entry) => {
+    // A checkout reading its copy from another changes none of it: every route that writes the forms answers the writer's line.
+    const refusal = site.state === 'ready' && COPY_WRITES.has(`${req.method} ${route}`) ? copyFromRefusal(site.config, 'dev') : null;
+    if (refusal !== null) return json({ error: refusal }, 409);
     switch (`${req.method} ${route}`) {
       case 'GET site':
         return await siteReply(site, entry, ctx.launched);
       case 'POST site/save':
         return await save(ctx, req, site, entry);
+      case 'POST site/approve':
+        return await approve(req, site, entry);
       case 'POST site/commit':
         return await commit(ctx, req, site);
       case 'POST site/push':
@@ -510,6 +517,18 @@ async function sitePathRoute(ctx: DevContext, req: Request, url: URL, route: str
   });
 }
 
+/** The routes that write a site's forms or commit them, which a `copyFrom` checkout refuses. */
+const COPY_WRITES: ReadonlySet<string> = new Set([
+  'POST site/save',
+  'POST site/approve',
+  'POST site/commit',
+  'POST site/merge',
+  'POST site/split',
+  'POST site/restore',
+  'POST site/pages/declare',
+  'POST site/remove',
+]);
+
 /** A site that is not loadable is answered with what it is, on every route that needs its forms. */
 function requireReady(site: SiteState): Extract<SiteState, { state: 'ready' }> {
   if (site.state === 'ready') return site;
@@ -561,9 +580,13 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
       descriptorPath: config.descriptorPath,
       snapshotPath: config.snapshotPath,
       managedSurfaces: config.managedSurfaces,
+      generated: config.generated.map((entry) => entry.file),
+      // The attributes the preview reads a mark on (D16.1): the config's own key attribute beside data-stet.
+      reads: { attributes: markAttributes(config) },
       store: { adapter: config.store?.adapter ?? 'snapshot' },
     },
     environments,
+    ...statusPayload(site),
     previewReads: await previewReads(site, env),
     dev: devDefaults(config, entry),
     previewDefault: routerPreviewCommand(config),
@@ -571,6 +594,28 @@ async function siteReply(site: SiteState, entry: WorkspaceEntry, launched: strin
     ...pendingSplit(site),
     git: { ...site.git, live: liveOf(site.path, site.git.branch) },
   });
+}
+
+/**
+ * The approval status the page shows: the status file where this snapshot-only
+ * site has one, else null, and whether Approve is offered — on every
+ * snapshot-only site, the file or not, since the first approval is what creates
+ * it — and the name an approval records, git's `user.name`. A store-backed site has neither: draft and published are its approval. A
+ * file that cannot be read is no status here and Approve is off; the page shows
+ * the reason as `statusError`, and a save goes through without touching the file.
+ */
+function statusPayload(site: Ready): { status: StatusFile | null; approvable: boolean; approver: string | null; statusError?: string } {
+  if (site.mode !== 'snapshot') return { status: null, approvable: false, approver: null };
+  // A checkout reading its copy from another shows the owner's status and approves nothing.
+  const at = site.owner ?? { path: site.path, config: site.config };
+  const approvable = site.owner === undefined;
+  const approver = approvable ? gitUserName(site.path) : null;
+  try {
+    return { status: trackedStatus(at.path, at.config, false), approvable, approver };
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    return { status: null, approvable: false, approver, statusError: error.message };
+  }
 }
 
 /**
@@ -763,14 +808,60 @@ async function save(ctx: DevContext, req: Request, site: SiteState, listed: Work
   }
 
   const report = new Report();
-  const { written, unchanged } = applyForms(ready.path, config, descriptor, next, report, 'dashboard save');
+  // A status file that cannot be read is left alone: the save goes through without it.
+  let held: StatusFile | null = null;
+  try {
+    held = trackedStatus(ready.path, config, false);
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    // A `value-status` output hashes the status words, so it cannot be written without them.
+    if (config.generated.some((entry) => entry.values === 'value-status')) return json({ error: error.message }, 409);
+  }
+  // A changed default-locale value goes back to proposed in the same batch as the value.
+  const status = held === null ? null : resetChanged(held, ready.snapshot, next, config.locales.default);
+  const { written, unchanged } = applyForms(ready.path, config, descriptor, next, report, 'dashboard save', status);
   const touched = body['touch'] === false ? null : touchReadPath(ready);
   return json({
     written,
     unchanged,
     touched,
     same,
+    status: status !== null ? Object.fromEntries([...new Set(edits.map((edit) => edit.key))].map((key) => [key, statusOf(status, key)])) : null,
     findings: [...gate.findings, ...report.findings],
+    at: gitState(ready.path),
+    ...pendingSplit(ready),
+  });
+}
+
+/**
+ * `POST site/approve` `{ key }` — `stet approve`'s path over the dashboard's
+ * site: the named key approved by git's `user.name` today, written through the
+ * whole repo batch so a generated output that hashes the status words moves
+ * with it. The reply carries the key's entry and the status file as it now
+ * stands, since the first approval brings every declared key into the file.
+ */
+async function approve(req: Request, site: SiteState, listed: WorkspaceEntry): Promise<Response> {
+  if (requireReady(site).mode !== 'snapshot') return json({ error: STORE_BACKED_APPROVAL }, 409);
+  const body = await readJson(req);
+  const key = reqStr(body, 'key');
+  // Read again after the body, as a save does: the files may have moved while it streamed in.
+  const ready = requireReady(loadSite(listed));
+  if (!Object.hasOwn(ready.descriptor.keys, key)) return json({ error: `undeclared key: ${key}` }, 400);
+  const from = ready.descriptor.keys[key]?.derivesFrom;
+  if (from !== undefined) return json({ error: derivedApproval(key, from) }, 400);
+  const by = gitUserName(ready.path);
+  if (by === null) return json({ error: 'approve: git has no user.name here — set one so the approval records who made it' }, 409);
+  const { file, already } = approveKeys(loadStatus(ready.path, ready.config), [key], by);
+  const report = new Report();
+  const { written } = applyForms(ready.path, ready.config, ready.descriptor, ready.snapshot, report, 'dashboard approve', file, true);
+  const status = loadStatus(ready.path, ready.config);
+  return json({
+    key,
+    entry: statusOf(status, key),
+    already: already.length > 0,
+    status,
+    written,
+    findings: report.findings,
     at: gitState(ready.path),
     ...pendingSplit(ready),
   });
@@ -790,9 +881,13 @@ function applyForms(
   snapshot: Snapshot,
   report: Report,
   label: string,
+  status: StatusFile | null = loadStatus(path, config),
+  /** Leave the descriptor's and snapshot's bytes alone where their content is unchanged — an approval moves neither. */
+  keepBytes = false,
 ): { written: string[]; unchanged: string[] } {
   try {
-    return writePlanned(planRepoForms(path, config, descriptor, snapshot, report));
+    const plans = planRepoForms(path, config, descriptor, snapshot, status, report);
+    return writePlanned(keepBytes ? keepFormatting(plans, [config.descriptorPath, config.snapshotPath]) : plans);
   } catch (error) {
     rethrowBatchFailure(label, error);
     // `rethrowBatchFailure` always throws; TypeScript cannot see it.
@@ -1024,12 +1119,15 @@ function keyMoves(
  * The forms stet writes on this site, enumerated once for the commit's accept
  * set and the pending list: the descriptor and the snapshot, then either the
  * codegen files or — on the static-HTML host — the managed globs whose marked
- * documents count.
+ * documents count, then the status file and the generated outputs.
  */
 function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
   const { config } = site;
+  const outputs = config.generated.map((entry) => entry.file);
+  // A checkout reading its copy from another writes its generated outputs alone.
+  if (site.owner !== undefined) return { files: outputs.map(gitSpelling), globs: [] };
   if (site.host === 'html') {
-    return { files: [config.descriptorPath, config.snapshotPath].map(gitSpelling), globs: config.managedSurfaces };
+    return { files: [config.descriptorPath, config.snapshotPath, config.statusPath, ...outputs].map(gitSpelling), globs: config.managedSurfaces };
   }
   return {
     files: [
@@ -1039,6 +1137,8 @@ function stetFormPaths(site: Ready): { files: string[]; globs: string[] } {
       config.codegen.dts,
       config.codegen.defaults,
       config.codegen.resolved,
+      config.statusPath,
+      ...outputs,
     ].map(gitSpelling),
     globs: [],
   };
@@ -1162,7 +1262,7 @@ function stetWrittenForms(site: Ready, files: string[]): Set<string> {
   // of this process's memory — so a document written by a previous run is
   // still committable after a restart.
   const managed = filesForGlobs(site.path, globs).filter((file) => files.includes(file));
-  for (const mark of proposeHtml(site.path, managed).claimed) labels.add(mark.file);
+  for (const mark of proposeHtml(site.path, managed, markAttributes(site.config)).claimed) labels.add(mark.file);
   return labels;
 }
 
@@ -1335,16 +1435,17 @@ async function mergeKeys(req: Request, site: SiteState): Promise<Response> {
   const body = await readJson(req);
   const plan = await planMerge(ready.path, ready.config, ready.descriptor, ready.snapshot, reqStr(body, 'key'), reqStr(body, 'into'));
   if ('refused' in plan) return json({ error: plan.refused.join('\n'), lines: plan.refused }, 409);
-  return json(applyKeyMove(ready, plan, 'dashboard merge'));
+  return json(applyKeyMove(ready, plan, new Map([[reqStr(body, 'key'), reqStr(body, 'into')]]), 'dashboard merge'));
 }
 
 /** A merge or split plan written as its command's one batch, answered with what changed and the checkout's state. */
 function applyKeyMove(
   ready: Ready,
   plan: { descriptor: Descriptor; snapshot: Snapshot; host: HostRenames },
+  moved: ReadonlyMap<string, string>,
   label: string,
 ): { written: string[]; touched: string | null; at: GitState; pending: string[]; untracked: string[] } {
-  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, new Report()).filter((p) => p.status !== 'unchanged');
+  const changed = keyMoveWrites(ready.path, ready.config, plan, plan.host, moved, new Report()).filter((p) => p.status !== 'unchanged');
   const dirtyBefore = uncommittedPaths(ready.path, changed.map((p) => `:(literal)${p.label}`));
   const hashesBefore = new Map(changed.map((p) => [p.label, hashOf(ready, p.label)]));
   try {
@@ -1372,7 +1473,7 @@ async function splitPlace(req: Request, site: SiteState): Promise<Response> {
   if (typeof name !== 'string' || name === '') throw new UsageError('name is required');
   const plan = await planSplit(ready.path, ready.config, ready.descriptor, ready.snapshot, key, name, at);
   if ('refused' in plan) return json({ error: plan.refused.join('\n'), lines: plan.refused }, 409);
-  return json({ ...applyKeyMove(ready, plan, 'dashboard split'), key: name });
+  return json({ ...applyKeyMove(ready, plan, new Map(), 'dashboard split'), key: name });
 }
 
 /**
@@ -1490,7 +1591,7 @@ function documentsAt(site: Ready, rev: string): HtmlProposalSet {
     const shown = gitData(site.path, ['show', `${rev}:./${file}`]);
     if (shown.code === 0) sources.push({ file, source: shown.stdout });
   }
-  return proposeHtmlSources(sources);
+  return proposeHtmlSources(sources, markAttributes(site.config));
 }
 
 /** Each key's first mark in a claim pass, in file then document order. */
@@ -2040,7 +2141,7 @@ async function closeProxy(ctx: DevContext, path: string): Promise<void> {
 function marks(site: SiteState): Response {
   const ready = requireReady(site);
   if (ready.host !== 'html') return json({ documents: [], keys: {}, places: keyReads(ready) });
-  const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
+  const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces), markAttributes(ready.config));
   const pages = new Map<string, string>();
   for (const [name, page] of Object.entries(ready.descriptor.pages ?? {})) pages.set(normalizeRoute(page.route), name);
   const documents = set.documents.map((document) => ({
@@ -2082,8 +2183,11 @@ function usageCacheOf(ctx: DevContext, path: string): UsageCache {
 
 /**
  * The keys one route's files read: on the static-HTML host the marks of the
- * document served at the route, complete where every web text key the
- * descriptor declares is marked in some document; on a JavaScript host the reads `siteReads`
+ * document served at the route and what its own scripts read (`documentScripts`,
+ * followed through their imports and read by `siteReads`), complete where every
+ * web text key the descriptor declares is marked in some document or named in
+ * the source, and none of the document's scripts holds a cause, loads a script
+ * stet cannot follow (`loadsScripts`) or could not be read; on a JavaScript host the reads `siteReads`
  * settles for the route's page files (`routeFiles`) and everything they import,
  * through the host's path aliases: the keys each file names, and every declared
  * key under a prefix it reads. `complete` is false where the walk met a file it
@@ -2096,16 +2200,55 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
   if (route === null) throw new UsageError('route is required');
   const unmapped = { route, files: [], keys: [], complete: false, renders: {}, coincident: [] };
   if (ready.host === 'html') {
-    const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces));
+    const set = proposeHtml(ready.path, filesForGlobs(ready.path, ready.config.managedSurfaces), markAttributes(ready.config));
     const document = set.documents.find((d) => normalizeRoute(servedRoute(d.file)) === normalizeRoute(route));
     if (document === undefined) return json(unmapped);
-    const keys = [...new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key))].sort();
+    const keys = new Set(set.claimed.filter((mark) => mark.file === document.file).map((mark) => mark.key));
     // A declared key no document marks is rendered by something other than the HTML (the page's own script), so the marks are not the page's whole reads.
     const marked = new Set(set.claimed.map((mark) => mark.key));
-    const markedEverywhere = Object.entries(ready.descriptor.keys).every(
-      ([key, def]) => def.shape !== 'text' || def.target !== DEFAULT_TARGET || def.derivesFrom !== undefined || marked.has(key),
-    );
-    return json({ route, files: [document.file], keys, complete: markedEverywhere, renders: {}, coincident: [] });
+    const webText = Object.entries(ready.descriptor.keys)
+      .filter(([, def]) => def.shape === 'text' && def.target === DEFAULT_TARGET && def.derivesFrom === undefined)
+      .map(([key]) => key);
+    const scripts = documentScripts(ready.path, document);
+    // The document's own code: its inline scripts and the handlers its tags carry.
+    const inline = dialectCode(document.source, 'html')
+      .scripts.map((span) => document.source.slice(span.start, span.end))
+      .filter((text) => text.trim() !== '');
+    if (scripts.files.length === 0 && !scripts.missing && inline.length === 0) {
+      return json({ route, files: [document.file], keys: [...keys].sort(), complete: webText.every((key) => marked.has(key)), renders: {}, coincident: [] });
+    }
+    const ts = await loadTypescript();
+    let chain: Chain;
+    try {
+      chain = importClosure(ts, ready.path, scripts.files, undefined, (rel) => insideCheckout(ready.path, join(ready.path, rel)) !== null);
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      return json({ route, files: [document.file, ...scripts.files], keys: [...keys].sort(), complete: false, renders: {}, coincident: [] });
+    }
+    const declaredKeys = Object.keys(ready.descriptor.keys);
+    const reads = await siteReads(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path));
+    const under = (prefixes: readonly UsagePrefix[]): string[] => declaredKeys.filter((key) => prefixes.some((p) => key.startsWith(p.prefix)));
+    // The files stet writes name every key and read none: a copy table or a generated file a page loads is no script to follow.
+    const own = ownFiles(ready.config, ready.path);
+    const followed = chain.files.filter((file) => !own.has(file.rel) && !isGenerated(file.text));
+    let complete = !chain.boundary && !scripts.missing;
+    for (const rel of [document.file, ...followed.map((file) => file.rel)]) {
+      const read = reads.files.get(rel);
+      // A script the scan did not read (ignored by git, outside the source extensions): its reads are not known.
+      if (read === undefined) {
+        if (rel !== document.file) complete = false;
+        continue;
+      }
+      for (const key of [...read.named, ...under(read.prefixes)]) keys.add(key);
+      if (read.causes.length > 0) complete = false;
+    }
+    for (const text of inline) if (loadsScripts(ts, `${document.file}.js`, text) || importsLazily(ts, `${document.file}.js`, text)) complete = false;
+    for (const file of followed) if (loadsScripts(ts, file.rel, file.text) || importsLazily(ts, file.rel, file.text)) complete = false;
+    // Every web text key is marked somewhere or named by the source; one neither is rendered by something stet does not read.
+    const named = new Set<string>();
+    for (const read of reads.files.values()) for (const key of [...read.named, ...under(read.prefixes)]) named.add(key);
+    if (!webText.every((key) => marked.has(key) || named.has(key))) complete = false;
+    return json({ route, files: [document.file, ...chain.files.map((file) => file.rel)], keys: [...keys].sort(), complete, renders: {}, coincident: [] });
   }
   const files = routeFiles(ready.path, route, ready.config);
   if (files === null) return json(unmapped);
@@ -2136,7 +2279,7 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
   }
   const declaredKeys = Object.keys(ready.descriptor.keys);
   const declared = new Set(declaredKeys);
-  const own = ownFiles(ready.config);
+  const own = ownFiles(ready.config, ready.path);
   const reads = await siteReads(ready.path, ready.config, ready.descriptor, usageCacheOf(ctx, ready.path));
   const keys = new Set<string>();
   let complete = !chain.boundary;
@@ -2201,28 +2344,86 @@ async function routeReads(ctx: DevContext, url: URL, site: SiteState): Promise<R
 }
 
 /**
+ * Whether any node of a file, parsed as its extension says, satisfies `pred`;
+ * true where the file nests past the compiler's recursion, since it is then not
+ * known to be free of one.
+ */
+function anyNode(ts: typeof import('typescript'), rel: string, text: string, pred: (node: TS.Node) => boolean): boolean {
+  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
+  const found = (node: TS.Node): boolean => pred(node) || ts.forEachChild(node, found) === true;
+  try {
+    return found(sf);
+  } catch (error) {
+    if (error instanceof RangeError) return true;
+    throw error;
+  }
+}
+
+/**
+ * Whether a script loads another one the route reads cannot follow: it creates
+ * a script element (`createElement('script')`) or one by a computed name, assigns
+ * or sets a `src` or an attribute by a computed name, writes a string holding a
+ * `<script` tag, runs `eval` or `new Function`, or calls `importScripts`, starts
+ * a `Worker`, `SharedWorker` or service worker, or calls `getScript` — the
+ * static arm's `importsLazily`. A library loaded from a list of files this way
+ * is read by nothing, so the route is incomplete.
+ */
+export function loadsScripts(ts: typeof import('typescript'), rel: string, text: string): boolean {
+  if (!/\bcreateElement\b|\bsrc\b|\bimportScripts\b|\bsetAttribute\b|<script|\beval\b|\bFunction\b|\bWorker\b|\bSharedWorker\b|\bserviceWorker\b|\bgetScript\b/i.test(text)) return false;
+  const literal = (node: TS.Node | undefined, value?: string): boolean =>
+    node !== undefined && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && (value === undefined || node.text.toLowerCase() === value);
+  return anyNode(ts, rel, text, (node) => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
+      return /<script/i.test(node.text);
+    }
+    if (ts.isIdentifier(node)) return node.text === 'eval';
+    if ((ts.isNewExpression(node) || ts.isCallExpression(node)) && ts.isIdentifier(node.expression) && node.expression.text === 'Function') return true;
+    // `new Worker("w.js")`, `new SharedWorker(…)`: a script the page starts.
+    if (ts.isNewExpression(node)) {
+      const callee = ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression;
+      return ts.isIdentifier(callee) && (callee.text === 'Worker' || callee.text === 'SharedWorker');
+    }
+    if (ts.isCallExpression(node)) {
+      if (ts.isIdentifier(node.expression)) return node.expression.text === 'importScripts' || node.expression.text === 'getScript';
+      if (!ts.isPropertyAccessExpression(node.expression)) return false;
+      const first = node.arguments[0];
+      const callee = node.expression;
+      if (callee.name.text === 'createElement') return !literal(first) || literal(first, 'script');
+      if (callee.name.text === 'setAttribute') return !literal(first) || literal(first, 'src');
+      if (callee.name.text === 'getScript') return true;
+      // `navigator.serviceWorker.register("sw.js")`.
+      if (callee.name.text === 'register') return ts.isPropertyAccessExpression(callee.expression) ? callee.expression.name.text === 'serviceWorker' : ts.isIdentifier(callee.expression) && callee.expression.text === 'serviceWorker';
+      // `Object.assign(el, { src })`.
+      if (callee.name.text === 'assign') {
+        return node.arguments.some((arg) => ts.isObjectLiteralExpression(arg) && arg.properties.some((prop) => prop.name !== undefined && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) && prop.name.text.toLowerCase() === 'src'));
+      }
+      return false;
+    }
+    if (!ts.isBinaryExpression(node) || node.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return false;
+    // `el.src = …` and `el["src"] = …`.
+    if (ts.isPropertyAccessExpression(node.left)) return node.left.name.text === 'src';
+    return ts.isElementAccessExpression(node.left) && literal(node.left.argumentExpression, 'src');
+  });
+}
+
+/**
  * Whether a file holds a dynamic `import()`, a `require()` call or a glob import
  * (`import.meta.glob(…)`, `Astro.glob(…)`): a module the walk would not see.
  */
 export function importsLazily(ts: typeof import('typescript'), rel: string, text: string): boolean {
   if (!/\b(?:import|require)\s*\(|\bimport\.meta\.glob|\bAstro\.glob/.test(text)) return false;
-  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, rel));
   const globbed = (callee: TS.Expression): boolean =>
     ts.isPropertyAccessExpression(callee) &&
     callee.name.text === 'glob' &&
     (ts.isMetaProperty(callee.expression) || (ts.isIdentifier(callee.expression) && callee.expression.text === 'Astro'));
-  const found = (node: TS.Node): boolean =>
-    (ts.isCallExpression(node) &&
-      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
-        (ts.isIdentifier(node.expression) && node.expression.text === 'require') ||
-        globbed(node.expression))) ||
-    ts.forEachChild(node, found) === true;
-  try {
-    return found(sf);
-  } catch (error) {
-    if (error instanceof RangeError) return true; // too deeply nested to read: not known to be free of one
-    throw error;
-  }
+  return anyNode(
+    ts,
+    rel,
+    text,
+    (node) =>
+      ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === 'require') || globbed(node.expression)),
+  );
 }
 
 /**
@@ -2470,7 +2671,7 @@ export function renderSites(ts: typeof import('typescript'), file: string, sourc
   for (const [key, entry] of out) {
     if (entry.open) continue;
     let named = 0;
-    for (const m of source.matchAll(new RegExp(`(?<![\\w$])${key}(?![\\w$])`, 'g'))) if (inCode(m.index)) named += 1;
+    for (const m of source.matchAll(keyPattern(key, 'g'))) if (occurrenceIsKey(source, m.index, key, declared) && inCode(m.index)) named += 1;
     if (named > (classified.get(key) ?? 0)) entry.open = true;
   }
   return out;
@@ -2975,7 +3176,7 @@ async function health(ctx: DevContext, url: URL, site: SiteState): Promise<Respo
   const at = gitState(ready.path);
   const doctor = await captured(ctx, ['doctor'], ready, env);
   const report = new Report();
-  check(ready.config, ready.path, report);
+  await check(ready.config, ready.path, report);
   const scan = await captured(ctx, ['scan', '--json'], ready);
   const audit = ready.mode === 'snapshot' ? null : (await captured(ctx, ['audit', '--json'], ready, env)).json;
   return json({

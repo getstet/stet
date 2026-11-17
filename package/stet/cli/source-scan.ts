@@ -22,11 +22,10 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { builtinModules } from 'node:module';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
 import { plainOf } from '../src/placeholder.js';
 import { escapeRegExp } from '../src/seo.js';
 import type { Descriptor } from '../src/types.js';
@@ -36,6 +35,7 @@ import {
   isHeadKind,
   itemReader,
   itemWord,
+  KEY_NAME,
   looseHeadingRole,
   metaCopyNameOf,
   roleOf,
@@ -45,12 +45,14 @@ import {
   type ItemNode,
   type Place,
   type SectionNode,
+  wordsOf,
 } from './key-names.js';
 import {
   blankNonMarkup,
   closing,
   dialectCode,
   FRONTMATTER,
+  HTML_TAGS,
   markupBraces,
   maskExpressions,
   markupTags,
@@ -64,6 +66,7 @@ import {
   type MarkupTag,
   type Span as MarkupSpan,
 } from './markup.js';
+import { calleeName } from './key-usage.js';
 import { CliError } from './report.js';
 // The markup layer's names this module's importers read from here.
 export { BOGUS_COMMENT, blankNonMarkup, CDATA_SECTION, CODE_FENCE, ESM_LINE, FRONTMATTER, HTML_COMMENT, type Dialect } from './markup.js';
@@ -223,6 +226,8 @@ export interface LocatedLiteral {
   rich?: { value: string; tags: number; renderers: Array<{ open: Span; close: Span; tag: string; keyed?: true }> };
   /** A JSX sentence's file already imports stet's `richParts`, so its rewrite inserts no second import (D16). */
   richImported?: true;
+  /** A copy module's property value read out of a `[value, meta]` pair or a `{ value, … }` object; absent for a bare string. */
+  form?: 'pair' | 'object';
 }
 
 /** A copy string the scanner recognizes as i18n's — reported, never rewritten. */
@@ -378,15 +383,6 @@ const SEND_DENY = new Set(['from', 'to', 'cc', 'bcc', 'replyTo', 'reply_to', 'ht
 const I18N_ELEMENTS = new Set(['Trans']);
 
 const IGNORE_MARKER = 'stet-ignore-next-line';
-
-/**
- * The descriptor's own key grammar, compiled once — the schema's `keyName`
- * pattern, read from the generated zero-dependency module rather than
- * `descriptor.ts`'s re-export, which would drag `ajv` into this file's graph.
- * A copy module's property name proposes ITSELF as a key, so the question
- * "could this name be a key" has to be answered by the thing that decides it.
- */
-const KEY_NAME = new RegExp(DESCRIPTOR_SCHEMA.$defs.keyName.pattern);
 
 /**
  * The named HTML entities worth decoding so a seeded default matches what render
@@ -1305,6 +1301,8 @@ export async function scanSource(
     readPathImport: string;
     /** The file's page word, where it serves a page; a component file has none. */
     page?: string;
+    /** The joiner the naming rule puts between a name's parts (`keyJoiner`); `_` where absent. */
+    joiner?: '_' | '.';
   },
 ): Promise<ScanResult> {
   const ts = await loadTypescript();
@@ -1899,12 +1897,15 @@ export async function scanSource(
     proposedKey:
       p.context === 'send-arg'
         ? proposeKey(p.text)
-        : baseName({
-            ...(opts.page === undefined ? {} : { page: opts.page }),
-            ...(isHeadKind(p.place) ? {} : { section: p.section }),
-            ...(p.item === undefined ? {} : { item: p.item }),
-            role: p.role ?? roleOf(p.place),
-          }),
+        : baseName(
+            {
+              ...(opts.page === undefined ? {} : { page: opts.page }),
+              ...(isHeadKind(p.place) ? {} : { section: p.section }),
+              ...(p.item === undefined ? {} : { item: p.item }),
+              role: p.role ?? roleOf(p.place),
+            },
+            opts.joiner,
+          ),
     place: p.place,
     sectionWord: p.section,
     ...(p.item === undefined ? {} : { item: p.item }),
@@ -1932,6 +1933,223 @@ function lineSpan(source: string, pos: number, nodeEnd: number): Span {
   if (source.charAt(end) === '\r') end += 1;
   if (source.charAt(end) === '\n') end += 1;
   return { pos: start, end };
+}
+
+/** What the screen pass reads from the config (D15). */
+export interface ScreenOptions {
+  /** The configured read functions' written names (`TS.t`): a call of one is a read, never an element. */
+  reads: readonly string[];
+  /** The mark attributes (`markAttributes`): a prop of one names the key its element reads. */
+  attributes: readonly string[];
+  /** `scan.builders`: callees read as an element whatever their first argument (`h(Card, …)`). */
+  builders: readonly string[];
+  /** The file's page word, where it serves a page; else the file's own name gives one. */
+  page?: string;
+  joiner?: '_' | '.';
+}
+
+/**
+ * A JavaScript screen's copy (D15): a hyperscript element's string child or
+ * copy prop, or a string a DOM property or `setAttribute` takes. It is listed
+ * for adoption by hand and never rewritten, so it is its own type: it carries
+ * none of a `LocatedLiteral`'s rewrite fields and cannot reach `planRewrite`.
+ */
+export interface ScreenLiteral {
+  file: string;
+  pos: number;
+  text: string;
+  place: Place;
+  sectionWord: string | null;
+  /** The role name before its number. */
+  proposedKey: string;
+}
+
+/** One screen's copy, and the text it holds as possible copy with no key: an HTML fragment's, or a string child of a call no element encloses. */
+export interface ScreenScan {
+  literals: ScreenLiteral[];
+  possible: DialectFinding[];
+}
+
+/** A hyperscript call read as an element: its tag, its props where the second argument is an object literal, and its children. */
+export interface HyperscriptElement {
+  tag: string;
+  props?: TS.ObjectLiteralExpression;
+  children: readonly TS.Expression[];
+  /** Named in `scan.builders`, or a hyperscript call given props: an element beyond doubt, which `h("div", "x")` is not. */
+  sure: boolean;
+}
+
+/** The last segment of a callee that is hyperscript (`h`, `React.createElement`): any other call is an element only through `scan.builders`. */
+const HYPERSCRIPT_CALLEES: ReadonlySet<string> = new Set(['h', 'm', 'el', 'html', 'createElement', 'jsx', 'jsxs']);
+
+/** The elements whose children are code: a screen proposes none of it as copy. */
+const OPAQUE_TAGS: ReadonlySet<string> = new Set(['script', 'style']);
+
+/** The copy props a hyperscript element carries: the JSX walk's copy attributes a visitor reads. */
+const SCREEN_PROPS: ReadonlySet<string> = new Set([...COPY_ATTRS].filter((name) => ['placeholder', 'title', 'alt', 'aria-label'].includes(name)));
+
+/** The DOM properties whose string is copy, each with the attribute it is; `textContent` and `innerText` are the element's text. */
+const DOM_COPY: Record<string, string | undefined> = { textContent: undefined, innerText: undefined, title: 'title', placeholder: 'placeholder', alt: 'alt', ariaLabel: 'aria-label' };
+
+/** A custom element's name: lowercase, with a hyphen, and no attribute's (`aria-label` is `setAttribute`'s first argument). */
+const CUSTOM_ELEMENT = /^(?!aria-|data-)[a-z][a-z0-9]*-[a-z0-9-]*$/;
+
+/**
+ * A call read as a hyperscript element (D15): a call whose last callee segment
+ * is in `HYPERSCRIPT_CALLEES`, with a first argument naming an HTML element
+ * (`HTML_TAGS`) or a custom one, then an optional object literal of props (or
+ * `null`) and the children; or any call of a name in `scan.builders`, whose
+ * first argument may be a component (`h(Card, …)`). Props make a hyperscript
+ * call sure. A call of a configured read function is a read and never an
+ * element, and so is every other call, whatever its first argument
+ * (`log("div", { a: 1 }, "…")`). Callees are named as `calleeName` folds them.
+ * Null for any call that is not an element.
+ */
+export function hyperscriptElement(
+  ts: typeof import('typescript'),
+  sf: TS.SourceFile,
+  call: TS.CallExpression,
+  opts: Pick<ScreenOptions, 'reads' | 'builders'>,
+): HyperscriptElement | null {
+  const callee = calleeName(ts, call.expression) ?? call.expression.getText(sf).replace(/\s+/g, '');
+  const [first, second] = call.arguments;
+  if (first === undefined || opts.reads.includes(callee)) return null;
+  const built = opts.builders.includes(callee);
+  const named = ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first) ? first.text : undefined;
+  if (!built && (!HYPERSCRIPT_CALLEES.has(callee.slice(callee.lastIndexOf('.') + 1)) || named === undefined || !(HTML_TAGS.has(named) || CUSTOM_ELEMENT.test(named)))) return null;
+  const props = second !== undefined && (ts.isObjectLiteralExpression(second) || second.kind === ts.SyntaxKind.NullKeyword);
+  return {
+    tag: named ?? first.getText(sf),
+    ...(second !== undefined && ts.isObjectLiteralExpression(second) ? { props: second } : {}),
+    children: call.arguments.slice(props ? 2 : 1),
+    sure: built || props,
+  };
+}
+
+/**
+ * A JavaScript screen's copy (D15), over a file `scanSource` parsed. Inside a
+ * hyperscript element a string child is copy, and so is a string `placeholder`,
+ * `title`, `alt` or `aria-label` prop; a prop named by a mark attribute names
+ * the key the element reads, so its children are not copy (and `<mark>-<prop>`
+ * keys that prop); a read call, like every other expression, is code. The
+ * enclosing elements are the chain `sectionWord` reads. A string assigned to a
+ * DOM copy property, or `setAttribute`'s value for a copy attribute, is copy
+ * with the role from the property. An `innerHTML` or `insertAdjacentHTML`
+ * fragment is read by the dialect detector as possible copy, and so is the
+ * string child of a hyperscript call given no props that sits in no element
+ * (`h("div", "x")`).
+ */
+export function scanScreen(ts: typeof import('typescript'), sf: TS.SourceFile, opts: ScreenOptions): ScreenScan {
+  const file = sf.fileName;
+  const page = opts.page ?? (wordsOf(basename(file).replace(/\.[^.]*$/, '')) || undefined);
+  const literals: ScreenLiteral[] = [];
+  const possible: DialectFinding[] = [];
+  const isString = (n: TS.Node): n is TS.StringLiteral | TS.NoSubstitutionTemplateLiteral => ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n);
+  const elements = new Map<TS.CallExpression, HyperscriptElement | null>();
+  const elementOf = (call: TS.CallExpression): HyperscriptElement | null => {
+    if (!elements.has(call)) elements.set(call, hyperscriptElement(ts, sf, call, opts));
+    return elements.get(call) ?? null;
+  };
+  // The elements a node sits inside as a child, nearest first.
+  const enclosing = (node: TS.Node): HyperscriptElement[] => {
+    const out: HyperscriptElement[] = [];
+    for (let at = node; at.parent !== undefined; at = at.parent) {
+      const el = ts.isCallExpression(at.parent) ? elementOf(at.parent) : null;
+      if (el !== null && el.children.includes(at as TS.Expression)) out.push(el);
+    }
+    return out;
+  };
+  const propOf = (el: HyperscriptElement, name: string): TS.PropertyAssignment | undefined =>
+    el.props?.properties.find((p): p is TS.PropertyAssignment => ts.isPropertyAssignment(p) && propName(ts, p.name) === name);
+  const textOf = (el: HyperscriptElement): string =>
+    OPAQUE_TAGS.has(el.tag) ? '' : el.children.map((c) => (isString(c) ? c.text : ts.isCallExpression(c) && elementOf(c) !== null ? textOf(elementOf(c) as HyperscriptElement) : '')).join('');
+  const firstHeading = (el: HyperscriptElement): HyperscriptElement | undefined => {
+    let found: HyperscriptElement | undefined;
+    const look = (n: TS.Node): void => {
+      if (found !== undefined) return;
+      const inner = ts.isCallExpression(n) ? elementOf(n) : null;
+      if (inner !== null && /^h[1-6]$/.test(inner.tag)) found = inner;
+      else ts.forEachChild(n, look);
+    };
+    el.children.forEach(look);
+    return found;
+  };
+  const sectionNode = (el: HyperscriptElement): SectionNode => ({
+    tag: el.tag,
+    id: () => {
+      const init = propOf(el, 'id')?.initializer;
+      return init !== undefined && isString(init) ? init.text : undefined;
+    },
+    heading: () => {
+      const heading = firstHeading(el);
+      return heading === undefined ? undefined : textOf(heading);
+    },
+    headingTag: () => firstHeading(el)?.tag,
+  });
+  const push = (node: TS.StringLiteral | TS.NoSubstitutionTemplateLiteral, chain: HyperscriptElement[], attr?: string, tag = chain[0]?.tag): void => {
+    if (!qualifiesAsCopy(node.text)) return;
+    const pos = node.getStart(sf);
+    const place: Place = { file, line: sf.getLineAndCharacterOfPosition(pos).line + 1, ...(tag === undefined ? {} : { tag }), ...(attr === undefined ? {} : { attr }) };
+    const section = sectionWord(chain.map(sectionNode));
+    const proposedKey = baseName({ ...(page === undefined ? {} : { page }), ...(isHeadKind(place) ? {} : { section }), role: roleOf(place) }, opts.joiner);
+    literals.push({ file, pos, text: node.text, place, sectionWord: section, proposedKey });
+  };
+  // An HTML fragment's text runs, each at its place in the file; a template's substitutions are blanked.
+  const fragment = (expr: TS.Expression): void => {
+    if (!isString(expr) && !ts.isTemplateExpression(expr)) return;
+    const base = expr.getStart(sf) + 1;
+    let text = isString(expr) ? expr.text : sf.text.slice(base, expr.end - 1);
+    if (ts.isTemplateExpression(expr)) {
+      for (const span of expr.templateSpans) {
+        const from = span.expression.getFullStart() - 2 - base;
+        const to = span.literal.getStart(sf) + 1 - base;
+        text = text.slice(0, from) + text.slice(from, to).replace(/[^\n]/g, ' ') + text.slice(to);
+      }
+    }
+    for (const found of scanDialect(file, text, 'html')) possible.push({ file, pos: base + found.pos, text: collapseWhitespace(found.text) });
+  };
+
+  const visit = (node: TS.Node): void => {
+    const el = ts.isCallExpression(node) ? elementOf(node) : null;
+    if (el !== null) {
+      const chain = [el, ...enclosing(node)];
+      const sure = chain.some((e) => e.sure);
+      if (sure) {
+        for (const prop of el.props?.properties ?? []) {
+          const name = ts.isPropertyAssignment(prop) ? propName(ts, prop.name) : undefined;
+          if (name === undefined || !SCREEN_PROPS.has(name) || !isString((prop as TS.PropertyAssignment).initializer)) continue;
+          if (opts.attributes.some((a) => propOf(el, `${a}-${name}`) !== undefined)) continue;
+          push((prop as TS.PropertyAssignment).initializer as TS.StringLiteral, chain, name);
+        }
+      }
+      // A `<style>` or `<script>` child is code, not words.
+      if (!OPAQUE_TAGS.has(el.tag) && !opts.attributes.some((a) => propOf(el, a) !== undefined)) {
+        for (const child of el.children) {
+          if (!isString(child)) continue;
+          if (sure) push(child, chain);
+          else if (qualifiesAsCopy(child.text)) possible.push({ file, pos: child.getStart(sf), text: child.text });
+        }
+      }
+    }
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const [name, value] = node.arguments;
+      const method = node.expression.name.text;
+      if (method === 'setAttribute' && name !== undefined && value !== undefined && isString(name) && SCREEN_PROPS.has(name.text) && isString(value)) push(value, [], name.text);
+      if (method === 'insertAdjacentHTML' && value !== undefined) fragment(value);
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isPropertyAccessExpression(node.left)) {
+      const property = node.left.name.text;
+      if (property === 'innerHTML') fragment(node.right);
+      else if (Object.hasOwn(DOM_COPY, property) && isString(node.right)) {
+        // `document.title` is the page's title, every other `title` an element's tooltip.
+        const pageTitle = property === 'title' && calleeName(ts, node.left.expression) === 'document';
+        push(node.right, [], pageTitle ? undefined : DOM_COPY[property], pageTitle ? 'title' : undefined);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sf, visit);
+  return { literals, possible };
 }
 
 /**
@@ -1986,6 +2204,11 @@ export interface ModuleScanResult {
   parseErrors: boolean;
 }
 
+/** Whether a project's copy modules may hold `[value, meta]` pair and `{ value }` object tables: it sets `reads` or `generated`. */
+export function copyTablesOf(config: { reads?: unknown; generated: readonly unknown[] }): boolean {
+  return config.reads !== undefined || config.generated.length > 0;
+}
+
 /**
  * One DECLARED COPY MODULE, walked for the string literals its host means as
  * copy — the sibling of `scanSource` for the files the JSX locator has nothing
@@ -2011,6 +2234,10 @@ export interface ModuleScanResult {
  * stand on their own, for a `.tsx` declared as a copy module and nothing else,
  * where no JSX walk ran and there is nothing to hand over.
  *
+ * A table of `[value, meta]` pairs or `{ value }` objects is read as one only when
+ * `opts.tables` is set (`copyTablesOf`: the project sets `reads` or `generated`);
+ * every other project reads its copy modules as they were always read.
+ *
  * The rewrite-only fields of a returned literal are inert — no enclosing body,
  * no `copy` binding, no import position — because a module finding is adopted
  * as RECORD and its source is never edited. `register`'s runtime guard is what
@@ -2019,7 +2246,7 @@ export interface ModuleScanResult {
 export async function scanModule(
   file: string,
   source: string,
-  opts: { sourceFile?: TS.SourceFile; claimed?: readonly Span[] } = {},
+  opts: { sourceFile?: TS.SourceFile; claimed?: readonly Span[]; tables?: boolean } = {},
 ): Promise<ModuleScanResult> {
   const ts = await loadTypescript();
   const sf =
@@ -2113,7 +2340,11 @@ export async function scanModule(
   };
 
   /**
-   * The name of the object-literal property this literal is the value of.
+   * The name of the object-literal property this literal is the value of, and
+   * the form it sits in: the property's own string, element 0 of its
+   * `[value, meta]` pair, or the `value` member of its `{ value, … }` object.
+   * Null for a pair's later element or a sibling of `value` — a status word or a
+   * note, never copy — and undefined where the literal is no property's value.
    *
    * A per-value cast or parenthesis wraps the literal without changing what the
    * property is — `{ hero: 'Hero copy' as const }` names its key just as plainly
@@ -2122,20 +2353,68 @@ export async function scanModule(
    * dropped those to derived keys, forking the registry from the module through
    * a side door.
    */
-  const valueOfProperty = (lit: TS.Node): string | undefined => {
-    let node: TS.Node = lit;
-    for (
-      let up: TS.Node | undefined = node.parent;
-      up !== undefined &&
-      (ts.isAsExpression(up) || ts.isSatisfiesExpression(up) || ts.isParenthesizedExpression(up));
-      up = node.parent
-    ) {
-      node = up;
-    }
+  const valueOfProperty = (lit: TS.Node): { name: string | undefined; form?: 'pair' | 'object' } | null | undefined => {
+    const climb = (from: TS.Node): TS.Node => {
+      let node = from;
+      for (
+        let up: TS.Node | undefined = node.parent;
+        up !== undefined &&
+        (ts.isAsExpression(up) || ts.isSatisfiesExpression(up) || ts.isParenthesizedExpression(up));
+        up = node.parent
+      ) {
+        node = up;
+      }
+      return node;
+    };
+    /** The property `node` is the initializer of, inside an object literal. */
+    const propertyOf = (node: TS.Node): TS.PropertyAssignment | undefined => {
+      const parent: TS.Node | undefined = node.parent;
+      if (parent === undefined || !ts.isPropertyAssignment(parent) || parent.initializer !== node) return undefined;
+      return ts.isObjectLiteralExpression(parent.parent) ? parent : undefined;
+    };
+    const bare = (e: TS.Expression): TS.Expression =>
+      ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e) ? bare(e.expression) : e;
+    /** A `[value, meta]` pair: two string literals, either one cast or parenthesised. */
+    const isPair = (e: TS.Expression): boolean => {
+      const a = bare(e);
+      return ts.isArrayLiteralExpression(a) && a.elements.length === 2 && a.elements.every((x) => ts.isStringLiteralLike(bare(x)));
+    };
+    /** A `{ value: "…", … }` object: a string `value` member beside any others. */
+    const isValued = (e: TS.Expression): boolean => {
+      const o = bare(e);
+      return (
+        ts.isObjectLiteralExpression(o) &&
+        o.properties.some((p) => ts.isPropertyAssignment(p) && propName(ts, p.name) === 'value' && ts.isStringLiteralLike(bare(p.initializer)))
+      );
+    };
+    /** A table reads as `[value, meta]` pairs or `{ value }` objects only when it has at least two members and every one has the shape. */
+    const uniform = (table: TS.Node, shaped: (e: TS.Expression) => boolean): boolean => {
+      const members = (table as TS.ObjectLiteralExpression).properties;
+      return members.length >= 2 && members.every((m) => ts.isPropertyAssignment(m) && shaped(m.initializer));
+    };
+    const node = climb(lit);
     const parent: TS.Node | undefined = node.parent;
-    if (parent === undefined || !ts.isPropertyAssignment(parent) || parent.initializer !== node) return undefined;
-    if (!ts.isObjectLiteralExpression(parent.parent)) return undefined;
-    return propName(ts, parent.name);
+    // `"home.title": ["Make your whole ad campaign.", "approved"]`: element 0 is the value, where
+    // every member of the enclosing table is such a pair. A two-string list in an ordinary object
+    // (`features: ['Fast', 'Cheap']`) or a longer or shorter one stays the literals it always was.
+    if (parent !== undefined && ts.isArrayLiteralExpression(parent)) {
+      const pair = propertyOf(climb(parent));
+      if (opts.tables !== true || pair === undefined || !uniform(pair.parent, isPair)) return undefined;
+      return parent.elements[0] === node ? { name: propName(ts, pair.name), form: 'pair' } : null;
+    }
+    const own = propertyOf(node);
+    if (own === undefined) return undefined;
+    // `"home.lead": { value: "Every variant, one run.", note: "…" }`: the `value` member is the value,
+    // where every member of the enclosing table is such an object.
+    const holder = own.parent as TS.ObjectLiteralExpression;
+    const outer = propertyOf(climb(holder));
+    const valued = holder.properties.find(
+      (p): p is TS.PropertyAssignment => ts.isPropertyAssignment(p) && propName(ts, p.name) === 'value' && ts.isStringLiteralLike(bare(p.initializer)),
+    );
+    if (opts.tables === true && outer !== undefined && valued !== undefined && uniform(outer.parent, isValued)) {
+      return valued === own ? { name: propName(ts, outer.name), form: 'object' } : null;
+    }
+    return { name: propName(ts, own.name) };
   };
 
   const record = (node: TS.Node, literalText: string, isTemplate: boolean): void => {
@@ -2149,9 +2428,13 @@ export async function scanModule(
     // host named under a grammar-valid unclaimed name is a finding by
     // declaration, anything else takes the bar — so the count is
     // would-have-been findings and never suppressed junk.
+    // A pair's status word and a sibling of `value` are the table's own data, never copy.
+    const at = valueOfProperty(node);
+    if (at === null) return;
+
     const ignoredAt = ignoreAbove(node);
     if (ignoredAt !== undefined) {
-      const ignoredName = isTemplate ? undefined : valueOfProperty(node);
+      const ignoredName = isTemplate ? undefined : at?.name;
       let declared = false;
       if (ignoredName !== undefined && KEY_NAME.test(ignoredName) && !wouldClaim.has(ignoredName)) {
         wouldClaim.add(ignoredName);
@@ -2166,7 +2449,7 @@ export async function scanModule(
     let note: string | undefined;
     // A template with substitutions is never a property proposal — a default has
     // to be a literal value, and the slotted-template shape is extract's.
-    const name = isTemplate ? undefined : valueOfProperty(node);
+    const name = isTemplate ? undefined : at?.name;
     if (name !== undefined) {
       if (!KEY_NAME.test(name)) {
         note = `property name ${name} fails the key grammar — propose key ${key}`;
@@ -2179,6 +2462,7 @@ export async function scanModule(
         key = name;
       }
     }
+    const form = shape === 'property' ? at?.form : undefined;
     if (shape !== 'property' && !qualifiesAsCopy(literalText)) return;
     if (note !== undefined) notes.set(pos, note);
     literals.push({
@@ -2194,6 +2478,7 @@ export async function scanModule(
       copyBinding: 'none',
       accessorImported: false,
       importInsertPos: 0,
+      ...(form === undefined ? {} : { form }),
     });
   };
 
@@ -2739,14 +3024,81 @@ function blankLineFrom(text: string, i: number): boolean {
  * warn that rides the pre-commit hook: a crash there fails somebody's commit
  * over a typo in their descriptor.
  */
-export function mentionsToken(source: string, token: string): boolean {
+export function mentionsToken(source: string, token: string, declared?: ReadonlySet<string>): boolean {
   const escaped = escapeRegExp(token);
   // `\b` asserts a boundary only beside a word character, so a token that
   // begins or ends with punctuation takes a bare match on that side rather
   // than one that can never hold.
   const left = /^\w/.test(token) ? '\\b' : '';
   const right = /\w$/.test(token) ? '\\b' : '';
-  return new RegExp(`${left}${escaped}${right}`).test(source);
+  // A key inside a longer declared one (`waitlist.foot` in `waitlist.foot.more`, `title` in `home.title`) is that key's mention.
+  for (const m of source.matchAll(new RegExp(`${left}${escaped}${right}`, 'g'))) {
+    if (occurrenceIsKey(source, m.index, token, declared)) return true;
+  }
+  return false;
+}
+
+/**
+ * The declared keys a dotted token run names, each with where it starts in the
+ * run: each contiguous run of its dot-delimited segments that is a key, the
+ * longest first at every start, and none that sits inside a longer one already
+ * taken — so `obj.home_title` names `home_title`, `"home.title"` names
+ * `home.title` and not a flat `title`. Two keys that share segments without
+ * one holding the other (`a.b` and `b.c` in `a.b.c`) are both named and both
+ * `ambiguous`: which one the text means cannot be told.
+ */
+export function keyRunsIn(token: string, declared: ReadonlySet<string>): Array<{ key: string; at: number; ambiguous?: true }> {
+  const parts = token.split('.');
+  const starts = parts.map((_, i) => parts.slice(0, i).reduce((sum, part) => sum + part.length + 1, 0));
+  const taken: Array<{ from: number; to: number; run: { key: string; at: number; ambiguous?: true } }> = [];
+  for (let i = 0; i < parts.length; i += 1) {
+    for (let j = parts.length; j > i; j -= 1) {
+      if (taken.some((t) => t.from <= i && j <= t.to)) continue;
+      const key = parts.slice(i, j).join('.');
+      if (!declared.has(key)) continue;
+      const run: { key: string; at: number; ambiguous?: true } = { key, at: starts[i] as number };
+      for (const t of taken) {
+        if (t.from < j && i < t.to) {
+          run.ambiguous = true;
+          t.run.ambiguous = true;
+        }
+      }
+      taken.push({ from: i, to: j, run });
+    }
+  }
+  return taken.map((t) => t.run);
+}
+
+/** The declared keys a dotted token run names (`keyRunsIn`). */
+export const keysIn = (token: string, declared: ReadonlySet<string>): string[] => keyRunsIn(token, declared).map((run) => run.key);
+
+/** The key runs of the word-and-dot run round `at`, and where that run starts. */
+function runAround(source: string, at: number, declared: ReadonlySet<string>): { runs: ReturnType<typeof keyRunsIn>; start: number } | null {
+  let start = at;
+  while (start > 0 && /[\w$.]/.test(source[start - 1] as string)) start -= 1;
+  while (start < at && source[start] === '.') start += 1; // a spread's dots
+  const run = /^[\w$]+(?:\.[\w$]+)*/.exec(source.slice(start))?.[0];
+  return run === undefined ? null : { runs: keyRunsIn(run, declared), start };
+}
+
+/**
+ * Whether the text of `key` at `at` is that key and not part of another: the
+ * longest-sub-run rule of `keysIn` applied to the word-and-dot run round it, so
+ * `waitlist.foot` inside `waitlist.foot.more` and `title` inside `home.title`
+ * belong to the longer declared key. True where `declared` is absent or does
+ * not hold `key`.
+ */
+export function occurrenceIsKey(source: string, at: number, key: string, declared: ReadonlySet<string> | undefined): boolean {
+  if (declared === undefined || !declared.has(key)) return true;
+  const found = runAround(source, at, declared);
+  return found === null || found.runs.some((run) => run.key === key && run.at === at - found.start);
+}
+
+/** Whether the key at `at` shares segments with another declared key in the same run (`a.b` and `b.c` in `a.b.c`), so the text does not say which it means. */
+export function occurrenceIsAmbiguous(source: string, at: number, key: string, declared: ReadonlySet<string> | undefined): boolean {
+  if (declared === undefined || !declared.has(key)) return false;
+  const found = runAround(source, at, declared);
+  return found !== null && found.runs.some((run) => run.key === key && run.at === at - found.start && run.ambiguous === true);
 }
 
 /**

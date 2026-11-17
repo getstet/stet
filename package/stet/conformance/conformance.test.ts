@@ -519,7 +519,7 @@ describe('descriptor', () => {
     // — the fixture declares all eight — and the emission is as sorted and as
     // reproducible as `KEYS`.
     const stringUnion = /^export const STRING_KEYS = \[\n([\s\S]*?)^\] as const;$/m.exec(keysTs);
-    const stringKeys = [...(stringUnion?.[1] ?? '').matchAll(/^ {2}'([a-z0-9_]+)',$/gm)].map((m) => m[1] as string);
+    const stringKeys = [...(stringUnion?.[1] ?? '').matchAll(/^ {2}'([a-z0-9_.]+)',$/gm)].map((m) => m[1] as string);
     const ofShape = (...shapes: string[]): string[] =>
       Object.entries(descriptor.keys)
         .filter(([, def]) => shapes.includes(def.shape))
@@ -7952,7 +7952,7 @@ describe('adoption', () => {
     // Plan-only touches nothing.
     const beforePlan = html.file('index.html');
     expect(await html.run('eject')).toBe(0);
-    expect(html.stdout()).toContain('document: index.html — every mark removed, the text stays');
+    expect(html.stdout()).toContain('document: index.html — every data-stet mark removed, the text stays');
     expect(html.stdout()).not.toContain('un-rewrite');
     expect(html.file('index.html')).toBe(beforePlan);
 

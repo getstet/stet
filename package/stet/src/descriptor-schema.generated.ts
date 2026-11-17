@@ -43,7 +43,7 @@ export const DESCRIPTOR_SCHEMA = {
     "keyName": {
       "description": "Keys name content, never position. Slot keys flatten as <template>__<slot>.",
       "type": "string",
-      "pattern": "^[a-z0-9]+(?:_{1,2}[a-z0-9]+)*$"
+      "pattern": "^[a-z0-9]+(?:(?:\\.|_{1,2})[a-z0-9]+)*$"
     },
     "keyDef": {
       "type": "object",

@@ -122,8 +122,8 @@ describe('planProblems — a register plan', () => {
     ]);
     expect(planProblems(plan, 'p.json', DESCRIPTOR, ids, { hashes: MADE })).toEqual([
       'e01: "home_hero__eyebrow" uses "__", which names a template slot or the brand group',
-      'e02: "home_Hero" is not a key name — lowercase letters, digits and single underscores, starting with a letter',
-      'e03: "2026_footer" is not a key name — lowercase letters, digits and single underscores, starting with a letter',
+      'e02: "home_Hero" is not a key name — lowercase letters and digits, in parts joined by a dot or an underscore, starting with a letter',
+      'e03: "2026_footer" is not a key name — lowercase letters and digits, in parts joined by a dot or an underscore, starting with a letter',
       `e04: "a${'_b'.repeat(32)}" is longer than 64 characters`,
       'e05: "home_taken" is already a key in the descriptor',
       'e06 and e07: both are named "home_faq_question"',

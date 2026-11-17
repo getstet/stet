@@ -21,14 +21,14 @@ import { flag, parse, text as argText } from './args.js';
 import { astroPlaceName } from './astro-rewrite.js';
 import { rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, keyJoiner, loadConfig, markAttributes, refuseInCopyFrom, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { htmlBaseName, proposeHtml } from './html-host.js';
 import { numberNames } from './key-names.js';
 import { planProblems, type NamingPlan } from './key-plan.js';
 import type { CliIo } from './main.js';
 import { htmlPageOf, pageOfFile } from './pages.js';
-import { accessorBaseName, hostRefusals, keyMoveWrites, markRenames, readRenames, slotOrBrand, type HostRenames, type OnlyAt } from './rename.js';
+import { accessorBaseName, hostRefusals, htmlRenames, keyMoveWrites, readRenames, slotOrBrand, type HostRenames, type OnlyAt } from './rename.js';
 import { HostTextReport, UsageError } from './report.js';
 import { dialectOf, loadTypescript, scanSource } from './source-scan.js';
 
@@ -52,6 +52,7 @@ export async function runSplit(args: string[], io: CliIo): Promise<number> {
 
   const report = new HostTextReport();
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'split');
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);
@@ -63,14 +64,15 @@ export async function runSplit(args: string[], io: CliIo): Promise<number> {
     return report.emit(io);
   }
   const where = `${at.file}:${at.line}`;
-  const what = isHtmlHost(config) ? 'mark' : 'read';
+  // A mark is the one place with no line of source text; a configured read in a script is a read.
+  const what = plan.host.rewritten.some((occ) => occ.text === '') ? 'mark' : 'read';
   report.line(`${where} the ${what} is renamed; the value ${JSON.stringify(plan.text)} is copied`);
   for (const place of plan.keeps) report.line(`${place.file}:${place.line} keeps ${key}`);
   if (!flag(values, 'write')) {
     report.line(`split: run with --write to give ${where} its own key`);
     return report.emit(io);
   }
-  const changed = keyMoveWrites(io.cwd, config, plan, plan.host, report).filter((p) => p.status !== 'unchanged');
+  const changed = keyMoveWrites(io.cwd, config, plan, plan.host, new Map(), report).filter((p) => p.status !== 'unchanged');
   try {
     writePlanned(changed);
   } catch (error) {
@@ -110,7 +112,7 @@ export async function planSplit(
 
   const renames = new Map([[key, next]]);
   const move = (only?: OnlyAt): Promise<HostRenames> | HostRenames =>
-    isHtmlHost(config) ? markRenames(cwd, config, renames, only) : readRenames(cwd, config, renames, only);
+    isHtmlHost(config) ? htmlRenames(cwd, config, renames, descriptor, only) : readRenames(cwd, config, renames, new Set(Object.keys(descriptor.keys)), only);
   const all = await move();
   const here = await move(at);
   // A place is a line that marks or reads the key; two marks on one line are one place.
@@ -147,9 +149,9 @@ export async function proposedSplitName(
 ): Promise<string | null> {
   let base: string | null = null;
   if (isHtmlHost(config)) {
-    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces).filter((file) => file === at.file));
+    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces).filter((file) => file === at.file), markAttributes(config));
     const mark = set.claimed.find((m) => m.key === key && m.line === at.line);
-    if (mark !== undefined) base = htmlBaseName(htmlPageOf(cwd, mark.file, descriptor.pages), mark);
+    if (mark !== undefined) base = htmlBaseName(htmlPageOf(cwd, mark.file, descriptor.pages), mark, keyJoiner(config));
   } else {
     let source: string;
     try {
@@ -162,9 +164,9 @@ export async function proposedSplitName(
       // An Astro file's reads are named by the rewriter that wrote them.
       base = astroPlaceName(await loadTypescript(), cwd, at.file, source, key, at.line, page);
     } else {
-      const result = await scanSource(at.file, source, { readPathImport: config.readPath.import, ...(page === undefined ? {} : { page }) });
+      const result = await scanSource(at.file, source, { readPathImport: config.readPath.import, joiner: keyJoiner(config), ...(page === undefined ? {} : { page }) });
       const call = result.accessorCalls.find((c) => c.key === key && c.copyBinding === 'stet' && c.place.line === at.line);
-      if (call !== undefined) base = accessorBaseName(page, call);
+      if (call !== undefined) base = accessorBaseName(page, call, keyJoiner(config));
     }
   }
   if (base === null) return null;

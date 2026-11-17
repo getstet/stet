@@ -3887,3 +3887,94 @@ describe('register — JSX sentence keys (D16)', () => {
     expect([...scanned.out, ...scanned.err].join('\n')).not.toMatch(/unkeyed copy "(Run|Keep|Mind|Read)/);
   });
 });
+
+describe('register — a JavaScript screen is listed for adoption by hand (D15)', () => {
+  it('P6.2 declares the pill, prints the by-hand line naming TS.t and rewrites nothing', async () => {
+    const screen =
+      'var h = TS.h;\nTS.screen(function () {\n  return h("main", { class: "page" },\n    h("section", { id: "hero" },\n      h("span", { class: "badge outline wl-pill" }, "For ads, music videos and films")));\n});\n';
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<!doctype html>\n<html><head></head><body><script src="screens/waitlist.js"></script></body></html>\n', 'screens/waitlist.js': screen },
+      config: { managedSurfaces: ['screens/*.js'], keyStyle: 'dotted', reads: { functions: ['TS.t', 'TS.tx'], attribute: 'data-copy' } },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.out).toContain('screens/waitlist.js:5: "For ads, music videos and films" — read it through TS.t by hand');
+    expect(host.file('screens/waitlist.js')).toBe(screen);
+    expect(JSON.parse(host.file('content/descriptor.json')).keys['waitlist.hero.span']).toEqual({ shape: 'text', target: 'web', section: 'hero' });
+    expect(JSON.parse(host.file('content/defaults.json')).default['waitlist.hero.span']).toBe('For ads, music videos and films');
+  });
+});
+
+describe('register — a copy module on a {name} host seeds the stored form (Q37)', () => {
+  it('converts the table literal through the placeholder setting, and a second run adopts nothing', async () => {
+    const dir = project({ copyModules: ['src/copy.ts'] });
+    const config = JSON.parse(read(dir, 'stet.config.json')) as Record<string, unknown>;
+    write(dir, 'stet.config.json', JSON.stringify({ ...config, placeholders: '{name}' }));
+    write(dir, 'src/copy.ts', 'export const copy = {\n  greeting: "Hi {name}, welcome back",\n};\n');
+    expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+    expect(defaults(dir).default['greeting']).toBe('Hi {{name}}, welcome back');
+    const second = io(dir);
+    expect(await runRegister(['--from', 'scan', '--write'], second)).toBe(0);
+    expect(second.out.at(-1)).toBe('register: nothing to adopt');
+  });
+});
+
+describe('register — screens and generated outputs on a plain-JavaScript host (add-plain-js-hosts, fix D)', () => {
+  const homeHtml = '<!doctype html>\n<html><head></head><body>\n<p>First paragraph here</p>\n<script src="home.js"></script></body></html>\n';
+
+  it('C6-1 a {name} host seeds a screen text in the stored form with its variable declared, and a second scan proposes nothing', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html': '<!doctype html>\n<html><head></head><body><script src="screens/page.js"></script></body></html>\n',
+        'screens/page.js': 'h("p", { class: "x" }, "Hi {name}, welcome back");\n',
+      },
+      config: { managedSurfaces: ['screens/*.js'], keyStyle: 'dotted', placeholders: '{name}', reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    const key = Object.keys(JSON.parse(host.file('content/descriptor.json')).keys).find((k) => k.startsWith('page.'));
+    expect(JSON.parse(host.file('content/defaults.json')).default[key as string]).toBe('Hi {{name}}, welcome back');
+    expect(JSON.parse(host.file('content/descriptor.json')).keys[key as string].vars).toEqual(['name']);
+    host.err.length = 0;
+    expect(await host.run('scan')).toBe(0);
+    expect(host.err.join('\n')).not.toContain('Hi {name}');
+  });
+
+  it('C6-6 a screen text equal to a page element text adds no second key, and scan and register agree', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': homeHtml, 'home.js': 'el.textContent = "First paragraph here";\n' },
+      config: { managedSurfaces: ['index.html', 'home.js'], keyStyle: 'dotted', reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+    });
+    expect(await host.run('scan')).toBe(0);
+    expect(host.err.filter((l) => l.includes('home.js') && l.includes('First paragraph here'))).toEqual([]);
+    host.out.length = 0;
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.out.join('\n')).not.toContain('read it through');
+    const holders = Object.values(JSON.parse(host.file('content/defaults.json')).default).filter((value) => value === 'First paragraph here');
+    expect(holders).toHaveLength(1);
+  });
+
+  it('Q71 register reads a table of pairs as one only on a project that sets reads or generated', async () => {
+    const nav = 'export const nav = { primary: ["Home page", "About us"], secondary: ["Terms of use", "Privacy policy"] };\n';
+    const keysOf = async (extra: Record<string, unknown>): Promise<string[]> => {
+      const dir = project({ copyModules: ['src/nav.js'] });
+      const config = JSON.parse(read(dir, 'stet.config.json')) as Record<string, unknown>;
+      write(dir, 'stet.config.json', JSON.stringify({ ...config, ...extra }));
+      write(dir, 'src/nav.js', nav);
+      expect(await runRegister(['--from', 'scan', '--write'], io(dir))).toBe(0);
+      return Object.keys(descriptor(dir).keys).sort();
+    };
+    expect(await keysOf({})).toEqual(expect.arrayContaining(['about_us', 'privacy_policy']));
+    expect(await keysOf({ reads: { functions: ['TS.t'], attribute: 'data-copy' } })).toEqual(expect.arrayContaining(['primary', 'secondary']));
+  });
+
+  it('Q68 html register writes the generated outputs in its batch, so check stays current', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': homeHtml },
+      config: { generated: [{ file: 'public/copy.js', format: 'script', name: 'TS.copyTable' }] },
+    });
+    expect(await host.run('register', '--from', 'scan', '--write')).toBe(0);
+    expect(host.file('public/copy.js')).toContain('"First paragraph here"');
+    host.err.length = 0;
+    expect(await host.run('check')).toBe(0);
+    expect(host.err.join('\n')).not.toContain('public/copy.js');
+  });
+});

@@ -16,6 +16,8 @@ import { keyUsage, type KeyUsage, type UsageState } from './key-usage.js';
 import type { CliIo } from './main.js';
 import { loadProject, refuseAbsence, type LoadedProject } from './project.js';
 import { CliError, Report } from './report.js';
+import { statusOf, trackedStatus, type KeyStatus, type StatusFile } from './status.js';
+import { isStoreBacked } from './store.js';
 
 interface ListRow {
   key: string;
@@ -24,6 +26,8 @@ interface ListRow {
   draft: boolean;
   /** `--json` only: what the unread-key scan says of a judged key. */
   badge?: UsageState;
+  /** A snapshot-only project whose status file exists: the key's approval. */
+  status?: KeyStatus;
 }
 
 export async function runList(args: string[], io: CliIo): Promise<number> {
@@ -55,6 +59,11 @@ export async function runList(args: string[], io: CliIo): Promise<number> {
       }
     }
 
+    // The status column belongs to a snapshot-only project that tracks approval: its file exists.
+    // A checkout reading its copy from another shows the owner's.
+    const forms = project.owner ?? { path: io.cwd, config: project.config };
+    const approvals: StatusFile | null = trackedStatus(forms.path, forms.config, isStoreBacked(project.environment.block));
+
     const rows: ListRow[] = [];
     for (const key of Object.keys(project.descriptor.keys).sort()) {
       const resolution = resolve(project.descriptor, project.snapshot, answer.rows, { key, locale });
@@ -66,15 +75,19 @@ export async function runList(args: string[], io: CliIo): Promise<number> {
         version: live?.version ?? null,
         draft: candidates.some((r) => r.status === 'draft' && localeChain(locale).includes(r.locale)),
         ...(usage !== null && Object.hasOwn(usage.keys, key) ? { badge: usage.keys[key]?.state } : {}),
+        ...(approvals === null ? {} : { status: statusOf(approvals, key) }),
       });
     }
 
     const width = rows.reduce((w, r) => Math.max(w, r.key.length), 0);
-    report.line(`${'key'.padEnd(width)}  source    version  draft`);
+    const tracked = approvals !== null;
+    report.line(`${'key'.padEnd(width)}  source    version  ${tracked ? 'draft  ' : 'draft'}${tracked ? '  status' : ''}`);
     for (const row of rows) {
+      const draft = row.draft ? 'pending' : '—';
+      const approval = row.status === undefined ? '' : row.status.status === 'approved' ? `approved${row.status.at ? ` ${row.status.at}` : ''}` : 'proposed';
       report.line(
         `${row.key.padEnd(width)}  ${row.source.padEnd(8)}  ${String(row.version ?? '—').padStart(7)}  ${
-          row.draft ? 'pending' : '—'
+          tracked ? `${draft.padEnd(7)}  ${approval}` : draft
         }`,
       );
     }

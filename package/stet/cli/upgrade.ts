@@ -65,7 +65,7 @@ export async function runUpgrade(args: string[], io: CliIo): Promise<number> {
   // database and no content one: the content store is left alone.
   const env = text(values, 'env');
   const contactsOnly = adapter === undefined && env !== undefined && contactsOnlyEnv(loadConfig(io.cwd), env);
-  const project = await loadProject(io, { config, env: contactsOnly ? undefined : env });
+  const project = await loadProject(io, { config, env: contactsOnly ? undefined : env, writer: 'upgrade' });
   report.environment(contactsOnly ? (env as string) : project.environment.name);
 
   // The one command that mutates a stranger's database never exits silent

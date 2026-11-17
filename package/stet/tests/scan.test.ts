@@ -2053,3 +2053,160 @@ describe('runScan — display strings in module data (D13)', () => {
     expect(entries).toEqual([expect.objectContaining({ context: 'data', text: 'Pick a key' })]);
   });
 });
+
+describe('runScan — hyperscript and plain-JS screens (D15)', () => {
+  /** Topshine's shape: a static-HTML host whose screens render through `h`, keys dotted, read through `TS.t` and marked with `data-copy`. */
+  const screenHost = (screen: string, config: Record<string, unknown> = {}) =>
+    makeHtmlHost({
+      files: { 'index.html': '<!doctype html>\n<html><head></head><body><script src="screens/waitlist.js"></script></body></html>\n', 'screens/waitlist.js': screen },
+      config: { managedSurfaces: ['screens/*.js'], keyStyle: 'dotted', reads: { functions: ['TS.t', 'TS.tx'], attribute: 'data-copy' }, ...config },
+    });
+  const unkeyed = (lines: string[]): string[] => lines.filter((l) => l.includes('unkeyed copy'));
+  const possible = (lines: string[]): string[] => lines.filter((l) => l.includes('possible copy'));
+
+  it('P6.1 proposes a hyperscript pill under its section, named by the one rule', async () => {
+    const host = await screenHost(
+      'var h = TS.h;\nTS.screen(function () {\n  return h("main", { class: "page" },\n    h("section", { id: "hero" },\n      h("span", { class: "badge outline wl-pill" }, "For ads, music videos and films")));\n});\n',
+    );
+    expect(await host.run('scan')).toBe(0);
+    expect(unkeyed(host.err)).toEqual(['warn: screens/waitlist.js:5:53 unkeyed copy "For ads, music videos and films" — propose key waitlist.hero.span']);
+  });
+
+  it('P6.1 reads, keyed elements and code are not copy; textContent is copy and innerHTML possible copy', async () => {
+    const host = await screenHost(
+      [
+        'var h = TS.h;',
+        'function form(k) {',
+        '  return h("form", { class: "card" },',
+        '    h("button", { key: "join", class: "btn accent", type: "submit", "data-copy": "waitlist.join" }, TS.tx("waitlist.join"), TS.icon("arrow")),',
+        '    h("label", { key: k[0] }, h("input", { type: "checkbox" }), TS.tx("waitlist.use." + k[0])));',
+        '}',
+        'function done(el, box) {',
+        '  el.textContent = "Copied";',
+        '  box.innerHTML = "<b>Done</b> now";',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    expect(await host.run('scan')).toBe(0);
+    expect(unkeyed(host.err)).toEqual(['warn: screens/waitlist.js:8:20 unkeyed copy "Copied" — propose key waitlist.page.text']);
+    expect(possible(host.err)).toEqual([expect.stringMatching(/^warn: screens\/waitlist\.js:9 possible copy ".*Done.*"$/)]);
+  });
+
+  it('P6.1 reads a component builder named in scan.builders, and leaves the call code without it', async () => {
+    const screen = 'var h = TS.h;\nexport var plans = h(Card, { title: "Plans" }, "Pick one");\n';
+    const listed = await screenHost(screen, { scan: { severity: 'warn', baseline: '.stet/scan-baseline.json', builders: ['h'] } });
+    expect(await listed.run('scan')).toBe(0);
+    expect(unkeyed(listed.err)).toEqual([
+      'warn: screens/waitlist.js:2:37 unkeyed copy "Plans" — propose key waitlist.page.card_title',
+      'warn: screens/waitlist.js:2:48 unkeyed copy "Pick one" — propose key waitlist.page.card',
+    ]);
+    const bare = await screenHost(screen);
+    expect(await bare.run('scan')).toBe(0);
+    expect(unkeyed(bare.err)).toEqual([]);
+  });
+
+  it('P6.3 a log("div", "x")-shaped call in no element proposes at most one possible copy line and never a key', async () => {
+    const host = await screenHost('log("div", "x");\nlog("div", "the draft was saved");\n');
+    expect(await host.run('scan')).toBe(0);
+    expect(unkeyed(host.err)).toEqual([]);
+    expect(possible(host.err).length).toBeLessThanOrEqual(1);
+  });
+
+  it('C6-2 a <style> or <script> element holds code: its string child is no copy', async () => {
+    const host = await screenHost('var h = TS.h;\nh("style", null, ".card { color: red; }");\nh("script", { type: "application/json" }, "{\\"title\\": \\"Not copy at all\\"}");\n');
+    expect(await host.run('scan')).toBe(0);
+    expect(unkeyed(host.err)).toEqual([]);
+    expect(possible(host.err)).toEqual([]);
+  });
+
+  it('C6-3 and Q80 only a hyperscript callee or a scan.builders name makes an element: log, analytics, test and storage calls propose nothing', async () => {
+    const host = await screenHost(
+      [
+        'log("div", { a: 1 }, "something happened here");',
+        'analytics.track("button", { id: 1 }, "Clicked the join button");',
+        'it("title", { timeout: 5 }, "does the thing right");',
+        'TS.stateData("agent-bar", "connected");',
+        'localStorage.setItem("data", "some stored value");',
+        'el.setAttribute("title", "Copy the link");',
+        '',
+      ].join('\n'),
+    );
+    expect(await host.run('scan')).toBe(0);
+    // setAttribute is the one call that is copy: a tooltip, listed once.
+    expect(unkeyed(host.err)).toEqual(['warn: screens/waitlist.js:6:26 unkeyed copy "Copy the link" — propose key waitlist.page.tooltip']);
+    expect(possible(host.err)).toEqual([]);
+  });
+
+  it('C6-8 a read written window.TS.t or TS?.t is a read, and window.document.title is the page title', async () => {
+    const host = await screenHost(
+      ['window.TS.t("button", "Click here to join");', 'TS?.t("button", "Click here to join");', 'window.document.title = "Join the waitlist";', ''].join('\n'),
+    );
+    expect(await host.run('scan')).toBe(0);
+    expect(unkeyed(host.err)).toEqual(['warn: screens/waitlist.js:3:25 unkeyed copy "Join the waitlist" — propose key waitlist.page_title']);
+    expect(possible(host.err)).toEqual([]);
+  });
+
+  it('Q62 a call of a configured read function prints no i18n copy line; another t( call still does', async () => {
+    const host = await screenHost('TS.t("waitlist.title");\nTS?.t("waitlist.sub");\nwindow.TS.tx("waitlist.use." + k);\ni18n.t("somewhere.else");\n');
+    expect(await host.run('scan')).toBe(0);
+    const lines = host.out.filter((l) => l.includes('i18n copy'));
+    expect(lines).toEqual(["screens/waitlist.js:4: i18n copy — outside stet's v1 scope, not a key"]);
+  });
+
+  it('Q70 a generated output is never a surface or a copy module', async () => {
+    const host = await makeHtmlHost({
+      files: {
+        'index.html': '<!doctype html>\n<html><head></head><body><script src="public/copy.js"></script></body></html>\n',
+        'public/copy.js': 'el.textContent = "Generated words here";\n',
+      },
+      config: { managedSurfaces: ['public/*.js'], generated: [{ file: 'public/copy.js', format: 'script', name: 'TS.copyTable' }] },
+    });
+    expect(await host.run('scan')).toBe(0);
+    expect(host.err.join('\n')).not.toContain('Generated words here');
+  });
+
+  it('proposes no key for an element already marked with the configured attribute (C3 validation V15)', async () => {
+    const host = await makeHtmlHost({
+      files: { 'index.html': '<!doctype html>\n<html lang="en"><head></head><body>\n<p data-copy="home.lead">A paragraph of copy here.</p>\n</body></html>\n' },
+      config: { reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+      keys: { 'home.lead': { shape: 'text', target: 'web' } },
+      defaults: { 'home.lead': 'A paragraph of copy here.' },
+    });
+    expect(await host.run('scan')).toBe(0);
+    expect(host.stderr()).not.toContain('A paragraph of copy here.');
+  });
+});
+
+describe('runScan — plain-JavaScript readings are gated on the project opting in (add-plain-js-hosts, Q60, Q71)', () => {
+  it('C6-9 a project with no reads or builders scans a screen file exactly as 0.8.1; with reads set the screen is read', async () => {
+    const screen = 'export function f(el) {\n  h("p", null, "Welcome aboard friends");\n  el.textContent = "Copied now";\n}\n';
+    const bare = project({ managedSurfaces: ['app/**/*.js'] });
+    write(bare, 'app/util.js', screen);
+    const quiet = io(bare);
+    expect(await runScan([], quiet)).toBe(0);
+    expect(quiet.err.join('\n')).not.toContain('Welcome aboard friends');
+    expect(quiet.err.join('\n')).not.toContain('Copied now');
+    const reading = project({ managedSurfaces: ['app/**/*.js'], reads: { functions: ['copy'] } });
+    write(reading, 'app/util.js', screen);
+    const loud = io(reading);
+    expect(await runScan([], loud)).toBe(0);
+    expect(loud.err.join('\n')).toContain('Welcome aboard friends');
+    expect(loud.err.join('\n')).toContain('Copied now');
+  });
+
+  it('Q71 a table of pairs reads as one only on a project that sets reads or generated', async () => {
+    const nav = 'export const nav = { primary: ["Home page", "About us"], secondary: ["Terms of use", "Privacy policy"] };\n';
+    const plain = project({ managedSurfaces: [], copyModules: ['src/nav.js'] });
+    write(plain, 'src/nav.js', nav);
+    const before = io(plain);
+    expect(await runScan([], before)).toBe(0);
+    expect(before.err.join('\n')).toContain('"About us"');
+    expect(before.err.join('\n')).toContain('"Privacy policy"');
+    const opted = project({ managedSurfaces: [], copyModules: ['src/nav.js'], reads: { functions: ['copy'] } });
+    write(opted, 'src/nav.js', nav);
+    const after = io(opted);
+    expect(await runScan([], after)).toBe(0);
+    expect(after.err.join('\n')).not.toContain('"About us"');
+  });
+});

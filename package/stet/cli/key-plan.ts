@@ -65,7 +65,7 @@ export interface NamingPlan {
 }
 
 /** A key a plan may give: a letter first, then lowercase letters and digits in words joined by single underscores. */
-export const PLAN_KEY = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
+export const PLAN_KEY = /^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$/;
 export const PLAN_KEY_MAX = 64;
 export const LABEL_MAX = 60;
 export const HELP_MAX = 500;
@@ -229,7 +229,7 @@ export function planProblems(
     if (e.key.includes('__')) {
       problems.push(`${id}: "${e.key}" uses "__", which names a template slot or the brand group`);
     } else if (!PLAN_KEY.test(e.key)) {
-      problems.push(`${id}: "${e.key}" is not a key name — lowercase letters, digits and single underscores, starting with a letter`);
+      problems.push(`${id}: "${e.key}" is not a key name — lowercase letters and digits, in parts joined by a dot or an underscore, starting with a letter`);
     } else if (e.key.length > PLAN_KEY_MAX) {
       problems.push(`${id}: "${e.key}" is longer than ${PLAN_KEY_MAX} characters`);
     }

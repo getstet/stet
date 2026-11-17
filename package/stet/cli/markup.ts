@@ -161,6 +161,18 @@ export function openTagAttrs(markup: string, tag: MarkupTag, offset = 0): HtmlAt
 /** The HTML elements that take no close tag: Astro reads `<br>` as JSX reads `<br />`. */
 export const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
 
+/** The element names of the WHATWG HTML standard, `svg` and `math` among them: a hyperscript call's first argument names one (D15). */
+export const HTML_TAGS: ReadonlySet<string> = new Set([
+  'a', 'abbr', 'address', 'area', 'article', 'aside', 'audio', 'b', 'base', 'bdi', 'bdo', 'blockquote', 'body', 'br', 'button',
+  'canvas', 'caption', 'cite', 'code', 'col', 'colgroup', 'data', 'datalist', 'dd', 'del', 'details', 'dfn', 'dialog', 'div',
+  'dl', 'dt', 'em', 'embed', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'head',
+  'header', 'hgroup', 'hr', 'html', 'i', 'iframe', 'img', 'input', 'ins', 'kbd', 'label', 'legend', 'li', 'link', 'main', 'map',
+  'mark', 'math', 'menu', 'meta', 'meter', 'nav', 'noscript', 'object', 'ol', 'optgroup', 'option', 'output', 'p', 'picture',
+  'pre', 'progress', 'q', 'rp', 'rt', 'ruby', 's', 'samp', 'script', 'search', 'section', 'select', 'slot', 'small', 'source',
+  'span', 'strong', 'style', 'sub', 'summary', 'sup', 'svg', 'table', 'tbody', 'td', 'template', 'textarea', 'tfoot', 'th',
+  'thead', 'time', 'title', 'tr', 'track', 'u', 'ul', 'var', 'video', 'wbr',
+]);
+
 /** A top-level brace of a dialect's markup: `end` is just past its `}`; `inTag` where it sits inside an open tag. */
 export interface MarkupBrace {
   start: number;
@@ -319,7 +331,8 @@ export function unraw(page: string): string {
  * matter, script bodies and MDX's ESM lines are TypeScript regions, returned
  * apart so the caller can take their comments out with the compiler; tag
  * interiors outside their quoted values, and braces, are expressions. A
- * `.html` file on a JavaScript host evaluates only its scripts.
+ * `.html` file on a JavaScript host evaluates its scripts and the code in its
+ * tags: `on*` handler values and `javascript:` URLs (`handlerSpans`).
  *
  * One walk over the markup, so a `<script>` inside a raw element is raw too.
  * An open tag closes where `closing` says, quotes and braces respected, so
@@ -387,6 +400,7 @@ export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]
       const { end, name, selfClosing } = openTag(source, i);
       const tag = source.slice(i, end);
       if (dialect !== 'html') expressions.push(...tagCode(source, i, end, dialect, braces));
+      else scripts.push(...handlerSpans(source, i, end));
       if (name === 'script' || name === 'style') {
         if (selfClosing) {
           i = end;
@@ -439,6 +453,30 @@ export function dialectCode(source: string, dialect: Dialect): { scripts: Span[]
     i += 1;
   }
   return { scripts, expressions, braces, raws };
+}
+
+/**
+ * The attribute values of an html open tag the browser runs as code: an `on*`
+ * handler's value and the code after `javascript:` in an `href` or `src`. Each
+ * is a client script of its own, as an inline `<script>` is.
+ */
+function handlerSpans(source: string, start: number, end: number): Array<Span & { own: true }> {
+  const name = /^<[A-Za-z][\w:.-]*/.exec(source.slice(start, end))?.[0] as string;
+  const base = start + name.length;
+  const out: Array<Span & { own: true }> = [];
+  for (const attr of readAttrs(source, base, source.slice(base, source.charAt(end - 1) === '>' ? end - 1 : end))) {
+    if (attr.valueEnd <= attr.valueStart) continue;
+    let from = attr.valueStart;
+    if (/^on[a-z]+$/.test(attr.name)) {
+      // A handler's whole value is code.
+    } else if (attr.name === 'href' || attr.name === 'src') {
+      const scheme = /^\s*javascript:/i.exec(source.slice(attr.valueStart, attr.valueEnd));
+      if (scheme === null) continue;
+      from += scheme[0].length;
+    } else continue;
+    out.push({ start: from, end: attr.valueEnd, own: true });
+  }
+  return out;
 }
 
 /** A Vue directive: its quoted value is an expression. */

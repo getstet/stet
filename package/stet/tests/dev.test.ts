@@ -1735,7 +1735,7 @@ describe('POST /api/site/save', () => {
     expect(again.body['written']).toEqual([]);
 
     const report = new Report();
-    check(loadConfig(host.cwd), host.cwd, report);
+    await check(loadConfig(host.cwd), host.cwd, report);
     expect(report.findings.filter((f) => f.level === 'error')).toEqual([]);
   });
 
@@ -4477,7 +4477,7 @@ describe('one site’s requests never interleave', () => {
     expect(JSON.parse(host.file('content/defaults.json')).default.hero_headline).toBe('Second');
 
     const report = new Report();
-    check(loadConfig(host.cwd), host.cwd, report);
+    await check(loadConfig(host.cwd), host.cwd, report);
     expect(report.findings.filter((f) => f.level === 'error')).toEqual([]);
   });
 });
@@ -14385,6 +14385,121 @@ describe('GET /api/site/usage and /api/site/route-reads (D6, 5.5)', () => {
     expect(body.keys).toEqual(expect.arrayContaining(marksIn(host.cwd, 'index.html')));
   });
 
+  // add-plain-js-hosts C3 (D7): a static page's own scripts are read beside its marks.
+  const PLAIN_KEYS = ['home.title', 'waitlist.title', 'waitlist.use.ads', 'waitlist.use.other'];
+  const plainHost = (files: Record<string, string>, config: Record<string, unknown> = { reads: { functions: ['TS.t', 'TS.tx'] } }): Promise<CliHost> =>
+    makeHtmlHost({
+      files,
+      keys: Object.fromEntries(PLAIN_KEYS.map((k) => [k, { shape: 'text', target: 'web' }])),
+      defaults: Object.fromEntries(PLAIN_KEYS.map((k) => [k, `Text of ${k}`])),
+      config,
+    });
+  const plainPage = (body: string): string => `<!DOCTYPE html>\n<html lang="en">\n<head><title>Join</title></head>\n<body>\n${body}\n</body>\n</html>\n`;
+
+  it('P3.8 an html page with <script src="screen.js">: the script\'s named keys and prefixes join the route, complete where no cause stands', async () => {
+    const screen = 'var TS = window.TS;\nTS.t("waitlist.title");\n["ads", "other"].forEach(function (k) { TS.tx("waitlist.use." + k); });\n';
+    const host = await plainHost({
+      'index.html': plainPage('  <h1 data-stet="home.title">Text of home.title</h1>\n  <script src="screen.js"></script>'),
+      'screen.js': screen,
+    });
+    const { handler } = handlerOver([host.cwd]);
+    expect(await routeReadsOf(handler, host)).toMatchObject({ keys: PLAIN_KEYS.slice().sort(), complete: true });
+
+    const caused = await plainHost({
+      'index.html': plainPage('  <h1 data-stet="home.title">Text of home.title</h1>\n  <script src="screen.js"></script>'),
+      'screen.js': `${screen}TS.tx(window.pick());\n`,
+    });
+    expect(await routeReadsOf(handlerOver([caused.cwd]).handler, caused)).toMatchObject({ keys: PLAIN_KEYS.slice().sort(), complete: false });
+  });
+
+  it('P3.12 with reads.attribute data-copy, the route reads a data-copy mark beside a data-stet one', async () => {
+    const host = await plainHost(
+      {
+        'index.html': plainPage(
+          '  <h1 data-copy="home.title">Text of home.title</h1>\n  <p data-stet="waitlist.title">Text of waitlist.title</p>\n' +
+            '  <i data-copy="waitlist.use.ads">Text of waitlist.use.ads</i>\n  <i data-stet="waitlist.use.other">Text of waitlist.use.other</i>',
+        ),
+      },
+      { reads: { functions: ['TS.t'], attribute: 'data-copy' } },
+    );
+    expect(await routeReadsOf(handlerOver([host.cwd]).handler, host)).toMatchObject({ keys: PLAIN_KEYS.slice().sort(), complete: true });
+  });
+
+  it('P3.13 a followed script that creates script elements from a list leaves the route incomplete, though every key is found', async () => {
+    const loader = "var FILES = ['data/copy.js', 'c/header.js']; FILES.forEach(function (f) { var s = document.createElement('script'); s.src = f; document.head.appendChild(s); });\n";
+    const host = await plainHost({
+      'index.html': plainPage(
+        PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n') + '\n  <script src="ui/index.js"></script>',
+      ),
+      'ui/index.js': loader,
+    });
+    const body = await routeReadsOf(handlerOver([host.cwd]).handler, host);
+    expect(body.keys).toEqual(PLAIN_KEYS.slice().sort());
+    expect(body.complete).toBe(false);
+  });
+
+  it('V5 an inline script is read beside the marks, and one that loads scripts leaves the route incomplete', async () => {
+    const inline = await plainHost({
+      'index.html': plainPage('  <h1 data-stet="home.title">Text of home.title</h1>\n  <script>TS.t("waitlist.title");</script>'),
+    });
+    const read = await routeReadsOf(handlerOver([inline.cwd]).handler, inline);
+    expect(read.keys).toEqual(['home.title', 'waitlist.title']);
+
+    const marked = PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n');
+    const loader = await plainHost({
+      'index.html': plainPage(`${marked}\n  <script>var s = document.createElement("script"); s.src = "x.js"; document.head.appendChild(s);</script>`),
+    });
+    expect((await routeReadsOf(handlerOver([loader.cwd]).handler, loader)).complete).toBe(false);
+    const quiet = await plainHost({ 'index.html': plainPage(`${marked}\n  <script>console.log("hi");</script>`) });
+    expect((await routeReadsOf(handlerOver([quiet.cwd]).handler, quiet)).complete).toBe(true);
+  });
+
+  it('V6 a followed script that imports lazily leaves the route incomplete', async () => {
+    const marked = PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n');
+    for (const lazy of ['import("./x.js");', 'require("./x.js");']) {
+      const host = await plainHost({ 'index.html': plainPage(`${marked}\n  <script src="s.js"></script>`), 's.js': `${lazy}\n`, 'x.js': 'TS.t("waitlist.title");\n' });
+      expect((await routeReadsOf(handlerOver([host.cwd]).handler, host)).complete, lazy).toBe(false);
+    }
+  });
+
+  it('V7 a script written as a string, or an element or attribute created by a computed name, leaves the route incomplete', async () => {
+    const marked = PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n');
+    const loaders = [
+      'document.write("<script src=a.js></script>");',
+      'document.body.innerHTML += "<SCRIPT src=a.js></SCRIPT>";',
+      'var el = document.createElement(tag);',
+      'el.setAttribute(attr, value);',
+      'fetch(u).then(eval);',
+      'var f = new Function("return 1");',
+      'var w = new Worker("w.js");',
+      'var w = new SharedWorker("w.js");',
+      'navigator.serviceWorker.register("sw.js");',
+      '$.getScript("x.js");',
+      's["src"] = f;',
+      'Object.assign(s, { src: f });',
+      'Object.assign(s, { src });',
+    ];
+    for (const loader of loaders) {
+      const host = await plainHost({ 'index.html': plainPage(`${marked}\n  <script src="s.js"></script>`), 's.js': `${loader}\n` });
+      expect.soft((await routeReadsOf(handlerOver([host.cwd]).handler, host)).complete, loader).toBe(false);
+    }
+    const plain = await plainHost({ 'index.html': plainPage(`${marked}\n  <script src="s.js"></script>`), 's.js': 'var el = document.createElement("div"); el.setAttribute("class", "x");\n' });
+    expect((await routeReadsOf(handlerOver([plain.cwd]).handler, plain)).complete).toBe(true);
+  });
+
+  it('V13 a copy table and a generated file loaded by <script src> do not make a fully marked page incomplete', async () => {
+    const marked = PLAIN_KEYS.map((k) => `  <p data-stet="${k}">Text of ${k}</p>`).join('\n');
+    const host = await plainHost(
+      {
+        'index.html': plainPage(`${marked}\n  <script src="data/copy.js"></script>\n  <script src="gen/strings.js"></script>`),
+        'data/copy.js': 'window.TS = window.TS || {};\nTS.copyTable = { "home.title": ["Make it", "approved"] };\n',
+        'gen/strings.js': 'window.TS_STRINGS = {};\n',
+      },
+      { reads: { functions: ['TS.t'] }, copyModules: ['data/copy.js'], generated: [{ file: 'gen/strings.js', format: 'script', name: 'TS_STRINGS', values: 'value' }] },
+    );
+    expect((await routeReadsOf(handlerOver([host.cwd]).handler, host)).complete).toBe(true);
+  });
+
   it('an alias that resolves nowhere makes the route incomplete', async () => {
     const host = nextSite();
     const { handler } = handlerOver([host.cwd]);
@@ -15157,5 +15272,150 @@ describe('REVIEW probe: a second stet write to one page file (PD14)', () => {
     expect(split.body['written']).toContain('src/pages/about.astro');
     const pending = (await get(handler, `/api/site/carries${site(host)}`)).files as string[];
     expect(pending).toContain('src/pages/about.astro');
+  });
+});
+
+describe('the approval status in the dashboard routes (add-plain-js-hosts, C4)', () => {
+  const approved = { status: 'approved', at: '2026-11-02', by: 'nj-io' };
+  const statusHost = (file: Record<string, unknown> | null, config: Record<string, unknown> = { project: 't' }): CliHost => {
+    const host = gitHost({ config });
+    if (file !== null) write(host.cwd, 'content/status.json', JSON.stringify(file));
+    return host;
+  };
+
+  it('P4.4 a save of a changed value resets the key to proposed in one batch; the same value saved again leaves the approval', async () => {
+    const host = statusHost({ hero_headline: approved, welcome__subject: approved });
+    const { handler } = handlerOver([host.cwd]);
+    const changed = await post(handler, `/api/site/save${site(host)}`, { values: [{ key: 'hero_headline', value: 'A new headline' }] });
+    expect(changed.status).toBe(200);
+    expect(changed.body['written']).toEqual(expect.arrayContaining(['content/defaults.json', 'content/status.json']));
+    expect(changed.body['status']).toEqual({ hero_headline: { status: 'proposed' } });
+    const file = JSON.parse(host.file('content/status.json'));
+    expect(file['hero_headline']).toEqual({ status: 'proposed' });
+    expect(file['welcome__subject']).toEqual(approved);
+    // Approving again, then saving the same words, leaves the approval and writes nothing.
+    const again = await post(handler, `/api/site/approve${site(host)}`, { key: 'hero_headline' });
+    expect(again.status).toBe(200);
+    const same = await post(handler, `/api/site/save${site(host)}`, { values: [{ key: 'hero_headline', value: 'A new headline' }] });
+    expect(same.body['written']).toEqual([]);
+    expect(same.body['status']).toEqual({ hero_headline: expect.objectContaining({ status: 'approved' }) });
+    // Old words back do not restore the approval of the first.
+    const back = await post(handler, `/api/site/save${site(host)}`, { values: [{ key: 'hero_headline', value: 'Never miss a post again.' }] });
+    expect(back.body['status']).toEqual({ hero_headline: { status: 'proposed' } });
+  });
+
+  it('P4.8 the site payload: status null and approvable true with no file, the file once it exists, null and not approvable when store-backed', async () => {
+    const bare = statusHost(null);
+    const { handler } = handlerOver([bare.cwd]);
+    const none = await get(handler, `/api/site${site(bare)}`);
+    expect(none.status).toBeNull();
+    expect(none.approvable).toBe(true);
+    // The first approval creates the file, and the payload then carries it.
+    const first = await post(handler, `/api/site/approve${site(bare)}`, { key: 'hero_headline' });
+    expect(first.status).toBe(200);
+    expect(first.body['entry']).toMatchObject({ status: 'approved', by: 'dev' });
+    expect(bare.exists('content/status.json')).toBe(true);
+    const some = await get(handler, `/api/site${site(bare)}`);
+    expect(some.approvable).toBe(true);
+    expect(some.status.hero_headline).toMatchObject({ status: 'approved', by: 'dev' });
+    expect(some.status.welcome__subject).toEqual({ status: 'proposed' });
+    // The Commit panel lists the status file beside the snapshot.
+    expect((await get(handler, `/api/site/carries${site(bare)}`)).files).toContain('content/status.json');
+
+    const store = statusHost(null, { store: { adapter: 'memory' } });
+    const held = await get(handlerOver([store.cwd]).handler, `/api/site${site(store)}`);
+    expect(held.status).toBeNull();
+    expect(held.approvable).toBe(false);
+  });
+
+  it('P4.7 the approve route refuses an undeclared key and a store-backed site, writing nothing', async () => {
+    const host = statusHost({ hero_headline: approved });
+    const { handler } = handlerOver([host.cwd]);
+    const before = host.file('content/status.json');
+    const undeclared = await post(handler, `/api/site/approve${site(host)}`, { key: 'nope' });
+    expect(undeclared.status).toBe(400);
+    expect(undeclared.body['error']).toBe('undeclared key: nope');
+    const inherited = await post(handler, `/api/site/approve${site(host)}`, { key: 'constructor' });
+    expect(inherited.status).toBe(400);
+    expect(host.file('content/status.json')).toBe(before);
+
+    const store = statusHost(null, { store: { adapter: 'memory' } });
+    const refused = await post(handlerOver([store.cwd]).handler, `/api/site/approve${site(store)}`, { key: 'hero_headline' });
+    expect(refused.status).toBe(409);
+    expect(refused.body['error']).toBe('approve: this project is store-backed — publishing is its approval');
+    expect(store.exists('content/status.json')).toBe(false);
+  });
+});
+
+describe('the approval status in the dashboard routes (add-plain-js-hosts, fix D)', () => {
+  const statusHost = (): CliHost => gitHost({ config: { project: 't' } });
+
+  it('P4.11 a malformed status file shows as a notice with Approve off, a save goes through and leaves it as it is, and approve answers 409', async () => {
+    const host = statusHost();
+    write(host.cwd, 'content/status.json', '{ nope');
+    const { handler } = handlerOver([host.cwd]);
+    const payload = await get(handler, `/api/site${site(host)}`);
+    expect(payload.status).toBeNull();
+    expect(payload.approvable).toBe(false);
+    expect(payload.statusError).toContain('content/status.json: not valid JSON');
+    const saved = await post(handler, `/api/site/save${site(host)}`, { values: [{ key: 'hero_headline', value: 'A new headline' }] });
+    expect(saved.status).toBe(200);
+    expect(saved.body['written']).toContain('content/defaults.json');
+    expect(saved.body['written']).not.toContain('content/status.json');
+    expect(saved.body['status']).toBeNull();
+    expect(host.file('content/status.json')).toBe('{ nope');
+    const refused = await post(handler, `/api/site/approve${site(host)}`, { key: 'hero_headline' });
+    expect(refused.status).toBe(409);
+    expect(host.file('content/status.json')).toBe('{ nope');
+  });
+
+  it('P4.12 the approve route refuses a derived key, and an approval leaves hand-formatted forms alone', async () => {
+    const host = statusHost();
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, unknown> };
+    descriptor.keys['hero_echo'] = { shape: 'text', target: 'web', derivesFrom: 'hero_headline', tmpl: '{v}!' };
+    write(host.cwd, 'content/descriptor.json', JSON.stringify(descriptor, null, 4));
+    write(host.cwd, 'content/defaults.json', JSON.stringify(JSON.parse(host.file('content/defaults.json')), null, 4));
+    const before = [host.file('content/descriptor.json'), host.file('content/defaults.json')];
+    const { handler } = handlerOver([host.cwd]);
+    const derived = await post(handler, `/api/site/approve${site(host)}`, { key: 'hero_echo' });
+    expect(derived.status).toBe(400);
+    expect(derived.body['error']).toBe('approve: hero_echo derives from hero_headline — approve the source');
+    expect(host.exists('content/status.json')).toBe(false);
+    const approved = await post(handler, `/api/site/approve${site(host)}`, { key: 'hero_headline' });
+    expect(approved.status).toBe(200);
+    expect(approved.body['written']).toContain('content/status.json');
+    expect(approved.body['written']).not.toContain('content/descriptor.json');
+    expect(approved.body['written']).not.toContain('content/defaults.json');
+    expect([host.file('content/descriptor.json'), host.file('content/defaults.json')]).toEqual(before);
+  });
+});
+
+describe('a copyFrom checkout in the dashboard (add-plain-js-hosts, C5)', () => {
+  it("P5.3 its keys are the owner's, and a save, an approval and a commit answer 409 with the writer's line", async () => {
+    const owner = gitHost({ config: { project: 't' } });
+    const worker = gitHost({ config: null });
+    rmSync(join(worker.cwd, 'content'), { recursive: true, force: true });
+    const from = relative(worker.cwd, owner.cwd);
+    write(
+      worker.cwd,
+      'stet.config.json',
+      JSON.stringify({ project: 't', copyFrom: from, generated: [{ file: 'src/strings.mjs', format: 'esm', name: 'STRINGS', only: ['hero_'] }] }),
+    );
+    const { handler } = handlerOver([worker.cwd]);
+    const body = await get(handler, `/api/site${site(worker)}`);
+    expect(body.copyFrom).toBe(from);
+    expect(Object.keys(body.descriptor.keys)).toContain('hero_headline');
+    const held = owner.file('content/defaults.json');
+    for (const [route, payload] of [
+      ['save', { values: [{ key: 'hero_headline', value: 'From the worker' }] }],
+      ['approve', { key: 'hero_headline' }],
+      ['commit', { files: ['src/strings.mjs'], message: 'x' }],
+    ] as const) {
+      const answer = await post(handler, `/api/site/${route}${site(worker)}`, payload);
+      expect(answer.status, route).toBe(409);
+      expect(answer.body['error']).toBe(`this checkout reads its copy from ${from}; run stet dev there`);
+    }
+    expect(owner.file('content/defaults.json')).toBe(held);
+    expect(owner.exists('content/status.json')).toBe(false);
   });
 });

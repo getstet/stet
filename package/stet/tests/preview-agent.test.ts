@@ -8,6 +8,8 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { Report } from '../cli/report.js';
+import { validateValue } from '../cli/validate.js';
 import {
   AGENT,
   DASHBOARD,
@@ -2989,5 +2991,155 @@ describe('typing a sentence key in the page (C9, D18)', () => {
     await tick(300);
     expect((framed.doc.getElementById('s') as HTMLElement).textContent).toBe('Install: go npx x init and answer.');
     expect((await censusOf(framed, keys))?.['found']).toEqual({ other: 1, install: 1 });
+  });
+});
+
+describe('plain JavaScript hosts in the preview (add-plain-js-hosts C7, D16)', () => {
+  /** The dashboard's reads message for the page the frame shows, naming the mark attributes. */
+  async function readsOf(framed: Framed, attributes: string[]): Promise<void> {
+    framed.send({ stet: 'reads', route: framed.win.location.pathname, keys: null, attributes });
+    await tick();
+  }
+
+  it('P7.1: a data-copy mark is a mark beside data-stet where the reads name both, and not where they name data-stet alone (Q21, journey B29)', async () => {
+    const body =
+      '<button id="join" data-copy="waitlist.join">Join the waitlist</button>' +
+      '<i id="sub" data-stet="waitlist.sub">Ships in a day</i>' +
+      '<p id="title">Join the waitlist</p>';
+    const keys: CensusKey[] = [
+      { key: 'waitlist.join', texts: ['Join the waitlist'] },
+      { key: 'waitlist.sub', texts: ['Ships in a day'] },
+      { key: 'waitlist.title', texts: ['Join the waitlist'] },
+    ];
+    const framed = await frame(body);
+    await readsOf(framed, ['data-copy', 'data-stet']);
+    expect((await censusOf(framed, keys))?.['found']).toEqual({ 'waitlist.join': 1, 'waitlist.sub': 1 });
+    expect(await framed.locate({ key: 'waitlist.join', texts: ['Join the waitlist'] })).toMatchObject({ found: 1, by: 'mark' });
+    await setMode(framed, 'edit');
+    press(framed, framed.doc.getElementById('join') as Element, 'click');
+    await tick();
+    expect(lastOf(framed, 'pick')?.['keys']).toEqual([{ key: 'waitlist.join', attr: null, by: 'mark', inplace: true }]);
+
+    const plain = await frame(body);
+    await readsOf(plain, ['data-stet']);
+    expect((await censusOf(plain, keys))?.['found']).toEqual({ 'waitlist.sub': 1 });
+    expect(await plain.locate({ key: 'waitlist.join', texts: ['Join the waitlist'] })).toMatchObject({ by: 'text' });
+  });
+
+  it('P7.2: a value split across sibling spans matches with the space, and a page whose spans join without it still matches (journey B29)', async () => {
+    const framed = await frame(
+      '<h1 id="spaced"><span>Make your whole ad campaign.</span><span>Every variant, one run.</span></h1>' +
+        '<h2 id="joined"><span>Pay</span><span>day</span></h2>',
+    );
+    const keys: CensusKey[] = [
+      { key: 'hero', texts: ['Make your whole ad campaign. Every variant, one run.'] },
+      { key: 'payday', texts: ['Payday'] },
+    ];
+    expect((await censusOf(framed, keys))?.['found']).toEqual({ hero: 1, payday: 1 });
+    await setMode(framed, 'edit');
+    const h1 = framed.doc.getElementById('spaced') as HTMLElement;
+    h1.dispatchEvent(new framed.win.MouseEvent('pointerover', { bubbles: true }));
+    await tick();
+    expect(lastOf(framed, 'hover')?.['keys']).toEqual([{ key: 'hero', attr: null, by: 'element', runs: 2 }]);
+  });
+
+  it('P7.3: a runs edit of a key with no tags proposes the islands joined with one space; a key with tags proposes its tags', async () => {
+    const body =
+      '<h1 id="t" data-stet="home.title"><span>Make your whole ad campaign.</span><span>Every variant, one run.</span><span>Shipped in a day.</span></h1>';
+    const value = 'Make your whole ad campaign. Every variant, one run. Shipped in a day.';
+    const run = async (tags?: number): Promise<unknown> => {
+      const framed = await frame(body);
+      const h1 = framed.doc.getElementById('t') as HTMLElement;
+      await editOn(framed, h1, [{ key: 'home.title', texts: [value], ...(tags === undefined ? {} : { tags }) }], 'home.title', { form: 'runs' });
+      const island = h1.querySelector('[data-stet-island]') as HTMLElement;
+      const node = island.firstChild as Text;
+      caret(framed, node, node.length);
+      await typeAtEnd(framed, island, node, ' Now');
+      return lastOf(framed, 'typed')?.['value'];
+    };
+    expect(await run()).toBe('Make your whole ad campaign. Now Every variant, one run. Shipped in a day.');
+    expect(await run(3)).toBe('<1>Make your whole ad campaign. Now</1><2>Every variant, one run.</2><3>Shipped in a day.</3>');
+  });
+
+  it('P7.4: a page write of the saved words during an edit is put back with the caret kept; a write of other words ends it lost (Q9, journey B29)', async () => {
+    const body = '<h1 id="t" data-stet="home.title"><span>Make your whole ad campaign.</span><span>Every variant, one run.</span></h1>';
+    const value = 'Make your whole ad campaign. Every variant, one run.';
+    const runsEdit = async (): Promise<{ framed: Framed; node: Text; island: HTMLElement }> => {
+      const framed = await frame(body);
+      const h1 = framed.doc.getElementById('t') as HTMLElement;
+      await editOn(framed, h1, [{ key: 'home.title', texts: [value] }], 'home.title', { form: 'runs' });
+      const island = h1.querySelector('[data-stet-island]') as HTMLElement;
+      const node = island.firstChild as Text;
+      caret(framed, node, node.length);
+      await typeAtEnd(framed, island, node, ' X');
+      // Where a browser leaves the caret after typing, as its selectionchange reports it.
+      caret(framed, node, node.length);
+      framed.doc.dispatchEvent(new framed.win.Event('selectionchange'));
+      return { framed, node, island };
+    };
+    const redrawn = await runsEdit();
+    redrawn.node.data = 'Make your whole ad campaign.';
+    await tick();
+    const selection = redrawn.framed.win.getSelection() as Selection;
+    expect([redrawn.node.data, selection.focusNode === redrawn.node, selection.focusOffset]).toEqual(['Make your whole ad campaign. X', true, 30]);
+    expect(sentOf(redrawn.framed, 'edited')).toEqual([]);
+    key(redrawn.framed, redrawn.island, { key: 'Enter' });
+    await tick();
+    expect(lastOf(redrawn.framed, 'edited')).toMatchObject({ how: 'keep', proposed: true });
+    expect(lastOf(redrawn.framed, 'typed')?.['value']).toBe('Make your whole ad campaign. X Every variant, one run.');
+
+    // A draft layered on the node before the edit began: the page redrawing the saved words is a redraw too.
+    const framed = await frame('<button id="b">Start free trial</button>');
+    const button = framed.doc.getElementById('b') as HTMLElement;
+    await censusOf(framed, BUTTON);
+    framed.send({ stet: 'layer', drafts: [{ key: 'lab_button', texts: ['Start free trial'], draft: 'Begin now' }] });
+    await tick();
+    expect(button.textContent).toBe('Begin now');
+    await editOn(framed, button, BUTTON, 'lab_button');
+    const held = button.firstChild as Text;
+    caret(framed, held, held.length);
+    await typeAtEnd(framed, button, held, '!');
+    held.data = 'Start free trial';
+    await tick();
+    expect([held.data, sentOf(framed, 'edited')]).toEqual(['Begin now!', []]);
+
+    const other = await runsEdit();
+    other.node.data = 'Copied';
+    await tick();
+    expect(lastOf(other.framed, 'edited')).toMatchObject({ how: 'lost', proposed: true });
+  });
+
+  it('P7.5: a whole selection in a sentence key is kept, and typing replaces its words with its tags kept; a partial one collapses (Q11, journey B29)', async () => {
+    const body = '<p id="s">A site that’s only HTML files has its own chapter: <a href="/docs/html">plain HTML sites</a>.</p>';
+    const text = 'A site that’s only HTML files has its own chapter: plain HTML sites.';
+    const keys: CensusKey[] = [{ key: 'docs.prereq', texts: [text], tags: 1 }];
+    const framed = await frame(body);
+    const p = framed.doc.getElementById('s') as HTMLElement;
+    await editOn(framed, p, keys, 'docs.prereq', { form: 'sentence' });
+    const walker = framed.doc.createTreeWalker(p, 4);
+    const held: Text[] = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) held.push(node as Text);
+    const [first, link, last] = held as [Text, Text, Text];
+    const selection = framed.win.getSelection() as Selection;
+
+    selection.setBaseAndExtent(first, 2, last, 1);
+    framed.doc.dispatchEvent(new framed.win.Event('selectionchange'));
+    expect(selection.isCollapsed).toBe(true);
+    selection.setBaseAndExtent(first, 0, last, 1);
+    framed.doc.dispatchEvent(new framed.win.Event('selectionchange'));
+    expect(selection.isCollapsed).toBe(false);
+
+    caret(framed, link, 3);
+    const selectAll = key(framed, p, { key: 'a', metaKey: true });
+    expect([selectAll.defaultPrevented, selection.toString()]).toEqual([true, text]);
+    const typed = new framed.win.InputEvent('beforeinput', { inputType: 'insertText', data: 'See the HTML chapter', bubbles: true, cancelable: true });
+    p.dispatchEvent(typed);
+    await tick();
+    expect([typed.defaultPrevented, first.data, link.data, last.data, link.parentNode === p.querySelector('a')]).toEqual([true, 'See the HTML chapter', '', '', true]);
+    const value = lastOf(framed, 'typed')?.['value'];
+    expect(value).toBe('See the HTML chapter<1></1>');
+    const report = new Report();
+    expect(validateValue({ version: 1, keys: { 'docs.prereq': { shape: 'text', target: 'web', tags: 1 } } }, { default: {} }, 'docs.prereq', value, 'default', report)).toBe(true);
+    expect(report.findings).toEqual([]);
   });
 });

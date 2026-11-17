@@ -8,9 +8,9 @@
  * that walk (`conformance/cli-host.ts`), so both drive an identical project.
  */
 import { spawnSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, join, relative } from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
@@ -2018,10 +2018,10 @@ describe('dispatch', () => {
     expect(host.stderr()).toContain('stet hook has two subcommands, install and remove — got "uninstall"');
   });
 
-  it('import is a named, declined fast-follow — not "unknown command"', async () => {
+  it('import is a command — a bare `stet import` asks for its file, never "unknown command"', async () => {
     const host = makeHost();
     expect(await host.run('import')).toBe(2);
-    expect(host.stderr()).toContain('fast-follow');
+    expect(host.stderr()).toContain('usage: stet import <file>');
     expect(host.stderr()).not.toContain('unknown command');
   });
 
@@ -2676,7 +2676,7 @@ describe('environments', () => {
 
 /**
  * `constructor` is the ONE prototype name the descriptor's key grammar admits
- * (`^[a-z0-9]+(?:_{1,2}[a-z0-9]+)*$`), so every membership test over a
+ * (`^[a-z0-9]+(?:(?:\.|_{1,2})[a-z0-9]+)*$`), so every membership test over a
  * JSON-parsed key map has to be an own-property test. A bare `in` or a bare
  * index answers it from `Object.prototype`, and each of these four commands
  * then behaved as though an undeclared key were declared — differently, and
@@ -3335,7 +3335,7 @@ describe('per-command help', () => {
 
   it('reads every command word out of the usage', () => {
     expect(commands).toEqual([
-      'init', 'scan', 'register', 'remove', 'rename', 'merge', 'split', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
+      'init', 'scan', 'register', 'import', 'approve', 'remove', 'rename', 'merge', 'split', 'pages scan', 'eject', 'hook install', 'hook remove', 'agents install',
       'email extract', 'email verify', 'email render', 'email test', 'check', 'seo check', 'list', 'get', 'diff', 'draft', 'publish',
       'seed', 'pull', 'audit', 'audit lighthouse', 'doctor', 'upgrade', 'contacts groups', 'contacts list', 'contacts get',
       'contacts export', 'contacts erase', 'contacts suppress', 'contacts import', 'contacts group add',
@@ -3794,5 +3794,402 @@ describe('list --json: the unread-key badge (D6, 5.6)', () => {
       vi.doUnmock('typescript');
       vi.resetModules();
     }
+  });
+});
+
+describe('the approval status consumers (add-plain-js-hosts, C4)', () => {
+  const approvedAt = (by: string): { status: 'approved'; at: string; by: string } => ({ status: 'approved', at: '2026-11-02', by });
+
+  it('P4.3 approve prints the two lines, writes the file in the repo batch, answers `already`, refuses store-backed', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    expect(await host.run('approve', 'hero_headline', 'welcome__subject', '--by', 'nj-io')).toBe(0);
+    const today = new Date().toISOString().slice(0, 10);
+    expect(host.out).toContain(`approved hero_headline (nj-io, ${today})`);
+    expect(host.out).toContain(`approved welcome__subject (nj-io, ${today})`);
+    const file = JSON.parse(host.file('content/status.json')) as Record<string, { status: string; by?: string }>;
+    expect(file['hero_headline']).toEqual({ status: 'approved', at: today, by: 'nj-io' });
+    // The file holds every declared key, the unapproved ones proposed.
+    expect(Object.values(file).filter((e) => e.status === 'proposed').length).toBeGreaterThan(0);
+    const before = host.file('content/status.json');
+    host.out.length = 0;
+    expect(await host.run('approve', 'hero_headline', '--by', 'someone-else')).toBe(0);
+    expect(host.out).toContain(`hero_headline is already approved (nj-io, ${today})`);
+    expect(host.file('content/status.json')).toBe(before);
+    // An undeclared key is refused with the line the other key commands use.
+    expect(await host.run('approve', 'nope', '--by', 'nj-io')).toBe(1);
+    expect(host.stderr()).toContain('"nope" is not a key in content/descriptor.json');
+    expect(host.file('content/status.json')).toBe(before);
+
+    const store = makeHost({ config: { store: { adapter: 'memory' } } });
+    expect(await store.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(1);
+    expect(store.stderr()).toContain('approve: this project is store-backed — publishing is its approval');
+    expect(store.exists('content/status.json')).toBe(false);
+  });
+
+  it('P4.5 list prints the status column and --json the field on a snapshot-only project with a status file; neither on store-backed', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    writeFileSync(join(host.cwd, 'content/status.json'), JSON.stringify({ hero_headline: approvedAt('nj-io') }));
+    expect(await host.run('list')).toBe(0);
+    const lines = host.out.join('\n').split('\n');
+    expect(lines[0]).toMatch(/draft +status$/);
+    expect(lines.find((l) => l.startsWith('hero_headline'))).toMatch(/approved 2026-11-02$/);
+    expect(lines.find((l) => l.startsWith('welcome__subject'))).toMatch(/proposed$/);
+    host.out.length = 0;
+    expect(await host.run('list', '--json')).toBe(0);
+    const rows = host.json<{ rows: Array<{ key: string; status?: unknown }> }>().rows;
+    expect(rows.find((r) => r.key === 'hero_headline')?.status).toEqual(approvedAt('nj-io'));
+    expect(rows.find((r) => r.key === 'welcome__subject')?.status).toEqual({ status: 'proposed' });
+
+    const store = makeHost({ config: { store: { adapter: 'memory' } } });
+    writeFileSync(join(store.cwd, 'content/status.json'), JSON.stringify({ hero_headline: approvedAt('nj-io') }));
+    expect(await store.run('list')).toBe(0);
+    expect(store.out[0]).not.toContain('status');
+    store.out.length = 0;
+    expect(await store.run('list', '--json')).toBe(0);
+    expect(store.json<{ rows: Array<Record<string, unknown>> }>().rows.every((r) => !('status' in r))).toBe(true);
+  });
+
+  it('P4.6 check reports a stale entry (warn), an approved entry with no date or approver (error), and a status file on a store-backed project (warn)', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    writeFileSync(join(host.cwd, 'content/status.json'), JSON.stringify({ gone_key: { status: 'proposed' }, hero_headline: { status: 'approved' } }));
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('gone_key: in content/status.json, not in the descriptor — stale');
+    expect(host.stderr()).toContain('hero_headline: approved with no date or approver');
+    host.err.length = 0;
+    writeFileSync(join(host.cwd, 'content/status.json'), JSON.stringify({ hero_headline: { status: 'approved', at: '2026-11-02', by: 'nj-io' } }));
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).not.toContain('status.json');
+    writeFileSync(join(host.cwd, 'content/status.json'), JSON.stringify({ hero_headline: { status: 'approved', at: 'yesterday', by: 'nj-io' } }));
+    expect(await host.run('check')).toBe(1);
+
+    const store = makeHost({ config: { store: { adapter: 'memory' } } });
+    writeFileSync(join(store.cwd, 'content/status.json'), '{}');
+    expect(await store.run('check')).toBe(0);
+    expect(store.stderr()).toContain('content/status.json: a store-backed project keeps draft and published as its approval — remove the file');
+  });
+
+  it('P4.8 a snapshot-only site with no status file shows no status anywhere, rename writes none, and the first approval brings the column', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    expect(await host.run('list')).toBe(0);
+    expect(host.out[0]).not.toContain('status');
+    host.out.length = 0;
+    expect(await host.run('list', '--json')).toBe(0);
+    expect(host.json<{ rows: Array<Record<string, unknown>> }>().rows.every((r) => !('status' in r))).toBe(true);
+    expect(await host.run('rename', 'hero_headline', 'hero_title', '--write')).toBe(0);
+    expect(host.exists('content/status.json')).toBe(false);
+    host.out.length = 0;
+    expect(await host.run('approve', 'hero_title', '--by', 'nj-io')).toBe(0);
+    expect(host.exists('content/status.json')).toBe(true);
+    host.out.length = 0;
+    expect(await host.run('list')).toBe(0);
+    expect(host.out[0]).toMatch(/status$/);
+  });
+
+  it('P4.9 approve refuses a derived key, naming its source, and writes nothing', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    const descriptor = JSON.parse(host.file('content/descriptor.json')) as { keys: Record<string, unknown> };
+    descriptor.keys['hero_echo'] = { shape: 'text', target: 'web', derivesFrom: 'hero_headline', tmpl: '{v}!' };
+    writeFileSync(join(host.cwd, 'content/descriptor.json'), JSON.stringify(descriptor, null, 2));
+    expect(await host.run('approve', 'hero_headline', 'hero_echo', '--by', 'nj-io')).toBe(1);
+    expect(host.stderr()).toContain('approve: hero_echo derives from hero_headline — approve the source');
+    expect(host.exists('content/status.json')).toBe(false);
+  });
+
+  it('P4.10 an approval on hand-formatted forms writes the status file alone', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    for (const rel of ['content/descriptor.json', 'content/defaults.json']) {
+      writeFileSync(join(host.cwd, rel), JSON.stringify(JSON.parse(host.file(rel)), null, 4));
+    }
+    const before = [host.file('content/descriptor.json'), host.file('content/defaults.json')];
+    expect(await host.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(0);
+    expect(host.out.filter((line) => line.startsWith('wrote '))).toEqual(['wrote content/status.json']);
+    expect([host.file('content/descriptor.json'), host.file('content/defaults.json')]).toEqual(before);
+  });
+});
+
+describe('generated outputs and copyFrom (add-plain-js-hosts, C5)', () => {
+  const editSnapshot = (host: Host, key: string, value: string): void => {
+    const snapshot = JSON.parse(host.file('content/defaults.json')) as { default: Record<string, unknown> };
+    snapshot.default[key] = value;
+    writeFileSync(join(host.cwd, 'content/defaults.json'), JSON.stringify(snapshot, null, 2));
+  };
+  const reset = (host: Host): void => {
+    host.out.length = 0;
+    host.err.length = 0;
+  };
+
+  it('P5.2 pull writes the outputs; check reports current, stale, hand-edited, not generated and the json differs line; approve rewrites a value-status output in the same batch', async () => {
+    const host = makeHost({
+      config: {
+        project: 't',
+        generated: [
+          { file: 'public/copy.js', format: 'script', name: 'TS.copyTable', values: 'value-status' },
+          { file: 'public/strings.json', format: 'json', only: ['hero_'] },
+        ],
+      },
+    });
+    expect(await host.run('check')).toBe(0);
+    expect(host.stderr()).toContain('public/copy.js: not generated — run stet pull');
+    expect(host.stderr()).toContain('public/strings.json: not generated — run stet pull');
+    reset(host);
+    expect(await host.run('pull')).toBe(0);
+    expect(host.out).toEqual(expect.arrayContaining(['wrote public/copy.js', 'wrote public/strings.json']));
+    expect(host.file('public/copy.js')).toContain('  "hero_headline": ["Never miss a post again.", "proposed"],');
+    expect(Object.keys(JSON.parse(host.file('public/strings.json')) as object)).toEqual(['hero_body', 'hero_headline']);
+    reset(host);
+    expect(await host.run('check')).toBe(0);
+    expect(host.out).toEqual(expect.arrayContaining(['generated: public/copy.js current', 'generated: public/strings.json current']));
+    // A second pull leaves both as they are.
+    reset(host);
+    expect(await host.run('pull')).toBe(0);
+    expect(host.out.join('\n')).not.toMatch(/wrote public\//);
+
+    editSnapshot(host, 'hero_headline', 'A new headline');
+    reset(host);
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('public/copy.js: stale — its source moved; run stet pull');
+    expect(host.stderr()).toContain('public/strings.json: differs from the snapshot — run stet pull');
+    expect(await host.run('pull')).toBe(0);
+    reset(host);
+    expect(await host.run('check')).toBe(0);
+
+    writeFileSync(join(host.cwd, 'public/copy.js'), host.file('public/copy.js').replace('A new headline', 'Edited by hand'));
+    reset(host);
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('public/copy.js: hand-edited — run stet pull instead of editing');
+    expect(await host.run('pull')).toBe(0);
+
+    reset(host);
+    expect(await host.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(0);
+    expect(host.out).toEqual(expect.arrayContaining(['wrote content/status.json', 'wrote public/copy.js']));
+    expect(host.file('public/copy.js')).toContain('  "hero_headline": ["A new headline", "approved"],');
+    reset(host);
+    expect(await host.run('check')).toBe(0);
+    expect(host.out).toContain('generated: public/copy.js current');
+  });
+
+  it('P5.2b check names a script at an output path that carries no stet header as the host\'s own, not as stale', async () => {
+    const host = makeHost({ config: { project: 't', generated: [{ file: 'public/copy.js', format: 'script', name: 'TS.copyTable' }] } });
+    mkdirSync(join(host.cwd, 'public'));
+    writeFileSync(join(host.cwd, 'public/copy.js'), 'window.TS = { copyTable: {} };\n');
+    expect(await host.run('check')).toBe(1);
+    expect(host.stderr()).toContain('public/copy.js: not generated by stet — move the hand-kept file aside, or import it, then run stet pull');
+    expect(host.stderr()).not.toContain('public/copy.js: stale');
+  });
+
+  it('P5.5 a generated file outside the checkout is refused at load, and nothing is written', async () => {
+    const host = makeHost({ config: { project: 't', generated: [{ file: '../c5-outside-copy.json', format: 'json' }] } });
+    const before = host.file('content/defaults.json');
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('stet.config.json: generated[0].file must be inside this checkout — a second checkout generates its own file through copyFrom');
+    expect(existsSync(join(host.cwd, '..', 'c5-outside-copy.json'))).toBe(false);
+    expect(host.file('content/defaults.json')).toBe(before);
+  });
+
+  /** A folder outside every checkout, removed when `body` ends. */
+  const withOutside = async (body: (outside: string) => Promise<void>): Promise<void> => {
+    const outside = mkdtempSync(join(tmpdir(), 'stet-c5-out-'));
+    try {
+      await body(outside);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  };
+  const INSIDE = 'stet.config.json: generated[0].file must be inside this checkout — a second checkout generates its own file through copyFrom';
+
+  it('P5.5b a generated output whose folder is a symlink to a folder outside the checkout is refused, and nothing is written', async () => {
+    await withOutside(async (outside) => {
+      const host = makeHost({ config: { project: 't', generated: [{ file: 'gen/strings.js', format: 'script', name: 'T' }] } });
+      symlinkSync(outside, join(host.cwd, 'gen'));
+      expect(await host.run('pull')).toBe(1);
+      expect(host.stderr()).toContain(INSIDE);
+      expect(readdirSync(outside)).toEqual([]);
+    });
+  });
+
+  it('P5.5d a generated output that is itself a symlink to a file outside the checkout is refused', async () => {
+    await withOutside(async (outside) => {
+      const foreign = join(outside, 'foreign.json');
+      writeFileSync(foreign, '{}\n');
+      const host = makeHost({ config: { project: 't', generated: [{ file: 'strings.json', format: 'json' }] } });
+      symlinkSync(foreign, join(host.cwd, 'strings.json'));
+      expect(await host.run('pull')).toBe(1);
+      expect(host.stderr()).toContain(INSIDE);
+      expect(readFileSync(foreign, 'utf8')).toBe('{}\n');
+    });
+  });
+
+  it('N1a a generated output reached through a symlinked folder inside the checkout onto a file stet keeps is refused, and the file is byte-equal', async () => {
+    const host = makeHost({ config: { project: 't' } });
+    expect(await host.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(0);
+    const status = host.file('content/status.json');
+    symlinkSync('content', join(host.cwd, 'alias'));
+    writeFileSync(join(host.cwd, 'stet.config.json'), JSON.stringify({ project: 't', generated: [{ file: 'alias/status.json', format: 'json' }] }));
+    reset(host);
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('stet.config.json: generated[0].file names a file stet already keeps — alias/status.json');
+    expect(host.file('content/status.json')).toBe(status);
+  });
+
+  it('N1b a generated output that is a hard link to a file outside the checkout is refused, and the outside file is byte-equal', async () => {
+    await withOutside(async (outside) => {
+      const foreign = join(outside, 'foreign.json');
+      writeFileSync(foreign, '{}\n');
+      const host = makeHost({ config: { project: 't', generated: [{ file: 'strings.json', format: 'json' }] } });
+      linkSync(foreign, join(host.cwd, 'strings.json'));
+      expect(await host.run('pull')).toBe(1);
+      expect(host.stderr()).toContain('stet.config.json: generated[0].file strings.json is a hard link — stet writes only files with one name');
+      expect(readFileSync(foreign, 'utf8')).toBe('{}\n');
+    });
+  });
+
+  it('N7 check and pull each print one warning for an only entry that matches no key, and the exit codes stay', async () => {
+    const warning = 'generated[0].only: "home" matches no key — end it with . or _ to keep every key under it';
+    const host = makeHost({ config: { project: 't', generated: [{ file: 'strings.json', format: 'json', only: ['home'] }] } });
+    expect(await host.run('pull')).toBe(0);
+    expect([...host.out, host.stderr()].join('\n').split(warning).length - 1).toBe(1);
+    reset(host);
+    expect(await host.run('check')).toBe(0);
+    expect([...host.out, host.stderr()].join('\n').split(warning).length - 1).toBe(1);
+    // An entry that already ends in a joiner is a prefix: the hint would tell it what it did.
+    const prefix = makeHost({ config: { project: 't', generated: [{ file: 'strings.json', format: 'json', only: ['nothere.'] }] } });
+    expect(await prefix.run('pull')).toBe(0);
+    const lines = [...prefix.out, prefix.stderr()].join('\n');
+    expect(lines).toContain('generated[0].only: "nothere." matches no key');
+    expect(lines).not.toContain('end it with');
+  });
+
+  it('P5.5e a status file whose folder is a symlink to a folder outside the checkout is refused: an approval writes nowhere', async () => {
+    await withOutside(async (outside) => {
+      const host = makeHost({ config: { project: 't', statusPath: 'st/status.json' } });
+      symlinkSync(outside, join(host.cwd, 'st'));
+      expect(await host.run('approve', 'hero_headline', '--by', 'nj-io')).toBe(1);
+      expect(host.stderr()).toContain('stet.config.json: statusPath must be a file path inside this checkout');
+      expect(readdirSync(outside)).toEqual([]);
+    });
+  });
+
+  it('P5.5c a copyFrom checkout whose output path runs through a link into the owner leaves the owner byte-equal', async () => {
+    const owner = makeHost({ config: { project: 't' } });
+    const worker = makeHost({ config: null });
+    rmSync(join(worker.cwd, 'content'), { recursive: true, force: true });
+    // The owner's file carries stet's header, so only the path guard can keep the worker out of it.
+    const table = `// generated by stet — source-hash: ${'0'.repeat(64)}\nwindow.OWNED = {};\n`;
+    writeFileSync(join(owner.cwd, 'copy.js'), table);
+    symlinkSync(owner.cwd, join(worker.cwd, 'owner'));
+    writeFileSync(
+      join(worker.cwd, 'stet.config.json'),
+      JSON.stringify({ project: 't', copyFrom: relative(worker.cwd, owner.cwd), generated: [{ file: 'owner/copy.js', format: 'script', name: 'WORKER_TABLE', only: ['hero_'] }] }),
+    );
+    expect(await worker.run('pull')).toBe(1);
+    expect(worker.stderr()).toContain('generated[0].file must be inside this checkout');
+    expect(owner.file('copy.js')).toBe(table);
+  });
+
+  /** An owner checkout and a thin second checkout reading its copy: the second holds a config and nothing else. */
+  const pair = (): { owner: Host; worker: Host; from: string } => {
+    const owner = makeHost({ config: { project: 't' } });
+    const worker = makeHost({ config: null });
+    rmSync(join(worker.cwd, 'content'), { recursive: true, force: true });
+    const from = relative(worker.cwd, owner.cwd);
+    writeFileSync(
+      join(worker.cwd, 'stet.config.json'),
+      JSON.stringify({ project: 't', copyFrom: from, generated: [{ file: 'src/strings.mjs', format: 'esm', name: 'STRINGS', only: ['hero_', 'pricing_'] }] }),
+    );
+    return { owner, worker, from };
+  };
+  const OWNER_FORMS = ['content/descriptor.json', 'content/defaults.json', 'content/keys.ts', 'content/stet-env.d.ts', 'content/defaults.ts', 'content/resolved.ts'];
+  const CODEGEN = /content\/(keys\.ts|stet-env\.d\.ts|defaults\.ts|resolved\.ts)/;
+
+  it('P5.3 a copyFrom checkout checks and pulls its own output, lists the owner\'s keys, and every writer answers the writer\'s line', async () => {
+    const { owner, worker, from } = pair();
+    expect(await worker.run('check')).toBe(0);
+    expect(worker.out).toContain(`copy: read from ${from}`);
+    expect(worker.stderr()).toContain('src/strings.mjs: not generated — run stet pull');
+    reset(worker);
+    expect(await worker.run('pull')).toBe(0);
+    expect(worker.out).toContain('wrote src/strings.mjs');
+    expect(worker.file('src/strings.mjs')).toContain('\nexport const STRINGS = {\n');
+    expect(worker.file('src/strings.mjs')).toContain('  "hero_headline": "Never miss a post again.",');
+    reset(worker);
+    expect(await worker.run('check')).toBe(0);
+    expect(worker.out).toContain('generated: src/strings.mjs current');
+
+    editSnapshot(owner, 'hero_headline', 'A new headline');
+    reset(worker);
+    expect(await worker.run('check')).toBe(1);
+    expect(worker.out).toContain(`copy: read from ${from}`);
+    expect(worker.stderr()).toContain('src/strings.mjs: stale — its source moved; run stet pull');
+
+    reset(worker);
+    expect(await worker.run('list')).toBe(0);
+    expect(worker.stdout()).toContain('hero_headline');
+    expect(worker.stdout()).toContain('welcome__subject');
+
+    const held = OWNER_FORMS.map((rel) => owner.file(rel));
+    writeFileSync(join(worker.cwd, 'strings.json'), JSON.stringify({ hero_headline: 'From the worker' }));
+    for (const [command, args] of [
+      ['approve', ['approve', 'hero_headline', '--by', 'nj-io']],
+      ['rename', ['rename', 'hero_headline', 'hero_title', '--write']],
+      ['import', ['import', 'strings.json', '--write']],
+    ] as const) {
+      reset(worker);
+      expect(await worker.run(...args), command).toBe(1);
+      expect(worker.stderr()).toContain(`this checkout reads its copy from ${from}; run stet ${command} there`);
+    }
+    expect(OWNER_FORMS.map((rel) => owner.file(rel))).toEqual(held);
+    expect(worker.exists('content')).toBe(false);
+  });
+
+  it('P5.4 copyFrom naming a folder with no config, this folder, or an owner that reads from elsewhere is a config error', async () => {
+    const at = (copyFrom: string): Host => {
+      const host = makeHost({ config: null });
+      rmSync(join(host.cwd, 'content'), { recursive: true, force: true });
+      writeFileSync(join(host.cwd, 'stet.config.json'), JSON.stringify({ project: 't', copyFrom }));
+      return host;
+    };
+    const nowhere = at('../c5-no-such-owner');
+    expect(await nowhere.run('check')).toBe(1);
+    expect(nowhere.stderr()).toContain('stet.config.json: copyFrom names ../c5-no-such-owner, which holds no stet.config.json');
+    const itself = at('.');
+    expect(await itself.run('check')).toBe(1);
+    expect(itself.stderr()).toContain('stet.config.json: copyFrom names itself');
+    const { worker: middle } = pair();
+    const chained = at('x');
+    writeFileSync(join(chained.cwd, 'stet.config.json'), JSON.stringify({ project: 't', copyFrom: relative(chained.cwd, middle.cwd) }));
+    expect(await chained.run('check')).toBe(1);
+    expect(chained.stderr()).toContain(`stet.config.json: copyFrom names ${relative(chained.cwd, middle.cwd)}, which reads its own copy from elsewhere — name the owner`);
+  });
+
+  it('P5.7 a copyFrom checkout with no host of its own: pull writes its generated file and nothing else, and check names no codegen file', async () => {
+    const { owner, worker } = pair();
+    const held = OWNER_FORMS.map((rel) => owner.file(rel));
+    expect(await worker.run('pull')).toBe(0);
+    expect(worker.out).toEqual(['wrote src/strings.mjs']);
+    expect(worker.exists('content')).toBe(false);
+    for (const rel of OWNER_FORMS) expect(worker.exists(rel), rel).toBe(false);
+    expect(OWNER_FORMS.map((rel) => owner.file(rel))).toEqual(held);
+    reset(worker);
+    expect(await worker.run('check')).toBe(0);
+    expect(`${worker.stdout()}\n${worker.stderr()}`).not.toMatch(CODEGEN);
+    expect(worker.stderr()).not.toContain('not generated');
+  });
+
+  it('Q67 a script output already on disk without stet\'s header is never overwritten: pull refuses, and a stet-written one updates', async () => {
+    const host = makeHost({ config: { project: 't', generated: [{ file: 'public/copy.js', format: 'script', name: 'TS.copyTable' }] } });
+    const handKept = 'window.TS = window.TS || {};\nTS.copyTable = { hero_headline: "Hand kept words" };\n';
+    mkdirSync(join(host.cwd, 'public'), { recursive: true });
+    writeFileSync(join(host.cwd, 'public/copy.js'), handKept);
+    expect(await host.run('pull')).toBe(1);
+    expect(host.stderr()).toContain('refusing to overwrite public/copy.js');
+    expect(host.file('public/copy.js')).toBe(handKept);
+    // Moved aside, the first pull writes the output with stet's header, and a later one updates it.
+    rmSync(join(host.cwd, 'public/copy.js'));
+    reset(host);
+    expect(await host.run('pull')).toBe(0);
+    editSnapshot(host, 'hero_headline', 'A new headline');
+    reset(host);
+    expect(await host.run('pull')).toBe(0);
+    expect(host.file('public/copy.js')).toContain('"A new headline"');
   });
 });

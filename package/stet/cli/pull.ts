@@ -6,7 +6,8 @@
  * on a store-backed project only — the read bundle with its version metadata.
  * A snapshot-only project gets no bundle, because its committed `defaults.json`
  * IS the bundle; emitting a second copy of the same bytes under another name is
- * the divergence the archived contract exists to prevent.
+ * the divergence the archived contract exists to prevent. The outputs the
+ * config's `generated` lists ride the same batch.
  *
  * It MERGES; it never deletes. Only the enabled locales are resolved — the
  * resolve chain would materialize a value for every key in any locale it is
@@ -25,17 +26,22 @@ import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
 import { shapeSchema } from '../src/validate.js';
 import {
+  planJson,
   planRepoForms,
+  planSideForms,
+  planWrite,
   rethrowBatchFailure,
   writeJsonDeterministic,
   writePlanned,
-  writeText,
+  type WritePlan,
 } from './artifacts.js';
 import { ENV_OPTION, noPositionals, parse, text } from './args.js';
 import { isHtmlHost } from './config.js';
+import { warnUnmatchedOnly } from './generated.js';
 import type { CliIo } from './main.js';
-import { loadProject, refuseAbsence } from './project.js';
+import { loadProject, refuseAbsence, type LoadedProject } from './project.js';
 import { Report } from './report.js';
+import { loadStatus } from './status.js';
 import { isStoreBacked } from './store.js';
 
 export async function runPull(args: string[], io: CliIo): Promise<number> {
@@ -46,6 +52,7 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
   try {
     const report = new Report();
     report.environment(project.environment.name);
+    if (project.owner !== null) return pullOutputs(io, project, project.owner, report);
     // A non-default source is deliberate — `pull --env prod` IS the release
     // step — so it is warned, never refused: refusing would break that step's
     // symmetry. The warn names the source and the git diff is the review
@@ -64,6 +71,7 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
 
     const { config, descriptor, snapshot } = project;
     const keys = Object.keys(descriptor.keys).sort();
+    warnUnmatchedOnly(config.generated, descriptor, report);
     const enabled = config.locales.enabled;
 
     const merged: Snapshot = {};
@@ -124,7 +132,7 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
       let written: string[];
       try {
         ({ written } = writePlanned(
-          planRepoForms(io.cwd, config, project.descriptor, merged, report),
+          planRepoForms(io.cwd, config, project.descriptor, merged, loadStatus(io.cwd, config), report),
         ));
       } catch (error) {
         rethrowBatchFailure('stet pull', error);
@@ -132,12 +140,21 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
       if (written.length === 0) report.line('pull: documents current');
       for (const name of written) report.line(`wrote ${name}`);
     } else {
-      writeJsonDeterministic(join(io.cwd, config.snapshotPath), merged);
-      writeText(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged));
-      writeText(join(io.cwd, config.codegen.resolved), generateResolvedModule(project.descriptor, merged));
-      report.line(`wrote ${config.snapshotPath}`);
-      report.line(`wrote ${config.codegen.defaults}`);
-      report.line(`wrote ${config.codegen.resolved}`);
+      // The snapshot and the two modules are rewritten every run, as they always
+      // were; the generated outputs ride the same batch and are written where they move.
+      const always = (plan: WritePlan): WritePlan => ({ ...plan, status: 'write' });
+      let written: string[];
+      try {
+        ({ written } = writePlanned([
+          always(planJson(join(io.cwd, config.snapshotPath), merged, config.snapshotPath)),
+          always(planWrite(join(io.cwd, config.codegen.defaults), generateDefaultsModule(merged), config.codegen.defaults)),
+          always(planWrite(join(io.cwd, config.codegen.resolved), generateResolvedModule(project.descriptor, merged), config.codegen.resolved)),
+          ...planSideForms(io.cwd, config, project.descriptor, merged, loadStatus(io.cwd, config)).generated,
+        ]));
+      } catch (error) {
+        rethrowBatchFailure('stet pull', error);
+      }
+      for (const name of written) report.line(`wrote ${name}`);
     }
 
     if (isStoreBacked(project.environment.block)) {
@@ -156,6 +173,28 @@ export async function runPull(args: string[], io: CliIo): Promise<number> {
   } finally {
     await project.dispose();
   }
+}
+
+/**
+ * `pull` in a checkout that reads its copy from another: its generated outputs
+ * from the owner's forms, and nothing else — the owner's snapshot is the
+ * owner's to refresh, and this checkout holds no descriptor, snapshot or
+ * codegen file of its own.
+ */
+function pullOutputs(io: CliIo, project: LoadedProject, owner: NonNullable<LoadedProject['owner']>, report: Report): number {
+  warnUnmatchedOnly(project.config.generated, project.descriptor, report);
+  let written: string[];
+  let unchanged: string[];
+  try {
+    ({ written, unchanged } = writePlanned(
+      planRepoForms(io.cwd, project.config, project.descriptor, project.snapshot, loadStatus(owner.path, owner.config), report),
+    ));
+  } catch (error) {
+    rethrowBatchFailure('stet pull', error);
+  }
+  for (const name of written) report.line(`wrote ${name}`);
+  for (const name of unchanged) report.line(`generated: ${name} current`);
+  return report.emit(io);
 }
 
 /**

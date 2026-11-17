@@ -34,12 +34,14 @@ import type { Descriptor, KeyDef, PageDef } from '../src/types.js';
 import { flag, parse, refuseEnv } from './args.js';
 import { planRepoForms, rethrowBatchFailure, writePlanned } from './artifacts.js';
 import { checkValues, descriptorOf, snapshotOf } from './check.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, loadConfig, markAttributes, refuseInCopyFrom, type StetConfig } from './config.js';
 import { proposeHtml, stripMarks } from './html-host.js';
 import type { CliIo } from './main.js';
 import { clip, CliError, Report, UsageError } from './report.js';
 import { filesForGlobs } from './files.js';
+import { usageFiles } from './key-usage.js';
 import { mentionsToken } from './source-scan.js';
+import { loadStatus } from './status.js';
 import { isStoreBacked } from './store.js';
 
 /** How much of a leaving value the plan quotes — the `scan`/`register` excerpt width. */
@@ -59,6 +61,7 @@ export async function runRemove(args: string[], io: CliIo): Promise<number> {
   // prints check's own error string.
   const report = new Report();
   const config = loadConfig(io.cwd);
+  refuseInCopyFrom(config, 'remove');
   const descriptor = descriptorOf(config, io.cwd, report);
   if (!descriptor) return report.emit(io);
   const snapshot = snapshotOf(config, io.cwd, report);
@@ -170,7 +173,7 @@ export function planRemoval(
       );
     }
     for (const { file, source } of surfaces) {
-      if (!mentionsToken(source, key)) continue;
+      if (!mentionsToken(source, key, new Set(Object.keys(descriptor.keys)))) continue;
       report.line(
         `  ${file} mentions "${key}" — un-wire the read first, or the regenerated types surface it ` +
           `at the host's typecheck`,
@@ -202,7 +205,7 @@ export function planRemoval(
   // names each one the batch will strip. The text stays where it is; only the
   // attribute goes.
   if (isHtmlHost(config)) {
-    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces));
+    const set = proposeHtml(cwd, filesForGlobs(cwd, config.managedSurfaces), markAttributes(config));
     const marks = set.claimed.filter((mark) => keys.includes(mark.key));
     if (marks.length > 0) {
       for (const mark of marks) {
@@ -263,7 +266,7 @@ function apply(
   report: Report,
 ): void {
   try {
-    writePlanned(planRepoForms(io.cwd, config, cleaned, snapshot, report));
+    writePlanned(planRepoForms(io.cwd, config, cleaned, snapshot, loadStatus(io.cwd, config), report));
   } catch (error) {
     rethrowBatchFailure('stet remove --write', error);
   }
@@ -400,14 +403,17 @@ function surfaceSources(cwd: string, config: StetConfig): { file: string; source
   const globs = [...config.managedSurfaces, ...config.emailSurfaces, ...config.copyModules];
   const found: { file: string; source: string }[] = [];
   const html = isHtmlHost(config);
-  for (const file of filesForGlobs(cwd, globs)) {
+  // On a host that names its read functions, the scripts it reads copy in are surfaces too.
+  const files = new Set(filesForGlobs(cwd, globs));
+  if (config.reads !== undefined) for (const file of usageFiles(cwd, config)) files.add(file);
+  for (const file of files) {
     try {
       const text = readFileSync(join(cwd, file), 'utf8');
       // On this host a document's marks are the very thing the batch strips, so
       // a `data-stet="<key>"` is not a read to un-wire and naming it would put a
       // caution on every page the removal already handles. The mark goes; a
       // mention of the key in prose or in a script is left to be found.
-      found.push({ file, source: html && file.endsWith('.html') ? stripMarks(text) : text });
+      found.push({ file, source: html && /\.html?$/.test(file) ? stripMarks(text, markAttributes(config)) : text });
     } catch {
       // A file the walk listed and this read cannot open mentions nothing.
     }

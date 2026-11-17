@@ -4,7 +4,8 @@
  *
  * Three states, and the safe direction between them. A key NAMED in code in
  * any scanned file is `read`: an identifier, a property name, a string
- * literal's content, an `.html` file's `data-stet` mark. A key named nowhere is
+ * literal's content, an `.html` file's mark (`data-stet`, or the config's own
+ * key attribute beside it). A key named nowhere is
  * `not_found` only while nothing in the source reads copy in a way that could
  * reach it unnamed; a read through a stet binding with no literal key is
  * followed one hop to key names (B1), else its visible prefix is learnt (B2),
@@ -19,9 +20,23 @@
  * recognised by its import from `@getstet/stet/react`, and so is an exported
  * wrapper that returns it, called with arguments or not, and an export of it
  * under another name. The accessors a host builds with `createServerCopy` and
- * `createAccessor` are bindings too. The hook handed on as a value, and a
- * string that points at the snapshot or a generated data module by path, are
- * causes. Comments, JSX text and prose are never code.
+ * `createAccessor` are bindings too. A call through one of the project's
+ * configured read functions (`reads.functions`, `TS.tx(…)`) is a read whatever
+ * binds its name and however it is spelled (`window.TS.tx`, `TS?.tx`,
+ * `TS["tx"]`): the config binds it; any other reference to the function or to
+ * its head object (`items.map(TS.tx)`, `var { tx } = TS`, `T = TS`, `run(TS)`,
+ * `TS[k]`, `import { t as tr }`) is a cause, and so is any mention of a
+ * configured function in text the parse does not read as code (a string handed
+ * to `eval`, a directive attribute, a `text/babel` script). An html page's
+ * inline handlers and `javascript:` URLs are code. On a project that sets
+ * `reads.attribute`, a spelling of that attribute no literal shows (markup
+ * built from pieces, `attr(name, expr)`, a `dataset` alias, a computed
+ * `setAttribute` name, a props spread) is a cause too. The hook
+ * handed on as a value, and a string that points at the snapshot or a
+ * generated data module by path, are causes. A top-level `var` of a classic
+ * script that another file assigns or declares again, or writes through the
+ * global object (`window.k = …`), is not once-assigned.
+ * Comments, JSX text and prose are never code.
  * The scan reads and never writes.
  *
  * Per file, one parse: `codeOf` makes each tree through this module's `parse`,
@@ -30,18 +45,20 @@
  * (`UsageCache`) and re-reads a file only when its size or mtime moves.
  */
 
-import { closeSync, lstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
-import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath } from 'node:path';
+import { closeSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync, type Stats } from 'node:fs';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep } from 'node:path';
 
 import type * as TS from 'typescript';
 
-import { resolveSpecifier, type StetConfig } from './config.js';
+import { CONFIG_FILE, markAttributes, resolveSpecifier, type ReadFunction, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import { gitData, gitFiles } from './git.js';
 import { lineIndex } from './html-host.js';
-import { codeOf, within, type Span } from './key-reads.js';
-import { dialectOf, loadTypescript, MAX_SOURCE_BYTES, packageNames, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
-import { insideCheckout } from './static-files.js';
+import { codeOf, mentionPattern, splitName, within, type Span } from './key-reads.js';
+import { HTML_COMMENT, HTML_TAGS, readAttrs, type Dialect } from './markup.js';
+import { dialectOf, keysIn, loadTypescript, MAX_SOURCE_BYTES, packageNames, parseDiagnosticsOf, scriptKindFor } from './source-scan.js';
+import { insideCheckout, servableFile } from './static-files.js';
+import { escapeRegExp } from '../src/seo.js';
 import type { Descriptor } from '../src/types.js';
 
 export type UsageState = 'read' | 'unknown' | 'not_found';
@@ -80,7 +97,7 @@ export interface KeyUsage {
 export interface UsageCache {
   /** The declared key set the facts were read against; a change clears them. */
   keys: string;
-  files: Map<string, { stamp: string; facts: FileFacts | null | 'grew' }>;
+  files: Map<string, { stamp: string; facts: FileFacts | null | 'grew' | 'unopened' }>;
 }
 
 export function usageCache(): UsageCache {
@@ -88,15 +105,21 @@ export function usageCache(): UsageCache {
 }
 
 /** The source files the scan reads. */
-const SOURCE = /\.(?:[cm]?[jt]sx?|astro|vue|svelte|mdx|html)$/;
+const SOURCE = /\.(?:[cm]?[jt]sx?|astro|vue|svelte|mdx|html?)$/;
+/** Files a page does not run: images, fonts, media, archives, source maps and prose. The text beyond the source list is read for the calls it may hold, except these. */
+const NOT_SCRIPT = /\.(?:png|jpe?g|gif|webp|avif|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp[34]|webm|mov|wav|ogg|pdf|zip|gz|tgz|br|wasm|map|md|markdown|txt|rst|lock)$/i;
+/** The dialect the usage scan reads a file as: `.htm` is HTML under its older extension. */
+export const usageDialect = (rel: string): Dialect | null => (rel.endsWith('.htm') ? 'html' : dialectOf(rel));
 /** Whether a repo-relative path is a source file the scan reads, by its extension. */
 export const isSourceFile = (rel: string): boolean => SOURCE.test(rel);
 
 /** The first line a stet-generated module carries. */
 const GENERATED = '// generated by stet';
 
-/** A mark on a static-HTML document: `data-stet="<key>"` or `data-stet-<attr>="<key>"`. */
-const MARK = /data-stet(?:-[a-z-]+)?\s*=\s*["']([a-z][a-z0-9_]*)["']/g;
+/** A mark on a static-HTML document under one of `attributes`: `data-stet="<key>"` or `data-stet-<attr>="<key>"`. */
+function markPattern(attributes: readonly string[]): RegExp {
+  return new RegExp(`(?:${attributes.map(escapeRegExp).join('|')})(?:-[a-z-]+)?\\s*=\\s*["']([a-z0-9]+(?:(?:\\.|_{1,2})[a-z0-9]+)*)["']`, 'g');
+}
 
 /** The cause a file too deeply nested to walk raises. */
 const UNREADABLE = 'too deeply nested to read';
@@ -104,11 +127,17 @@ const UNREADABLE = 'too deeply nested to read';
 /** The cause a file past `MAX_SOURCE_BYTES` raises: it is never opened, so a key it names stays possible. */
 const TOO_LARGE = 'over 5 MB, so the scan skipped it';
 
+/** The cause a file git lists but the scan cannot open raises: whatever it reads stays possible. */
+const UNOPENED = 'could not be read';
+
 /** A cause's source text is cut here. */
 const CAUSE_TEXT = 40;
 
 /** The name stet's React hook is exported under. */
 const HOOK = 'useCopy';
+
+/** The root a read through a configured function carries: no import binds it, the config does. */
+const CONFIGURED = '\u0000configured';
 
 /** The functions a host calls to make an accessor of its own, which reads copy as the hook's result does. */
 const ACCESSORS = ['createServerCopy', 'createAccessor'];
@@ -138,8 +167,8 @@ interface Read {
   text: string;
   /** B1: followed to key names in this file. */
   placed?: true;
-  /** B1's adapter form: placed where every call of `name` passes a key-name literal at `index`. */
-  adapter?: { name: string; index: number };
+  /** B1's adapter form: placed where every call of `name` passes a key-name literal at `index` — in `file` alone where the function is that file's own. */
+  adapter?: { name: string; index: number; file?: string };
   /** B2: the prefixes in sight of this read. */
   prefixes: string[];
   /** A call of a candidate: the hook call itself where the callee is one, reached through `member` of a namespace. */
@@ -148,6 +177,8 @@ interface Read {
   value?: { member?: string };
   /** The read is an argument of a call of a function imported from `@getstet/stet`, or of `Object.keys`. */
   exemptArg?: true;
+  /** Top-level `var`/`let` names of a classic script the read was placed or given its prefixes through: another file that assigns or redeclares one makes the read a cause. */
+  global?: string[];
 }
 
 /** One binding scope: a TypeScript file, a dialect component's scripts and markup, or a client script of its own. */
@@ -188,6 +219,10 @@ export interface FileFacts {
   values: Set<string>;
   /** Strings that name the snapshot or a generated data module by path, outside an import: the data is read by a route unseen. */
   pathReads: Array<{ line: number; text: string }>;
+  /** Every name the file assigns to, anywhere (`k = …`, `[k] = …`, `k++`). */
+  assigns: Set<string>;
+  /** The names a classic script declares at its top level: its globals, which another script may declare again. */
+  topNames: Set<string>;
 }
 
 /** What a string names when it points at the snapshot or a generated data module: their file names, and the folder they sit in. */
@@ -215,7 +250,20 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
   const ts = await loadTypescript();
   const declared = new Set(Object.keys(descriptor.keys));
   const needles = pathNeedles(config);
-  const stamp = [...[...declared].sort(), '', ...needles.names, needles.folder ?? ''].join('\n');
+  const configured = config.reads?.functions ?? [];
+  const attributes = markAttributes(config);
+  // The config's read functions, mark attributes and whether it sets `reads` at all change what a file yields, so they stamp the facts too.
+  const stamp = [
+    ...[...declared].sort(),
+    '',
+    ...needles.names,
+    needles.folder ?? '',
+    '',
+    ...configured.map((f) => `${f.name}:${f.key}`),
+    '',
+    ...attributes,
+    config.reads === undefined ? 'no reads' : 'reads',
+  ].join('\n');
   if (cache.keys !== stamp) {
     cache.keys = stamp;
     cache.files.clear();
@@ -224,18 +272,36 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
   // Step 1: the files, each read and parsed only where its stamp moved.
   const facts = new Map<string, FileFacts>();
   const listed = new Set<string>();
-  const { files: sources, tooLarge } = sourceFiles(cwd, config);
+  const unopened: string[] = [];
+  const { files: sources, tooLarge, texts, lost } = sourceFiles(cwd, config, config.reads !== undefined);
+  const settle = (rel: string, found: FileFacts | null | 'grew' | 'unopened'): void => {
+    if (found === 'grew') tooLarge.push(rel);
+    else if (found === 'unopened') unopened.push(rel);
+    else if (found !== null) facts.set(rel, found);
+  };
   for (const { rel, stamp: fileStamp } of sources) {
     listed.add(rel);
     const held = cache.files.get(rel);
-    let found: FileFacts | null | 'grew';
+    let found: FileFacts | null | 'grew' | 'unopened';
     if (held !== undefined && held.stamp === fileStamp) found = held.facts;
     else {
-      found = factsOf(ts, cwd, rel, declared, needles);
+      found = factsOf(ts, cwd, rel, declared, needles, configured, attributes, config.reads !== undefined);
       cache.files.set(rel, { stamp: fileStamp, facts: found });
     }
-    if (found === 'grew') tooLarge.push(rel);
-    else if (found !== null) facts.set(rel, found);
+    settle(rel, found);
+  }
+  // Text the scan does not parse (a template, a script served though git ignores it) is read for the calls it may hold, by the mention pass alone.
+  const parsed = facts.size;
+  for (const { rel, stamp: fileStamp } of texts) {
+    listed.add(rel);
+    const held = cache.files.get(rel);
+    let found: FileFacts | null | 'grew' | 'unopened';
+    if (held !== undefined && held.stamp === fileStamp) found = held.facts;
+    else {
+      found = textFactsOf(cwd, rel, configured);
+      cache.files.set(rel, { stamp: fileStamp, facts: found });
+    }
+    settle(rel, found);
   }
   for (const rel of [...cache.files.keys()]) if (!listed.has(rel)) cache.files.delete(rel);
 
@@ -274,7 +340,7 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
     return name !== undefined && hookNames.has(name) && (isStetPackage(imported.spec) || hookAccepts(rel)(imported.spec));
   };
   const bound = (rel: string, scope: Scope, root: string): boolean =>
-    parseCall(root) !== null ? hookBound(rel, scope, root) : scope.imports.some((i) => i.local === root && accepts(rel)(i.spec));
+    root === CONFIGURED || (parseCall(root) !== null ? hookBound(rel, scope, root) : scope.imports.some((i) => i.local === root && accepts(rel)(i.spec)));
   for (let round = 0; round <= facts.size; round++) {
     let added = false;
     for (const [rel, file] of facts) {
@@ -324,10 +390,12 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
     hookAccepts = acceptor(cwd, mappings, new Set([...targets, ...hookModules]), config.readPath.import);
   }
 
-  // Pass 2: the reads of a binding with no literal key, settled across files.
-  const adapterHolds = (name: string, index: number): boolean => {
+  // Pass 2: the reads of a binding with no literal key, settled across files —
+  // or, for a function a file keeps to itself, over that file alone.
+  const adapterHolds = (name: string, index: number, own?: string): boolean => {
     let count = 0;
-    for (const file of facts.values()) {
+    const judged = own === undefined ? facts.values() : [facts.get(own)].filter((f) => f !== undefined);
+    for (const file of judged) {
       if (file.values.has(name)) return false;
       const calls = file.calls.get(name);
       if (calls === undefined) continue;
@@ -335,6 +403,11 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
       count += calls.count;
     }
     return count > 0;
+  };
+  // A classic script's top-level `var` is every script's global: another file that assigns it, or declares it again, may leave any value in it.
+  const touchedElsewhere = (names: readonly string[], own: string): boolean => {
+    for (const [rel, file] of facts) if (rel !== own && names.some((name) => file.assigns.has(name) || file.topNames.has(name))) return true;
+    return false;
   };
   // A file that imports stet hands its generated data whole to stet's own
   // functions by design: only a read rooted at one of those modules, as an
@@ -362,11 +435,13 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
         if (!bound(rel, scope, read.root)) continue;
         if (read.hook !== undefined && hookBound(rel, scope, read.hook.member === undefined ? `${read.root}()` : `${read.root}.${read.hook.member}()`)) continue;
         if (file.importsStet && read.exemptArg === true && dataRooted(rel, scope, read.root)) continue;
-        if (read.placed === true) continue;
-        if (read.adapter !== undefined && adapterHolds(read.adapter.name, read.adapter.index)) continue;
-        if (read.prefixes.length > 0) {
-          for (const prefix of read.prefixes) prefixes.push({ prefix, file: rel, line: read.line });
-          continue;
+        if (read.global === undefined || !touchedElsewhere(read.global, rel)) {
+          if (read.placed === true) continue;
+          if (read.adapter !== undefined && adapterHolds(read.adapter.name, read.adapter.index, read.adapter.file)) continue;
+          if (read.prefixes.length > 0) {
+            for (const prefix of read.prefixes) prefixes.push({ prefix, file: rel, line: read.line });
+            continue;
+          }
         }
         causes.push({ text: read.text, file: rel, line: read.line });
       }
@@ -377,7 +452,15 @@ export async function siteReads(cwd: string, config: StetConfig, descriptor: Des
     }
   }
   for (const rel of tooLarge) out.set(rel, { named: [], serverCode: false, prefixes: [], causes: [{ text: TOO_LARGE, file: rel, line: 1 }] });
-  return { files: out, read: facts.size };
+  for (const rel of unopened) out.set(rel, { named: [], serverCode: false, prefixes: [], causes: [{ text: UNOPENED, file: rel, line: 1 }] });
+  // A script a document serves that is no readable file here: what it reads stays possible.
+  for (const { file, line } of lost) {
+    const cause = { text: UNOPENED, file, line };
+    const held = out.get(file);
+    if (held === undefined) out.set(file, { named: [], serverCode: false, prefixes: [], causes: [cause] });
+    else held.causes.push(cause);
+  }
+  return { files: out, read: parsed };
 }
 
 /**
@@ -434,24 +517,33 @@ export async function keyUsage(
 /**
  * The keys one file names in code: identifiers, property names and string
  * literals' contents equal to a declared key, outside comments and JSX text,
- * and in an `.html` file each `data-stet` mark. Pass 1 for one file.
+ * and in an `.html` file each mark under one of `attributes` (`markAttributes`).
+ * Pass 1 for one file.
  */
-export function namedKeys(ts: typeof import('typescript'), file: string, source: string, declared: ReadonlySet<string>): Set<string> {
-  const code = codeOf(ts, file, source, dialectOf(file));
-  return code === null ? new Set() : namesIn(file, source, code.code, code.nonCode, declared);
+export function namedKeys(
+  ts: typeof import('typescript'),
+  file: string,
+  source: string,
+  declared: ReadonlySet<string>,
+  attributes: readonly string[] = ['data-stet'],
+): Set<string> {
+  const code = codeOf(ts, file, source, usageDialect(file));
+  return code === null ? new Set() : namesIn(file, source, code.code, code.nonCode, declared, attributes);
 }
 
-function namesIn(file: string, source: string, code: Span[], nonCode: Span[], declared: ReadonlySet<string>): Set<string> {
+function namesIn(file: string, source: string, code: Span[], nonCode: Span[], declared: ReadonlySet<string>, attributes: readonly string[]): Set<string> {
   const named = new Set<string>();
   const inCode = spanTest(code);
   const inNonCode = spanTest(nonCode);
-  // A key is a whole token: the run of word characters it sits in is the key.
-  for (const m of source.matchAll(/[\w$]+/g)) {
-    if (!declared.has(m[0]) || named.has(m[0])) continue;
-    if (inCode(m.index) && !inNonCode(m.index)) named.add(m[0]);
+  // A key is a whole token: the run of word characters and dots it sits in, or
+  // any dot-delimited sub-run of it, is the key — so `obj.home_title` still
+  // names `home_title` and `"home.title"` names `home.title`.
+  for (const m of source.matchAll(/[\w$]+(?:\.[\w$]+)*/g)) {
+    if (!inCode(m.index) || inNonCode(m.index)) continue;
+    for (const key of keysIn(m[0], declared)) named.add(key);
   }
-  if (file.endsWith('.html')) {
-    for (const m of source.matchAll(MARK)) if (declared.has(m[1] as string)) named.add(m[1] as string);
+  if (/\.html?$/.test(file)) {
+    for (const m of source.matchAll(markPattern(attributes))) if (declared.has(m[1] as string)) named.add(m[1] as string);
   }
   return named;
 }
@@ -647,11 +739,28 @@ function moduleTest(
 
 /**
  * The files stet writes or owns, which hold no read of copy: the read path, the
- * descriptor, the snapshot and every file `codegen` names. Repo-relative.
+ * descriptor, the snapshot, every file `codegen` names, and the `generated`
+ * outputs — which declare keys and read none. Repo-relative. The copy modules
+ * are listed where `cwd` is given and the project sets `reads` or `generated`,
+ * which is what makes a copy table a table and no reader; a project that sets
+ * neither keeps reading them as 0.8.x did.
  */
-export function ownFiles(config: StetConfig): Set<string> {
+export function ownFiles(config: StetConfig, cwd?: string): Set<string> {
   const { registry, defaults, dts, resolved } = config.codegen;
-  return new Set([config.readPath.file, config.descriptorPath, config.snapshotPath, registry, defaults, dts, resolved].map((rel) => posix.normalize(rel)));
+  const tables = cwd !== undefined && (config.reads !== undefined || config.generated.length > 0);
+  return new Set(
+    [
+      config.readPath.file,
+      config.descriptorPath,
+      config.snapshotPath,
+      registry,
+      defaults,
+      dts,
+      resolved,
+      ...(tables ? filesForGlobs(cwd, config.copyModules) : []),
+      ...config.generated.map((g) => g.file),
+    ].map((rel) => posix.normalize(rel)),
+  );
 }
 
 /** Whether a module's text opens with the header stet puts on what it generates. */
@@ -665,15 +774,35 @@ export const isGenerated = (text: string): boolean => text.startsWith(GENERATED)
  * Each kept file carries its stamp. A file over `MAX_SOURCE_BYTES` is not kept
  * and is not opened: it is listed in `tooLarge`, since a key it names would
  * otherwise be called not found.
+ *
+ * With `beyond` (a project that sets `reads`), the scripts the managed pages
+ * serve through `<script src>`, and the files those import, join the list
+ * whether or not git lists them (`lost` names a served script that is no
+ * readable file), and the text git lists that is not source (`texts`, minus
+ * images, fonts and prose) is kept for the mention pass alone.
  */
-function sourceFiles(cwd: string, config: StetConfig): { files: Array<{ rel: string; stamp: string }>; tooLarge: string[] } {
+function sourceFiles(
+  cwd: string,
+  config: StetConfig,
+  beyond = false,
+): {
+  files: Array<{ rel: string; stamp: string }>;
+  tooLarge: string[];
+  texts: Array<{ rel: string; stamp: string }>;
+  lost: Array<{ file: string; line: number }>;
+} {
   const listed = gitFiles(cwd, ['--cached', '--others', '--exclude-standard']);
   const paths = listed === null ? filesForGlobs(cwd, ['**/*']) : [...new Set(listed)].sort();
-  const own = ownFiles(config);
+  const own = ownFiles(config, cwd);
   const out: Array<{ rel: string; stamp: string }> = [];
+  const texts: Array<{ rel: string; stamp: string }> = [];
   const tooLarge: string[] = [];
-  for (const rel of paths) {
-    if (!SOURCE.test(rel) || own.has(rel) || rel.startsWith('.stet/')) continue;
+  const served = beyond ? servedScripts(cwd, config) : { files: [], lost: [] };
+  for (const rel of beyond ? [...new Set([...paths, ...served.files])] : paths) {
+    const source = SOURCE.test(rel);
+    // The config names the read functions, and the status file names keys: neither is a script.
+    const text = !source && beyond && !NOT_SCRIPT.test(rel) && rel !== CONFIG_FILE && rel !== config.statusPath;
+    if ((!source && !text) || own.has(rel) || rel.startsWith('.stet/')) continue;
     const abs = join(cwd, rel);
     let stat: Stats;
     try {
@@ -687,12 +816,147 @@ function sourceFiles(cwd: string, config: StetConfig): { files: Array<{ rel: str
     }
     if (!stat.isFile()) continue;
     if (stat.size > MAX_SOURCE_BYTES) {
-      tooLarge.push(rel);
+      if (source) tooLarge.push(rel);
       continue;
     }
-    out.push({ rel, stamp: `${stat.size}:${stat.mtimeMs}` });
+    (source ? out : texts).push({ rel, stamp: `${stat.size}:${stat.mtimeMs}` });
   }
-  return { files: out, tooLarge };
+  return { files: out, tooLarge, texts, lost: served.lost };
+}
+
+/** How many imports deep a served script's relative imports are followed. */
+const IMPORT_DEPTH = 8;
+
+/** A module specifier in script text: `import "x"`, `import … from "x"`, `export … from "x"`, `import("x")`, in groups 2, 4 and 6. Text in a comment or string matches too: the files it adds are only read. */
+const IMPORT_SPECIFIER = /\bimport\s*\(\s*(['"])([^'"\n]+)\1\s*\)|\b(?:import|export)\b[^'"();]*?\bfrom\s*(['"])([^'"\n]+)\3|\bimport\s*(['"])([^'"\n]+)\5/g;
+
+/**
+ * The scripts the managed documents load through a same-origin `<script src>`
+ * that land on a file of the checkout, repo-relative, sorted, and the files
+ * those scripts reach by a relative import or re-export, static or dynamic
+ * (`followImports`): a served file counts for the scan though git ignores it
+ * (a build output). `lost` lists each such `<script src>` that lands on no
+ * readable file of the checkout, by document and line.
+ */
+function servedScripts(cwd: string, config: StetConfig): { files: string[]; lost: Array<{ file: string; line: number }> } {
+  const out = new Set<string>();
+  const lost: Array<{ file: string; line: number }> = [];
+  for (const rel of filesForGlobs(cwd, config.managedSurfaces)) {
+    if (!/\.html?$/.test(rel)) continue;
+    let source: string;
+    try {
+      source = readFileSync(join(cwd, rel), 'utf8');
+    } catch {
+      continue;
+    }
+    const scripts = documentScripts(cwd, { file: rel, source });
+    for (const file of scripts.files) out.add(file);
+    const lineAt = lineIndex(source);
+    for (const at of scripts.lost) lost.push({ file: rel, line: lineAt(at) });
+  }
+  for (const file of followImports(cwd, [...out])) out.add(file);
+  return { files: [...out].sort(), lost };
+}
+
+/**
+ * The files `entries` reach by a relative import, re-export or dynamic
+ * `import()`, resolved as the static arm serves a URL (`servableFile`), so a
+ * file outside the checkout is never entered. Breadth-first to `IMPORT_DEPTH`
+ * levels, each file once; the entries themselves are not in the answer.
+ */
+function followImports(cwd: string, entries: readonly string[]): string[] {
+  const root = realpathSync(cwd);
+  const seen = new Set(entries);
+  const found: string[] = [];
+  let level = [...entries];
+  for (let depth = 0; depth < IMPORT_DEPTH && level.length > 0; depth++) {
+    const next: string[] = [];
+    for (const rel of level) {
+      let text: string;
+      try {
+        const abs = join(cwd, rel);
+        if (statSync(abs).size > MAX_SOURCE_BYTES) continue;
+        text = readFileSync(abs, 'utf8');
+      } catch {
+        continue;
+      }
+      for (const m of text.matchAll(IMPORT_SPECIFIER)) {
+        const spec = m[2] ?? m[4] ?? m[6];
+        if (spec === undefined || !/^\.{1,2}\//.test(spec)) continue;
+        let url: URL;
+        try {
+          url = new URL(spec, `http://stet.invalid/${rel}`);
+        } catch {
+          continue;
+        }
+        const abs = servableFile(cwd, url.pathname);
+        const target = abs === null ? null : relative(root, abs).split(sep).join('/');
+        if (target === null || seen.has(target)) continue;
+        seen.add(target);
+        found.push(target);
+        next.push(target);
+      }
+    }
+    level = next;
+  }
+  return found;
+}
+
+/**
+ * The scripts a static document loads that the route reads follow: each
+ * `<script src>` whose URL is same-origin, resolved against the document's own
+ * path as the static arm serves it, and lands on a file inside the checkout
+ * (`servableFile`). `missing` where a same-origin script names no such file —
+ * a built asset, say — whose reads stet cannot know; `lost` is the offset of
+ * each such `<script>` tag.
+ */
+export function documentScripts(cwd: string, document: { file: string; source: string }): { files: string[]; missing: boolean; lost: number[] } {
+  const files: string[] = [];
+  const lost: number[] = [];
+  let missing = false;
+  // `servableFile` answers the real path, so the checkout's own is the base its paths are relative to.
+  const root = realpathSync(cwd);
+  // The reader blanks a script whole, tag and body, so the tags are read off the source, comments aside, each body skipped.
+  const source = document.source.replace(HTML_COMMENT, (comment) => ' '.repeat(comment.length));
+  const open = /<script\b([^>]*)>/gi;
+  for (let m = open.exec(source); m !== null; m = open.exec(source)) {
+    const close = source.toLowerCase().indexOf('</script', open.lastIndex);
+    const src = readAttrs(source, m.index + '<script'.length, m[1] as string).find((a) => a.name === 'src')?.value.trim();
+    if (close !== -1) open.lastIndex = close;
+    if (src === undefined || src === '') continue;
+    let url: URL;
+    try {
+      url = new URL(src, `http://stet.invalid/${document.file}`);
+    } catch {
+      continue;
+    }
+    if (url.origin !== 'http://stet.invalid') continue;
+    const abs = servableFile(cwd, url.pathname);
+    const rel = abs === null ? null : relative(root, abs).split(sep).join('/');
+    if (rel === null) {
+      missing = true;
+      lost.push(m.index);
+    } else if (!files.includes(rel)) files.push(rel);
+  }
+  return { files, missing, lost };
+}
+
+/** The files the usage scan reads (`sourceFiles`), repo-relative, sorted; a file past the size ceiling is not among them. */
+export function usageFiles(cwd: string, config: StetConfig): string[] {
+  return sourceFiles(cwd, config).files.map((file) => file.rel);
+}
+
+/**
+ * The files the scan reads beyond `usageFiles`, on a project that sets `reads`:
+ * the text git lists that is no source (read for the calls it may hold) and the
+ * scripts a managed page serves, or those scripts import, though git ignores
+ * them. Sorted; none without `reads`.
+ */
+export function usageBeyond(cwd: string, config: StetConfig): string[] {
+  if (config.reads === undefined) return [];
+  const own = new Set(usageFiles(cwd, config));
+  const all = sourceFiles(cwd, config, true);
+  return [...all.files, ...all.texts].map((file) => file.rel).filter((rel) => !own.has(rel)).sort();
 }
 
 /** `cwd` relative to the repository's top, `/`-ended; the folder's own name where it is the top or git cannot say. */
@@ -748,24 +1012,33 @@ const isStetPackage = (spec: string): boolean => spec === '@getstet/stet' || spe
 /**
  * One file's facts: its named keys, whether it is server code or exempt, its
  * re-exports, and per scope its imports and its binding reads, B1 and B2
- * settled as far as the file alone can. Null for a generated module or a file
- * that cannot be read; `'grew'` for a file whose bytes passed the ceiling
- * after the stat that let it through.
+ * settled as far as the file alone can. Null for a generated module (`readHeaded`
+ * reads it as source); `'unopened'` for a file that cannot be read; `'grew'` for a
+ * file whose bytes passed the ceiling after the stat that let it through.
  */
-function factsOf(ts: typeof import('typescript'), cwd: string, rel: string, declared: ReadonlySet<string>, needles: PathNeedles): FileFacts | null | 'grew' {
-  const abs = join(cwd, rel);
+function factsOf(
+  ts: typeof import('typescript'),
+  cwd: string,
+  rel: string,
+  declared: ReadonlySet<string>,
+  needles: PathNeedles,
+  configured: readonly ReadFunction[] = [],
+  attributes: readonly string[] = ['data-stet'],
+  readHeaded = false,
+): FileFacts | null | 'grew' | 'unopened' {
   let source: string;
   try {
-    if (isGenerated(headOf(abs))) return null;
-    const bytes = readFileSync(abs);
+    // A module headed as stet's own that no config names is skipped, except on a project that sets `reads`: there a header leading a hand-kept script (a concatenation) hides its reads.
+    if (!readHeaded && isGenerated(headOf(join(cwd, rel)))) return null;
+    const bytes = readFileSync(join(cwd, rel));
     // The file grew since the stat that passed it: skipped like one the stat caught.
     if (bytes.length > MAX_SOURCE_BYTES) return 'grew';
     source = bytes.toString('utf8');
   } catch {
-    return null;
+    return 'unopened';
   }
   try {
-    return readFacts(ts, rel, source, declared, needles);
+    return readFacts(ts, rel, source, declared, needles, configured, attributes);
   } catch (error) {
     if (!(error instanceof RangeError)) throw error;
     // A file nested past the compiler's recursion: its names by tokens, and one cause.
@@ -783,12 +1056,57 @@ function factsOf(ts: typeof import('typescript'), cwd: string, rel: string, decl
       calls: new Map(),
       values: new Set(),
       pathReads: [],
+      assigns: new Set(),
+      topNames: new Set(),
     };
   }
 }
 
-function readFacts(ts: typeof import('typescript'), rel: string, source: string, declared: ReadonlySet<string>, needles: PathNeedles): FileFacts | null {
-  const dialect = dialectOf(rel);
+/**
+ * The facts of a file the scan does not parse: no names, no scopes' reads but
+ * the mention pass over its text, one cause per configured function it writes
+ * (`unreadMentions`). Null for a file that holds a NUL byte, which is no text.
+ */
+function textFactsOf(cwd: string, rel: string, configured: readonly ReadFunction[]): FileFacts | null | 'grew' | 'unopened' {
+  let source: string;
+  try {
+    const bytes = readFileSync(join(cwd, rel));
+    if (bytes.length > MAX_SOURCE_BYTES) return 'grew';
+    if (bytes.subarray(0, 8192).includes(0)) return null;
+    source = bytes.toString('utf8');
+  } catch {
+    return 'unopened';
+  }
+  const facts: FileFacts = {
+    named: [],
+    serverCode: false,
+    exempt: false,
+    importsStet: false,
+    reexports: [],
+    renames: [],
+    scopes: [{ imports: [], reads: [], exported: [], wrappers: [], exportedNames: [], aliased: [], loose: [] }],
+    calls: new Map(),
+    values: new Set(),
+    pathReads: [],
+    assigns: new Set(),
+    topNames: new Set(),
+  };
+  const names = new Set(configured.map((f) => f.name));
+  const ctx = { lineOf: lineIndex(source), names, spelled: [] };
+  (facts.scopes[0] as Scope).reads.push(...unreadMentions(ctx, source, () => false, (name) => `${name} in a file the scan does not read`));
+  return facts;
+}
+
+function readFacts(
+  ts: typeof import('typescript'),
+  rel: string,
+  source: string,
+  declared: ReadonlySet<string>,
+  needles: PathNeedles,
+  configured: readonly ReadFunction[] = [],
+  attributes: readonly string[] = ['data-stet'],
+): FileFacts | null {
+  const dialect = usageDialect(rel);
   const trees = new Map<number, TS.SourceFile>();
   const code = codeOf(ts, rel, source, dialect, (name, text, base) => {
     const sf = ts.createSourceFile(name, text, ts.ScriptTarget.Latest, true, scriptKindFor(ts, name));
@@ -798,7 +1116,7 @@ function readFacts(ts: typeof import('typescript'), rel: string, source: string,
   if (code === null) return null;
 
   const facts: FileFacts = {
-    named: [...namesIn(rel, source, code.code, code.nonCode, declared)],
+    named: [...namesIn(rel, source, code.code, code.nonCode, declared, attributes)],
     serverCode: serverPath(rel),
     exempt: testPath(rel),
     importsStet: false,
@@ -808,10 +1126,16 @@ function readFacts(ts: typeof import('typescript'), rel: string, source: string,
     calls: new Map(),
     values: new Set(),
     pathReads: [],
+    assigns: new Set(),
+    topNames: new Set(),
   };
   const lineOf = lineIndex(source);
   const keyList = [...declared];
-  const ctx: WalkContext = { ts, declared, keyList, lineOf, facts, needles };
+  const names = new Set(configured.map((f) => f.name));
+  const heads = new Set(configured.flatMap((f) => splitName(f.name)?.head ?? []));
+  const marks = attributes.filter((a) => a !== 'data-stet');
+  const ctx: WalkContext = { ts, rel, declared, keyList, lineOf, facts, needles, configured, names, heads, marks, spelled: [], blind: new Set(), leaned: new Set() };
+  for (const sf of trees.values()) noteGlobals(ts, sf, facts);
 
   if (dialect === null) {
     const sf = trees.get(0) as TS.SourceFile;
@@ -844,6 +1168,9 @@ function readFacts(ts: typeof import('typescript'), rel: string, source: string,
     );
     for (const r of regions) if (r.region.own === true) facts.scopes.push(scopeOf(ctx, [r.tree], []));
   }
+  // Text the parse never read, which may still call a configured function.
+  const comments = dialect === null ? [] : [...source.matchAll(/<!--[\s\S]*?-->/g)].map((m) => ({ start: m.index, end: m.index + m[0].length }));
+  facts.scopes[0]?.reads.push(...unreadMentions(ctx, source, spanTest([...code.nonCode, ...comments])));
   return facts;
 }
 
@@ -855,11 +1182,26 @@ interface Tree {
 
 interface WalkContext {
   ts: typeof import('typescript');
+  /** The file walked, repo-relative: a function it keeps to itself is judged by its calls here alone. */
+  rel: string;
   declared: ReadonlySet<string>;
   keyList: string[];
   lineOf: (offset: number) => number;
   facts: FileFacts;
   needles: PathNeedles;
+  /** The project's own read functions (`reads.functions`). */
+  configured: readonly ReadFunction[];
+  /** The written names of the configured functions, and the head objects of the dotted ones. */
+  names: ReadonlySet<string>;
+  heads: ReadonlySet<string>;
+  /** The project's own key attribute (`reads.attribute`), when it sets one beside `data-stet`: a computed value of it is a computed read. */
+  marks: readonly string[];
+  /** Where the walk met a configured function's name written as code, by absolute offset: what `unreadMentions` counts as accounted for. */
+  spelled: Array<{ name: string; start: number; end: number }>;
+  /** The key attributes this file already raised a cause for (`attributeBackstop`): one cause each. */
+  blind: Set<string>;
+  /** The top-level names of a classic script that the resolution in hand leaned on (`localOf`). */
+  leaned: Set<string>;
 }
 
 /** Markup text the compiler could not take as one expression: read by tokens. */
@@ -1199,8 +1541,20 @@ function isReference(ts: typeof import('typescript'), id: TS.Identifier): boolea
 function walkUses(ctx: WalkContext, tree: Tree, roots: ReadonlyMap<string, string[]>, scope: Scope): void {
   const { ts, facts, needles, lineOf } = ctx;
   const { sf, base } = tree;
+  const aliases = headAliases(ctx, sf);
   const visit = (node: TS.Node): void => {
-    if (ts.isCallExpression(node)) recordCall(ctx, node);
+    if (ts.isCallExpression(node)) {
+      recordCall(ctx, node);
+      scope.reads.push(...configuredRead(ctx, tree, node));
+    }
+    if (ctx.marks.length > 0) scope.reads.push(...attributeRead(ctx, tree, node), ...attributeBackstop(ctx, tree, node));
+    if (ctx.configured.length > 0) {
+      scope.reads.push(...configuredReferences(ctx, tree, node, aliases, scope));
+      if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+        const written = calleeName(ts, node);
+        if (written !== undefined && ctx.names.has(written)) ctx.spelled.push({ name: written, start: base + node.getStart(sf), end: base + node.end });
+      }
+    }
     if (
       (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) &&
       namesData(needles, node.text) &&
@@ -1229,6 +1583,461 @@ function walkUses(ctx: WalkContext, tree: Tree, roots: ReadonlyMap<string, strin
     ts.forEachChild(node, visit);
   };
   visit(sf);
+}
+
+/**
+ * A callee's written name with the spellings that reach one function folded
+ * together: parentheses and assertions dropped, `?.` read as `.`, `["x"]` as
+ * `.x`, a leading `window.`, `self.` or `globalThis.` dropped. Undefined for
+ * any other expression.
+ */
+export function calleeName(ts: typeof import('typescript'), expr: TS.Expression): string | undefined {
+  const at = unwrap(ts, expr);
+  let name: string | undefined;
+  if (ts.isIdentifier(at)) name = at.text;
+  else if (ts.isPropertyAccessExpression(at) || (ts.isElementAccessExpression(at) && isLiteral(ts, at.argumentExpression))) {
+    const object = calleeName(ts, at.expression);
+    const member = ts.isPropertyAccessExpression(at) ? at.name.text : (at as TS.ElementAccessExpression).argumentExpression;
+    name = object === undefined ? undefined : `${object}.${typeof member === 'string' ? member : (member as TS.StringLiteral).text}`;
+  }
+  return name?.replace(/^(?:(?:window|self|globalThis)\.)+(?=[^.])/, '');
+}
+
+/** Names bound to the head object of a configured function (`var T = TS`), by name. A name bound to its own head (`var TS = window.TS`) is no alias. */
+function headAliases(ctx: WalkContext, sf: TS.SourceFile): Map<string, string> {
+  const { ts, configured } = ctx;
+  const out = new Map<string, string>();
+  if (configured.length === 0) return out;
+  const heads = new Set(configured.flatMap((f) => splitName(f.name)?.head ?? []));
+  if (heads.size === 0) return out;
+  const note = (name: TS.Node, value: TS.Expression | undefined): void => {
+    const head = value === undefined ? undefined : calleeName(ts, value);
+    if (ts.isIdentifier(name) && head !== undefined && heads.has(head) && name.text !== head) out.set(name.text, head);
+  };
+  const visit = (node: TS.Node): void => {
+    if (ts.isVariableDeclaration(node)) note(node.name, node.initializer);
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) note(unwrap(ts, node.left), node.right);
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+/**
+ * A call through one of the project's configured read functions (`TS.tx(…)`,
+ * `t(…)`), matched by the callee's name as `calleeName` folds it: a key-name
+ * literal at the key argument is pass 1's to name and reads nothing here; any
+ * other argument is a read with no literal key, followed one hop and given its
+ * prefixes as a stet binding's is; a call with no key argument is a cause.
+ */
+function configuredRead(ctx: WalkContext, tree: Tree, call: TS.CallExpression): Read[] {
+  const { ts } = ctx;
+  if (ctx.configured.length === 0) return [];
+  const callee = calleeName(ts, call.expression);
+  const fn = callee === undefined ? undefined : ctx.configured.find((f) => f.name === callee);
+  if (fn === undefined) return [];
+  const arg = call.arguments[fn.key];
+  if (arg !== undefined && isLiteral(ts, arg)) return [];
+  return [computedRead(ctx, tree, call, call.getText(tree.sf), arg)];
+}
+
+/**
+ * A read whose key is not a literal: `arg`, followed one hop and given its
+ * prefixes as a stet binding's is; with no key expression (`arg` undefined), a
+ * cause. `at` places it and `text` names it.
+ */
+function computedRead(ctx: WalkContext, tree: Tree, at: TS.Node, text: string, arg: TS.Expression | undefined): Read {
+  const { sf, base } = tree;
+  ctx.leaned.clear();
+  const out: Read = {
+    root: CONFIGURED,
+    line: ctx.lineOf(base + at.getStart(sf)),
+    text: text.replace(/\s+/g, ' ').slice(0, CAUSE_TEXT),
+    prefixes: arg === undefined ? [] : prefixOfArgument(ctx, arg),
+  };
+  if (arg !== undefined) {
+    const placed = placement(ctx, arg);
+    if (placed === 'keys') out.placed = true;
+    else if (placed !== null) out.adapter = placed;
+  }
+  if (ctx.leaned.size > 0) out.global = [...ctx.leaned];
+  return out;
+}
+
+/** `data-copy` of `el.dataset.copy`, `data-my-key` of `el.dataset.myKey`. */
+const datasetOf = (mark: string): string => mark.replace(/^data-/, '').replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+
+/**
+ * A computed value of the project's key attribute: a prop of that name in an
+ * object literal (`h('p', { 'data-copy': 'a.' + k })`), a JSX attribute with an
+ * expression, `setAttribute('data-copy', expr)` and `el.dataset.copy = expr`.
+ * It is a computed read as a configured call with a computed key is — the
+ * prefix it opens with makes the keys under it unknown, else it is a cause. A
+ * literal value is pass 1's to name.
+ */
+function attributeRead(ctx: WalkContext, tree: Tree, node: TS.Node): Read[] {
+  const { ts, marks } = ctx;
+  const { sf } = tree;
+  const named = (name: TS.Node | undefined): string | undefined =>
+    name !== undefined && (ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name) || ts.isIdentifier(name)) ? name.text : undefined;
+  let attribute: string | undefined;
+  let value: TS.Expression | undefined;
+  if (ts.isPropertyAssignment(node)) {
+    const name = ts.isComputedPropertyName(node.name) ? named(unwrap(ts, node.name.expression)) : named(node.name);
+    if (name !== undefined && marks.includes(name)) [attribute, value] = [name, node.initializer];
+  } else if (ts.isJsxAttribute(node)) {
+    const name = node.name.getText(sf);
+    if (marks.includes(name) && node.initializer !== undefined && ts.isJsxExpression(node.initializer)) [attribute, value] = [name, node.initializer.expression];
+  } else if (ts.isCallExpression(node)) {
+    const callee = unwrap(ts, node.expression);
+    const [first, second] = node.arguments;
+    if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'setAttribute' && isLiteral(ts, first) && marks.includes(first.text)) [attribute, value] = [first.text, second];
+  } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    const left = unwrap(ts, node.left);
+    const field = ts.isPropertyAccessExpression(left) ? left.name.text : ts.isElementAccessExpression(left) && isLiteral(ts, left.argumentExpression) ? left.argumentExpression.text : undefined;
+    const holder = ts.isPropertyAccessExpression(left) || ts.isElementAccessExpression(left) ? unwrap(ts, left.expression) : undefined;
+    if (field !== undefined && holder !== undefined && ts.isPropertyAccessExpression(holder) && holder.name.text === 'dataset') {
+      attribute = marks.find((mark) => datasetOf(mark) === field);
+      value = node.right;
+    }
+  }
+  if (attribute === undefined || value === undefined || isLiteral(ts, unwrap(ts, value))) return [];
+  return [computedRead(ctx, tree, value, `${attribute} set from ${value.getText(sf)}`, value)];
+}
+
+/** Calls that only look an attribute up or select by it: the attribute's name in their argument writes nothing. */
+const ATTRIBUTE_LOOKUPS = new Set(['querySelector', 'querySelectorAll', 'closest', 'matches', 'getAttribute', 'getAttributeNS', 'hasAttribute', 'hasAttributeNS', 'removeAttribute', 'removeAttributeNS', 'removeAttr']);
+/** jQuery's selectors: a read unless the string builds markup or sets (`=` in it). */
+const SELECTOR_CALLS = new Set(['$', 'jQuery', 'find', 'filter', 'is', 'not', 'has']);
+/** Calls that take an attribute's name and then its value. */
+const ATTRIBUTE_SETTERS = new Set(['attr', 'prop', 'data', 'setAttribute', 'setAttributeNS']);
+/** Calls that put an attribute node on an element, whatever name the node carries. */
+const ATTRIBUTE_NODES = new Set(['setAttributeNode', 'setAttributeNodeNS', 'setNamedItem']);
+
+/**
+ * The backstop for the spellings of the project's key attribute that
+ * `attributeRead` cannot follow, on a project that sets one. Each is a cause
+ * (`<attribute> in text the scan cannot read`), once per attribute and file:
+ * the keys it may set stay possible.
+ *
+ * - a string or template chunk that spells the attribute (case aside) and is
+ *   neither a form `attributeRead` follows, nor an argument of a lookup or
+ *   selector (`querySelector`, `getAttribute`, `$('[data-copy]')`), nor a
+ *   markup or `name, value` pair whose value is a literal;
+ * - `setAttribute`/`setAttributeNS` with a computed attribute name and a
+ *   computed value, and any `setAttributeNode`;
+ * - jQuery's `.data("copy", expr)`;
+ * - a `dataset` that is aliased (`var d = el.dataset`, `d = el.dataset`) or
+ *   handed to `Object.assign` or `extend`, and a computed `dataset[name] = …`;
+ * - a spread into the props of a hyperscript call (`h('p', { ...props })`) or a JSX tag.
+ */
+function attributeBackstop(ctx: WalkContext, tree: Tree, node: TS.Node): Read[] {
+  const { ts, marks } = ctx;
+  const { sf, base } = tree;
+  const cause = (at: TS.Node, attribute: string): Read[] => {
+    if (ctx.blind.has(attribute)) return [];
+    ctx.blind.add(attribute);
+    return [{ root: CONFIGURED, line: ctx.lineOf(base + at.getStart(sf)), text: `${attribute} in text the scan cannot read`.slice(0, CAUSE_TEXT), prefixes: [] }];
+  };
+  const first = marks[0] as string;
+  const lastName = (callee: TS.Expression): string | undefined => {
+    const at = unwrap(ts, callee);
+    return ts.isIdentifier(at) ? at.text : ts.isPropertyAccessExpression(at) ? at.name.text : undefined;
+  };
+  const stringy = ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node);
+  if (stringy) {
+    const text = (node as TS.StringLiteral).text;
+    const lower = text.toLowerCase();
+    const hit = marks.find((mark) => lower.includes(mark.toLowerCase()));
+    if (hit === undefined) return [];
+    // The forms `attributeRead` follows: the attribute as a prop name, or the first argument of `setAttribute`.
+    const holder = ts.isComputedPropertyName(node.parent) ? node.parent.parent : node.parent;
+    const propName = ts.isPropertyAssignment(holder) && (holder.name === node || holder.name === node.parent);
+    if (marks.includes(text) && (propName || (ts.isCallExpression(holder) && lastName(holder.expression) === 'setAttribute' && holder.arguments[0] === node))) return [];
+    // A prop of the attribute (or of one of its `-label`, `-placeholder` kind) with a literal value: the key it names is pass 1's.
+    if (propName && isLiteral(ts, unwrap(ts, holder.initializer))) return [];
+    // Every spelling of the attribute in the chunk is followed by a complete quoted value: markup or a selector with a literal.
+    const spelt = new RegExp(escapeRegExp(hit), 'gi');
+    let literal = true;
+    for (const m of text.matchAll(spelt)) if (!/^[\w-]*\s*=\s*(["'])[^"']*\1/.test(text.slice(m.index + hit.length))) literal = false;
+    if (literal) return [];
+    // The call the chunk is (part of) an argument of: `querySelector('[data-copy="' + k + '"]')`.
+    let at: TS.Node = node;
+    while (ts.isTemplateSpan(at.parent) || ts.isTemplateExpression(at.parent) || ts.isParenthesizedExpression(at.parent) || (ts.isBinaryExpression(at.parent) && at.parent.operatorToken.kind === ts.SyntaxKind.PlusToken)) at = at.parent;
+    const call = ts.isCallExpression(at.parent) && at.parent.arguments.includes(at as TS.Expression) ? at.parent : undefined;
+    const name = call === undefined ? undefined : lastName(call.expression);
+    if (call !== undefined && name !== undefined) {
+      if (ATTRIBUTE_LOOKUPS.has(name)) return [];
+      if (SELECTOR_CALLS.has(name) && !text.includes('=')) return [];
+      if (ATTRIBUTE_SETTERS.has(name) && at === node) {
+        const nameAt = name === 'setAttributeNS' ? 1 : 0;
+        const value = call.arguments[nameAt + 1];
+        if (call.arguments[nameAt] === node && (value === undefined || isLiteral(ts, unwrap(ts, value)))) return [];
+      }
+    }
+    return cause(node, hit);
+  }
+  if (ts.isCallExpression(node)) {
+    const name = lastName(node.expression);
+    if (name === undefined) return [];
+    if (ATTRIBUTE_NODES.has(name)) return cause(node, first);
+    const nameAt = name === 'setAttributeNS' ? 1 : 0;
+    const [attribute, value] = [node.arguments[nameAt], node.arguments[nameAt + 1]];
+    if ((name === 'setAttribute' || name === 'setAttributeNS') && attribute !== undefined && !isLiteral(ts, unwrap(ts, attribute)) && value !== undefined && !isLiteral(ts, unwrap(ts, value))) return cause(node, first);
+    // jQuery's `.data("copy", expr)` sets the data the attribute's `dataset` name stands for.
+    if (name === 'data' && isLiteral(ts, attribute) && value !== undefined && !isLiteral(ts, unwrap(ts, value))) {
+      const dataName = (text: string): string => text.toLowerCase().replace(/^data-/, '').replace(/-/g, '');
+      if (marks.some((mark) => dataName(mark) === dataName(attribute.text))) return cause(node, first);
+    }
+    return [];
+  }
+  // The `data-*` attribute's dataset name: a write the walk cannot place by key is a cause.
+  const dataMark = marks.find((mark) => mark.toLowerCase().startsWith('data-'));
+  const datasetHolder = (access: TS.Expression): boolean => {
+    const holder = unwrap(ts, access);
+    return ts.isPropertyAccessExpression(holder) && holder.name.text === 'dataset';
+  };
+  /** The node is written to by an assignment of any operator, or by `++`/`--`. */
+  const written = (target: TS.Node, plain: boolean): boolean => {
+    const p = target.parent;
+    if (ts.isBinaryExpression(p) && p.left === target) {
+      const op = p.operatorToken.kind;
+      return op === ts.SyntaxKind.EqualsToken ? plain : op >= ts.SyntaxKind.FirstAssignment && op <= ts.SyntaxKind.LastAssignment;
+    }
+    return (ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) && p.operand === target && (p.operator === ts.SyntaxKind.PlusPlusToken || p.operator === ts.SyntaxKind.MinusMinusToken);
+  };
+  if (ts.isPropertyAccessExpression(node) && node.name.text === 'dataset') {
+    const p = node.parent;
+    const aliased =
+      (ts.isVariableDeclaration(p) && p.initializer === node && !ts.isObjectBindingPattern(p.name)) ||
+      (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.right === node) ||
+      (ts.isCallExpression(p) && p.arguments[0] === node && ['assign', 'extend', 'merge'].includes(lastName(p.expression) ?? '')) ||
+      // `Reflect.set(el.dataset, …)`, `Object.defineProperty(el.dataset, …)`: a write by a name the walk does not see.
+      (ts.isCallExpression(p) && p.arguments.includes(node) && dataMark !== undefined && /^defineProperty|^defineProperties$/.test(lastName(p.expression) ?? '')) ||
+      (ts.isCallExpression(p) && p.arguments.includes(node) && dataMark !== undefined && ts.isPropertyAccessExpression(p.expression) && ts.isIdentifier(p.expression.expression) && p.expression.expression.text === 'Reflect');
+    return aliased ? cause(node, first) : [];
+  }
+  if (dataMark !== undefined) {
+    // `var { dataset } = el`, `({ dataset } = el)`, `function f({ dataset })`: the dataset itself leaves under a name of its own.
+    const bound =
+      (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && (node.propertyName ?? node.name).getText(sf) === 'dataset') ||
+      (ts.isShorthandPropertyAssignment(node) && node.name.text === 'dataset' && ts.isBinaryExpression(node.parent.parent) && node.parent.parent.left === node.parent) ||
+      (ts.isPropertyAssignment(node) && ts.isIdentifier(node.name) && node.name.text === 'dataset' && ts.isBinaryExpression(node.parent.parent) && node.parent.parent.left === node.parent);
+    if (bound) return cause(node, dataMark);
+    // `el.dataset.copy += k`, `el.dataset.copy++`: the value the attribute held is built on, whatever it was.
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const field = ts.isPropertyAccessExpression(node) ? node.name.text : isLiteral(ts, node.argumentExpression) ? node.argumentExpression.text : undefined;
+      const mark = field === undefined ? undefined : marks.find((m) => datasetOf(m) === field);
+      if (mark !== undefined && datasetHolder(node.expression) && written(node, false)) return cause(node, mark);
+    }
+  }
+  if (ts.isElementAccessExpression(node) && !isLiteral(ts, node.argumentExpression)) {
+    return written(node, true) && datasetHolder(node.expression) ? cause(node, first) : [];
+  }
+  if (ts.isSpreadAssignment(node)) {
+    const object = node.parent;
+    const call = ts.isObjectLiteralExpression(object) ? object.parent : undefined;
+    const tag = call !== undefined && ts.isCallExpression(call) && call.arguments.length > 1 && call.arguments.includes(object as TS.Expression) ? call.arguments[0] : undefined;
+    return tag !== undefined && isLiteral(ts, tag) && HTML_TAGS.has(tag.text.toLowerCase()) ? cause(node, first) : [];
+  }
+  if (ts.isJsxSpreadAttribute(node)) return cause(node, first);
+  return [];
+}
+
+/**
+ * Every other way a configured read function is reached, which the scan cannot
+ * follow and so raises as a cause: the function used as a value (`items.map(TS.tx)`,
+ * `var t = TS.tx`, `TS.tx.call(…)`, `.apply`, `.bind`), pulled off its head
+ * object by destructuring (`var { tx } = TS`), or reached through a name bound to
+ * that head object (`var T = TS; T.tx(…)`). Only the outermost access of a
+ * chain is judged; the function's own definition (`TS.tx = …`, `function t`) and
+ * a `typeof` test are no use of it.
+ *
+ * The head object itself is judged the same way (`headUse`): it may only be the
+ * object of a member access, a `typeof` operand, a truth test (`if (TS)`,
+ * `TS && TS.tx(…)`, `!TS`), or written to itself
+ * (`var TS = window.TS`, `window.TS = window.TS || {}`). Anywhere else it
+ * leaves the file by a name the scan cannot follow. An import that renames a
+ * configured name or head (`import { t as tr }`, `export { t as x }`) is an
+ * alias, and so is a default or namespace import used as `T.tx`.
+ */
+function configuredReferences(ctx: WalkContext, tree: Tree, node: TS.Node, aliases: ReadonlyMap<string, string>, scope: Scope): Read[] {
+  const { ts, lineOf } = ctx;
+  const { sf, base } = tree;
+  const cause = (at: TS.Node, name: string): Read[] => [
+    { root: CONFIGURED, line: lineOf(base + at.getStart(sf)), text: `${name} used as a value`.slice(0, CAUSE_TEXT), prefixes: [] },
+  ];
+  const names = ctx.configured.map((f) => f.name);
+
+  // `import { t as tr }`, `export { t as tr } from`: the function goes on under another name.
+  if (ts.isImportSpecifier(node) || ts.isExportSpecifier(node)) {
+    if (node.propertyName === undefined) return [];
+    const imported = node.propertyName.text;
+    return imported !== node.name.text && (names.includes(imported) || ctx.heads.has(imported)) ? cause(node, imported) : [];
+  }
+
+  // `var { tx } = TS`, `({ tx } = TS)`, `var { TS: T } = window`.
+  let pattern: Array<{ member: string | null; local: string | null }> | null = null;
+  let source: TS.Expression | undefined;
+  if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name)) {
+    source = node.initializer;
+    pattern = node.name.elements.map((el) => {
+      const local = ts.isIdentifier(el.name) ? el.name.text : null;
+      if (el.dotDotDotToken !== undefined || (el.propertyName !== undefined && !ts.isIdentifier(el.propertyName) && !ts.isStringLiteral(el.propertyName))) return { member: null, local };
+      return { member: el.propertyName === undefined ? local : (el.propertyName as TS.Identifier | TS.StringLiteral).text, local };
+    });
+  } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isObjectLiteralExpression(unwrap(ts, node.left))) {
+    source = node.right;
+    pattern = (unwrap(ts, node.left) as TS.ObjectLiteralExpression).properties.map((prop) => {
+      if (ts.isShorthandPropertyAssignment(prop)) return { member: prop.name.text, local: prop.name.text };
+      if (ts.isPropertyAssignment(prop) && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name))) {
+        const value = unwrap(ts, prop.initializer);
+        return { member: prop.name.text, local: ts.isIdentifier(value) ? value.text : null };
+      }
+      return { member: null, local: null };
+    });
+  }
+  if (pattern !== null && source !== undefined) {
+    const head = calleeName(ts, source);
+    const root = head === undefined ? undefined : (aliases.get(head) ?? head);
+    const out: Read[] = [];
+    for (const name of names) {
+      const split = splitName(name);
+      // A member that is not named (a rest element, a computed key) may be the function.
+      if (split !== null && split.head === root && pattern.some((el) => el.member === null || el.member === split.last)) out.push(...cause(node, name));
+    }
+    // The head object pulled off the global object under another name: `var { TS: T } = window`.
+    if (head === 'window' || head === 'self' || head === 'globalThis') {
+      for (const h of ctx.heads) if (pattern.some((el) => (el.member === null || el.member === h) && el.local !== h)) out.push(...cause(node, h));
+    }
+    return out;
+  }
+
+  // `import T from "./ts.mjs"; T.tx(…)`, `import * as T from …`: a module object whose member is a configured function's name.
+  if (ts.isIdentifier(node) && ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node && isReference(ts, node)) {
+    const member = node.parent.name.text;
+    const bound = scope.imports.some((i) => i.local === node.text && (i.imported === 'default' || i.imported === '*'));
+    if (bound && !ctx.heads.has(node.text) && names.some((name) => splitName(name)?.last === member)) return cause(node.parent, `${node.text}.${member}`);
+  }
+
+  if (!(ts.isIdentifier(node) ? isReference(ts, node) : ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))) return [];
+  const top = climb(ts, node as TS.Expression);
+  const up = top.parent;
+  const written = calleeName(ts, node as TS.Expression);
+  if (written !== undefined && (ctx.heads.has(written) || aliases.has(written))) return headUse(ctx, top, written, cause(node, written), cause(up, `${written}[…]`));
+  // Only the outermost access of a chain: `TS.tx` inside `TS.tx.call` is judged there.
+  if ((ts.isPropertyAccessExpression(up) || ts.isElementAccessExpression(up)) && up.expression === top) return [];
+  if (written === undefined) return [];
+  // A name bound to the head object stands for it.
+  const dot = written.indexOf('.');
+  const alias = aliases.get(dot < 0 ? written : written.slice(0, dot));
+  const name = alias !== undefined && dot >= 0 ? `${alias}${written.slice(dot)}` : written;
+  const method = /\.(?:call|apply|bind)$/.test(name) ? name.replace(/\.(?:call|apply|bind)$/, '') : undefined;
+  const fn = names.find((candidate) => candidate === name);
+  if (method !== undefined && names.includes(method)) return cause(node, method);
+  if (fn === undefined) return [];
+  if (alias !== undefined) return cause(node, fn);
+  // A bare name the file declares itself (a parameter `t`, a local `t`) is that declaration, whose own initializer is judged where it is written.
+  if (ts.isIdentifier(node) && resolveLocal(ts, node) !== null) return [];
+  if (ts.isCallExpression(up) && up.expression === top) return [];
+  if (ts.isBinaryExpression(up) && up.operatorToken.kind === ts.SyntaxKind.EqualsToken && up.left === top) return [];
+  if (ts.isTypeOfExpression(up)) return [];
+  return cause(node, fn);
+}
+
+/**
+ * Whether an expression is only asked whether it is there: the test of an
+ * `if`, a loop or a conditional, the operand of `!`, or the left of `&&`, which
+ * passes on only a falsy value. Nothing of it reaches anywhere else.
+ */
+function truthTested(ts: typeof import('typescript'), top: TS.Expression): boolean {
+  const up = top.parent;
+  if (ts.isPrefixUnaryExpression(up)) return up.operator === ts.SyntaxKind.ExclamationToken;
+  if (ts.isIfStatement(up) || ts.isWhileStatement(up) || ts.isDoStatement(up)) return up.expression === top;
+  if (ts.isForStatement(up)) return up.condition === top;
+  if (ts.isConditionalExpression(up)) return up.condition === top;
+  return ts.isBinaryExpression(up) && up.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken && up.left === top;
+}
+
+/**
+ * A reference to the head object of a configured function (`TS`, a name bound
+ * to it), judged by where it sits: the object of a member access (`TS.tx`, and
+ * `TS["tx"]`), a `typeof` operand, an assignment target, or a value that
+ * flows back into the head itself (`var TS = window.TS`, `window.TS =
+ * window.TS || {}`, an immediately called function's parameter of that name)
+ * is no use of it. A computed member (`TS[k]`) may be any function of the
+ * head; every other place hands the head on.
+ */
+function headUse(ctx: WalkContext, top: TS.Expression, head: string, onValue: Read[], onComputed: Read[]): Read[] {
+  const { ts } = ctx;
+  const up = top.parent;
+  if (ts.isPropertyAccessExpression(up) && up.expression === top) return [];
+  if (ts.isElementAccessExpression(up) && up.expression === top) return isLiteral(ts, up.argumentExpression) ? [] : onComputed;
+  if (ts.isTypeOfExpression(up)) return [];
+  if (truthTested(ts, top)) return [];
+  if (ts.isBinaryExpression(up) && up.left === top && up.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && up.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return [];
+  if (ts.isCallExpression(up) && up.arguments.includes(top)) {
+    const callee = unwrap(ts, up.expression);
+    if (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) {
+      const param = callee.parameters[up.arguments.indexOf(top)];
+      if (param !== undefined && ts.isIdentifier(param.name) && param.name.text === head) return [];
+    }
+  }
+  // The value goes on through `||`, `&&`, `??`, a conditional and parentheses to where it lands.
+  let at: TS.Node = top;
+  for (;;) {
+    const p: TS.Node = at.parent;
+    const passes =
+      ts.isParenthesizedExpression(p) ||
+      ts.isAsExpression(p) ||
+      ts.isNonNullExpression(p) ||
+      (ts.isBinaryExpression(p) &&
+        (p.operatorToken.kind === ts.SyntaxKind.BarBarToken || p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken || p.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) ||
+      (ts.isConditionalExpression(p) && (p.whenTrue === at || p.whenFalse === at));
+    if (!passes) break;
+    at = p;
+  }
+  const landing = at.parent;
+  if (ts.isVariableDeclaration(landing) && landing.initializer === at && ts.isIdentifier(landing.name) && landing.name.text === head) return [];
+  if (ts.isBinaryExpression(landing) && landing.operatorToken.kind === ts.SyntaxKind.EqualsToken && landing.right === at && calleeName(ts, landing.left) === head) return [];
+  return onValue;
+}
+
+/**
+ * The backstop for text the parse never reads as code: a configured function's
+ * name written in a string handed to `eval` or `setTimeout`, in an attribute no
+ * rule names as code (`x-text`, `@click`, `srcdoc`, `formaction`), in a script
+ * of a type the scan does not parse (`text/babel`). Each mention outside a
+ * comment that the walk did not meet as code (`ctx.spelled`) makes one cause per
+ * function, at the first such line: the call may read any key.
+ */
+function unreadMentions(
+  ctx: Pick<WalkContext, 'lineOf' | 'names' | 'spelled'>,
+  source: string,
+  inComment: (at: number) => boolean,
+  textOf: (name: string) => string = (name) => `${name} in text the scan cannot read`,
+): Read[] {
+  const out: Read[] = [];
+  for (const name of ctx.names) {
+    const seen = ctx.spelled.filter((s) => s.name === name).sort((a, b) => a.start - b.start);
+    const accounted = (at: number): boolean => {
+      let lo = 0;
+      let hi = seen.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if ((seen[mid] as { start: number }).start <= at) lo = mid + 1;
+        else hi = mid;
+      }
+      const before = seen[lo - 1];
+      return before !== undefined && at < before.end;
+    };
+    for (const m of source.matchAll(mentionPattern(name))) {
+      if (accounted(m.index) || inComment(m.index)) continue;
+      out.push({ root: CONFIGURED, line: ctx.lineOf(m.index), text: textOf(name).slice(0, CAUSE_TEXT), prefixes: [] });
+      break;
+    }
+  }
+  return out;
 }
 
 /**
@@ -1269,8 +2078,9 @@ function recordCall(ctx: WalkContext, call: TS.CallExpression): void {
   const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : undefined;
   if (name === undefined) return;
   const here: number[] = [];
+  // A key-name literal, or an argument the one-hop rule reads to key names (`msg(ERRORS[e])`).
   call.arguments.forEach((arg, i) => {
-    if (isLiteral(ts, arg) && declared.has(arg.text)) here.push(i);
+    if ((isLiteral(ts, arg) && declared.has(arg.text)) || placement(ctx, arg) === 'keys') here.push(i);
   });
   const held = facts.calls.get(name);
   if (held === undefined) facts.calls.set(name, { count: 1, keyAt: here });
@@ -1302,7 +2112,15 @@ function widen(ctx: WalkContext, from: TS.Expression): TS.Expression {
  * is a candidate of its own, judged under the root `<root>()`.
  */
 function classify(ctx: WalkContext, scope: Scope, tree: Tree, id: TS.Identifier, root: string): Read[] {
+  const reads = classifyReference(ctx, scope, tree, id, root);
+  // Whatever global a once-assigned answer leaned on while these reads were built stays with them.
+  if (ctx.leaned.size > 0) for (const read of reads) read.global = [...ctx.leaned];
+  return reads;
+}
+
+function classifyReference(ctx: WalkContext, scope: Scope, tree: Tree, id: TS.Identifier, root: string): Read[] {
   const { ts } = ctx;
+  ctx.leaned.clear();
   const use = widen(ctx, id);
   const out = classifyUse(ctx, scope, tree, use, root);
   const p = use.parent;
@@ -1484,7 +2302,7 @@ function literalArms(ts: typeof import('typescript'), node: TS.Expression): bool
  * parameter of a function declared here, placed when every call of that
  * function passes a key-name literal at its position (settled across files).
  */
-function placement(ctx: WalkContext, arg: TS.Expression): 'keys' | { name: string; index: number } | null {
+function placement(ctx: WalkContext, arg: TS.Expression): 'keys' | { name: string; index: number; file?: string } | null {
   const { ts } = ctx;
   const at = unwrap(ts, arg);
   // `copy(a ? 'x' : 'y')`: both arms name keys, and a ternary may stand in either arm.
@@ -1494,7 +2312,7 @@ function placement(ctx: WalkContext, arg: TS.Expression): 'keys' | { name: strin
     return isLiteral(ts, u) && ctx.declared.has(u.text);
   };
   const constInit = (id: TS.Identifier): TS.Expression | undefined => {
-    const local = resolveLocal(ts, id);
+    const local = localOf(ctx, id);
     return local?.kind === 'const' && local.init !== undefined ? unwrap(ts, local.init) : undefined;
   };
   const keyArray = (node: TS.Expression): boolean => {
@@ -1510,7 +2328,7 @@ function placement(ctx: WalkContext, arg: TS.Expression): 'keys' | { name: strin
   };
 
   if (ts.isIdentifier(at)) {
-    const local = resolveLocal(ts, at);
+    const local = localOf(ctx, at);
     if (local === null) return null;
     if (local.kind === 'const') return isKey(local.init) ? 'keys' : null;
     if (local.kind === 'forof') return keyArray(local.stmt.expression) ? 'keys' : null;
@@ -1529,17 +2347,20 @@ function placement(ctx: WalkContext, arg: TS.Expression): 'keys' | { name: strin
     ) {
       return 'keys';
     }
-    // `function t(k) { … }`, `const t = (k) => …`
-    if (ts.isFunctionDeclaration(fn) && fn.name !== undefined) return { name: fn.name.text, index: local.index };
+    // `function t(k) { … }`, `const t = (k) => …`, `var msg = function (key) { … }` assigned once.
+    // A function its file keeps to itself is judged by that file's calls alone (`ownFunction`).
+    if (ts.isFunctionDeclaration(fn) && fn.name !== undefined) {
+      return { name: fn.name.text, index: local.index, ...(ownFunction(ts, fn, fn.name.text) ? { file: ctx.rel } : {}) };
+    }
     if (
       (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) &&
       ts.isVariableDeclaration(holder) &&
       holder.initializer === fn &&
       ts.isIdentifier(holder.name) &&
       ts.isVariableDeclarationList(holder.parent) &&
-      (holder.parent.flags & ts.NodeFlags.Const) !== 0
+      ((holder.parent.flags & ts.NodeFlags.Const) !== 0 || !reassigned(ts, holder.getSourceFile(), holder.name.text))
     ) {
-      return { name: holder.name.text, index: local.index };
+      return { name: holder.name.text, index: local.index, ...(ownFunction(ts, holder, holder.name.text) ? { file: ctx.rel } : {}) };
     }
     return null;
   }
@@ -1681,7 +2502,7 @@ function prefixesOfSiblings(ctx: WalkContext, args: readonly TS.Expression[], us
       return;
     }
     if (hop && ts.isIdentifier(at) && isReference(ts, at)) {
-      const local = resolveLocal(ts, at);
+      const local = localOf(ctx, at);
       if (local?.kind === 'const' && local.init !== undefined) {
         list(local.init, false);
         return;
@@ -1702,20 +2523,20 @@ function opening(ctx: WalkContext, node: TS.Expression, hop: boolean): string | 
   if (ts.isTemplateExpression(at)) return at.head.text;
   if (ts.isBinaryExpression(at) && at.operatorToken.kind === ts.SyntaxKind.PlusToken) return opening(ctx, at.left, hop);
   if (hop && ts.isIdentifier(at) && isReference(ts, at)) {
-    const local = resolveLocal(ts, at);
+    const local = localOf(ctx, at);
     if (local?.kind === 'const' && local.init !== undefined) return opening(ctx, local.init, false);
   }
   return undefined;
 }
 
-/** The heads that are a proper prefix of at least one declared key and end at `_`. */
+/** The heads that are a proper prefix of at least one declared key and end at `_` or `.`. */
 function prefixes(ctx: WalkContext, heads: readonly string[]): string[] {
   const { declared, keyList } = ctx;
-  return [...new Set(heads)].filter((text) => text.endsWith('_') && !declared.has(text) && keyList.some((key) => key.startsWith(text)));
+  return [...new Set(heads)].filter((text) => /[._]$/.test(text) && !declared.has(text) && keyList.some((key) => key.startsWith(text)));
 }
 
 type Local =
-  | { kind: 'const'; init: TS.Expression | undefined }
+  | { kind: 'const'; init: TS.Expression | undefined; /** Set for a top-level `var` or `let` of a classic script: a global, which another script may reassign. */ global?: string }
   | { kind: 'param'; fn: TS.SignatureDeclaration; index: number }
   | { kind: 'forof'; stmt: TS.ForOfStatement }
   | { kind: 'other' };
@@ -1724,6 +2545,103 @@ type Local =
 function patternDeclares(ts: typeof import('typescript'), pattern: TS.BindingName, name: string): boolean {
   if (ts.isIdentifier(pattern)) return pattern.text === name;
   return pattern.elements.some((el) => !ts.isOmittedExpression(el) && patternDeclares(ts, el.name, name));
+}
+
+/** How many variable declarations in `scope` (function boundaries aside) declare `name`: a second `var k` in the same scope is a reassignment. */
+function declarationsIn(ts: typeof import('typescript'), scope: TS.Node, name: string): number {
+  let count = 0;
+  const visit = (node: TS.Node): void => {
+    if (ts.isVariableDeclaration(node) && patternDeclares(ts, node.name, name)) count += 1;
+    if (!ts.isFunctionLike(node) || node === scope) ts.forEachChild(node, visit);
+  };
+  visit(scope);
+  return count;
+}
+
+/** The names a file assigns to after their declaration (`x = …`, `x += …`, `x++`, `({ x } = …)`, `[x] = …`, `for (x in …)`), computed once per tree. */
+const ASSIGNED = new WeakMap<TS.SourceFile, Set<string>>();
+function assignedNames(ts: typeof import('typescript'), sf: TS.SourceFile): Set<string> {
+  let names = ASSIGNED.get(sf);
+  if (names === undefined) {
+    const found = new Set<string>();
+    // The names an assignment target binds: an identifier, or those inside an array or object pattern, a default or a rest.
+    const target = (e: TS.Expression): void => {
+      const at = unwrap(ts, e);
+      if (ts.isIdentifier(at)) found.add(at.text);
+      else if (ts.isArrayLiteralExpression(at)) {
+        for (const el of at.elements) target(ts.isSpreadElement(el) ? el.expression : el);
+      } else if (ts.isObjectLiteralExpression(at)) {
+        for (const prop of at.properties) {
+          if (ts.isShorthandPropertyAssignment(prop)) found.add(prop.name.text);
+          else if (ts.isPropertyAssignment(prop)) target(prop.initializer);
+          else if (ts.isSpreadAssignment(prop)) target(prop.expression);
+        }
+      } else if (ts.isBinaryExpression(at) && at.operatorToken.kind === ts.SyntaxKind.EqualsToken) target(at.left);
+      else if (ts.isPropertyAccessExpression(at) || ts.isElementAccessExpression(at)) {
+        // A global written through the global object: `window.k = …`, `globalThis["k"] = …`.
+        const object = unwrap(ts, at.expression);
+        if (ts.isIdentifier(object) && (object.text === 'window' || object.text === 'self' || object.text === 'globalThis')) {
+          if (ts.isPropertyAccessExpression(at)) found.add(at.name.text);
+          else if (isLiteral(ts, at.argumentExpression)) found.add(at.argumentExpression.text);
+        }
+      }
+    };
+    const walk = (node: TS.Node): void => {
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) target(node.left);
+      if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) target(node.operand);
+      if ((ts.isForInStatement(node) || ts.isForOfStatement(node)) && !ts.isVariableDeclarationList(node.initializer)) target(node.initializer);
+      ts.forEachChild(node, walk);
+    };
+    walk(sf);
+    ASSIGNED.set(sf, (names = found));
+  }
+  return names;
+}
+
+const reassigned = (ts: typeof import('typescript'), sf: TS.SourceFile, name: string): boolean => assignedNames(ts, sf).has(name);
+
+/**
+ * What a tree adds to its file's globals: every name it assigns, and — when it
+ * is a classic script, not a module — the names it declares at its top level.
+ * Another file's once-assigned rule reads them (`touchedElsewhere`).
+ */
+function noteGlobals(ts: typeof import('typescript'), sf: TS.SourceFile, facts: FileFacts): void {
+  for (const name of assignedNames(ts, sf)) facts.assigns.add(name);
+  if (ts.isExternalModule(sf)) return;
+  const bind = (pattern: TS.BindingName): void => {
+    if (ts.isIdentifier(pattern)) facts.topNames.add(pattern.text);
+    else for (const el of pattern.elements) if (!ts.isOmittedExpression(el)) bind(el.name);
+  };
+  for (const stmt of sf.statements) {
+    if (ts.isVariableStatement(stmt)) for (const decl of stmt.declarationList.declarations) bind(decl.name);
+    else if (ts.isFunctionDeclaration(stmt) && stmt.name !== undefined) facts.topNames.add(stmt.name.text);
+  }
+}
+
+/**
+ * Whether a function declaration, or the variable holding a function, is its
+ * file's own: no export reaches it, and it is not a global — inside a function,
+ * or at the top of an ES module. A classic script's top-level function is every
+ * script's to call, so its calls are judged across the files.
+ */
+function ownFunction(ts: typeof import('typescript'), decl: TS.FunctionDeclaration | TS.VariableDeclaration, name: string): boolean {
+  const sf = decl.getSourceFile();
+  const statement = ts.isFunctionDeclaration(decl) ? decl : decl.parent.parent;
+  const exportedHere = ts.canHaveModifiers(statement) && ts.getModifiers(statement)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true;
+  if (exportedHere) return false;
+  const listed = sf.statements.some(
+    (stmt) => ts.isExportDeclaration(stmt) && stmt.exportClause !== undefined && ts.isNamedExports(stmt.exportClause) && stmt.exportClause.elements.some((el) => (el.propertyName ?? el.name).text === name),
+  );
+  const defaulted = sf.statements.some((stmt) => ts.isExportAssignment(stmt) && ts.isIdentifier(unwrap(ts, stmt.expression)) && (unwrap(ts, stmt.expression) as TS.Identifier).text === name);
+  if (listed || defaulted) return false;
+  return statement.parent !== sf || ts.isExternalModule(sf);
+}
+
+/** `resolveLocal`, noting on the context the global a once-assigned answer leans on. */
+function localOf(ctx: WalkContext, id: TS.Identifier): Local | null {
+  const local = resolveLocal(ctx.ts, id);
+  if (local?.kind === 'const' && local.global !== undefined) ctx.leaned.add(local.global);
+  return local;
 }
 
 /** The declaration an identifier refers to, by the nearest enclosing scope that declares its name; null where none in the file does. */
@@ -1753,8 +2671,11 @@ function resolveLocal(ts: typeof import('typescript'), id: TS.Identifier): Local
         if (ts.isVariableStatement(stmt)) {
           for (const decl of stmt.declarationList.declarations) {
             if (!patternDeclares(ts, decl.name, name)) continue;
-            const isConst = (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0;
-            return isConst && ts.isIdentifier(decl.name) ? { kind: 'const', init: decl.initializer } : { kind: 'other' };
+            const declaredConst = (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0;
+            // Declared again in this scope, or assigned later: not once-assigned.
+            const isConst = declaredConst || (decl.initializer !== undefined && !reassigned(ts, id.getSourceFile(), name) && declarationsIn(ts, scope, name) === 1);
+            if (!isConst || !ts.isIdentifier(decl.name)) return { kind: 'other' };
+            return { kind: 'const', init: decl.initializer, ...(!declaredConst && ts.isSourceFile(scope) && !ts.isExternalModule(scope) ? { global: name } : {}) };
           }
         } else if ((ts.isFunctionDeclaration(stmt) || ts.isClassDeclaration(stmt) || ts.isEnumDeclaration(stmt)) && stmt.name?.text === name) {
           return { kind: 'other' };

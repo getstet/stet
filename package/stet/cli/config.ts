@@ -10,13 +10,16 @@
  * (§13.1's table lists phase-2 and phase-3 fields this change does not read).
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve as resolvePath } from 'node:path';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, posix, resolve as resolvePath } from 'node:path';
 
+import type { Placeholders } from '../src/placeholders.js';
 import { SEO_SEVERITY } from '../src/seo.js';
 import type { SeoRule } from '../src/seo.js';
-import { writeJsonDeterministic } from './artifacts.js';
+import { asUpdate, planJson, writeJsonDeterministic, type WritePlan } from './artifacts.js';
+import { filesForGlobs } from './files.js';
 import { CliError, UsageError } from './report.js';
+import { landsOnFile } from './static-files.js';
 
 export const CONFIG_FILE = 'stet.config.json';
 
@@ -24,6 +27,26 @@ export const CONFIG_FILE = 'stet.config.json';
 export const HOST_MIGRATIONS = join('stet', 'migrations');
 
 export type StoreAdapterName = 'pg' | 'postgrest' | 'memory' | 'snapshot';
+
+/** A function the project reads copy through: its written name (`TS.t`, `t`) and the argument that carries the key. */
+export interface ReadFunction {
+  name: string;
+  key: number;
+}
+
+/** The joiner the naming rule puts between a name's parts. */
+export type KeyStyle = 'underscore' | 'dotted';
+
+/** One file generated from the snapshot for the host to read: a classic script, an ES module or bare JSON. */
+export interface GeneratedOutput {
+  file: string;
+  format: 'script' | 'esm' | 'json';
+  /** The global or export the table is bound to; required for `script` and `esm`. */
+  name?: string;
+  values: 'value' | 'value-status';
+  /** Key names kept: an entry ending in `.` or `_` is a prefix, any other an exact key; absent keeps every web key. */
+  only?: string[];
+}
 
 /** One store connection: an adapter and the variables holding its credential. */
 export interface StoreBlock {
@@ -76,7 +99,19 @@ export interface StetConfig {
    * `baseline` names the accepted-literals file that makes an existing repo
    * start at zero.
    */
-  scan: { severity: 'warn' | 'fail'; baseline: string };
+  scan: { severity: 'warn' | 'fail'; baseline: string; /** Hyperscript builders whose first argument is not a tag (`h(Card, …)`); absent is none. */ builders?: string[] };
+  /** The functions the project reads copy through, and the attribute its elements carry a key in; absent, only stet's own accessors read. */
+  reads?: { functions: ReadFunction[]; attribute?: string };
+  /** The placeholder grammar the host's table is written in. */
+  placeholders: Placeholders;
+  /** The joiner the naming rule puts between a name's parts. */
+  keyStyle: KeyStyle;
+  /** Files generated from the snapshot for the host to read. */
+  generated: GeneratedOutput[];
+  /** A folder (relative to this config's) whose config and copy this checkout reads instead of its own. */
+  copyFrom?: string;
+  /** Where the approval status file lives. */
+  statusPath: string;
   /**
    * The detected router. `register` reads it to choose the accessor: `pages`
    * and `vite` force the client form, a Pages-Router file and a Vite SPA's
@@ -280,12 +315,56 @@ function parseEnvironments(environments: Record<string, unknown>, path: string):
   return map;
 }
 
+/** A read function's written name: identifiers joined by dots (`t`, `TS.t`, `i18n.copy.t`). */
+const READ_NAME = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
+
+/** The joiner the naming rule puts between a name's parts under the config's `keyStyle`. */
+export function keyJoiner(config: Pick<StetConfig, 'keyStyle'>): '_' | '.' {
+  return config.keyStyle === 'dotted' ? '.' : '_';
+}
+
+/**
+ * The attributes a mark is read under: `data-stet`, and the config's own key
+ * attribute beside it (`reads.attribute`). Every writer writes `data-stet`, so
+ * no mark stet writes goes unread.
+ */
+export function markAttributes(config: Pick<StetConfig, 'reads'>): string[] {
+  const own = config.reads?.attribute;
+  return own === undefined || own === 'data-stet' ? ['data-stet'] : [own, 'data-stet'];
+}
+
+/**
+ * The config file edited as RAW JSON, so no default and no unknown field is
+ * rewritten: `loadConfig` fills in every default and ignores the fields later
+ * changes own, and writing its result back would rewrite settings the caller
+ * never read. A project with no config file gets one, defaults included.
+ * `edit` changes the object in place.
+ */
+export function rawConfigPlan(cwd: string, edit: (raw: Record<string, unknown>) => void): WritePlan {
+  const path = join(cwd, CONFIG_FILE);
+  const raw: Record<string, unknown> = existsSync(path)
+    ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>)
+    : withoutNewDefaults(defaultConfig());
+  edit(raw);
+  return asUpdate(planJson(path, raw, CONFIG_FILE));
+}
+
 /** Where a Next host's `CopyProvider` mount lives, absent a host saying otherwise. */
 export const DEFAULT_ROOT_LAYOUT = 'app/layout.tsx';
 
 /** The forms secret's variable name: the configured one, else `STET_FORMS_SECRET`. */
 export function formsSecretEnvOf(config: Pick<StetConfig, 'formsSecretEnv'>): string {
   return config.formsSecretEnv ?? 'STET_FORMS_SECRET';
+}
+
+/**
+ * A config as a new `stet.config.json` carries it: the four settings of 0.9.0
+ * (`placeholders`, `keyStyle`, `generated`, `statusPath`) leave out their
+ * defaults, so a project that sets none of them gains none.
+ */
+export function withoutNewDefaults(config: StetConfig): Record<string, unknown> {
+  const { placeholders: _placeholders, keyStyle: _keyStyle, generated: _generated, statusPath: _statusPath, ...rest } = config;
+  return rest;
 }
 
 export function defaultConfig(): StetConfig {
@@ -295,6 +374,10 @@ export function defaultConfig(): StetConfig {
     emailSurfaces: [],
     copyModules: [],
     scan: { severity: 'warn', baseline: '.stet/scan-baseline.json' },
+    placeholders: '{{name}}',
+    keyStyle: 'underscore',
+    generated: [],
+    statusPath: 'content/status.json',
     router: 'app',
     readPath: { file: 'lib/content.ts', import: '@/lib/content' },
     rootLayout: DEFAULT_ROOT_LAYOUT,
@@ -421,7 +504,90 @@ export function loadConfig(cwd: string): StetConfig {
         `${CONFIG_FILE}: scan.severity must be "warn" or "fail" — got ${JSON.stringify(scan['severity'] ?? null)}`,
       );
     }
-    config.scan = { severity, baseline: str(scan, 'baseline', config.scan.baseline, 'scan.') };
+    const builders = scan['builders'] === undefined ? undefined : stringArray(scan, 'builders', [], 'scan.');
+    config.scan = {
+      severity,
+      baseline: str(scan, 'baseline', config.scan.baseline, 'scan.'),
+      ...(builders === undefined ? {} : { builders }),
+    };
+  }
+
+  const reads = obj(source, 'reads');
+  if (reads) {
+    const functions = reads['functions'];
+    if (!Array.isArray(functions) || functions.length === 0) {
+      throw new CliError(`${CONFIG_FILE}: reads.functions must be a list of function names, such as "t" or "TS.t"`);
+    }
+    const parsed: ReadFunction[] = functions.map((entry) => {
+      if (typeof entry === 'string' && READ_NAME.test(entry)) return { name: entry, key: 0 };
+      if (entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
+        const { name, key } = entry as Record<string, unknown>;
+        if (typeof name === 'string' && READ_NAME.test(name) && (key === undefined || (Number.isInteger(key) && (key as number) >= 0))) {
+          return { name, key: key === undefined ? 0 : (key as number) };
+        }
+      }
+      throw new CliError(`${CONFIG_FILE}: reads.functions must be a list of function names, such as "t" or "TS.t"`);
+    });
+    const attribute = optionalStr(reads, 'attribute');
+    if (attribute !== undefined && !/^data-[a-z][a-z0-9-]*$/.test(attribute)) {
+      throw new CliError(`${CONFIG_FILE}: reads.attribute must be a data-* attribute name`);
+    }
+    config.reads = attribute === undefined ? { functions: parsed } : { functions: parsed, attribute };
+  }
+  const placeholders = optionalStr(source, 'placeholders');
+  if (placeholders !== undefined) {
+    if (placeholders !== '{{name}}' && placeholders !== '{name}') {
+      throw new CliError(`${CONFIG_FILE}: placeholders must be "{{name}}" or "{name}"`);
+    }
+    config.placeholders = placeholders;
+  }
+  const keyStyle = optionalStr(source, 'keyStyle');
+  if (keyStyle !== undefined) {
+    if (keyStyle !== 'underscore' && keyStyle !== 'dotted') {
+      throw new CliError(`${CONFIG_FILE}: keyStyle must be "underscore" or "dotted"`);
+    }
+    config.keyStyle = keyStyle;
+  }
+  const generated = source['generated'];
+  if (generated !== undefined) {
+    if (!Array.isArray(generated)) throw new CliError(`${CONFIG_FILE}: generated must be a list`);
+    config.generated = generated.map((entry, i) => {
+      const fail = (): never => {
+        throw new CliError(`${CONFIG_FILE}: generated[${i}] needs a file, a format (script, esm or json) and, for script and esm, a name`);
+      };
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return fail();
+      const { file, format, name, values, only } = entry as Record<string, unknown>;
+      if (typeof file !== 'string' || file === '') return fail();
+      if (format !== 'script' && format !== 'esm' && format !== 'json') return fail();
+      if (format !== 'json' && (typeof name !== 'string' || name === '')) return fail();
+      // The name is written into the output as code: a script binds a dotted global, a module one export.
+      if (format === 'script' && !READ_NAME.test(name as string)) return fail();
+      if (format === 'esm' && !/^[A-Za-z_$][\w$]*$/.test(name as string)) return fail();
+      if (values !== undefined && values !== 'value' && values !== 'value-status') return fail();
+      if (only !== undefined && (!Array.isArray(only) || only.some((p) => typeof p !== 'string'))) return fail();
+      // A config that writes outside its repo is the one way stet would write host source it does not own.
+      if (!insideCheckout(file)) {
+        throw new CliError(
+          `${CONFIG_FILE}: generated[${i}].file must be inside this checkout — a second checkout generates its own file through copyFrom`,
+        );
+      }
+      return {
+        file,
+        format,
+        ...(typeof name === 'string' ? { name } : {}),
+        values: values === undefined ? 'value' : values,
+        ...(only === undefined ? {} : { only: only as string[] }),
+      };
+    });
+  }
+  const copyFrom = optionalStr(source, 'copyFrom');
+  if (copyFrom !== undefined) {
+    if (copyFrom.trim() === '') throw new CliError(`${CONFIG_FILE}: copyFrom must name a folder holding stet.config.json`);
+    config.copyFrom = copyFrom;
+  }
+  config.statusPath = str(source, 'statusPath', config.statusPath);
+  if (config.statusPath === '' || !insideCheckout(config.statusPath)) {
+    throw new CliError(`${CONFIG_FILE}: statusPath must be a file path inside this checkout`);
   }
 
   const readPath = obj(source, 'readPath');
@@ -491,7 +657,59 @@ export function loadConfig(cwd: string): StetConfig {
     config.seoCheck = map;
   }
 
+  refuseKeptOutputs(config, cwd);
   return config;
+}
+
+/**
+ * A generated output may not sit on a file stet keeps for itself — the config,
+ * the descriptor, the snapshot, the bundle, the status file, the read path, a
+ * codegen file, or (on an html host) a managed `.html` document — nor on another
+ * output's file: the first `pull` would replace it, and two outputs at one path
+ * would disagree for ever. Compared in lower case, since the file systems that
+ * fold case would reach the same file.
+ */
+function refuseKeptOutputs(config: StetConfig, cwd: string): void {
+  if (config.generated.length === 0) return;
+  const at = (rel: string): string => posix.normalize(rel.replace(/\\/g, '/')).toLowerCase();
+  const kept = new Set(keptFiles(config, cwd).map(at));
+  const seen = new Set<string>();
+  config.generated.forEach((entry, i) => {
+    const file = at(entry.file);
+    if (kept.has(file) || seen.has(file) || keptFileReached(config, cwd, entry.file) !== null) {
+      throw new CliError(`${CONFIG_FILE}: generated[${i}].file names a file stet already keeps — ${entry.file}`);
+    }
+    seen.add(file);
+  });
+}
+
+/** The settings that name the files stet keeps. */
+export type KeptConfig = Pick<
+  StetConfig,
+  'descriptorPath' | 'snapshotPath' | 'bundlePath' | 'statusPath' | 'readPath' | 'codegen' | 'host' | 'managedSurfaces'
+>;
+
+/** The files stet keeps for itself, repo-relative: nothing a generated output may be written over. */
+export function keptFiles(config: KeptConfig, cwd: string): string[] {
+  return [
+    CONFIG_FILE,
+    config.descriptorPath,
+    config.snapshotPath,
+    config.bundlePath,
+    config.statusPath,
+    config.readPath.file,
+    ...Object.values(config.codegen),
+    ...(isHtmlHost(config) ? filesForGlobs(cwd, config.managedSurfaces).filter((file) => file.endsWith('.html')) : []),
+  ];
+}
+
+/**
+ * The kept file a generated output reaches by real path or inode — through a
+ * symlinked folder inside the checkout, say — or null. The name check cannot
+ * see it, so the load and the planner each ask again.
+ */
+export function keptFileReached(config: KeptConfig, cwd: string, file: string): string | null {
+  return keptFiles(config, cwd).find((kept) => landsOnFile(cwd, file, kept)) ?? null;
 }
 
 /**
@@ -697,6 +915,43 @@ function host(source: Record<string, unknown>): 'html' | undefined {
 }
 
 /**
+ * The checkout a `copyFrom` config reads its copy from: the owner's folder and
+ * its config, through which the descriptor, the snapshot and the status file
+ * are read. Null where the config names none. The owner must hold a config of
+ * its own, be another folder, and own its copy itself — a chain would make
+ * "the owner" a question with more than one answer.
+ */
+export function resolveCopyFrom(cwd: string, config: Pick<StetConfig, 'copyFrom'>): { owner: string; config: StetConfig } | null {
+  const named = config.copyFrom;
+  if (named === undefined) return null;
+  const owner = resolvePath(cwd, named);
+  if (!existsSync(join(owner, CONFIG_FILE))) {
+    throw new CliError(`${CONFIG_FILE}: copyFrom names ${named}, which holds no ${CONFIG_FILE}`);
+  }
+  if (realpathSync(owner) === realpathSync(cwd)) throw new CliError(`${CONFIG_FILE}: copyFrom names itself`);
+  const ownerConfig = loadConfig(owner);
+  if (ownerConfig.copyFrom !== undefined) {
+    throw new CliError(`${CONFIG_FILE}: copyFrom names ${named}, which reads its own copy from elsewhere — name the owner`);
+  }
+  return { owner, config: ownerConfig };
+}
+
+/**
+ * The one guard every writer runs where it loads its project: a checkout that
+ * reads its copy from another changes none of it, so the command is sent to
+ * the owner before anything is read or written.
+ */
+export function refuseInCopyFrom(config: Pick<StetConfig, 'copyFrom'>, command: string): void {
+  const refusal = copyFromRefusal(config, command);
+  if (refusal !== null) throw new CliError(refusal);
+}
+
+/** The line a writer answers in a checkout that reads its copy from another; null elsewhere. The dashboard answers it as a 409. */
+export function copyFromRefusal(config: Pick<StetConfig, 'copyFrom'>, command: string): string | null {
+  return config.copyFrom === undefined ? null : `this checkout reads its copy from ${config.copyFrom}; run stet ${command} there`;
+}
+
+/**
  * The ONE predicate every seam asks. Nothing tests `config.host === 'html'`
  * inline, so the proof that a seam branched is a grep for this name.
  */
@@ -740,6 +995,12 @@ export function isLanguageTag(value: string): boolean {
   return new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }).of(primary) !== undefined;
 }
 
+/** A relative path that stays inside the checkout it is read from. */
+function insideCheckout(file: string): boolean {
+  const at = posix.normalize(file.replace(/\\/g, '/'));
+  return !(isAbsolute(file) || at === '..' || at.startsWith('../'));
+}
+
 function str(
   source: Record<string, unknown>,
   field: string,
@@ -769,11 +1030,11 @@ function obj(source: Record<string, unknown>, field: string): Record<string, unk
 }
 
 /** An array-of-strings field — `managedSurfaces`, `emailSurfaces` and `copyModules`. */
-function stringArray(source: Record<string, unknown>, field: string, fallback: string[]): string[] {
+function stringArray(source: Record<string, unknown>, field: string, fallback: string[], prefix = ''): string[] {
   const value = source[field];
   if (value === undefined) return fallback;
   if (!Array.isArray(value) || value.some((g) => typeof g !== 'string')) {
-    throw new CliError(`${CONFIG_FILE}: ${field} must be an array of strings`);
+    throw new CliError(`${CONFIG_FILE}: ${prefix}${field} must be an array of strings`);
   }
   return value as string[];
 }

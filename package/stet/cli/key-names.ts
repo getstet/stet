@@ -18,6 +18,8 @@
 // key — html-host, source-scan, pages, register, scan, rename, the dashboard's
 // routes — can import it without closing a ring.
 
+import { DESCRIPTOR_SCHEMA } from '../src/descriptor-schema.generated.js';
+
 /** Where a key renders: a file and line, and the element's tag and attribute where stet can read them. */
 export interface Place {
   file: string;
@@ -150,6 +152,15 @@ export function wordsOf(raw: string): string {
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
 }
+
+/**
+ * The descriptor's own key grammar, compiled once — the schema's `keyName`
+ * pattern, read from the generated zero-dependency module rather than
+ * `descriptor.ts`'s re-export, which would drag `ajv` into a file's graph.
+ * A copy module's property name proposes ITSELF as a key, so the question
+ * "could this name be a key" has to be answered by the thing that decides it.
+ */
+export const KEY_NAME = new RegExp(DESCRIPTOR_SCHEMA.$defs.keyName.pattern);
 
 /** A descriptor name part: lowercase letters and digits in words joined by single underscores. */
 export const NAME_PART = /^[a-z0-9]+(?:_[a-z0-9]+)*$/;
@@ -336,7 +347,8 @@ export interface NameParts {
 }
 
 /**
- * A role name before its number: the parts joined by `_`, at most
+ * A role name before its number: the parts joined by `joiner` (`_`, or `.` on a
+ * project whose `keyStyle` is dotted; the words inside a part keep `_`), at most
  * {@link BASE_MAX} characters. Past it the section loses words from its end,
  * then the page from its start, then the section goes, then the page; the item
  * and the role are never cut here — the role being capped by `roleOf` — so
@@ -345,11 +357,12 @@ export interface NameParts {
  * would open with a digit takes {@link NO_SECTION} in front, since
  * `copy.2026_x` is no JavaScript a host could write.
  */
-export function baseName(parts: NameParts): string {
+export function baseName(parts: NameParts, joiner: '_' | '.' = '_'): string {
   let page = parts.page === undefined ? [] : parts.page.split('_').filter((w) => w !== '');
   let section =
     parts.section === undefined ? [] : (parts.section ?? NO_SECTION).split('_').filter((w) => w !== '');
-  const join = (): string => [...page, ...section, ...(parts.item === undefined ? [] : [parts.item]), parts.role].join('_');
+  const join = (): string =>
+    [...[page.join('_'), section.join('_')].filter((w) => w !== ''), ...(parts.item === undefined ? [] : [parts.item]), parts.role].join(joiner);
   while (join().length > BASE_MAX && section.length > 1) section = section.slice(0, -1);
   while (join().length > BASE_MAX && page.length > 1) page = page.slice(1);
   if (join().length > BASE_MAX) section = [];
@@ -357,7 +370,13 @@ export function baseName(parts: NameParts): string {
   const joined = join();
   if (!/^[0-9]/.test(joined)) return joined;
   // The item is never cut, so a name carrying one takes its prefix whole.
-  return parts.item === undefined ? firstWords(`${NO_SECTION}_${joined}`, Infinity, BASE_MAX) : `${NO_SECTION}_${joined}`;
+  const prefixed = `${NO_SECTION}${joiner}${joined}`;
+  if (parts.item !== undefined) return prefixed;
+  if (joiner === '_') return firstWords(prefixed, Infinity, BASE_MAX);
+  // `firstWords` reads `_` as the word break and would rewrite the dots; cut at the last separator that fits.
+  if (prefixed.length <= BASE_MAX) return prefixed;
+  const cut = Math.max(prefixed.lastIndexOf('.', BASE_MAX), prefixed.lastIndexOf('_', BASE_MAX));
+  return cut > 0 ? prefixed.slice(0, cut) : prefixed.slice(0, BASE_MAX);
 }
 
 /**

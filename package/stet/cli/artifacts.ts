@@ -9,16 +9,20 @@
  * construction.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { canonicalize, generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
+import { canonicalize, embeddedHash, generateDefaultsModule, generateRegistry, generateResolvedModule } from '../src/codegen.js';
 import type { Snapshot } from '../src/snapshot.js';
 import type { Descriptor } from '../src/types.js';
-import { isHtmlHost, type StetConfig } from './config.js';
+import { CONFIG_FILE, isHtmlHost, keptFileReached, markAttributes, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
+import { generateOutput } from './generated.js';
 import { planDocuments } from './html-host.js';
 import { CliError, UsageError, type Report } from './report.js';
+import { completeStatus, statusPlan, type StatusFile } from './status.js';
+import { containsPath } from './static-files.js';
+import { isStoreBacked } from './store.js';
 
 /** JSON, keys sorted at every depth, two-space indent, one trailing newline. */
 export function writeJsonDeterministic(path: string, value: unknown): void {
@@ -154,8 +158,98 @@ export function writePlanned(
 }
 
 /**
- * The six repo forms as one update batch — the descriptor, the snapshot and
- * the regenerated codegen files.
+ * The forms that ride beside the descriptor and the snapshot: the approval
+ * status file, planned over `completeStatus` so it holds every declared key —
+ * null while the file does not exist and nothing is approved, and always null
+ * on a store-backed project, where publishing is the approval — and one write
+ * per generated output, from the snapshot's default locale.
+ *
+ * Every file written here stays inside the checkout BY REAL PATH: a symlinked
+ * folder or file, or a `copyFrom` checkout whose path runs through a link into
+ * its owner, is refused before a byte is planned, since `config.ts` can only
+ * test the path as written.
+ *
+ * A `script` or `esm` output already on disk without stet's header is the
+ * host's own file: its plan stays `differs`, so the batch refuses rather than
+ * replace it. A `json` output has no header to tell by, so a file that differs
+ * is updated only when it parses as a JSON object whose keys are all keys this
+ * output writes or the descriptor on disk declares (stet's earlier output, which
+ * a removal or a rename leaves holding a key the new text no longer has, or a
+ * subset of it); any other content is the host's own and the plan stays `differs`.
+ */
+export function planSideForms(
+  cwd: string,
+  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'bundlePath' | 'statusPath' | 'readPath' | 'codegen' | 'host' | 'managedSurfaces' | 'store' | 'generated' | 'placeholders' | 'locales'>,
+  descriptor: Descriptor,
+  snapshot: Snapshot,
+  status: StatusFile | null,
+): { status: WritePlan | null; generated: WritePlan[] } {
+  const held = status === null || isStoreBacked(config.store) ? null : status;
+  const generated = config.generated.map((entry, i) => {
+    if (!containsPath(cwd, entry.file)) {
+      throw new CliError(`${CONFIG_FILE}: generated[${i}].file must be inside this checkout — a second checkout generates its own file through copyFrom`);
+    }
+    if (keptFileReached(config, cwd, entry.file) !== null) {
+      throw new CliError(`${CONFIG_FILE}: generated[${i}].file names a file stet already keeps — ${entry.file}`);
+    }
+    const plan = planWrite(join(cwd, entry.file), generateOutput(entry, descriptor, snapshot, status, config.placeholders, config.locales.default), entry.file);
+    if (plan.status !== 'unchanged' && existsSync(plan.path) && statSync(plan.path).nlink > 1) {
+      throw new CliError(`${CONFIG_FILE}: generated[${i}].file ${entry.file} is a hard link — stet writes only files with one name`);
+    }
+    return plan.status === 'differs' && isHostsOwn(entry.format, plan, () => declaredOnDisk(cwd, config.descriptorPath)) ? plan : asUpdate(plan);
+  });
+  const statusWrite = held === null ? null : statusPlan(cwd, config, completeStatus(held, descriptor));
+  if (statusWrite !== null && !containsPath(cwd, config.statusPath)) {
+    throw new CliError(`${CONFIG_FILE}: statusPath must be a file path inside this checkout`);
+  }
+  return { status: statusWrite, generated };
+}
+
+/** Whether the file a differing output plan found is the host's own: a script or module with no stet header, or JSON holding a key neither this output writes nor the descriptor declares. */
+function isHostsOwn(format: 'script' | 'esm' | 'json', plan: WritePlan, declared: () => Set<string>): boolean {
+  const text = readFileSync(plan.path, 'utf8');
+  if (format !== 'json') return embeddedHash(text) === null;
+  try {
+    const held: unknown = JSON.parse(text);
+    if (held === null || typeof held !== 'object' || Array.isArray(held)) return true;
+    const known = new Set([...Object.keys(JSON.parse(plan.text) as object), ...declared()]);
+    return Object.keys(held).some((key) => !known.has(key));
+  } catch {
+    return true;
+  }
+}
+
+/** The keys the descriptor on disk declares, before this batch writes; none where it cannot be read. */
+function declaredOnDisk(cwd: string, descriptorPath: string): Set<string> {
+  try {
+    const keys = (JSON.parse(readFileSync(join(cwd, descriptorPath), 'utf8')) as { keys?: unknown }).keys;
+    return new Set(keys !== null && typeof keys === 'object' ? Object.keys(keys) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * The JSON forms named by `labels` left as they are on disk when what the plan
+ * would write parses to the same content — a hand-formatted descriptor or
+ * snapshot an approval did not change keeps its bytes.
+ */
+export function keepFormatting(plans: WritePlan[], labels: readonly string[]): WritePlan[] {
+  const same = (plan: WritePlan): boolean => {
+    try {
+      const canon = (text: string): string => JSON.stringify(canonicalize(JSON.parse(text)));
+      return canon(readFileSync(plan.path, 'utf8')) === canon(plan.text);
+    } catch {
+      return false;
+    }
+  };
+  return plans.map((plan) => (labels.includes(plan.label) && plan.status === 'write' && existsSync(plan.path) && same(plan) ? { ...plan, status: 'unchanged' as const } : plan));
+}
+
+/**
+ * The repo forms as one update batch — the descriptor, the snapshot, the
+ * regenerated codegen files, once one exists the status file, and the
+ * generated outputs.
  *
  * The three commands that write keys write exactly these six, and a batch that
  * missed one would leave a permanent finding: `generateRegistry` stamps the
@@ -170,18 +264,31 @@ export function writePlanned(
  * leaves behind.
  *
  * `config.ts`'s runtime import of this module is one runtime edge between the
- * two; `isHtmlHost` is the other, and it runs the other way. This module also
- * reaches `html-host.ts` and `files.ts` at runtime — one way, since neither of
- * those imports anything from here.
+ * two; `isHtmlHost` is the other, and it runs the other way, and `status.ts`,
+ * `store.ts` and `generated.ts` (through `status.ts`) each run back the same
+ * way (a function called, never a value read at load). This module also reaches `html-host.ts` and `files.ts` at
+ * runtime — one way, since neither of those imports anything from here.
+ *
+ * A checkout that reads its copy from another (`copyFrom`) owns its generated
+ * outputs alone, whatever its `host`: the forms passed are the owner's, and
+ * the batch is those outputs and nothing else — never a descriptor, snapshot
+ * or codegen file planned into a checkout that owns none of them.
  */
 export function planRepoForms(
   cwd: string,
-  config: Pick<StetConfig, 'descriptorPath' | 'snapshotPath' | 'codegen' | 'host' | 'managedSurfaces'>,
+  config: Pick<
+    StetConfig,
+    'descriptorPath' | 'snapshotPath' | 'bundlePath' | 'readPath' | 'codegen' | 'host' | 'managedSurfaces' | 'reads' | 'statusPath' | 'store' | 'generated' | 'placeholders' | 'locales' | 'copyFrom'
+  >,
   descriptor: Descriptor,
   snapshot: Snapshot,
+  status: StatusFile | null,
   report: Report,
 ): WritePlan[] {
   const at = (rel: string): string => join(cwd, rel);
+  const side = planSideForms(cwd, config, descriptor, snapshot, status);
+  if (config.copyFrom !== undefined) return side.generated;
+  const sideWrites = [...(side.status === null ? [] : [side.status]), ...side.generated];
   // On the static-HTML host the repo forms are the descriptor, the snapshot and
   // the MARKED DOCUMENTS: there are no codegen files, and each document is
   // regenerated from the snapshot rather than written from a generator.
@@ -192,6 +299,7 @@ export function planRepoForms(
       descriptor,
       snapshot,
       report,
+      markAttributes(config),
     );
     // The batch NEVER runs with a document left half-true. This is the one place
     // the refusal lives, so every command that writes on this host inherits it.
@@ -206,6 +314,7 @@ export function planRepoForms(
       asUpdate(planJson(at(config.descriptorPath), descriptor, config.descriptorPath)),
       asUpdate(planJson(at(config.snapshotPath), snapshot, config.snapshotPath)),
       ...writes.map((w) => asUpdate(planWrite(w.abs, w.text, w.rel))),
+      ...sideWrites,
     ];
   }
   const { keysTs, dts } = generateRegistry(descriptor);
@@ -216,6 +325,7 @@ export function planRepoForms(
     asUpdate(planWrite(at(config.codegen.dts), dts, config.codegen.dts)),
     asUpdate(planWrite(at(config.codegen.defaults), generateDefaultsModule(snapshot), config.codegen.defaults)),
     asUpdate(planWrite(at(config.codegen.resolved), generateResolvedModule(descriptor, snapshot), config.codegen.resolved)),
+    ...sideWrites,
   ];
 }
 

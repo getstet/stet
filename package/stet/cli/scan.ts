@@ -17,21 +17,25 @@ import { join, posix } from 'node:path';
 import type * as TS from 'typescript';
 
 import { loadDescriptor } from '../src/descriptor.js';
+import { toStet } from '../src/placeholders.js';
 import { loadSnapshot, type Snapshot } from '../src/snapshot.js';
 import type { Descriptor, PageDef } from '../src/types.js';
 
 import { flag, noPositionals, parse, refuseEnv } from './args.js';
 import { writeJsonDeterministic } from './artifacts.js';
-import { isHtmlHost, loadConfig, type StetConfig } from './config.js';
+import { isHtmlHost, keyJoiner, loadConfig, markAttributes, type StetConfig } from './config.js';
 import { isRegistryFile, proposeTemplates, templateExports, type ExtractSkip } from './email-extract.js';
 import { filesForGlobs } from './files.js';
 import { htmlBaseName, planHtmlRegister, proposeHtml } from './html-host.js';
-import { classifyAdoption, isRecord, planJsxRun, type Adoption } from './register-run.js';
+import { calleeName } from './key-usage.js';
+import { numberNames } from './key-names.js';
+import { classifyAdoption, isRecord, planJsxRun, sharedTextIndex, type Adoption } from './register-run.js';
 import type { CliIo } from './main.js';
 import { detectPagesRoots, htmlPageOf, pageOfFile, proposePages } from './pages.js';
 import { CliError, clip, lineCol, plural, posixRelative, Report } from './report.js';
 import {
   astroFindings,
+  copyTablesOf,
   dialectOf,
   isJsxFile,
   loadTypescript,
@@ -41,8 +45,12 @@ import {
   scanDialect,
   scriptKindFor,
   scanModule,
+  scanScreen,
   scanSource,
   type LocatedLiteral,
+  type ScanResult,
+  type ScreenLiteral,
+  type ScreenScan,
   type Span,
 } from './source-scan.js';
 
@@ -51,8 +59,8 @@ const LITERAL_EXCERPT = 60;
 
 interface BaselineEntry {
   file: string;
-  /** A literal's own context, plus `'dialect'` — the text detector's, which no `LocatedLiteral` can carry — and `'data'`, the display strings of module-scope data. */
-  context: LocatedLiteral['context'] | 'dialect' | 'data' | 'html';
+  /** A literal's own context, plus `'dialect'` — the text detector's, which no `LocatedLiteral` can carry — `'data'`, the display strings of module-scope data, and `'screen'`, a JavaScript screen's copy. */
+  context: LocatedLiteral['context'] | 'dialect' | 'data' | 'html' | 'screen';
   text: string;
 }
 
@@ -166,7 +174,14 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   const surfaceGlobs = [...new Set(config.managedSurfaces)];
   const moduleGlobs = [...new Set(config.copyModules)];
   const declared = [...new Set([...surfaceGlobs, ...moduleGlobs])];
-  const perGlob = declared.map((glob) => ({ glob, matched: filesForGlobs(io.cwd, [glob]) }));
+  // A generated output is stet's own file: it is never a surface or a copy module, whatever glob matches it.
+  const outputs = new Set(config.generated.map((entry) => posix.normalize(entry.file)));
+  // A glob whose every match is an output is not a dead glob: the output was bound to it (a copy module that `pull` now writes).
+  const perGlob = declared.map((glob) => {
+    const found = filesForGlobs(io.cwd, [glob]);
+    const matched = found.filter((file) => !outputs.has(file));
+    return { glob, matched, outputsOnly: found.length > 0 && matched.length === 0 };
+  });
   const files = [...new Set(perGlob.flatMap((entry) => entry.matched))].sort();
 
   // Each read at most once, and only where something asks. The descriptor is
@@ -191,8 +206,26 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   }
   let neededCompiler = false;
 
-  const i18nLines = (file: string, source: string, skips: { pos: number }[]): void => {
+  // A call of a configured read function is a read of a stet key, not catalog copy: it prints no i18n line.
+  const readNames = new Set((config.reads?.functions ?? []).map((f) => f.name));
+  const readTs = compilerRefusal === null && readNames.size > 0 ? await loadTypescript() : null;
+  const insideRead = (sf: TS.SourceFile, pos: number): boolean => {
+    if (readTs === null) return false;
+    let found = false;
+    const visit = (node: TS.Node): void => {
+      if (found || node.getStart(sf) > pos || node.end <= pos) return;
+      const callee = readTs.isCallExpression(node) ? node.expression : readTs.isTaggedTemplateExpression(node) ? node.tag : undefined;
+      const name = callee === undefined ? undefined : calleeName(readTs, callee);
+      if (name !== undefined && readNames.has(name)) found = true;
+      else readTs.forEachChild(node, visit);
+    };
+    visit(sf);
+    return found;
+  };
+  const i18nLines = (file: string, source: string, skips: { pos: number }[], parsed?: TS.SourceFile): void => {
+    const sf = readTs === null || skips.length === 0 ? null : (parsed ?? readTs.createSourceFile(file, source, readTs.ScriptTarget.Latest, true, scriptKindFor(readTs, file)));
     for (const skip of skips) {
+      if (sf !== null && insideRead(sf, skip.pos)) continue;
       const { line } = lineCol(source, skip.pos);
       report.line(`${file}:${line}: i18n copy — outside stet's v1 scope, not a key`);
     }
@@ -213,7 +246,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   // The forms are handed in EMPTY: the locator's only read is the document's
   // own marks, so scan's raw descriptor and snapshot — which it deliberately
   // never validates — have nothing to contribute and are not converted here.
-  const html = isHtmlHost(config) ? proposeHtml(io.cwd, files) : null;
+  const html = isHtmlHost(config) ? proposeHtml(io.cwd, files, markAttributes(config)) : null;
 
   // The names `register` would give, from its own naming pass over the same
   // files, so the key scan proposes is the key register adds. The pass reads
@@ -233,11 +266,34 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
           report: new Report(),
           pageOf: (file) => htmlPageOf(io.cwd, file, forms.descriptor.pages),
           set: html,
+          attributes: markAttributes(config),
+          joiner: keyJoiner(config),
         }).keyAt
       : null;
   const run =
     html === null && forms !== null && compilerRefusal === null
       ? await planJsxRun({ cwd: io.cwd, config, descriptor: forms.descriptor, snapshot: forms.snapshot, report: new Report() })
+      : null;
+  // A JavaScript screen's copy, over the parse the JSX run made where it made one, named past
+  // every key declared and every name the runs above give (D15).
+  const declaredKeys = descriptorOnce()?.keys;
+  const reserved = new Set<string>([
+    ...(isRecord(declaredKeys) ? Object.keys(declaredKeys) : []),
+    ...(run?.nameOf.values() ?? []),
+    ...(run?.propertyNames.keys() ?? []),
+    ...(keyAt?.values() ?? []),
+  ]);
+  const screens =
+    compilerRefusal === null
+      ? await screenRun({
+          cwd: io.cwd,
+          config,
+          files: files.filter((file) => surfaceGlobs.some((glob) => matchGlob(glob, file))),
+          ...(run === null ? {} : { parsed: run.parsed }),
+          pages: rawPages(descriptorOnce()),
+          held: forms === null ? null : sharedTextIndex(forms.descriptor, forms.snapshot),
+          taken: (name) => reserved.has(name),
+        })
       : null;
 
   let refused = 0;
@@ -263,7 +319,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
               ? ` (${proposal.attr})`
               : ` (meta ${proposal.metaName})`;
         // The role name before its number, where the naming pass gave none.
-        const base = htmlBaseName(htmlPageOf(io.cwd, file, rawPages(descriptorOnce())), proposal);
+        const base = htmlBaseName(htmlPageOf(io.cwd, file, rawPages(descriptorOnce())), proposal, keyJoiner(config));
         report.warn(
           'scan',
           `${file}:${proposal.line} possible copy ${JSON.stringify(clip(proposal.value, LITERAL_EXCERPT))}${suffix} — ` +
@@ -332,11 +388,12 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
     if (isSurface) {
       // The naming pass parsed this file already; a file it did not reach is parsed here.
       const page = pageOfFile(io.cwd, file, rawPages(descriptorOnce()));
-      const held = run?.parsed.get(file);
+      const held = run?.parsed.get(file) ?? screens?.parsed.get(file);
       const result =
         held === undefined
           ? await scanSource(file, source, {
               readPathImport: config.readPath.import,
+              joiner: keyJoiner(config),
               ...(page === undefined ? {} : { page }),
             })
           : held;
@@ -346,7 +403,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
         continue;
       }
       handoff = { sourceFile: result.sourceFile, claimed: result.claimed };
-      i18nLines(file, source, result.i18nSkips);
+      i18nLines(file, source, result.i18nSkips, result.sourceFile);
       // Display strings in module-scope data: reported like the dialects' text, no key proposed.
       for (const found of result.data) {
         if (baselined({ file, context: 'data', text: found.text })) continue;
@@ -375,13 +432,28 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
         report.warn('scan', `${file}:${line} possible copy ${JSON.stringify(clip(item.text, LITERAL_EXCERPT))}`, undefined, { at: { file, line } });
         warned += 1;
       }
+      // A JavaScript screen's copy, proposed as register lists it for adoption by hand, and its fragments as possible copy (D15).
+      const screen = screens?.byFile.get(file);
+      for (const literal of screen?.literals ?? []) {
+        if (baselined({ file, context: 'screen', text: literal.text })) continue;
+        const { line, col } = lineCol(source, literal.pos);
+        const name = screens?.nameOf.get(literal) ?? literal.proposedKey;
+        report.warn('scan', `${file}:${line}:${col} unkeyed copy ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))} — propose key ${name}`, name, { at: { file, line, col } });
+        warned += 1;
+      }
+      for (const found of screen?.possible ?? []) {
+        if (baselined({ file, context: 'screen', text: found.text })) continue;
+        const { line } = lineCol(source, found.pos);
+        report.warn('scan', `${file}:${line} possible copy ${JSON.stringify(clip(found.text, LITERAL_EXCERPT))}`, undefined, { at: { file, line } });
+        warned += 1;
+      }
     }
 
     // A file both lists match is parsed once and walked by both
     // classifications, neither of them twice: the JSX walk above owns every
     // position it classified, and the module walk covers what it leaves.
     if (isModule) {
-      const result = run?.modules.get(file) ?? (await scanModule(file, source, handoff));
+      const result = run?.modules.get(file) ?? (await scanModule(file, source, { ...handoff, tables: copyTablesOf(config) }));
       if (result.parseErrors) {
         report.line(`${file}: could not be parsed cleanly — reported, not scanned`);
         refused += 1;
@@ -395,7 +467,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
       if (!isSurface && isJsxFile(file)) {
         report.warn('scan', `${file}: JSX not scanned — the file is a copy module only; add it to managedSurfaces`);
       }
-      i18nLines(file, source, result.i18nSkips);
+      i18nLines(file, source, result.i18nSkips, handoff?.sourceFile);
       const descriptor = descriptorOnce();
       const snapshot = snapshotOnce();
       for (const literal of result.literals) {
@@ -409,7 +481,10 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
           warned += 1;
           continue;
         }
-        const verdict = classifyAdoption(descriptor, snapshot, literal.proposedKey, literal.text);
+        // The table's own form, named on the line: ` (pair)`, ` (object)`, nothing for a bare string.
+        const form = literal.form === undefined ? '' : ` (${literal.form})`;
+        // A `{name}` host's table reads in its own spelling; the snapshot holds the stored `{{name}}`.
+        const verdict = classifyAdoption(descriptor, snapshot, literal.proposedKey, toStet(literal.text, config.placeholders));
         // Adopted is SILENT — the module's literal IS the snapshot default.
         if (verdict === 'adopted') continue;
         if (verdict === 'diverged') {
@@ -427,7 +502,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
           report.warn(
             'scan',
             `${at} ${literal.proposedKey} diverged from the snapshot default — ` +
-              `module ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))}, ` +
+              `module ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))}${form}, ` +
               (stored === undefined
                 ? 'snapshot has no default'
                 : `snapshot ${JSON.stringify(clip(stored, LITERAL_EXCERPT))}`),
@@ -441,7 +516,7 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
         report.warn(
           'scan',
           note === undefined
-            ? `${at} unkeyed copy ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))} — propose key ${literal.proposedKey}`
+            ? `${at} unkeyed copy ${JSON.stringify(clip(literal.text, LITERAL_EXCERPT))}${form} — propose key ${literal.proposedKey}`
             : `${at} ${note}`,
           literal.proposedKey,
         );
@@ -470,10 +545,10 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   // A run that scanned nothing must never read as a clean bill. Ahead of the
   // `--baseline` return, so a baseline written over nothing warns too; silent
   // where NOTHING is declared, which is the bare repo's own contract.
-  for (const { glob, matched } of perGlob) {
-    if (matched.length === 0) report.warn('scan', `glob matched no files: ${glob}`);
+  for (const { glob, matched, outputsOnly } of perGlob) {
+    if (matched.length === 0 && !outputsOnly) report.warn('scan', `glob matched no files: ${glob}`);
   }
-  if (perGlob.length > 0 && files.length === 0) {
+  if (perGlob.length > 0 && files.length === 0 && !perGlob.every((entry) => entry.outputsOnly)) {
     report.warn('scan', 'the declared globs matched no files — nothing was scanned');
   }
   // The second zero-shape, the same class: files MATCHED and the parser
@@ -512,6 +587,66 @@ export async function runScan(args: string[], io: CliIo): Promise<number> {
   // R4's warn never fails, so it joins the report after the promotion.
   await undeclaredTemplates(io, config, report, descriptorOnce());
   return report.emit(io, { json: flag(values, 'json') });
+}
+
+/** A run's JavaScript screens: each file's parse and copy, and the name each proposal takes. */
+export interface ScreenRun {
+  /** The files this pass parsed itself, by path — the ones the JSX run did not. */
+  parsed: Map<string, ScanResult>;
+  byFile: Map<string, ScreenScan>;
+  nameOf: Map<ScreenLiteral, string>;
+}
+
+/**
+ * The screen pass over a run's surfaces (D15), shared by `scan` and `register`
+ * so the name scan proposes is the key register adds. It runs on a static-HTML
+ * host, and on a JavaScript host once the config names `reads` or
+ * `scan.builders`: a JSX or Astro host that names neither scans as before, and
+ * null answers. A file the JSX run parsed (`parsed`) is read over that parse;
+ * a file it refused is skipped; a template dialect is never one. A proposal
+ * whose text a declared key already holds (`held`) is recorded already and
+ * drops out. Identical texts take one name; the rest are numbered across the
+ * run past every name `taken` answers for.
+ */
+export async function screenRun(input: {
+  cwd: string;
+  config: StetConfig;
+  files: readonly string[];
+  parsed?: ReadonlyMap<string, ScanResult | null>;
+  pages: Record<string, PageDef> | undefined;
+  held: ReadonlyMap<string, readonly string[]> | null;
+  taken: (name: string) => boolean;
+}): Promise<ScreenRun | null> {
+  const { cwd, config } = input;
+  if (!isHtmlHost(config) && config.reads === undefined && (config.scan.builders ?? []).length === 0) return null;
+  const files = input.files.filter((file) => dialectOf(file) === null && input.parsed?.get(file) !== null);
+  const out: ScreenRun = { parsed: new Map(), byFile: new Map(), nameOf: new Map() };
+  if (files.length === 0) return out;
+  const ts = await loadTypescript();
+  const options = { reads: (config.reads?.functions ?? []).map((f) => f.name), attributes: markAttributes(config), builders: config.scan.builders ?? [], joiner: keyJoiner(config) };
+  const fresh: ScreenLiteral[] = [];
+  const first = new Map<string, ScreenLiteral>();
+  for (const file of files) {
+    const page = pageOfFile(cwd, file, input.pages);
+    let result = input.parsed?.get(file);
+    if (result === undefined || result === null) {
+      result = await scanSource(file, readFileSync(join(cwd, file), 'utf8'), { readPathImport: config.readPath.import, joiner: keyJoiner(config), ...(page === undefined ? {} : { page }) });
+      out.parsed.set(file, result);
+    }
+    if (result.parseErrors) continue;
+    const scan = scanScreen(ts, result.sourceFile, { ...options, ...(page === undefined ? {} : { page }) });
+    scan.literals = scan.literals.filter((literal) => input.held?.get(toStet(literal.text, config.placeholders)) === undefined);
+    out.byFile.set(file, scan);
+    for (const literal of scan.literals) {
+      if (first.has(literal.text)) continue;
+      first.set(literal.text, literal);
+      fresh.push(literal);
+    }
+  }
+  const names = numberNames(fresh.map((literal) => literal.proposedKey), input.taken);
+  const nameOfText = new Map(fresh.map((literal, i) => [literal.text, names[i] as string]));
+  for (const scan of out.byFile.values()) for (const literal of scan.literals) out.nameOf.set(literal, nameOfText.get(literal.text) as string);
+  return out;
 }
 
 /**

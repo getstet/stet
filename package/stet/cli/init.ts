@@ -37,6 +37,7 @@ import {
   defaultStoreBlock,
   formsSecretEnvOf,
   pathAliasMappings,
+  withoutNewDefaults,
   type StetConfig,
 } from './config.js';
 import { filesForGlobs } from './files.js';
@@ -151,7 +152,7 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
       // Computed from the file as it stands, so an existing `.env.example` is extended and never refused.
       plans.push(asUpdate(plan('.env.example', envExample(target, formsEnvNames(config, storeBacked)))));
     }
-    plans.push(planJsonAt(CONFIG_FILE, router === 'vite' ? viteConfigProjection(config) : config));
+    plans.push(planJsonAt(CONFIG_FILE, router === 'vite' ? viteConfigProjection(config) : withoutNewDefaults(config)));
   }
 
   const { written, unchanged } = writePlanned(plans, {
@@ -215,7 +216,7 @@ export async function runInit(args: string[], io: CliIo): Promise<number> {
   }
 
   report.line('');
-  check(config, target, report);
+  await check(config, target, report);
   report.line('');
   // A store-backed read path serves `config.bundlePath`, which `pull` writes and
   // `init` does not — so a fresh store host must `pull` before that path
@@ -407,7 +408,7 @@ function htmlConfigProjection(config: StetConfig): Record<string, unknown> {
 
 /** The config a Vite SPA writes: no read path and no mount route — the browser reads the provider. */
 function viteConfigProjection(config: StetConfig): Record<string, unknown> {
-  const { readPath: _readPath, mountRoute: _mountRoute, ...rest } = config;
+  const { readPath: _readPath, mountRoute: _mountRoute, ...rest } = withoutNewDefaults(config);
   return rest;
 }
 

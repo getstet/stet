@@ -23,7 +23,7 @@ import type * as TS from 'typescript';
 
 import { tagTree, type TagNode } from '../src/placeholder.js';
 import { escapeRegExp } from '../src/seo.js';
-import { loadConfig, pathAliasMappings, resolveSpecifier, type StetConfig } from './config.js';
+import { keyJoiner, loadConfig, pathAliasMappings, resolveSpecifier, type StetConfig } from './config.js';
 import { filesForGlobs } from './files.js';
 import {
   attrOf,
@@ -302,7 +302,7 @@ function bindingOf(ts: typeof import('typescript'), cwd: string, config: StetCon
     for (const span of spans) {
       for (const m of r.page.slice(span.start, span.end).matchAll(KEY_READ)) {
         const at = span.start + m.index;
-        if (within(r.code.nonCode, at) || !/^copy(?!Map)/.test(m[0]) || /[\w$.]/.test(r.page.charAt(at - 1))) continue;
+        if (m[6] !== undefined || within(r.code.nonCode, at) || !/^copy(?!Map)/.test(m[0]) || /[\w$.]/.test(r.page.charAt(at - 1))) continue;
         if (m[2] !== undefined || m[4] !== undefined) evidence.call = true;
         else if (m[5] !== 'get') evidence.property = true;
       }
@@ -923,12 +923,15 @@ export function planAstroFile(input: {
       const place = placeOf({ file, line, ...c.at });
       const head = isHeadKind(place) || c.inHead === true;
       const naming = c.el === undefined ? { sectionWord: null, role: roleOf(place) } : namingOf(c.el, r.parents, items, place);
-      const proposedKey = baseName({
-        ...(page === undefined ? {} : { page }),
-        ...(head ? {} : { section: naming.sectionWord }),
-        ...(naming.item === undefined ? {} : { item: naming.item }),
-        role: naming.role,
-      });
+      const proposedKey = baseName(
+        {
+          ...(page === undefined ? {} : { page }),
+          ...(head ? {} : { section: naming.sectionWord }),
+          ...(naming.item === undefined ? {} : { item: naming.item }),
+          role: naming.role,
+        },
+        keyJoiner(config),
+      );
       return {
         file,
         pos: c.pos + r.bom,
@@ -2040,12 +2043,15 @@ export function astroReads(
     const place = placeOf({ file, line: lineAt(f.at + r.bom), ...f.where });
     const head = f.head || isHeadKind(place);
     const naming = f.el === undefined ? { sectionWord: null, role: roleOf(place) } : namingOf(f.el, r.parents, items, place);
-    const base = baseName({
-      ...(page === undefined ? {} : { page }),
-      ...(head ? {} : { section: naming.sectionWord }),
-      ...(naming.item === undefined ? {} : { item: naming.item }),
-      role: naming.role,
-    });
+    const base = baseName(
+      {
+        ...(page === undefined ? {} : { page }),
+        ...(head ? {} : { section: naming.sectionWord }),
+        ...(naming.item === undefined ? {} : { item: naming.item }),
+        role: naming.role,
+      },
+      keyJoiner(config),
+    );
     return { key: f.key, line: place.line, place, base, section: head ? null : naming.sectionWord };
   });
 }
@@ -2236,7 +2242,8 @@ export function planAstroUnrewrite(input: {
   for (const scope of scopes) {
     for (const m of page.slice(scope.span.start, scope.span.end).matchAll(KEY_READ)) {
       const at = scope.span.start + m.index;
-      if (!inCode(at) || /[\w$.]/.test(page.charAt(at - 1))) continue;
+      // The element form is no read this rewrite plans: the check below refuses it as it always has.
+      if (m[6] !== undefined || !inCode(at) || /[\w$.]/.test(page.charAt(at - 1))) continue;
       const name = /^(copyMap|copy|get)/.exec(m[0])?.[1] as string;
       if (scope.bindings.get(name) !== 'stet') continue;
       if (scope.brace !== undefined && rebinds(page, scope.brace, name)) {
@@ -2474,7 +2481,7 @@ function richReadOf(page: string, start: number, end: number, mode: 'jsx' | 'tru
   const sticky = new RegExp(KEY_READ.source, 'y');
   sticky.lastIndex = i;
   const m = sticky.exec(page);
-  if (m === null || m[5] === 'get') return null;
+  if (m === null || m[5] === 'get' || m[6] !== undefined) return null;
   const at = i;
   i += m[0].length;
   if (m[2] !== undefined || m[4] !== undefined) {
@@ -2689,7 +2696,7 @@ export function unrewrittenClean(
   for (const span of spans) {
     for (const m of a.slice(span.start, span.end).matchAll(KEY_READ)) {
       const at = span.start + m.index;
-      if (!within(nonCode, at) && !/[\w$.]/.test(a.charAt(at - 1)) && expected.names.has(/^(copyMap|copy|get)/.exec(m[0])?.[1] as string)) return false;
+      if (m[6] === undefined && !within(nonCode, at) && !/[\w$.]/.test(a.charAt(at - 1)) && expected.names.has(/^(copyMap|copy|get)/.exec(m[0])?.[1] as string)) return false;
     }
     if (expected.names.has('richParts') && [...a.slice(span.start, span.end).matchAll(/(?<![\w$.])richParts\s*\(/g)].some((m) => !within(nonCode, span.start + m.index))) return false;
   }

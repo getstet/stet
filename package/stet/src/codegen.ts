@@ -88,8 +88,8 @@ export function generateRegistry(d: Descriptor): { keysTs: string; dts: string }
   for (const key of keys) {
     // The schema constrains key names; a hand-built descriptor does not meet it,
     // and emitting a key that needs escaping would emit broken TypeScript.
-    if (!/^[A-Za-z0-9_]+$/.test(key)) {
-      throw new Error(`cannot generate a registry for key "${key}": key names are [A-Za-z0-9_] only`);
+    if (!/^[A-Za-z0-9_.]+$/.test(key)) {
+      throw new Error(`cannot generate a registry for key "${key}": key names are [A-Za-z0-9_.] only`);
     }
   }
   const header = generatedHeader('descriptor.json', sourceHash(d));

@@ -25,7 +25,7 @@ import {
 import { SECTION_WORD_ROWS } from './fixtures/section-words.js';
 
 /** descriptor.schema.json:44 — every proposed key must satisfy it. */
-const KEY_REGEX = /^[a-z0-9]+(?:_{1,2}[a-z0-9]+)*$/;
+const KEY_REGEX = /^[a-z0-9]+(?:(?:\.|_{1,2})[a-z0-9]+)*$/;
 
 const scan = (file: string, source: string) => scanSource(file, source, { readPathImport: '@/lib/content' });
 
