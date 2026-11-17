@@ -1,0 +1,34 @@
+{
+  "apiTokenEnv": "STET_API_TOKEN",
+  "bundlePath": ".stet/bundle.json",
+  "codegen": {
+    "defaults": "content/defaults.ts",
+    "dts": "content/stet-env.d.ts",
+    "registry": "content/keys.ts"
+  },
+  "copyModules": [],
+  "descriptorPath": "content/descriptor.json",
+  "emailSurfaces": [],
+  "locales": {
+    "default": "default",
+    "enabled": [
+      "default"
+    ]
+  },
+  "managedSurfaces": [
+    "src/app/**/*.tsx",
+    "src/components/**/*.tsx"
+  ],
+  "project": "default",
+  "readPath": {
+    "file": "src/copy/index.ts",
+    "import": "@/copy"
+  },
+  "rootLayout": "src/app/_layout.tsx",
+  "router": "app",
+  "scan": {
+    "baseline": ".stet/scan-baseline.json",
+    "severity": "warn"
+  },
+  "snapshotPath": "content/defaults.json"
+}

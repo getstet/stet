@@ -1,0 +1,26 @@
+{
+  "name": "web-signup",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1 --port 3100",
+    "build": "next build",
+    "start": "next start --hostname 127.0.0.1 --port 3100",
+    "capture": "node scripts/capture.mjs",
+    "check:release": "node scripts/check-release.mjs",
+    "check:live": "node scripts/check-live.mjs"
+  },
+  "dependencies": {
+    "@getstet/stet": "0.3.2",
+    "next": "16.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "playwright": "1.63.0",
+    "typescript": "^5.9.0"
+  }
+}

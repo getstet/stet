@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "app": { "id": "mobile-expo", "title": "Weather sample", "kind": "mobile" },
+  "points": {
+    "welcome": { "screen": "/welcome", "stack": ["/welcome"], "title": "Welcome" },
+    "create-account": { "screen": "/create-account", "stack": ["/welcome", "/create-account"], "title": "Create account" },
+    "onboarding.name": { "screen": "/onboarding/name", "stack": ["/onboarding/name"], "title": "Name", "account": "new" },
+    "onboarding.units": {
+      "screen": "/onboarding/units", "stack": ["/onboarding/name", "/onboarding/units"], "title": "Units", "account": "new"
+    },
+    "onboarding.notifications": {
+      "screen": "/onboarding/notifications", "stack": ["/onboarding/name", "/onboarding/units", "/onboarding/notifications"],
+      "title": "Notifications", "account": "new"
+    },
+    "onboarding.done": {
+      "screen": "/onboarding/done",
+      "stack": ["/onboarding/name", "/onboarding/units", "/onboarding/notifications", "/onboarding/done?notifications=allowed"],
+      "title": "Done", "account": "new"
+    },
+    "onboarding.done.denied": {
+      "screen": "/onboarding/done",
+      "stack": ["/onboarding/name", "/onboarding/units", "/onboarding/notifications", "/onboarding/done?notifications=denied"],
+      "title": "Done — notifications denied", "account": "new"
+    },
+    "home.new": { "screen": "/", "stack": ["/"], "title": "Home — new account", "account": "new" },
+    "home.setup-skipped": { "screen": "/", "stack": ["/?setup=skipped"], "title": "Home — setup skipped", "account": "new" },
+    "sign-in": { "screen": "/sign-in", "stack": ["/welcome", "/sign-in"], "title": "Sign in" },
+    "sign-in.wrong-password": {
+      "screen": "/sign-in", "stack": ["/welcome", "/sign-in?error=wrong-password"], "title": "Sign in — wrong password"
+    },
+    "home": { "screen": "/", "stack": ["/"], "title": "Home", "account": "returning", "fixture": "weather-loaded" },
+    "home.weather-loading": {
+      "screen": "/", "stack": ["/"], "title": "Home — weather loading", "account": "returning", "fixture": "weather-loading"
+    },
+    "home.weather-failed": {
+      "screen": "/", "stack": ["/"], "title": "Home — weather failed", "account": "returning", "fixture": "weather-failed"
+    },
+    "home.city-not-found": {
+      "screen": "/", "stack": ["/?city=Atlantis"], "title": "Home — city not found", "account": "returning", "fixture": "city-not-found"
+    },
+    "profile": { "screen": "/profile", "stack": ["/", "/profile"], "title": "Profile", "account": "returning", "fixture": "weather-loaded" },
+    "settings": {
+      "screen": "/settings", "stack": ["/", "/profile", "/settings"], "title": "Settings", "account": "returning", "fixture": "weather-loaded"
+    },
+    "settings.units": {
+      "screen": "/settings/units", "stack": ["/", "/profile", "/settings", "/settings/units"], "title": "Units",
+      "account": "returning", "fixture": "weather-loaded"
+    },
+    "settings.units.saved": {
+      "screen": "/settings/units", "stack": ["/", "/profile", "/settings", "/settings/units?saved=1"], "title": "Units — saved",
+      "account": "returning", "fixture": "weather-loaded"
+    },
+    "settings.units.unsaved": {
+      "screen": "/settings/units", "stack": ["/", "/profile", "/settings", "/settings/units?draft=fahrenheit&confirm=leave"],
+      "title": "Units — unsaved changes", "account": "returning", "fixture": "weather-loaded"
+    },
+    "home.trial-ended": {
+      "screen": "/", "stack": ["/"], "title": "Home — trial ended", "account": "trial-ended", "fixture": "weather-loaded"
+    },
+    "profile.trial-ended": {
+      "screen": "/profile", "stack": ["/", "/profile"], "title": "Profile — trial ended", "account": "trial-ended", "fixture": "weather-loaded"
+    },
+    "home.many-alerts": {
+      "screen": "/", "stack": ["/"], "title": "Home — 500 alerts", "account": "returning", "fixture": "many-alerts"
+    },
+    "home.long-name": {
+      "screen": "/", "stack": ["/"], "title": "Home — 40-character name", "account": "long-name", "fixture": "weather-loaded"
+    },
+    "profile.long-name": {
+      "screen": "/profile", "stack": ["/", "/profile"], "title": "Profile — 40-character name", "account": "long-name", "fixture": "weather-loaded"
+    },
+    "home.offline": { "screen": "/", "stack": ["/"], "title": "Home — offline", "account": "returning", "fixture": "offline" },
+    "home.session-expired": {
+      "screen": "/", "stack": ["/"], "title": "Home — session expired", "account": "returning", "fixture": "session-expired"
+    }
+  },
+  "flows": [
+    {
+      "id": "first-run", "title": "First run",
+      "steps": [
+        { "point": "welcome" },
+        { "point": "create-account", "action": "Tap Create account" },
+        { "point": "onboarding.name", "action": "Enter an email and password, tap Create account" },
+        { "point": "onboarding.units", "action": "Enter a name, tap Continue" },
+        { "point": "onboarding.notifications", "action": "Choose units, tap Continue" },
+        { "point": "onboarding.done", "action": "Tap Allow notifications" },
+        { "point": "home.new", "action": "Tap Go to my weather" }
+      ],
+      "branches": [
+        {
+          "id": "notifications-denied", "title": "Notifications denied",
+          "from": "onboarding.notifications", "action": "Tap Don't allow",
+          "steps": [ { "point": "onboarding.done.denied" } ],
+          "rejoins": "home.new"
+        },
+        {
+          "id": "skip-onboarding", "title": "Setup skipped",
+          "from": "onboarding.name", "action": "Tap Skip setup",
+          "steps": [ { "point": "home.setup-skipped" } ]
+        }
+      ]
+    },
+    {
+      "id": "returning", "title": "Returning",
+      "steps": [
+        { "point": "sign-in" },
+        { "point": "home", "action": "Enter the email and password, tap Sign in" }
+      ],
+      "branches": [
+        {
+          "id": "wrong-password", "title": "Wrong password",
+          "from": "sign-in", "action": "Tap Sign in with a wrong password",
+          "steps": [ { "point": "sign-in.wrong-password" } ],
+          "rejoins": "home"
+        },
+        {
+          "id": "weather-loading", "title": "Weather loading",
+          "from": "sign-in", "action": "Sign in while the weather loads",
+          "steps": [ { "point": "home.weather-loading" } ],
+          "rejoins": "home"
+        },
+        {
+          "id": "weather-failed", "title": "Weather failed",
+          "from": "sign-in", "action": "Sign in; the weather call fails",
+          "steps": [ { "point": "home.weather-failed" } ],
+          "rejoins": "home"
+        },
+        {
+          "id": "city-not-found", "title": "City not found",
+          "from": "home", "action": "Search for a city that doesn't exist",
+          "steps": [ { "point": "home.city-not-found" } ]
+        }
+      ]
+    },
+    {
+      "id": "settings", "title": "Changing units",
+      "steps": [
+        { "point": "home" },
+        { "point": "profile", "action": "Tap Profile" },
+        { "point": "settings", "action": "Tap Settings" },
+        { "point": "settings.units", "action": "Tap Units" },
+        { "point": "settings.units.saved", "action": "Choose Fahrenheit, tap Save" }
+      ],
+      "branches": [
+        {
+          "id": "unsaved-discarded", "title": "Unsaved changes discarded",
+          "from": "settings.units", "action": "Choose Fahrenheit, tap Back",
+          "steps": [
+            { "point": "settings.units.unsaved" },
+            { "point": "settings", "action": "Tap Discard", "back": "settings" }
+          ]
+        },
+        {
+          "id": "unsaved-kept", "title": "Unsaved changes kept",
+          "from": "settings.units", "action": "Choose Fahrenheit, tap Back",
+          "steps": [
+            { "point": "settings.units.unsaved" },
+            { "point": "settings", "action": "Tap Save", "back": "settings" }
+          ]
+        }
+      ]
+    }
+  ],
+  "edgeStates": [
+    { "id": "trial-ended", "title": "Trial ended", "points": ["home.trial-ended", "profile.trial-ended"], "flows": ["returning", "settings"] },
+    { "id": "many-alerts", "title": "500 alerts", "points": ["home.many-alerts"], "flows": ["returning", "settings"] },
+    { "id": "long-name", "title": "40-character name", "points": ["home.long-name", "profile.long-name"], "flows": ["returning", "settings"] },
+    { "id": "offline", "title": "Offline", "points": ["home.offline"], "flows": ["returning", "settings"] },
+    { "id": "session-expired", "title": "Session expired", "points": ["home.session-expired"], "flows": ["returning", "settings"] }
+  ],
+  "devices": [
+    { "id": "iphone-17e", "platform": "ios", "name": "iPhone 17e" },
+    { "id": "iphone-18-pro-max", "platform": "ios", "name": "iPhone 18 Pro Max" },
+    { "id": "pixel", "platform": "android", "name": "Pixel 8 (stet_pixel)" }
+  ]
+}

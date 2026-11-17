@@ -1,0 +1,58 @@
+# Changing units: Home → Profile → Settings → Units, leaving with unsaved changes
+# (discarded), then choosing again and saving.
+appId: dev.getstet.examples.weather
+name: Changing units
+---
+- launchApp:
+    stopApp: true
+- extendedWaitUntil:
+    visible:
+      id: welcome-sign-in
+    timeout: 60000
+- tapOn:
+    id: welcome-sign-in
+- tapOn:
+    id: email
+- inputText: returning@example.com
+- tapOn:
+    id: password
+- inputText: weather-demo
+- hideKeyboard
+- tapOn:
+    id: sign-in-submit
+- waitForAnimationToEnd
+- runFlow:
+    when:
+      visible: Not Now
+    commands:
+      - tapOn: Not Now
+- assertVisible: Hello, Ada
+- tapOn:
+    id: profile-button
+- assertVisible: Profile
+- takeScreenshot: settings-1-profile
+- tapOn:
+    id: profile-settings
+- assertVisible:
+    id: settings-units
+- takeScreenshot: settings-2-settings
+- tapOn:
+    id: settings-units
+- tapOn:
+    id: units-fahrenheit
+- tapOn:
+    id: back
+- assertVisible: Save your changes?
+- takeScreenshot: settings-3-unsaved
+- tapOn:
+    id: dialog-cancel
+- assertVisible:
+    id: settings-units
+- tapOn:
+    id: settings-units
+- tapOn:
+    id: units-fahrenheit
+- tapOn:
+    id: units-save
+- assertVisible: Your units are saved.
+- takeScreenshot: settings-4-saved

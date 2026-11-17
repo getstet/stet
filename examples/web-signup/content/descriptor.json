@@ -1,0 +1,308 @@
+{
+  "version": 1,
+  "keys": {
+    "app_name": {
+      "shape": "text",
+      "target": "web",
+      "label": "App name",
+      "section": "Shared"
+    },
+    "nav_dashboard": {
+      "shape": "text",
+      "target": "web",
+      "label": "Navigation: dashboard link",
+      "section": "Shared"
+    },
+    "nav_settings": {
+      "shape": "text",
+      "target": "web",
+      "label": "Navigation: settings link",
+      "section": "Shared"
+    },
+    "nav_sign_out": {
+      "shape": "text",
+      "target": "web",
+      "label": "Navigation: sign out",
+      "section": "Shared"
+    },
+    "not_found_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Page not found: title",
+      "section": "Shared"
+    },
+    "not_found_link": {
+      "shape": "text",
+      "target": "web",
+      "label": "Page not found: link",
+      "section": "Shared"
+    },
+    "signup_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Title",
+      "section": "Sign up"
+    },
+    "signup_intro": {
+      "shape": "text",
+      "target": "web",
+      "label": "Introduction",
+      "section": "Sign up"
+    },
+    "signup_name_label": {
+      "shape": "text",
+      "target": "web",
+      "label": "Name field label",
+      "section": "Sign up"
+    },
+    "signup_email_label": {
+      "shape": "text",
+      "target": "web",
+      "label": "Email field label",
+      "section": "Sign up"
+    },
+    "signup_email_placeholder": {
+      "shape": "text",
+      "target": "web",
+      "label": "Email field placeholder",
+      "section": "Sign up"
+    },
+    "signup_submit": {
+      "shape": "text",
+      "target": "web",
+      "label": "Submit button",
+      "section": "Sign up"
+    },
+    "signup_sending": {
+      "shape": "text",
+      "target": "web",
+      "label": "Submit button while sending",
+      "section": "Sign up"
+    },
+    "signup_name_required": {
+      "shape": "text",
+      "target": "web",
+      "label": "Error: name missing",
+      "section": "Sign up"
+    },
+    "signup_email_invalid": {
+      "shape": "text",
+      "target": "web",
+      "label": "Error: invalid email address",
+      "section": "Sign up"
+    },
+    "signup_unavailable_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Service unavailable: title",
+      "section": "Sign up"
+    },
+    "signup_unavailable_body": {
+      "shape": "text",
+      "target": "web",
+      "label": "Service unavailable: message",
+      "section": "Sign up"
+    },
+    "signup_retry": {
+      "shape": "text",
+      "target": "web",
+      "label": "Service unavailable: retry button",
+      "section": "Sign up"
+    },
+    "signup_joined_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Joined: title",
+      "section": "Sign up",
+      "vars": [
+        "name"
+      ]
+    },
+    "signup_joined_body": {
+      "shape": "text",
+      "target": "web",
+      "label": "Joined: message",
+      "section": "Sign up",
+      "vars": [
+        "email"
+      ]
+    },
+    "signup_continue": {
+      "shape": "text",
+      "target": "web",
+      "label": "Joined: continue button",
+      "section": "Sign up"
+    },
+    "signup_privacy": {
+      "shape": "text",
+      "target": "web",
+      "label": "Privacy note",
+      "section": "Sign up"
+    },
+    "welcome_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Title",
+      "section": "Welcome",
+      "vars": [
+        "name"
+      ]
+    },
+    "welcome_body": {
+      "shape": "text",
+      "target": "web",
+      "label": "Message",
+      "section": "Welcome"
+    },
+    "welcome_cta": {
+      "shape": "text",
+      "target": "web",
+      "label": "Button",
+      "section": "Welcome"
+    },
+    "dashboard_greeting": {
+      "shape": "text",
+      "target": "web",
+      "label": "Greeting",
+      "section": "Dashboard",
+      "vars": [
+        "name"
+      ]
+    },
+    "dashboard_projects_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Projects heading",
+      "section": "Dashboard"
+    },
+    "dashboard_projects_empty": {
+      "shape": "text",
+      "target": "web",
+      "label": "No projects message",
+      "section": "Dashboard"
+    },
+    "dashboard_project_updated": {
+      "shape": "text",
+      "target": "web",
+      "label": "Project: last updated",
+      "section": "Dashboard",
+      "vars": [
+        "date"
+      ]
+    },
+    "settings_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Title",
+      "section": "Settings"
+    },
+    "settings_profile_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Profile heading",
+      "section": "Settings"
+    },
+    "settings_name_label": {
+      "shape": "text",
+      "target": "web",
+      "label": "Display name label",
+      "section": "Settings"
+    },
+    "settings_name_hint": {
+      "shape": "text",
+      "target": "web",
+      "label": "Display name hint",
+      "section": "Settings"
+    },
+    "settings_name_required": {
+      "shape": "text",
+      "target": "web",
+      "label": "Error: display name missing",
+      "section": "Settings"
+    },
+    "settings_email_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Email preferences heading",
+      "section": "Settings"
+    },
+    "settings_pref_updates": {
+      "shape": "text",
+      "target": "web",
+      "label": "Product updates option",
+      "section": "Settings"
+    },
+    "settings_pref_updates_hint": {
+      "shape": "text",
+      "target": "web",
+      "label": "Product updates hint",
+      "section": "Settings"
+    },
+    "settings_pref_summary": {
+      "shape": "text",
+      "target": "web",
+      "label": "Weekly summary option",
+      "section": "Settings"
+    },
+    "settings_pref_summary_hint": {
+      "shape": "text",
+      "target": "web",
+      "label": "Weekly summary hint",
+      "section": "Settings"
+    },
+    "settings_save": {
+      "shape": "text",
+      "target": "web",
+      "label": "Save button",
+      "section": "Settings"
+    },
+    "settings_saving": {
+      "shape": "text",
+      "target": "web",
+      "label": "Save button while saving",
+      "section": "Settings"
+    },
+    "settings_saved": {
+      "shape": "text",
+      "target": "web",
+      "label": "Saved notice",
+      "section": "Settings"
+    },
+    "settings_unsaved": {
+      "shape": "text",
+      "target": "web",
+      "label": "Unsaved changes notice",
+      "section": "Settings"
+    },
+    "settings_back": {
+      "shape": "text",
+      "target": "web",
+      "label": "Back button",
+      "section": "Settings"
+    },
+    "settings_discard_title": {
+      "shape": "text",
+      "target": "web",
+      "label": "Discard dialog: title",
+      "section": "Settings"
+    },
+    "settings_discard_body": {
+      "shape": "text",
+      "target": "web",
+      "label": "Discard dialog: message",
+      "section": "Settings"
+    },
+    "settings_discard_confirm": {
+      "shape": "text",
+      "target": "web",
+      "label": "Discard dialog: discard button",
+      "section": "Settings"
+    },
+    "settings_discard_keep": {
+      "shape": "text",
+      "target": "web",
+      "label": "Discard dialog: keep button",
+      "section": "Settings"
+    }
+  }
+}

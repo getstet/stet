@@ -1,0 +1,54 @@
+# First run: Welcome → Create account → Name → Units → Notifications → Done → Home.
+appId: dev.getstet.examples.weather
+name: First run
+---
+- launchApp:
+    stopApp: true
+- extendedWaitUntil:
+    visible:
+      id: welcome-create-account
+    timeout: 60000
+- takeScreenshot: first-run-1-welcome
+- tapOn:
+    id: welcome-create-account
+- tapOn:
+    id: email
+- inputText: robin@example.com
+- tapOn:
+    id: password
+- inputText: weather-walk
+- hideKeyboard
+- takeScreenshot: first-run-2-create-account
+- tapOn:
+    id: create-account-submit
+- waitForAnimationToEnd
+- runFlow:
+    when:
+      visible: Not Now
+    commands:
+      - tapOn: Not Now
+- assertVisible: What should we call you?
+- waitForAnimationToEnd
+- tapOn:
+    id: name-field
+- inputText: Robin
+- hideKeyboard
+- takeScreenshot: first-run-3-name
+- tapOn:
+    id: onboarding-continue
+- assertVisible: Which units do you use?
+- tapOn:
+    id: units-fahrenheit
+- takeScreenshot: first-run-4-units
+- tapOn:
+    id: onboarding-continue
+- assertVisible: Stay in the loop
+- takeScreenshot: first-run-5-notifications
+- tapOn:
+    id: notifications-allow
+- assertVisible: You're all set
+- takeScreenshot: first-run-6-done
+- tapOn:
+    id: onboarding-done
+- assertVisible: Hello, Robin
+- takeScreenshot: first-run-7-home
